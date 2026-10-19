@@ -210,7 +210,8 @@ class SpeechFrontierMixin:
         """
         h = self.handle or self._continuation_handle
         if (h is None or h.speech_id != speech_id or h.reason
-                or h.identity[0] != identity[0] or h.turn_id != turn_id):
+                or h.identity[0] != identity[0] or self.runtime.gate(identity)
+                or h.workspace.generation != self.generation):
             return None
         state = h.admission
         if state is None or not h.rewritable:
@@ -235,6 +236,8 @@ class SpeechFrontierMixin:
                 return None
             h.text = baseline + text
         h.text_revision = getattr(h, "text_revision", 0) + 1
+        h.revision_source_turn_id = turn_id  # revision_source_turn_id（最近修订来源轮次）。
+        h.revision_request_id = identity[1]  # revision_request_id（最近修订来源请求）。
         # 分段器已结束，权威文本同时用于事务结算及本地状态快照。
         accepted = h.text + h.continuation_tail
         if not state.closed:
@@ -243,6 +246,8 @@ class SpeechFrontierMixin:
         await self.runtime.emit("speech.tail_rewritten", {
             "speech_id": h.speech_id, "conversation_id": h.identity[0],
             "turn_id": h.turn_id, "output_generation": h.workspace.generation,
+            "revision_source_turn_id": h.revision_source_turn_id,  # 修订来源轮次，独立于原播报归属。
+            "revision_request_id": h.revision_request_id,  # 修订来源请求。
             "text_revision": h.text_revision,  # text_revision（单事务文本版本）。
             "text": accepted,  # text（本事务正文及待接播尾巴，不重复前序事务文字）。
             "sent_chars": state.sent_chars,

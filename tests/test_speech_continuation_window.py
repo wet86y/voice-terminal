@@ -82,6 +82,101 @@ def test_closed_sender_accepts_empty_tail_and_plays_only_suffix_after_settlement
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("event_kind,stale_progress", [
+    ("information", False), ("result", False), ("input_required", False),
+    ("failed", False), ("durable", False), ("progress", False), ("progress", True),
+])
+def test_background_return_revises_previous_turn_without_reviving_stale_progress(event_kind, stale_progress):
+    """后台各入口均走真实接播；二等进度在推理中遇到新讲话仍须过期。"""
+    from voice_terminal.shadow_agent.contracts import DurableVoiceEvent, ShadowEvent
+
+    async def scenario():
+        harness = ContinuationHarness()
+        runtime = _agent(harness)
+        runtime._ensure_runner = lambda: None  # 由本测试控制唯一请求的派发时点。
+        entered, release = asyncio.Event(), asyncio.Event()
+        answer = "后台已核对，结果与最新要求一致。"
+        turn_id = "background-followup"
+
+        class Provider:
+            transport = "responses"  # transport（模型响应协议）。
+
+            def stream_events(self, messages, **_kwargs):
+                async def stream():
+                    assert answer in json.dumps(messages, ensure_ascii=False)
+                    assert "只汇报核对结果" in json.dumps(messages, ensure_ascii=False)
+                    assert runtime._last_model_speak_state["owner_scope"] == "previous_turn"
+                    assert runtime._last_model_speak_state["continuation_mode"] == "rewrite_tail"
+                    entered.set()
+                    await release.wait()
+                    yield {"type": "content", "text": json.dumps({
+                        "speak": {"state": "revision", "emotion": "calm", "text": answer},
+                        "actions": [],
+                    }, ensure_ascii=False)}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        runtime.provider = Provider()
+        runtime.agent_step_id = harness.identity[1]
+        step = None
+        try:
+            first = await harness.first()
+            runtime.last_turn_id = harness.runtime.last_turn_id = turn_id
+            runtime._identity_turns[harness.identity] = turn_id
+            runtime.inputs[turn_id] = {"text": "只汇报核对结果", "final": True}
+            runtime.ledger.commit_input(turn_id, "只汇报核对结果")
+            runtime.ledger.set_shadow_runtime_state(available=True, active=True, activation_id="background")
+            if event_kind == "durable":
+                await runtime.accept_durable_voice_event(DurableVoiceEvent("return", answer, "dsh-session"))
+            else:
+                await runtime.accept_shadow_event(ShadowEvent(
+                    "return", event_kind, answer, 1, "background",
+                ))
+            dispatch_context = None
+            if event_kind == "progress":
+                dispatch_context = {
+                    "owner_scope": "system_check", "system_check_id": "background-check",
+                    "prompt_kind": "secondary_mailbox", "speech_turn_id": turn_id,
+                    "generation": runtime.scheduler.generation,
+                    "user_speech_epoch": runtime._user_speech_epoch,
+                    "user_speaking_at_dispatch": False,
+                    "shadow_activation_id": "background",
+                    "shadow_progress_generation": runtime.ledger._shadow_progress_generation,
+                }
+                kinds = {"SECONDARY_MAILBOX"}
+            else:
+                kinds = set(runtime.pending)
+                assert kinds
+            step = asyncio.create_task(runtime._step(harness.identity, kinds, dispatch_context=dispatch_context))
+            await asyncio.wait_for(entered.wait(), HANDOFF_TIMEOUT_SECONDS)
+            await complete(harness, first)
+            expire(first)
+            if stale_progress:
+                runtime._user_speech_epoch += 1  # 模拟二等评估派发后用户又开始讲话。
+            release.set()
+            outcome = await asyncio.wait_for(step, HANDOFF_TIMEOUT_SECONDS)
+            if stale_progress:
+                assert outcome == "system_check_stale"
+                assert not first.continuation_tail
+                assert len(harness.tts.sessions) == 1
+            else:
+                assert outcome == "completed"
+                second = await harness.wait_for_drain(timeout=HANDOFF_TIMEOUT_SECONDS)
+                assert harness.tts.sessions[1].sent == [answer]
+                await complete(harness, second)
+                assert harness.output.delivered["text"] == FIRST_TEXT + answer
+                assert harness.records[-1]["revision_source_turn_id"] == turn_id
+            assert not first.continuation_tickets
+            assert not harness.output.inference_boundary.frozen
+        finally:
+            if step is not None:
+                step.cancel()
+                await asyncio.gather(step, return_exceptions=True)
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
 def test_one_second_window_starts_at_actual_output_and_does_not_delay_ready_suffix():
     async def scenario():
         harness = ContinuationHarness(device_latency_ms=40)
@@ -243,31 +338,49 @@ def test_cancellation_revokes_pending_tail_and_inflight_permission(phase, reason
     asyncio.run(scenario())
 
 
-def test_turn_change_revokes_window_without_requiring_next_user_to_wait():
+@pytest.mark.parametrize("after_playback", [False, True])
+def test_new_user_turn_can_revise_current_speech_and_continue_after_playback(after_playback):
     async def scenario():
         harness = ContinuationHarness()
         runtime = _agent(harness)
         try:
             first = await harness.first()
-            await complete(harness, first)
-            snapshot = dict(harness.output.speak_snapshot)
+            if after_playback:
+                await complete(harness, first)
             harness.runtime.last_turn_id = "next-turn"
-            assert harness.output.speak_snapshot["queue_status"] == "empty"
-            assert await revise(harness, runtime, SUFFIX_TEXT, snapshot) is None
-            next_handle = await harness.output.begin(harness.identity, "next-turn")
-            await next_handle.feed("新问题的回答。")
-            await next_handle.finish()
-            await harness.wait_for_drain(next_handle)
-            await complete(harness, next_handle)
-            assert harness.tts.sessions[1].sent == ["新问题的回答。"]
+            identity = (harness.identity[0], "next-request")
+            async with harness.output.inference_boundary.request(identity):
+                snapshot = dict(harness.output.speak_snapshot)
+                state = AgentEpisodeRuntime._model_speak_state(
+                    snapshot, conversation_id=identity[0], turn_id="next-turn",
+                )
+                assert state["owner_scope"] == "previous_turn"
+                assert state["continuation_mode"] == "rewrite_tail"
+                result = await runtime._apply_revision_tail(
+                    identity, "next-turn", snapshot, SUFFIX_TEXT, emotion="calm",
+                )
+                assert result is first
+            if not after_playback:
+                await complete(harness, first)
+            second = await harness.wait_for_drain(timeout=HANDOFF_TIMEOUT_SECONDS)
+            assert harness.tts.sessions[1].sent == [SUFFIX_TEXT]
+            await complete(harness, second)
+            assert harness.output.delivered["text"] == FIRST_TEXT + SUFFIX_TEXT
+            assert harness.records[-1]["turn_id"] == harness.turn_id
+            assert harness.records[-1]["revision_source_turn_id"] == "next-turn"
+            assert harness.records[-1]["revision_request_id"] == "next-request"
+            rewritten = next(payload for kind, payload in harness.events
+                             if kind == "speech.tail_rewritten")
+            assert rewritten["turn_id"] == harness.turn_id
+            assert rewritten["revision_source_turn_id"] == "next-turn"
         finally:
             await harness.close()
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("invalidation", ["interrupt", "turn_change", "cancel_by_id"])
-def test_handoff_preparation_remains_cancellable_and_rechecks_turn(invalidation):
+@pytest.mark.parametrize("invalidation", ["interrupt", "generation_change", "cancel_by_id"])
+def test_handoff_preparation_remains_cancellable_and_rechecks_generation(invalidation):
     async def scenario():
         harness = ContinuationHarness()
         runtime = _agent(harness)
@@ -289,7 +402,7 @@ def test_handoff_preparation_remains_cancellable_and_rechecks_turn(invalidation)
             elif invalidation == "cancel_by_id":
                 assert harness.output.cancel(first.speech_id)
             else:
-                harness.runtime.last_turn_id = "next-turn"
+                harness.output.generation += 1
             release.set()
             await asyncio.wait_for(asyncio.gather(worker, return_exceptions=True), HANDOFF_TIMEOUT_SECONDS)
             assert len(harness.tts.sessions) == 1
@@ -598,8 +711,9 @@ def test_continuation_retains_backend_voice_and_inference_steps_until_transfer()
     asyncio.run(scenario())
 
 
-def test_screen_result_request_keeps_revision_authority_through_real_playback_end():
-    """截图普通轮次在全锁定快照发起，返回时已过窗口，也能真实播出结论。"""
+@pytest.mark.parametrize("new_user_turn", [False, True])
+def test_screen_result_request_keeps_revision_authority_through_real_playback_end(new_user_turn):
+    """截图返回并遇到后续讲话，推理跨过播放结束仍能接播图片结论。"""
     from tests.test_screen_capture import packet
 
     async def scenario():
@@ -619,7 +733,10 @@ def test_screen_result_request_keeps_revision_authority_through_real_playback_en
                     assert len(images) == 2
                     state = runtime._last_model_speak_state
                     assert state["continuation_mode"] == "rewrite_tail"
+                    assert state["owner_scope"] == ("previous_turn" if new_user_turn else "current_turn")
                     assert state["text_parts"]["revisable_tail"] == ""
+                    if new_user_turn:
+                        assert "比较左右两块区域" in json.dumps(messages, ensure_ascii=False)
                     entered.set()
                     await release.wait()
                     yield {"type": "content", "text": json.dumps({
@@ -640,7 +757,23 @@ def test_screen_result_request_keeps_revision_authority_through_real_playback_en
         step = None
         try:
             first = await harness.first()
-            step = asyncio.create_task(runtime._step(harness.identity, {"SCREEN_CAPTURE_READY"}))
+            kinds = {"SCREEN_CAPTURE_READY"}
+            if new_user_turn:
+                # 图片仍来自上一轮；新一轮的最终识别稿和精修稿共同进入图片分析请求。
+                turn_id = "screen-followup"
+                runtime.last_turn_id = harness.runtime.last_turn_id = turn_id
+                runtime._identity_turns[harness.identity] = turn_id
+                runtime.inputs[turn_id] = {
+                    "text": "比较左右两块区域", "final": True,
+                    "refined_text": "比较左右两块区域是否相同。",
+                    "transcript_updates": [
+                        {"kind": "asr_final", "source": "paraformer", "text": "比较左右两块区域", "revision": 1},
+                        {"kind": "refinement", "source": "sensevoice", "text": "比较左右两块区域是否相同。", "revision": 2},
+                    ],
+                }
+                runtime.ledger.commit_input(turn_id, "比较左右两块区域")
+                kinds.update({"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"})
+            step = asyncio.create_task(runtime._step(harness.identity, kinds))
             await asyncio.wait_for(entered.wait(), HANDOFF_TIMEOUT_SECONDS)
             await complete(harness, first)
             expire(first)
@@ -653,6 +786,8 @@ def test_screen_result_request_keeps_revision_authority_through_real_playback_en
             assert not first.continuation_tickets
             assert not harness.output.inference_boundary.frozen
             assert runtime._screen_pending is None
+            if new_user_turn:
+                assert harness.records[-1]["revision_source_turn_id"] == "screen-followup"
         finally:
             if step is not None:
                 step.cancel()

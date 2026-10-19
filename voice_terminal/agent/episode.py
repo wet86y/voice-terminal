@@ -2835,9 +2835,10 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 "prefetched_clause": "",
                 "revisable_tail": "",
             }
+        same_conversation = bool(conversation_id and snapshot.get("conversation_id") == conversation_id)
         continuation_mode = (
             "rewrite_tail"
-            if same_turn and parts_valid and bool(snapshot.get("rewritable"))
+            if same_conversation and parts_valid and bool(snapshot.get("rewritable"))
             else "none"
         )
         value = {
@@ -2864,8 +2865,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         current = current if isinstance(current, dict) else {}
         speech_id = snapshot.get("speech_id")
         reason = None
-        if (not speech_id or snapshot.get("conversation_id") != identity[0]
-                or snapshot.get("turn_id") != turn_id):
+        if not speech_id or snapshot.get("conversation_id") != identity[0]:
             reason = "no_owned_transaction"
         elif any(current.get(key) != snapshot.get(key) for key in (
                 "speech_id", "output_generation", "sent_chars", "text", "text_revision")):
@@ -2903,6 +2903,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             if rewritten is not None:
                 await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
                                path="rewrite", speech_id=rewritten.speech_id,
+                               speech_turn_id=snapshot.get("turn_id"),  # 原播报所属轮次。
                                locked_chars=len(locked), new_tail_chars=len(proposal),
                                context_locked_chars=sent_chars,
                                apply_locked_chars=getattr(rewritten, "sent_chars", sent_chars),

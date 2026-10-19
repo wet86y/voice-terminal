@@ -337,13 +337,20 @@ Product UI 的会话排序只信任服务端 `conversation.append` / `conversati
 修改 speak（新播报）、revision（尾巴修订）或 cancel（取消）时，回归
 tests/test_speak_revision.py（决策职责）、tests/test_speech_admission.py（提交确认）、
 tests/test_speech_continuation.py（真实播放器边界）、tests/test_speech_inference.py（推理冻结组合）、
+tests/test_speech_continuation_window.py（续写窗口、截图与后台回传）、
 tests/test_v06_contracts.py（完整与流式契约）、tests/test_context_cache_contract.py（缓存分区），
 tests/test_json_schema_shadow.py（模型提示与结构契约），
 以及 apps/frontend/src/composables/useVoiceTerminal.test.ts（展示文本同步）。
 
 必须确认：排队、播放、设备输出尾音及结算期间拒绝新 speak（新播报）；忙碌请求在推理期间等到空闲也不能补执行；
-revision（尾巴修订）只能修改快照仍匹配的未提交尾巴，发送中、跨轮、版本过期及窗口关闭全部拒绝且不追加；
+revision（尾巴修订）只能修改快照仍匹配的未提交尾巴，用户换轮不构成拒绝理由；发送中、会话或输出代次失效、版本过期及窗口关闭全部拒绝且不追加；
 cancel（取消）带文本仍可硬替换并拒绝旧 PCM（原始音频）；修订事件以权威全文替换展示，拒绝迟到版本。
+
+续写窗口回归还必须覆盖：用户换轮后的截图识别和普通后续发言，以及后台 `information`（影子信息）、`result`（后台结果）、
+`input_required`（需要用户输入）、`failed`（后台失败）、`durable`（持久语音事件）和 `system_check`（系统检查）
+返回，均能在同会话当前事务仍可写时修订尾巴；旧播报轮次归属保持不变，最近修订来源轮次与请求单独记录。
+实际播放结束后的窗口只允许带有效请求票据的推理完成修订，截止后到达的新请求不能借用旧票据。
+`system_check`（系统检查）若在处理前已过期，不得恢复旧修订资格或创建后继播放段。
 
 推理准备必须覆盖：剩余已返回音频恰好 3 秒时不补块、不足时最多补一块、当前块与预取块最多两块、等待期间已有音频足够时撤销补块、2 秒准备超时、正在发送的块与字符计数一起结算。推理中播放耗尽不能推进提交；revision（尾巴修订）后丢弃已取出的旧块，wait（等待）后恢复旧文本调度，speak（新播报）不能改尾巴或追加。失败和取消释放各自票据，旧请求释放不能解锁新请求；空二等信箱及过期恢复不冻结，有效重试仍使用匹配的信箱快照。
 
