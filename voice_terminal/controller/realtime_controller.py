@@ -65,6 +65,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
         self._endpoint_task: asyncio.Task | None = None
+        self._tts_hold_fallback_task: asyncio.Task | None = None  # 待播 TTS 的 VAD 静默兜底计时任务。
+        self._tts_hold_fallback_generation = 0  # 兜底计时代次，避免过期任务释放新队列。
         self._refine_task: asyncio.Task | None = None
         self._tts_prewarm_tasks: dict[str, asyncio.Task] = {}
         # Keep input timing dictionaries after the audio workspace is retired;
@@ -244,6 +246,54 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             if not t.cancelled():
                 t.exception()
         task.add_done_callback(done)
+
+    def _cancel_tts_hold_fallback(self) -> int:
+        """Invalidate any VAD-silence fallback task and return its new generation."""
+        self._tts_hold_fallback_generation = getattr(self, "_tts_hold_fallback_generation", 0) + 1
+        task = getattr(self, "_tts_hold_fallback_task", None)
+        self._tts_hold_fallback_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        return self._tts_hold_fallback_generation
+
+    def _start_tts_hold_fallback(self) -> None:
+        """Start the configured hard-release timer for the currently held TTS queue."""
+        generation = self._cancel_tts_hold_fallback()
+        output = getattr(self, "output", None)
+        if not bool(getattr(output, "playback_hold_active", False)):
+            return
+        episode = getattr(self, "episode", None)
+        timeout_ms = int(getattr(self.options, "tts_hold_fallback_ms", 2000))
+
+        async def release_after_silence() -> None:
+            try:
+                await asyncio.sleep(timeout_ms / 1000)
+                if (generation != getattr(self, "_tts_hold_fallback_generation", None)
+                        or getattr(self, "episode", None) is not episode
+                        or getattr(self, "output", None) is not output
+                        or not bool(getattr(output, "playback_hold_active", False))):
+                    return
+                self._release_tts_hold("vad_silence_timeout")
+            except asyncio.CancelledError:
+                return
+            finally:
+                if self._tts_hold_fallback_task is asyncio.current_task():
+                    self._tts_hold_fallback_task = None
+
+        task = asyncio.create_task(release_after_silence(), name="tts-hold-silence-fallback")
+        self._tts_hold_fallback_task = task
+        self._track(task)
+
+    def _release_tts_hold(self, reason: str):
+        """Release a held output once; reason（放行原因）is recorded in TTS_RELEASED（待播语音放行事件）。"""
+        self._cancel_tts_hold_fallback()
+        output = getattr(self, "output", None)
+        if not bool(getattr(output, "playback_hold_active", False)):
+            return None
+        release = getattr(output, "release_held", None)
+        if callable(release):
+            return release(reason=reason)
+        return None
 
     def _valid(self, token: tuple[str, int]) -> bool:
         # Token validity is now an explicit workspace cancellation boundary.
@@ -484,6 +534,17 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         activity = await asyncio.to_thread(self.vad.feed, frame.pcm)
         if generation != self._vad_generation or getattr(self, "_input_resetting", False):
             return  # Turn was cancelled while native VAD was running.
+        if activity.speech_started:
+            # A resumed VAD speech interval invalidates both the pending
+            # playback fallback and any endpoint result for the prior pause.
+            self._cancel_tts_hold_fallback()
+            stale_task = self._endpoint_task
+            self._endpoint_task = None
+            if stale_task is not None:
+                stale_task.cancel()
+        elif activity.speech_ended:
+            # VAD（语音活动检测）已包含自身的静默判定窗口；2 秒从此事件开始。
+            self._start_tts_hold_fallback()
         if getattr(self, "speaker_sensor", None) is not None:
             output = getattr(self,"output",None)
             handle = getattr(output,"handle",None)
@@ -626,13 +687,6 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 self._resume_started = None
             return
 
-        if activity.speech_started:
-            if self._endpoint_task:
-                stale_task = self._endpoint_task
-                self._endpoint_task = None
-                # The task sends native inference cancellation without holding
-                # up this VAD/audio callback.
-                stale_task.cancel()
         if activity.speech_ended:
             await self._segment(ws.raw_partial, pause=True)
         elapsed_ms = (frame.captured_at - ws.started_at) * 1000
@@ -817,6 +871,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             ws.timings["smart_turn_ms"] = reply["elapsed_ms"]
             await self._detail("turn.semantic_state", **result)
             if result["probability"] >= self.options.threshold and task is self._endpoint_task:
+                self._release_tts_hold("smart_turn")
                 await self._freeze("smart_turn", self._last_frame)
         except asyncio.CancelledError:
             raise

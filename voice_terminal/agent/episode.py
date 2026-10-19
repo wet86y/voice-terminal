@@ -2009,10 +2009,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 self.voice_activation_task.cancel()
         if self.episode_id and speaking is not None and speaking != previous:
             await self.observe("SPEECH_STARTED" if speaking else "SPEECH_ENDED")
-        if speaking is False and previous is True:
-            release = getattr(self.output, "release_held", None)
-            if callable(release):
-                release()
+        # SPEECH_ENDED（静默事件）只报告用户活动状态。
+        # 待播语音由 SmartTurn（语音结束判断）或控制器的静默兜底计时显式放行。
 
     def _meaningful_pending(self):
         return {

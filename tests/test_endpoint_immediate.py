@@ -12,6 +12,14 @@ def test_legacy_candidate_configuration_still_loads_without_delaying_vad_end():
     options = InputOptions.from_mapping({"candidate_ms": 5000, "recheck_ms": 1000}, Path.cwd())
     assert options.candidate_ms == 5000
     assert options.hard_silence_ms == 1400
+    assert options.tts_hold_fallback_ms == 2000
+    assert InputOptions.from_mapping({"tts_hold_fallback_ms": 2500}, Path.cwd()).tts_hold_fallback_ms == 2500
+    try:
+        InputOptions.from_mapping({"tts_hold_fallback_ms": 0}, Path.cwd())
+    except ValueError as exc:
+        assert "tts_hold_fallback_ms" in str(exc)
+    else:
+        raise AssertionError("non-positive TTS hold fallback must be rejected")
 
 
 def test_vad_end_starts_one_check_without_candidate_wait_and_hard_silence_recovers():
@@ -65,6 +73,9 @@ def test_vad_end_starts_one_check_without_candidate_wait_and_hard_silence_recove
         controller._active_input = True
         controller._endpoint_task = None
         controller._sub_id = "asr-a"
+        hold_events = []
+        controller._start_tts_hold_fallback = lambda: hold_events.append("silence")
+        controller._cancel_tts_hold_fallback = lambda: hold_events.append("speech")
         controller._queue_asr = lambda _chunk: None
         controller._observe_activity = lambda activity, _frame: asyncio.sleep(0, result=activity)
         controller._segment = lambda *_args, **_kwargs: asyncio.sleep(0)
@@ -92,5 +103,88 @@ def test_vad_end_starts_one_check_without_candidate_wait_and_hard_silence_recove
 
         await controller.handle_frame(AudioFrame(b"\0\0" * 22400, 3840, 2.64))
         assert freezes == ["hard_silence"]
+        assert hold_events == ["silence", "speech", "silence"]
+
+    asyncio.run(scenario())
+
+
+def test_smart_turn_positive_releases_held_tts_before_freezing_input():
+    async def scenario():
+        class Analysis:
+            async def analyze(self, *_args):
+                return {"result": {"probability": 0.9}, "elapsed_ms": 10}
+
+        class Output:
+            def __init__(self):
+                self.playback_hold_active = True
+                self.reasons = []
+
+            def release_held(self, *, reason):
+                self.reasons.append(reason)
+                self.playback_hold_active = False
+
+        controller = object.__new__(RealtimeController)
+        controller.options = InputOptions(smart_turn=True, threshold=0.5)
+        controller.analysis = Analysis()
+        controller.workspace = TurnWorkspace("turn-smart")
+        controller._active_input = True
+        controller._endpoint_task = None
+        controller._last_frame = AudioFrame(b"\0\0" * 320, 0, 1.0)
+        controller.output = Output()
+        controller._tts_hold_fallback_task = None
+        controller._tts_hold_fallback_generation = 0
+        controller._detail = lambda *_args, **_kwargs: asyncio.sleep(0)
+        frozen = []
+
+        async def freeze(reason, _frame):
+            frozen.append(reason)
+            controller._active_input = False
+
+        controller._freeze = freeze
+        task = asyncio.create_task(controller._endpoint(
+            controller.workspace, controller._last_frame, b"\0\0" * 320,
+        ))
+        controller._endpoint_task = task
+        await task
+
+        assert controller.output.reasons == ["smart_turn"]
+        assert frozen == ["smart_turn"]
+
+    asyncio.run(scenario())
+
+
+def test_smart_turn_continue_keeps_held_tts_for_the_fallback_deadline():
+    async def scenario():
+        class Analysis:
+            async def analyze(self, *_args):
+                return {"result": {"probability": 0.1}, "elapsed_ms": 10}
+
+        class Output:
+            playback_hold_active = True
+
+            def release_held(self, *, reason):
+                raise AssertionError(f"SmartTurn continue must not release TTS: {reason}")
+
+        controller = object.__new__(RealtimeController)
+        controller.options = InputOptions(smart_turn=True, threshold=0.5)
+        controller.analysis = Analysis()
+        controller.workspace = TurnWorkspace("turn-continue")
+        controller._active_input = True
+        controller._endpoint_task = None
+        controller._last_frame = AudioFrame(b"\0\0" * 320, 0, 1.0)
+        controller.output = Output()
+        controller._tts_hold_fallback_task = None
+        controller._tts_hold_fallback_generation = 0
+        controller._detail = lambda *_args, **_kwargs: asyncio.sleep(0)
+        frozen = []
+        controller._freeze = lambda reason, _frame: asyncio.sleep(0, result=frozen.append(reason))
+        task = asyncio.create_task(controller._endpoint(
+            controller.workspace, controller._last_frame, b"\0\0" * 320,
+        ))
+        controller._endpoint_task = task
+        await task
+
+        assert controller.output.playback_hold_active is True
+        assert frozen == []
 
     asyncio.run(scenario())

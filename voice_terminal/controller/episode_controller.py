@@ -1340,6 +1340,8 @@ class EpisodeController(RealtimeController):
         # Input cleanup never blocks/cancels the independently owned output.
         ws = self.workspace
         if reason != "completed":
+            self._cancel_tts_hold_fallback()
+        if reason != "completed":
             await self._cancel_tts_prewarm(ws.turn_id if ws else None)
         if record and ws and ws.turn_id not in self._input_history_committed:
             await self._ensure_workspace_episode(ws)
@@ -1400,12 +1402,14 @@ class EpisodeController(RealtimeController):
         self.output.playback_started(key)
 
     async def _handle_asr_disconnect(self):
+        self._cancel_tts_hold_fallback()
         await self.episode.speech_activity(None, interrupt_reason="input_unavailable")
         self.output.cancel_all("input_unavailable")
         await super()._handle_asr_disconnect()
 
     async def _error(self, code, message, *, recoverable, turn_id=None):
         if not recoverable or code == "AUDIO_PIPELINE_FAILED":
+            self._cancel_tts_hold_fallback()
             await self._cancel_wake_preparation()
             if self.workspace is not None:
                 await self._cancel_turn(reason="failed", record=True)
@@ -1422,6 +1426,7 @@ class EpisodeController(RealtimeController):
         so closing the episode here would incorrectly cancel that response.
         Full output teardown remains owned by reset/close/error paths.
         """
+        self._cancel_tts_hold_fallback()
         await self._cancel_early_silence()
         self.state.listening = False
         if self.workspace is not None:
@@ -1455,6 +1460,7 @@ class EpisodeController(RealtimeController):
 
     async def _reset_session_state(self):
         """在音频准入暂停期间完成会话及输入边界清理。"""
+        self._cancel_tts_hold_fallback()
         self._ensure_speaker_policy()
         self._activation_generation = getattr(self, "_activation_generation", 0) + 1
         await self._cancel_wake_preparation()
@@ -1496,6 +1502,7 @@ class EpisodeController(RealtimeController):
 
     async def close(self):
         self._input_resetting = True  # 关闭期间不允许建立新的用户输入。
+        self._cancel_tts_hold_fallback()
         self._ensure_speaker_policy()
         self._activation_generation = getattr(self, "_activation_generation", 0) + 1
         await self._cancel_wake_preparation()

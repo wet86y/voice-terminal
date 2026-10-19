@@ -705,8 +705,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         await h.production_ready.wait()
         await self._run(h)
 
-    def release_held(self):
-        """Grant playback to the latest candidate after local endpointing."""
+    def release_held(self, *, reason: str = "explicit"):
+        """Grant playback to the latest candidate; reason（放行原因）is recorded with TTS_RELEASED（待播语音放行事件）。"""
         self._playback_hold = False
         self._playback_release.set()
         candidates = ([self.handle] if self.handle else []) + list(self._pending)
@@ -734,7 +734,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                     h.workspace.timings.setdefault("playback_hold_released", released_at)
                     self._schedule_output_event(
                         h, "TTS_RELEASED", "tts_hold_released",
-                        reason="user_speech_ended",
+                        reason=reason,
                         hold_ms=round((released_at - hold_started) * 1000),
                     )
                 h.state = "READY"
