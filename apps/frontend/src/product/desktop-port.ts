@@ -118,6 +118,8 @@ export interface DesktopPort {
   exportLogs(): Promise<string | null>;
   /** openConsole（打开控制台）：由 Host（应用宿主）校验并在默认浏览器打开 DSH（代理执行宿主）；url（短期令牌地址）。 */
   openConsole(url: string): Promise<void>
+  /** openMinimaxVoiceLibrary（打开 MiniMax 音色库）：只打开固定的官方音色管理页面。 */
+  openMinimaxVoiceLibrary(): Promise<void>
   /** exit（退出）：由桌面宿主关闭应用。 */
   exit(): Promise<void>;
   /** publishFloatingModel（发布悬浮窗视图）：仅向本实例的浮窗发送限量动效数据。 */
@@ -248,6 +250,7 @@ export function desktopPort(): DesktopPort {
     focus: () => call('focus_main'),
     exportLogs: () => call('export_logs'),
     openConsole: url => call('open_console', { url }),
+    openMinimaxVoiceLibrary: () => call('open_minimax_voice_library'),
     exit: () => call('exit_application'),
     publishFloatingModel: model => call('publish_floating_model', { model }),
     getFloatingModel: () => call<FloatingWindowModel>('get_floating_model'),

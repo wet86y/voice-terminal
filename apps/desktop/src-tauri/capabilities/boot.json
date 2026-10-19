@@ -39,6 +39,7 @@
     "allow-app-update-download",
     "allow-app-update-cancel",
     "allow-project-open-repository",
+    "allow-open-minimax-voice-library",
     "allow-resource-import",
     "allow-resource-import-confirm",
     "allow-resource-open-source",
