@@ -29,6 +29,7 @@ smart_turn:
   analysis_url: ws://127.0.0.1:8767/analysis
   smart_timeout_ms: 300
   hard_silence_ms: 1400
+  tts_hold_fallback_ms: 2000 # tts_hold_fallback_ms（SmartTurn 未结束时待播 TTS 队列的兜底释放时限，毫秒）。
   max_turn_ms: 60000
 shadow_agent:
   # Session-scoped single Shadow Agent. The voice model can only wake it;

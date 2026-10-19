@@ -310,7 +310,8 @@ def test_passive_speech_activity_keeps_llm_state_alive():
 
             await runtime.speech_activity(False)
             assert runtime.user_speaking is False
-            assert output.released == 1
+            # 静默只更新用户活动状态；SmartTurn/超时路径单独授权播放。
+            assert output.released == 0
             assert not request.cancelled()
         finally:
             if runtime.voice_activation_task and not runtime.voice_activation_task.done():

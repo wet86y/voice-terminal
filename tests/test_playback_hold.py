@@ -177,3 +177,81 @@ def test_cancelled_held_reply_is_not_revived_by_late_input_end():
         assert controller.player.buffered_ms == 0
         assert handle.reason == "reset"
     asyncio.run(scenario())
+
+
+def test_vad_silence_fallback_releases_held_tts_with_timeout_reason():
+    async def scenario():
+        controller, output, handle = make_held_output("off")
+        controller._background = set()
+        controller._tts_hold_fallback_task = None
+        controller._tts_hold_fallback_generation = 0
+        controller.options = InputOptions(tts_hold_fallback_ms=20)
+        controller.episode = object()
+        controller._track = lambda task: task.add_done_callback(controller._background.discard)
+        releases = []
+        output._schedule_output_event = lambda _h, kind, _trace, **payload: releases.append((kind, payload))
+        output.hold_unplayed()
+
+        controller._start_tts_hold_fallback()
+        fallback = controller._tts_hold_fallback_task
+        await asyncio.sleep(0)
+        assert output.playback_hold_active is True
+        await fallback
+
+        released = [(kind, payload) for kind, payload in releases if kind == "TTS_RELEASED"]
+        assert len(released) == 1
+        assert released[0][1]["reason"] == "vad_silence_timeout"
+        assert output.playback_hold_active is False
+        handle.task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_explicit_tts_release_records_the_smart_turn_reason():
+    async def scenario():
+        controller, output, handle = make_held_output("off")
+        events = []
+        output._schedule_output_event = lambda _h, kind, *_args, **payload: events.append((kind, payload))
+        output.hold_unplayed()
+
+        assert output.release_held(reason="smart_turn") == handle.speech_id
+        released = [(kind, payload) for kind, payload in events if kind == "TTS_RELEASED"]
+        assert len(released) == 1
+        assert released[0][1]["reason"] == "smart_turn"
+        handle.task.cancel()
+        await asyncio.gather(handle.task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_resumed_speech_cancels_old_fallback_and_new_silence_gets_fresh_deadline():
+    async def scenario():
+        controller, output, handle = make_held_output("off")
+        controller._background = set()
+        controller._tts_hold_fallback_task = None
+        controller._tts_hold_fallback_generation = 0
+        controller.options = InputOptions(tts_hold_fallback_ms=25)
+        controller.episode = object()
+        controller._track = lambda task: task.add_done_callback(controller._background.discard)
+        releases = []
+        output._schedule_output_event = lambda _h, kind, _trace, **payload: releases.append((kind, payload))
+        output.hold_unplayed()
+
+        controller._start_tts_hold_fallback()
+        first = controller._tts_hold_fallback_task
+        await asyncio.sleep(0.005)
+        controller._cancel_tts_hold_fallback()  # 用户重新开口。
+        await asyncio.gather(first, return_exceptions=True)
+        await asyncio.sleep(0.03)
+        assert output.playback_hold_active is True
+        assert not any(kind == "TTS_RELEASED" for kind, _ in releases)
+
+        controller._start_tts_hold_fallback()  # 下一次 VAD 静默重新计时。
+        second = controller._tts_hold_fallback_task
+        await second
+        released = [(kind, payload) for kind, payload in releases if kind == "TTS_RELEASED"]
+        assert len(released) == 1
+        assert released[0][1]["reason"] == "vad_silence_timeout"
+        handle.task.cancel()
+
+    asyncio.run(scenario())

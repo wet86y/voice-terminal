@@ -16,6 +16,7 @@ class InputOptions:
     recheck_ms: int = 200
     smart_timeout_ms: int = 300
     hard_silence_ms: int = 1400
+    tts_hold_fallback_ms: int = 2000  # 待播 TTS 队列在 VAD 静默后等待 SmartTurn 的兜底释放时限，毫秒。
     refine_timeout_ms: int = 3000
     min_segment_chars: int = 6
     max_segment_chars: int = 20
@@ -43,7 +44,7 @@ class InputOptions:
             if key in values and not isinstance(values[key], bool):
                 raise ValueError(f"smart_turn.{key} must be boolean")
         result = cls(**values)
-        for key in ("candidate_ms", "recheck_ms", "smart_timeout_ms", "hard_silence_ms", "refine_timeout_ms",
+        for key in ("candidate_ms", "recheck_ms", "smart_timeout_ms", "hard_silence_ms", "tts_hold_fallback_ms", "refine_timeout_ms",
                     "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms",
                     "tts_local_buffer_ms"):
             value = getattr(result, key)
