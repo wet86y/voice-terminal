@@ -55,7 +55,7 @@ def digest(value: object) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="deepseek-chat")
+    parser.add_argument("--model", default="deepseek-flash", help="model（请求模型名称）")
     parser.add_argument("--base-url", default="https://api.deepseek.com")
     parser.add_argument("--dynamic-instructions", action="store_true",
                         help="counterexample: put the changing clock into instructions")

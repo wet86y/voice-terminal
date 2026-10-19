@@ -16,6 +16,12 @@ llm:
 
 当前生产请求使用 Responses + strict `json_schema`。兼容 schema 名称 `voice_decision_v06` 只用于本地决策 envelope 和冻结测试，不表示版本号。
 
+### DeepSeek 请求模型名
+
+DeepSeek 默认 profile（供应商配置档案）的 `llm.model`（LLM 请求模型名字段）使用 `deepseek-flash`。官方 2026-10-17 更新说明，该名称当前调用 DeepSeek-V4.1-Flash-1017，调用方式与价格保持不变。已过期的 `deepseek-chat`（旧模型别名）和 `deepseek-reasoner`（旧推理模型别名）不应再用于新配置；旧名 `deepseek-v4-flash`（旧 Flash 模型别名）虽暂时兼容转发，新的配置仍应统一使用 `deepseek-flash`。
+
+参考：[DeepSeek API 更新日志（官方）](https://api-docs.deepseek.com/zh-cn/updates/)；[DeepSeek API 调用指南（官方）](https://api-docs.deepseek.com/api/responses)。
+
 可选的 OpenCode Go 调试 profile：
 
 ```powershell
