@@ -28,7 +28,8 @@ class SpeechContinuationMixin:
         runtime = self.runtime
         if getattr(runtime, "closed", False) or runtime.gate(h.identity):
             return False
-        return getattr(runtime, "last_turn_id", h.turn_id) in {None, h.turn_id}
+        # 用户换轮不撤销当前事务；取消、会话关闭和输出代次变化仍撤销续写。
+        return True
 
     def _continuation_alive(self, h):
         """已受理工作或在途权限仍有待结算时保留锚；实际播放结束才开始计时。"""

@@ -562,7 +562,7 @@ def test_controller_revision_confirms_boundary_and_emits_authoritative_text():
         assert handle.text == "前缀旧尾巴" and not events
         frozen = dict(output.speak_snapshot)
         assert await output.rewrite_unsent(
-            handle.identity, handle.turn_id, speech_id=handle.speech_id,
+            (handle.identity[0], "followup-request"), "followup-turn", speech_id=handle.speech_id,
             text="改正", expected_generation=0, expected_sent_chars=frozen["sent_chars"],
             expected_text=frozen["text"]) is handle
         assert handle.text == "前缀旧改正"
@@ -571,11 +571,21 @@ def test_controller_revision_confirms_boundary_and_emits_authoritative_text():
         assert events[0][0] == "speech.tail_rewritten"
         assert events[0][1]["text"] == handle.text
         assert events[0][1]["text_revision"] == 1
+        assert events[0][1]["turn_id"] == handle.turn_id
+        assert events[0][1]["revision_source_turn_id"] == "followup-turn"
+        assert events[0][1]["revision_request_id"] == "followup-request"
         # 相同提交前缀也不能接受针对旧版本生成的第二次修订。
         assert await output.rewrite_unsent(
             handle.identity, handle.turn_id, speech_id=handle.speech_id,
             text="再次修改", expected_generation=0, expected_sent_chars=frozen["sent_chars"],
             expected_text=handle.text, expected_text_revision=0) is None
+        # 同一旧事务的快照即使仍吻合，也不能跨过真正的输出代次撤销。
+        output.generation += 1
+        assert await output.rewrite_unsent(
+            handle.identity, "another-turn", speech_id=handle.speech_id,
+            text="过期结果", expected_generation=0, expected_sent_chars=handle.sent_chars,
+            expected_text=handle.text, expected_text_revision=1) is None
+        assert handle.text == "前缀旧改正"
     asyncio.run(scenario())
 
 

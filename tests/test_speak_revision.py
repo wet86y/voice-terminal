@@ -535,7 +535,7 @@ def test_revision_rejects_changed_request_boundary_without_any_fallback():
     asyncio.run(scenario())
 
 
-def test_revision_rejects_a_different_turn_and_failed_final_confirmation():
+def test_revision_accepts_a_different_turn_but_rejects_failed_final_confirmation():
     async def scenario():
         output = _Output({
             "queue_status": "speaking", "speech_id": "live",
@@ -547,12 +547,49 @@ def test_revision_rejects_a_different_turn_and_failed_final_confirmation():
         output.speak_snapshot["conversation_id"] = identity[0]
         envelope = DecisionEnvelope(SpeechDecision("revision", "calm", "新尾巴"), ())
         await runtime._apply_decision_v06(identity, "turn-b", envelope)
-        assert output.calls == []
+        assert output.calls == [("rewrite", "live", "新尾巴")]
+        assert runtime.current_action == "speak"
+        output.calls.clear()
         output.rewrite_unavailable = True
         await runtime._apply_decision_v06(identity, "turn-a", envelope)
         assert output.calls == [("rewrite", "live", "新尾巴")]
         assert runtime.current_action == "wait"
         assert output.feeds == []
+    asyncio.run(scenario())
+
+
+def test_previous_turn_revision_permission_depends_on_transaction_not_turn():
+    snapshot = {
+        "queue_status": "speaking", "speech_id": "live",
+        "conversation_id": "conversation", "turn_id": "turn-a",
+        "text": "已锁定旧尾巴", "sent_chars": 3, "rewritable": True,
+    }
+    state = AgentEpisodeRuntime._model_speak_state(
+        snapshot, conversation_id="conversation", turn_id="turn-b",
+    )
+    assert state["owner_scope"] == "previous_turn"
+    assert state["continuation_mode"] == "rewrite_tail"
+    assert state["text_parts"]["revisable_tail"] == "旧尾巴"
+    other = AgentEpisodeRuntime._model_speak_state(
+        snapshot, conversation_id="other", turn_id="turn-b",
+    )
+    assert other["continuation_mode"] == "none"
+
+
+def test_cross_turn_revision_still_rejects_a_different_conversation():
+    async def scenario():
+        output = _Output({
+            "queue_status": "speaking", "speech_id": "live",
+            "conversation_id": "other", "turn_id": "turn-a",
+            "text": "旧尾巴", "sent_chars": 0, "rewritable": True,
+        })
+        runtime, identity = _runtime(output)
+        result = await runtime._apply_revision_tail(
+            identity, "turn-b", dict(output.speak_snapshot), "新尾巴", emotion="calm",
+        )
+        assert result is None
+        assert output.calls == []
+        assert runtime.minor_protocol_feedback[-1]["reason"] == "no_owned_transaction"
     asyncio.run(scenario())
 
 

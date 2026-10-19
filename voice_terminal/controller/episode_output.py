@@ -79,6 +79,8 @@ class SpeechHandle:
         self.admission = None
         self.continuation_tail = ""  # continuation_tail（发送结束后等待接播的新尾巴）。
         self.continuation_identity = None  # continuation_identity（最近一次有效修订请求）。
+        self.revision_source_turn_id = None  # revision_source_turn_id（最近修订来源轮次）。
+        self.revision_request_id = None  # revision_request_id（最近修订来源请求）。
         self.continuation_base = ""  # continuation_base（本次窗口已实际播放的完整前缀）。
         self.continuation_deadline = None  # continuation_deadline（实际播放完成后的窗口截止时间）。
         self.continuation_tickets = set()  # continuation_tickets（已获得续写权限的推理票据）。
@@ -519,6 +521,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         if _continuation_parent is not None:
             # 接播严格晚于旧段结算；普通替换的旧段可能还在异步结算，不能提前冻结。
             h.delivered_prefix = _continuation_parent.continuation_base
+            h.revision_source_turn_id = _continuation_parent.revision_source_turn_id
+            h.revision_request_id = _continuation_parent.revision_request_id
         h.envelope_validated = getattr(self.runtime, "_validated_envelope_identity", None) == identity
         if hasattr(self.tts, "bind"):
             if _continuation_parent is None:
@@ -1185,6 +1189,9 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                         "latency": {**settled_latency,
                                      "queue_to_playback_ms": round((timings["playback"] - h.queued_at) * 1000)
                                      if "playback" in timings else None}}
+            if h.revision_source_turn_id is not None:
+                record["revision_source_turn_id"] = h.revision_source_turn_id  # 最近修订来源轮次。
+                record["revision_request_id"] = h.revision_request_id  # 最近修订来源请求。
             self.last_completed_speech = {
                 "speech_id": h.speech_id,
                 "conversation_id": h.identity[0],

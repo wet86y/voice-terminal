@@ -493,7 +493,8 @@ class EpisodeController(RealtimeController):
             added = self.history.commit_delivery(
                 speech_id, str(payload.get("text") or ""), delivery,
                 metadata={key: payload.get(key) for key in (
-                    "conversation_id", "request_id", "turn_id", "owner_scope", "kind", "envelope_validated")},
+                    "conversation_id", "request_id", "turn_id", "owner_scope", "kind", "envelope_validated",
+                    "revision_source_turn_id", "revision_request_id")},  # 修订来源与原播报归属分别持久化。
             )
             # Every settled transaction becomes one conversation line — also a
             # failed or interrupted one, whose status is what the user needs to
