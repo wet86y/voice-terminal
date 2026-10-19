@@ -131,15 +131,25 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 `schedule_*`（后台会话任务工具）。使用现有回执确认任务状态；任务到期需要提醒用户时，
 由 `publish_voice_event`（投递语音事件）发送回语音链路。不得重复创建任务或用等待、口头答应代替任务操作。
 
-公共提示词与 DSH 专属规则由构建脚本按这个顺序生成唯一受管提示词：
+公共提示词与 DSH 专属规则由构建脚本按这个顺序生成唯一受管桥接指令：
 `config/shadow_agent/instructions.md`（公共规则）后接 `config/dsh/shadow-agent.rules.md`（DSH 规则）。
-保持 `shadow_prompt_sha256`（后台提示词摘要）纳入构建状态核验；只修改源码规则后必须重建插件、
-运行 DSH（后台执行宿主）验证并安装，再按项目维护流程重启 Voice Server（语音服务）和 DSH（后台执行宿主）。
-通过这些步骤后新会话使用新提示词；已经开始的语音会话继续使用它原有的冻结提示词。
+这条桥接指令与根代理系统提示（system prompt，系统提示）是不同路径；根代理的人设由
+`integrations/dsh/voice-terminal/preset/shadow-agent/agent.cordis.yml`（影子代理预设配置文件）维护。
+当前 `persona`（人设）启用了 `complete: true`（完整人设模式），只有渲染后的 `prefix`（系统提示前缀）
+作为该人设的系统提示；`suffix`（系统提示后缀）和其他提示词区块不会合并进去。项目 DSH 使用
+`.local/data/dsh`（项目 DSH 数据目录）作为 `DSH_HOME`（DSH 数据目录）；用户目录中的
+`AGENTS.md`（代理指令文件）不能代替这个预设的人设系统提示，稳定控制该预设语言时应直接维护 `persona.prefix`。
+
+要让后台推理（reasoning，推理）及思考流（thinking stream，思考输出）使用简体中文，应将规则写入该预设的
+`persona.prefix`（人设系统提示前缀），要求直接用中文生成，不要先用英文展开再翻译，并保留代码、命令、路径、
+配置项、标识符和错误原文。`shadow_prompt_sha256`（后台桥接指令摘要）覆盖受管桥接指令；预设修改由预设源码
+新鲜度及运行产物摘要核验。修改受管规则或预设后都必须重建插件、运行 DSH（后台执行宿主）验证并安装，
+再按项目维护流程重启 Voice Server（语音服务）和 DSH（后台执行宿主）。通过这些步骤后新会话使用新配置；
+已经开始的语音会话继续使用它原有的冻结提示词。
 
 `build-state.json`（构建记录）格式更新为 `schema_version: 6`（格式版本），记录 `plugin_bundle_version`（统一插件版本）、`plugin_runtime_artifacts_sha256`（运行产物摘要）、`plugin_build_inputs_sha256`（构建输入摘要）、`shadow_prompt_sha256`（提示词摘要）及宿主身份。源码新鲜度检查覆盖全部组件源码、预设、清单、声明、构建和检查脚本、宿主补丁及两套类型配置；运行摘要覆盖包清单、生成补丁、组件声明和完整编译目录，包括源码映射。文档与测试不参与运行新鲜度判断。
 
-公共提示词仍由 `config/shadow_agent/instructions.md`（公共指令）与 `config/dsh/shadow-agent.rules.md`（DSH 专属规则）按原顺序连接生成，不维护另一份手写运行提示词。新增运行文件必须进入编译目录或显式加入构建输入和运行摘要；PowerShell（安装脚本）、Python（运行校验）及 Node.js（诊断脚本）三处摘要算法必须一致。
+公共桥接指令仍由 `config/shadow_agent/instructions.md`（公共指令）与 `config/dsh/shadow-agent.rules.md`（DSH 专属规则）按原顺序生成，不要复制出第二份受管桥接指令。`persona.prefix`（人设系统提示前缀）是项目预设的系统提示配置，按预设源码及运行产物摘要跟踪。新增运行文件必须进入编译目录或显式加入构建输入和运行摘要；PowerShell（安装脚本）、Python（运行校验）及 Node.js（诊断脚本）三处摘要算法必须一致。
 
 ## 维护完成标准
 
