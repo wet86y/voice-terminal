@@ -52,12 +52,12 @@ const instructionRows = computed(() => props.scene === 'empty' ? [] : instructio
 const loading = computed(() => props.scene === 'loading')
 const updatePreview = computed<AppUpdateStatus>(() => ({
   state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
-  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.3',
+  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.4',
   release_notes: props.scene === 'empty' ? null : [
-    'Voice Terminal（语音终端）v0.9.3', '',
-    '下载与安装', '• 改善首次安装组件的下载体验，优先使用国内镜像，失败时自动尝试原站。',
-    '• 保留已有设置、用户数据、模型和运行环境。', '',
-    '更新体验', '• 优化应用更新页面和下载进度展示。', '• 修复旧版程序交给分发器更新时的编号兼容问题。',
+    'Voice Terminal（语音终端）v0.9.4', '',
+    '音色试听', '• 用户主动试听不再受被动静默时段阻塞。', '• 普通助手播报继续遵循静默策略。', '',
+    '语音与对话', '• 改善在线音色选择与试听，修正本地音色样音播放。', '• SmartTurn 判定说完后及时放行待播语音。',
+    '• 改善跨轮次人格修订、热词入口及截图消费。',
     ...(props.scene === 'long' ? Array.from({ length: 12 }, () => `• ${longText}`) : []),
   ].join('\n'),
   completed_bytes: 43 * 1024 ** 2, total_bytes: 107 * 1024 ** 2,
