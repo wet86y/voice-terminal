@@ -15,6 +15,9 @@ from pathlib import Path
 from uuid import uuid4
 
 
+SCREEN_CAPTURE_UNCONSUMED_TTL_SECONDS = 5.0  # 未消费截图最长保留时间（秒）。
+
+
 @dataclass(frozen=True)
 class ScreenCaptureConfig:
     enabled: bool = True  # enabled（按需截屏开关）。
@@ -251,6 +254,9 @@ class ScreenCaptureService:
         self.capture = capture or capture_windows
         self.generation = 0  # generation（配置及生命周期代次）。
         self._native_busy = threading.Lock()
+        self._lease_lock = threading.Lock()  # _lease_lock（待消费状态的并发保护锁）。
+        self._unconsumed_captures = {}  # _unconsumed_captures（按来源及范围保存的未消费图片包和截止时刻）。
+        self._lease_generations = {}  # _lease_generations（按来源及范围记录的失效代次）。
         from concurrent.futures import ThreadPoolExecutor
         def initialize():
             # COM（系统组件对象接口）在固定捕获线程初始化，兼容库已在其他线程导入。
@@ -266,27 +272,113 @@ class ScreenCaptureService:
     def configure(self, config):
         self.config = config
         if not config.enabled:
-            self.generation += 1
+            self.invalidate()
 
     def close(self):
         self.invalidate()
         self._executor.shutdown(wait=False, cancel_futures=False)
 
-    def invalidate(self):
-        self.generation += 1
+    @staticmethod
+    def _lease_key(source, scope):
+        """_lease_key（未消费状态键）：source（来源）与 scope（会话或激活范围）。"""
+        if source is None:
+            return None
+        if source not in {"llm", "dsh"}:
+            raise ValueError("截图来源必须是 llm（语音主模型）或 dsh（桌面后台代理）")
+        if not isinstance(scope, str) or not scope:
+            raise ValueError("截图来源范围不能为空")
+        return source, scope
 
-    async def grab(self):
+    def _purge_expired_leases_locked(self, now):
+        """_purge_expired_leases_locked（清理过期租约）：调用方持有租约锁。"""
+        for key, lease in tuple(self._unconsumed_captures.items()):
+            if now >= lease["expires_at"]:
+                self._unconsumed_captures.pop(key, None)
+
+    def _unconsumed_packet(self, key):
+        """_unconsumed_packet（读取未消费图片）：过期图片不会复用。"""
+        if key is None:
+            return None
+        now = time.monotonic()
+        with self._lease_lock:
+            self._purge_expired_leases_locked(now)
+            lease = self._unconsumed_captures.get(key)
+            return lease["packet"] if lease is not None else None
+
+    def _lease_generation(self, key):
+        if key is None:
+            return None
+        with self._lease_lock:
+            return self._lease_generations.setdefault(key, 0)
+
+    def lease_generation(self, source, scope):
+        """lease_generation（读取来源范围失效代次）：用于拒绝已失效的在途结果。"""
+        return self._lease_generation(self._lease_key(source, scope))
+
+    def _remember_unconsumed(self, key, packet, generation, lease_generation):
+        """_remember_unconsumed（登记待消费图片）：捕获完成后开始 5 秒兜底时限。"""
+        if key is None:
+            return
+        with self._lease_lock:
+            if generation != self.generation or lease_generation != self._lease_generations.get(key, 0):
+                return
+            now = time.monotonic()
+            self._purge_expired_leases_locked(now)
+            self._unconsumed_captures[key] = {
+                "packet": packet,  # packet（图片包）。
+                "expires_at": now + SCREEN_CAPTURE_UNCONSUMED_TTL_SECONDS,  # expires_at（单调时钟截止时刻）。
+            }
+
+    def consume(self, source, scope, capture_id):
+        """consume（标记已消费）：仅释放匹配来源、范围及 capture_id（截图标识）的图片。"""
+        key = self._lease_key(source, scope)
+        now = time.monotonic()
+        with self._lease_lock:
+            self._purge_expired_leases_locked(now)
+            lease = self._unconsumed_captures.get(key)
+            if lease is None or lease["packet"].get("capture_id") != capture_id:
+                return False
+            self._unconsumed_captures.pop(key, None)
+            return True
+
+    def invalidate(self, *, source=None, scope=None):
+        """invalidate（使捕获状态失效）：来源范围清理不会影响其他来源。"""
+        with self._lease_lock:
+            if source is None:
+                self.generation += 1
+                self._unconsumed_captures.clear()
+                self._lease_generations.clear()
+            elif scope is None:
+                keys = set(self._lease_generations) | set(self._unconsumed_captures)
+                for key in keys:
+                    if key[0] == source:
+                        self._lease_generations[key] = self._lease_generations.get(key, 0) + 1
+                        self._unconsumed_captures.pop(key, None)
+            else:
+                key = self._lease_key(source, scope)
+                self._lease_generations[key] = self._lease_generations.get(key, 0) + 1
+                self._unconsumed_captures.pop(key, None)
+
+    async def grab(self, *, source=None, scope=None):
+        """grab（捕获或复用图片）：source（来源）独立维护未消费租约。"""
         if not self.available:
             raise RuntimeError("屏幕捕获当前不可用")
+        lease_key = self._lease_key(source, scope)
+        pending = self._unconsumed_packet(lease_key)
+        if pending is not None:
+            return pending
         if not self._native_busy.acquire(blocking=False):
             raise RuntimeError("上一次屏幕捕获尚未结束")
         config = self.config
+        generation = self.generation
+        lease_generation = self._lease_generation(lease_key)  # lease_generation（本来源范围的失效代次）。
         def work():
             started = time.monotonic()
             try:
                 packet = self.capture(config)
                 # elapsed_ms（捕获编码耗时）；日志仅含尺寸、字节数和摘要，绝不输出编码。
                 packet["elapsed_ms"] = round((time.monotonic() - started) * 1000, 2)
+                self._remember_unconsumed(lease_key, packet, generation, lease_generation)
                 logging.getLogger(__name__).info("screen_capture（屏幕捕获） elapsed_ms=%s images=%s",
                     packet["elapsed_ms"], [{key: item[key] for key in ("role", "width", "height", "bytes", "sha256")}
                                            for item in packet.get("attachments", [])])

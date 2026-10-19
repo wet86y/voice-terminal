@@ -385,8 +385,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if not service.available:
             raise HTTPException(status_code=503, detail="屏幕捕获组件当前不可用。")
         generation = service.generation
+        lease_generation = service.lease_generation("dsh", activation_id)
         try:
-            packet = await service.grab()
+            packet = await service.grab(source="dsh", scope=activation_id)
         except asyncio.TimeoutError as exc:
             raise HTTPException(status_code=504, detail="屏幕捕获超过 3 秒时限。") from exc
         except RuntimeError as exc:
@@ -394,14 +395,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=status, detail="屏幕捕获暂不可用：" + str(exc)[:200]) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail="屏幕捕获失败：" + str(exc)[:200]) from exc
-        if generation != service.generation or not service.config.enabled:
+        if (generation != service.generation or not service.config.enabled
+                or lease_generation != service.lease_generation("dsh", activation_id)):
             raise HTTPException(status_code=409, detail="捕获期间屏幕图像设置已变化，本次图片已作废。")
         if session.activation_id != activation_id:
             raise HTTPException(status_code=409, detail="捕获期间 DSH 激活已结束，本次图片已作废。")
-        return JSONResponse(
+        response = JSONResponse(
             {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", "capture": packet},
             headers={"Cache-Control": "no-store"},
         )
+        service.consume("dsh", activation_id, packet["capture_id"])
+        return response
 
     @app.post("/api/internal/dsh-bridge/input.early-silence")
     async def dsh_early_silence(request: Request) -> JSONResponse:
