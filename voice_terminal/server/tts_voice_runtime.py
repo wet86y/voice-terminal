@@ -120,6 +120,16 @@ class TtsVoiceOperationManager:
             "model": model, "voice_id": voice_id.strip(), "text": text.strip(),
         }, self._minimax_preview, require_library=False)
 
+    @staticmethod
+    def _allow_user_initiated_playback(player, key: str) -> None:
+        """allow_user_initiated_playback（允许用户主动播放）：只豁免本次试听或样音播放。"""
+        allow_user_initiated = getattr(player, "allow_user_initiated", None)
+        if callable(allow_user_initiated):
+            allow_user_initiated(key)
+        else:
+            # 兼容只实现旧 allow(key) 接口的播放器替身（测试/嵌入环境）。
+            player.allow(key)
+
     async def _minimax_preview(self, operation):
         config = self.runtime.config.tts
         player = getattr(self.runtime, "player", None)
@@ -189,7 +199,7 @@ class TtsVoiceOperationManager:
             else:
                 pcm = mono.astype("<i2", copy=False).tobytes()
             duration = len(pcm) / max(1, int(player.sample_rate) * int(player.channels) * 2)
-            player.allow(operation.id)
+            self._allow_user_initiated_playback(player, operation.id)
             player_allowed = True
             player.enqueue(operation.id, pcm)
             await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
@@ -367,7 +377,7 @@ class TtsVoiceOperationManager:
         pcm = mono.astype("<i2", copy=False).tobytes()
         if player.channels == 2:
             pcm = np.repeat(mono.reshape(-1, 1), 2, axis=1).astype("<i2", copy=False).tobytes()
-        player.allow(operation.id)
+        self._allow_user_initiated_playback(player, operation.id)
         player.enqueue(operation.id, pcm)
         duration = len(pcm) / (player.sample_rate * player.channels * 2)
         try:

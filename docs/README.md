@@ -62,6 +62,7 @@
 - [0.9.1 应用更新交接与重新发行验收](testing/app-update-handoff-20261018.md)
 - [0.9.2 构建、本机安装与公开发行验收](testing/release-0.9.2-20261018.md)
 - [0.9.3 构建、本机安装与公开发行验收](testing/release-0.9.3-20261019.md)
+- [0.9.4 构建、本机安装与公开发行验收](testing/release-0.9.4-20261020.md)
 - [GitHub 节点测速择优与四路下载接入验证](testing/github-node-selection-20261019.md)
 - [关于页、工作区迁移与更新加速验证](testing/about-workspace-acceleration-20261019.md)
 - [0.9.2 一代 TTS 播放失败调查与修复验证](testing/tts-v1-playback-investigation-20261018.md)
@@ -83,6 +84,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.4 语音音色试听、对话与影子执行修复](releases/v0.9.4.md)
 - [v0.9.1 下载改进与应用更新修订](releases/v0.9.1.md)
 - [v0.9.2 日志导出、感知延迟与语音合成修复](releases/v0.9.2.md)
 - [v0.9.3 关于页、工作区迁移与下载加速](releases/v0.9.3.md)

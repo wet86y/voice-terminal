@@ -73,6 +73,7 @@ class PcmPlayer:
         self.playback_permission = playback_permission  # playback_permission（播放器出口策略）。
         self.on_policy_blocked = on_policy_blocked  # on_policy_blocked（被策略阻止时通知事务所有者）。
         self._policy_blocked_key: str | None = None
+        self._user_initiated_key: str | None = None  # user_initiated_key（用户主动播放键）：仅豁免对应的单次试听/样音播放。
         self.device_latency_ms = max(0, int(device_latency_ms))
         # The callback can consume only part of a TTS chunk.  A queue.Queue
         # cannot put that remainder at the front, so using it directly would
@@ -138,11 +139,20 @@ class PcmPlayer:
             }
 
     def allow(self, key: str) -> None:
+        self._allow(key, user_initiated=False)
+
+    def allow_user_initiated(self, key: str) -> None:
+        """allow_user_initiated（允许用户主动播放）：只为指定试听任务豁免被动静默策略。"""
+        self._allow(key, user_initiated=True)
+
+    def _allow(self, key: str, *, user_initiated: bool) -> None:
         with self._queue_lock:
             self._render_points.clear()
             self._clear_unlocked()
             self._gated = True
             self._allowed_key = key
+            if user_initiated:
+                self._user_initiated_key = key
 
     def hold(self, key: str) -> bool:
         """Atomically pause an unstarted playback generation without clearing it.
@@ -437,7 +447,11 @@ class PcmPlayer:
         first_rendered_turn: str | None = None
         queue_to_submit_ms = 0.0  # 首块入队到设备提交毫秒。
         blocked_key: str | None = None
-        permitted = self.playback_permission is None or self.playback_permission()
+        with self._queue_lock:
+            policy_key = self._active_turn
+            user_initiated = policy_key is not None and self._user_initiated_key == policy_key
+        permitted = (user_initiated or self.playback_permission is None
+                     or self.playback_permission())
 
         if _status:
             status_text = str(_status)
@@ -447,15 +461,18 @@ class PcmPlayer:
                     logger.warning("audio.player_callback_status status=%s", status_text)
 
         with self._queue_lock:
-            if not permitted and self._active_turn is not None and self._policy_blocked_key != self._active_turn:
+            same_turn = self._active_turn == policy_key
+            if (same_turn and not user_initiated and not permitted and policy_key is not None
+                    and self._policy_blocked_key != policy_key):
                 self._policy_blocked_key = self._active_turn
                 blocked_key = self._active_turn
             callback_at = time.monotonic()
             device_time = getattr(_time, "outputBufferDacTime", None)
             if isinstance(device_time, (int, float)):
                 self._last_device_output_time = float(device_time)
-            can_play = (self._held_key != self._active_turn and self._paused_key != self._active_turn
-                        and self._policy_blocked_key != self._active_turn)
+            can_play = (same_turn and self._held_key != self._active_turn
+                        and self._paused_key != self._active_turn
+                        and (user_initiated or self._policy_blocked_key != self._active_turn))
             if can_play and self._stream_buffer_key == self._active_turn and not self._stream_complete:
                 started = self._started_for_turn == self._active_turn and self._active_turn is not None
                 if self._buffered_bytes < len(target):
@@ -585,12 +602,15 @@ class PcmPlayer:
                 return
             if self._active_turn != turn_id:
                 held_for_key = self._held_key == turn_id
+                user_initiated = self._user_initiated_key == turn_id
                 self._render_points.clear()
                 self._clear_unlocked()
                 self._active_turn = turn_id
                 self._started_for_turn = None
                 if held_for_key:
                     self._held_key = turn_id
+                if user_initiated:
+                    self._user_initiated_key = turn_id
             if not self._render_points:
                 # Establish a zero-output anchor before the first PortAudio
                 # callback.  An interruption can begin after enqueue but
@@ -613,6 +633,8 @@ class PcmPlayer:
 
     def _clear_unlocked(self) -> None:
         self._chunks.clear()
+        self._policy_blocked_key = None
+        self._user_initiated_key = None
         self._first_enqueued_at = None
         self._stream_buffer_key = None
         self._stream_waiting = False
