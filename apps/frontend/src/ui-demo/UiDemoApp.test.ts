@@ -176,7 +176,7 @@ describe('桌面样例回放交互', () => {
     const tabs = wrapper.findAll('.settings-tabs button')
     expect(tabs).toHaveLength(8)
     expect(tabs.map(tab => tab.attributes('aria-label'))).toContain('热词替换')
-    expect(tabs.map(tab => tab.attributes('aria-label'))).toContain('关于与工作区')
+    expect(tabs.map(tab => tab.attributes('aria-label'))).toContain('关于')
     expect(wrapper.get('#local-components-title').text()).toBe('组件设置')
     expect(wrapper.findAll('.local-component-detail')).toHaveLength(0)
     expect(wrapper.get('.local-memory-summary').text()).toContain('2.12 GB')

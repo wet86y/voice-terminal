@@ -7,6 +7,6 @@ export const settingsSections = [
   { id: "speaker", label: "声纹识别", hint: "身份与打断策略", description: "身份识别与打断策略", icon: "♬" },
   { id: "wakes", label: "唤醒任务", hint: "定时与循环提醒", description: "定时唤醒与循环提醒", icon: "◷" },
   { id: "compute", label: "组件设置", hint: "分类配置与运行状态", description: "按用途管理语音、推理与扩展组件", icon: "▦" },
-  { id: "workspace", label: "关于与工作区", hint: "版本与数据位置", description: "应用版本、工作区位置与迁移", icon: "⌂" },
+  { id: "workspace", label: "关于", hint: "应用更新与工作区", description: "应用更新与工作区迁移", icon: "⌂" },
 ] as const;
 export type SettingsSection = (typeof settingsSections)[number]["id"];

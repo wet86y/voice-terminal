@@ -188,12 +188,18 @@ impl DownloadTotals {
     }
     fn transfer(&mut self,file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,phase:&str)->Result<(),String>{
         crate::download::download_with_progress(file,target,cancel,&mut|stage,done,_|{
-            if stage=="下载固定资源"{self.report(progress,phase,done.min(file.size));}
-            else if stage.starts_with("校验"){progress(&format!("下载缓存：{stage}"),done,file.size);}
-            else{progress(stage,0,0);}
+            self.transfer_progress(stage,done,file.size,progress,phase);
         },0)?;
         self.completed_bytes=self.completed_bytes.saturating_add(file.size);self.current_bytes=0;
         self.report(progress,phase,0);Ok(())
+    }
+    fn transfer_progress(&mut self,stage:&str,done:u64,size:u64,progress:&mut Progress,phase:&str){
+        if crate::download::is_transfer_phase(stage){
+            let detail=if stage=="下载固定资源"{phase.to_owned()}else{format!("{phase} · {stage}")};
+            self.report(progress,&detail,done.min(size));
+        }
+        else if stage.starts_with("校验"){progress(&format!("下载缓存：{stage}"),done,size);}
+        else{progress(stage,0,0);}
     }
 }
 fn copy_interpreter(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
@@ -549,6 +555,17 @@ mod tests {
         totals.report(&mut progress,"组装固定运行依赖",0);
         assert_eq!(&samples[..5],&[(60,300),(60,300),(100,300),(150,300),(300,300)]);
         assert_eq!(samples.last(),Some(&(0,0)));
+    }
+
+    #[test]
+    fn accelerated_dependency_transfer_keeps_byte_progress_and_fallback_description(){
+        let mut totals=DownloadTotals{total_bytes:300,completed_bytes:100,..Default::default()};let mut samples=vec![];
+        let mut progress=|phase:&str,done,total|samples.push((phase.to_owned(),done,total));
+        totals.transfer_progress("下载固定资源（四路加速）",60,200,&mut progress,"正在下载固定依赖");
+        totals.transfer_progress("下载固定资源（四路加速失败，已回退单路下载）",20,200,&mut progress,"正在下载固定依赖");
+        totals.transfer_progress("下载固定资源（四路加速失败，已回退单路下载）",150,200,&mut progress,"正在下载固定依赖");
+        assert_eq!(samples.iter().map(|(_,done,total)|(*done,*total)).collect::<Vec<_>>(),vec![(160,300),(160,300),(250,300)]);
+        assert!(samples[0].0.contains("四路加速"));assert!(samples[1].0.contains("已回退单路"));
     }
 
     #[test]

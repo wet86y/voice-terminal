@@ -38,6 +38,7 @@
     "allow-app-update-check",
     "allow-app-update-download",
     "allow-app-update-cancel",
+    "allow-project-open-repository",
     "allow-resource-import",
     "allow-resource-import-confirm",
     "allow-resource-open-source",

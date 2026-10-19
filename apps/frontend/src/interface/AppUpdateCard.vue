@@ -12,6 +12,7 @@ const emit = defineEmits<{
   check: []
   download: []
   cancel: []
+  /** repository（在系统浏览器打开项目仓库）。 */ repository: []
 }>()
 const progress = computed(() => {
   const { completed_bytes: done, total_bytes: total } = props.status
@@ -77,6 +78,7 @@ function formatBytes(value: number | null | undefined) {
       <div class="update-release-heading"><h4 id="update-release-title">本次更新</h4><small v-if="status.total_bytes">安装包 {{ formatBytes(status.total_bytes) }}</small></div>
       <div class="update-release-notes" tabindex="0" role="region" aria-label="发行说明">{{ status.release_notes }}</div>
     </section>
+    <footer class="update-about"><p>作者 <strong>wet86y</strong></p><button class="outline-button update-repository" type="button" @click="emit('repository')">GitHub（项目仓库）<span aria-hidden="true">↗</span></button></footer>
   </section>
 </template>
 
@@ -105,6 +107,9 @@ function formatBytes(value: number | null | undefined) {
 .update-release-heading small{font-size:var(--font-caption);color:var(--subtle)}
 .update-release-notes{max-height:220px;overflow:auto;padding-right:8px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--font-body);line-height:1.8;color:var(--muted)}
 .update-error{margin:0;padding:10px 12px;border-radius:9px;background:#efa0b10a;color:var(--danger);font-size:var(--font-body);line-height:1.6;overflow-wrap:anywhere;white-space:pre-wrap}
+.update-about{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--line);font-size:var(--font-body);color:var(--muted)}
+.update-about strong{margin-left:6px;font-weight:500;color:var(--text)}
+.update-repository{display:flex;align-items:center;gap:8px;min-height:var(--compact-control-height);padding:7px 12px;font-size:var(--font-body)}
 .update-failed{border-color:color-mix(in srgb,var(--danger) 28%,transparent)}
 @media(max-width:560px){.app-update-card{padding:16px;gap:16px}.update-summary{gap:12px}.update-action{width:100%}.update-release-heading{gap:6px}}
 </style>

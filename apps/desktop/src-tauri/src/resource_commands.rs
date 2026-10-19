@@ -1148,9 +1148,10 @@ fn validate_batch_admission(jobs:&HashMap<String,JobControl>,resource:&str,paren
 fn progress_kind(phase:&str)->&'static str{ // progress_kind（阶段投影）：字节只属于当前阶段。
     if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX){"download"}
     else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){"verify"}
+    else if phase.contains("下载固定资源")||phase.contains("正在下载"){"download"}
     else if phase.contains("等待")||phase.contains("来源")||phase.starts_with("一键下载：")||phase.starts_with("自动恢复"){"waiting"}
     else if phase.contains("校验")||phase.contains("核验")||phase.contains("核对"){"verify"}
-    else if phase.contains("下载进度")||phase.contains("下载固定资源")||phase.contains("正在下载"){"download"}
+    else if phase.contains("下载进度"){"download"}
     else{"install"}
 }
 pub(crate) fn retryable_failure(message:&str)->bool{ // retryable_failure（可自动恢复）：取消、永久配置与权限错误停止重试。
@@ -1265,6 +1266,12 @@ pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Des
 
 #[cfg(test)]
 mod service_tests {
+    #[test]
+    fn source_and_speed_details_preserve_transfer_progress_kind(){
+        assert_eq!(super::progress_kind("下载固定资源（四路加速） · 8.20 MiB/秒（兆二进制字节每秒） · 来源：GitHub（代码托管平台）原站"),"download");
+        assert_eq!(super::progress_kind("来源测速：GitHub（代码托管平台）原站"),"waiting");
+        assert_eq!(super::progress_kind("校验下载文件"),"verify");
+    }
     use super::*;
 
     #[test]

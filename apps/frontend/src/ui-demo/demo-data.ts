@@ -171,7 +171,7 @@ export const settingsTabs: Array<{
   { id: 'speaker', label: '声纹设置', hint: '主人识别与模板', icon: '◎' },
   { id: 'wakes', label: '定时唤醒', hint: '任务与触发规则', icon: '◴' },
   { id: 'compute', label: '组件设置', hint: '分类配置与运行状态', icon: '▤' },
-  { id: 'workspace', label: '工作区与更新', hint: '位置与版本', icon: '⌂' },
+  { id: 'workspace', label: '关于', hint: '应用更新与工作区', icon: '⌂' },
 ]
 export const sceneChoices: Array<{
   /** value（场景标识）。 */ value: PreviewScene

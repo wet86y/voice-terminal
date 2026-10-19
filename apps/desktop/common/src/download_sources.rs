@@ -23,6 +23,18 @@ fn query_path(path: &str) -> String {
 pub fn candidates(url: &str) -> Vec<String> {
     // update.json（未独立签名的更新清单）只能通过原站建立信任。
     if url.split('?').next().unwrap_or(url).ends_with("/update.json") { return vec![url.into()]; }
+    // GitHub（代码托管平台）安装计划与原生节点池共用配置，避免双重代理包装。
+    if crate::download::github_source(url) {
+        let mut result=vec![];
+        if policy()["github_download"]["acceleration_enabled"]!=false {
+            if let Some(nodes)=policy()["github_download"]["nodes"].as_array(){
+                let mut nodes=nodes.iter().filter(|node|node["enabled"]==true&&node["id"]!="github-direct").collect::<Vec<_>>();
+                nodes.sort_by_key(|node|node["priority"].as_i64().unwrap_or(1000));
+                for node in nodes{if let Some(template)=node["template"].as_str(){result.push(template.replace("{url}",url));}}
+            }
+        }
+        result.push(url.to_owned());result.dedup();return result;
+    }
     let mut result = vec![];
     for row in policy()["models"].as_array().unwrap() {
         if let Some(path) = url.strip_prefix(row["origin_prefix"].as_str().unwrap()) {
@@ -68,6 +80,8 @@ mod tests {
         let private="https://private.example/pkg.whl"; assert_eq!(candidates(private),vec![private]);
         let manifest="https://github.com/wet86y/voice-terminal/releases/latest/download/update.json";
         assert_eq!(candidates(manifest),vec![manifest]);
+        assert!(!crate::download::github_source(manifest));
+        assert!(!crate::download::github_source(&format!("{manifest}?release=1")));
     }
     #[test]
     fn model_mirror_keeps_original_revision_and_encodes_path() {
@@ -75,5 +89,13 @@ mod tests {
         let rows=candidates(origin); assert_eq!(rows.len(),2); assert_eq!(rows[1],origin);
         assert!(rows[0].contains("Revision=710b2d85fa66ecd0e9cc4eee6413b9595171f502&FilePath=VoxCPM2-GGUF%2Fa%20b.gguf"));
         assert_eq!(candidates(&origin.replace("1b5981b2b89a1af578ebba5c8cf34226810e1f55","different")).len(),1);
+    }
+    #[test]
+    fn github_and_raw_assets_share_sdk_nodes_and_keep_canonical_source_last(){
+        for url in ["https://github.com/example/project/releases/download/v1/asset.zip","https://raw.githubusercontent.com/example/project/v1/weights.bin"]{
+            let sources=candidates(url);assert_eq!(sources.last().unwrap(),url);assert_eq!(sources.len(),4);
+            assert!(sources[0].starts_with("https://gh-proxy.org/https://"));
+            assert!(sources.iter().all(|source|source.matches("https://gh-proxy.org/").count()<=1));
+        }
     }
 }

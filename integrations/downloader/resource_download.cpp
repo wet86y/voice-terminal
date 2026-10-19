@@ -1,5 +1,6 @@
 // Generic resource transport（通用资源传输）：复用固定 DesktopUpdateKit（桌面下载组件）的 WinHTTP（系统网络库）。
 #include <DesktopUpdateKit/UpdateKit.h>
+#include "locked_kit_transfer.h"
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
@@ -12,8 +13,8 @@
 #include <functional>
 #include <thread>
 
-using Progress = int (*)(void*, int, std::uint64_t, std::uint64_t); // Progress（进度回调）：阶段 1 传输、2 摘要、3 启用，非零表示取消。
-using CancelCheck = int (*)(const void*); // CancelCheck（线程安全取消检查）：只读独立原子信号，不调用界面回调。
+using Progress = ResourceProgress; // Progress（进度回调）：阶段 1 传输、2 摘要、3 启用、4 缓存、5 四路、6 回退，非零取消。
+using CancelCheck = ResourceCancel; // CancelCheck（线程安全取消检查）：只读独立原子信号，不调用界面回调。
 struct DownloadFailure : std::runtime_error { // DownloadFailure（分类失败）：-2 本地文件、-3 取消、-4 不可恢复。
     int kind;
     DownloadFailure(int code, const std::string& message) : std::runtime_error(message), kind(code) {}
@@ -64,13 +65,13 @@ static void promote_download(const std::filesystem::path& part, const std::files
 }
 
 extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t size,
-    const char* expected, int sha512, std::uint64_t probe_limit, Progress progress, void* context, CancelCheck cancel_check, const void* cancel_context,
+    const char* expected, int sha512, int accelerate, std::uint64_t probe_limit, Progress progress, void* context, CancelCheck cancel_check, const void* cancel_context,
     char* error, std::size_t error_size) noexcept {
     try {
         using namespace desktop_update_kit;
-        auto cancelled = [&](std::uint64_t current, int phase = 1) {
+        auto cancelled = [&](std::uint64_t current, int phase = 1, const char* detail = nullptr) {
             if (cancel_check && cancel_check(cancel_context)) throw DownloadFailure(-3, "任务已取消，断点已保留");
-            if (progress && progress(context, phase, current, size)) throw DownloadFailure(-3, "任务已取消，断点已保留");
+            if (progress && progress(context, phase, current, size, detail)) throw DownloadFailure(-3, "任务已取消，断点已保留");
         };
         auto verifying = [&](std::uint64_t current) { cancelled(current, 2); };
         cancelled(0);
@@ -101,7 +102,7 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         std::filesystem::path output(target), part(output.wstring() + L".part"), checkpoint(output.wstring() + L".part.identity");
         std::filesystem::create_directories(output.parent_path());
         if (std::filesystem::exists(output) && std::filesystem::file_size(output) == size && hash_file(output, sha512 != 0, [&](auto done) { cancelled(done, 4); }) == expected) {
-            cancelled(size, 3); return 0;
+            cancelled(size, 8); cancelled(size, 3); return 0;
         }
         const std::string identity = std::to_string(size) + ":" + (sha512 ? "sha512:" : "sha256:") + expected;
         std::string previous; { std::ifstream in(checkpoint); std::getline(in, previous); }
@@ -109,6 +110,27 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
             std::filesystem::remove(part); std::ofstream(checkpoint) << identity;
         }
         std::uint64_t offset = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
+        // accelerate（复用上游四路）：已有连续断点优先续传；新下载的大型 GitHub（代码托管平台）文件使用锁定算法。
+        if (accelerate && offset == 0) {
+            try {
+                voice_resource_download::transfer_with_locked_kit(*transport, url, part, size,
+                    [&](auto done, int connections, bool fallback, double speed) {
+                        const int phase = fallback ? 6 : connections > 1 ? 5 : 1;
+                        std::ostringstream detail;
+                        detail << (fallback ? "下载固定资源（四路加速失败，已回退单路下载）" : connections > 1 ? "下载固定资源（四路加速）" : "下载固定资源")
+                            << " · " << std::fixed << std::setprecision(2) << speed / (1024 * 1024) << " MiB/秒（兆二进制字节每秒）";
+                        cancelled(done, phase, detail.str().c_str());
+                    });
+            } catch (const std::exception& failure) {
+                cancelled(0);
+                const std::string message = failure.what();
+                if (message == "Unable to create update file" || message == "Unable to create range file" ||
+                    message == "Unable to create merged update file" || message == "Unable to write update file")
+                    throw DownloadFailure(-4, "下载暂存文件不可写，请检查磁盘空间与目录权限；断点已保留。");
+                throw;
+            }
+            offset = size;
+        }
         std::ofstream stream(part, std::ios::binary | std::ios::app);
         if (!stream) throw DownloadFailure(-4, "下载暂存文件不可写，请检查磁盘空间与目录权限");
         cancelled(offset);
@@ -177,6 +199,28 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
 }
 
 // vt_fetch_manifest（读取应用更新清单）：固定 HTTPS（加密传输）地址、响应大小和超时。
+extern "C" int vt_resource_cached(const wchar_t* target, std::uint64_t size, const char* expected, int sha512,
+    ResourceProgress progress, void* context, ResourceCancel cancel_check, const void* cancel_context, char* error, std::size_t error_size) noexcept {
+    try {
+        auto report = [&](std::uint64_t done, int phase) {
+            if ((cancel_check && cancel_check(cancel_context)) || (progress && progress(context, phase, done, size, nullptr)))
+                throw DownloadFailure(-3, "任务已取消，断点已保留");
+        };
+        if (cancel_check && cancel_check(cancel_context)) throw DownloadFailure(-3, "任务已取消，断点已保留");
+        const std::filesystem::path output(target);
+        if (!std::filesystem::exists(output) || std::filesystem::file_size(output) != size) return 0;
+        report(0, 4);
+        if (hash_file(output, sha512 != 0, [&](auto done) { report(done, 4); }) != expected) return 0;
+        report(size, 8); report(size, 3); return 1;
+    } catch (const DownloadFailure& failure) {
+        if (error && error_size) { std::strncpy(error, failure.what(), error_size - 1); error[error_size - 1] = 0; }
+        return failure.kind;
+    } catch (...) {
+        if (error && error_size) { std::strncpy(error, "现有下载缓存无法读取，旧缓存已保留。", error_size - 1); error[error_size - 1] = 0; }
+        return -2;
+    }
+}
+
 extern "C" int vt_fetch_manifest(const char* url, unsigned char* output, std::size_t output_size,
     char* error, std::size_t error_size) noexcept {
     try {

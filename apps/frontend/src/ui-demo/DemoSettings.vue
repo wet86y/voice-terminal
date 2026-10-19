@@ -7,6 +7,7 @@ import SilenceTimeoutControl from '../interface/SilenceTimeoutControl.vue'
 import LocalComponents from '../interface/LocalComponents.vue'
 import SettingsPageHeader from '../interface/SettingsPageHeader.vue'
 import AppUpdateCard from '../interface/AppUpdateCard.vue'
+import WorkspaceLocationCard from '../interface/WorkspaceLocationCard.vue'
 import type { AppUpdateStatus } from '../interface/app-update'
 import TimePicker from '../interface/TimePicker.vue'
 import WakeTaskSchedule from '../interface/WakeTaskSchedule.vue'
@@ -51,9 +52,9 @@ const instructionRows = computed(() => props.scene === 'empty' ? [] : instructio
 const loading = computed(() => props.scene === 'loading')
 const updatePreview = computed<AppUpdateStatus>(() => ({
   state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
-  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.2',
+  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.3',
   release_notes: props.scene === 'empty' ? null : [
-    'Voice Terminal（语音终端）v0.9.2', '',
+    'Voice Terminal（语音终端）v0.9.3', '',
     '下载与安装', '• 改善首次安装组件的下载体验，优先使用国内镜像，失败时自动尝试原站。',
     '• 保留已有设置、用户数据、模型和运行环境。', '',
     '更新体验', '• 优化应用更新页面和下载进度展示。', '• 修复旧版程序交给分发器更新时的编号兼容问题。',
@@ -285,11 +286,8 @@ function cancelTask(item: DemoWakeTask) {
 
     <template v-else-if="tab === 'workspace'">
       <SettingsPageHeader section="workspace" />
-      <section class="preference-card workspace-preview-card" aria-labelledby="workspace-preview-title">
-        <header class="preference-heading"><span class="preference-index" aria-hidden="true">01</span><div><h3 id="workspace-preview-title">开发运行工作区</h3><p>开发模式只显示项目路径，不提供迁移操作。</p></div></header>
-        <dl class="workspace-preview-path"><div><dt>项目路径</dt><dd>由桌面启动器提供的项目工作区</dd></div></dl>
-      </section>
-      <AppUpdateCard :status="updatePreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消更新下载')" />
+      <AppUpdateCard :status="updatePreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消更新下载')" @repository="feedback('项目仓库：https://github.com/wet86y/voice-terminal')" />
+      <WorkspaceLocationCard :root="scene === 'long' ? `D:\\语音终端\\${longIdentifier}\\工作区` : 'D:\\语音终端\\工作区'" can-manage @migrate="feedback('模拟选择目标目录并确认工作区迁移')" />
     </template>
     <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">
       <section role="dialog" aria-modal="true" aria-labelledby="demo-bundle-title" class="demo-bundle-dialog">
