@@ -1285,12 +1285,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             value = await asyncio.to_thread(store.save_persona, body)
-            await runtime.refresh_prompt_settings()
             return {
                 "settings": {"persona": value.get("persona", {})},
-                "effective_from": "next_request",
-                "pending": False,
-                "message": "人格与用户资料已保存，当前会话的后续模型请求立即使用新内容。",
+                "effective_from": "next_session",  # effective_from（生效时机）：新会话。
+                "pending": True,  # pending（待生效标记）：当前会话保留原人格与资料快照。
+                "message": "人格与用户资料已保存；新会话开始后生效，当前会话继续使用原快照。",
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
@@ -1305,7 +1304,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise ProductSettingsError("请求字段必须是 custom_instructions（自定义指令列表）。")
             store = product_store_or_404()
             value = await asyncio.to_thread(store.save_custom_instructions, body["custom_instructions"])
-            await runtime.refresh_prompt_settings()
+            await runtime.refresh_custom_instruction_settings()
             return {
                 "settings": {"custom_instructions": value["custom_instructions"]},
                 "effective_from": "next_request",

@@ -64,6 +64,7 @@ from ..vad.detector import FsmnVadDetector
 from ..compute import device_candidates, hardware_status
 from ..analysis.client import AnalysisClient
 from .product import (
+    PERSONA_FILES,
     ProductSettingsStore,
     ShadowProductProjection,
 )
@@ -700,6 +701,19 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             except Exception as exc:
                 self._record_error("tts", f"恢复后重新准备失败：{type(exc).__name__}: {exc}")
 
+    def _episode_persona_config(self):
+        """返回与产品设置写入位置一致的 Persona（人格资料）读取配置。"""
+        persona = self.config.persona
+        store = self.product_settings
+        if store is None:
+            return persona
+        return replace(
+            persona,
+            directory=store.persona_directory,
+            personality_file=PERSONA_FILES["personality"],
+            user_file=PERSONA_FILES["user"],
+        )
+
     async def _initialize_controller(self, *, _session_lock_held: bool = False) -> None:
         """_initialize_controller（唯一会话调度器）：依赖上游能力全部汇合。"""
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
@@ -709,7 +723,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.controller = EpisodeController(
             hotwords=self.hotwords,
             options=self.config.smart_turn, agent_options=self.config.agent,
-            persona_config=self.config.persona,
+            persona_config=self._episode_persona_config(),
             custom_instructions_provider=lambda: self._instruction_snapshot,
             continuity_document_provider=lambda: self.continuity.document,
             on_user_activity=self._on_voice_activity,

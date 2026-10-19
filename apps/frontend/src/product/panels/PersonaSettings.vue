@@ -12,7 +12,7 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
     <nav class="persona-nav persona-nav-with-note" aria-label="人格文档">
       <button v-for="document in personaItems" :key="document.id" type="button" :class="{ active: activePersona === document.id }" :title="`${document.label} · ${document.owner}`" @click="activePersona = document.id"><strong>{{ document.label }}</strong><small>{{ document.owner }}</small></button>
     </nav>
-    <label class="document-editor"><span :title="currentDocument.path">{{ currentDocument.path }}（文档路径）</span><textarea v-model="personaDocuments[currentDocument.id]" :aria-label="`${currentDocument.label}文档内容`" spellcheck="false"></textarea><small>文档最多 64 KB；保存后，当前会话的后续模型请求立即使用新内容。</small></label>
+    <label class="document-editor"><span :title="currentDocument.path">{{ currentDocument.path }}（文档路径）</span><textarea v-model="personaDocuments[currentDocument.id]" :aria-label="`${currentDocument.label}文档内容`" spellcheck="false"></textarea><small>文档最多 64 KB；保存后新会话生效，当前会话继续使用原人格与资料快照。</small></label>
   </div>
   <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存人格与用户资料' }}</button></footer>
   <section class="preview-section instruction-section" aria-label="自定义指令">

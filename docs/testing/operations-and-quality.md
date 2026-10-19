@@ -24,6 +24,8 @@ git diff --check
 
 正式程序固定文件校验使用 `.local/Verify-Package.ps1`（正式包逐文件校验）。测试报告记录自己的执行范围和日期；不能把定向测试写成全量通过，也不能把自动化检查当作麦克风、真实供应商或干净设备验收。
 
+屏幕抓取与多模态用例需要 Pillow（Python 图片处理库）。项目运行依赖已在 `apps/server/requirements.txt`（服务依赖清单）声明 `Pillow>=11,<13`，运行锁固定为 12.3.0；优先使用项目私有解释器。若用独立 Python（运行环境）运行这些用例，先在该解释器安装同一范围的 Pillow，避免 `ModuleNotFoundError: No module named 'PIL'`（找不到图片处理模块）。
+
 ## 区域与测试入口
 
 | 区域及中文说明 | 测试入口及中文说明 |
@@ -34,6 +36,7 @@ git diff --check
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | 资源下载、复制、摘要与首次安装启动 | `apps/frontend/src/management/ManagementApp.test.ts`（管理页状态回归）；`cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common -p voice-terminal-desktop --locked`（原生资源与宿主回归）；公共模块可增加 `--features qualification`（隔离下载验收） |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
+| 屏幕抓取、图片预处理与多模态上下文 | `tests/test_screen_capture.py`、`tests/test_multimodal_context.py`；需要 Pillow（Python 图片处理库），已列入 `apps/server/requirements.txt`（服务依赖清单）并固定在运行锁中 |
 | Bridge 2.0（第二版桥接协议）、二等信箱与 DSH（代理执行宿主）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_secondary_mailbox.py`、`tests/test_scheduler_staircase.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow（后台代理）、上下文与台账 | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
 | TTS（语音合成）、语音准入与分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |

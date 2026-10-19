@@ -84,7 +84,7 @@ dsh:
   restart_limit: 2
   restart_delay_ms: 1000
 
-# persona（人格资料）：首次激活读取，显式保存后更新后续请求快照。
+# persona（人格资料）：首次激活读取；保存修订留待新会话载入，不改写活动会话快照。
 persona:
   directory: config/persona
   personality_file: personality.md
@@ -166,7 +166,7 @@ llm:
   reasoning_mode: deep  # reasoning_mode（运行模式）：fast（快速）或 deep（深度）。
   thinking: enabled
   reasoning_effort: low
-  timeout_ms: 15000
+  timeout_ms: 30000  # timeout_ms（模型响应读取超时，毫秒）：给较长上下文更多首响应时间。
   # DeepSeek's documented maximum output budget: 384K tokens.
   max_output_tokens: 393216
   protocol_recovery_limit: 1

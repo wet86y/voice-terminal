@@ -221,32 +221,46 @@ def test_silence_save_changes_live_scheduler_and_preserves_session(runtime):
     asyncio.run(run())
 
 
-def test_persona_and_instruction_save_refresh_same_episode_and_shadow_context(runtime):
+def test_persona_save_waits_for_new_session_but_custom_instructions_refresh_same_episode(runtime):
     async def run():
         registry = SimpleNamespace(action_definitions=lambda: [], begin_turn=lambda _: None)
         output = SimpleNamespace(status="IDLE", speak_snapshot={"queue_status": "empty", "text_only_queue": True})
         episode = AgentEpisodeRuntime(None, registry, output, AsyncMock(), conversation=runtime.conversation,
-            ledger=runtime.history, persona_config=runtime.config.persona,
+            ledger=runtime.history, persona_config=runtime._episode_persona_config(),
             custom_instructions_provider=lambda: runtime._instruction_snapshot)
         runtime.controller = SimpleNamespace(episode=episode)
         await episode.ensure_episode(turn_id="same-turn", text="继续")
         episode.persona_documents = PersonaDocuments(personality="旧人格", user="旧资料")
+        runtime._shadow_user_profile = "旧资料"
+        runtime.shadow_context.set_product_context("旧资料", runtime._instruction_snapshot)
         old_messages = episode.messages({"USER_INPUT_FINALIZED"})
         old_digest = episode.static_context_digest
         original_id = episode.episode_id
         saved = await request(runtime, "persona", {"personality": "新人格：简洁回答", "user": "新资料：用中文"})
-        assert saved.json()["effective_from"] == "next_request" and not saved.json()["pending"]
+        assert saved.json()["effective_from"] == "next_session" and saved.json()["pending"]
+        assert saved.json()["message"] == "人格与用户资料已保存；新会话开始后生效，当前会话继续使用原快照。"
+        assert runtime._shadow_user_profile == "旧资料"
+
+        next_episode = AgentEpisodeRuntime(
+            None, registry, output, AsyncMock(), conversation=runtime.conversation.__class__(),
+            ledger=runtime.history.__class__(), persona_config=runtime._episode_persona_config(),
+            custom_instructions_provider=lambda: runtime._instruction_snapshot,
+        )
+        await next_episode.ensure_episode(turn_id="next-turn", text="新会话")
+        assert next_episode.persona_documents.personality == "新人格：简洁回答"
+        assert next_episode.persona_documents.user == "新资料：用中文"
+
         instruction = {"id": "rule", "trigger": "查询资料", "target": "shadow", "instruction": "核实来源", "enabled": True}
         saved = await request(runtime, "custom-instructions", {"custom_instructions": [instruction]})
         assert saved.json()["pending"] is False
         new_messages = episode.messages({"USER_INPUT_FINALIZED"})
         assert episode.episode_id == original_id
-        assert "新人格" in str(new_messages) and "旧人格" not in str(new_messages)
+        assert "旧人格" in str(new_messages) and "新人格" not in str(new_messages)
         assert "旧人格" in str(old_messages) and "新人格" not in str(old_messages)
         assert "查询资料" in str(new_messages)
         assert episode.static_context_digest != old_digest
         environment = runtime.shadow_context.environment_snapshot()
-        assert environment["user_profile"] == "新资料：用中文"
+        assert environment["user_profile"] == "旧资料"
         assert environment["custom_instructions"][0]["执行目标"] == "核实来源"
         assert runtime._instruction_snapshot == [instruction]
         revision = runtime.history.shadow_input_revision
@@ -258,6 +272,8 @@ def test_persona_and_instruction_save_refresh_same_episode_and_shadow_context(ru
         assert "custom_instructions" not in runtime.shadow_context.environment_snapshot()
         if episode._tokenizer_prewarm_task is not None:
             await episode._tokenizer_prewarm_task
+            if next_episode._tokenizer_prewarm_task is not None:
+                await next_episode._tokenizer_prewarm_task
     asyncio.run(run())
 
 
