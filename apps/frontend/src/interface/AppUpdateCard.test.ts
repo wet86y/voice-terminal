@@ -5,11 +5,18 @@ import AppUpdateCard from './AppUpdateCard.vue'
 import type { AppUpdateStatus } from './app-update'
 
 const status: AppUpdateStatus = {
-  state: 'available', current_version: '0.9.0', target_version: '0.9.2',
+  state: 'available', current_version: '0.9.0', target_version: '0.9.3',
   release_notes: '改进安装与更新体验\n• 保留已有用户设置和组件。', fields: {},
 }
 
 describe('AppUpdateCard（应用更新卡片）', () => {
+  it('显示作者并通过独立操作打开项目仓库，不触发更新下载', async () => {
+    const wrapper = mount(AppUpdateCard, { props: { status } })
+    expect(wrapper.get('.update-about').text()).toContain('作者 wet86y')
+    await wrapper.get('.update-repository').trigger('click')
+    expect(wrapper.emitted('repository')).toHaveLength(1)
+    expect(wrapper.emitted('download')).toBeUndefined()
+  })
   it('下载时保持取消操作可用，并展示进度和独立发行说明', async () => {
     const wrapper = mount(AppUpdateCard, { props: { status: {
       ...status, state: 'downloading', can_cancel: true, completed_bytes: 25, total_bytes: 100,

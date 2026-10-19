@@ -1,5 +1,29 @@
 {
   "schema": 1,
+  "github_download": {
+    "application_id": "VoiceTerminal-GitHubDownloads",
+    "acceleration_enabled": true,
+    "auto_select": true,
+    "probe_timeout_ms": 2000,
+    "sample_bytes": 1048576,
+    "nodes": [
+      {"id": "gh-proxy", "template": "https://gh-proxy.org/{url}", "priority": 10, "enabled": true},
+      {"id": "gh-llkk", "template": "https://gh.llkk.cc/{url}", "priority": 20, "enabled": true},
+      {"id": "ghproxy-net", "template": "https://ghproxy.net/{url}", "priority": 30, "enabled": true},
+      {"id": "github-direct", "template": "{url}", "priority": 1000, "enabled": true}
+    ],
+    "fields": {
+      "application_id": "共享原生下载器的节点缓存标识，更新与组件共用",
+      "acceleration_enabled": "允许使用加速节点；默认开启，界面不显示开关",
+      "auto_select": "比较原站与启用节点的有限下载样本，优先较快来源",
+      "probe_timeout_ms": "每个节点的探测及测速总时限，单位毫秒",
+      "sample_bytes": "单节点测速最大样本字节数，不计入正式下载进度",
+      "nodes": "传入锁定上游组件的加速节点与强制官方回退",
+      "id": "节点编号", "template": "以原始地址替换单个 {url} 的节点模板",
+      "priority": "测速接近或不可用时的节点顺序", "enabled": "是否启用该节点",
+      "fields": "字段中文说明"
+    }
+  },
   "prefixes": [
     {"origin_prefix": "https://www.python.org/ftp/python/", "mirror_prefix": "https://mirrors.huaweicloud.com/python/"},
     {"origin_prefix": "https://files.pythonhosted.org/", "mirror_prefix": "https://pypi.tuna.tsinghua.edu.cn/"},
@@ -29,6 +53,7 @@
   },
   "fields": {
     "schema": "下载来源配置格式；不参与组件内容身份计算",
+    "github_download": "桌面 GitHub（代码托管平台）资产统一节点管理、测速与回退配置",
     "prefixes": "固定原始地址到公共镜像的前缀映射，原站始终作为最后候选",
     "origin_prefix": "原始来源前缀，包含固定版本时仅适用该版本",
     "mirror_prefix": "镜像地址前缀",

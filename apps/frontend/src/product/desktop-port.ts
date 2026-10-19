@@ -171,6 +171,8 @@ export interface DesktopWorkspacePort {
 
 /** DesktopUpdatePort（应用更新接口）：下载后由分发安装器接管现有工作区。 */
 export interface DesktopUpdatePort {
+  /** openProjectRepository（打开当前项目的官方仓库）。 */
+  openProjectRepository(): Promise<void>
   checkAppUpdate(): Promise<AppUpdateStatus>
   downloadAppUpdate(): Promise<AppUpdateStatus>
   cancelAppUpdate(): Promise<void>
@@ -279,6 +281,7 @@ export function desktopPort(): DesktopPort {
     fixedCredentials: () => call('model_credentials_status'),
     saveFixedCredentials: request => call('model_credentials_save', { request }),
     checkAppUpdate: () => call<AppUpdateStatus>('app_update_check'),
+    openProjectRepository: () => call('project_open_repository'),
     downloadAppUpdate: () => call<AppUpdateStatus>('app_update_download'),
     cancelAppUpdate: () => call('app_update_cancel'),
     listen: async <T>(eventName: string, handler: (event: DesktopEvent<T>) => void) => {

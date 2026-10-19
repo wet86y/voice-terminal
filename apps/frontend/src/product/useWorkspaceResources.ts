@@ -275,6 +275,11 @@ export function useWorkspaceResources() {
     unlistenAppUpdate = undefined
   })
 
+  async function openProjectRepository() {
+    try { await port.openProjectRepository() }
+    catch (error) { workspaceError.value = error instanceof Error ? error.message : '无法打开项目仓库。' }
+  }
+
   async function checkAppUpdate() {
     if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     appUpdate.value = { ...appUpdate.value, state: 'checking', error: null }
@@ -484,6 +489,7 @@ export function useWorkspaceResources() {
     workspaceError,
     eventError,
     appUpdate,
+    openProjectRepository,
     checkAppUpdate,
     downloadAppUpdate,
     cancelAppUpdate,
