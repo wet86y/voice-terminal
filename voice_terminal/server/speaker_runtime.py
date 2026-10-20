@@ -501,6 +501,14 @@ class SpeakerRuntimeMixin:
 
     @asynccontextmanager
     async def _capture_speaker_pcm(self, *, owner: str, seconds: float, capture_id: str | None):
+        from .runtime_operations import runtime_operation
+        async with runtime_operation(self, "speaker_capture", "声纹现场测试" if owner == "test" else "声纹录制",
+                                     phase="recording", pause=True, wait_output=True):
+            async with self._capture_speaker_pcm_paused(owner=owner, seconds=seconds, capture_id=capture_id) as result:
+                yield result
+
+    @asynccontextmanager
+    async def _capture_speaker_pcm_paused(self, *, owner: str, seconds: float, capture_id: str | None):
         """capture_id（采集请求标识）只绑定一个有界流，取消不能复活已删除的会话。"""
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 5 <= seconds <= 10:
             raise ValueError("录制时长必须为 5–10 秒")
@@ -517,12 +525,13 @@ class SpeakerRuntimeMixin:
         key = capture_id or uuid4().hex
         control = CaptureControl()
         captures[key] = (owner, control)
+        capture_task = asyncio.create_task(asyncio.to_thread(
+            capture_segment, sample_rate=self.config.audio.sample_rate,
+            channels=self.config.audio.channels, input_device=self.config.audio.input_device,
+            seconds=seconds, processor=self.audio_processor, control=control,
+        ))
         try:
-            captured = await asyncio.to_thread(
-                capture_segment, sample_rate=self.config.audio.sample_rate,
-                channels=self.config.audio.channels, input_device=self.config.audio.input_device,
-                seconds=seconds, processor=self.audio_processor, control=control,
-            )
+            captured = await asyncio.shield(capture_task)
             if control.cancel.is_set() or (owner != "test" and owner not in self._speaker_enrollment):
                 raise EnrollmentCaptureError("本次采集已取消", code="SPEAKER_CAPTURE_CANCELLED")
             if not 5000 <= captured.duration_ms <= 10000:
@@ -530,7 +539,11 @@ class SpeakerRuntimeMixin:
             yield captured, control
         finally:
             control.cancel.set()
-            captures.pop(key, None)
+            try:
+                # 原生录音线程退出后再归还麦克风；取消协程不会取消线程本身。
+                await asyncio.shield(asyncio.gather(capture_task, return_exceptions=True))
+            finally:
+                captures.pop(key, None)
 
     async def stop_speaker_capture(self, owner: str, capture_id: str, *, cancel: bool = False) -> dict[str, Any]:
         """cancel（取消本段）丢弃采样；普通停止只接受至少五秒的真实采样。"""
@@ -604,12 +617,6 @@ class SpeakerRuntimeMixin:
             raise ValueError("录音会话不存在或已过期")
         if isinstance(index, bool) or not isinstance(index, int) or index not in {0, 1, 2}:
             raise ValueError("录音段编号必须是 0、1 或 2")
-        controller = self.controller
-        if controller is not None and getattr(controller, "workspace", None) is not None:
-            raise EnrollmentCaptureError(
-                "语音会话正在进行，请先停止监听再录制声纹。",
-                code="SPEAKER_INPUT_BUSY",
-            )
         async with self._capture_speaker_pcm(owner=enrollment_id, seconds=seconds, capture_id=capture_id) as (captured, control):
             speech_ms = captured.speech_ms
             measured = speech_ms > 0
@@ -997,12 +1004,6 @@ class SpeakerRuntimeMixin:
             raise ValueError("尚未注册声纹")
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
             raise ValueError("录制时长必须是数字")
-        controller = self.controller
-        if controller is not None and getattr(controller, "workspace", None) is not None:
-            raise EnrollmentCaptureError(
-                "语音会话正在进行，请先停止监听再做现场测试。",
-                code="SPEAKER_INPUT_BUSY",
-            )
         async with self._capture_speaker_pcm(owner="test", seconds=seconds, capture_id=capture_id) as (captured, control):
             speech_ms = captured.speech_ms
             if speech_ms <= 0:

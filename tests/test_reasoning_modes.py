@@ -295,10 +295,15 @@ def test_session_mode_command_publishes_valid_modes_and_preserves_state_on_rejec
             assert await runtime.set_reasoning_mode(mode) is True
             runtime.controller.set_reasoning_mode.assert_called_with(mode)
             assert runtime.bus.publish.call_args.args[0].payload["reasoning_mode"] == mode
+        published = runtime.bus.publish.await_count
+        completed_modes = [call.args[0].payload["reasoning_mode"]
+                           for call in runtime.bus.publish.await_args_list
+                           if call.args[0].payload["runtime_operations"][-1]["state"] == "succeeded"]
+        assert completed_modes == ["deep", "fast"]
         for mode in ("balanced", "invalid"):
             assert await runtime.set_reasoning_mode(mode) is False
             assert runtime.reasoning_mode == "fast"
         assert runtime.controller.set_reasoning_mode.call_count == 2
-        assert runtime.bus.publish.await_count == 2
+        assert runtime.bus.publish.await_count == published  # 非法模式不能创建新的切换操作或状态。
 
     asyncio.run(scenario())

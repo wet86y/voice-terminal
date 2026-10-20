@@ -1511,6 +1511,7 @@ export function useProductControls() {
     return activePage.value === "home" ? "工作台" : "设置";
   }
   function runtimeAction() {
+    if (voice.inputPaused.value) return false;
     if (coreUnavailable.value) {
       applicationHost.inspect();
       showApplicationSystem();
@@ -1580,11 +1581,13 @@ export function useProductControls() {
     return {
       state: runtimeState.value,
       audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
-      sessionActive: connected.value && listening.value, // sessionActive（真实会话开关）：等待唤醒时仍保持会话布局。
+      sessionActive: connected.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
       sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
-      action: applicationSnapshot.value?.startup_complete === false || coreStarting.value
+      action: voice.inputPaused.value
+        ? "系统切换中"
+        : applicationSnapshot.value?.startup_complete === false || coreStarting.value
         ? "组件启动中"
         : coreUnavailable.value
         ? "查看本地组件"
@@ -1593,11 +1596,11 @@ export function useProductControls() {
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: loading.value || Boolean(voice.sessionOperation.value) || coreStarting.value
+      disabled: voice.inputPaused.value || Boolean(voice.sessionOperation.value) || loading.value || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false,
       modeDisabled: !connected.value || Boolean(voice.sessionOperation.value) || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false,
-      canReset: connected.value && !listening.value && applicationSnapshot.value?.startup_complete !== false,
+      canReset: connected.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
       latency: formatResponseLatency(latencyMs.value),
       latencyPending: latencyRunning.value,

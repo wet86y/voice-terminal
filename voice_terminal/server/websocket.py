@@ -72,6 +72,7 @@ from .snapshot import snapshot_event
 from .speaker_runtime import SpeakerRuntimeMixin
 from .handoff_runtime import HandoffRuntimeMixin
 from .settings_runtime import ProductSettingsRuntimeMixin
+from .runtime_operations import runtime_operation, runtime_operations
 
 logger = logging.getLogger(__name__)
 
@@ -861,6 +862,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
         value.payload["audio_enhancements_switching"] = bool(getattr(self, "_enhancement_switching", False))
+        operations = runtime_operations(self)
+        value.payload["runtime_operations"] = operations.registry.snapshot()  # runtime_operations（运行操作状态）。
+        value.payload["input_paused"] = bool(operations.holds or operations.restoring)  # input_paused（维护期间暂时停听）。
+        value.payload["listening_requested"] = operations.resume_requested if value.payload["input_paused"] else self.state.listening
         local_tts_status = self.local_tts_status_payload()
         value.payload["local_tts"] = local_tts_status  # local_tts（本地模型选择与加载状态）。
         value.payload["session_operation"] = getattr(self, "_session_operation", None)  # session_operation（手动会话操作）。
@@ -1257,13 +1262,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     async def set_reasoning_mode(self, mode: str) -> bool:
         if mode not in {"fast", "deep"}:
             return False
-        async with self._session_lock:
-            self.reasoning_mode = mode
-            if self.controller is not None:
-                self.controller.set_reasoning_mode(mode)
-            bus = getattr(self, "bus", None)
-            if bus is not None:
-                await bus.publish(self.snapshot())
+        async with runtime_operation(self, "reasoning_mode", "推理模式"):
+            async with self._session_lock:
+                self.reasoning_mode = mode
+                if self.controller is not None:
+                    self.controller.set_reasoning_mode(mode)
+                bus = getattr(self, "bus", None)
+                if bus is not None:
+                    await bus.publish(self.snapshot())
         return True
 
     def _api_key(self, environment_name: str) -> str:
@@ -1674,6 +1680,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.state.set_state(TerminalState.STARTING, listening=False)
 
     async def start_listening(self) -> None:
+        if getattr(self, "_closed", False) or getattr(self, "_application_stopping", False):
+            return
+        operations = runtime_operations(self)
+        if operations.holds:
+            operations.intent(True)
+            await operations.publish()
+            return
         if getattr(self, "_enhancement_switching", False):
             self._enhancement_resume_requested = True
             return
@@ -1694,6 +1707,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self._listen_resume_requested = None  # 成功进入启动路径后撤销更早的挂起意图。
         self._tts_resume_requested = None  # 新的主动启动撤销更早的停止意图。
         async with self._session_lock:
+            if getattr(self, "_closed", False) or getattr(self, "_application_stopping", False):
+                return
+            if operations.holds:
+                operations.intent(True)
+                return
             voice_operations = getattr(self, "tts_voice_operations", None)
             operation = voice_operations.current_payload() if voice_operations is not None else None
             if operation and operation.get("kind") in {"preview", "play"}:
@@ -1735,6 +1753,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     return
             if not self.state.listening:
                 self._approval_listen_generation = getattr(self, "_approval_listen_generation", 0) + 1
+            if getattr(self, "_closed", False):
+                return
+            if operations.holds:
+                operations.intent(True)
+                return
             await self.controller.start_listening()
             pending_buffer = getattr(self, "_shadow_pending", None)
             pending = pending_buffer.drain() if pending_buffer is not None else []
@@ -1743,6 +1766,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await self._deliver_voice_mailbox()
 
     async def stop_listening(self) -> None:
+        runtime_operations(self).intent(False)
         self._enhancement_resume_requested = False
         self._tts_resume_requested = False  # 用户主动停止优先于后台切换的恢复意图。
         self._listen_resume_requested = False  # 用户主动停止也撤销能力加载中的挂起意图。
@@ -1839,6 +1863,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 await bus.publish(self.snapshot())
 
     async def close(self, *, preserve_tts_updates: bool = False) -> None:
+        runtime_operations(self).intent(False)
         self._enhancement_resume_requested = False
         self._closed = True
         update_task = getattr(self, "_tts_update_task", None)

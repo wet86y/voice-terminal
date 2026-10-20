@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import TtsSettings from "./panels/TtsSettings.vue";
+import OperationNotice from './OperationNotice.vue';
 import { provideTtsVoiceState } from "../interface/useTtsVoiceState";
 provideTtsVoiceState();
 import { computed, onBeforeUnmount, watch } from 'vue';
@@ -51,6 +52,10 @@ const {
   floatingSessionAction,
 } = controls;
 const desktop = desktopPort();
+const operations = computed(() => [
+  ...(controls.voice.runtimeOperations?.value ?? []),
+  ...(applicationSnapshot.value?.runtime_operations ?? []),
+]);
 const floatingUnlisteners: Array<() => void> = [];
 let disposed = false;
 function subscribeFloating<T>(name: string, handler: (payload: T) => void) {
@@ -182,6 +187,8 @@ function exportLogs() {
         <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
     ></SettingsFrame>
     <template #overlays>
+      <div class="notification-stack">
+      <OperationNotice :operations="operations" />
       <Transition name="save-notice"
         ><div v-if="lastError" class="save-notice error-notice" role="alert">
           <span>!</span>{{ lastError
@@ -199,6 +206,7 @@ function exportLogs() {
           }}<button aria-label="关闭提示" @click="setNotice('')">×</button>
         </div></Transition
       >
+      </div>
       <ApplicationStartup v-if="!resourceMaintenance || entering || exiting" :entering="entering" :exiting="exiting" /></template>
   </AppFrame>
   </ApplicationMotion>

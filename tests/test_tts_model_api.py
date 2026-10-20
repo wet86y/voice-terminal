@@ -339,7 +339,7 @@ def test_legacy_empty_transcript_can_be_corrected_without_replacing_clone_audio(
     asyncio.run(scenario())
 
 
-def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path):
+def test_sequential_selection_waits_for_readiness_and_respects_explicit_stop(tmp_path):
     async def scenario():
         config = AppConfig()
         store = ProductSettingsStore(path=tmp_path / "data/config/product-settings.json", config=config)
@@ -350,23 +350,31 @@ def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path)
         runtime.state.set_service("tts", "READY")
         async def stop():
             runtime.state.set_state(TerminalState.IDLE, listening=False)
+            runtime.controller._active_input = False
         runtime.controller = SimpleNamespace(_active_input=True, stop_listening=stop, start_listening=AsyncMock())
         switched = []
+        entered, release = asyncio.Event(), asyncio.Event()
         async def switch(backend, model):
             switched.append((backend, model))
+            entered.set()
+            await release.wait()
             runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, backend=backend, local_model=model))
             runtime.tts.backend = backend
         runtime.switch_tts_selection = switch
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, product_settings=store)), base_url="http://test") as client:
-                first = await client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm1"})
-                second = await client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm2"})
-                assert first.json()["pending"] and second.json()["pending"]
-                assert runtime.config.tts.backend == "minimax"
-                await runtime.stop_listening()
-                runtime.controller._active_input = False
-                await asyncio.wait_for(runtime._tts_update_task, 3)
-                assert switched == [("voxcpm1", "voxcpm2")]
+                first_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm1"}))
+                await asyncio.wait_for(entered.wait(), 2)
+                assert not runtime.state.listening
+                second_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm2"}))
+                stopping = asyncio.create_task(runtime.stop_listening())
+                await asyncio.sleep(0)
+                release.set()
+                first, second = await asyncio.gather(first_request, second_request)
+                await stopping
+                assert first.status_code == second.status_code == 200
+                assert first.json()["pending"] is False and second.json()["pending"] is False
+                assert switched == [("voxcpm1", "voxcpm1"), ("voxcpm1", "voxcpm2")]
                 assert not runtime.state.listening
                 runtime.controller.start_listening.assert_not_awaited()
                 assert store.settings_only()["tts"]["local_model"] == "voxcpm2"
@@ -377,7 +385,7 @@ def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path)
     asyncio.run(scenario())
 
 
-def test_queued_online_tts_settings_apply_after_current_transaction(tmp_path, monkeypatch):
+def test_online_tts_switch_pauses_then_waits_for_output_and_resumes(tmp_path, monkeypatch):
     async def scenario():
         config = AppConfig()
         store = ProductSettingsStore(path=tmp_path / "data/config/product-settings.json", config=config)
@@ -388,12 +396,20 @@ def test_queued_online_tts_settings_apply_after_current_transaction(tmp_path, mo
         runtime.state.set_state(TerminalState.LISTENING, listening=True)
         runtime.state.set_service("tts", "READY")
 
+        stopped = asyncio.Event()
         async def stop():
             runtime.state.set_state(TerminalState.IDLE, listening=False)
+            runtime.controller._active_input = False
+            stopped.set()
 
         runtime.controller = SimpleNamespace(
             _active_input=True, stop_listening=stop, start_listening=AsyncMock(),
         )
+        async def resume():
+            runtime.state.set_state(TerminalState.LISTENING, listening=True)
+        runtime.start_listening = AsyncMock(side_effect=resume)
+        busy = True
+        runtime.tts_switch_busy = lambda: busy
         switched = []
 
         async def switch(backend, local_model):
@@ -405,20 +421,22 @@ def test_queued_online_tts_settings_apply_after_current_transaction(tmp_path, mo
         monkeypatch.setattr(http_api, "_validate_minimax_voice_id", validate)
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, product_settings=store)), base_url="http://test") as client:
-                response = await client.put("/api/v1/product/settings/tts", json={
+                request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={
                     "online_model": "speech-2.8-turbo", "online_voice_id": "clone-queued",
-                })
-                assert response.status_code == 200, response.text
-                assert response.json()["pending"] is True
+                }))
+                await asyncio.wait_for(stopped.wait(), 2)
+                assert not runtime.state.listening and not request.done()
                 assert runtime.config.tts.model == "speech-2.8-hd"
+                busy = False
+                response = await asyncio.wait_for(request, 2)
+                assert response.status_code == 200, response.text
+                assert response.json()["pending"] is False
                 assert store.settings_only()["tts"]["online_voice_id"] == "clone-queued"
-                await runtime.stop_listening()
-                runtime.controller._active_input = False
-                await asyncio.wait_for(runtime._tts_update_task, 3)
             assert switched == [("minimax", "voxcpm2", "speech-2.8-turbo", "clone-queued")]
             assert runtime.config.tts.model == "speech-2.8-turbo"
             assert runtime.config.tts.voice_id == "clone-queued"
-            runtime.controller.start_listening.assert_not_awaited()
+            runtime.start_listening.assert_awaited_once()
+            assert runtime.state.listening
         finally:
             if getattr(runtime, "_tts_update_task", None) and not runtime._tts_update_task.done():
                 runtime._tts_update_task.cancel()

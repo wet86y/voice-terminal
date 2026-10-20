@@ -303,7 +303,7 @@ class HandoffRuntimeMixin:
                 self._voice_silence_anchor = None
                 return True
             finally:
-                if was_listening and self.controller is not None and not self._handoff_marker.exists():
+                if was_listening and self.controller is not None and not self._handoff_marker.exists() and not getattr(getattr(self, "_runtime_operations", None), "holds", 0):
                     await self.controller.start_listening()
 
     async def _commit_handoff(self, result: OrganizedHandoff, *, cleared_voice_event_ids: list[str] | None = None) -> None:
@@ -397,18 +397,22 @@ class HandoffRuntimeMixin:
     @asynccontextmanager
     async def _session_operation_scope(self, operation: str, *, _lock_held: bool = False):
         """session operation（手动会话操作）：完整事务期间向所有前端发布锁定状态。"""
+        from .runtime_operations import runtime_operations
+        runtime_operations(self).intent(False)  # 重置/清除撤销旧维护操作的自动恢复意图。
         if not _lock_held:
             async with self._session_lock:
                 async with self._session_operation_scope(operation, _lock_held=True):
                     yield
             return
-        self._session_operation = operation  # _session_operation（正在执行的重置或清除）。
-        try:
-            await self.bus.publish(self.snapshot())
-            yield
-        finally:
-            self._session_operation = None
-            await self.bus.publish(self.snapshot())
+        from .runtime_operations import runtime_operation
+        async with runtime_operation(self, "session", "重置会话" if operation == "reset" else "清除会话", phase="processing"):
+            self._session_operation = operation  # _session_operation（正在执行的重置或清除）。
+            try:
+                await self.bus.publish(self.snapshot())
+                yield
+            finally:
+                self._session_operation = None
+                await self.bus.publish(self.snapshot())
 
     async def _settle_session_for_archive(self) -> None:
         """归档前沿用现有结算和取消逻辑，等待语音与后台记录稳定。"""
@@ -450,7 +454,7 @@ class HandoffRuntimeMixin:
             await self._commit_handoff(result)
         finally:
             self._cleanup_in_progress = False
-            if was_listening and self.controller is not None and not self._handoff_marker.exists():
+            if was_listening and self.controller is not None and not self._handoff_marker.exists() and not getattr(getattr(self, "_runtime_operations", None), "holds", 0):
                 self.controller.set_reasoning_mode(self.reasoning_mode)
                 await self.controller.start_listening()
 
@@ -484,6 +488,6 @@ class HandoffRuntimeMixin:
                 self._voice_silence_anchor = None
             finally:
                 self._cleanup_in_progress = False
-                if was_listening and self.controller is not None and not self._handoff_marker.exists():
+                if was_listening and self.controller is not None and not self._handoff_marker.exists() and not getattr(getattr(self, "_runtime_operations", None), "holds", 0):
                     self.controller.set_reasoning_mode(self.reasoning_mode)
                     await self.controller.start_listening()

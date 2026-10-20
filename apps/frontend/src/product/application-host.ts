@@ -55,6 +55,7 @@ export interface ApplicationCapability {
 }
 
 export interface ApplicationSnapshot {
+  runtime_operations?: import('../runtime/runtime-operations').RuntimeOperation[] // 运行操作快照，重启期间由宿主持有。
   /** resource_processes（同次采样的去重进程）：component_id（所属组件），其余为进程资源指标。 */
   resource_processes?: Array<Pick<ApplicationComponent, 'pid' | 'created_at' | 'memory_rss_bytes' | 'memory_private_commit_bytes' | 'gpu_dedicated_bytes'> & { component_id: string }>
   /** instance_id（应用实例标识）。 */

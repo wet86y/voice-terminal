@@ -7,6 +7,7 @@ import logging
 from typing import Any, Mapping
 
 from .product import apply_settings_to_config
+from .runtime_operations import runtime_operation
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,6 @@ class ProductSettingsRuntimeMixin:
                                             self.config.model_dir, {"音频增强": requirements} if requirements else {})
             if issues:
                 raise ValueError("；".join(issues.values()))
-            self._enhancement_switching = True
-            self._enhancement_resume_requested = bool(self.state.listening)
             controller = self.controller
             analysis = AnalysisClient(self.config.smart_turn.analysis_url)
             changed = {"emotion": new.emotion, "acoustic": new.acoustic_events}
@@ -51,40 +50,47 @@ class ProductSettingsRuntimeMixin:
                     for key, enabled in selected.items():
                         if status.get(key, {}).get("status") != ("READY" if enabled else "DISABLED"):
                             raise RuntimeError(f"音频增强通道 {key} 未达到预期状态")
-            resume = False
-            try:
-                async with self._session_lock:
-                    if controller is not None:
-                        await controller.stop_listening()
-                await self.bus.publish(self.snapshot())
-                await apply(new)
-                if self.product_settings is not None:
-                    await asyncio.to_thread(self.product_settings.save_audio_enhancements, new.snapshot())
-                self.config = replace(self.config, audio_enhancements=new)
-                if controller is not None:
-                    controller.audio_enhancements = new
-                    if not new.acoustic_events:
-                        controller.perception["acoustic"].clear()
-                resume = True
-            except BaseException as failure:
+            self._enhancement_resume_requested = True
+            labels = {"dual_pass": "双路精修", "emotion": "情绪背景", "acoustic_events": "声学事件"}
+            label = "、".join(labels[key] for key in labels if getattr(new, key) != getattr(old, key))
+            async with runtime_operation(self, "audio_enhancements", label, pause=True) as operation:
+                self._enhancement_switching = True
                 try:
-                    await apply(old)
-                    resume = True
-                except Exception as rollback_error:
-                    logger.exception("音频增强恢复失败，保持停止监听")
-                    self._enhancement_resume_requested = False
-                    if not isinstance(failure, asyncio.CancelledError):
-                        raise RuntimeError(f"音频增强切换失败且恢复原模型失败，已停止监听：{rollback_error}") from failure
-                raise
-            finally:
-                self._enhancement_switching = False
-                if resume and self._enhancement_resume_requested and not getattr(self, "_closed", False):
-                    await self.start_listening()
-                await self.bus.publish(self.snapshot())
+                    await operation.update("loading")
+                    await apply(new)
+                    await operation.update("verifying")
+                    if self.product_settings is not None:
+                        await asyncio.to_thread(self.product_settings.save_audio_enhancements, new.snapshot())
+                    self.config = replace(self.config, audio_enhancements=new)
+                    if controller is not None:
+                        controller.audio_enhancements = new
+                        if not new.acoustic_events:
+                            controller.perception["acoustic"].clear()
+                except BaseException as failure:
+                    await operation.update("rolling_back")
+                    try:
+                        await apply(old)
+                    except Exception as rollback_error:
+                        logger.exception("音频增强恢复失败，保持停止监听")
+                        operation.prevent_resume()
+                        if not isinstance(failure, asyncio.CancelledError):
+                            raise RuntimeError(f"音频增强切换失败且恢复原模型失败，已停止监听：{rollback_error}") from failure
+                    raise
+                finally:
+                    self._enhancement_switching = False
+                    if not self._enhancement_resume_requested:
+                        operation.prevent_resume()
             return new.snapshot()
 
-    async def apply_product_settings(self, settings: Mapping[str, Any]) -> bool:
+    async def apply_product_settings(self, settings: Mapping[str, Any], *, label: str = "运行设置") -> bool:
         """apply_product_settings（即时应用）：保留当前输入、播放与会话历史。"""
+        async with runtime_operation(self, "product_settings", label) as operation:
+            applied = await self._apply_product_settings(settings)
+            if not applied:
+                operation.fail("运行设置应用失败")
+            return applied
+
+    async def _apply_product_settings(self, settings: Mapping[str, Any]) -> bool:
         async with self._session_lock:
             async with self._product_settings_lock:
                 self.stage_product_settings(settings)

@@ -9,8 +9,11 @@ from ..providers.minimax_tts import MiniMaxTtsClient
 from ..tts.voices import (VoiceLibraryError, ResolvedLocalTtsVoice, safe_voice_diagnostic,
                          DESIGN_INFERENCE_STEPS, DESIGN_GENERATION_RECIPE)
 from .product import PRODUCT_MINIMAX_TTS_MODELS
+from .runtime_operations import runtime_operation, runtime_operations
 
 DESIGN_SAMPLE_TEXT = "你好，很高兴认识你。现在开始测试这个音色，我会用自然的语气清楚地说话。"
+OPERATION_LABELS = {"preview": "音色生成与试音", "minimax_preview": "在线音色试听",
+                    "play": "样音播放", "transcribe": "参考音频转写"}
 
 
 def _collapsed_text(value: Any) -> str:
@@ -32,6 +35,7 @@ class VoiceOperation:
     result: Any = None  # result（生成素材与候选参数）。
     error: str | None = None  # error（可展示错误）。
     completed_monotonic: float | None = None  # 完成时刻，用于回收过期操作记录。
+    ticket: Any = None  # ticket（同步预约的运行操作）。
 
     def payload(self):
         return {"operation_id": self.id, "kind": self.kind, "state": self.state,
@@ -70,12 +74,34 @@ class TtsVoiceOperationManager:
         item = VoiceOperation(uuid4().hex, kind, dict(request))
         self._items[item.id] = item
         self._active_id = item.id
+        operations = runtime_operations(self.runtime)
+        item.ticket = operations.reserve("tts_voice", OPERATION_LABELS.get(kind, "音色操作"),
+                                         phase="processing", pause=kind != "transcribe")
         item.task = asyncio.create_task(self._run(item, runner), name=f"tts-voice-{kind}-{item.id}")
+        def completed(task):
+            if not item.ticket.started:
+                item.state = "cancelled"
+                item.completed_monotonic = time.monotonic()
+                if self._active_id == item.id:
+                    self._active_id = None
+                asyncio.create_task(operations.finish(item.ticket, asyncio.CancelledError()))
+        item.task.add_done_callback(completed)
         return item.payload()
 
     async def _run(self, item, runner):
+        def release():
+            if self._active_id == item.id:
+                self._active_id = None
         try:
-            result = await runner(item)
+            pause = item.kind != "transcribe"
+            async with runtime_operation(self.runtime, "tts_voice", OPERATION_LABELS.get(item.kind, "音色操作"),
+                                         phase="processing", pause=pause, wait_output=pause, on_release=release,
+                                         ticket=item.ticket):
+                try:
+                    result = await runner(item)
+                finally:
+                    if self._active_id == item.id:
+                        self._active_id = None
             if item.state != "cancelled":
                 item.result = result
                 item.state = "succeeded"
