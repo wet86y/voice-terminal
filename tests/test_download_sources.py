@@ -1,5 +1,6 @@
 """下载来源回归：使用本机响应，验证内容校验、原子替换及公开源隔离。"""
 import hashlib
+from io import BytesIO
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
@@ -68,6 +69,50 @@ def test_all_failures_keep_installed_file(tmp_path, server):
     assert target.read_bytes() == b"previous installation"
 
 
+@pytest.mark.parametrize("mirror_body", [b"angry\nneutral\n\n", b"tampered tokens\n"])
+def test_known_modelscope_token_variant_normalizes_or_falls_back(tmp_path, mirror_body):
+    canonical = b"angry\nneutral\n"
+    mirror = "https://modelscope.cn/api/v1/models/iic/emotion2vec_plus_base/repo?FilePath=tokens.txt"
+    origin = "https://huggingface.co/emotion2vec/emotion2vec_plus_base/resolve/rev/tokens.txt"
+    variant = {
+        "source_host": "modelscope.cn",
+        "size_bytes": len(canonical) + 1,
+        "sha256": hashlib.sha256(canonical + b"\n").hexdigest(),
+        "normalization": "remove_one_final_line_feed",
+    }
+    requests = []
+
+    class Response:
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def __init__(self, body):
+            self.body = BytesIO(body)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, size=-1):
+            return self.body.read(size)
+
+    def open_source(url, timeout):
+        requests.append(url)
+        assert timeout == 20
+        return Response(mirror_body if url == mirror else canonical)
+
+    target = tmp_path / "tokens.txt"
+    with patch.object(sources, "candidates", return_value=[mirror, origin]), \
+            patch.object(sources.urllib.request, "urlopen", side_effect=open_source):
+        result = sources.download(origin, target, sha256=hashlib.sha256(canonical).hexdigest(),
+                                  size=len(canonical), download_variants=[variant])
+
+    assert target.read_bytes() == canonical
+    assert result == hashlib.sha256(canonical).hexdigest()
+    assert requests == ([mirror] if mirror_body == canonical + b"\n" else [mirror, origin])
+
+
 def test_user_interrupt_never_tries_next_source(tmp_path):
     with patch.object(sources, "candidates", return_value=["https://mirror", "https://origin"]), patch.object(sources.urllib.request, "urlopen", side_effect=KeyboardInterrupt) as opening:
         with pytest.raises(KeyboardInterrupt):
@@ -90,15 +135,34 @@ def test_all_locked_resources_map_without_changing_identity():
                 if row.get("asset"):
                     continue
                 origin = f'https://huggingface.co/{spec["source"]["repo_id"]}/resolve/{spec["source"]["revision"]}/{row.get("source_path", row["path"])}'
-                if spec["source"].get("mirror_policy") == "origin_only":
-                    # 未核验相同摘要的镜像不能替换固定权重或声学类别表。
+                mirror_policy = spec["source"].get("mirror_policy")
+                candidates = sources.candidates(origin)
+                if mirror_policy == "modelscope_then_origin":
+                    assert spec["resource_id"] == "emotion2vec-plus-base"
+                    assert candidates[0].startswith("https://modelscope.cn/api/v1/models/iic/emotion2vec_plus_base/")
+                elif mirror_policy == "hf_mirror_then_origin":
+                    assert spec["resource_id"] == "yamnet"
+                    assert candidates[0].startswith("https://hf-mirror.net/audiomagic/yamnet-onnx/")
+                elif mirror_policy == "origin_only":
+                    # 未核验同摘要的镜像不能替换固定模型文件。
                     assert spec["resource_id"] in {"emotion2vec-plus-base", "yamnet"}
                     assert spec["source"].get("mirror_policy_zh")
-                    assert sources.candidates(origin) == [origin]
-                    assert len(spec["source"]["revision"]) == 40
+                    assert candidates == [origin]
                 else:
-                    assert sources.candidates(origin)[0].startswith("https://modelscope.cn/")
-                assert sources.candidates(origin)[-1] == origin
+                    assert candidates[0].startswith("https://modelscope.cn/")
+                assert candidates[-1] == origin
+                if spec["resource_id"] in {"emotion2vec-plus-base", "yamnet"}:
+                    assert spec["required"] is False
+                    assert spec["download_in_required_batch"] is False
+                    assert len(spec["source"]["revision"]) == 40
+                if spec["resource_id"] == "emotion2vec-plus-base":
+                    tokens = next(row for row in spec["files"] if row["path"] == "tokens.txt")
+                    assert tokens["download_variants"] == [{
+                        "source_host": "modelscope.cn",
+                        "size_bytes": 120,
+                        "sha256": "654625c18ef0f0583441a3b811c20904f2cf30febb716f32e14810b8e6bb715c",
+                        "normalization": "remove_one_final_line_feed",
+                    }]
     manifest = "https://github.com/wet86y/voice-terminal/releases/latest/download/update.json"
     assert sources.candidates(manifest) == [manifest]
     assert sources.candidates("https://private.example/resource") == ["https://private.example/resource"]

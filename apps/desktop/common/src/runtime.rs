@@ -158,7 +158,7 @@ pub fn plan(context:&LaunchContext,group:&str)->Result<Value,String>{
         "total_bytes":wheels.iter().map(|v|v["size"].as_u64().unwrap_or(0)).sum::<u64>()+lock["python"]["size"].as_u64().unwrap_or(0),
         "fields":{"group":"安装依赖组","resource_id":"运行依赖卡片编号","required":"是否为必需依赖","profile":"本次安装计算组合；处理器依赖更新保留已安装显卡组合","already_ready":"完整匹配可跳过","system_candidates":"可复用的官方解释器候选","accepted":"筛选通过","wheels":"本次完整环境的固定依赖包；含显卡时只替换张量框架与音频扩展","total_bytes":"未扣除复用的最大下载大小"}}))
 }
-fn spec(value:&Value)->Result<DownloadFile,String>{Ok(DownloadFile{url:value["url"].as_str().ok_or("依赖来源缺失")?.into(),size:value["size"].as_u64().ok_or("大小缺失")?,sha256:value["sha256"].as_str().ok_or("摘要缺失")?.into(),sha512:String::new(),path:value["file"].as_str().unwrap_or("python.zip").into()})}
+fn spec(value:&Value)->Result<DownloadFile,String>{Ok(DownloadFile{url:value["url"].as_str().ok_or("依赖来源缺失")?.into(),size:value["size"].as_u64().ok_or("大小缺失")?,sha256:value["sha256"].as_str().ok_or("摘要缺失")?.into(),sha512:String::new(),path:value["file"].as_str().unwrap_or("python.zip").into(),download_variants:vec![]})}
 fn valid_cached_with_progress(path:&Path,item:&Value,cancel:&AtomicBool,progress:&mut Progress)->Result<bool,String>{
     resources::check_cancel(cancel)?;
     if path.metadata().ok().map(|v|v.len())!=item["size"].as_u64(){return Ok(false);}

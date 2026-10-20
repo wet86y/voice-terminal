@@ -1,7 +1,8 @@
 //! Native download（原生下载）：静态 C ABI（C 调用接口）与固定摘要。
-use std::{ffi::{CString, c_void}, path::{Path,PathBuf}, sync::{mpsc,Arc,Mutex,Condvar, atomic::{AtomicBool,AtomicUsize, Ordering}},time::Duration};
+use std::{ffi::{CString, c_void}, fs, path::{Path,PathBuf}, sync::{mpsc,Arc,Mutex,Condvar, atomic::{AtomicBool,AtomicUsize, Ordering}},time::Duration};
 use serde::{Serialize, Deserialize};
 use base64::Engine;
+use sha2::{Digest,Sha256};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DownloadFile {
@@ -10,6 +11,15 @@ pub struct DownloadFile {
     #[serde(default)] pub sha256: String, // sha256（十六进制摘要）。
     #[serde(default)] pub sha512: String, // sha512（十六进制或 Base64 编码摘要）。
     #[serde(default)] pub path: String, // path（安装相对文件名）。
+    #[serde(default)] pub download_variants: Vec<DownloadVariant>, // download_variants（按下载来源接受的等价文件字节版本）。
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadVariant {
+    pub source_host: String, // source_host（适用下载来源域名）。
+    #[serde(rename="size_bytes")] pub size: u64, // size（等价文件字节数）。
+    pub sha256: String, // sha256（等价文件摘要）。
+    #[serde(default)] pub normalization: String, // normalization（校验后的固定规范化方式）。
 }
 
 type Callback = unsafe extern "C" fn(*mut c_void, i32, u64, u64, *const i8) -> i32; // Callback（阶段、字节及中文详情回调）。
@@ -129,9 +139,17 @@ fn download_candidates(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,ca
         if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
         let host=crate::download_sources::host(source);
         callback(&format!("下载来源：{host}"),0,file.size);
-        let mut candidate=file.clone();candidate.url=source.clone();
+        let candidate=candidate_for_source(file,source);
         match download_one(&candidate,target,cancel.clone(),callback,probe_limit,accelerated_github(file),None) {
-            Ok(value)=>return Ok(value),
+            Ok(value)=>{
+                if let Some(variant)=source_variant(file,source){
+                    if let Err(message)=normalize_download_variant(file,target,variant){
+                        callback(&format!("来源 {host} 规范化失败，{}：{message}",if selected.is_some(){"本轮结束，等待任务恢复"}else{"尝试备用来源"}),0,file.size);
+                        errors.push(format!("{host}：{message}"));continue;
+                    }
+                }
+                return Ok(value);
+            }
             Err(error)=>{
                 if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
                 if error.kind!=DownloadErrorKind::Source{return Err(error.message);}
@@ -141,6 +159,37 @@ fn download_candidates(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,ca
         }
     }
     Err(format!("{}：{}",if selected.is_some(){"本轮下载来源失败"}else{"所有下载来源均失败"},errors.join("；")))
+}
+
+fn candidate_for_source(file:&DownloadFile,source:&str)->DownloadFile{
+    let mut candidate=file.clone();candidate.url=source.to_owned();
+    if let Some(variant)=source_variant(file,source){
+        candidate.size=variant.size;candidate.sha256=variant.sha256.clone();candidate.sha512.clear();
+    }
+    candidate
+}
+fn source_variant<'a>(file:&'a DownloadFile,source:&str)->Option<&'a DownloadVariant>{
+    let host=crate::download_sources::host(source);
+    file.download_variants.iter().find(|variant|variant.source_host.eq_ignore_ascii_case(host))
+}
+fn normalize_download_variant(file:&DownloadFile,target:&Path,variant:&DownloadVariant)->Result<(),String>{
+    if variant.normalization!="remove_one_final_line_feed"{return Err("未支持的等价下载版本规范化方式".into());}
+    let actual_size=target.metadata().map_err(|e|e.to_string())?.len();
+    let actual_sha=crate::workspace::file_hash(target)?;
+    if actual_size==file.size&&actual_sha==file.sha256{return Ok(());}
+    if actual_size!=variant.size||actual_sha!=variant.sha256||actual_size!=file.size.saturating_add(1)||actual_size>4096{
+        return Err("已下载的等价文件未匹配固定字节版本".into());
+    }
+    let bytes=fs::read(target).map_err(|e|e.to_string())?;
+    if bytes.last()!=Some(&b'\n')||format!("{:x}",Sha256::digest(&bytes[..bytes.len()-1]))!=file.sha256{
+        return Err("等价文件去除末尾换行后未匹配固定文件".into());
+    }
+    let output=fs::OpenOptions::new().write(true).open(target).map_err(|e|e.to_string())?;
+    output.set_len(file.size).map_err(|e|e.to_string())?;output.sync_all().map_err(|e|e.to_string())?;
+    if target.metadata().map_err(|e|e.to_string())?.len()!=file.size||crate::workspace::file_hash(target)?!=file.sha256{
+        return Err("等价文件规范化后未匹配固定文件".into());
+    }
+    Ok(())
 }
 fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64,accelerate:bool,routing:Option<&str>)->Result<u64,DownloadError>{
     if !(file.url.starts_with("https://") || (cfg!(feature="qualification") && file.url.starts_with("http://127.0.0.1:"))) {
@@ -271,6 +320,35 @@ pub fn download_batch(files:&[(DownloadFile,PathBuf)],cancel:Arc<AtomicBool>,cal
 #[path = "download_github_tests.rs"]
 mod github_tests;
 
+#[cfg(test)]
+mod source_variant_tests {
+    use super::*;
+
+    #[test]
+    fn source_variant_is_scoped_to_its_host_and_keeps_upstream_fallback_lock(){
+        let file=DownloadFile{url:"https://huggingface.co/example/model/resolve/rev/tokens.txt".into(),size:119,
+            sha256:"a".repeat(64),sha512:String::new(),path:"tokens.txt".into(),download_variants:vec![DownloadVariant{
+                source_host:"modelscope.cn".into(),size:120,sha256:"b".repeat(64),normalization:"remove_one_final_line_feed".into()}]};
+        let mirror=candidate_for_source(&file,"https://modelscope.cn/api/v1/models/example/repo?FilePath=tokens.txt");
+        assert_eq!(mirror.size,120);assert_eq!(mirror.sha256,"b".repeat(64));assert_eq!(mirror.url,"https://modelscope.cn/api/v1/models/example/repo?FilePath=tokens.txt");
+        let upstream=candidate_for_source(&file,&file.url);
+        assert_eq!(upstream.size,119);assert_eq!(upstream.sha256,"a".repeat(64));
+    }
+
+    #[test]
+    fn verified_final_line_feed_variant_is_normalized_to_fixed_content(){
+        let root=std::env::temp_dir().join(format!("voice-download-variant-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let canonical=b"angry\nneutral\n";let variant_bytes=[&canonical[..],b"\n"].concat();let target=root.join("tokens.txt");fs::write(&target,&variant_bytes).unwrap();
+        let file=DownloadFile{url:"https://huggingface.co/emotion2vec/model/resolve/rev/tokens.txt".into(),size:canonical.len() as u64,
+            sha256:format!("{:x}",Sha256::digest(canonical)),sha512:String::new(),path:"tokens.txt".into(),download_variants:vec![]};
+        let variant=DownloadVariant{source_host:"modelscope.cn".into(),size:variant_bytes.len() as u64,
+            sha256:format!("{:x}",Sha256::digest(&variant_bytes)),normalization:"remove_one_final_line_feed".into()};
+        normalize_download_variant(&file,&target,&variant).unwrap();
+        assert_eq!(fs::read(&target).unwrap(),canonical);assert_eq!(crate::workspace::file_hash(&target).unwrap(),file.sha256);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[cfg(all(test, windows, feature = "qualification"))]
 mod tests {
     use super::*;
@@ -288,7 +366,7 @@ mod tests {
             let(mut socket,_)=listener.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
             write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();
         });
-        let file=DownloadFile{url:format!("http://{address}/shared.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"shared.bin".into()};
+        let file=DownloadFile{url:format!("http://{address}/shared.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"shared.bin".into(),download_variants:vec![]};
         std::thread::scope(|scope|{let first=scope.spawn(||download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0));
             let second=scope.spawn(||download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0));
             assert!(first.join().unwrap().is_ok());assert!(second.join().unwrap().is_ok());});
@@ -299,7 +377,7 @@ mod tests {
     fn locked_local_promotion_does_not_retry_other_sources(){
         let root=std::env::temp_dir().join(format!("voice-download-local-error-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
         let target=root.join("same.bin");let part=target.with_extension("bin.part");let body=b"verified complete partial";
-        let file=DownloadFile{url:"http://127.0.0.1:1/same.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"same.bin".into()};
+        let file=DownloadFile{url:"http://127.0.0.1:1/same.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"same.bin".into(),download_variants:vec![]};
         fs::write(&part,body).unwrap();fs::write(target.with_extension("bin.part.identity"),format!("{}:sha256:{}",file.size,file.sha256)).unwrap();
         let held=fs::OpenOptions::new().read(true).share_mode(3).open(&part).unwrap();let mut sources=0;
         let error=download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase.starts_with("下载来源："){sources+=1;}},0,&[file.url.clone(),"http://127.0.0.1:2/same.bin".into()]).unwrap_err();
@@ -315,7 +393,7 @@ mod tests {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
         let server=std::thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
             write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();});
-        let file=DownloadFile{url:format!("http://{address}/upgrade.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"upgrade.bin".into()};
+        let file=DownloadFile{url:format!("http://{address}/upgrade.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"upgrade.bin".into(),download_variants:vec![]};
         let mut verified_before_replace=false;
         download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase=="校验下载文件"{assert_eq!(fs::read(&target).unwrap(),old);verified_before_replace=true;}},0).unwrap();
         server.join().unwrap();assert!(verified_before_replace);assert_eq!(fs::read(&target).unwrap(),body);
@@ -325,16 +403,16 @@ mod tests {
     use std::{os::windows::fs::OpenOptionsExt, time::Duration};
 
     #[test]
-    fn mirror_bad_digest_falls_back_and_cancel_stops_before_next_source(){
+    fn mirror_bad_size_or_digest_falls_back_and_cancel_stops_before_next_source(){
         let root=std::env::temp_dir().join(format!("voice-mirror-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
         let body=b"verified resource";let expected=format!("{:x}",Sha256::digest(body));
         let mut sources=vec![];let mut servers=vec![];
-        for payload in [b"incorrect content".to_vec(),body.to_vec()] {
+        for payload in [b"incorrect content".to_vec(),b"verified resource\n".to_vec(),body.to_vec()] {
             let server=TcpListener::bind("127.0.0.1:0").unwrap();sources.push(format!("http://{}/model.bin",server.local_addr().unwrap()));
             servers.push(std::thread::spawn(move||{let(mut socket,_)=server.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
                 write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",payload.len(),payload.len()-1,payload.len()).unwrap();socket.write_all(&payload).unwrap();}));
         }
-        let file=DownloadFile{url:sources[1].clone(),size:body.len() as u64,sha256:expected,sha512:String::new(),path:"model.bin".into()};
+        let file=DownloadFile{url:sources[2].clone(),size:body.len() as u64,sha256:expected,sha512:String::new(),path:"model.bin".into(),download_variants:vec![]};
         let target=root.join("download.bin");let mut phases=vec![];
         download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|phases.push(phase.to_owned()),0,&sources).unwrap();
         for server in servers{server.join().unwrap();}
@@ -353,7 +431,7 @@ mod tests {
             let mut request=[0;4096];socket.read(&mut request).unwrap();
             write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();});
         let sources=vec!["http://127.0.0.1:1/unavailable".to_owned(),format!("http://{address}/model")];
-        let file=DownloadFile{url:sources[0].clone(),path:"model.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new()};
+        let file=DownloadFile{url:sources[0].clone(),path:"model.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),download_variants:vec![]};
         let target=root.join("model.bin");
         let first=with_attempt(Some(1),||download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0,&sources));
         assert!(first.unwrap_err().contains("本轮下载来源失败"));assert!(!called.load(Ordering::Acquire));assert_eq!(current_attempt(),None);
@@ -365,7 +443,7 @@ mod tests {
     fn cached_hash_reports_progress_and_cancels_without_touching_verified_file(){
         let root=std::env::temp_dir().join(format!("voice-download-摘要取消-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
         let body=vec![42u8;8*1024*1024];let target=root.join("缓存.bin");fs::write(&target,&body).unwrap();
-        let file=DownloadFile{url:"http://127.0.0.1:1/cache.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(&body)),sha512:String::new(),path:"cache.bin".into()};
+        let file=DownloadFile{url:"http://127.0.0.1:1/cache.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(&body)),sha512:String::new(),path:"cache.bin".into(),download_variants:vec![]};
         let cancel=Arc::new(AtomicBool::new(false));let mut phases=vec![];let started=std::time::Instant::now();
         let result=download_with_progress(&file,&target,cancel.clone(),&mut|phase,done,_|{
             phases.push(phase.to_owned());if phase=="校验现有下载缓存"&&done>=1024*1024{cancel.store(true,Ordering::Release);}
@@ -381,7 +459,7 @@ mod tests {
         let (arrived,accepted)=mpsc::channel();let (release,wait)=mpsc::channel();
         let server=std::thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();arrived.send(()).unwrap();let _=wait.recv_timeout(Duration::from_secs(3));});
         let root=std::env::temp_dir().join(format!("voice-download-网络停滞-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();let target=root.join("model.bin");
-        let file=DownloadFile{url:format!("http://{address}/model.bin"),size:1024,sha256:format!("{:x}",Sha256::digest(vec![1u8;1024])),sha512:String::new(),path:"model.bin".into()};
+        let file=DownloadFile{url:format!("http://{address}/model.bin"),size:1024,sha256:format!("{:x}",Sha256::digest(vec![1u8;1024])),sha512:String::new(),path:"model.bin".into(),download_variants:vec![]};
         let cancel=Arc::new(AtomicBool::new(false));let flag=cancel.clone();
         let trigger=std::thread::spawn(move||{accepted.recv_timeout(Duration::from_secs(3)).unwrap();let start=std::time::Instant::now();flag.store(true,Ordering::Release);start});
         let result=download(&file,&target,cancel,&mut|_,_|{},0);let started=trigger.join().unwrap();
@@ -398,7 +476,7 @@ mod tests {
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",content.len()).unwrap();let _=socket.write_all(&content);
         }requests});
         let root=std::env::temp_dir().join(format!("voice-download-无范围-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();let target=root.join("large.bin");
-        let file=DownloadFile{url:format!("http://{address}/large.bin"),size:body.len() as u64,sha256:expected.clone(),sha512:String::new(),path:"large.bin".into()};
+        let file=DownloadFile{url:format!("http://{address}/large.bin"),size:body.len() as u64,sha256:expected.clone(),sha512:String::new(),path:"large.bin".into(),download_variants:vec![]};
         fs::write(target.with_extension("bin.part"),vec![99u8;1024*1024]).unwrap();fs::write(target.with_extension("bin.part.identity"),format!("{}:sha256:{}",file.size,expected)).unwrap();
         download(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_|{},0).unwrap();let requests=server.join().unwrap();
         assert!(requests[0].contains("Range: bytes=1048576-"));assert!(!requests[1].contains("Range:"));assert_eq!(crate::workspace::file_hash(&target).unwrap(),expected);
@@ -419,7 +497,7 @@ mod tests {
         }for worker in workers{worker.join().unwrap();}});
         let root=std::env::temp_dir().join(format!("voice-download-并行-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
         let files=(0u8..12).map(|index|{let name=format!("{index}.bin");let body=vec![index;256*1024];
-            (DownloadFile{url:format!("http://{address}/{name}"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(&body)),sha512:String::new(),path:name.clone()},root.join(name))}).collect::<Vec<_>>();
+            (DownloadFile{url:format!("http://{address}/{name}"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(&body)),sha512:String::new(),path:name.clone(),download_variants:vec![]},root.join(name))}).collect::<Vec<_>>();
         std::thread::scope(|scope|{let mut workers=vec![];for batch in files.chunks(6){workers.push(scope.spawn(move||{
             let caller=std::thread::current().id();let mut samples=vec![];
             download_batch(batch,Arc::new(AtomicBool::new(false)),&mut|phase,done,total|{assert_eq!(std::thread::current().id(),caller);assert!(done<=total);samples.push((phase.to_owned(),done,total));}).unwrap();
@@ -452,7 +530,7 @@ mod tests {
         let part = target.with_extension("whl.part"); // part（下载暂存文件）。
         let checkpoint = target.with_extension("whl.part.identity"); // checkpoint（固定大小及摘要断点）。
         let file = DownloadFile { url: format!("http://{address}/dependency.whl"), size: body.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into(),download_variants:vec![] };
         let mut release = None; // release（模拟其他进程短暂占用后释放句柄）。
         let result = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |done, _| {
             if done == file.size && release.is_none() {
@@ -486,7 +564,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();let target = root.join("dependency.whl");
         let part = target.with_extension("whl.part");let checkpoint = target.with_extension("whl.part.identity");
         let file = DownloadFile { url: "http://127.0.0.1:1/dependency.whl".into(), size: body.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into(),download_variants:vec![] };
         fs::write(&part, body).unwrap();fs::write(&checkpoint, format!("{}:sha256:{}", file.size, file.sha256)).unwrap();
         fs::write(&target, b"keep previous cache").unwrap();
         let held = fs::OpenOptions::new().read(true).share_mode(3).open(&part).unwrap();
@@ -510,7 +588,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();let target = root.join("dependency.whl");
         let part = target.with_extension("whl.part");let checkpoint = target.with_extension("whl.part.identity");
         let file = DownloadFile { url: "http://127.0.0.1:1/dependency.whl".into(), size: body.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into(),download_variants:vec![] };
         fs::write(&part, body).unwrap();fs::write(&checkpoint, format!("{}:sha256:{}", file.size, file.sha256)).unwrap();
         fs::write(&target, b"keep previous cache").unwrap();
         let held = fs::OpenOptions::new().read(true).share_mode(3).open(&target).unwrap();
@@ -539,8 +617,8 @@ mod tests {
             });
             let root = std::env::temp_dir().join(format!("voice-download-{}", crate::workspace::new_id()));
             fs::create_dir_all(&root).unwrap();let target = root.join("model.bin");
-            let file = DownloadFile { url: format!("http://{address}/model.bin"), size: body.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "model.bin".into() };
+        let file = DownloadFile { url: format!("http://{address}/model.bin"), size: body.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "model.bin".into(),download_variants:vec![] };
             let mut samples = vec![];
             let result = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |done, total| samples.push((done, total)), 0);
             assert_eq!(result.is_ok(), valid);

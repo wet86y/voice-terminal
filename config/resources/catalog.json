@@ -782,6 +782,7 @@
       "destination": "analysis/emotion2vec-plus-base",
       "version": "b318240bfe67db81a8c572ecb37ce9c3759b81c9",
       "required": false,
+      "download_in_required_batch": false,
       "source": {
         "platform": "huggingface",
         "repo_id": "emotion2vec/emotion2vec_plus_base",
@@ -791,8 +792,8 @@
         "transfer": {
           "kind": "fixed_resolve_http"
         },
-        "mirror_policy": "origin_only",
-        "mirror_policy_zh": "仅使用已核验的固定上游版本；未登记相同摘要的 ModelScope（魔搭）镜像。"
+        "mirror_policy": "modelscope_then_origin",
+        "mirror_policy_zh": "优先使用固定提交的 ModelScope（魔搭）副本；每个文件按固定版本或已登记的等价字节版本校验，其他情况回退固定上游。tokens.txt（标签表）的已知末尾换行差异会校验后规范化。"
       },
       "files": [
         {
@@ -813,7 +814,15 @@
         {
           "path": "tokens.txt",
           "size_bytes": 119,
-          "sha256": "866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f"
+          "sha256": "866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f",
+          "download_variants": [
+            {
+              "source_host": "modelscope.cn",
+              "size_bytes": 120,
+              "sha256": "654625c18ef0f0583441a3b811c20904f2cf30febb716f32e14810b8e6bb715c",
+              "normalization": "remove_one_final_line_feed"
+            }
+          ]
         }
       ]
     },
@@ -824,6 +833,7 @@
       "destination": "analysis/yamnet",
       "version": "f25b741c2f0bdc6d7e6db24b5fddda23347dbafd",
       "required": false,
+      "download_in_required_batch": false,
       "source": {
         "platform": "huggingface",
         "repo_id": "audiomagic/yamnet-onnx",
@@ -833,8 +843,8 @@
         "transfer": {
           "kind": "fixed_resolve_http"
         },
-        "mirror_policy": "origin_only",
-        "mirror_policy_zh": "仅使用已核验的固定上游版本；未登记相同摘要的 ModelScope（魔搭）镜像。"
+        "mirror_policy": "hf_mirror_then_origin",
+        "mirror_policy_zh": "优先经 hf-mirror.net（社区加速代理）获取固定上游文件；每个文件仍按锁定大小与摘要校验，失败回退固定 Hugging Face（模型托管平台）上游。"
       },
       "files": [
         {
@@ -865,10 +875,14 @@
     "path": "来源和安装目录内的相对文件路径",
     "size_bytes": "预期文件字节数",
     "sha256": "文件 SHA-256（摘要）十六进制值",
+    "download_variants": "仅限指定来源的已知等价文件字节版本及校验规则",
+    "source_host": "此等价文件版本适用的下载来源域名",
+    "normalization": "校验通过后执行的固定内容规范化方式",
     "optional": "是否为可选文件",
     "asset": "程序随包携带的生成文件相对路径",
     "dependency_group": "安装或更新该资源前配置的专用运行依赖组",
     "required": "是否为整体语音服务必需资源；管理页可先运行以完成安装或更新",
+    "download_in_required_batch": "是否在必需或初次下载批次中自动下载；false 表示可由用户单独下载，不阻塞基础服务",
     "generated_assets": "由程序本身提供或生成的文件说明",
     "transfer": "下载任务使用的固定传输适配器",
     "artifact": "固定远端安装文件说明",
