@@ -249,6 +249,8 @@ npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapt
 
 现场检查 `SECONDARY_MAILBOX_ENQUEUED`（二等状态登记）、`SECONDARY_MAILBOX_CONSUMED`（二等版本消费）、`SECONDARY_MAILBOX_DISPATCHED`（二等评估派发）、`SHADOW_INFORMATION`（影子信息事件）、`SHADOW_INFORMATION_CONSUMED`（影子信息认领）与 `LLM_DISPATCHED`（模型请求派发）的数量和版本；确认进度不立即唤醒模型，重复正文不重新登记，普通请求消费后不会随后再触发二等请求。检查讲话和退避跳过后状态保留、暂停不补发、同一内容不从两个入口重复触发、最终检查优先且二等评估不重置静默期限。终态和激活失效应清理进度，每次激活仍只接受一个终态。
 
+声学信箱另外验证无转写场景：激活会话并启动静默窗口后，不提供任何 ASR（语音识别）文本，只输入可识别环境声音，确认每秒入箱，在有效四秒检查点发起一次二等推理；关闭影子代理仍须成立。再验证普通请求提前消费、讲话或忙碌跳过、最终静默优先以及声音入箱不重置期限。声学观察应出现在 `runtime.acoustic_events`（待消费声音观察列表），不伪装为影子进度；情绪单标签持续更新不增加请求次数。回归入口为 `tests/test_audio_enhancements.py`（音频增强契约测试），实测见[音频增强验收记录](audio-enhancements-20261020.md)。
+
 协议结构、会话迁移要求、本次自动化测试结果和隔离 HTTP（超文本传输协议）验收边界见 [Bridge 2.0 可替换信息协议](../architecture/bridge-2.0-protocol.md)。现场端到端验收从 `SessionRuntime.start_listening()`（启动 Voice 输入会话）进入；若要验证真实模型推理，必须在启动服务后观察实际模型请求和语音端决策，不能将请求消息构造测试视为模型实测。
 
 ## Shadow 验收

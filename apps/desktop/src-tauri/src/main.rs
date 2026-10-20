@@ -5,7 +5,7 @@ mod initialization;
 #[cfg(feature="qualification")] mod qualification;
 mod environment_commands;
 mod credential_commands;
-use credential_commands::{model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save};
+use credential_commands::{model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save,audio_enhancements_settings};
 use initialization::{desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init};
 use environment_commands::{resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide};
 use std::{
@@ -1451,7 +1451,7 @@ fn run() -> Result<(), String> {
             exit_application,
             focus_main,
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
-            model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save,
+            model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
             workspace_info,workspace_choose,workspace_link,workspace_migrate,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
             resource_inventory,resource_jobs,resource_download,resource_download_required,resource_import,resource_import_confirm,resource_open_source,resource_cancel
@@ -1628,7 +1628,7 @@ mod tests {
     fn startup_credentials_are_authorized_only_for_owned_local_windows() {
         let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         let authority = context.runtime_authority_mut(); // authority（实际编译的桌面权限解析器）。
-        for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
+        for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "audio_enhancements_settings", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
             for window in ["main", "startup"] {
                 assert!(authority.resolve_access(command, window, window, &tauri::ipc::Origin::Local).is_some(), "启动前密钥命令缺少权限：{command}");
             }
@@ -1644,7 +1644,7 @@ mod tests {
             let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
             let authority = context.runtime_authority_mut();
             authority.add_capability(frontend_capability(mode, "http://127.0.0.1:45001", 7).to_string()).unwrap();
-            for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
+            for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "audio_enhancements_settings", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
                 let owned = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap() }; // owned（当前实例业务页面）。
                 assert_eq!(authority.resolve_access(command, "main", "main", &owned).is_some(), mode == FrontendMode::Product);
                 assert!(authority.resolve_access(command, "startup", "startup", &owned).is_none());

@@ -17,6 +17,21 @@ const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
+const enhancementBusy = ref(false) // enhancementBusy（增强切换事务进行中）。
+const enhancementError = ref('') // enhancementError（切换或回滚失败原因）。
+type EnhancementKey = 'dual_pass' | 'emotion' | 'acoustic_events'
+function enhancement(key: EnhancementKey, label: string) {
+  return { label, enabled: settings.audio_enhancements?.[key] !== false, busy: enhancementBusy.value,
+    toggle: async () => {
+      enhancementBusy.value = true; enhancementError.value = ''
+      try {
+        const response = await productApi.saveAudioEnhancements({ [key]: settings.audio_enhancements?.[key] === false })
+        settings.audio_enhancements = response.settings
+        await refreshComputeStatus(true)
+      } catch (failure) { enhancementError.value = failure instanceof Error ? failure.message : String(failure) }
+      finally { enhancementBusy.value = false }
+    } }
+}
 const providerLoading = ref(true) // providerLoading（正在读取在线服务配置状态）。
 const providerSaving = ref(false) // providerSaving（正在保存在线服务密钥）。
 const providerConfigured = ref({ deepseek: false, minimax: false }) // providerConfigured（只含配置状态，不含密钥正文）。
@@ -27,10 +42,10 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
   voice_vad: 'fsmn-vad',
   campplus: 'campplus-zh-cn-common',
   smart_turn: 'smart-turn',
-  sensevoice: 'sensevoice-small',
+  emotion: 'emotion2vec-plus-base',
 }
-// deviceSelectableModelIds（可切换 CPU／GPU 的模型）：只有 Paraformer、SenseVoice（精修模型）与 CAM++ 支持此设置。
-const deviceSelectableModelIds = new Set<ProductLocalModelId>(['paraformer', 'sensevoice', 'campplus'])
+// deviceSelectableModelIds（可切换 CPU／GPU 的模型）：Paraformer（识别）、emotion2vec+ base（情绪）与 CAM++（声纹）。
+const deviceSelectableModelIds = new Set<ProductLocalModelId>(['paraformer', 'emotion', 'campplus'])
 // availableModelServices（可用模型状态）：与后端就绪契约一致，工作中的状态同样可用。
 // READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
 const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
@@ -96,7 +111,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
     const managed = managedResource(modelResourceIds[item.id])
-    const sharedEstimate = ['kws', 'voice_vad', 'smart_turn'].includes(item.id)
+    const sharedEstimate = ['kws', 'voice_vad', 'smart_turn', 'emotion'].includes(item.id)
     const countedHere = !sharedEstimate || resources.value.has(item.id)
     const metrics = resources.value.get(sharedEstimate ? item.id : owners[item.id])
     const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
@@ -116,9 +131,10 @@ const rows = computed<LocalComponentRow[]>(() => {
     const available = !updateRequired && !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
-    const category: LocalComponentCategory = ['paraformer', 'sensevoice', 'smart_turn'].includes(item.id) ? 'speech' : 'extensions'
+    const category: LocalComponentCategory = ['paraformer', 'smart_turn'].includes(item.id) ? 'speech' : 'extensions'
     return {
       id: item.id, name: item.title, category,
+      enhancement: item.id === 'paraformer' ? enhancement('dual_pass', '双路精修') : item.id === 'emotion' ? enhancement('emotion', '情绪背景') : undefined,
       state: updateRequired ? 'failed' : available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
       status: updateRequired ? '需更新' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
       available, retryable: !updateRequired && !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
@@ -135,10 +151,14 @@ const rows = computed<LocalComponentRow[]>(() => {
       description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: sharedEstimate ? countedHere ? '加载与预热的内存增量估算，已从所属进程扣除；共享运行库与后续缓存仍计入进程余量。' : '尚无加载增量采样，资源暂计入所属进程。' : '所属进程当前余量；已扣除单列模型的加载增量估算，显存仍按进程计量。',
       facts: [
+        ...(item.id === 'paraformer' && computeStatus.value?.auxiliary?.dual_pass?.load_error ? [{ label: '离线精修错误', value: computeStatus.value.auxiliary.dual_pass.load_error }] : []),
+        ...(item.id === 'emotion' ? [{ label: '情绪模型加载增量', value: formatComponentMemory(status?.resource_footprint?.rss_bytes) || "未采样" }] : []),
+        ...(item.id === 'paraformer' ? [{ label: '离线精修设备', value: '跟随主识别' }, { label: '双路精修', value: serviceLabel(computeStatus.value?.auxiliary?.dual_pass?.service) }, { label: '离线模型加载增量', value: formatComponentMemory(computeStatus.value?.auxiliary?.dual_pass?.resource_footprint?.rss_bytes) || "未采样" }] : []),
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
       resource: managed,
+      resourceChoices: item.id === 'paraformer' ? [managedResource('paraformer-offline')].filter((row): row is ManagedResourceRow => Boolean(row)) : undefined,
       ...(deviceSelectableModelIds.has(item.id) ? { device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
         locked: updateRequired || !available || !status || refreshing.value,
@@ -151,6 +171,36 @@ const rows = computed<LocalComponentRow[]>(() => {
         hint: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
       } } : {}),
     }
+  })
+  const acoustic = computeStatus.value?.auxiliary?.acoustic_events
+  const acousticMetrics = resources.value.get('acoustic_events')
+  const acousticOwner = componentFor('analysis')
+  const analysisMetrics = resources.value.get('analysis')
+  const analysisLoading = Boolean(acousticOwner?.retrying || ['waiting', 'starting', 'stopping'].includes(acousticOwner?.state ?? ''))
+  const analysisAvailable = ['ready', 'external'].includes(acousticOwner?.state ?? '')
+  models.push({ id: 'analysis-runtime', name: '音频分析共享运行环境', category: 'extensions',
+    state: analysisLoading ? 'loading' : analysisAvailable ? 'ready' : 'disabled',
+    status: analysisLoading ? '启动中' : analysisAvailable ? '运行中' : '未运行', available: analysisAvailable,
+    runtime: '情绪、声学事件与结束判断共用进程',
+    description: '显示框架与后续缓存的进程余量；各模型加载增量单列，进程显存只在此计一次。',
+    residentMemory: formatComponentMemory(analysisMetrics?.memory_rss_bytes),
+    privateMemory: formatComponentMemory(analysisMetrics?.memory_private_commit_bytes),
+    vram: analysisMetrics?.gpu_dedicated_bytes ? formatComponentMemory(analysisMetrics.gpu_dedicated_bytes) : undefined,
+    resourceBytes: { resident: analysisMetrics?.memory_rss_bytes ?? undefined,
+      privateCommit: analysisMetrics?.memory_private_commit_bytes ?? undefined,
+      vram: analysisMetrics?.gpu_dedicated_bytes ?? undefined },
+    facts: acousticOwner?.pid ? [{ label: '进程标识', value: String(acousticOwner.pid) }] : [],
+  })
+  const acousticLoading = Boolean(acousticOwner?.retrying || ['waiting', 'starting', 'stopping'].includes(acousticOwner?.state ?? '') || !acoustic && application.snapshot.value?.startup_complete === false)
+  models.push({ id: 'yamnet', name: 'YAMNet（声学事件）', category: 'extensions',
+    state: acousticLoading ? 'loading' : acoustic?.service === 'READY' ? 'ready' : acoustic?.service === 'DISABLED' ? 'disabled' : 'failed',
+    status: acousticLoading ? '启动中' : serviceLabel(acoustic?.service), available: !acousticLoading && acoustic?.service === 'READY',
+    runtime: acoustic?.runtime || 'ONNX Runtime（推理引擎）', location: 'CPU（中央处理器）',
+    description: '每秒更新声学信箱；连续相同事件组合延长时间，普通请求和四秒检查均可消费。',
+    enhancement: enhancement('acoustic_events', '声学事件'), resource: managedResource('yamnet'),
+    error: acoustic?.load_error || undefined, facts: [],
+    residentMemory: formatComponentMemory(acousticMetrics?.memory_rss_bytes),
+    resourceBytes: { resident: acousticMetrics?.memory_rss_bytes ?? undefined },
   })
   for (const [id, name, ownerId] of [
     ['hotwords', '热词修订（音素匹配）', 'voice'],
@@ -385,7 +435,7 @@ const model = computed<LocalComponentsModel>(() => {
     resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
       || props.resourceController?.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
     resourceBatchRetry: props.resourceController?.resourceJobs.value.some(job => job.resource_id === 'batch' && job.state === 'failed') ?? false,
-    rows: rows.value, error: application.error.value, refreshing: refreshing.value,
+    rows: rows.value, error: enhancementError.value || application.error.value, refreshing: refreshing.value,
   }
 })
 async function refresh() {

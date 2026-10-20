@@ -212,6 +212,39 @@ class AsrWorkerClient:
         )
         self._last_log_at_by_turn.pop(turn_id, None)
 
+    async def configure_enhancements(self, dual_pass: bool) -> dict:
+        """configure_enhancements（停止监听后的模型切换请求）。"""
+        await self.connect()
+        request_id = uuid.uuid4().hex
+        waiter = asyncio.get_running_loop().create_future()
+        self._health_waiters[request_id] = waiter
+        try:
+            await self._send({"type": "enhancements.configure", "request_id": request_id,
+                              "dual_pass": dual_pass})
+            result = await asyncio.wait_for(waiter, 240)
+            if result.get("type") == "error":
+                raise AsrWorkerError(str(result.get("message")))
+            return result
+        finally:
+            self._health_waiters.pop(request_id, None)
+
+    async def transcribe_reference(self, pcm: bytes) -> dict:
+        """transcribe_reference（人工上传参考音频转写），与实时 VAD（语音活动检测）路线分离。"""
+        import base64
+        await self.connect()
+        request_id = uuid.uuid4().hex
+        waiter = asyncio.get_running_loop().create_future()
+        self._health_waiters[request_id] = waiter
+        try:
+            await self._send({"type": "reference.transcribe", "request_id": request_id,
+                              "turn_id": request_id, "pcm_base64": base64.b64encode(pcm).decode("ascii")})
+            response = await asyncio.wait_for(waiter, 30)
+            if response.get("type") == "error":
+                raise AsrWorkerError(str(response.get("message")))
+            return response["result"]
+        finally:
+            self._health_waiters.pop(request_id, None)
+
     async def health(self, timeout_s: float = 2.0) -> dict[str, Any]:
         """Perform an application-level readiness check.
 

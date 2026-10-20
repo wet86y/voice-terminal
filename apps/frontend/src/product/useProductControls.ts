@@ -175,9 +175,9 @@ export function useProductControls() {
       detail: "实时语音识别工作进程。",
     },
     {
-      id: "sensevoice",
-      title: "SenseVoiceSmall（语音识别与分析）",
-      detail: "包含同设备运行的内部 FSMN-VAD（语音活动检测）。",
+      id: "emotion",
+      title: "emotion2vec+ base（情绪背景）",
+      detail: "每 400 毫秒更新一个情绪背景标签，不触发推理。",
     },
     {
       id: "voice_vad",

@@ -73,30 +73,30 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
     asyncio.run(scenario())
 
 
-def test_reference_transcription_reuses_current_refine_lane_without_rewriting(tmp_path, monkeypatch):
+def test_reference_transcription_reuses_paraformer_without_rewriting(tmp_path, monkeypatch):
     calls = []
-    class Analysis:
+    class Asr:
         def __init__(self, url):
             calls.append(("url", url))
-        async def health(self):
-            return {"refine": {"status": "READY", "device": "cuda"}}
-        async def analyze(self, operation, pcm, turn, generation, timeout):
-            calls.append((operation, len(pcm), turn, generation, timeout))
-            return {"result": {"complete": True, "text": "  嘿小爪 API原始文本  "}}
-    monkeypatch.setattr("voice_terminal.analysis.client.AnalysisClient", Analysis)
+        async def transcribe_reference(self, pcm):
+            calls.append(("reference", len(pcm)))
+            return {"complete": True, "text": "  嘿小爪 API原始文本  "}
+        async def close(self):
+            calls.append(("closed",))
+    monkeypatch.setattr("voice_terminal.asr.client.AsrWorkerClient", Asr)
     async def scenario():
         library = ModelVoiceLibraries(tmp_path)
         asset = library.for_model("voxcpm2").put_import(_wav_bytes(), "reference.wav")
-        runtime = SimpleNamespace(voice_library=library, config=SimpleNamespace(smart_turn=SimpleNamespace(analysis_url="ws://current-loaded-analysis")), player=None)
+        runtime = SimpleNamespace(voice_library=library, config=SimpleNamespace(asr=SimpleNamespace(worker_url="ws://current-loaded-asr")), player=None)
         manager = TtsVoiceOperationManager(runtime)
         operation = manager.start_transcribe("voxcpm2", asset["asset_id"])
         await manager._items[operation["operation_id"]].task
         result = manager.get(operation["operation_id"])
         assert result["state"] == "succeeded"
         assert result["result"]["text"] == "嘿小爪 API原始文本"
-        assert calls[0] == ("url", "ws://current-loaded-analysis")
-        assert calls[1][0] == "refine" and calls[1][-1] == 30000
-        assert calls[1][2].startswith("voice-ref-") and calls[1][3] == 0
+        assert calls[0] == ("url", "ws://current-loaded-asr")
+        assert calls[1][0] == "reference" and calls[1][1] > 0
+        assert calls[2] == ("closed",)
         assert not manager.busy
     asyncio.run(scenario())
 

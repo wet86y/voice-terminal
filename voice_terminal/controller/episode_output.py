@@ -1114,7 +1114,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 "speak_requested_ms": since_turn("speak_requested"),
                 "tts_first_audio_ms": since_turn("first_audio"),
                 "player_first_pcm_submitted_ms": since_turn("first_pcm_submitted"),
-                "refinement_ms": timings.get("sensevoice_refine_ms"),
+                "refinement_ms": timings.get("paraformer_refine_ms", timings.get("sensevoice_refine_ms")),
                 "prewarm_status": getattr(self.controller.workspace, "tts_prewarm_status", None)
                 if getattr(self.controller, "workspace", None) is not None else timings.get("tts_prewarm_status"),
                 "prewarm_used": bool(timings.get("tts_prewarm_used")),
@@ -1150,7 +1150,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 "speech_end_to_first_pcm_ms": elapsed("last_speech", "first_pcm_submitted"),
                 "first_pcm_to_player_submit_ms": elapsed("first_audio", "first_pcm_submitted"),
                 "agent_request_to_speak_ms": elapsed("llm_request", "speak_requested"),
-                "refine_duration_ms": timings.get("sensevoice_refine_ms"),
+                "refine_duration_ms": timings.get("paraformer_refine_ms", timings.get("sensevoice_refine_ms")),
                 "tts_prewarm_ready_ms": elapsed("tts_prewarm_requested", "tts_prewarm_ready"),
                 "tts_checkout_ms": elapsed("tts_prewarm_requested", "tts_prewarm_checkout"),
                 "tts_cold_start_ms": elapsed("tts_session_start", "tts_session_ready")

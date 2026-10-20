@@ -9,7 +9,7 @@ def open_request_audio(value: dict):
         return decode_request(value), None
     if "pcm_base64" in value:
         raise ValueError("音频正文与引用不能同时提交")
-    if (value.get("operation") not in {"endpoint", "refine"}
+    if (value.get("operation") not in {"endpoint", "refine", "emotion", "acoustic"}
             or not isinstance(value.get("request_id"), str) or not isinstance(value.get("turn_id"), str)
             or type(value.get("generation_id")) is not int):
         raise ValueError("分析请求身份无效")
@@ -19,7 +19,7 @@ def open_request_audio(value: dict):
 
 
 def decode_request(value: dict) -> bytes:
-    if value.get("operation") not in {"endpoint", "refine"}:
+    if value.get("operation") not in {"endpoint", "refine", "emotion", "acoustic"}:
         raise ValueError("unknown analysis operation")
     if not isinstance(value.get("request_id"), str) or not isinstance(value.get("turn_id"), str):
         raise ValueError("missing request identity")

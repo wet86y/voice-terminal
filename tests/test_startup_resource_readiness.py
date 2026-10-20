@@ -97,7 +97,7 @@ class StartupResourceReadinessTests(unittest.TestCase):
 
         self.assertEqual(requirements["asr"], ["paraformer-streaming"])
         self.assertEqual(requirements["voice"], ["fsmn-vad", "kws-sherpa-onnx"])
-        self.assertEqual(requirements["analysis"], ["smart-turn", "sensevoice-small", "fsmn-vad"])
+        self.assertEqual(requirements["analysis"], ["smart-turn"])
         self.assertEqual(requirements["speaker"], ["wespeaker-cnceleb-resnet34"])
 
     def test_speaker_readiness_uses_selected_optional_model(self) -> None:

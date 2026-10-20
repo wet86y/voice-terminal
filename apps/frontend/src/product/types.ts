@@ -18,7 +18,7 @@ export type ProductModelOrigin = 'runtime_config' | 'local_scan' | 'product_mana
 /** 本地模型 device mode（设备模式）：自动、仅 CPU（中央处理器）或 CUDA（NVIDIA GPU）。 */
 export type ComputeDeviceMode = 'auto' | 'cpu' | 'cuda'
 /** 可调度的非 TTS 本地模型标识。 */
-export type ProductLocalModelId = 'paraformer' | 'sensevoice' | 'voice_vad' | 'kws' | 'smart_turn' | 'campplus'
+export type ProductLocalModelId = 'paraformer' | 'emotion' | 'voice_vad' | 'kws' | 'smart_turn' | 'campplus'
 
 export interface ProductComputeSettings {
   /** devices（设备选项）：每个本地模型选择自动、仅 CPU 或 GPU。 */
@@ -50,7 +50,7 @@ export interface ProductComputeModelStatus {
   gpu_available: boolean
   /** gpu_unavailable_reason（GPU 不可用原因）：后端未安装或设备不兼容的解释。 */
   gpu_unavailable_reason?: string | null
-  /** internal_vad_device（内部 VAD 设备）：SenseVoiceSmall 内部 FSMN-VAD 的实际设备。 */
+  /** internal_vad_device（内部 VAD 设备）：emotion2vec+ base 内部 FSMN-VAD 的实际设备。 */
   internal_vad_device?: string | null
 }
 
@@ -124,7 +124,7 @@ export interface ProductComputeStatus {
   /** models（模型采样）：所属进程切换状态时，暂时移除旧采样，等待重新读取。 */
   models: Partial<Record<ProductLocalModelId, ProductComputeModelStatus>>
   /** auxiliary（辅助组件）：热词修订及流式标点，共用已有工作进程。 */
-  auxiliary?: Partial<Record<'hotwords' | 'punctuation', Pick<ProductComputeModelStatus,
+  auxiliary?: Partial<Record<'hotwords' | 'punctuation' | 'dual_pass' | 'acoustic_events', Pick<ProductComputeModelStatus,
     'service' | 'device' | 'runtime' | 'resource_status' | 'resource_footprint' | 'load_error'>>>
 }
 
@@ -168,6 +168,8 @@ export interface ScreenCaptureSettings {
   app_overrides: Array<{ executable: string; mode: 'auto' | 'cursor' | 'center' }> // app_overrides（文件名与中心模式规则）。
 }
 export interface ProductSettingsSnapshot {
+  /** audio_enhancements（音频增强）：三个独立开关，兼容旧快照省略。 */
+  audio_enhancements?: { dual_pass: boolean; emotion: boolean; acoustic_events: boolean }
   screen_capture?: ScreenCaptureSettings // screen_capture（兼容旧版本可省略）。
   /** quiet_hours（每日被动静默）：enabled（启用）、start（开始时间）、end（结束时间）。 */
   quiet_hours?: { enabled: boolean; start: string; end: string }

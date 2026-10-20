@@ -10,6 +10,7 @@ class AudioChunk:
     turn_id: str
     pcm: bytes
     is_final: bool = False
+
     sent_at_monotonic_ns: int | None = None  # sent_at_monotonic_ns（本机单调时钟发送时间，纳秒）。
 
     def to_dict(self) -> dict[str, Any]:
@@ -22,6 +23,24 @@ class AudioChunk:
         if self.sent_at_monotonic_ns is not None:
             payload["sent_at_monotonic_ns"] = self.sent_at_monotonic_ns
         return payload
+
+
+@dataclass(frozen=True)
+class AudioSegment:
+    """AudioSegment（VAD 闭合句段），不是业务轮次最终确认。"""
+    turn_id: str
+    pcm: bytes
+    segment_id: str
+    start_sample: int
+    end_sample: int
+    is_final: bool = False
+    revision: int = 1  # revision（声学段精修修订号）。
+
+    def to_dict(self):
+        return {**AudioChunk(self.turn_id, self.pcm).to_dict(), "type": "audio.segment",
+                "segment_id": self.segment_id, "start_sample": self.start_sample,
+                "end_sample": self.end_sample, "revision": self.revision,
+                "parent_turn_id": self.turn_id.split("/asr/", 1)[0]}  # parent_turn_id（原业务轮次）。
 
 
 def decode_audio_chunk(payload: dict[str, Any]) -> AudioChunk:

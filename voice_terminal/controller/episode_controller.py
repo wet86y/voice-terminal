@@ -154,6 +154,7 @@ class EpisodeController(RealtimeController):
                                         admit_user_turn=self._speaker_admit_turn,
                                         defer_user_turn=self._speaker_defer_turn)
         runtime.quiet_policy = self.quiet_policy
+        runtime.perception = self.perception
         runtime.deferred_capture = self.deferred_capture
         runtime.deferred_append = self.deferred_append
         self.output.runtime = runtime
@@ -169,7 +170,6 @@ class EpisodeController(RealtimeController):
     async def _flush_speaker_admissions(self) -> None:
         """一个事件批量恢复按原始顺序排列的获准轮次，正文修订只发布一次。"""
         if self.speaker_mode != "filter": return
-        if self.workspace is not None and not self.speaker_policy.admitted_text(self.workspace.turn_id): return
         changes = []
         activation_id = self.speaker_policy.activation_id  # activation_id（准入恢复所属录音窗口）。
         for item in self.speaker_policy.admitted_turns():
@@ -191,6 +191,9 @@ class EpisodeController(RealtimeController):
                                        activation_id=self.speaker_policy.activation_id)
             await self._detail("speaker.recovered", count=len(changes),
                                activation_id=self.speaker_policy.activation_id)
+            for ws in {id(value["workspace"]): value["workspace"]
+                       for value in getattr(self, "_enhancement_streams", {}).values()}.values():
+                await self._publish_segment_refinements(ws)
 
     def _speaker_heartbeat_pulse(self, pulse) -> None:
         if self.speaker_sensor is None:
@@ -333,6 +336,9 @@ class EpisodeController(RealtimeController):
             # 无新增证据和短静音不会撤销本句已确认身份。
             return
         self.state.current["speaker_session"] = self.speaker_policy.snapshot()
+        previous_identity = getattr(getattr(self, "_speaker_snapshot", None), "identity", None)
+        if previous_identity is not None and previous_identity != snapshot.identity and hasattr(self, "perception"):
+            self._clear_emotion_background()
         self._speaker_snapshot = snapshot
         self._speaker_snapshot_turn_id = turn_id
         self._speaker_snapshot_generation = turn_generation
@@ -912,13 +918,14 @@ class EpisodeController(RealtimeController):
 
             ws.final_text = self.speaker_policy.admitted_text(ws.turn_id).strip()
             ws.paraformer_final = ws.final_text
-            ws.refined_text = ws.refined_text if self.speaker_policy.fully_admitted(ws.turn_id) else ""
             ws.refinement_available = bool(ws.refined_text)
             ws.segments = [{"text": ws.final_text}] if ws.final_text else []
             if not self.speaker_policy.fully_admitted(ws.turn_id):
                 ws.analysis = {}
                 ws.audio_cues = []
-                ws.transcript_updates = []
+                # 精修入口已逐音频片段准入；其他尾段待定不能删除已获准的精修证据。
+                ws.transcript_updates = [item for item in ws.transcript_updates
+                                         if item.get("kind") == "refinement"]
             self.state.current.update(final_text=ws.final_text, partial_text="")
             await self._flush_speaker_admissions()
         if mode == "filter" and getattr(self, "hotwords", None) is not None:
@@ -951,17 +958,15 @@ class EpisodeController(RealtimeController):
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
                 self.episode_history[ws.turn_id] = ws.episode_id
-            # Refinement that completed just before ASR final is applied only
-            # after the primary input is marked final.  A late refinement
-            # arriving afterwards uses the same hook below.
-            if ws.refinement_available and ws.refined_text:
+            # 兼容尚未投递的精修稿；声学闭段精修通常已在业务确认之前投递。
+            if ws.refinement_available and ws.refined_text and not hasattr(ws, "_published_refinement"):
                 await self._refinement_completed(ws, {
                     "text": ws.refined_text,
                     "segments": list(ws.audio_cues),
                 })
         # Finalized input is not a completed dialogue turn.  Retire only the
         # capture workspace so ASR resources are released while Agent/TTS and
-        # late SenseVoice refinement retain the same turn correlation.
+        # late Paraformer（离线识别）refinement retain the same turn correlation.
         await self._commit_input_workspace(ws)
         if not ws.final_text:
             await self._settle_committed_turn(ws.turn_id, outcome="empty_input")
@@ -978,6 +983,7 @@ class EpisodeController(RealtimeController):
             "raw_text": getattr(ws, "raw_final_text", "") or ws.final_text, "hotwords": dict(getattr(ws, "hotword_final", {})),
             "segments": list(ws.segments), "audio_cues": list(ws.audio_cues),
             "analysis": dict(ws.analysis), "refined_text": ws.refined_text,
+            "refinement_source": getattr(ws, "_published_refinement", ("paraformer_offline",))[0],
             "raw_refined_text": getattr(ws, "raw_refined_text", ""),
             "refinement_available": ws.refinement_available,
             "speaker_decision": dict(ws.speaker_decision),
@@ -991,6 +997,7 @@ class EpisodeController(RealtimeController):
                         "raw_text": getattr(ws, "raw_final_text", "") or ws.final_text, "hotwords": dict(getattr(ws, "hotword_final", {})),
                         "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                         "refined_text": ws.refined_text,
+                        "refinement_source": getattr(ws, "_published_refinement", ("paraformer_offline",))[0],
                         "raw_refined_text": getattr(ws, "raw_refined_text", ""),
                         "refinement_available": ws.refinement_available,
                         "speaker_decision": dict(ws.speaker_decision),
@@ -1036,6 +1043,7 @@ class EpisodeController(RealtimeController):
         if self.workspace is not ws:
             return
         self.workspace = None
+        self._retire_enhancement_streams(ws)
         self._active_input = False
         if self._completion_task is asyncio.current_task():
             self._completion_task = None
@@ -1090,8 +1098,8 @@ class EpisodeController(RealtimeController):
                 "turn_total_ms": elapsed("completed", "start"),
                 "first_segment_ms": elapsed("first_segment", "start"),
                 "smart_turn_ms": timings.get("smart_turn_ms"),
-                "sensevoice_refine_ms": timings.get("sensevoice_refine_ms"),
-                "refine_duration_ms": timings.get("sensevoice_refine_ms"),
+                "sensevoice_refine_ms": timings.get("paraformer_refine_ms", timings.get("sensevoice_refine_ms")),
+                "refine_duration_ms": timings.get("paraformer_refine_ms", timings.get("sensevoice_refine_ms")),
                 "refine_to_redecision_ms": elapsed("refinement_redecision_started", "refinement_completed"),
                 "agent_request_to_speak_ms": elapsed("speak_requested", "llm_request"),
                 "tts_prewarm_requested_ms": elapsed("tts_prewarm_requested", "start"),
@@ -1116,7 +1124,7 @@ class EpisodeController(RealtimeController):
                 "speak_requested_ms": None,
                 "tts_first_audio_ms": None,
                 "player_first_pcm_submitted_ms": None,
-                "refinement_ms": ws.timings.get("sensevoice_refine_ms"),
+                "refinement_ms": ws.timings.get("paraformer_refine_ms", ws.timings.get("sensevoice_refine_ms")),
                 "prewarm_status": getattr(ws, "tts_prewarm_status", None),
                 "replacement_count": int(ws.timings.get("replacement_count", 0) or 0),
             }
@@ -1149,97 +1157,60 @@ class EpisodeController(RealtimeController):
         await self._cancel_tts_prewarm(turn_id)
 
     async def _refinement_completed(self, ws, result: dict) -> None:
-        """Attach SenseVoice evidence to one finalized turn and wake Agent once."""
-
-        if ws.speaker_mode == "filter" and not self.speaker_policy.fully_admitted(ws.turn_id):
+        """精修稿按原轮次和修订号投递，声学闭段不确认业务轮次。"""
+        if getattr(ws, "_enhancement_invalidated", False):
             return
-        text = str(result.get("text") or "").strip()
-        if not text:
+        if ws.speaker_mode == "filter" and not result.get("admission_checked") and not self.speaker_policy.fully_admitted(ws.turn_id):
             return
+        raw_text = str(result.get("text") or "").strip()
         if self.wake_enabled:
             from ..kws.keywords import strip_wake_prefix
-            text = strip_wake_prefix(text, self.wake_keywords)
-        raw_text = getattr(ws, "raw_refined_text", "") if text == ws.refined_text and getattr(ws, "raw_refined_text", "") else text
+            raw_text = strip_wake_prefix(raw_text, self.wake_keywords)
+        if not raw_text:
+            return
+        source = str(result.get("source") or "paraformer_offline")
+        revision = int(result.get("source_revision") or max(1, ws.generation + 1))
+        key = (source, revision, raw_text)
+        if key == getattr(ws, "_published_refinement", None):
+            return
+        text = raw_text
         if getattr(self, "hotwords", None) is not None:
             token = ws.token
-            correction = await self.hotwords.correct(raw_text, token, lane="final", cache_key="refinement")
-            if ws.token != token:
+            correction = await self.hotwords.correct(raw_text, token, lane="final",
+                                                       cache_key=f"refinement:{revision}")
+            if ws.token != token or getattr(ws, "_enhancement_invalidated", False):
                 return
             text = correction["text"]
-        ws.raw_refined_text = raw_text
-        ws.refined_text = text
+        ws._published_refinement = key
+        ws.raw_refined_text, ws.refined_text = raw_text, text
         ws.refinement_available = True
-        prior_refinement = next(
-            (item for item in ws.transcript_updates
-             if isinstance(item, dict) and item.get("kind") == "refinement"),
-            None,
-        )
-        if prior_refinement is None:
-            existing_revision = max(
-                [int(item.get("revision") or 0) for item in ws.transcript_updates
-                 if isinstance(item, dict)] or [0]
-            )
-            ws.transcript_updates.append({
-                    "kind": "refinement", "source": "sensevoice", "text": text,
-                "raw_text": raw_text,
-                "revision": max(2, existing_revision + 1),
-            })
-        segments = list(result.get("segments") or [])
-        if segments:
-            ws.audio_cues = segments
+        ws.transcript_updates.append({"kind": "refinement", "source": source, "text": text,
+                                      "raw_text": raw_text, "revision": revision})
         ws.timings.setdefault("refinement_completed", time.monotonic())
-
-        if ws.turn_id not in self._refinement_events:
-            self._refinement_events.add(ws.turn_id)
-            if len(self._refinement_events) > 128:
-                self._refinement_events = set(list(self._refinement_events)[-64:])
-            payload = {
-                "text": text,
-                "source": "sensevoice",
-                "workspace": ws.snapshot(),
-            }
-            if self.workspace is ws:
-                await self._detail("transcript.refined", text=text, source="sensevoice")
-                await self._detail("speech.emotion", status="READY", source="SenseVoiceSmall",
-                                    segments=segments)
-            else:
-                await self._publish(event("transcript.refined", ws.turn_id, output_generation=ws.generation, **payload))
-                await self._publish(event("speech.emotion", ws.turn_id, output_generation=ws.generation,
-                                           status="READY", source="SenseVoiceSmall", segments=segments,
-                                           workspace=ws.snapshot()))
-
-        # A filtered turn has no ordinary SessionLedger/Agent entry.  A late
-        # SenseVoice result may enrich only its session-scoped ambient record.
+        if self.workspace is ws:
+            await self._detail("transcript.refined", text=text, source=source, revision=revision)
+        else:
+            await self._publish(event("transcript.refined", ws.turn_id, output_generation=ws.generation,
+                                      text=text, source=source, revision=revision, workspace=ws.snapshot()))
         if ws.speaker_blocked:
             if self.ambient_store is not None:
                 self.ambient_store.update_refined(ws.turn_id, text)
             return
-
-        # Do not let a refinement that wins the race with finalization start a
-        # provisional Agent decision.  The final observer below will call this
-        # hook again once the input record is finalized.
-        source = self.episode.inputs.get(ws.turn_id, {}) if self.episode.episode_id else {}
-        if not source.get("final"):
-            return
-        if ws.turn_id in self._refinement_agent_events:
-            return
-        self._refinement_agent_events.add(ws.turn_id)
         updater = getattr(self.history, "update_input_refinement", None)
         if callable(updater):
-            updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis), "raw_refined_text": raw_text})
-        if self.episode.closed or self.episode.episode_id is None:
+            updater(ws.turn_id, text, details={"analysis": dict(ws.analysis), "raw_refined_text": raw_text,
+                                              "refinement_source": source})
+        if self.episode.closed:
             return
-        # A late refinement remains an ordinary scheduler event even when a
-        # newer capture turn is already active.  It is attached to its own
-        # sentence/turn record; no semantic-version check may discard it.
+        if ws.episode_id is None:
+            await self._ensure_workspace_episode(ws)
+        if self.episode.episode_id is None or ws.episode_id != self.episode.episode_id:
+            return
         await self.episode.observe("USER_INPUT_REFINED", turn_id=ws.turn_id, text=text,
-                                    source="sensevoice", source_revision=ws.generation,
-                                    audio_cues=segments, analysis=dict(ws.analysis),
-                                    input_finished_at=ws.timings.get("commit"), output_generation=ws.generation,
-                                    sentences=list(ws.segments))
-        ws.episode_id = self.episode.episode_id
-        if ws.episode_id:
-            self.episode_history[ws.turn_id] = ws.episode_id
+                                   source=source, source_revision=revision,
+                                   analysis=dict(ws.analysis), output_generation=ws.generation,
+                                   input_finished_at=ws.timings.get("commit"), sentences=list(ws.segments))
+        self.episode_history[ws.turn_id] = ws.episode_id
 
     async def _ensure_workspace_episode(self, ws):
         if ws.episode_id:
@@ -1276,12 +1247,16 @@ class EpisodeController(RealtimeController):
             self.history.commit_input(ws.turn_id, ws.final_text, details={"segments": list(ws.segments),
                                       "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                                       "refined_text": ws.refined_text,
+                                      "refinement_source": getattr(ws, "_published_refinement", ("paraformer_offline",))[0],
+                                      "transcript_updates": list(ws.transcript_updates),
                                       "refinement_available": ws.refinement_available})
             record = self.history.append_record({"turn_id": ws.turn_id, "transcript": ws.final_text,
                                                  "delivery": delivery, "conversation_id": ws.episode_id,
                                                  "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
                                                              "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                                                              "refined_text": ws.refined_text,
+                                      "refinement_source": getattr(ws, "_published_refinement", ("paraformer_offline",))[0],
+                                      "transcript_updates": list(ws.transcript_updates),
                                                              "refinement_available": ws.refinement_available}})
             self._input_history_committed.add(ws.turn_id)
             # Same rule as the commit path: the user's line enters the ordered
@@ -1316,7 +1291,7 @@ class EpisodeController(RealtimeController):
             "speak_requested_ms": since_turn("speak_requested"),
             "tts_first_audio_ms": since_turn("first_audio"),
             "player_first_pcm_submitted_ms": since_turn("first_pcm_submitted"),
-            "refinement_ms": ws.timings.get("sensevoice_refine_ms"),
+            "refinement_ms": ws.timings.get("paraformer_refine_ms", ws.timings.get("sensevoice_refine_ms")),
             "prewarm_status": ws.tts_prewarm_status,
             "prewarm_used": bool(ws.timings.get("tts_prewarm_used")),
             "replacement_count": int(ws.timings.get("replacement_count", 0) or 0),
@@ -1339,6 +1314,10 @@ class EpisodeController(RealtimeController):
     async def _cancel_turn(self, *, reason="stopped", snapshot=None, record=True):
         # Input cleanup never blocks/cancels the independently owned output.
         ws = self.workspace
+        if reason != "completed" and ws is not None:
+            ws._enhancement_invalidated = True
+            self._enhancement_streams = {key: value for key, value in getattr(self, "_enhancement_streams", {}).items()
+                                        if value["workspace"] is not ws}
         if reason != "completed":
             self._cancel_tts_hold_fallback()
         if reason != "completed":
@@ -1418,6 +1397,8 @@ class EpisodeController(RealtimeController):
         await super()._error(code, message, recoverable=recoverable, turn_id=turn_id)
 
     async def stop_listening(self):
+        self.state.listening = False  # 先撤销输入准入，再等待原生任务退出。
+        await self._stop_enhancements()
         self._ensure_speaker_policy()
         """Stop microphone input without cancelling the Agent output scope.
 
@@ -1459,6 +1440,7 @@ class EpisodeController(RealtimeController):
             self._input_resetting = False
 
     async def _reset_session_state(self):
+        await self._stop_enhancements(clear=True)
         """在音频准入暂停期间完成会话及输入边界清理。"""
         self._cancel_tts_hold_fallback()
         self._ensure_speaker_policy()

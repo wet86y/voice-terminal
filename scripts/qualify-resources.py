@@ -34,7 +34,9 @@ RESOURCE_IDS = (
     "fsmn-vad",
     "campplus-zh-cn-common",
     "smart-turn",
-    "sensevoice-small",
+    "paraformer-offline",
+    "emotion2vec-plus-base",
+    "yamnet",
     "dsh",
 )
 _DSH_RESOURCE = next(row for row in json.loads((REPO_ROOT / 'config/resources/catalog.json').read_text('utf-8-sig'))['resources'] if row['resource_id'] == 'dsh')

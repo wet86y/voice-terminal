@@ -25,14 +25,51 @@ pub fn load(path:&Path)->Result<Value,String>{
     let bytes=fs::read(path).map_err(|e|e.to_string())?;
     serde_json::from_slice(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)).map_err(|e|e.to_string())
 }
+/// audio_enhancements（音频增强设置）：与运行中 Python（解释器）共用同一持久化文件。
+pub fn audio_enhancements(data:&Path,request:Option<&Value>)->Result<Value,String>{
+    let path=data.join("config/product-settings.json");
+    let mut settings=if path.exists(){load(&path)?}else{json!({})};
+    if !settings.is_object(){return Err("产品设置文件必须是对象，请先修复配置。".into());}
+    let mut legacy=true;
+    if let Ok(text)=fs::read_to_string(data.join("config/local.yaml")){
+        let mut in_section=false;
+        for raw in text.lines(){
+            let body=raw.split('#').next().unwrap_or("").trim();
+            if body.is_empty(){continue;}
+            let indentation=raw.chars().take_while(|c|c.is_whitespace()).count();
+            if indentation==0{in_section=body=="smart_turn:";continue;}
+            if in_section&&indentation==2{if let Some((key,value))=body.split_once(':'){
+                if key.trim()=="sensevoice"{legacy=value.trim()!="false";}
+            }}
+        }
+    }
+    let mut selected=json!({"dual_pass":legacy,"emotion":legacy,"acoustic_events":legacy});
+    for key in ["dual_pass","emotion","acoustic_events"]{
+        if let Some(value)=settings["audio_enhancements"][key].as_bool(){selected[key]=json!(value);}
+    }
+    if let Some(update)=request{
+        let object=update.as_object().ok_or("音频增强设置必须是对象。")?;
+        for (key,value) in object{
+            if !matches!(key.as_str(),"dual_pass"|"emotion"|"acoustic_events")||!value.is_boolean(){return Err("音频增强开关必须是有效的布尔字段。".into());}
+            selected[key]=value.clone();
+        }
+        settings["audio_enhancements"]=selected.clone();
+        settings["schema_version"]=json!(16);
+        atomic_json(&path,&settings)?;
+    }
+    Ok(selected)
+}
 pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
     let mut items=load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone();
     let settings=load(&context.data.join("config/product-settings.json")).unwrap_or(Value::Null);
+    let enhancements=audio_enhancements(&context.data,None)?;
     let runtime=load(&context.install.join("runtimes/python/runtime.json")).unwrap_or(Value::Null);
     let registration=load(&context.data.join("config/gpu-environment.json")).unwrap_or(Value::Null);
     let device=settings["compute"]["devices"]["smart_turn"].as_str().unwrap_or("auto");
     let gpu_environment=runtime["compatible_gpu"]==true||runtime["profile"]=="cu128"||registration["models"]["smart_turn"]["gpu_available"]==true;
     for item in &mut items{
+        let selected=match item["resource_id"].as_str(){Some("paraformer-offline")=>enhancements["dual_pass"]==true,Some("emotion2vec-plus-base")=>enhancements["emotion"]==true,Some("yamnet")=>enhancements["acoustic_events"]==true,_=>false};
+        item["selected_enhancement"]=json!(selected);
         if item["kind"]=="dsh" && item["origin"]=="npm_package" {let target=crate::dsh::target(&context.installed_program())?;item["version"]=target["version"].clone();item["source"]["distribution"]=target;continue;}
         if item["kind"]!="model"{continue;}
         let installed=destination(context,item)?;let smart_turn=item["resource_id"]=="smart-turn";
@@ -976,6 +1013,22 @@ mod download_tests {
     use super::*;
 
     #[test]
+    fn audio_enhancement_switches_migrate_and_save_independently(){
+        let root=std::env::temp_dir().join(format!("voice-enhancements-{}",crate::workspace::new_id()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/local.yaml"),"smart_turn:\n  sensevoice: false # 旧精修关闭\n").unwrap();
+        assert_eq!(audio_enhancements(&root,None).unwrap(),json!({"dual_pass":false,"emotion":false,"acoustic_events":false}));
+        let value=audio_enhancements(&root,Some(&json!({"emotion":true}))).unwrap();
+        assert_eq!(value,json!({"dual_pass":false,"emotion":true,"acoustic_events":false}));
+        assert_eq!(audio_enhancements(&root,None).unwrap(),value);
+        assert!(audio_enhancements(&root,Some(&json!({"emotion":1}))).is_err());
+        assert_eq!(audio_enhancements(&root,None).unwrap(),value);
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(root.file_name().unwrap().to_string_lossy().starts_with("voice-enhancements-"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore="手动验收：仅使用已下载官方归档，在独立报告目录安装及复核原生补丁，不修改正式工作区"]
     fn install_official_audiocpp_patch_in_isolated_workspace(){
         let root=PathBuf::from(std::env::var_os("VOICE_TTS_TEST_ROOT").expect("需要 VOICE_TTS_TEST_ROOT（独立原生测试目录）"));
@@ -1078,8 +1131,8 @@ mod download_tests {
     fn startup_requires_complete_files_and_shared_dependencies() {
         let complete=json!({"resource_id":"voice-server","label":"语音服务","can_start":true});
         let missing=json!({"resource_id":"paraformer-streaming","label":"流式识别模型","files_installed":false,"can_start":false,"error":"模型文件不完整"});
-        let update=json!({"resource_id":"sensevoice-small","label":"精修模型","files_installed":true,"can_start":false,"update_available":true});
-        let missing_runtime=json!({"resource_id":"sensevoice-small","label":"精修模型","files_installed":true,"runtime_ready":false,"can_start":false});
+        let update=json!({"resource_id":"streaming-punctuation","label":"流式标点","files_installed":true,"can_start":false,"update_available":true});
+        let missing_runtime=json!({"resource_id":"streaming-punctuation","label":"流式标点","files_installed":true,"runtime_ready":false,"can_start":false});
         let readiness=readiness_from_inventory(&[complete.clone(),missing,missing_runtime]);
         assert_eq!(readiness["ready"],false);
         assert_eq!(readiness["checked_components"],3);

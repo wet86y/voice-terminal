@@ -366,8 +366,10 @@ class AgentContextMixin:
             ContextLane.REQUEST_TAIL, "system", self.context_projector.runtime_tail(
                 current=semantic, speak_state=speak_state,
                 calendar_epoch=self.conversation.calendar_epoch_if_changed(),
-                shadow=self.ledger.shadow_runtime_tail(information=shadow_information, progress=secondary_context),
+                shadow=self.ledger.shadow_runtime_tail(information=shadow_information, progress={key: row for key, row in (secondary_context or {}).items() if key != "acoustic_events"}),
                 tool_availability=self._tool_availability(),
+                voice_emotion=getattr(self, "perception", {}).get("voice_emotion"),
+                acoustic_events=self._acoustic_context(secondary_context),
             ),
             context_kind="runtime_state",
         ))

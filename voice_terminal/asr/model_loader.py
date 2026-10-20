@@ -27,6 +27,10 @@ _SOURCE_HASHES = {
 
 # 每项格式为注册名称、注册表和实现模块；组件集合按本地 config.yaml 精确识别。
 _COMPONENTS = {
+    "offline_model": ("BiCifParaformer", "model_classes", "funasr.models.bicif_paraformer.model"),
+    "offline_encoder": ("SANMEncoder", "encoder_classes", "funasr.models.sanm.encoder"),
+    "offline_predictor": ("CifPredictorV3", "predictor_classes", "funasr.models.bicif_paraformer.cif_predictor"),
+    "emotion_model": ("Emotion2vec", "model_classes", "funasr.models.emotion2vec.model"),
     "paraformer_model": ("ParaformerStreaming", "model_classes", "funasr.models.paraformer_streaming.model"),
     "paraformer_encoder": ("SANMEncoderChunkOpt", "encoder_classes", "funasr.models.scama.encoder"),
     # 同名解码器有重复注册；使用完整扫描最终选中的实现，避免改变模型构造。
@@ -46,6 +50,15 @@ _COMPONENTS = {
     "streaming_punc_encoder": ("SANMVadEncoder", "encoder_classes", "funasr.models.ct_transformer_streaming.encoder"),
 }
 _MODEL_CONFIGS = {
+    "offline": (
+        {"model": "BiCifParaformer", "encoder": "SANMEncoder", "predictor": "CifPredictorV3",
+         "frontend": "WavFrontend", "tokenizer": "CharTokenizer"},
+        ("offline_model", "offline_encoder", "offline_predictor", "paraformer_decoder", "wav_frontend", "char_tokenizer", "specaug"),
+    ),
+    "emotion": (
+        {"model": "Emotion2vec", "tokenizer": "CharTokenizer"},
+        ("emotion_model", "char_tokenizer"),
+    ),
     "streaming_punc": (
         {"model": "CTTransformerStreaming", "encoder": "SANMVadEncoder", "tokenizer": "CharTokenizer"},
         ("streaming_punc_model", "streaming_punc_encoder", "char_tokenizer"),

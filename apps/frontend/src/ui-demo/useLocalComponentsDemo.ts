@@ -13,7 +13,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
   const providerConfigured = reactive({ deepseek: true, minimax: true }) // providerConfigured（演示账号是否已配置在线服务）。
   const resourceSamples: ManagedResourceRow[] = [
     { id: 'paraformer-streaming', label: 'Paraformer（流式语音识别）', state: 'installed', status: '已安装' },
-    { id: 'sensevoice-small', label: 'SenseVoiceSmall（语音理解）', state: 'incomplete', status: '安装不完整', error: '缺少配置文件，可重新下载或导入。' },
+    { id: 'emotion2vec-plus-base', label: 'emotion2vec+ base（情绪背景）', state: 'incomplete', status: '安装不完整', error: '缺少配置文件，可重新下载或导入。' },
     { id: 'kws-sherpa-onnx', label: 'KWS（关键词识别）', state: 'installed', status: '已安装' },
     { id: 'smart-turn', label: 'SmartTurn（语音轮次判断）', state: 'missing', status: '未安装' },
     { id: 'campplus-zh-cn-common', label: 'CAM++（中文通用声纹模型）', state: 'installed', status: '已安装' },
@@ -28,12 +28,12 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     { id: 'voice-runtime-gpu', label: 'GPU（图形处理器）运行依赖', state: 'missing', status: '未安装', required: false },
   ]
   const runtimes: Record<string, string> = {
-    paraformer: 'PyTorch（推理框架）', sensevoice: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
+    paraformer: 'PyTorch（推理框架）', emotion: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
     kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', campplus: 'PyTorch（推理框架）',
     dsh: 'Node.js（执行环境）', voice: 'Python（语音进程）', web: 'WebView2（桌面引擎）',
   }
   const sourceRows = [
-    ...demoComputeModels.map(item => ({ ...item, description: '本地语音处理模型。', pid: item.id === 'paraformer' ? '21048' : item.id === 'sensevoice' ? '21052' : '21044', commit: `${Math.round(Number.parseInt(item.memory) * 1.25)} MB`, cpu: '0.3%' })),
+    ...demoComputeModels.map(item => ({ ...item, description: '本地语音处理模型。', pid: item.id === 'paraformer' ? '21048' : item.id === 'emotion' ? '21052' : '21044', commit: `${Math.round(Number.parseInt(item.memory) * 1.25)} MB`, cpu: '0.3%' })),
     ...demoSystemComponents.filter(item => ['dsh', 'voice'].includes(item.id)).sort((a, b) => ['dsh', 'voice'].indexOf(a.id) - ['dsh', 'voice'].indexOf(b.id)).map(item => ({ ...item, memory: item.id === 'voice' ? '866 MB' : item.memory, commit: item.id === 'voice' ? '1042 MB' : item.commit,
       device: 'local', gpu: false, description: item.id === 'voice' ? '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。' : item.phase })),
   ]
@@ -50,11 +50,11 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     const baseId = item.id.replace(/-\d+$/, '')
     const busy = retrying.has(item.id)
     const loading = scene.value === 'loading' || busy
-    const failed = scene.value === 'error' && ['sensevoice', 'dsh'].includes(baseId) && !recovered.has(item.id)
+    const failed = scene.value === 'error' && ['emotion', 'dsh'].includes(baseId) && !recovered.has(item.id)
     const available = !loading && !failed
     const model = demoComputeModels.find(row => row.id === baseId)
     const resourceId: Record<string, string> = {
-      paraformer: 'paraformer-streaming', sensevoice: 'sensevoice-small', voice_vad: 'fsmn-vad',
+      paraformer: 'paraformer-streaming', emotion: 'emotion2vec-plus-base', voice_vad: 'fsmn-vad',
       kws: 'kws-sherpa-onnx', smart_turn: 'smart-turn', campplus: 'campplus-zh-cn-common', dsh: 'dsh', voice: 'voice-server',
     }
     const resource = resourceSamples.find(row => row.id === resourceId[baseId])
@@ -62,7 +62,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     return {
       id: baseId === 'voice' ? item.id.replace(/^voice/, 'voice-system') : item.id,
       name: scene.value === 'long' ? `${item.name} · ${longIdentifier}` : item.name,
-      category: (baseId === 'voice' ? 'voice-server' : baseId === 'dsh' ? 'inference' : ['paraformer', 'sensevoice', 'smart_turn'].includes(baseId) ? 'speech' : 'extensions') as LocalComponentCategory,
+      category: (baseId === 'voice' ? 'voice-server' : baseId === 'dsh' ? 'inference' : ['paraformer', 'smart_turn'].includes(baseId) ? 'speech' : 'extensions') as LocalComponentCategory,
       state: loading ? 'loading' : failed ? 'failed' : 'ready',
       status: loading ? '启动中' : failed ? '不可用' : '运行中',
       available, retryable: failed && !loading, busy: loading,
@@ -71,13 +71,13 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       vram: item.device === 'cuda' && available ? '740 MB' : undefined,
       description: loading ? busy ? '正在重新启动组件' : '等待组件启动' : item.description,
       error: failed && !loading ? baseId === 'dsh' ? '代理执行宿主未启动，请重试。' : '模型加载失败，请重试。' : undefined,
-      note: countedHere ? '同一进程可承载多个模型，内存总量按进程去重。' : baseId === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
+      note: countedHere ? '同一进程可承载多个模型，内存总量按进程去重。' : baseId === 'smart_turn' ? '与 emotion2vec+ base（情绪背景）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       location: '本机',
       facts: [
         { label: '进程标识', value: available ? item.pid : '未运行' },
         { label: '处理器占用', value: available ? item.cpu : '—' },
       ],
-      resource: resource && scene.value === 'error' && ['sensevoice', 'dsh'].includes(baseId)
+      resource: resource && scene.value === 'error' && ['emotion', 'dsh'].includes(baseId)
         ? { ...resource, state: 'installed', status: '已安装', error: undefined } : resource,
       runtimeDependencies: baseId === 'voice' ? ['voice-runtime-cpu', 'tts-audiocpp-runtime', 'voice-runtime-gpu']
         .flatMap(id => resourceSamples.find(resource => resource.id === id) ?? []) : undefined,
@@ -151,7 +151,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
         id: 'sample-resource-job', resourceId: 'dsh', label: 'DSH（代理执行宿主）', state: 'running',
         phase: '正在校验固定版本安装包', completedBytes: 164_000_000, totalBytes: 289_000_000, canCancel: true,
       }] : scene.value === 'error' ? [{
-        id: 'sample-resource-failure', resourceId: 'sensevoice-small', label: 'SenseVoiceSmall（语音理解）', state: 'failed',
+        id: 'sample-resource-failure', resourceId: 'emotion2vec-plus-base', label: 'emotion2vec+ base（情绪背景）', state: 'failed',
         phase: '导入已停止，原有安装保持不变', error: '压缩包校验失败，可重试导入或下载。', canCancel: false,
       }] : [],
       resourceActionsAvailable: !empty,

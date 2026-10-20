@@ -1,8 +1,8 @@
 # 本地模型运行设备
 
-设置页中的“本地模型设备”可以分别配置 Paraformer（流式语音识别）、SenseVoiceSmall（语音识别与分析）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键词唤醒）、SmartTurn（语音结束判断）和 CAM++（当前默认的可选声纹模型）。必需运行资源缺失、损坏、待更新或完整文件摘要检查失败时，程序进入本地组件管理页；启用声纹时，CAM++ 还须通过自身的资源及模型检查。版本和恢复规则见[程序升级与必需组件更新](model-resource-updates.md)。
+设置页显示 Paraformer（语音识别）、emotion2vec+ base（基础版情绪模型）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键词唤醒）、SmartTurn（语音结束判断）和 CAM++（可选声纹模型）的实际运行位置。其中 Paraformer、情绪和声纹模型提供设备偏好选项；离线精修跟随主识别实际设备，不提供独立偏好。YAMNet（声学事件模型）首版固定使用处理器。必需运行资源缺失、损坏、待更新或完整文件摘要检查失败时，程序进入本地组件管理页；三项音频增强资源缺失只影响自身能力，不阻断基础识别。版本和恢复规则见[程序升级与必需组件更新](model-resource-updates.md)及[音频增强说明](audio-enhancements.md)。
 
-每个模型可选择：
+支持设备偏好的模型可选择：
 
 - **自动**：可用且显存充足时先尝试 NVIDIA CUDA（GPU 计算平台）；模型加载失败或显存不足时回退 CPU（中央处理器）。
 - **仅 CPU**：强制在 CPU 上运行。
@@ -24,7 +24,7 @@
 
 `gpu_dedicated_bytes`（进程专用显存字节）从 Windows（操作系统）GPU Process Memory（显卡进程内存）性能计数器读取，不初始化推理框架；多适配器按进程合并，共享进程与子进程按进程标识、创建时间去重。读取失败保留未知，不能用整张显卡已用量代替应用占用。接口实现依据 [PdhAddEnglishCounterW（加入性能计数器）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhaddenglishcounterw) 与 [PdhGetFormattedCounterArrayW（读取实例计数数组）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcounterarrayw)。
 
-CPU（中央处理器）模式的 FSMN-VAD（语音活动检测）可按策略使用已校验的轻量 ONNX（开放神经网络交换格式）模型；GPU（图形处理器）请求继续使用原 PyTorch（深度学习框架）后端，不将量化的 SenseVoice ONNX 候选作为默认模型。每个模型当前可用的运行设备以状态接口逐项结果为准，模型性能和资源测量见[本地模型设备基准](../testing/local-model-compute-benchmark.md)及[内存优化报告](../testing/memory-optimization-20261010.md)。
+CPU（中央处理器）模式的 FSMN-VAD（语音活动检测）可按策略使用已校验的轻量 ONNX（开放神经网络交换格式）模型；GPU（图形处理器）请求继续使用原 PyTorch（深度学习框架）后端。旧 SenseVoice（语音理解模型）及其量化候选均不再进入生产加载。每个模型当前可用的运行设备以状态接口逐项结果为准；当前替换模型实测见[音频增强验收记录](../testing/audio-enhancements-20261020.md)，此前模型的历史测量见[本地模型设备基准](../testing/local-model-compute-benchmark.md)及[内存优化报告](../testing/memory-optimization-20261010.md)。
 
 ## GPU 推理后端与环境更新
 
@@ -38,6 +38,6 @@ Voice Server（语音服务）现按中央处理器必需依赖、audio.cpp（�
 
 内存管理当前实现和未启用的优化候选见[运行资源管理](runtime-resource-management.md)；逐模型输入、输出和内存对照见[内存优化报告](../testing/memory-optimization-20261010.md)。
 
-SenseVoiceSmall 及其内部 FSMN-VAD（语音活动检测）始终使用同一设备。FunASR（语音识别工具包）通过 device="cuda" 或 device="cpu" 选择运行位置，具体以加载结果和设置页健康状态为准。
+Paraformer（语音识别）的流式与离线模型使用同一解释器、框架环境及实际设备。主路整体回退时离线路跟随；仅离线路加载失败时报告双路不可用并保留单路，不独立回退形成跨设备组合。emotion2vec+ base（基础版情绪模型）使用独立设备偏好，迁移时继承旧模型的有效偏好，缺省为处理器。FunASR（语音识别工具包）通过 `device="cuda"`（显卡设备）或 `device="cpu"`（处理器设备）选择运行位置，以加载结果和组件健康状态为准。
 
 正式程序和源码业务共用上述后端组件与 `.local/models/`（当前模型集合）。SmartTurn（语音结束判断）显卡模式还需要同修订的单精度显卡模型；模型变化先在项目临时区构建完整候选，再通过 `ModelsRoot`（模型组件候选参数）与相应环境一起发布。运行库版本、真实显卡验证、程序与模型组件统一切换及分段计时见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。

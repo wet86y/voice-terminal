@@ -4,6 +4,7 @@ from .screen_capture import ScreenCaptureConfig
 
 import os
 from dataclasses import dataclass, field
+from .audio_enhancements import AudioEnhancements
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -150,7 +151,7 @@ class AsrConfig:
 
 COMPUTE_MODEL_IDS = (
     "paraformer",
-    "sensevoice",
+    "emotion",
     "voice_vad",
     "kws",
     "smart_turn",
@@ -166,7 +167,7 @@ class ComputeConfig:
     # devices（设备偏好）：auto 自动选择，cpu 仅中央处理器，cuda 使用 NVIDIA GPU。
     devices: Mapping[str, str] = field(default_factory=lambda: {
         "paraformer": "auto",
-        "sensevoice": "cpu",
+        "emotion": "cpu",
         "voice_vad": "cpu",
         "kws": "cpu",
         "smart_turn": "cpu",
@@ -175,7 +176,7 @@ class ComputeConfig:
     # fallback_devices（回退设备）：显式 GPU 加载失败时使用的上次成功设备。
     fallback_devices: Mapping[str, str] = field(default_factory=lambda: {
         "paraformer": "cpu",
-        "sensevoice": "cpu",
+        "emotion": "cpu",
         "voice_vad": "cpu",
         "kws": "cpu",
         "smart_turn": "cpu",
@@ -188,6 +189,9 @@ class ComputeConfig:
             if "wespeaker" in values and "campplus" not in values:
                 values["campplus"] = values["wespeaker"]
             values.pop("wespeaker", None)
+            if "sensevoice" in values and "emotion" not in values:
+                values["emotion"] = values["sensevoice"]
+            values.pop("sensevoice", None)
             object.__setattr__(self, attr, values)
         for name in COMPUTE_MODEL_IDS:
             device = self.devices.get(name, "cpu")
@@ -623,6 +627,7 @@ class ContinuityConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
+    audio_enhancements: "AudioEnhancements" = field(default_factory=lambda: AudioEnhancements())  # 音频增强。
     quiet_hours: QuietHoursConfig = field(default_factory=QuietHoursConfig)  # quiet_hours（被动静默时间）。
     continuity: ContinuityConfig = field(default_factory=ContinuityConfig)  # continuity（交接整理配置）。
     smart_turn: InputOptions = field(default_factory=InputOptions)
@@ -663,6 +668,10 @@ class AppConfig:
     @property
     def asr_model_dir(self) -> Path:
         return self.model_dir / "funasr" / "paraformer-zh-streaming"
+
+    @property
+    def offline_asr_model_dir(self) -> Path:
+        return self.model_dir / "funasr" / "paraformer-zh-offline"
 
     @property
     def punctuation_model_dir(self) -> Path:
@@ -848,7 +857,9 @@ class AppConfig:
                 "provider": (ShadowProviderConfig(**dict(_section(_section(data, "continuity"), "provider")))
                              if _section(_section(data, "continuity"), "provider") else None),
             }),
-            smart_turn=InputOptions.from_mapping(smart_turn_data, root),
+            smart_turn=InputOptions.from_mapping({**smart_turn_data, "sensevoice": False}, root),
+            audio_enhancements=AudioEnhancements.from_mapping(data.get("audio_enhancements"),
+                legacy=smart_turn_data.get("sensevoice", True)),
             screen_capture=screen_capture,
             agent=AgentOptions.from_mapping(_section(data, "agent")),
             shadow_agent=ShadowAgentConfig(
@@ -1000,12 +1011,14 @@ class AppConfig:
             compute=ComputeConfig(
                 devices={
                     **ComputeConfig().devices,
+                    **({"emotion": compute["devices"]["sensevoice"]} if isinstance(compute.get("devices"), Mapping) and compute["devices"].get("sensevoice") in COMPUTE_DEVICE_MODES else {}),
                     **({key: value for key, value in compute.get("devices", {}).items()
                         if key in COMPUTE_MODEL_IDS and isinstance(value, str) and value in COMPUTE_DEVICE_MODES}
                        if isinstance(compute.get("devices"), Mapping) else {}),
                 },
                 fallback_devices={
                     **ComputeConfig().fallback_devices,
+                    **({"emotion": compute["fallback_devices"]["sensevoice"]} if isinstance(compute.get("fallback_devices"), Mapping) and compute["fallback_devices"].get("sensevoice") in {"cpu", "cuda"} else {}),
                     **({key: value for key, value in compute.get("fallback_devices", {}).items()
                         if key in COMPUTE_MODEL_IDS and isinstance(value, str) and value in {"cpu", "cuda"}}
                        if isinstance(compute.get("fallback_devices"), Mapping) else {}),

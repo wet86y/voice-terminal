@@ -25,6 +25,16 @@ class AnalysisClient:
             self._shared_peer = result.get("shared_audio") or False
             return result
 
+    async def configure(self, enabled: dict[str, bool]) -> dict:
+        """configure（模型切换）：只允许停止监听后的受管调用。"""
+        import websockets
+        async with websockets.connect(self.url, open_timeout=5, close_timeout=0.2) as socket:
+            await socket.send(json.dumps({"operation": "configure", "enabled": enabled}))
+            result = json.loads(await asyncio.wait_for(socket.recv(), 240))
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            return result
+
     async def analyze(self, operation: str, pcm: bytes, turn_id: str, generation_id: int, timeout_ms: int) -> dict:
         if os.environ.get("VOICE_APP_ANALYSIS_AVAILABLE") == "0":
             raise RuntimeError("应用未确认分析工作进程所有权或就绪状态")

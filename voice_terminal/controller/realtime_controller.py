@@ -13,6 +13,8 @@ from .speech_pipeline import SpeechPipeline
 from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
 from .options import InputOptions
+from .enhancements import AudioEnhancementsMixin
+from ..audio_enhancements import AudioEnhancements
 from ..analysis.client import AnalysisClient
 from ..agent.shadow_registry import VoiceShadowRegistry
 from ..asr.protocol import AudioChunk
@@ -31,12 +33,13 @@ from ..session.ambient import AmbientTranscriptStore
 logger = logging.getLogger(__name__)
 
 
-class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
+class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipeline, InputController):
     """Realtime input orchestration used by the session runtime."""
 
     def __init__(self, *, options: InputOptions, analysis=None,
                  shadow_waker=None, shadow_available: bool = False, **kwargs) -> None:
         self.conversation = kwargs.pop("conversation")
+        self._init_enhancements(kwargs.pop("audio_enhancements", AudioEnhancements(False, False, False)))
         self.hotwords = kwargs.pop("hotwords", None)  # hotwords（原文旁路的短句纠正服务）。
         self.speaker_client: SpeakerWorkerClient | None = kwargs.pop("speaker_client", None)
         self.speaker_router: SpeakerRouter | None = kwargs.pop("speaker_router", None)
@@ -412,12 +415,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
 
     async def initialize(self) -> None:
         await super().initialize()
-        if self.options.smart_turn or self.options.sensevoice:
+        if self.options.smart_turn or self.audio_enhancements.emotion or self.audio_enhancements.acoustic_events:
             try:
                 health = await self.analysis.health()
                 self.analysis_health = health if isinstance(health, dict) else {}
                 status = "READY" if all(health.get(k, {}).get("status") == "READY" for k, enabled in
-                                        (("endpoint", self.options.smart_turn), ("refine", self.options.sensevoice)) if enabled) else "DEGRADED"
+                                        (("endpoint", self.options.smart_turn),) if enabled) else "DEGRADED"
             except Exception as exc:
                 self.analysis_health = {
                     "endpoint": {"status": "DEGRADED", "error": str(exc) or "health unavailable"},
@@ -532,7 +535,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             self._reset_vad_pending = False
         generation = self._vad_generation
         activity = await asyncio.to_thread(self.vad.feed, frame.pcm)
-        if generation != self._vad_generation or getattr(self, "_input_resetting", False):
+        if generation != self._vad_generation or getattr(self, "_input_resetting", False) or not getattr(getattr(self, "state", None), "listening", True):
             return  # Turn was cancelled while native VAD was running.
         if activity.speech_started:
             # A resumed VAD speech interval invalidates both the pending
@@ -558,6 +561,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             )
         if activity.speech_started:
             self._speech_start_sample = self._vad_origin + (activity.speech_start_sample or 0)
+            self._enhancement_start = self._speech_start_sample
             self._speech_end_sample = None
             if self.workspace is not None and self._active_input:
                 # A new VAD speech epoch may belong to a different person;
@@ -586,6 +590,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         activity = await self._observe_activity(activity, frame)
         if activity is None or getattr(self, "_input_resetting", False):
             return
+        self._perception_frame(frame, activity)
         ws = self.workspace
         if ws is None:
             if self.wake_enabled and not always_on:
@@ -688,6 +693,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             return
 
         if activity.speech_ended:
+            self._close_acoustic_segment(ws)
             await self._segment(ws.raw_partial, pause=True)
         elapsed_ms = (frame.captured_at - ws.started_at) * 1000
         if elapsed_ms >= self.options.max_turn_ms:
@@ -777,6 +783,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._sub_origins[self._sub_id] = max(0, end - len(pcm) // 2)
         self._sub_sequences[self._sub_id] = self._sub_sequence
         self._sub_generations[self._sub_id] = self.workspace.generation
+        self._register_enhancement_stream()
         self._queue_asr(AudioChunk(self._sub_id, pcm))
 
     def _stop_generation(self) -> list[asyncio.Task]:
@@ -896,49 +903,10 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         ws.timings["endpoint_accepted"] = time.monotonic()
         if "last_speech" not in ws.timings:
             ws.timings["last_speech"] = frame.captured_at
-        audio = bytes(ws.audio.pcm)
-        self._refine_task = asyncio.create_task(self._refine(ws, token, audio)) if self.options.sensevoice else None
-        self._track(self._refine_task)
         await self._detail("turn.finalizing", reason=reason)
         await self._state_event(TerminalState.FINALIZING, listening=True, turn_id=ws.turn_id)
         self._completion_task = asyncio.create_task(self._complete(ws, token, self._sub_id, self._refine_task))
         self._track(self._completion_task)
-
-    async def _refine(self, ws, token, audio):
-        try:
-            reply = await self.analysis.analyze("refine", audio, *token, self.options.refine_timeout_ms)
-            result = dict(reply["result"])
-            if not result.get("complete") or not isinstance(result.get("text"), str):
-                raise ValueError("incomplete refinement")
-            if ws.speaker_mode == "filter" and not self.speaker_policy.fully_admitted(ws.turn_id):
-                return {"complete": True, "text": self.speaker_policy.admitted_text(ws.turn_id), "segments": []}
-            refined_text = result["text"].strip()
-            if self.wake_enabled:
-                refined_text = strip_wake_prefix(refined_text, self.wake_keywords)
-            result["text"] = refined_text
-            ws.raw_refined_text = refined_text  # raw_refined_text（未经热词替换的精修原文）。
-            # SenseVoice is a supplemental result.  Keep it attached to the
-            # same workspace even after the fast Paraformer commit has
-            # retired that workspace from the live input controller.
-            ws.refined_text = refined_text
-            ws.refinement_available = True
-            ws.audio_cues = list(result.get("segments") or [])
-            ws.timings["sensevoice_refine_ms"] = reply.get("elapsed_ms")
-            ws.timings["refinement_completed"] = time.monotonic()
-            ws.analysis["refine"] = self._analysis_meta("refine", status="READY")
-            # A fast refinement can technically beat the ASR final callback.
-            # Store it now, but only notify the Agent after the primary input
-            # has crossed the formal commit boundary.
-            if ws.committed:
-                await self._refinement_completed(ws, result)
-            return result
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            details = self._analysis_meta("refine", status="DEGRADED")
-            details.update({"error": str(exc) or "timeout", "fallback": "paraformer"})
-            ws.analysis["refine"] = details
-            return None
 
     async def _complete(self, ws, token, sub_id, refinement) -> None:
         try:
@@ -964,24 +932,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 ws.segments = self.hotwords.final_sentences(raw_rows, ws.paraformer_final, correction, ws.token)
                 ws.final_text = correction["text"]
                 ws.hotword_final = correction
-            # If SenseVoice happened to finish first, retain its supplemental
-            # fields; otherwise these remain the empty defaults until the
-            # background refinement task completes.
+            # 已完成的片段精修保留在原工作区；最终确认只提交主识别原稿。
             if not ws.refinement_available:
                 ws.refined_text = ""
-                ws.audio_cues = []
-            refine_meta = ws.analysis.get("refine", {}) if isinstance(ws.analysis, dict) else {}
-            refine_ready = isinstance(refine_meta, dict) and refine_meta.get("status") == "READY"
-            speech_emotion = {
-                "status": "READY" if refine_ready else "UNAVAILABLE",
-                "source": (
-                    refine_meta.get("model") or "SenseVoiceSmall"
-                    if refine_ready else "paraformer_fallback"
-                ),
-                "segments": list(ws.audio_cues),
-            }
-            if isinstance(refine_meta, dict) and "model_loaded" in refine_meta:
-                speech_emotion["model_loaded"] = bool(refine_meta["model_loaded"])
             valid_samples = self._speech_samples + (max(0, self._last_frame.end_sample - self._speech_start_sample) if self._speech_start_sample is not None else 0)
             if valid_samples < self.vad_min_speech_ms * 16:
                 ws.final_text = ""
@@ -991,7 +944,6 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 ws.timings["asr_final_to_commit_ms"] = round((ws.timings["commit"] - ws.timings["asr_final"]) * 1000)
             self.state.current.update(final_text=ws.final_text, partial_text="")
             await self._detail("transcript.final", text=ws.final_text, source="paraformer")
-            await self._detail("speech.emotion", **speech_emotion)
             await self._detail("turn.committed")
             # EpisodeController retires the audio workspace as soon as the
             # primary input is committed.  Detach the refinement task first
@@ -1015,6 +967,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 await self._finish_v2(ws, ws.staged_response)
 
     async def _on_asr_result(self, message: dict) -> None:
+        if await self._enhancement_result(message):
+            return
         sub_id, text = message.get("turn_id"), message.get("text")
         if message.get("type") == "error":
             if sub_id is None or sub_id in self._sub_parts:
@@ -1050,6 +1004,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         flush = getattr(self, "_flush_speaker_admissions", None)
         if callable(flush): await flush()
         self._sub_parts[sub_id] = text or self._sub_parts[sub_id]
+        stream = self._enhancement_streams.get(sub_id)
+        if stream is not None:
+            stream["text"] = self._sub_parts[sub_id]
         ws = self.workspace
         if text and text.strip():
             wake = getattr(self, "_wake_preparation", None)
@@ -1130,8 +1087,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             "speech_end_to_playback_ms": delta("playback", "last_speech"), "turn_total_ms": delta("completed", "start"),
             "first_segment_ms": delta("first_segment", "start"),
             "smart_turn_ms": t.get("smart_turn_ms"), "sensevoice_refine_ms": t.get("sensevoice_refine_ms"),
+            "paraformer_refine_ms": t.get("paraformer_refine_ms"),  # 离线片段精修耗时。
             "commit_to_final_llm_ms": delta("llm_request", "commit"),
-            "refine_duration_ms": t.get("sensevoice_refine_ms"),
+            "refine_duration_ms": t.get("paraformer_refine_ms", t.get("sensevoice_refine_ms")),
             "refine_to_redecision_ms": delta("refinement_redecision_started", "refinement_completed"),
             "agent_request_to_speak_ms": delta("speak_requested", "llm_request"),
             "tts_prewarm_requested_ms": delta("tts_prewarm_requested", "start"),

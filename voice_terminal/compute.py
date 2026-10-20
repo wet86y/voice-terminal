@@ -191,7 +191,7 @@ def _backend_hardware_status(*, onnx_only: bool = False) -> dict[str, Any]:
 
     models = {
         "paraformer": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
-        "sensevoice": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
+        "emotion": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
         "voice_vad": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
         "kws": {"gpu_available": sherpa_cuda, "reason": None if sherpa_cuda else "Sherpa-ONNX（语音模型运行时）显卡后端或可用显卡缺失。"},
         "smart_turn": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime（模型推理运行时）显卡后端缺失或实际计算检查未通过。"},
@@ -290,7 +290,7 @@ def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool
     result = copy.deepcopy(hardware)
     required = {
         "paraformer": config.asr_model_dir / "model.pt",
-        "sensevoice": config.model_dir / "analysis/sensevoice/model.pt",
+        "emotion": config.model_dir / "analysis/emotion2vec-plus-base/model.pt",
         "voice_vad": config.vad_model_dir / "model.pt",
         "smart_turn": config.model_dir / "analysis/smart-turn/smart-turn-v3.2-gpu.onnx",
         "campplus": config.speaker_model_path,
@@ -313,7 +313,7 @@ def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool
             if status and status.get("gpu_available"):
                 verified = _isolated_onnx_model_probe(name, required[name], hardware.get("capabilities_sampled_at"))
                 status.update(gpu_available=verified["ready"], reason=verified.get("reason"))
-        for name in ("paraformer", "sensevoice", "voice_vad"):
+        for name in ("paraformer", "emotion", "voice_vad"):
             status = result.get("models", {}).get(name)
             if status and status.get("gpu_available") and not (required[name].parent / "config.yaml").is_file():
                 status.update(gpu_available=False, reason="当前模型的推理配置文件缺失。")
@@ -424,7 +424,7 @@ def loaded_funasr_device(model: Any, attempted: str) -> str:
 
 _GPU_MINIMUM_FREE_BYTES = {
     "paraformer": 1024 * 1024 * 1024,
-    "sensevoice": 1536 * 1024 * 1024,
+    "emotion": 1536 * 1024 * 1024,
     "voice_vad": 384 * 1024 * 1024,
     "kws": 256 * 1024 * 1024,
     "smart_turn": 256 * 1024 * 1024,

@@ -12,6 +12,77 @@ logger = logging.getLogger(__name__)
 
 
 class ProductSettingsRuntimeMixin:
+    async def switch_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
+        """音频增强切换事务：立即停听、等待原生调用、核验并保存、恢复监听意图。"""
+        from ..audio_enhancements import AudioEnhancements
+        from ..analysis.client import AnalysisClient
+        from ..application.resource_readiness import inspect_model_resources
+        if not hasattr(self, "_enhancement_switch_lock"):
+            self._enhancement_switch_lock = asyncio.Lock()
+        async with self._enhancement_switch_lock:
+            old = self.config.audio_enhancements
+            new = AudioEnhancements.from_mapping({**old.snapshot(), **dict(payload)})
+            if old == new:
+                return new.snapshot()
+            requirements = [resource for field, resource in (
+                ("dual_pass", "paraformer-offline"), ("emotion", "emotion2vec-plus-base"),
+                ("acoustic_events", "yamnet")) if getattr(new, field) and not getattr(old, field)]
+            issues = await asyncio.to_thread(inspect_model_resources, self._project_root,
+                                            self.config.model_dir, {"音频增强": requirements} if requirements else {})
+            if issues:
+                raise ValueError("；".join(issues.values()))
+            self._enhancement_switching = True
+            self._enhancement_resume_requested = bool(self.state.listening)
+            controller = self.controller
+            analysis = AnalysisClient(self.config.smart_turn.analysis_url)
+            changed = {"emotion": new.emotion, "acoustic": new.acoustic_events}
+            changed = {key: value for key, value in changed.items()
+                       if value != (old.emotion if key == "emotion" else old.acoustic_events)}
+            async def apply(settings):
+                if new.dual_pass != old.dual_pass:
+                    status = await self.asr.configure_enhancements(settings.dual_pass)
+                    offline = status.get("offline", {})
+                    if (offline.get("status") != ("READY" if settings.dual_pass else "DISABLED")
+                            or settings.dual_pass and offline.get("device") != status.get("device")):
+                        raise RuntimeError("双路精修未就绪或实际设备与主识别不一致")
+                if changed:
+                    selected = {key: settings.emotion if key == "emotion" else settings.acoustic_events for key in changed}
+                    status = await analysis.configure(selected)
+                    for key, enabled in selected.items():
+                        if status.get(key, {}).get("status") != ("READY" if enabled else "DISABLED"):
+                            raise RuntimeError(f"音频增强通道 {key} 未达到预期状态")
+            resume = False
+            try:
+                async with self._session_lock:
+                    if controller is not None:
+                        await controller.stop_listening()
+                await self.bus.publish(self.snapshot())
+                await apply(new)
+                if self.product_settings is not None:
+                    await asyncio.to_thread(self.product_settings.save_audio_enhancements, new.snapshot())
+                self.config = replace(self.config, audio_enhancements=new)
+                if controller is not None:
+                    controller.audio_enhancements = new
+                    if not new.acoustic_events:
+                        controller.perception["acoustic"].clear()
+                resume = True
+            except BaseException as failure:
+                try:
+                    await apply(old)
+                    resume = True
+                except Exception as rollback_error:
+                    logger.exception("音频增强恢复失败，保持停止监听")
+                    self._enhancement_resume_requested = False
+                    if not isinstance(failure, asyncio.CancelledError):
+                        raise RuntimeError(f"音频增强切换失败且恢复原模型失败，已停止监听：{rollback_error}") from failure
+                raise
+            finally:
+                self._enhancement_switching = False
+                if resume and self._enhancement_resume_requested and not getattr(self, "_closed", False):
+                    await self.start_listening()
+                await self.bus.publish(self.snapshot())
+            return new.snapshot()
+
     async def apply_product_settings(self, settings: Mapping[str, Any]) -> bool:
         """apply_product_settings（即时应用）：保留当前输入、播放与会话历史。"""
         async with self._session_lock:

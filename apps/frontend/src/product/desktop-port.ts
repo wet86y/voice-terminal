@@ -161,6 +161,7 @@ export interface DesktopWorkspacePort {
   downloadRequiredResources?(): Promise<{ job_id: string }> // downloadRequiredResources（一键必要资源）。
   ttsSelectionStatus?(): Promise<TtsSelection> // ttsSelectionStatus（启动前语音目标）。
   saveTtsSelection?(request: TtsSelection): Promise<TtsSelection> // saveTtsSelection（仅保存，不启动）。
+  audioEnhancements?(request?: Record<string, boolean>): Promise<{ dual_pass: boolean; emotion: boolean; acoustic_events: boolean }> // audioEnhancements（启动前读取或保存音频增强）。
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
   importResource(resourceId?: string): Promise<{ job_id: string }>
   /** resource_open_source（打开上游）：由原生宿主打开资源来源页面。 */
@@ -269,6 +270,7 @@ export function desktopPort(): DesktopPort {
     downloadRequiredResources: () => call<{ job_id: string }>('resource_download_required'),
     ttsSelectionStatus: () => call<TtsSelection>('tts_selection_status'),
     saveTtsSelection: request => call<TtsSelection>('tts_selection_save', { request }),
+    audioEnhancements: request => call('audio_enhancements_settings', { request: request ?? null }),
     importResource: resourceId => call<{ job_id: string }>('resource_import', resourceId === undefined ? undefined : { resource_id: resourceId }),
     openResourceSource: resourceId => call('resource_open_source', { resource_id: resourceId }),
     cancelResource: jobId => call('resource_cancel', { job_id: jobId }),

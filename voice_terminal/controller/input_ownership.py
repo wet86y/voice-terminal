@@ -577,7 +577,7 @@ class InputOwnershipMixin:
         while True:
             item = await self._asr_queue.get()
             try:
-                if isinstance(item, AudioChunk):
+                if isinstance(item, AudioChunk) or hasattr(item, "segment_id"):
                     if item.turn_id in self._sub_parts:
                         await self.asr.send_audio(item)
                 else:

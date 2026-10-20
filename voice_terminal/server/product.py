@@ -10,6 +10,7 @@ the internal Agent/Shadow trace.
 from __future__ import annotations
 
 from ..screen_capture import ScreenCaptureConfig
+from ..audio_enhancements import AudioEnhancements
 
 import asyncio
 import json
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 15
+PRODUCT_SETTINGS_SCHEMA_VERSION = 16
 PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
@@ -89,9 +90,11 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
     final_silence_ms = int(getattr(config.agent, "final_silence_ms", 30_000))
     paraformer_mode = config.asr.device if config.asr.device in COMPUTE_DEVICE_MODES else "auto"
     compute_devices = {name: "cpu" for name in COMPUTE_MODEL_IDS}
+    compute_devices["emotion"] = config.compute.devices.get("emotion", "cpu")
     compute_devices["paraformer"] = paraformer_mode
     return {
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
+        "audio_enhancements": config.audio_enhancements.snapshot(),
         "screen_capture": config.screen_capture.snapshot(),
         "quiet_hours": config.quiet_hours.snapshot(),
         "wake": {
@@ -222,13 +225,20 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     except (ValueError, TypeError):
         result["screen_capture"] = defaults["screen_capture"]
     result["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
+    from ..audio_enhancements import AudioEnhancements
+    try:
+        result["audio_enhancements"] = AudioEnhancements.from_mapping(
+            value.get("audio_enhancements", defaults["audio_enhancements"])).snapshot()
+    except ValueError:
+        result["audio_enhancements"] = deepcopy(defaults["audio_enhancements"])
     raw_compute = value.get("compute")
     if isinstance(raw_compute, Mapping):
         for field, allowed in (("devices", COMPUTE_DEVICE_MODES), ("fallback_devices", {"cpu", "cuda"})):
             entries = raw_compute.get(field)
             if isinstance(entries, Mapping):
                 for name in COMPUTE_MODEL_IDS:
-                    mode = entries.get(name, entries.get("wespeaker") if name == "campplus" else None)
+                    mode = entries.get(name, entries.get("wespeaker") if name == "campplus" else
+                                       entries.get("sensevoice") if name == "emotion" else None)
                     if isinstance(mode, str) and mode in allowed:
                         result["compute"][field][name] = mode
     wake = result["wake"]
@@ -597,7 +607,9 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     if quiet.enabled and not next_wake.enabled:
         raise ProductSettingsError("被动静默要求开启 KWS（关键词唤醒）。")
     return replace(config, screen_capture=ScreenCaptureConfig(**settings.get("screen_capture", config.screen_capture.snapshot())), quiet_hours=quiet, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
-                   speaker=next_speaker, tts=next_tts, compute=next_compute)
+                   speaker=next_speaker, tts=next_tts, compute=next_compute,
+                   audio_enhancements=AudioEnhancements.from_mapping(
+                       settings.get("audio_enhancements", config.audio_enhancements.snapshot())))
 
 
 class ProductSettingsStore:
@@ -669,6 +681,18 @@ class ProductSettingsStore:
         if selections:
             result["tts"]["active_voice_by_model"] = selections()
         return result
+
+    def save_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
+        """保存三个独立开关，写入失败恢复原值。"""
+        current = self._settings["audio_enhancements"]
+        value = AudioEnhancements.from_mapping({**current, **payload}).snapshot()
+        self._settings["audio_enhancements"] = value
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["audio_enhancements"] = current
+            raise
+        return dict(value)
 
     def save_hotwords(self, payload: dict) -> dict:
         """save_hotwords（保存热词）：写入失败不改变内存配置。"""

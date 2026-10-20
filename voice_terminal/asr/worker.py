@@ -41,8 +41,14 @@ class AsrWorkerEngine:
         fallback_device: str = "cpu",
         punctuation_model_dir: Path | None = None,  # punctuation_model_dir（实时标点目录；空值关闭）。
         punctuation_device: str = "cpu",  # punctuation_device（标点推理设备）。
+        offline_model_dir: Path | None = None,  # offline_model_dir（固定离线权重目录）。
+        dual_pass_enabled: bool = False,  # dual_pass_enabled（双路开关）。
     ) -> None:
         self.model_dir = model_dir
+        from .dual_pass import DualPassLane
+        self.offline = DualPassLane(offline_model_dir) if offline_model_dir is not None else None
+        self.dual_pass_enabled = dual_pass_enabled
+        self._segment_offsets: dict[str, int] = {}
         # device（请求设备）：auto/cpu/cuda；self.device（实际设备）由加载结果决定。
         self.requested_device = device
         self.device = "cpu"
@@ -199,10 +205,14 @@ class AsrWorkerEngine:
         """prepare（准备）：在识别专用线程完成加载和预热。"""
         future = asyncio.get_running_loop().run_in_executor(self._executor, self.load)
         await self._await_native(future)
+        if self.offline is not None:
+            await self.offline.configure(self.dual_pass_enabled, self.device)
 
     def close(self) -> None:
         """close（关闭）：工作进程结束时回收专用通道。"""
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if self.offline is not None:
+            self.offline.close()
         if self.punctuation is not None:
             self.punctuation.close()
 
@@ -255,6 +265,7 @@ class AsrWorkerEngine:
         return text
 
     def _clear_turn(self, turn_id: str) -> None:
+        self._segment_offsets.pop(turn_id, None)
         if self.punctuation is not None:
             self.punctuation.clear_turn(turn_id)
         self._cache_by_turn.pop(turn_id, None)
@@ -321,7 +332,16 @@ class AsrWorkerEngine:
                 self._clear_turn(turn_id)
                 raise
 
-    async def _infer_serial(self, turn_id: str, pcm: bytes, is_final: bool) -> AsrInferenceResult:
+    async def flush_segment(self, turn_id: str):
+        """刷新声学段缓存并保留业务轮次累计稿，不发送业务最终确认。"""
+        async with self._inference_lock:
+            self._call_latency = {}
+            result = await self._infer_serial(turn_id, b"", True, close_turn=False)
+            offset = self._segment_offsets.get(turn_id, 0)
+            self._segment_offsets[turn_id] = len(result.text)
+            return result, result.text[offset:]
+
+    async def _infer_serial(self, turn_id: str, pcm: bytes, is_final: bool, *, close_turn=True) -> AsrInferenceResult:
         started = time.perf_counter()
         self._current_spans = []
         self._chunk_count_by_turn[turn_id] = self._chunk_count_by_turn.get(turn_id, 0) + 1
@@ -386,15 +406,47 @@ class AsrWorkerEngine:
                 elapsed_ms,
                 len(text),
             )
-        if is_final:
+        if is_final and close_turn:
             # Return the final cumulative text before releasing per-turn
             # model cache and aggregation state.
             self._clear_turn(turn_id)
+        elif is_final:
+            self._cache_by_turn.pop(turn_id, None)
+            self._model_call_count_by_turn[turn_id] = 0
         return AsrInferenceResult(text=text, emitted=bool(emitted_text), segments=list(self._current_spans), latency=dict(self._call_latency))
 
 
 async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None:
     owned_turns: set[str] = set()
+    send_lock = asyncio.Lock()
+    refinements: set[asyncio.Task] = set()
+    completed_segments: set[tuple[str, str]] = set()
+
+    async def send(payload):
+        async with send_lock:
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+
+    async def refine_segment(message, pcm, streamed_text):
+        try:
+            result = await engine.offline.infer(pcm)
+            if result is not None:
+                await send({"type": "asr.refined", "turn_id": message["turn_id"],
+                    "segment_id": message["segment_id"], "start_sample": message["start_sample"],
+                    "parent_turn_id": message.get("parent_turn_id", message["turn_id"]),
+                    "revision": message.get("revision", 1),
+                    "end_sample": message["end_sample"], "streamed_text": streamed_text,
+                    "start_char": message["start_char"], "end_char": message["end_char"],
+                    "source": "paraformer_offline", **result})
+            else:
+                await send({"type": "asr.refinement_failed", "turn_id": message["turn_id"],
+                            "segment_id": message["segment_id"],
+                            "error": engine.offline.error or "离线精修不可用或已切换"})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("asr.offline_failed")
+            await send({"type": "asr.refinement_failed", "turn_id": message["turn_id"],
+                        "segment_id": message["segment_id"], "error": str(exc)})
     peer = getattr(websocket, "remote_address", None)
     logger.info("asr.worker.connection_open peer=%s", peer)
     try:
@@ -408,6 +460,52 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 if not isinstance(message, dict):
                     raise ValueError("消息必须是 JSON 对象")
                 message_type = message.get("type")
+                if message_type == "reference.transcribe":
+                    chunk = decode_audio_chunk(message)
+                    if not chunk.pcm or len(chunk.pcm) > 16000*2*62:
+                        raise ValueError("参考音频必须为不超过 62 秒的有效音频")
+                    result = await engine.offline.infer(chunk.pcm) if engine.offline else None
+                    if result is None:
+                        raise ValueError("双路精修未启用或不可用，请开启后重试或手动填写")
+                    await send({"type": "health", "request_id": message.get("request_id"), "result": result})
+                    continue
+                if message_type == "enhancements.configure":
+                    request_id = message.get("request_id")
+                    try:
+                        if type(message.get("dual_pass")) is not bool or engine.offline is None:
+                            raise ValueError("双路设置无效或离线模型目录未配置")
+                        if message["dual_pass"] and not engine.model_loaded:
+                            raise ValueError("主识别模型尚未就绪，无法确定双路实际设备")
+                        await engine.offline.configure(message["dual_pass"], engine.device, strict=True)
+                        await send({"type": "health", "request_id": request_id, "status": "READY",
+                                    "model_loaded": engine.model_loaded, "device": engine.device,
+                                    "offline": engine.offline.status()})
+                    except Exception as exc:
+                        await send({"type": "error", "request_id": request_id, "message": str(exc)})
+                    continue
+                if message_type == "audio.segment":
+                    chunk = decode_audio_chunk(message)
+                    segment_id = message.get("segment_id")
+                    start, end = message.get("start_sample"), message.get("end_sample")
+                    if (not isinstance(segment_id, str) or type(start) is not int or type(end) is not int
+                            or start < 0 or end <= start or len(chunk.pcm) != (end-start)*2
+                            or len(chunk.pcm) > 16000*2*62):
+                        raise ValueError("VAD（语音活动检测）句段范围无效")
+                    key = (chunk.turn_id, segment_id)
+                    if key in completed_segments:
+                        continue
+                    completed_segments.add(key)
+                    inference, streamed_text = await engine.flush_segment(chunk.turn_id)
+                    message = {**message, "start_char": len(inference.text)-len(streamed_text),
+                               "end_char": len(inference.text)}
+                    await send({"type": "asr.partial", "turn_id": chunk.turn_id,
+                                "text": inference.text, "segments": inference.segments,
+                                "segment_id": segment_id, "segment_closed": True})
+                    if engine.offline is not None and engine.offline.enabled:
+                        task = asyncio.create_task(refine_segment(message, chunk.pcm, streamed_text))
+                        refinements.add(task)
+                        task.add_done_callback(refinements.discard)
+                    continue
                 if message_type == "health":
                     request_id = message.get("request_id")
                     if request_id is not None and not isinstance(request_id, str):
@@ -423,6 +521,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "device": getattr(engine, "device", None),
                             "requested_device": getattr(engine, "requested_device", None),
                             "load_error": getattr(engine, "load_error", None),
+                            "offline": engine.offline.status() if getattr(engine, "offline", None) is not None else {"status": "DISABLED"},
                             "punctuation": engine.punctuation.status() if getattr(engine, "punctuation", None) is not None else {"status": "DISABLED"},  # punctuation（标点通道健康状态）。
                             "process_memory_rss_bytes": process_memory_bytes(),
                             "resource_status": process_resource_status(),  # resource_status（资源状态）。
@@ -443,7 +542,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                         response["hardware_capabilities"] = hardware_status()  # hardware_capabilities（重型后端能力）。
                     if isinstance(request_id, str):
                         response["request_id"] = request_id
-                    await websocket.send(json.dumps(response, ensure_ascii=False))
+                    await send(response)
                     logger.info(
                         "asr.worker.health_reply request_id=%s status=%s model_loaded=%s",
                         request_id,
@@ -455,6 +554,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     turn_id = message.get("turn_id")
                     if isinstance(turn_id, str):
                         engine._clear_turn(turn_id)
+                        completed_segments.difference_update(tuple(key for key in completed_segments if key[0] == turn_id))
                         owned_turns.discard(turn_id)
                         logger.info("asr.worker.turn_finish turn_id=%s", turn_id)
                     continue
@@ -496,9 +596,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                         response["segments"] = inference.segments
                     if latency is not None:
                         response["latency"] = latency  # latency（分段耗时）：旧接收端可以忽略。
-                    await websocket.send(
-                        json.dumps(response, ensure_ascii=False)
-                    )
+                    await send(response)
                     logger.info(
                         "asr.worker.result turn_id=%s type=%s text_len=%d text=%r",
                         chunk.turn_id,
@@ -519,8 +617,12 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 }
                 if isinstance(message, dict) and isinstance(message.get("request_id"), str):
                     error_payload["request_id"] = message["request_id"]
-                await websocket.send(json.dumps(error_payload, ensure_ascii=False))
+                await send(error_payload)
     finally:
+        remaining = tuple(refinements)
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
         for turn_id in owned_turns:
             engine._clear_turn(turn_id)
         logger.info("asr.worker.connection_closed peer=%s", peer)

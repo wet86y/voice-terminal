@@ -139,7 +139,7 @@ export const demoModelEntries: DemoModelEntry[] = [
   { id: 'local-asr', name: 'Paraformer Streaming', modelId: 'paraformer-zh-streaming', capability: 'local_asr', origin: 'local_scan', provider: '受管目录', status: 'healthy', path: 'model_dir/funasr/paraformer-zh-streaming' },
   { id: 'local-vad', name: 'FSMN-VAD', modelId: 'fsmn-vad', capability: 'local_vad', origin: 'local_scan', provider: '受管目录', status: 'healthy', path: 'model_dir/funasr/fsmn-vad' },
   { id: 'local-smart-turn', name: 'Smart Turn V3.2', modelId: 'smart-turn-v3.2-cpu', capability: 'local_analysis_endpoint', origin: 'local_scan', provider: '受管目录', status: 'healthy', path: 'model_dir/analysis/smart-turn' },
-  { id: 'local-sensevoice', name: 'SenseVoice Small', modelId: 'sensevoice-small', capability: 'local_analysis_refine', origin: 'local_scan', provider: '受管目录', status: 'healthy', path: 'model_dir/analysis/sensevoice' },
+  { id: 'local-emotion', name: 'emotion2vec+ base Small', modelId: 'emotion2vec-plus-base', capability: 'local_analysis_refine', origin: 'local_scan', provider: '受管目录', status: 'healthy', path: 'model_dir/analysis/emotion' },
 ]
 
 export const capabilityLabels: Record<DemoModelCapability, string> = {
@@ -251,7 +251,7 @@ export const demoWakeTasks: DemoWakeTask[] = [
 /** id（标识）、name（模型名称）、device（当前设备）、memory（常驻内存）、gpu（显卡可选）。 */
 export const demoComputeModels = [
   { id: 'paraformer', name: 'Paraformer（流式语音识别）', device: 'cpu', memory: '420 MB', gpu: true },
-  { id: 'sensevoice', name: 'SenseVoiceSmall（语音识别与分析）', device: 'cuda', memory: '610 MB', gpu: true },
+  { id: 'emotion', name: 'emotion2vec+ base（语音识别与分析）', device: 'cuda', memory: '610 MB', gpu: true },
   { id: 'voice_vad', name: 'FSMN-VAD（语音活动检测）', device: 'cpu', memory: '58 MB', gpu: false },
   { id: 'kws', name: 'KWS（关键词唤醒）', device: 'cpu', memory: '96 MB', gpu: false },
   { id: 'smart_turn', name: 'SmartTurn（语音结束判断）', device: 'cpu', memory: '180 MB', gpu: false },
