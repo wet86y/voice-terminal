@@ -46,6 +46,7 @@ class _RecordingKws:
 
 class _Activity:
     speech_started = False
+    speech_ended = False
     speech_end_sample = None
     is_speech = False
 

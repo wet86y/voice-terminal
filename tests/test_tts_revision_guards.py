@@ -131,7 +131,7 @@ def test_reference_preview_uses_prompt_audio_task_and_native_pcm(tmp_path, respo
 
 
 @pytest.mark.parametrize("native_rate", [16000, 48000])
-def test_overlong_stream_is_rejected_cleared_and_released_without_replay(native_rate, caplog):
+def test_overlong_stream_is_rejected_and_cleared_without_replay(native_rate, caplog):
     async def scenario():
         submitted, released = [], []
         async def handler(request):
@@ -153,7 +153,8 @@ def test_overlong_stream_is_rejected_cleared_and_released_without_replay(native_
         assert session.audio_rejected and session._buffered_bytes == 0
         assert session.completed_segments == 0 and session.request_metrics == []
         rejected.assert_called_once()
-        assert len(submitted) == 1 and len(released) == 1
+        assert len(submitted) == 1 and released == []
+        assert "continuation_id" not in submitted[0]
         assert 0 < submitted[0]["options"]["max_tokens"] < 1024
         with pytest.raises(AudioCppDegenerateError):
             _ = [pcm async for pcm in session.audio_chunks()]
@@ -261,16 +262,16 @@ def test_local_model_device_failure_rolls_back_native_model_and_all_clocks():
 
 
 @pytest.mark.parametrize("backend,model,available,rate", [
-    ("minimax", "voxcpm2", ["voxcpm2"], 48000),
-    ("voxcpm1", "voxcpm1", ["voxcpm2"], 48000),
+    ("minimax", "voxcpm2", [], 32000),
+    ("voxcpm1", "voxcpm2", ["voxcpm2"], 48000),
     ("voxcpm1", "voxcpm1", ["voxcpm1"], 16000),
 ])
 def test_startup_selection_and_first_player_share_native_reverse_rate(tmp_path, monkeypatch, backend, model, available, rate):
     runtime = SessionRuntime.__new__(SessionRuntime)
     runtime.config = replace(AppConfig(), tts=replace(AppConfig().tts, backend=backend, local_model=model))
     runtime._runtime_local_root = tmp_path
-    runtime._api_key = lambda name: ""
-    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root: available)
+    runtime._api_key = lambda name: "test-minimax-api-key" if backend == "minimax" else ""
+    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root, **_kwargs: available)
     runtime._select_available_tts()
     assert runtime.config.tts.sample_rate == rate
     runtime.player = None

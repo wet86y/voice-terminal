@@ -123,7 +123,9 @@ class InputContinuityRecoveryTests(unittest.IsolatedAsyncioTestCase):
         controller._active_input = False
         controller.wake_enabled = False
         controller.vad = SimpleNamespace(
-            feed=lambda _pcm: SimpleNamespace(speech_started=False, speech_end_sample=None),
+            feed=lambda _pcm: SimpleNamespace(
+                speech_started=False, speech_ended=False, speech_end_sample=None,
+            ),
         )
         controller.workspace = SimpleNamespace(audio=CurrentTurnAudioBuffer())
 
