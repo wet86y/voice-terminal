@@ -64,6 +64,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const connectionError = ref('')
   const state = ref<TerminalState>('STARTING')
   const listening = ref(false)
+  const inputPaused = ref(false) // inputPaused（自动暂停监听中）。
+  const listeningRequested = ref(false) // listeningRequested（恢复监听意图）。
+  const runtimeOperations = ref<import('../runtime/runtime-operations').RuntimeOperation[]>([])
   const canStart = ref(false)
   const serverSessionOperation = ref<SessionOperation | null>(null) // serverSessionOperation（后端会话操作，重连时从快照恢复）。
   const pendingSessionOperation = ref<SessionOperation | null>(null) // pendingSessionOperation（本机等待回执的会话操作）。
@@ -845,6 +848,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyRuntimeSnapshot(payload: RuntimeSnapshotPayload, turnId: string | null) {
+    if (Array.isArray(payload.runtime_operations)) runtimeOperations.value = payload.runtime_operations
+    inputPaused.value = payload.input_paused === true
+    listeningRequested.value = payload.listening_requested ?? payload.listening
     if (payload.session_operation === 'reset' || payload.session_operation === 'clear' || payload.session_operation === null) {
       serverSessionOperation.value = payload.session_operation
     }
@@ -1310,14 +1316,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   /** setListening（设置麦克风输入目标）：停止输入保留播报，开始复用原有识别链路。 */
   function setListening(enabled: boolean) {
     if (connection.value !== 'connected' || sessionOperation.value) return false
-    if (listening.value === enabled) return false
+    if ((inputPaused.value ? listeningRequested.value : listening.value) === enabled) return false
     if (!enabled) return sendCommand('session.stop')
-    if (!canStart.value) return false
+    if (!canStart.value && !inputPaused.value) return false
     return sendCommand('session.start')
   }
 
   function toggleListening() {
-    return setListening(!listening.value)
+    return setListening(!(inputPaused.value ? listeningRequested.value : listening.value))
   }
 
   function performSessionOperation(operation: SessionOperation) {
@@ -1357,6 +1363,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     connectionError.value = ''
     state.value = 'STARTING'
     listening.value = false
+    inputPaused.value = listeningRequested.value = false
     canStart.value = false
     resetConnectionData()
     Object.assign(services, createOfflineStatuses())
@@ -1371,6 +1378,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     connectionLabel,
     state,
     listening,
+    inputPaused,
+    listeningRequested,
+    runtimeOperations,
     canStart,
     sessionOperation,
     wakeAlwaysOn,

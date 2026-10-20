@@ -74,7 +74,6 @@ async function choose() {
     const result = await productApi.saveTts(choice === 'minimax' ? { backend: 'minimax' } : { backend: 'voxcpm1', local_model: choice })
     if (generation !== selectionGeneration) return
     if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
-    context?.setNotice(result.message || '语音目标已提交。')
     await live.refresh(true) // 切换结果不能被先前仍在途的状态读取覆盖。
   } catch (failure) {
     if (generation !== selectionGeneration) return
@@ -105,7 +104,6 @@ async function saveOnlineSettings() {
     }
     const result = await productApi.saveTts({ online_model: onlineModelDraft.value, online_voice_id: voiceId })
     if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
-    context?.setNotice(result.message || 'MiniMax 在线模型与音色已保存。')
     await live.refresh(true)
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '保存 MiniMax 在线模型与音色失败。'
@@ -172,7 +170,7 @@ async function openOfficialVoiceLibrary() {
     <template v-if="selected !== 'minimax' && selectedReady">
       <TtsVoiceLibrary :port="productApi" :model="model" :steps="steps[model]" :unavailable="unavailable" :demo="demo" @changed="refreshStatus" />
       <details class="tts-quality"><summary>合成质量</summary><label class="form-field"><span>{{ names[model] }} · 推理步数</span><input v-model.number="steps[model]" type="number" min="1" max="30" step="1" :disabled="saving" @change="saveSteps"><small>默认一代 10 步、二代 20 步。保存后用于下一次回答。</small></label></details>
-      <p class="instruction-hint">试音前请先结束监听和当前播报。设计音色保存生成的样音，正式回答使用这段样音克隆。</p>
+      <p class="instruction-hint">试音会自动暂停监听并等待当前播报结束，完成后恢复原先的监听状态。设计音色保存生成的样音，正式回答使用这段样音克隆。</p>
     </template>
   </div>
 </template>

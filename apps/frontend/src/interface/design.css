@@ -3142,6 +3142,23 @@ time {
 .save-notice.is-fading {
   opacity: 0;
 }
+.notification-stack {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  max-width: calc(100vw - 40px);
+  pointer-events: none;
+}
+.notification-stack > .save-notice {
+  position: relative;
+  inset: auto;
+  pointer-events: auto;
+}
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -3366,6 +3383,10 @@ time {
     grid-template-columns: 1fr;
   }
   .save-notice {
+    right: 12px;
+    bottom: 12px;
+  }
+  .notification-stack {
     right: 12px;
     bottom: 12px;
   }

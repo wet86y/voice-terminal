@@ -23,6 +23,7 @@
 ## 说明
 
 - [组件设置与分类下载](guides/component-settings.md)
+- [在线切换、自动停听与状态提示](guides/runtime-switching.md)
 - [国内镜像与原站回退](guides/download-sources.md)
 - [模型运行环境配置指南](guides/模型运行环境配置指南.md)
 - [应用生命周期](guides/application-lifecycle.md)
@@ -50,6 +51,8 @@
 - [统一正式程序与分发安装器](guides/unified-product-installer.md)
 
 ## 测试
+
+- [在线切换与自动停听回归（2026-10-20）](testing/runtime-switching-20261020.md)
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
 - [当前已知问题](testing/known-issues.md)

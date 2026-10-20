@@ -986,6 +986,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const latencyRunning = computed(() => connected.value && voice.perceptualLatencyRunning.value)
 
   function runtimeAction() {
+    if (voice.inputPaused.value) return false
     if (!application.businessReady.value) return false
     if (application.snapshot.value?.startup_complete === false) return false
     if (!connected.value) {

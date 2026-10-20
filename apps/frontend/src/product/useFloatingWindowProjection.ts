@@ -99,7 +99,7 @@ export function useFloatingWindowProjection(voice: ReturnType<typeof useVoiceTer
       sessionActive: workbench.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(workbench.value.state),
       audioLevels: workbench.value.audioLevels ?? voice.audioLevels.value,
       silenced: !voice.listening.value,
-      canControl: voice.connection.value === 'connected' && !workbench.value.disabled
+      canControl: voice.connection.value === 'connected' && !workbench.value.disabled && !voice.inputPaused?.value
         && (voice.listening.value || voice.canStart.value),
       caption,
     }

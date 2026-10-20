@@ -218,6 +218,9 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  runtime_operations?: import('./runtime/runtime-operations').RuntimeOperation[] // 运行操作快照。
+  input_paused?: boolean // input_paused（维护操作暂时停听）。
+  listening_requested?: boolean // listening_requested（维护结束后的监听意图）。
   session_operation?: SessionOperation | null // session_operation（后端正在执行的会话操作）。
   audio_generation?: number // audio_generation（音频轮代），用于丢弃状态切换前的音量。
   /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不含待传达内容。 */

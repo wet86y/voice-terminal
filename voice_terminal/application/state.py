@@ -7,6 +7,7 @@ import time
 import uuid
 
 from .ports import validate_endpoint_url
+from ..core.operations import OperationRegistry
 
 TERMINAL = {"ready", "disabled", "failed", "blocked", "external", "stopped"}
 # LOADING_STATES（加载中组件状态）：瞬态，整体状态按“启动中”呈现而不是启动失败。
@@ -22,6 +23,7 @@ LABELS = {
 class ApplicationState:
     def __init__(self) -> None:
         self.condition = threading.Condition(threading.RLock())
+        self.operations = OperationRegistry()
         self.value = {
             "instance_id": uuid.uuid4().hex,  # instance_id（应用实例标识）。
             "revision": 0,  # revision（状态版本）。
@@ -57,6 +59,7 @@ class ApplicationState:
     def snapshot(self) -> dict:
         with self.condition:
             result = copy.deepcopy(self.value)
+            result["runtime_operations"] = self.operations.snapshot()  # runtime_operations（宿主运行操作）。
             scheduled = [c for c in result["components"] if c["enabled"]]
             result["completed_components"] = sum(c["state"] in TERMINAL for c in scheduled)
             result["total_components"] = len(scheduled)
@@ -77,11 +80,22 @@ class ApplicationState:
 
     def component(self, key: str, **values) -> None:
         with self.condition:
+            operation_failed = values.pop("operation_failed", None)  # 能力级恢复可以明确报告终态。
+            operation_label = values.pop("operation_label", None)  # 可选的能力中文名称。
+            operation_target = values.pop("operation_target", None)  # 可选的能力标识。
             row = next(c for c in self.value["components"] if c["id"] == key)
+            was_retrying = row["retrying"]
             if "pid" in values and values["pid"] != row["pid"]:
                 row.update(created_at=None, memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                     cpu_percent=None, uptime_seconds=None, sampled_at=None)
             row.update(values)
+            if row["retrying"] and not was_retrying:
+                row["operation_id"] = self.operations.begin(operation_target or key, operation_label or row["name"], "restarting")
+            elif was_retrying and not row["retrying"] and row.get("operation_id"):
+                failed = (row["state"] in {"failed", "blocked", "stopped"}
+                          if operation_failed is None else bool(operation_failed))
+                self.operations.update(row.pop("operation_id"), state="failed" if failed else "succeeded",
+                                       phase="failed" if failed else "ready", detail=row["error"] if failed else "")
             if row["state"] in {"blocked", "disabled", "stopped"} or row["pid"] is None:
                 row.update(memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                     cpu_percent=None, uptime_seconds=None)

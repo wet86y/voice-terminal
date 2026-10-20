@@ -112,7 +112,8 @@ class ApplicationHost:
             if voice_row is None or voice_row["retrying"]:
                 # 同一能力（或整进程）恢复期间拒绝重复请求，与组件级重试的门禁一致。
                 return False
-            self.state.component("voice", retrying=True, phase=f"恢复{row.get('label') or capability}")
+            self.state.component("voice", retrying=True, phase=f"恢复{row.get('label') or capability}",
+                                 operation_label=row.get("label") or capability, operation_target=f"capability:{capability}")
         self.enqueue(self._retry_capability_locked(capability))
         return True
 
@@ -135,6 +136,7 @@ class ApplicationHost:
             return
         label = (self._capability_row(capability) or {}).get("label") or capability
         voice = self.processes.get("voice")
+        recovered = False
         try:
             if voice is None or voice.poll() is not None:
                 log.info("能力恢复回落到整进程重建：组件=voice，能力=%s", capability)
@@ -148,11 +150,12 @@ class ApplicationHost:
                 raise RuntimeError(response.get("message") or "组件恢复失败")
             await self.probe("voice")
             self._reset_probe_failure("voice")
+            recovered = True
         except Exception as exc:
             log.exception("能力级恢复失败：能力=%s", capability)
             self.state.component("voice", error=f"{label}恢复失败：{str(exc)[:160]}")
         finally:
-            self.state.component("voice", retrying=False)
+            self.state.component("voice", retrying=False, operation_failed=not recovered)
             self.state.finish()
 
     def request_retry(self, key: str) -> bool:
