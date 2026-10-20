@@ -23,6 +23,7 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
     seen.add(identity)
     const group = resourceGroup(row.component_id)
     const residual = { ...row }
+    const analysisShares = new Map<string, ComponentResources>()
     // 归属增量按当前进程身份校验，并以进程当前余量为限；各条目合计始终不超过宿主总量。
     const candidates = [
       ...(['kws', 'voice_vad', 'smart_turn', 'emotion'] as const).map(id => ({ id, status: compute?.models?.[id] })),
@@ -32,7 +33,12 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
       const footprint = status?.resource_footprint
       if (!footprint || footprint.basis !== 'load_delta' || footprint.pid !== row.pid
         || footprint.created_at !== row.created_at || status?.service === 'DISABLED') continue
-      const assigned: ComponentResources = { memory_rss_bytes: null }
+      // analysis（分析进程）的模型卡会承接共享余量；已知进程指标下把未知的模型增量视作零，
+      // 让余量继续参与分摊，而不把同一项指标标成未知。
+      const assigned: ComponentResources = {
+        memory_rss_bytes: group === 'analysis' && typeof row.memory_rss_bytes === 'number' ? 0 : null,
+        ...(group === 'analysis' && typeof row.memory_private_commit_bytes === 'number' ? { memory_private_commit_bytes: 0 } : {}),
+      }
       for (const [key, source] of [['memory_rss_bytes', 'rss_bytes'], ['memory_private_commit_bytes', 'private_commit_bytes']] as const) {
         const remaining = residual[key], estimate = footprint[source]
         if (typeof remaining !== 'number' || !Number.isFinite(remaining) || remaining < 0
@@ -40,9 +46,50 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
         assigned[key] = Math.min(remaining, estimate)
         residual[key] = remaining - assigned[key]!
       }
-      groups.set(id, [...(groups.get(id) ?? []), assigned])
+      if (group === 'analysis') analysisShares.set(id, assigned)
+      else groups.set(id, [...(groups.get(id) ?? []), assigned])
     }
-    groups.set(group, [...(groups.get(group) ?? []), residual])
+    if (group === 'analysis') {
+      // 同进程的模型没有独立进程计数器；常驻与提交余量按已加载模型均分，显存只归属报告 CUDA 的模型。
+      // 这是可追溯的共享成本归属，避免为共享运行环境额外创建一张模型卡。
+      // id（模型卡标识）与 status（该模型的运行状态及进程身份）。
+      const analysisCandidates = [
+        { id: 'emotion', status: compute?.models?.emotion },
+        { id: 'smart_turn', status: compute?.models?.smart_turn },
+        { id: 'acoustic_events', status: compute?.auxiliary?.acoustic_events },
+      ] as const
+      const matchesProcess = (status: typeof analysisCandidates[number]['status'], process: typeof row) => {
+        if (!status || status.service === 'DISABLED') return false
+        const footprint = status.resource_footprint
+        const sample = status.resource_status
+        return footprint?.pid === process.pid && footprint.created_at === process.created_at
+          || sample?.pid === process.pid && sample.created_at === process.created_at
+      }
+      const loaded = analysisCandidates.filter(candidate => matchesProcess(candidate.status, row))
+      const addShare = (id: string, key: keyof ComponentResources, amount: number) => {
+        const share = analysisShares.get(id) ?? {
+          memory_rss_bytes: typeof row.memory_rss_bytes === 'number' ? 0 : null,
+          ...(typeof row.memory_private_commit_bytes === 'number' ? { memory_private_commit_bytes: 0 } : {}),
+        }
+        share[key] = typeof share[key] === 'number' ? share[key]! + amount : amount
+        analysisShares.set(id, share)
+      }
+      const distribute = (key: keyof ComponentResources, owners: readonly { id: string }[]) => {
+        const value = residual[key]
+        if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || !owners.length) return
+        const each = Math.floor(value / owners.length)
+        const remainder = value - each * owners.length
+        owners.forEach((owner, index) => addShare(owner.id, key, each + (index < remainder ? 1 : 0)))
+        residual[key] = 0
+      }
+      distribute('memory_rss_bytes', loaded)
+      distribute('memory_private_commit_bytes', loaded)
+      const gpuOwners = loaded.filter(candidate => candidate.status?.device?.startsWith('cuda'))
+      distribute('gpu_dedicated_bytes', gpuOwners)
+      for (const [id, share] of analysisShares) groups.set(id, [...(groups.get(id) ?? []), share])
+    } else {
+      groups.set(group, [...(groups.get(group) ?? []), residual])
+    }
   }
   const total = (rows: ComponentResources[], key: keyof ComponentResources) =>
     rows.every(row => typeof row[key] === 'number' && Number.isFinite(row[key]) && row[key]! >= 0)

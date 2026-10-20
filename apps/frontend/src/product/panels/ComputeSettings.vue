@@ -12,7 +12,7 @@ import type { useWorkspaceResources } from '../useWorkspaceResources'
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
 
 const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources> }>()
-const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
+const { settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
 const refreshing = ref(false)
@@ -21,13 +21,14 @@ const enhancementBusy = ref(false) // enhancementBusy（增强切换事务进行
 const enhancementError = ref('') // enhancementError（切换或回滚失败原因）。
 type EnhancementKey = 'dual_pass' | 'emotion' | 'acoustic_events'
 function enhancement(key: EnhancementKey, label: string) {
-  return { label, enabled: settings.audio_enhancements?.[key] !== false, busy: enhancementBusy.value,
+  return { label, enabled: settings.audio_enhancements?.[key] !== false,
+    busy: enhancementBusy.value || settingsLoading.value, busyLabel: settingsLoading.value ? '读取状态中' : '切换中',
     toggle: async () => {
+      if (enhancementBusy.value || settingsLoading.value) return
       enhancementBusy.value = true; enhancementError.value = ''
       try {
-        const response = await productApi.saveAudioEnhancements({ [key]: settings.audio_enhancements?.[key] === false })
-        settings.audio_enhancements = response.settings
-        await refreshComputeStatus(true)
+        await saveAudioEnhancement(key)
+        void refreshComputeStatus(true)
       } catch (failure) { enhancementError.value = failure instanceof Error ? failure.message : String(failure) }
       finally { enhancementBusy.value = false }
     } }
@@ -131,7 +132,10 @@ const rows = computed<LocalComponentRow[]>(() => {
     const available = !updateRequired && !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
-    const category: LocalComponentCategory = ['paraformer', 'smart_turn'].includes(item.id) ? 'speech' : 'extensions'
+    const category: LocalComponentCategory = ['paraformer', 'smart_turn', 'voice_vad'].includes(item.id) ? 'speech' : 'extensions'
+    const analysisModel = ['emotion', 'smart_turn'].includes(item.id)
+    const modelVram = metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes
+    const measuredVram = status?.device?.startsWith('cuda') && typeof modelVram === 'number' && modelVram > 0 ? modelVram : undefined
     return {
       id: item.id, name: item.title, category,
       enhancement: item.id === 'paraformer' ? enhancement('dual_pass', '双路精修') : item.id === 'emotion' ? enhancement('emotion', '情绪背景') : undefined,
@@ -142,18 +146,17 @@ const rows = computed<LocalComponentRow[]>(() => {
       location: deviceLabel(status?.device),
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
-      vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
+      vram: countedHere && measuredVram !== undefined ? formatComponentMemory(measuredVram) : undefined,
       resourceBytes: {
         resident: countedHere ? metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes ?? undefined : undefined,
         privateCommit: countedHere ? metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes ?? undefined : undefined,
-        vram: countedHere && status?.device?.startsWith('cuda') ? metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes ?? undefined : undefined,
+        vram: countedHere ? measuredVram : undefined,
       },
       description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
-      note: sharedEstimate ? countedHere ? '加载与预热的内存增量估算，已从所属进程扣除；共享运行库与后续缓存仍计入进程余量。' : '尚无加载增量采样，资源暂计入所属进程。' : '所属进程当前余量；已扣除单列模型的加载增量估算，显存仍按进程计量。',
+      note: sharedEstimate ? countedHere ? analysisModel ? '包含模型加载增量及共享分析进程余量；共享内存按已加载模型均分，显存计入报告 GPU（图形处理器）的模型。' : '加载与预热的内存增量估算，已从所属进程扣除；共享运行库与后续缓存仍计入进程余量。' : '尚无加载增量采样，资源暂计入所属进程。' : '所属进程当前余量；已扣除单列模型的加载增量估算，显存仍按进程计量。',
       facts: [
         ...(item.id === 'paraformer' && computeStatus.value?.auxiliary?.dual_pass?.load_error ? [{ label: '离线精修错误', value: computeStatus.value.auxiliary.dual_pass.load_error }] : []),
         ...(item.id === 'emotion' ? [{ label: '情绪模型加载增量', value: formatComponentMemory(status?.resource_footprint?.rss_bytes) || "未采样" }] : []),
-        ...(item.id === 'paraformer' ? [{ label: '离线精修设备', value: '跟随主识别' }, { label: '双路精修', value: serviceLabel(computeStatus.value?.auxiliary?.dual_pass?.service) }, { label: '离线模型加载增量', value: formatComponentMemory(computeStatus.value?.auxiliary?.dual_pass?.resource_footprint?.rss_bytes) || "未采样" }] : []),
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
@@ -175,22 +178,6 @@ const rows = computed<LocalComponentRow[]>(() => {
   const acoustic = computeStatus.value?.auxiliary?.acoustic_events
   const acousticMetrics = resources.value.get('acoustic_events')
   const acousticOwner = componentFor('analysis')
-  const analysisMetrics = resources.value.get('analysis')
-  const analysisLoading = Boolean(acousticOwner?.retrying || ['waiting', 'starting', 'stopping'].includes(acousticOwner?.state ?? ''))
-  const analysisAvailable = ['ready', 'external'].includes(acousticOwner?.state ?? '')
-  models.push({ id: 'analysis-runtime', name: '音频分析共享运行环境', category: 'extensions',
-    state: analysisLoading ? 'loading' : analysisAvailable ? 'ready' : 'disabled',
-    status: analysisLoading ? '启动中' : analysisAvailable ? '运行中' : '未运行', available: analysisAvailable,
-    runtime: '情绪、声学事件与结束判断共用进程',
-    description: '显示框架与后续缓存的进程余量；各模型加载增量单列，进程显存只在此计一次。',
-    residentMemory: formatComponentMemory(analysisMetrics?.memory_rss_bytes),
-    privateMemory: formatComponentMemory(analysisMetrics?.memory_private_commit_bytes),
-    vram: analysisMetrics?.gpu_dedicated_bytes ? formatComponentMemory(analysisMetrics.gpu_dedicated_bytes) : undefined,
-    resourceBytes: { resident: analysisMetrics?.memory_rss_bytes ?? undefined,
-      privateCommit: analysisMetrics?.memory_private_commit_bytes ?? undefined,
-      vram: analysisMetrics?.gpu_dedicated_bytes ?? undefined },
-    facts: acousticOwner?.pid ? [{ label: '进程标识', value: String(acousticOwner.pid) }] : [],
-  })
   const acousticLoading = Boolean(acousticOwner?.retrying || ['waiting', 'starting', 'stopping'].includes(acousticOwner?.state ?? '') || !acoustic && application.snapshot.value?.startup_complete === false)
   models.push({ id: 'yamnet', name: 'YAMNet（声学事件）', category: 'extensions',
     state: acousticLoading ? 'loading' : acoustic?.service === 'READY' ? 'ready' : acoustic?.service === 'DISABLED' ? 'disabled' : 'failed',
@@ -200,7 +187,10 @@ const rows = computed<LocalComponentRow[]>(() => {
     enhancement: enhancement('acoustic_events', '声学事件'), resource: managedResource('yamnet'),
     error: acoustic?.load_error || undefined, facts: [],
     residentMemory: formatComponentMemory(acousticMetrics?.memory_rss_bytes),
-    resourceBytes: { resident: acousticMetrics?.memory_rss_bytes ?? undefined },
+    privateMemory: formatComponentMemory(acousticMetrics?.memory_private_commit_bytes),
+    resourceBytes: { resident: acousticMetrics?.memory_rss_bytes ?? undefined,
+      privateCommit: acousticMetrics?.memory_private_commit_bytes ?? undefined },
+    note: '包含 YAMNet（声学事件）加载增量及共享分析进程内存余量；共享内存按已加载模型均分，显存计入报告 GPU（图形处理器）的模型。',
   })
   for (const [id, name, ownerId] of [
     ['hotwords', '热词修订（音素匹配）', 'voice'],
@@ -402,7 +392,7 @@ const model = computed<LocalComponentsModel>(() => {
     resources: [
       { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
       { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
-      { id: 'vram', label: '显存', used: formatComponentMemory(snapshot?.total_gpu_dedicated_bytes), total: formatComponentMemory(gpu?.total_bytes) },
+      { id: 'vram', label: '显存', used: typeof snapshot?.total_gpu_dedicated_bytes === 'number' && snapshot.total_gpu_dedicated_bytes > 0 ? formatComponentMemory(snapshot.total_gpu_dedicated_bytes) : undefined, total: formatComponentMemory(gpu?.total_bytes) },
     ],
     managedResourceJobs: props.resourceController?.resourceJobs.value.map(job => {
       const resource = props.resourceController?.resources.value.find(item => item.resource_id === job.resource_id)

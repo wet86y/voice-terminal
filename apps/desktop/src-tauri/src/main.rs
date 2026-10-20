@@ -790,7 +790,7 @@ fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:
         if state.workspace_busy.load(Ordering::Acquire){return Err("工作区正在切换或迁移，更新已停止。".into());}
         let installer=workspace::safe_path(&context.install,"tmp/app-update/VoiceTerminalSetup.exe")?;
         let source=manifest.asset_url();
-        let file=voice_desktop_common::download::DownloadFile{url:source,size:manifest.size,sha256:manifest.sha256.clone(),sha512:String::new(),path:manifest.asset.clone()};
+        let file=voice_desktop_common::download::DownloadFile{url:source,size:manifest.size,sha256:manifest.sha256.clone(),sha512:String::new(),path:manifest.asset.clone(),download_variants:vec![]};
         for attempt in 1..=3{
             let result=voice_desktop_common::download::with_attempt(Some(attempt),||voice_desktop_common::download::download_with_progress(&file,&installer,state.app_update.cancel.clone(),&mut|phase,done,total|{
                 let phase=format!("第 {attempt} / 3 轮 · {phase}");

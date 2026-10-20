@@ -16,24 +16,39 @@ const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopWorkspacePort
 const enhancementSettings = ref({ dual_pass: true, emotion: true, acoustic_events: true })
 const enhancementBusy = ref(false)
+const enhancementLoading = ref(true) // enhancementLoading（首次读取或刷新增强设置）。
 const enhancementFailure = ref('')
-onMounted(async () => {
-  try { if (port.audioEnhancements) enhancementSettings.value = await port.audioEnhancements() }
-  catch (failure) { enhancementFailure.value = String(failure) }
-})
+async function refreshEnhancements() {
+  if (enhancementBusy.value) return
+  enhancementLoading.value = true; enhancementFailure.value = ''
+  try {
+    if (!port.audioEnhancements) throw new Error('当前宿主不支持读取音频增强设置。')
+    enhancementSettings.value = await port.audioEnhancements()
+  } catch (failure) { enhancementFailure.value = String(failure) }
+  finally { enhancementLoading.value = false }
+}
+onMounted(() => { void refreshEnhancements() })
 function enhancement(resource: string): LocalComponentRow['enhancement'] {
   const keys: Record<string, 'dual_pass' | 'emotion' | 'acoustic_events'> = { 'paraformer-streaming': 'dual_pass', 'emotion2vec-plus-base': 'emotion', yamnet: 'acoustic_events' }
   const key = keys[resource]
   if (!key) return undefined
   return { label: key === 'dual_pass' ? '双路精修' : key === 'emotion' ? '情绪背景' : '声学事件',
-    enabled: enhancementSettings.value[key], busy: enhancementBusy.value,
+    enabled: enhancementSettings.value[key], busy: enhancementBusy.value || enhancementLoading.value,
+    busyLabel: enhancementLoading.value ? '读取状态中' : '切换中',
     toggle: async () => {
+      if (enhancementBusy.value || enhancementLoading.value) return
+      const previous = enhancementSettings.value[key]
+      const requested = !previous
       enhancementBusy.value = true; enhancementFailure.value = ''
+      enhancementSettings.value = { ...enhancementSettings.value, [key]: requested }
       try {
         if (!port.audioEnhancements) throw new Error('当前宿主不支持保存音频增强设置。')
-        enhancementSettings.value = await port.audioEnhancements({ [key]: !enhancementSettings.value[key] })
-        await resources.refreshInventory()
-      } catch (failure) { enhancementFailure.value = String(failure) }
+        enhancementSettings.value = await port.audioEnhancements({ [key]: requested })
+        void resources.refreshInventory()
+      } catch (failure) {
+        enhancementSettings.value = { ...enhancementSettings.value, [key]: previous }
+        enhancementFailure.value = String(failure)
+      }
       finally { enhancementBusy.value = false }
     } }
 }
@@ -69,7 +84,7 @@ const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'pa
 const categoryByResource: Record<string, LocalComponentCategory> = {
   'kws-sherpa-onnx': 'extensions', 'paraformer-streaming': 'speech', 'emotion2vec-plus-base': 'extensions',
   yamnet: 'extensions',
-  'smart-turn': 'speech', 'streaming-punctuation': 'speech', 'fsmn-vad': 'extensions',
+  'smart-turn': 'speech', 'streaming-punctuation': 'speech', 'fsmn-vad': 'speech',
   'campplus-zh-cn-common': 'extensions', dsh: 'inference', 'voice-server': 'voice-server',
 }
 const componentIdByResource: Record<string, string> = {
@@ -255,6 +270,9 @@ async function startProgram() {
 function resourceBundleDownload(request: { title: string; entries: import('../interface/local-components').LocalDownloadItem[] }) {
   void resources.prepareDownloadBundle(request.entries, request.title)
 }
+async function refresh() {
+  await Promise.allSettled([resources.refresh(), refreshEnhancements()])
+}
 function retry(id: string) {
   const row = model.value.rows.find(item => item.id === id)
   const resourceId = row?.resource?.id
@@ -283,7 +301,7 @@ function exportLogs() {
             <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置 DeepSeek 与 TTS。' : componentBlockMessage }}</p>
             <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
           </div>
-          <LocalComponents :model="model" @refresh="resources.refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @tts-selection="saveTtsChoice" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
+          <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @tts-selection="saveTtsChoice" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
         </template>
         <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
         <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>

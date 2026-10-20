@@ -1,4 +1,4 @@
-# Download sources（下载来源）：构建脚本共用配置，不写入系统或用户全局设置。
+﻿# Download sources（下载来源）：构建脚本共用配置，不写入系统或用户全局设置。
 function Get-DownloadPolicy {
   Get-Content -LiteralPath (Join-Path $PSScriptRoot '../config/download-sources.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 }

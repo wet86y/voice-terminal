@@ -30,11 +30,11 @@ describe('共享模型的内存归属估算', () => {
     const result = componentResources(snapshot, compute)
     expect(result.get('voice-system')?.memory_rss_bytes).toBe(400)
     expect(result.get('asr')?.memory_rss_bytes).toBe(350)
-    expect(result.get('analysis')?.memory_rss_bytes).toBe(500)
+    expect(result.get('smart_turn')?.memory_rss_bytes).toBe(600)
     expect([...result.values()].reduce((sum, row) => sum + (row.memory_rss_bytes ?? 0), 0)).toBe(2100)
     expect([...result.values()].reduce((sum, row) => sum + (row.memory_private_commit_bytes ?? 0), 0)).toBe(3700)
-    expect(result.get('smart_turn')?.gpu_dedicated_bytes).toBeUndefined()
-    expect(result.get('analysis')?.gpu_dedicated_bytes).toBe(50)
+    expect(result.get('smart_turn')?.gpu_dedicated_bytes).toBe(50)
+    expect(result.has('analysis')).toBe(false)
   })
 
   it('拒绝旧进程及编号复用后的采样', () => {

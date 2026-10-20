@@ -14,6 +14,21 @@ npm run desktop:dist         # 构建内嵌同一正式包的独立安装器
 .\.local\Verify-Package.ps1  # 原生固定本体摘要校验，无后端环境也可执行
 ```
 
+### 项目本地 Rust 工具链
+
+桌面原生构建使用项目本地的 Rustup（Rust 工具链管理器）和 Cargo（Rust 包管理与构建工具），位置为 `.local/tools/rust/`。`scripts/build-desktop.ps1`（桌面构建脚本）会直接调用 `.local/tools/rust/cargo/bin/cargo.exe`，并将 `CARGO_HOME`（Cargo 主目录）和 `RUSTUP_HOME`（Rustup 工具链状态目录）指向同一项目目录，因此不要求把 Cargo 永久加入系统 `PATH`（命令搜索路径）。优先使用上方的 `npm run desktop:build`（桌面构建命令），它会配置好这些路径。
+
+在未配置环境的 PowerShell（命令行）中直接运行 `cargo` 可能出现“找不到命令”；只调用项目里的 `cargo.exe`、却未设置项目的 `RUSTUP_HOME`，也可能因读取到用户级空工具链目录而报“未选择默认工具链”。这不代表项目本地工具链缺失。需要手动运行 Cargo 命令时，在项目根目录先为当前 PowerShell 配置项目路径：
+
+```powershell
+$env:CARGO_HOME = (Resolve-Path '.local/tools/rust/cargo').Path
+$env:RUSTUP_HOME = (Resolve-Path '.local/tools/rust/rustup').Path
+$env:Path = (Resolve-Path '.local/tools/rust/cargo/bin').Path + [IO.Path]::PathSeparator + $env:Path
+cargo --version
+```
+
+这些环境变量只影响当前 PowerShell 进程；不需要修改全局环境变量或重新下载已存在的项目工具链。
+
 发布前退出工作区业务实例。本体发布与安装器重装均保留用户数据、编号、模型、运行环境及其登记。组件维护在正式程序内执行；“应用更新”页面读取官方发行清单，按固定大小与摘要校验安装器后进入同一工作区安装事务。备份白名单和完整环境导出工具见[本地目录与覆盖发布](local-layout.md)。
 
 修改源码后，仅构建缓存不会更新 `.local/app`（日常启动的已发布本体）。完整更新必须把新统一包发布到 `.local`（本机工作区），再用同一包构建分发安装器；最终核对本机 `app/release.json`（本体清单）、`package-info.json`（程序包记录）及 `delivery.json`（安装器交付记录）的构建编号和摘要。当前交付状态以[当前交付](../releases/current-release.md)及这些实际清单为准。
