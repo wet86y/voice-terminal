@@ -84,7 +84,8 @@ def fetch(url: str, *, head: bool = False, decode_json: bool = False) -> bytes |
 
 
 def download(url: str, destination: Path, *, sha256: str | None = None,
-             size: int | None = None, sha512: str | None = None) -> str:
+             size: int | None = None, sha512: str | None = None,
+             download_variants: list[dict] | None = None) -> str:
     """download（原子下载）：候选文件逐源重下，校验失败不启用；不吞掉用户中断。"""
     destination.parent.mkdir(parents=True, exist_ok=True)
     part = destination.with_name(destination.name + ".part")
@@ -93,20 +94,41 @@ def download(url: str, destination: Path, *, sha256: str | None = None,
         host = urlsplit(source).hostname or "未知来源"
         try:
             print(f"下载来源：{host}", flush=True)
-            digest = hashlib.sha512() if sha512 else hashlib.sha256()
+            variant = next((row for row in download_variants or []
+                            if row.get("source_host", "").lower() == host.lower()), None)
+            source_size = variant.get("size_bytes") if variant else size
+            source_sha512 = None if variant else sha512
+            source_sha256 = variant.get("sha256") if variant else sha256
+            if variant and (not isinstance(source_size, int) or source_size <= 0
+                            or not isinstance(source_sha256, str) or len(source_sha256) != 64
+                            or any(char not in "0123456789abcdefABCDEF" for char in source_sha256)):
+                raise ValueError("等价下载版本锁无效")
+            digest = hashlib.sha512() if source_sha512 else hashlib.sha256()
             count = 0
             with urllib.request.urlopen(source, timeout=20) as response, part.open("wb") as output:
                 if "text/html" in response.headers.get("Content-Type", "").lower():
                     raise ValueError("来源返回网页，未返回资源文件")
                 while block := response.read(1024 * 1024):
                     count += len(block)
-                    if size is not None and count > size:
+                    if source_size is not None and count > source_size:
                         raise ValueError("下载内容超出锁定大小")
                     output.write(block)
                     digest.update(block)
-            expected = sha512 or sha256
-            if size is not None and count != size or expected and digest.hexdigest() != expected:
+            expected = source_sha512 or source_sha256
+            if source_size is not None and count != source_size or expected and digest.hexdigest() != expected:
                 raise ValueError("下载文件大小或摘要不符")
+            if variant:
+                if variant.get("normalization") != "remove_one_final_line_feed":
+                    raise ValueError("未支持的等价下载版本规范化方式")
+                content = part.read_bytes()
+                normalized = content[:-1] if content.endswith(b"\n") else b""
+                if (len(content) > 4096 or len(normalized) != size
+                        or hashlib.sha256(normalized).hexdigest() != sha256):
+                    raise ValueError("等价下载版本规范化后未匹配固定文件")
+                part.write_bytes(normalized)
+                if part.stat().st_size != size or hashlib.sha256(part.read_bytes()).hexdigest() != sha256:
+                    raise ValueError("等价下载版本落盘校验失败")
+                digest = hashlib.sha256(normalized)
             part.replace(destination)
             return digest.hexdigest()
         except (OSError, ValueError, HTTPException) as error:

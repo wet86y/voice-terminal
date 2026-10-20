@@ -321,7 +321,7 @@ impl ResourceManager {
         self.wait_required(parent,&[cpu_id],&mut installed)?;
         let specs=voice_desktop_common::resources::specs(&self.context).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
         let mut children=vec![];let mut errors=vec![];
-        for item in specs.iter().filter(|item|item["required"]!=false||item["selected_enhancement"]==true){
+        for item in specs.iter().filter(|item|include_in_required_batch(item)){
             if self.cancelled(parent){break;}
             let Some(resource)=item["resource_id"].as_str()else{continue;};
             match self.download_child(resource.into(),Some(parent.into())){
@@ -1154,6 +1154,9 @@ fn progress_kind(phase:&str)->&'static str{ // progress_kind（阶段投影）�
     else if phase.contains("下载进度"){"download"}
     else{"install"}
 }
+fn include_in_required_batch(item:&Value)->bool{
+    item["required"]!=false||(item["selected_enhancement"]==true&&item["download_in_required_batch"]!=false)
+}
 pub(crate) fn retryable_failure(message:&str)->bool{ // retryable_failure（可自动恢复）：取消、永久配置与权限错误停止重试。
     !["取消","空间不足","磁盘空间","目录权限","拒绝访问","Permission denied","os error 5","系统仍拒绝","系统错误码：5","缺少可信","清单无效","清单缺失","未锁定","来源必须","兼容显卡环境","无法暂停","恢复旧资源失败","恢复原组件失败","资源回滚留待"].iter().any(|reason|message.contains(reason))
 }
@@ -1271,6 +1274,14 @@ mod service_tests {
         assert_eq!(super::progress_kind("下载固定资源（四路加速） · 8.20 MiB/秒（兆二进制字节每秒） · 来源：GitHub（代码托管平台）原站"),"download");
         assert_eq!(super::progress_kind("来源测速：GitHub（代码托管平台）原站"),"waiting");
         assert_eq!(super::progress_kind("校验下载文件"),"verify");
+    }
+    #[test]
+    fn optional_audio_models_stay_out_of_initial_required_batch(){
+        for id in ["emotion2vec-plus-base","yamnet"]{
+            assert!(!super::include_in_required_batch(&serde_json::json!({"resource_id":id,"required":false,"selected_enhancement":true,"download_in_required_batch":false})));
+        }
+        assert!(super::include_in_required_batch(&serde_json::json!({"resource_id":"paraformer-offline","required":false,"selected_enhancement":true})));
+        assert!(super::include_in_required_batch(&serde_json::json!({"resource_id":"required-model","required":true,"selected_enhancement":false,"download_in_required_batch":false})));
     }
     use super::*;
 

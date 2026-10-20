@@ -25,6 +25,7 @@
     }
   },
   "prefixes": [
+    {"origin_prefix": "https://huggingface.co/audiomagic/yamnet-onnx/resolve/f25b741c2f0bdc6d7e6db24b5fddda23347dbafd/", "mirror_prefix": "https://hf-mirror.net/audiomagic/yamnet-onnx/resolve/f25b741c2f0bdc6d7e6db24b5fddda23347dbafd/"},
     {"origin_prefix": "https://www.python.org/ftp/python/", "mirror_prefix": "https://mirrors.huaweicloud.com/python/"},
     {"origin_prefix": "https://files.pythonhosted.org/", "mirror_prefix": "https://pypi.tuna.tsinghua.edu.cn/"},
     {"origin_prefix": "https://download.pytorch.org/whl/", "mirror_prefix": "https://mirror.sjtu.edu.cn/pytorch-wheels/"},
@@ -33,6 +34,7 @@
     {"origin_prefix": "https://registry.npmjs.org/", "mirror_prefix": "https://registry.npmmirror.com/"}
   ],
   "models": [
+    {"origin_prefix": "https://huggingface.co/emotion2vec/emotion2vec_plus_base/resolve/b318240bfe67db81a8c572ecb37ce9c3759b81c9/", "repo_id": "iic/emotion2vec_plus_base", "revision": "a4a780d91424116a2d46330c045336a6f62a66a1"},
     {"origin_prefix": "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/", "repo_id": "pipecat-ai/smart-turn-v3", "revision": "dd6b4b37fa45d30a8d0d56735a1727c96c11711e"},
     {"origin_prefix": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/1b5981b2b89a1af578ebba5c8cf34226810e1f55/", "repo_id": "HereIsMark/audio.cpp-gguf", "revision": "710b2d85fa66ecd0e9cc4eee6413b9595171f502"}
   ],
@@ -53,10 +55,10 @@
   "fields": {
     "schema": "下载来源配置格式；不参与组件内容身份计算",
     "github_download": "桌面 GitHub（代码托管平台）资产统一节点管理、测速与回退配置",
-    "prefixes": "固定原始地址到公共镜像的前缀映射，原站始终作为最后候选",
+    "prefixes": "固定原始地址到公共镜像或加速代理的前缀映射，原站始终作为最后候选",
     "origin_prefix": "原始来源前缀，包含固定版本时仅适用该版本",
-    "mirror_prefix": "镜像地址前缀",
-    "models": "内容摘要已核实的魔搭模型副本，不改变原资源版本",
+    "mirror_prefix": "镜像或代理地址前缀",
+    "models": "逐文件按固定摘要校验的魔搭模型副本；失败后回退原站，不改变原资源版本",
     "repo_id": "镜像模型仓库编号",
     "revision": "镜像仓库的固定提交号",
     "npm_registries": "公开脚本包注册表，按顺序回退；私有注册表不参与",

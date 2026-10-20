@@ -53,7 +53,8 @@ def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
             record = next(item for item in resource["files"] if item["path"] == filename)
             if not destination.is_file() or _sha256(destination) != record["sha256"]:
                 download(f"https://huggingface.co/{repo}/resolve/{revision}/{filename}", destination,
-                         size=record["size_bytes"], sha256=record["sha256"])
+                         size=record["size_bytes"], sha256=record["sha256"],
+                         download_variants=record.get("download_variants", []))
             checksums[filename] = _sha256(destination)
         if name == "smart-turn":
             WhisperFeatureExtractor(chunk_length=8).save_pretrained(folder)

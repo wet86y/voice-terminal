@@ -91,6 +91,24 @@ mod tests {
         assert_eq!(candidates(&origin.replace("1b5981b2b89a1af578ebba5c8cf34226810e1f55","different")).len(),1);
     }
     #[test]
+    fn emotion_modelscope_candidate_uses_pinned_domestic_revision_then_upstream_fallback(){
+        let source_revision="b318240bfe67db81a8c572ecb37ce9c3759b81c9";
+        let mirror_revision="a4a780d91424116a2d46330c045336a6f62a66a1";
+        for path in ["model.pt","config.yaml","configuration.json","tokens.txt"]{
+            let origin=format!("https://huggingface.co/emotion2vec/emotion2vec_plus_base/resolve/{source_revision}/{path}");
+            let rows=candidates(&origin);assert_eq!(rows.len(),2);assert_eq!(rows[1],origin);
+            assert!(rows[0].starts_with("https://modelscope.cn/api/v1/models/iic/emotion2vec_plus_base/repo?"));
+            assert!(rows[0].contains(&format!("Revision={mirror_revision}&FilePath={path}")));
+        }
+        let changed="https://huggingface.co/emotion2vec/emotion2vec_plus_base/resolve/changed/model.pt";
+        assert_eq!(candidates(changed),vec![changed.to_owned()]);
+    }
+    #[test]
+    fn yamnet_uses_hf_mirror_proxy_then_locked_upstream(){
+        let origin="https://huggingface.co/audiomagic/yamnet-onnx/resolve/f25b741c2f0bdc6d7e6db24b5fddda23347dbafd/yamnet.onnx";
+        assert_eq!(candidates(origin),vec!["https://hf-mirror.net/audiomagic/yamnet-onnx/resolve/f25b741c2f0bdc6d7e6db24b5fddda23347dbafd/yamnet.onnx".to_owned(),origin.to_owned()]);
+    }
+    #[test]
     fn github_and_raw_assets_share_sdk_nodes_and_keep_canonical_source_last(){
         for url in ["https://github.com/example/project/releases/download/v1/asset.zip","https://raw.githubusercontent.com/example/project/v1/weights.bin"]{
             let sources=candidates(url);assert_eq!(sources.last().unwrap(),url);assert_eq!(sources.len(),4);

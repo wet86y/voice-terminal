@@ -68,7 +68,7 @@ impl Fixture {
     }
     fn file(&self) -> DownloadFile {
         DownloadFile{url:"https://github.com/example/resource/releases/download/v1/fixture.bin".into(),size:self.body.len() as u64,
-            sha256:format!("{:x}",Sha256::digest(&*self.body)),sha512:String::new(),path:"fixture.bin".into()}
+            sha256:format!("{:x}",Sha256::digest(&*self.body)),sha512:String::new(),path:"fixture.bin".into(),download_variants:vec![]}
     }
 }
 impl Drop for Fixture {fn drop(&mut self){self.stop.store(true,Ordering::Release);self.worker.take().unwrap().join().unwrap();}}

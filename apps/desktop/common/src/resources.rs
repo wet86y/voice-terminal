@@ -95,9 +95,15 @@ fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
     safe_path(&context.install,&if spec["kind"]=="model"{format!("models/{relative}")}else{relative.into()})
 }
 fn file_spec(value:&Value,url:String)->Result<DownloadFile,String>{
+    let download_variants=serde_json::from_value::<Vec<crate::download::DownloadVariant>>(value.get("download_variants").cloned().unwrap_or_else(||json!([])))
+        .map_err(|_|"文件的等价下载版本配置无效")?;
+    if download_variants.iter().any(|variant|variant.source_host.is_empty()||variant.source_host.contains('/')||variant.size==0||
+        variant.sha256.len()!=64||!variant.sha256.bytes().all(|byte|byte.is_ascii_hexdigit())||variant.normalization!="remove_one_final_line_feed"){
+        return Err("文件的等价下载版本配置无效".into());
+    }
     Ok(DownloadFile{path:value["path"].as_str().or(value["filename"].as_str()).ok_or("文件缺少名称")?.into(),url,
         size:value["size_bytes"].as_u64().ok_or("文件缺少大小")?,sha256:value["sha256"].as_str().unwrap_or("").into(),
-        sha512:value["sha512_base64"].as_str().unwrap_or("").into()})
+        sha512:value["sha512_base64"].as_str().unwrap_or("").into(),download_variants})
 }
 pub fn walk(root:&Path)->Result<Vec<PathBuf>,String>{
     fn visit(base:&Path,folder:&Path,out:&mut Vec<PathBuf>)->Result<(),String>{
@@ -1160,10 +1166,16 @@ mod download_tests {
     #[test]
     fn optional_missing_or_outdated_components_do_not_block_startup() {
         let server=json!({"resource_id":"voice-server","required":true,"can_start":true});
-        for optional in [json!({"resource_id":"campplus-zh-cn-common","required":false,"can_start":false,"files_installed":false}),
-            json!({"resource_id":"campplus-zh-cn-common","required":false,"can_start":false,"update_available":true})] {
-            let readiness=readiness_from_inventory(&[server.clone(),optional]);
-            assert_eq!(readiness["ready"],true);assert_eq!(readiness["missing"],json!([]));
+        let catalog:Value=serde_json::from_str(include_str!("../../../../config/resources/catalog.json")).unwrap();
+        for id in ["emotion2vec-plus-base","yamnet"] {
+            let spec=catalog["resources"].as_array().unwrap().iter().find(|item|item["resource_id"]==id).unwrap();
+            assert_eq!(spec["required"],false);
+            assert_eq!(spec["download_in_required_batch"],false);
+            for optional in [json!({"resource_id":id,"required":false,"can_start":false,"files_installed":false}),
+                json!({"resource_id":id,"required":false,"can_start":false,"update_available":true})] {
+                let readiness=readiness_from_inventory(&[server.clone(),optional]);
+                assert_eq!(readiness["ready"],true);assert_eq!(readiness["missing"],json!([]));
+            }
         }
     }
 
