@@ -36,12 +36,12 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
     const control = card.get('[role="switch"]')
-    expect(control.attributes('aria-checked')).toBe('true')
-    await control.trigger('click')
+    expect((control.element as HTMLInputElement).checked).toBe(true)
+    await control.setValue(false)
     expect(toggle).toHaveBeenCalledTimes(1)
     await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!, enhancement: { label: '双路精修', enabled: false, busy: true, toggle } }] } })
     expect(control.attributes('disabled')).toBeDefined()
-    expect(control.text()).toContain('切换中')
+    expect(card.get('.component-enhancement-copy small').text()).toContain('切换中')
     wrapper.unmount()
   })
   it('资源齐全时保留一键下载与资源导入入口，标题不显示旧说明', async () => {
@@ -78,12 +78,12 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
   it('分类摘要会跟随子组件显示启动中、运行中和错误状态', async () => {
     const value = model()
     value.rows = [{
-      id: 'fsmn-vad', name: 'FSMN-VAD（语音活动检测）', category: 'extensions',
+      id: 'fsmn-vad', name: 'FSMN-VAD（语音活动检测）', category: 'speech',
       state: 'loading', status: '启动中', available: false, runtime: 'ONNX Runtime',
       description: '正在加载语音检测组件。', facts: [],
     }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const summary = wrapper.get('[data-category="extensions"] .local-category-observability .local-state')
+    const summary = wrapper.get('[data-category="speech"] .local-category-observability .local-state')
     expect(summary.text()).toBe('启动中')
     expect(summary.classes()).toContain('loading')
 

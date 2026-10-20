@@ -31,6 +31,9 @@ export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
 const NOTICE_DISPLAY_MS = 5000
 const NOTICE_FADE_MS = 420
+/** AudioEnhancementKey（音频增强字段编号）：和持久化设置字段一致。 */
+type AudioEnhancementKey = keyof NonNullable<ProductSettingsSnapshot['audio_enhancements']>
+const audioEnhancementKeys: AudioEnhancementKey[] = ['dual_pass', 'emotion', 'acoustic_events'] // audioEnhancementKeys（可同步的音频增强字段）。
 
 export interface ProductUiModel extends ProductModel {
   provider: string
@@ -94,6 +97,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const settingsTab = ref<ProductSettingsTab>('wake')
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
+  const pendingAudioEnhancements = new Set<AudioEnhancementKey>() // pendingAudioEnhancements（切换中而由本地事务暂时持有的开关）。
+  let audioEnhancementRevision = 0 // audioEnhancementRevision（设置事务代次，拒绝切换前后到达的旧快照）。
   let savedApprovalSettings = { ...DEFAULT_SETTINGS.approvals } // savedApprovalSettings（最后一次确认已保存的授权设置）。
   const computeStatus = ref<ProductComputeStatus | null>(null)
   let computeStatusRevision = 0 // computeStatusRevision（组件状态代次）：旧进程的采样不能覆盖新状态。
@@ -256,7 +261,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     noticeVisible.value = false
   }
 
-  function applySnapshot(value: ProductSnapshot, requestedRegistryRevision: number, requestedDshRevision: number) {
+  function applySnapshot(value: ProductSnapshot, requestedRegistryRevision: number, requestedDshRevision: number,
+    requestedAudioEnhancementRevision: number) {
     // 重连快照更新服务端基线，正在编辑的表单仍由根层持有。
     const known = snapshot.value !== null
     const differs = (draft: unknown, saved: unknown) => JSON.stringify(draft) !== JSON.stringify(saved)
@@ -285,6 +291,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       scheduleDshStatusPoll()
     }
     const nextSettings = normalizeSettings(value.settings)
+    if (requestedAudioEnhancementRevision === audioEnhancementRevision) {
+      const nextAudioEnhancements = nextSettings.audio_enhancements ?? DEFAULT_SETTINGS.audio_enhancements!
+      const audioEnhancements = { ...(settings.audio_enhancements ?? DEFAULT_SETTINGS.audio_enhancements!) }
+      for (const key of audioEnhancementKeys) {
+        if (!pendingAudioEnhancements.has(key)) audioEnhancements[key] = nextAudioEnhancements[key]
+      }
+      settings.audio_enhancements = audioEnhancements
+    }
     computeSavedDevices.value = { ...nextSettings.compute.devices }
     settings.screen_capture = nextSettings.screen_capture
     Object.assign(settings.wake, nextSettings.wake)
@@ -344,9 +358,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     loading.value = true
     const requestedRegistryRevision = registryRevision
     const requestedDshRevision = dshRevision
+    const requestedAudioEnhancementRevision = audioEnhancementRevision
     snapshotRequest = productApi.snapshot().then(async value => {
       if (adapterDisposed) return
-      applySnapshot(value, requestedRegistryRevision, requestedDshRevision)
+      applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision)
       await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
       lastError.value = ''
     }).catch(setError).finally(() => {
@@ -365,6 +380,30 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) computeStatus.value = value
     } catch (error) {
       if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) setError(error)
+    }
+  }
+
+  /** saveAudioEnhancement（音频增强开关事务）：即时预览目标值，失败时回滚，并保护它不被旧快照覆盖。 */
+  async function saveAudioEnhancement(key: AudioEnhancementKey) {
+    if (pendingAudioEnhancements.has(key)) return
+    const previous = settings.audio_enhancements?.[key] !== false
+    const requested = !previous
+    audioEnhancementRevision += 1
+    pendingAudioEnhancements.add(key)
+    settings.audio_enhancements = {
+      ...DEFAULT_SETTINGS.audio_enhancements!, ...settings.audio_enhancements, [key]: requested,
+    }
+    try {
+      const response = await productApi.saveAudioEnhancements({ [key]: requested })
+      settings.audio_enhancements = { ...DEFAULT_SETTINGS.audio_enhancements!, ...response.settings }
+    } catch (failure) {
+      settings.audio_enhancements = {
+        ...DEFAULT_SETTINGS.audio_enhancements!, ...settings.audio_enhancements, [key]: previous,
+      }
+      throw failure
+    } finally {
+      pendingAudioEnhancements.delete(key)
+      audioEnhancementRevision += 1
     }
   }
 
@@ -1581,6 +1620,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveSpeakerControls,
     refreshComputeStatus,
     saveComputeSettings,
+    saveAudioEnhancement,
     refreshSpeaker,
     startSpeakerEnrollment,
     cancelSpeakerEnrollment,

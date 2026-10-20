@@ -38,10 +38,10 @@ const expandedCategories = ref(new Set<LocalComponentCategory>()) // expandedCat
 const expandedComponents = ref(new Set<string>()) // expandedComponents（已展开组件详情）。
 const providerUsageRevision = ref(0) // providerUsageRevision（密钥更新后刷新在线服务额度摘要）。
 const categoryDefinitions: Array<{ id: LocalComponentCategory; title: string; description: string }> = [
-  { id: 'speech', title: '语音识别', description: '语音转写、语音轮次判断与流式标点' },
+  { id: 'speech', title: '语音识别', description: '语音活动检测、转写、轮次判断与流式标点' },
   { id: 'tts', title: '语音合成', description: '本地 VoxCPM 模型或 MiniMax 在线 API（程序接口）' },
   { id: 'inference', title: '推理执行', description: 'DeepSeek 在线推理服务与 DSH 执行组件' },
-  { id: 'extensions', title: '拓展组件', description: '唤醒词、声纹、语音检测与热词修订' },
+  { id: 'extensions', title: '拓展组件', description: '唤醒词、声纹、情绪背景、声学事件与热词修订' },
   { id: 'voice-server', title: 'Voice Server（语音服务）', description: '独立管理桌面语音运行环境' },
 ]
 // latestJobs（各资源的最近任务）：运行中的任务优先，旧失败记录不覆盖新下载。
@@ -107,6 +107,8 @@ function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] 
     const installed = dependency.state === 'installed' && !dependency.updateAvailable
     const serviceBusy = isCpu && row.state === 'loading'
     const serviceFailed = isCpu && row.state === 'failed'
+    const dependencyVram = typeof dependencyMetrics?.vram === 'number' && dependencyMetrics.vram > 0
+      ? dependencyMetrics.vram : undefined
     return {
       ...row,
       id: isCpu ? row.id : dependency.id,
@@ -122,11 +124,11 @@ function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] 
       runtime: '',
       residentMemory: isCpu ? row.residentMemory : formatComponentMemory(dependencyMetrics?.resident),
       privateMemory: isCpu ? row.privateMemory : formatComponentMemory(dependencyMetrics?.privateCommit),
-      vram: isCpu ? row.vram : formatComponentMemory(dependencyMetrics?.vram),
+      vram: isCpu ? row.vram : formatComponentMemory(dependencyVram),
       resourceBytes: isCpu ? row.resourceBytes : dependencyMetrics ? {
         resident: dependencyMetrics.resident,
         privateCommit: dependencyMetrics.privateCommit,
-        vram: dependencyMetrics.vram,
+        vram: dependencyVram,
       } : undefined,
       description: runtimeDescription(dependency.id),
       error: dependency.error || (serviceFailed ? row.error : undefined),
@@ -170,7 +172,7 @@ function rowCategory(row: LocalComponentRow): LocalComponentCategory {
   if (row.id === 'voice-system' || row.id === 'voice-server') return 'voice-server'
   if (row.id === 'tts') return 'tts'
   if (row.id === 'dsh' || row.id === 'deepseek') return 'inference'
-  if (['paraformer', 'smart_turn', 'punctuation', 'streaming-punctuation', 'paraformer-streaming', 'paraformer-offline'].includes(row.id)) return 'speech'
+  if (['paraformer', 'smart_turn', 'voice_vad', 'fsmn-vad', 'punctuation', 'streaming-punctuation', 'paraformer-streaming', 'paraformer-offline'].includes(row.id)) return 'speech'
   return 'extensions'
 }
 function rowResource(row: LocalComponentRow, fallback: ManagedResourceRow): ManagedResourceRow {
@@ -250,17 +252,37 @@ function resourceVersionText(resource?: ManagedResourceRow) {
   if (target) return `目标版本 ${target}`
   return ''
 }
-function resourceRuntimeInfo(resource?: ManagedResourceRow, row?: LocalComponentRow) {
-  const parts = [
-    resourceVersionText(resource),
-    ...(row?.runtime && row.runtime !== '未提供' ? [`运行时 ${row.runtime}`] : []),
-    ...((row?.device?.current || !row?.device && row?.location) ? [`运行位置 ${row.device?.current || row.location}`] : []),
+/** ResourceRuntimeFact（组件运行信息字段）：field label（字段名称）与对应展示值。 */
+type ResourceRuntimeFact = {
+  label: string // label（运行信息字段的中文名称）。
+  value: string // value（对应版本或运行指标的展示值）。
+}
+/** resourceRuntimeFacts（运行信息字段）：摘要已显示运行时，这里只列版本、位置与进程指标。 */
+function resourceRuntimeFacts(resource?: ManagedResourceRow, row?: LocalComponentRow): ResourceRuntimeFact[] {
+  const version = resourceVersionText(resource)
+  return [
+    ...(version ? [{ label: '版本', value: version }] : []),
+    ...((row?.device?.current || !row?.device && row?.location)
+      ? [{ label: '运行位置', value: row.device?.current || row.location! }] : []),
     ...(row?.facts ?? [])
       .filter(fact => fact.label === '进程标识' || fact.label === '处理器占用')
-      .map(fact => `${fact.label} ${fact.value}`),
-    ...(row?.vram ? [`显存 ${row.vram}`] : []),
-  ].filter(Boolean)
-  return parts.join(' · ')
+      .map(fact => ({ label: fact.label, value: fact.value })),
+  ]
+}
+function hasComponentMemory(row: LocalComponentRow) {
+  return row.residentMemory !== undefined || row.privateMemory !== undefined || row.vram !== undefined
+}
+function componentMemoryLabel(row: LocalComponentRow) {
+  const labels = [
+    ...(row.residentMemory !== undefined ? ['常驻内存'] : []),
+    ...(row.privateMemory !== undefined ? ['提交内存'] : []),
+    ...(row.vram !== undefined ? ['显存'] : []),
+  ]
+  return labels.join('／')
+}
+function componentMemoryValue(row: LocalComponentRow) {
+  return [row.residentMemory, row.privateMemory, row.vram]
+    .filter((value): value is string => value !== undefined).join(' / ')
 }
 function detailFacts(row: LocalComponentRow) {
   const mergedIntoRuntimeLine = Boolean(row.resource || row.runtimeDependencies?.length)
@@ -355,7 +377,7 @@ function categoryObservation(rows: LocalComponentRow[]) {
   const sum = (key: 'resident' | 'privateCommit' | 'vram') => {
     const bytes = rows.flatMap(row => {
       const value = row.resourceBytes?.[key]
-      return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? [value] : []
+      return typeof value === 'number' && Number.isFinite(value) && (key === 'vram' ? value > 0 : value >= 0) ? [value] : []
     })
     return bytes.length ? formatComponentMemory(bytes.reduce((total, value) => total + value, 0)) : undefined
   }
@@ -480,10 +502,9 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                     </div>
                   </div>
                   <p v-if="row.state === 'loading'" class="local-component-phase" aria-live="polite">{{ row.description }}</p>
-                  <dl v-if="row.runtime && row.runtime !== '未提供' || row.residentMemory !== undefined || row.privateMemory !== undefined || row.vram !== undefined" class="local-component-metrics local-summary-metrics">
+                  <dl v-if="row.runtime && row.runtime !== '未提供' || hasComponentMemory(row)" class="local-component-metrics local-summary-metrics">
                     <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
-                    <div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" class="local-runtime-metric" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div>
-                    <div v-if="row.vram !== undefined" class="local-runtime-metric" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
+                    <div v-if="hasComponentMemory(row)" class="local-runtime-metric" data-metric="memory"><dt>{{ componentMemoryLabel(row) }}</dt><dd>{{ componentMemoryValue(row) }}</dd></div>
                   </dl>
                 </div>
                 <div class="local-component-controls">
@@ -520,7 +541,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   <article v-for="dependency in row.runtimeDependencies" :key="dependency.id" class="local-download-choice" :data-runtime-dependency="dependency.id">
                     <div class="local-managed-resource-heading"><strong>{{ dependency.label }}</strong><span class="resource-install-state" :class="dependency.state">{{ dependency.updateAvailable ? '需更新' : dependency.status || resourceStateLabel(dependency.state) }}</span></div>
                     <small class="local-detail-note">{{ runtimeDescription(dependency.id) }}</small>
-                    <dl v-if="resourceRuntimeInfo(dependency, row)" class="local-resource-versions"><div><dt>运行信息</dt><dd>{{ resourceRuntimeInfo(dependency, row) }}</dd></div></dl>
+                    <dl v-if="resourceRuntimeFacts(dependency, row).length" class="local-resource-versions"><div v-for="fact in resourceRuntimeFacts(dependency, row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd :title="fact.value">{{ fact.value }}</dd></div></dl>
                     <ManagedResourceProgress v-if="visibleJob(resourceJob(dependency.id))" :job="visibleJob(resourceJob(dependency.id))!" :label="dependency.label" />
                     <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
                       <button v-if="jobIsActive(resourceJob(dependency.id))" class="outline-button" type="button" :disabled="!resourceJob(dependency.id)?.canCancel" @click="emit('cancelResource', resourceJob(dependency.id)!.id)">取消任务</button>
@@ -534,22 +555,13 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   </article>
                 </section>
                 <section v-else-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
-                  <div v-if="row.resource.updateAvailable || row.resource.state !== 'installed' || !resourceRuntimeInfo(row.resource, row)" class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
-                  <dl v-if="resourceRuntimeInfo(row.resource, row)" class="local-resource-versions"><div><dt>运行信息</dt><dd>{{ resourceRuntimeInfo(row.resource, row) }}</dd></div></dl>
+                  <div v-if="row.resource.updateAvailable || row.resource.state !== 'installed' || !resourceRuntimeFacts(row.resource, row).length" class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
+                  <dl v-if="resourceRuntimeFacts(row.resource, row).length" class="local-resource-versions"><div v-for="fact in resourceRuntimeFacts(row.resource, row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd :title="fact.value">{{ fact.value }}</dd></div></dl>
                   <p v-if="row.resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(row.resource.id))" class="local-error" role="status">{{ row.resource.error }}</p>
-                </section>
-                <section v-if="row.resourceChoices?.length" class="local-tts-downloads">
-                  <h5>本地 TTS（语音合成）模型</h5>
-                  <small>在组件卡片中分别管理 VoxCPM1、VoxCPM2；共用运行程序在语音服务分类单独下载。下载不会改变当前播放后端。</small>
-                  <article v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
-                    <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
-                    <dl v-if="resourceRuntimeInfo(resource)" class="local-resource-versions"><div><dt>版本</dt><dd>{{ resourceRuntimeInfo(resource) }}</dd></div></dl>
-                    <p v-if="resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(resource.id))" class="local-error">{{ resource.error }}</p>
-                  </article>
                 </section>
                 <section v-if="row.sharedResource" class="local-managed-resource" :data-resource="row.sharedResource.id" :aria-label="`${row.sharedResource.label}安装状态`">
                   <div class="local-managed-resource-heading"><span>{{ row.sharedResource.label }}（共享运行程序）</span><span class="resource-install-state" :class="row.sharedResource.state">{{ row.sharedResource.status || resourceStateLabel(row.sharedResource.state) }}</span></div>
-                  <dl v-if="resourceRuntimeInfo(row.sharedResource)" class="local-resource-versions"><div><dt>版本</dt><dd>{{ resourceRuntimeInfo(row.sharedResource) }}</dd></div></dl>
+                  <dl v-if="resourceRuntimeFacts(row.sharedResource).length" class="local-resource-versions"><div v-for="fact in resourceRuntimeFacts(row.sharedResource)" :key="fact.label"><dt>{{ fact.label }}</dt><dd :title="fact.value">{{ fact.value }}</dd></div></dl>
                   <p v-if="row.sharedResource.error && !rowHasActiveJob(row)" class="local-error" role="status">{{ row.sharedResource.error }}</p>
                 </section>
                 <FixedProviderSettings v-if="row.provider" :model="row.provider" @saved="refreshProviderUsage" />
@@ -557,13 +569,17 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
                 <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>
                 <dl v-if="detailFacts(row).length" class="local-detail-facts"><div v-for="fact in detailFacts(row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
-                <button v-if="row.enhancement" class="save-button" type="button" role="switch" :aria-checked="row.enhancement.enabled" :disabled="row.enhancement.busy" @click="row.enhancement.toggle()">{{ row.enhancement.label }}：{{ row.enhancement.busy ? '切换中' : row.enhancement.enabled ? '已开启' : '已关闭' }}</button>
+                <label v-if="row.enhancement" class="switch-row component-enhancement-toggle" :aria-busy="row.enhancement.busy">
+                  <div class="component-enhancement-copy"><strong>{{ row.enhancement.label }}</strong><small aria-live="polite">{{ row.enhancement.busy ? row.enhancement.busyLabel || '切换中' : row.enhancement.enabled ? '已开启' : '已关闭' }}</small></div>
+                  <input type="checkbox" role="switch" :aria-label="`${row.enhancement.label}开关`" :checked="row.enhancement.enabled" :disabled="row.enhancement.busy" @change="row.enhancement.toggle()" />
+                  <i aria-hidden="true"></i>
+                </label>
                 <div v-if="row.device" class="local-device-editor">
                   <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
                   <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
                   <small v-if="row.device.draft || row.device.pending"><span v-if="row.device.draft">运行位置草稿尚未保存</span><span v-if="row.device.draft && row.device.pending"> · </span><span v-if="row.device.pending">已保存配置下次启动生效</span></small>
                 </div>
-                <div v-else-if="!row.resource || !resourceRuntimeInfo(row.resource, row)" class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
+                <div v-else-if="!row.resource || !resourceRuntimeFacts(row.resource, row).length" class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
                 <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>
               </div>
             </article>
@@ -576,14 +592,14 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 
 <style scoped>
 .local-runtime-dependencies{display:grid;gap:12px;width:100%;min-width:0}.local-runtime-dependencies .local-managed-resource-heading{color:var(--text);flex-wrap:wrap}.local-runtime-dependencies .managed-resource-actions{margin-top:0}
-.local-tts-downloads{display:grid;gap:12px;width:100%;min-width:0}.local-tts-downloads h5{font-size:var(--font-body)}.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}
+.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}
 .local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-managed-heading>div{display:grid;gap:4px;min-width:0}
 .local-managed-heading>div>small{color:var(--muted)}
 .resource-batch-import{white-space:nowrap}.local-managed-heading .local-heading-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.local-managed-heading h3{font-size:var(--font-section);margin:0}.local-tts-selection{max-width:520px;padding:12px 0}.managed-batch-progress{grid-column:1 / -1}
 .resource-empty{padding:14px 16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted);font-size:var(--font-body)}
-.local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 14px 14px}.local-category-content>.resource-empty{margin-top:2px}
+.local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 8px 14px}.local-category-content>.resource-empty{margin-top:2px}
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}
 .local-category-heading{align-items:center}
 .local-category-main{gap:0}
@@ -603,7 +619,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
 .local-runtime-dependencies .local-managed-resource-heading>strong{flex:1 1 auto;min-width:0;white-space:nowrap;overflow-wrap:normal}
-.local-resource-versions{display:flex;gap:18px;flex-wrap:wrap}.local-resource-versions>div{display:flex;gap:6px;align-items:baseline}.local-resource-versions dd{font-size:var(--font-caption)}
+.local-resource-versions{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,140px),1fr));gap:6px;min-width:0}.local-resource-versions>div{display:grid;gap:2px;min-width:0;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#ffffff02}.local-resource-versions dt{font-size:var(--font-caption);color:var(--subtle)}.local-resource-versions dd{min-width:0;font-size:var(--font-caption);line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .resource-install-state{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:var(--font-caption);color:var(--muted);white-space:nowrap}
 .resource-install-state.installed{color:var(--mint)}
 .resource-install-state.missing,.resource-install-state.incomplete{color:var(--accent)}
@@ -630,8 +646,8 @@ small,dt{font-size:var(--font-caption)}
 .local-resource-value strong{font-size:18px;line-height:1.3;white-space:nowrap}
 .local-resource-total{font-size:var(--font-body);color:var(--muted);white-space:nowrap}
 .local-list-heading h3{font-size:var(--font-section)}
-.local-component-list{display:grid;gap:8px}
-.local-component-card{min-width:0;border:1px solid var(--line);border-radius:12px;background:#ffffff02;overflow:hidden}
+.local-component-list{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;width:100%}
+.local-component-card{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--line);border-radius:12px;background:#ffffff02;overflow:hidden}
 .local-component-card.failed{border-color:color-mix(in srgb,var(--danger) 28%,transparent)}
 /* action column（操作列）：按钮文案或箭头变化不挤动名称与状态列。 */
 .local-component-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;min-height:72px;padding:11px 14px}
@@ -671,6 +687,9 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-component-body>.local-error{margin-top:10px}
 .local-component-detail{display:grid;gap:14px;padding:16px;border-top:1px solid var(--line);background:#0000000b}
 .local-component-detail>p{color:var(--muted);font-size:var(--font-body);overflow-wrap:anywhere}
+.component-enhancement-toggle{width:100%;min-height:54px;margin:0;padding:10px 16px;cursor:pointer}
+.component-enhancement-copy{display:grid;gap:3px;min-width:0}
+.component-enhancement-copy small{font-size:var(--font-caption);line-height:1.35;color:var(--subtle)}
 .local-detail-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}
 .local-detail-metrics{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));padding-top:4px}.local-detail-metrics .local-runtime-metric{display:flex;flex-direction:column;gap:3px;min-width:0}.local-resource-hint{font-size:var(--font-caption);color:var(--muted);line-height:1.6}
 .local-device-editor{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;align-items:end;max-width:420px}

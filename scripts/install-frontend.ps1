@@ -1,4 +1,4 @@
-param([switch]$Offline)
+﻿param([switch]$Offline)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'download-sources.ps1')
 Push-Location (Join-Path $PSScriptRoot '..')

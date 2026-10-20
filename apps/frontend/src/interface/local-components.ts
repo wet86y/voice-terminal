@@ -26,7 +26,13 @@ export interface LocalProviderSettings {
 /** LocalComponentRow（组件条目）：展示层只接收指标与选项，不直接调用业务。 */
 export interface LocalComponentRow {
   /** enhancement（增强能力开关）：详情中直接保存；busy（切换中）时锁定。 */
-  enhancement?: { label: string; enabled: boolean; busy: boolean; toggle: () => Promise<void> }
+  enhancement?: {
+    label: string // label（开关中文名称）。
+    enabled: boolean // enabled（当前已保存或立即预览的开启状态）。
+    busy: boolean // busy（正在读取或切换，暂时锁定操作）。
+    busyLabel?: string // busyLabel（忙碌状态下显示的中文阶段）。
+    toggle: () => Promise<void> // toggle（保存切换；失败时由调用方恢复原状态）。
+  }
   /** id（稳定标识）与 name（组件名称）。 */
   id: string
   name: string

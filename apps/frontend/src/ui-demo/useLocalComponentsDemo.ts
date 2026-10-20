@@ -62,7 +62,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     return {
       id: baseId === 'voice' ? item.id.replace(/^voice/, 'voice-system') : item.id,
       name: scene.value === 'long' ? `${item.name} · ${longIdentifier}` : item.name,
-      category: (baseId === 'voice' ? 'voice-server' : baseId === 'dsh' ? 'inference' : ['paraformer', 'smart_turn'].includes(baseId) ? 'speech' : 'extensions') as LocalComponentCategory,
+      category: (baseId === 'voice' ? 'voice-server' : baseId === 'dsh' ? 'inference' : ['paraformer', 'smart_turn', 'voice_vad'].includes(baseId) ? 'speech' : 'extensions') as LocalComponentCategory,
       state: loading ? 'loading' : failed ? 'failed' : 'ready',
       status: loading ? '启动中' : failed ? '不可用' : '运行中',
       available, retryable: failed && !loading, busy: loading,

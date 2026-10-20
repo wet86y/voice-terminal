@@ -64,11 +64,13 @@ onBeforeUnmount(clearTimer)
 </template>
 
 <style scoped>
-.operation-notice { align-items: flex-start; transition: opacity 160ms; }
-.operation-content { display: grid; gap: 5px; min-width: 0; }
-.operation-content strong { font-size: 12px; font-weight: 600; }
-.operation-row { color: var(--muted); line-height: 1.6; }
-.operation-spinner { width: 15px; height: 15px; flex: none; margin-top: 2px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: operation-spin .8s linear infinite; }
+.operation-notice { align-items: center; justify-content: flex-start; gap: 10px; width: auto; min-height: 0; text-align: left; }
+.operation-content { display: grid; justify-items: start; gap: 2px; min-width: 0; max-width: 100%; text-align: left; }
+.operation-content strong { font-size: inherit; line-height: 1.35; font-weight: 600; }
+.operation-row { max-width: 100%; color: var(--muted); font-size: inherit; line-height: 1.4; overflow-wrap: anywhere; }
+.operation-notice > span:not(.operation-spinner) { flex: none; width: 14px; line-height: 1; text-align: center; font-weight: 700; }
+.operation-notice > button { position: static; flex: none; transform: none; margin: 0 0 0 4px; }
+.operation-spinner { width: 14px; height: 14px; flex: none; margin-top: 0; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: operation-spin .8s linear infinite; }
 .operation-failed { border-color: #efa0b140; }
 @keyframes operation-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .operation-spinner { animation-duration: 2s; } }
