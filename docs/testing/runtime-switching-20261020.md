@@ -16,7 +16,7 @@
 
 全量后端的 24 个失败节点与本轮之前的基线报告完全一致，新增失败为 0。既有问题集中在旧语音合成控制／续接测试、部分启动替身签名、关键词唤醒测试替身以及人格资料生效时机断言；本轮没有据此宣称全量测试全部通过。
 
-调试程序已更新至 `apps/desktop/target/debug/VoiceTerminalDesktop.exe`（桌面调试程序），大小 24,889,344 字节，构建完成时间为 2026-10-20 21:58（香港时间）。前端构建输出位于 `.local/build/frontend`（本地界面构建目录）。
+项目本机程序已通过正式发布流程换入 `.local/app`（日常运行本体），启动入口为 `.local/VoiceTerminal.exe`（正式启动器）。`app/release.json`（本体清单）和 `build/program-package/package-info.json`（程序包记录）的构建编号一致，均为 `product-b6dea0d93ee2c021`；程序包 SHA-256（文件摘要）为 `6f5521606bae46c088044bf90c0a2322fbf3f2817d6380c7b95af02858e7efc4`。桌面宿主大小 16,145,920 字节，构建时间为 2026-10-20 22:07（香港时间）。`.local/Verify-Package.ps1`（本机本体校验脚本）验证通过；模型、Python 运行环境、DSH（代理宿主）和 WebView2（网页运行引擎）目录均保留。前端构建输出位于 `.local/build/frontend`（本地界面构建目录）。
 
 ## 新增边界覆盖
 
