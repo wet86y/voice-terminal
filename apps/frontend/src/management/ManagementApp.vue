@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import AppFrame from '../interface/AppFrame.vue'
 import SettingsFrame from '../interface/SettingsFrame.vue'
 import LocalComponents from '../interface/LocalComponents.vue'
@@ -14,6 +14,29 @@ import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type Deskto
 const section = ref('compute')
 const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopWorkspacePort
+const enhancementSettings = ref({ dual_pass: true, emotion: true, acoustic_events: true })
+const enhancementBusy = ref(false)
+const enhancementFailure = ref('')
+onMounted(async () => {
+  try { if (port.audioEnhancements) enhancementSettings.value = await port.audioEnhancements() }
+  catch (failure) { enhancementFailure.value = String(failure) }
+})
+function enhancement(resource: string): LocalComponentRow['enhancement'] {
+  const keys: Record<string, 'dual_pass' | 'emotion' | 'acoustic_events'> = { 'paraformer-streaming': 'dual_pass', 'emotion2vec-plus-base': 'emotion', yamnet: 'acoustic_events' }
+  const key = keys[resource]
+  if (!key) return undefined
+  return { label: key === 'dual_pass' ? '双路精修' : key === 'emotion' ? '情绪背景' : '声学事件',
+    enabled: enhancementSettings.value[key], busy: enhancementBusy.value,
+    toggle: async () => {
+      enhancementBusy.value = true; enhancementFailure.value = ''
+      try {
+        if (!port.audioEnhancements) throw new Error('当前宿主不支持保存音频增强设置。')
+        enhancementSettings.value = await port.audioEnhancements({ [key]: !enhancementSettings.value[key] })
+        await resources.refreshInventory()
+      } catch (failure) { enhancementFailure.value = String(failure) }
+      finally { enhancementBusy.value = false }
+    } }
+}
 const credentials = useStartupCredentials(port, () => resources.refreshInventory())
 watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), item => {
   credentials.setLocalTtsReady(item ? item.selected_local_ready === true : null)
@@ -42,14 +65,15 @@ const componentBlockMessage = computed(() => updatesRequired.value
   : '启动前组件校验未通过，请先下载或导入缺失组件。')
 const tasksBusy = computed(() => resources.startingResources.value.size > 0
   || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)))
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small', 'streaming-punctuation', 'tts-voxcpm1', 'tts-voxcpm2'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'streaming-punctuation', 'tts-voxcpm1', 'tts-voxcpm2'])
 const categoryByResource: Record<string, LocalComponentCategory> = {
-  'kws-sherpa-onnx': 'extensions', 'paraformer-streaming': 'speech', 'sensevoice-small': 'speech',
+  'kws-sherpa-onnx': 'extensions', 'paraformer-streaming': 'speech', 'emotion2vec-plus-base': 'extensions',
+  yamnet: 'extensions',
   'smart-turn': 'speech', 'streaming-punctuation': 'speech', 'fsmn-vad': 'extensions',
   'campplus-zh-cn-common': 'extensions', dsh: 'inference', 'voice-server': 'voice-server',
 }
 const componentIdByResource: Record<string, string> = {
-  'kws-sherpa-onnx': 'kws', 'paraformer-streaming': 'paraformer', 'sensevoice-small': 'sensevoice',
+  'kws-sherpa-onnx': 'kws', 'paraformer-streaming': 'paraformer', 'emotion2vec-plus-base': 'emotion',
   'smart-turn': 'smart_turn', 'streaming-punctuation': 'punctuation', 'fsmn-vad': 'voice_vad',
   'campplus-zh-cn-common': 'campplus', dsh: 'dsh', 'voice-server': 'voice-system',
 }
@@ -81,6 +105,7 @@ function resourceRow(item: ResourceStatus, category: LocalComponentCategory): Lo
   const status = item.update_available ? '需更新' : item.installation_state === 'incomplete' ? '待修复' : item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装'
   return {
     id: componentIdByResource[item.resource_id] || item.resource_id,
+    enhancement: enhancement(item.resource_id),
     name: item.label,
     category,
     state: item.update_available ? 'failed' : item.can_start ? 'ready' : 'disabled',
@@ -100,6 +125,7 @@ function resourceRow(item: ResourceStatus, category: LocalComponentCategory): Lo
       ...(item.resource_id === 'voice-server' && item.version ? [{ label: '解释器版本', value: item.version }] : []),
     ],
     resource: managed,
+    resourceChoices: item.resource_id === 'paraformer-streaming' ? resources.resources.value.filter(row => row.resource_id === 'paraformer-offline').map(toManagedResource) : undefined,
     runtimeDependencies: item.runtime_components?.map(toManagedResource),
   }
 }
@@ -108,7 +134,7 @@ const model = computed<LocalComponentsModel>(() => {
   const findResource = (id: string) => inventory.find(item => item.resource_id === id)
   const knownRows = inventory.flatMap(item => {
     const category = categoryByResource[item.resource_id]
-    if (!category || category === 'voice-server' || item.resource_id.startsWith('tts-') || item.resource_id === 'tts-audiocpp-runtime') return []
+    if (!category || category === 'voice-server' || item.resource_id.startsWith('tts-') || item.resource_id === 'tts-audiocpp-runtime' || item.resource_id === 'paraformer-offline') return []
     return [resourceRow(item, category)]
   })
   const ttsResources = ['tts-voxcpm2', 'tts-voxcpm1'].map(findResource).filter((item): item is ResourceStatus => Boolean(item))
@@ -183,7 +209,7 @@ const model = computed<LocalComponentsModel>(() => {
     resourceActionsAvailable: resources.resourcesCanManage.value,
     resourceLoading: resources.loading.value || resources.refreshing.value || resources.inventoryRefreshing.value || resources.preparingDownloadBundle.value,
     resourceTasksBusy: tasksBusy.value,
-    resourceError: resources.resourceError.value || credentials.error.value || undefined,
+    resourceError: enhancementFailure.value || resources.resourceError.value || credentials.error.value || undefined,
     resourceEventError: resources.eventError.value || undefined,
     resourceBatchRetry: failedJobs.some(job => job.resource_id === 'batch'),
     managedResourceJobs: resources.resourceJobs.value.map(job => {

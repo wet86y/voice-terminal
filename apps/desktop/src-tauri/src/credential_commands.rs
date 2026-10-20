@@ -10,6 +10,17 @@ fn allowed(window:&WebviewWindow,desktop:&Desktop)->Result<(),String>{
     super::require_command(desktop.mode,super::DesktopCommand::FocusMain)
 }
 #[tauri::command]
+pub async fn audio_enhancements_settings(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,request:Option<Value>)->Result<Value,String>{
+    allowed(&window,&desktop)?;let desktop=desktop.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        let _guard=desktop.credentials_guard.lock().map_err(|_|"音频增强配置锁不可用。")?;
+        if request.is_some() && desktop.service.lock().map_err(|_|"服务状态锁不可用。")?.is_some(){return Err("程序已启动，请在组件详情中切换。".into());}
+        if desktop.workspace_busy.load(std::sync::atomic::Ordering::Acquire){return Err("正在切换工作区，请稍后保存。".into());}
+        let context=desktop.context().ok_or("请先选择工作区。")?;
+        voice_desktop_common::resources::audio_enhancements(&context.data,request.as_ref())
+    }).await.map_err(|_|"音频增强设置处理失败。".to_string())?
+}
+#[tauri::command]
 pub async fn model_credentials_status(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>)->Result<Value,String>{
     allowed(&window,&desktop)?;let desktop=desktop.inner().clone();
     tauri::async_runtime::spawn_blocking(move||{

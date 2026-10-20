@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import type { LocalDownloadItem } from '../../interface/local-components'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small', 'tts-voxcpm1', 'tts-voxcpm2'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'tts-voxcpm1', 'tts-voxcpm2'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
   if (!plan) return false

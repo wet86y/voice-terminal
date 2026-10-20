@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { mount } from '@vue/test-utils'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import LocalComponents from './LocalComponents.vue'
 import type { LocalComponentsModel } from './local-components'
 
@@ -29,6 +29,21 @@ async function expandComponent(wrapper: ReturnType<typeof mount>, category: stri
 }
 
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
+  it('增强开关在组件详情可操作，切换期间锁定并显示持久化状态', async () => {
+    const value = model()
+    const toggle = vi.fn(async () => {})
+    value.rows[0]!.enhancement = { label: '双路精修', enabled: true, busy: false, toggle }
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
+    const control = card.get('[role="switch"]')
+    expect(control.attributes('aria-checked')).toBe('true')
+    await control.trigger('click')
+    expect(toggle).toHaveBeenCalledTimes(1)
+    await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!, enhancement: { label: '双路精修', enabled: false, busy: true, toggle } }] } })
+    expect(control.attributes('disabled')).toBeDefined()
+    expect(control.text()).toContain('切换中')
+    wrapper.unmount()
+  })
   it('资源齐全时保留一键下载与资源导入入口，标题不显示旧说明', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
     const heading = wrapper.get('.local-managed-heading')

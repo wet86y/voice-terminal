@@ -58,6 +58,8 @@ async def run(config_path: Path | None = None) -> None:
         decoder_chunk_look_back=config.asr.decoder_chunk_look_back,
         punctuation_model_dir=config.punctuation_model_dir if config.asr.punctuation_enabled else None,
         punctuation_device=config.asr.punctuation_device,
+        offline_model_dir=config.offline_asr_model_dir,
+        dual_pass_enabled=config.audio_enhancements.dual_pass,
     )
     # Bind the listener before loading so the host can publish the selected port;
     # health readiness still waits for the fully loaded model below.

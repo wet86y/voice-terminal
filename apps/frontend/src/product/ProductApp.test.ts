@@ -548,7 +548,8 @@ describe('正式界面的真实控件交互', () => {
     expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
     expect(card.get('button[aria-label="Paraformer（流式识别）：跳转"]').text()).toBe('跳转')
-    expect(card.find('.local-component-action').exists()).toBe(false)
+    expect(card.find('.local-component-action').exists()).toBe(true)
+    expect(card.find('[role="switch"]').exists()).toBe(true)
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 Paraformer')
@@ -593,7 +594,7 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = await renderComponentSettings({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
     const mb = 1024 ** 2
     value.computeStatus.value = { hardware: { system_memory: {}, gpu: {} }, models: Object.fromEntries(
-      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map(id => [id, {
+      ['paraformer', 'emotion', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map(id => [id, {
         service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false,
         resource_status: { rss_bytes: 999 * mb, private_commit_bytes: 9999 * mb },
       }])) } as never
@@ -606,20 +607,21 @@ describe('正式界面的真实控件交互', () => {
     } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(12)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(14)
     expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(0)
     expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
     expect(wrapper.find('[data-component="hotwords"]').exists()).toBe(true)
     expect(wrapper.find('[data-component="punctuation"]').exists()).toBe(true)
     await expandComponent(wrapper, 'paraformer', 'speech')
-    await expandComponent(wrapper, 'sensevoice', 'speech')
+    await expandComponent(wrapper, 'emotion', 'extensions')
     await expandComponent(wrapper, 'campplus', 'extensions')
     await expandComponent(wrapper, 'dsh', 'inference')
     await expandComponent(wrapper, 'voice-system', 'voice-server')
     expect(wrapper.findAll('.local-component-card [data-metric="memory"]')).toHaveLength(5)
     expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toContain('100 MB / 1000 MB')
-    expect(wrapper.get('[data-component="sensevoice"] [data-metric="memory"]').text()).toContain('200 MB')
+    expect(wrapper.find('[data-component="emotion"] [data-metric="memory"]').exists()).toBe(false)
+    expect(wrapper.get('[data-component="analysis-runtime"] [data-metric="memory"]').text()).toContain('200 MB')
     expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toContain('440 MB')
     for (const id of ['voice_vad', 'kws', 'smart_turn']) expect(wrapper.find(`[data-component="${id}"] [data-metric="memory"]`).exists()).toBe(false)
     for (const id of ['voice', 'host', 'desktop', 'web', 'setup']) expect(wrapper.find(`[data-component="${id}"]`).exists()).toBe(false)
@@ -775,7 +777,7 @@ describe('正式界面的真实控件交互', () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = await renderComponentSettings({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
     value.computeStatus.value = { models: Object.fromEntries(
-      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map((id, index) => [id, {
+      ['paraformer', 'emotion', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map((id, index) => [id, {
         service: ['ERROR', 'UNAVAILABLE', 'DISABLED', 'UNKNOWN'][index % 4], load_error: '组件尚未就绪', runtime_error: '旧采样错误',
       }])) } as never
     application.snapshot.value = { state: 'starting', startup_complete: false, components: [
@@ -784,7 +786,7 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(12)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(14)
     expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(0)
     expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
@@ -843,7 +845,7 @@ describe('正式界面的真实控件交互', () => {
     allowBusinessReady(value)
     value.computeStatus.value = { models: {
       paraformer: { service: 'ERROR', load_error: '旧未就绪错误' },
-      sensevoice: { service: 'UNAVAILABLE', load_error: '尚未连接' },
+      emotion: { service: 'UNAVAILABLE', load_error: '尚未连接' },
       campplus: { service: 'DISABLED' },
     } } as never
     application.snapshot.value = { startup_complete: false, components: [
@@ -853,11 +855,11 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     const paraformer = await expandComponent(wrapper, 'paraformer', 'speech')
-    const sensevoice = await expandComponent(wrapper, 'sensevoice', 'speech')
+    const emotion = await expandComponent(wrapper, 'emotion', 'extensions')
     const campplus = await expandComponent(wrapper, 'campplus', 'extensions')
     expect(paraformer.get('.local-state').text()).toBe('启动中')
     expect(paraformer.find('.local-error').exists()).toBe(false)
-    expect(sensevoice.get('.local-error').text()).toBe('分析模型缺失')
+    expect(emotion.get('.local-error').text()).toBe('分析模型缺失')
     expect(campplus.get('.local-state').text()).toBe('已停用')
     application.snapshot.value!.startup_complete = true
     await flushPromises()

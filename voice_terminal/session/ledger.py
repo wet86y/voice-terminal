@@ -525,7 +525,7 @@ class SessionLedger:
             for item in metadata.get("transcript_updates", [])
         ):
             self._upsert_transcript_update(metadata, {
-                "kind": "refinement", "source": "sensevoice",
+                "kind": "refinement", "source": metadata.get("refinement_source", "sensevoice"),
                 "text": refined.strip(), "revision": 2,
             })
         entry = SessionLedgerEntry("input", value, metadata)
@@ -588,7 +588,7 @@ class SessionLedger:
                  if isinstance(item, dict)] or [0]
             ) + 1
             self._upsert_transcript_update(entry.metadata, {
-                "kind": "refinement", "source": "sensevoice", "text": value, "revision": revision,
+                "kind": "refinement", "source": entry.metadata.get("refinement_source", "sensevoice"), "text": value, "revision": revision,
             })
             # ``details`` is diagnostic/UI state supplied by the controller.
             # It must not be able to replace a prefix that may already have

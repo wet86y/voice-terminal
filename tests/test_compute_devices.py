@@ -89,13 +89,13 @@ class ComputeDeviceTests(unittest.TestCase):
 
     def test_auto_uses_gpu_only_when_backend_and_free_memory_are_available(self) -> None:
         with patch("voice_terminal.compute.hardware_status", return_value=self.hardware()):
-            self.assertEqual(startup_device("auto", "sensevoice"), "cuda")
-            self.assertEqual(device_candidates("auto", "sensevoice"), ["cuda", "cpu"])
+            self.assertEqual(startup_device("auto", "emotion"), "cuda")
+            self.assertEqual(device_candidates("auto", "emotion"), ["cuda", "cpu"])
         with patch("voice_terminal.compute.hardware_status", return_value=self.hardware(free=1)):
-            self.assertEqual(startup_device("auto", "sensevoice"), "cpu")
+            self.assertEqual(startup_device("auto", "emotion"), "cpu")
         with patch("voice_terminal.compute.hardware_status", return_value=self.hardware(supported=False)):
-            self.assertEqual(startup_device("auto", "sensevoice"), "cpu")
-        self.assertEqual(device_candidates("cuda", "sensevoice", "cpu"), ["cuda", "cpu"])
+            self.assertEqual(startup_device("auto", "emotion"), "cpu")
+        self.assertEqual(device_candidates("cuda", "emotion", "cpu"), ["cuda", "cpu"])
 
     def test_sensevoice_cuda_load_failure_retries_on_the_previous_cpu_device(self) -> None:
         from voice_terminal.analysis.sensevoice import SenseVoice

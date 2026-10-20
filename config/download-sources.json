@@ -34,7 +34,6 @@
   ],
   "models": [
     {"origin_prefix": "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/", "repo_id": "pipecat-ai/smart-turn-v3", "revision": "dd6b4b37fa45d30a8d0d56735a1727c96c11711e"},
-    {"origin_prefix": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/resolve/3847d57b6bdf2dd8875cb1508d2af43d80a16bf7/", "repo_id": "iic/SenseVoiceSmall", "revision": "7bf452403abd7353a300cd760f7adae7701c92c1"},
     {"origin_prefix": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/1b5981b2b89a1af578ebba5c8cf34226810e1f55/", "repo_id": "HereIsMark/audio.cpp-gguf", "revision": "710b2d85fa66ecd0e9cc4eee6413b9595171f502"}
   ],
   "npm_registries": ["https://registry.npmmirror.com", "https://registry.npmjs.org"],

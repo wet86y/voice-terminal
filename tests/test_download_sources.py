@@ -90,7 +90,14 @@ def test_all_locked_resources_map_without_changing_identity():
                 if row.get("asset"):
                     continue
                 origin = f'https://huggingface.co/{spec["source"]["repo_id"]}/resolve/{spec["source"]["revision"]}/{row.get("source_path", row["path"])}'
-                assert sources.candidates(origin)[0].startswith("https://modelscope.cn/")
+                if spec["source"].get("mirror_policy") == "origin_only":
+                    # 未核验相同摘要的镜像不能替换固定权重或声学类别表。
+                    assert spec["resource_id"] in {"emotion2vec-plus-base", "yamnet"}
+                    assert spec["source"].get("mirror_policy_zh")
+                    assert sources.candidates(origin) == [origin]
+                    assert len(spec["source"]["revision"]) == 40
+                else:
+                    assert sources.candidates(origin)[0].startswith("https://modelscope.cn/")
                 assert sources.candidates(origin)[-1] == origin
     manifest = "https://github.com/wet86y/voice-terminal/releases/latest/download/update.json"
     assert sources.candidates(manifest) == [manifest]

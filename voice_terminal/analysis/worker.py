@@ -27,6 +27,7 @@ class AnalysisLane:
         self.active_request_id: str | None = None
         self.active_run_options = None
         self.resource_footprint = None  # resource_footprint（加载及预热的内存增量估算）。
+        self.changing = False  # changing（模型正在装卸，暂停新任务准入）。
         self._managed_audio = ResourcePolicy.load().shared_audio
 
     def prepare(self, factory: Callable) -> None:
@@ -47,6 +48,7 @@ class AnalysisLane:
         return {
             "status": "DISABLED" if self.error == "disabled" else "READY" if self.model else "DEGRADED",
             "model": self.model_name,
+            "identity": getattr(model, "identity", None),  # identity（固定模型身份与来源修订）。
             "model_loaded": self.model is not None,
             "model_warmed": getattr(model, "warmed", None),  # model_warmed（是否完成真实推理预热）。
             "model_file": getattr(model, "model_file", None),  # model_file（实际模型文件）。
@@ -68,6 +70,8 @@ class AnalysisLane:
 
     async def run_measured(self, pcm: bytes, request_id: str, audio_owner=None) -> tuple[dict, dict]:
         """run_measured（带耗时执行）：计时绑定本次请求，避免下一次调用覆盖它。"""
+        if self.changing:
+            raise RuntimeError("analysis model switching")
         if self.model is None:
             raise RuntimeError(self.error or "model unavailable")
         if self.active is not None and not self.active.done():
@@ -124,7 +128,7 @@ class AnalysisLane:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
-def create_analysis_app(lanes: dict[str, AnalysisLane]):
+def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None = None):
     from fastapi import FastAPI, WebSocket
     from contextlib import asynccontextmanager
 
@@ -135,6 +139,7 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
             lane.close()
 
     app = FastAPI(lifespan=lifespan)
+    configuration_lock = asyncio.Lock()  # configuration_lock（模型切换全局互斥）。
 
     @app.get("/health")
     async def health():
@@ -156,6 +161,38 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
         try:
             request = await asyncio.wait_for(socket.receive_json(), 5)
             if request.get("operation") == "health":
+                await socket.send_json(await health())
+                return
+            if request.get("operation") == "configure":
+                import gc
+                changes = request.get("enabled")
+                if not isinstance(changes, dict) or not factories or any(
+                    name not in factories or type(enabled) is not bool for name, enabled in changes.items()
+                ):
+                    raise ValueError("背景感知模型设置无效")
+                async with configuration_lock:
+                    for name, enabled in changes.items():
+                        selected = lanes[name]
+                        selected.changing = True
+                        try:
+                            if selected.active is not None:
+                                await asyncio.gather(asyncio.shield(selected.active), return_exceptions=True)
+                            previous_device = getattr(selected.model, "device", None)
+                            selected.model = None
+                            gc.collect()
+                            if previous_device and str(previous_device).startswith("cuda"):
+                                import torch
+                                torch.cuda.empty_cache()
+                            selected.error = "disabled" if not enabled else None
+                            if enabled:
+                                from ..asr.worker import AsrWorkerEngine
+                                await AsrWorkerEngine._await_native(asyncio.ensure_future(
+                                    asyncio.to_thread(selected.prepare, factories[name])))
+                        except Exception as exc:
+                            selected.error = str(exc)
+                            raise
+                        finally:
+                            selected.changing = False
                 await socket.send_json(await health())
                 return
             try:

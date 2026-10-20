@@ -136,6 +136,8 @@ export interface LatencyValues {
   first_segment_ms?: number | null
   smart_turn_ms?: number | null
   sensevoice_refine_ms?: number | null
+  /** paraformer_refine_ms（离线片段精修耗时，毫秒）。 */
+  paraformer_refine_ms?: number | null
   commit_to_final_llm_ms?: number | null
   asr_final_to_commit_ms?: number | null
   refine_duration_ms?: number | null

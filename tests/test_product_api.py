@@ -182,7 +182,7 @@ class ProductApiTests(unittest.TestCase):
             },
         }
         devices = {
-            name: ("cuda" if name == "sensevoice" else "cpu")
+            name: ("cuda" if name == "emotion" else "cpu")
             for name in COMPUTE_MODEL_IDS
         }
         with patch("voice_terminal.server.websocket.hardware_status", return_value=unavailable):
@@ -191,7 +191,7 @@ class ProductApiTests(unittest.TestCase):
             ))
         self.assertEqual(response.status_code, 422)
         self.assertEqual(
-            self.runtime.product_settings.snapshot()["compute"]["devices"]["sensevoice"],
+            self.runtime.product_settings.snapshot()["compute"]["devices"]["emotion"],
             "cpu",
         )
 

@@ -64,14 +64,14 @@ def main() -> None:
         "speaker_url": config.speaker_worker_url,
         # port=0（系统分配端口）在 DSH（代理执行宿主）完成绑定前没有可发布的首选地址。
         "dsh_url": f"http://{config.dsh.host}:{config.dsh.port}" if config.dsh.port > 0 else "",
-        "analysis_enabled": config.smart_turn.smart_turn or config.smart_turn.sensevoice,
+        "analysis_enabled": True,
         "analysis_lanes": [name for name, enabled in (("endpoint", config.smart_turn.smart_turn),
-            ("refine", config.smart_turn.sensevoice)) if enabled],
+            ("emotion", False), ("acoustic", False)) if enabled],
         "startup_gpu_roles": [role for role, enabled, models in (
             ("asr", True, ("paraformer",)),
-            ("analysis", config.smart_turn.smart_turn or config.smart_turn.sensevoice,
+            ("analysis", config.smart_turn.smart_turn or config.audio_enhancements.emotion,
              tuple(name for name, selected in (("smart_turn", config.smart_turn.smart_turn),
-                                               ("sensevoice", config.smart_turn.sensevoice)) if selected)),
+                                               ("emotion", config.audio_enhancements.emotion)) if selected)),
             ("voice", True, ("voice_vad", "kws") +
              (("campplus",) if config.speaker.mode != "off" or config.speaker.owner_only_barge_in else ())),
         ) if enabled and any(config.compute.devices.get(name, "auto") != "cpu" for name in models)],

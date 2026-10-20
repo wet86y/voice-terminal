@@ -25,7 +25,6 @@ continuity:
 # The only runtime: audio input refinement is independently configurable.
 smart_turn:
   smart_turn: true
-  sensevoice: true
   analysis_url: ws://127.0.0.1:8767/analysis
   smart_timeout_ms: 300
   hard_silence_ms: 1400
@@ -250,7 +249,7 @@ speaker:
 
 speaker_worker:
   host: 127.0.0.1
-  # 8767 is reserved for the Smart Turn / SenseVoice analysis worker.
+  # 8767 is reserved for the SmartTurn / 音频背景分析 analysis worker.
   port: 8768
 
 agent:

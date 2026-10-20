@@ -644,6 +644,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return {"settings": store.settings_only().get("hotwords", DEFAULT_HOTWORDS),
                 "status": runtime.hotwords.last_status}
 
+    @app.put("/api/v1/product/settings/audio-enhancements")
+    async def save_audio_enhancements(body: dict[str, Any]) -> dict:
+        product_store_or_404()
+        try:
+            value = await runtime.switch_audio_enhancements(body)
+            return {"settings": value, "pending": False, "message": "音频增强设置已生效。"}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"音频增强切换失败：{exc}") from exc
+
     @app.put("/api/v1/product/settings/hotwords")
     async def save_hotwords(body: dict[str, Any]) -> dict:
         service = runtime.hotwords

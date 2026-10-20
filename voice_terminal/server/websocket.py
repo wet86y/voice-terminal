@@ -721,6 +721,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if self.product_settings is not None:
             await self.hotwords.configure(lambda: self.product_settings.settings_only().get("hotwords", self.hotwords.bank.settings))
         self.controller = EpisodeController(
+            audio_enhancements=self.config.audio_enhancements,
             hotwords=self.hotwords,
             options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self._episode_persona_config(),
@@ -859,6 +860,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
+        value.payload["audio_enhancements_switching"] = bool(getattr(self, "_enhancement_switching", False))
         local_tts_status = self.local_tts_status_payload()
         value.payload["local_tts"] = local_tts_status  # local_tts（本地模型选择与加载状态）。
         value.payload["session_operation"] = getattr(self, "_session_operation", None)  # session_operation（手动会话操作）。
@@ -1666,11 +1668,15 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         """Clear closed component references before a controlled rebuild."""
 
         self.state.clear_current()
+        self._closed = False
         self.state.agent = {}
         self.state.input_owner = "none"
         self.state.set_state(TerminalState.STARTING, listening=False)
 
     async def start_listening(self) -> None:
+        if getattr(self, "_enhancement_switching", False):
+            self._enhancement_resume_requested = True
+            return
         if getattr(self, "_pending_tts_update", None) or getattr(self, "_applying_tts_selection", None):
             self._tts_resume_requested = True  # 用户主动请求切换后继续监听。
             await self.bus.publish(event("status", code="TTS_SWITCH_PENDING", message="语音模型切换完成后开始监听。"))
@@ -1737,6 +1743,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await self._deliver_voice_mailbox()
 
     async def stop_listening(self) -> None:
+        self._enhancement_resume_requested = False
         self._tts_resume_requested = False  # 用户主动停止优先于后台切换的恢复意图。
         self._listen_resume_requested = False  # 用户主动停止也撤销能力加载中的挂起意图。
         async with self._session_lock:
@@ -1832,6 +1839,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 await bus.publish(self.snapshot())
 
     async def close(self, *, preserve_tts_updates: bool = False) -> None:
+        self._enhancement_resume_requested = False
+        self._closed = True
         update_task = getattr(self, "_tts_update_task", None)
         if not preserve_tts_updates and update_task is not None and update_task is not asyncio.current_task() and not update_task.done():
             update_task.cancel()
@@ -2337,7 +2346,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 "gpu_available": bool(hardware["models"].get(name, {}).get("gpu_available")),
                 "gpu_unavailable_reason": hardware["models"].get(name, {}).get("reason"),
             }
-            for name in ("paraformer", "sensevoice", "voice_vad", "kws", "smart_turn", "campplus")
+            for name in ("paraformer", "emotion", "voice_vad", "kws", "smart_turn", "campplus")
         }
 
         models["kws"].update(self._compute_models.get("kws", {}))
@@ -2369,6 +2378,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     "resource_footprint": punctuation.get("resource_footprint"),
                     "load_error": punctuation.get("load_error") or punctuation.get("last_error"),
                 }
+                offline = status.get("offline", {})
+                auxiliary["dual_pass"] = {"service": offline.get("status", "DISABLED"),
+                    "runtime": "PyTorch（双路离线识别）", "device": status.get("device"),
+                    "resource_status": status.get("resource_status"),
+                    "resource_footprint": offline.get("resource_footprint"), "load_error": offline.get("error")}
                 models["paraformer"].update({
                     "resource_status": status.get("resource_status"),
                     "runtime": status.get("runtime"),
@@ -2389,7 +2403,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
         try:
             analysis = await AnalysisClient(self.config.smart_turn.analysis_url).health()
-            for lane_name, model_name in (("refine", "sensevoice"), ("endpoint", "smart_turn")):
+            acoustic = analysis.get("acoustic", {})
+            auxiliary["acoustic_events"] = {"service": acoustic.get("status", "DISABLED"),
+                "runtime": acoustic.get("runtime"), "device": "cpu", "resource_status": acoustic.get("resource_status"),
+                "resource_footprint": acoustic.get("resource_footprint"), "load_error": acoustic.get("error")}
+            for lane_name, model_name in (("emotion", "emotion"), ("endpoint", "smart_turn")):
                 lane = analysis.get(lane_name, {})
                 if isinstance(lane, dict):
                     if isinstance(lane.get("resource_status"), dict):
@@ -2406,12 +2424,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                         "load_error": lane.get("load_error") or lane.get("error"),
                         "process_memory_rss_bytes": lane.get("process_memory_rss_bytes"),
                     })
-                    if model_name == "sensevoice":
+                    if model_name == "emotion":
                         models[model_name]["internal_vad_device"] = lane.get("internal_vad_device")
         except Exception as exc:
-            if self.config.smart_turn.smart_turn or self.config.smart_turn.sensevoice:
+            if self.config.smart_turn.smart_turn or self.config.audio_enhancements.emotion:
                 missing_resource_roles.add("analysis")
-            for name in ("sensevoice", "smart_turn"):
+            for name in ("emotion", "smart_turn"):
                 models[name].update({"service": "UNAVAILABLE", "load_error": str(exc)[:300]})
 
         if self.speaker is not None and self.speaker.connected:

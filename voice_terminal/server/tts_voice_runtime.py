@@ -231,21 +231,14 @@ class TtsVoiceOperationManager:
         samples, rate = await asyncio.to_thread(sf.read, library.asset_path(operation.request["asset_id"]), dtype="int16")
         if rate != 16000:
             raise TtsVoiceOperationError("参考音频必须为 16 kHz（千赫兹）。")
-        from ..analysis.client import AnalysisClient
-        client = AnalysisClient(self.runtime.config.smart_turn.analysis_url)
-        health = await client.health()
-        lane = health.get("refine", {})
-        if lane.get("status") != "READY":
-            raise TtsVoiceOperationError("当前精修模型未就绪，请稍后重试或手动填写。")
+        from ..asr.client import AsrWorkerClient
+        client = AsrWorkerClient(self.runtime.config.asr.worker_url)
         try:
-            reply = await client.analyze("refine", samples.astype("<i2").tobytes(), "voice-ref-" + operation.id, 0, 30000)
+            result = await client.transcribe_reference(samples.astype("<i2").tobytes())
         except TimeoutError as exc:
-            raise TtsVoiceOperationError("精修转写超过 30 秒，音频已保留，可重试或手填。") from exc
-        except RuntimeError as exc:
-            if "busy" in str(exc):
-                raise TtsVoiceOperationError("当前精修模型忙，音频已保留，可稍后重试或手填。") from exc
-            raise
-        result = reply.get("result", {})
+            raise TtsVoiceOperationError("离线转写超过 30 秒，音频已保留，可重试或手填。") from exc
+        finally:
+            await client.close()
         if not result.get("complete") or not isinstance(result.get("text"), str) or not result["text"].strip():
             raise TtsVoiceOperationError("未识别到完整人声，音频已保留，请校对或重试。")
         return {"asset_id": operation.request["asset_id"], "text": result["text"].strip()}

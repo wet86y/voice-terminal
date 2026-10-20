@@ -232,6 +232,7 @@ class LLMContextProjector:
         *, current: CurrentInput, speak_state: dict[str, Any],
         calendar_epoch: str | None = None, shadow: dict[str, Any] | None = None,
         tool_availability: dict[str, str] | None = None,
+        voice_emotion: str | None = None, acoustic_events: list[dict] | None = None,
     ) -> str:
         """Create the only volatile model context block for one request."""
 
@@ -255,6 +256,10 @@ class LLMContextProjector:
             payload["tool_availability"] = dict(tool_availability)
         if calendar_epoch:
             payload["runtime"]["calendar_epoch"] = calendar_epoch
+        if voice_emotion:
+            payload["runtime"]["voice_emotion"] = voice_emotion  # 语音情绪背景标签。
+        if acoustic_events:
+            payload["runtime"]["acoustic_events"] = acoustic_events  # 已冻结的待消费声学观察。
         if shadow is not None:
             payload["shadow"] = {
                 "available": bool(shadow.get("available")),

@@ -22,7 +22,7 @@ from voice_terminal.dsh.profile import build_profile
 from voice_terminal.dsh.official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
 from voice_terminal.paths import atomic_json
 
-CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "funasr/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727", "analysis/smart-turn", "analysis/sensevoice", "speaker/campplus-zh-cn-common")
+CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "funasr/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727", "analysis/smart-turn", "speaker/campplus-zh-cn-common")
 
 
 def copy_tree(source: Path, target: Path, *, excludes=()) -> None:
@@ -55,6 +55,10 @@ def collect_models(source: Path, target: Path) -> dict:
         if not folder.is_dir():
             raise FileNotFoundError(f"缺少本轮运行所需模型：{relative}")
         copy_tree(folder, target / relative, excludes=("keywords.txt", "keywords.raw.txt", "keywords_raw.txt"))
+    # 可选增强资源存在时随包收集，缺失时允许基础识别独立打包。
+    for relative in ("funasr/paraformer-zh-offline", "analysis/emotion2vec-plus-base", "analysis/yamnet"):
+        if (source / relative).is_dir():
+            copy_tree(source / relative, target / relative)
     record = manifest(target, kind="models", build="core")
     record["build"] = hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest()[:16]
     atomic_json(target / "manifest.json", record)

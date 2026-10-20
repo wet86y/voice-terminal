@@ -54,14 +54,16 @@ REPORT_FIELDS = {
     "voice_asr_session": "Voice（语音服务）当前实际持有的 ASR（语音识别）会话状态",
     "analysis": "Analysis（分析）的各识别通道健康状态",
     "smart_turn": "Smart Turn（智能轮次检测）模型状态",
-    "sensevoice": "SenseVoice（语音理解）模型状态",
-    "all_models_enabled": "是否启用 KWS（关键词唤醒）与 WeSpeaker（声纹）验收",
-    "all_model_health": "KWS、WeSpeaker 与基础模型健康状态",
+    "emotion": "emotion2vec+ base（情绪背景）模型状态",
+    "acoustic_events": "YAMNet（声学事件）通道状态",
+    "dual_pass": "Paraformer（语音识别）双路精修通道状态",
+    "all_models_enabled": "是否启用 KWS（关键词唤醒）与 CAM++（声纹）验收",
+    "all_model_health": "KWS（关键词唤醒）、CAM++（声纹）与基础模型健康状态",
     "test_configuration_restored": "本轮全部模型验收配置是否已在受管服务停止后恢复",
     "paraformer": "Paraformer（语音识别）模型健康状态",
     "voice_vad": "Voice VAD（语音活动检测）模型健康状态",
     "kws": "KWS（关键词唤醒）模型健康状态",
-    "wespeaker": "WeSpeaker（声纹）模型健康状态",
+    "campplus": "CAM++（声纹）模型健康状态",
     "service": "模型服务健康状态",
     "verified": "要求的模型健康状态是否全部通过",
     "component": "端点所属组件：host（应用宿主）、web（界面）、voice（语音服务）、asr（识别）、analysis（分析）、speaker（声纹）、dsh（代理）",
@@ -312,7 +314,7 @@ def _restore_test_files(workspace: Path, backups: dict[Path, bytes | None]) -> N
 
 def _apply_all_model_overrides(workspace: Path, app_root: Path,
                                backups: dict[Path, bytes | None] | None = None) -> dict[Path, bytes | None]:
-    """Temporarily enable KWS（关键词唤醒）and WeSpeaker（声纹）in this QA workspace only."""
+    """仅在验收工作区临时启用 KWS（关键词唤醒）与 CAM++（声纹）。"""
     config = workspace / "data/config"
     if not _inside(config.resolve(), workspace):
         raise QualificationError("workspace_write_path_invalid")
@@ -1067,7 +1069,6 @@ def _verify_dependencies(snapshot: dict, analysis_enabled: bool, timeout: float 
     asr_state = models.get("paraformer", {}).get("service")
     analysis_states = {
         "smart_turn": models.get("smart_turn", {}).get("service"),
-        "sensevoice": models.get("sensevoice", {}).get("service"),
     }
     if asr_state != "READY":
         raise QualificationError("asr_dependency_not_ready_after_reconnect")
@@ -1084,7 +1085,7 @@ def _verify_all_model_health(snapshot: dict, timeout: float = 300) -> dict:
     if not isinstance(voice, str) or not voice.startswith("http://127.0.0.1:"):
         raise QualificationError("voice_api_endpoint_unavailable")
     base = voice.rstrip("/")
-    model_names = ("paraformer", "sensevoice", "voice_vad", "kws", "smart_turn", "wespeaker")
+    model_names = ("paraformer", "voice_vad", "kws", "smart_turn", "campplus")
     deadline = time.monotonic() + timeout
     states: dict[str, str | None] = {}
     while time.monotonic() < deadline:
@@ -1096,7 +1097,14 @@ def _verify_all_model_health(snapshot: dict, timeout: float = 300) -> dict:
                 name: models.get(name, {}).get("service") if isinstance(models.get(name), dict) else None
                 for name in model_names
             }
-            if all(states.get(name) == "READY" for name in model_names):
+            # 三项增强是可选能力，停用允许；已启用能力仍必须完成加载与预热。
+            states["emotion"] = models.get("emotion", {}).get("service")
+            auxiliary = compute.get("auxiliary", {})
+            for name in ("dual_pass", "acoustic_events"):
+                states[name] = auxiliary.get(name, {}).get("service")
+            if (all(states.get(name) == "READY" for name in model_names)
+                    and all(states.get(name) in {"READY", "DISABLED"}
+                            for name in ("emotion", "dual_pass", "acoustic_events"))):
                 _wait_voice_asr_session(base, timeout=5)
                 return {"verified": True, "voice_asr_session": "READY", **states}
         time.sleep(.5)
@@ -1221,7 +1229,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-restart", action="store_true",
                         help="另执行一次整程序关闭/重启（完整进程重启）校验。")
     parser.add_argument("--all-models", action="store_true",
-                        help="在隔离工作区临时启用 KWS（关键词唤醒）与 WeSpeaker（声纹），验收全部本地模型。")
+                        help="在隔离工作区临时启用 KWS（关键词唤醒）与 CAM++（声纹），验收全部本地模型。")
     return parser
 
 

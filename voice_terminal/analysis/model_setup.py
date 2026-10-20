@@ -10,8 +10,10 @@ from ..model_setup import _sha256
 MODELS = {
     "smart-turn": ("pipecat-ai/smart-turn-v3", "f766f81d3cfdf7737ac64aad813d91bbfd56bf93",
                    ["smart-turn-v3.2-cpu.onnx"]),
-    "sensevoice": ("FunAudioLLM/SenseVoiceSmall", "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
-                  ["model.pt", "config.yaml", "configuration.json", "am.mvn", "chn_jpn_yue_eng_ko_spectok.bpe.model"]),
+    "emotion2vec-plus-base": ("emotion2vec/emotion2vec_plus_base", "b318240bfe67db81a8c572ecb37ce9c3759b81c9",
+                             ["model.pt", "config.yaml", "configuration.json", "tokens.txt"]),
+    "yamnet": ("audiomagic/yamnet-onnx", "f25b741c2f0bdc6d7e6db24b5fddda23347dbafd",
+               ["yamnet.onnx", "yamnet_class_map.csv"]),
 }
 SMART_TURN_GPU = "smart-turn-v3.2-gpu.onnx"  # SMART_TURN_GPU（可选显卡模型文件）。
 
@@ -47,7 +49,7 @@ def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
         for filename in selected:
             print(f"Downloading {name}/{filename} revision={revision}", flush=True)
             destination = folder / filename
-            resource = next(item for item in catalog["resources"] if item["resource_id"] == ("smart-turn" if name == "smart-turn" else "sensevoice-small"))
+            resource = next(item for item in catalog["resources"] if item["resource_id"] == name)
             record = next(item for item in resource["files"] if item["path"] == filename)
             if not destination.is_file() or _sha256(destination) != record["sha256"]:
                 download(f"https://huggingface.co/{repo}/resolve/{revision}/{filename}", destination,

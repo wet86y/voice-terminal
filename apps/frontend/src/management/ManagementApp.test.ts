@@ -37,7 +37,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   }
 
   beforeEach(() => {
-    inventory = [row('voice-server', 'Voice Server（语音服务）'), row('paraformer-streaming', 'Paraformer（流式识别）'), row('sensevoice-small', 'SenseVoice（精修模型）')]
+    inventory = [row('voice-server', 'Voice Server（语音服务）'), row('paraformer-streaming', 'Paraformer（流式识别）'), row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）')]
     jobs = []
     configured = { deepseek: true, minimax: true }
     saveCredentials.mockReset().mockImplementation(async (request: { deepseek_api_key: string; minimax_api_key: string }) => {
@@ -312,32 +312,32 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     inventory = [
       row('voice-server', 'Voice Server（语音服务）', true),
       row('paraformer-streaming', 'Paraformer（流式识别）', true),
-      { ...row('sensevoice-small', 'SenseVoice（精修模型）', true), update_available: true,
+      { ...row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）', true), update_available: true,
         installed_version: '1.0.0', version: '1.1.0', can_start: true },
     ]
     wrapper = mount(ManagementApp)
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
-    const card = await expandComponent('sensevoice', 'speech')
+    const card = await expandComponent('emotion', 'extensions')
     expect(card.get('.local-state').text()).toBe('需更新')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('更新')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转"]').text()).toBe('跳转')
-    await card.get('button[aria-label="SenseVoice（精修模型）：更新"]').trigger('click')
+    expect(card.get('button[aria-label="emotion2vec+ base（情绪背景）：更新"]').text()).toBe('更新')
+    expect(card.get('button[aria-label="emotion2vec+ base（情绪背景）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="emotion2vec+ base（情绪背景）：跳转"]').text()).toBe('跳转')
+    await card.get('button[aria-label="emotion2vec+ base（情绪背景）：更新"]').trigger('click')
     await flushPromises()
-    expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 SenseVoice')
+    expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 emotion2vec+ base')
     expect(wrapper.get('.install-plan-actions button').text()).toBe('开始更新')
     await wrapper.get('.install-plan-actions button').trigger('click')
     await flushPromises()
-    expect(download).toHaveBeenCalledWith('sensevoice-small')
-    expect(wrapper.get('[data-job="download-sensevoice-small"]').text()).toContain('正在准备下载')
+    expect(download).toHaveBeenCalledWith('emotion2vec-plus-base')
+    expect(wrapper.get('[data-job="download-emotion2vec-plus-base"]').text()).toContain('正在准备下载')
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
 
-    inventory = inventory.map(item => item.resource_id === 'sensevoice-small'
+    inventory = inventory.map(item => item.resource_id === 'emotion2vec-plus-base'
       ? { ...item, update_available: false, can_start: true, installed_version: '1.1.0' }
       : item)
-    resourceEvent?.({ payload: { job_id: 'download-sensevoice-small', resource_id: 'sensevoice-small', state: 'complete', phase: '更新校验通过', can_cancel: false } })
+    resourceEvent?.({ payload: { job_id: 'download-emotion2vec-plus-base', resource_id: 'emotion2vec-plus-base', state: 'complete', phase: '更新校验通过', can_cancel: false } })
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
     await wrapper.get('.start-program').trigger('click')
@@ -350,7 +350,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   it('首次缺失模型仍显示下载并通过固定资源下载计划安装当前目标版本', async () => {
     inventory = [row('voice-server', 'Voice Server（语音服务）', true),
       { ...row('paraformer-streaming', 'Paraformer（流式识别）'), version: '2.0.0' },
-      row('sensevoice-small', 'SenseVoice（精修模型）', true)]
+      row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）', true)]
     wrapper = mount(ManagementApp)
     await flushPromises()
     const card = await expandComponent('paraformer', 'speech')
@@ -370,19 +370,19 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   it('模型更新校验失败仍阻止服务启动并保留重试更新操作', async () => {
     inventory = [row('voice-server', 'Voice Server（语音服务）', true),
       row('paraformer-streaming', 'Paraformer（流式识别）', true),
-      { ...row('sensevoice-small', 'SenseVoice（精修模型）', true), update_available: true,
+      { ...row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）', true), update_available: true,
         installed_version: '1.0.0', version: '1.1.0', can_start: false }]
     wrapper = mount(ManagementApp)
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
-    resourceEvent?.({ payload: { job_id: 'failed-update', resource_id: 'sensevoice-small', state: 'failed',
+    resourceEvent?.({ payload: { job_id: 'failed-update', resource_id: 'emotion2vec-plus-base', state: 'failed',
       phase: '更新校验失败', error: '更新校验失败', can_cancel: false } })
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
-    const card = await expandComponent('sensevoice', 'speech')
+    const card = await expandComponent('emotion', 'extensions')
     expect(card.get('.local-state').text()).toBe('需更新')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：重试更新"]').text()).toBe('重试更新')
+    expect(card.get('button[aria-label="emotion2vec+ base（情绪背景）：重试更新"]').text()).toBe('重试更新')
     expect(start).not.toHaveBeenCalled()
     wrapper.unmount()
     wrapper = undefined
@@ -393,7 +393,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
       { ...row('voice-server', 'Voice Server（语音服务）', true), update_available: true,
         version: '3.12.10', can_start: true },
       row('paraformer-streaming', 'Paraformer（流式识别）', true),
-      row('sensevoice-small', 'SenseVoice（精修模型）', true),
+      row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）', true),
     ]
     wrapper = mount(ManagementApp)
     await flushPromises()
@@ -421,15 +421,15 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
 
   it('恢复正在下载的任务，同时允许启动两项不同模型的下载', async () => {
     jobs = [{ job_id: 'environment-all', resource_id: 'voice-server', state: 'running', phase: '正在下载语音依赖', completed_bytes: 50, total_bytes: 100, can_cancel: true },
-      { job_id: 'old-failure', resource_id: 'sensevoice-small', state: 'failed', phase: '失败', error: '旧下载失败' }]
+      { job_id: 'old-failure', resource_id: 'emotion2vec-plus-base', state: 'failed', phase: '失败', error: '旧下载失败' }]
     wrapper = mount(ManagementApp)
     await flushPromises()
     const voice = await expandComponent('voice-system', 'voice-server')
     expect(voice.get('[data-job="environment-all"]').text()).toContain('50%')
     expect(wrapper.text()).not.toContain('旧下载失败')
-    for (const name of ['Paraformer（流式识别）', 'SenseVoice（精修模型）']) {
-      const id = name.startsWith('Paraformer') ? 'paraformer' : 'sensevoice'
-      const card = await expandComponent(id, 'speech')
+    for (const name of ['Paraformer（流式识别）', 'emotion2vec+ base（情绪背景）']) {
+      const id = name.startsWith('Paraformer') ? 'paraformer' : 'emotion'
+      const card = await expandComponent(id, id === 'emotion' ? 'extensions' : 'speech')
       const button = card.get(`button[aria-label="${name}：下载"]`)
       expect(button.attributes('disabled')).toBeUndefined()
       await button.trigger('click')
@@ -437,7 +437,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
       await wrapper.get('.install-plan-actions button').trigger('click')
       await flushPromises()
     }
-    expect(download.mock.calls.map(call => call[0])).toEqual(['paraformer-streaming', 'sensevoice-small'])
+    expect(download.mock.calls.map(call => call[0])).toEqual(['paraformer-streaming', 'emotion2vec-plus-base'])
     expect(wrapper.findAll('[data-job]')).toHaveLength(3)
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(environment).toHaveBeenCalledTimes(3) // 初始恢复和两次启动任务均补查；正式宿主使用轻量任务接口。

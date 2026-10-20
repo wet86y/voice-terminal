@@ -3,7 +3,7 @@ import type { ProductLocalModelId, ProductComputeStatus } from './types'
 
 /** modelComponentOwners（模型所属进程）：状态、资源和重试使用同一所有者。 */
 export const modelComponentOwners: Record<ProductLocalModelId, string> = {
-  paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', campplus: 'speaker',
+  paraformer: 'asr', emotion: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', campplus: 'speaker',
 }
 
 /** ComponentResources（组件资源分组）：与宿主总量共用同一采样，按进程身份只计一次。 */
@@ -25,8 +25,8 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
     const residual = { ...row }
     // 归属增量按当前进程身份校验，并以进程当前余量为限；各条目合计始终不超过宿主总量。
     const candidates = [
-      ...(['kws', 'voice_vad', 'smart_turn'] as const).map(id => ({ id, status: compute?.models?.[id] })),
-      ...(['hotwords', 'punctuation'] as const).map(id => ({ id, status: compute?.auxiliary?.[id] })),
+      ...(['kws', 'voice_vad', 'smart_turn', 'emotion'] as const).map(id => ({ id, status: compute?.models?.[id] })),
+      ...(['hotwords', 'punctuation', 'acoustic_events'] as const).map(id => ({ id, status: compute?.auxiliary?.[id] })),
     ]
     for (const { id, status } of candidates) {
       const footprint = status?.resource_footprint

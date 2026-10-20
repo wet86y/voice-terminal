@@ -2139,7 +2139,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             dispatch_context["owner_scope"] = "system_check"
             dispatch_context["user_speech_epoch"] = self._user_speech_epoch
             dispatch_context["user_speaking_at_dispatch"] = self.user_speaking is True
-            if prompt_kind == "secondary_mailbox":
+            if prompt_kind == "secondary_mailbox" and "acoustic_events" not in self._secondary_snapshot():
                 dispatch_context["shadow_activation_id"] = self.ledger.shadow_activation_id  # 进度所属激活。
                 dispatch_context["shadow_progress_generation"] = self.ledger._shadow_progress_generation  # 进度作用域代次。
             self._system_check_turn_ids.add(system_check_id)
@@ -3082,10 +3082,31 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         return {source: state["version"] for source, state in self._secondary_snapshot().items()}
 
     def _secondary_snapshot(self) -> dict[str, dict]:
-        return self.ledger.shadow_progress_snapshot()
+        snapshot = self.ledger.shadow_progress_snapshot()
+        mailbox = getattr(self, "perception", {}).get("acoustic")
+        rows = mailbox.snapshot() if mailbox else []
+        if rows:
+            snapshot["acoustic_events"] = {"rows": rows, "version": rows[-1]["end_sample"]}
+        return snapshot
+
+    def _valid_secondary(self, captured):
+        snapshot = self.ledger.valid_shadow_progress({key: row for key, row in (captured or {}).items() if key != "acoustic_events"})
+        mailbox = getattr(self, "perception", {}).get("acoustic")
+        rows = mailbox.valid((captured or {}).get("acoustic_events", {}).get("rows", [])) if mailbox else []
+        if rows:
+            snapshot["acoustic_events"] = {"rows": rows, "version": rows[-1]["end_sample"]}
+        return snapshot
+
+    def _acoustic_context(self, captured):
+        mailbox = getattr(self, "perception", {}).get("acoustic")
+        return mailbox.project((captured or {}).get("acoustic_events", {}).get("rows", [])) if mailbox else []
 
     def _consume_secondary(self, captured: dict[str, dict], *, prompt_kind: str) -> list[str]:
-        consumed = self.ledger.consume_shadow_progress(captured)
+        consumed = self.ledger.consume_shadow_progress({key: row for key, row in captured.items() if key != "acoustic_events"})
+        mailbox = getattr(self, "perception", {}).get("acoustic")
+        if mailbox and "acoustic_events" in captured:
+            mailbox.consume(captured["acoustic_events"]["rows"])
+            consumed.append("acoustic_events")
         if prompt_kind == "final_silence":
             self._secondary_cleared_final += len(consumed)
         elif prompt_kind == "secondary_mailbox":
@@ -3140,10 +3161,10 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         """_request_secondary_context（有效二等上下文）：重试保留原请求快照。"""
         retry_key = source_turn_id or ""
         if recovery and recovery_signal is not None and recovery_signal.secondary_context is not None:
-            return self.ledger.valid_shadow_progress(recovery_signal.secondary_context)
+            return self._valid_secondary(recovery_signal.secondary_context)
         if ("LLM_RETRY" in kinds and retry_key in self._retry_secondary_by_turn
                 and not (set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"})):
-            return self.ledger.valid_shadow_progress(self._retry_secondary_by_turn[retry_key])
+            return self._valid_secondary(self._retry_secondary_by_turn[retry_key])
         return self._secondary_snapshot()
 
     async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None,
@@ -3939,6 +3960,11 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             await self._settle_final_system_check(system_check_id)
 
     async def end(self, reason):
+        perception = getattr(self, "perception", {})
+        if perception:
+            perception["scope"] += 1
+            perception["voice_emotion"] = None
+            perception["acoustic"].clear()
         self.invalidate_screen_capture()
         self._screen_requests.clear()
         self._screen_context_packet = None

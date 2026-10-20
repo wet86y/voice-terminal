@@ -5,9 +5,9 @@ import json
 import os
 from pathlib import Path
 
-MODEL_RESOURCES={'paraformer':'paraformer-streaming','voice_vad':'fsmn-vad','sensevoice':'sensevoice-small',
+MODEL_RESOURCES={'paraformer':'paraformer-streaming','voice_vad':'fsmn-vad','emotion':'emotion2vec-plus-base',
                  'smart_turn':'smart-turn','campplus':'campplus-zh-cn-common','kws':'kws-sherpa-onnx'}
-ROLES={'asr':('paraformer',),'analysis':('sensevoice','smart_turn'),'voice':('voice_vad','kws','campplus')}
+ROLES={'asr':('paraformer',),'analysis':('emotion','smart_turn'),'voice':('voice_vad','kws','campplus')}
 
 
 def managed_runtime(install: Path, program: Path) -> bool:
@@ -77,13 +77,11 @@ def probe_model(name:str,program:Path,install:Path)->dict:
         if loaded_funasr_device(model,'cuda')!='cuda':raise RuntimeError('模型自动回退到中央处理器')
         import torch
         torch.cuda.synchronize()
-    elif name=='sensevoice':
-        from .analysis.sensevoice import SenseVoice
-        model=SenseVoice(models/'analysis/sensevoice',models/'funasr/fsmn-vad',device='cuda')
+    elif name=='emotion':
+        from .analysis.perception import Emotion2vec
+        model=Emotion2vec(models/'analysis/emotion2vec-plus-base',device='cuda')
         model(pcm)
-        # 静音可能被内部 VAD（语音活动检测）过滤；仍需实际调用精修网络来验证显卡算子。
-        model.model.generate(input=np.zeros(32000,dtype=np.float32),cache={},language='auto',use_itn=True)
-        if model.device!='cuda' or model.internal_vad_device!='cuda':raise RuntimeError('精修或内部活动检测回退到中央处理器')
+        if model.device!='cuda':raise RuntimeError('情绪模型回退到中央处理器')
     elif name=='smart_turn':
         from .analysis.smart_turn import SmartTurn
         model=SmartTurn(models/'analysis/smart-turn',device='cuda')

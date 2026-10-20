@@ -20,7 +20,7 @@ ModelApplyCallback = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 MODEL_CAPABILITIES = {
     "llm", "tts", "local_kws", "local_asr", "local_vad",
-    "local_analysis_endpoint", "local_analysis_refine",
+    "local_analysis_endpoint", "local_asr_offline", "local_analysis_emotion", "local_analysis_acoustic",
 }
 LOCAL_CAPABILITIES = MODEL_CAPABILITIES - {"llm", "tts"}
 REGISTRY_SCHEMA_VERSION = 2
@@ -588,7 +588,9 @@ class ModelRegistryService:
             ("local_asr", "ASR", self.config.asr_model_dir),
             ("local_vad", "VAD", self.config.vad_model_dir),
             ("local_analysis_endpoint", "Smart Turn", root / "analysis" / "smart-turn"),
-            ("local_analysis_refine", "SenseVoice", root / "analysis" / "sensevoice"),
+            ("local_asr_offline", "Paraformer 离线精修", root / "funasr" / "paraformer-zh-offline"),
+            ("local_analysis_emotion", "emotion2vec+ base 情绪背景", root / "analysis" / "emotion2vec-plus-base"),
+            ("local_analysis_acoustic", "YAMNet 声学事件", root / "analysis" / "yamnet"),
         ]
         provider_id = _stable_id("provider", f"local/{root}")
         entries: list[dict[str, Any]] = []

@@ -68,26 +68,23 @@ DSH（后台执行宿主）与 LLM（大语言模型）语音交互链路向用�
 
 固定队列规则在稳定指令区只保留一份；当前用户输入、背景和恢复／调度信息在当前快照之前独立呈现，快照后是本次决策任务和最终输出约束。`state=revision`（尾巴修订）时，`speak.text`（播报文本）是从锁定边界续写的完整替换尾巴，保留原尾巴仍有效的要点。输出协议字段及本地受理逻辑保持不变，详见[缓存契约](llm-context-cache-contract.md)。
 
-### SenseVoice 精修线索
+### 双路精修与音频背景
 
-SenseVoiceSmall（语音精修和声学分析）返回的精修文本进入同一用户轮次的 `transcript_updates.available`（可用转写更新）。有可用情绪或声学事件时，该条 `refinement`（精修更新）可额外携带 `audio_cues`（音频判断线索）。示例中的 `kind`（更新种类）、`source`（来源）、`text`（精修文本）和 `revision`（修订序号）用于标识同一轮次的精修：
+Paraformer（语音识别模型）离线精修按原音频片段回填，进入同一用户轮次的 `transcript_updates.available`（可用转写更新）。声学闭段即可提交，不等待整轮业务确认；同轮支持多次更新，保留主流式原文与未精修尾稿。示例中的 `kind`（更新种类）、`source`（来源）、`text`（精修文本）和 `revision`（修订序号）用于标识同一轮次的精修：
 
 ```json
 {
   "kind": "refinement",
-  "source": "sensevoice",
+  "source": "paraformer_offline",
   "text": "精修后的文本",
-  "revision": 2,
-  "audio_cues": [
-    {"start_ms": 0, "end_ms": 900, "emotion": "HAPPY", "events": ["BGM"]}
-  ]
+  "revision": 2
 }
 ```
 
-- `start_ms`（片段开始毫秒）、`end_ms`（片段结束毫秒）、`emotion`（语音情绪）和 `events`（声学事件）仅用于描述 SenseVoice 的模型推断；不是用户转写内容或确定事实。`Speech`（普通语音事件）、未知情绪、转写文本、语言字段和原始标签不复制进线索。
-- `audio_cues` 只在当前请求由 `USER_INPUT_REFINED`（用户输入精修完成事件）触发时出现。`transcript_updates.available`（可用转写更新）后续仍可保留精修文本，但不重复带入音频线索；如果 ASR 最终稿与精修同窗到达，线索仍只属于精修条目。
-- `audio_cues.emotion`（输入语音情绪）与 `speak.emotion`（输出播报情绪）是不同信息，前者为理解语音提供参考，不会设置后者。
-- 线索只在当前 `REQUEST_TAIL`（请求尾部）中短暂出现，不追加到 `HISTORY`（会话历史）；历史缓存前缀保持不变。
+- `runtime.voice_emotion`（语音情绪背景标签）是每次构建上下文时同步尝试读取的单个字符串；没有可用值时省略。标签更新不登记事件、不独立请求模型，也不设置 `speak.emotion`（输出播报情绪）。
+- `runtime.acoustic_events`（待消费声音观察列表）包含 `labels`（声音类别）、`start_ms`（采集时间轴开始毫秒）和 `end_ms`（最近观察毫秒）。它独立于精修及影子代理，即使没有 ASR（语音识别）文本，也能在活跃静默窗口的四秒检查点触发二等评估。
+- 普通请求可提前消费声学快照；构建及审计成功后确认版本，失败或传输重试保留原冻结范围，新到及延长的观察不被旧确认清除。背景标签和声音观察均不追加到 `HISTORY`（会话历史），不重置静默期限。
+- 历史 SenseVoiceSmall（旧语音理解模型）报告中的 `audio_cues`（音频线索）仍可读取；当前生产路径不再以旧精修事件携带情绪或声音事件。详细参数与生命周期见[音频增强说明](../guides/audio-enhancements.md)。
 
 ### Shadow
 

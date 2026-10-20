@@ -8,7 +8,8 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 15,
+  schema_version: 16,
+  audio_enhancements: { dual_pass: true, emotion: true, acoustic_events: true },
   screen_capture: { enabled: true, crop_width: 960, crop_height: 640, global_max_edge: 1920, app_overrides: [] },
   tts: { backend: 'minimax', local_model: 'voxcpm2', online_model: 'speech-2.8-hd', online_voice_id: 'female-shaonv', inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20 } },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
@@ -18,11 +19,11 @@ export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
   speaker: { ...SPEAKER_DEFAULTS, mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false },
   compute: {
     devices: {
-      paraformer: 'auto', sensevoice: 'cpu', voice_vad: 'cpu',
+      paraformer: 'auto', emotion: 'cpu', voice_vad: 'cpu',
       kws: 'cpu', smart_turn: 'cpu', campplus: 'cpu',
     },
     fallback_devices: {
-      paraformer: 'cpu', sensevoice: 'cpu', voice_vad: 'cpu',
+      paraformer: 'cpu', emotion: 'cpu', voice_vad: 'cpu',
       kws: 'cpu', smart_turn: 'cpu', campplus: 'cpu',
     },
   },
@@ -88,6 +89,8 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const onlineVoiceId = text(tts.online_voice_id).trim() || DEFAULT_SETTINGS.tts.online_voice_id!
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
+    audio_enhancements: Object.fromEntries(['dual_pass', 'emotion', 'acoustic_events'].map(key =>
+      [key, !isRecord(value.audio_enhancements) || value.audio_enhancements[key] !== false])) as ProductSettingsSnapshot['audio_enhancements'],
     quiet_hours: { enabled: quiet.enabled === true, start: text(quiet.start) || '23:00', end: text(quiet.end) || '07:00' },
     tts: { backend: tts.backend === 'voxcpm1' ? 'voxcpm1' : 'minimax', local_model: tts.local_model === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2', online_model: onlineModel, online_voice_id: onlineVoiceId, inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20, ...(isRecord(tts.inference_steps_by_model) ? tts.inference_steps_by_model : {}) } },
     wake: {

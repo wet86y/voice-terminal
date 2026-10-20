@@ -48,7 +48,7 @@ lines = [line.removeprefix('VOICE_ENVIRONMENT_RESULT=') for line in result.stdou
 value = json.loads(lines[-1]) if lines else {'import_errors': {'interpreter': result.stderr[-3000:] or '解释器未输出检测结果'}}
 required = ['kws/sherpa-onnx-kws-zipformer-zh-en-3M/tokens.txt',
             'funasr/paraformer-zh-streaming/model.pt', 'funasr/paraformer-zh-streaming/config.yaml',
-            'funasr/fsmn-vad/model.pt', 'analysis/sensevoice/model.pt',
+            'funasr/fsmn-vad/model.pt',
             'analysis/smart-turn/smart-turn-v3.2-cpu.onnx', 'speaker/campplus-zh-cn-common/campplus_cn_common.bin']
 value['missing_models'] = [path for path in required if not (args.models / path).is_file()]
 value['system'] = platform.platform()

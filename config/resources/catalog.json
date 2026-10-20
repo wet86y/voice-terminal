@@ -392,51 +392,6 @@
       ]
     },
     {
-      "resource_id": "sensevoice-small",
-      "kind": "model",
-      "title": "SenseVoiceSmall 整句语音精修模型",
-      "destination": "analysis/sensevoice",
-      "version": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
-      "required": true,
-      "source": {
-        "platform": "huggingface",
-        "repo_id": "FunAudioLLM/SenseVoiceSmall",
-        "revision": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
-        "page_url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall",
-        "transfer": {
-          "kind": "fixed_resolve_http"
-        },
-        "license_url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall"
-      },
-      "files": [
-        {
-          "path": "model.pt",
-          "size_bytes": 936291369,
-          "sha256": "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea"
-        },
-        {
-          "path": "config.yaml",
-          "size_bytes": 1855,
-          "sha256": "f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19"
-        },
-        {
-          "path": "configuration.json",
-          "size_bytes": 396,
-          "sha256": "02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e"
-        },
-        {
-          "path": "am.mvn",
-          "size_bytes": 11203,
-          "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
-        },
-        {
-          "path": "chn_jpn_yue_eng_ko_spectok.bpe.model",
-          "size_bytes": 377341,
-          "sha256": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8"
-        }
-      ]
-    },
-    {
       "resource_id": "tts-voxcpm2",
       "kind": "model",
       "title": "VoxCPM2（本地语音合成模型）",
@@ -769,6 +724,130 @@
         "manifest_sha256": "885416e87b45264649da50b8b79d3f31b07a0b8ffab90e2b01c25c7cfa4cb960"
       },
       "version_from": "config/dsh/runtime.lock.json"
+    },
+    {
+      "resource_id": "paraformer-offline",
+      "kind": "model",
+      "title": "Paraformer 离线精修模型",
+      "destination": "funasr/paraformer-zh-offline",
+      "version": "v2.0.4",
+      "required": false,
+      "source": {
+        "platform": "modelscope",
+        "repo_id": "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "revision": "v2.0.4",
+        "page_url": "https://modelscope.cn/models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "license_url": "https://modelscope.cn/models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "transfer": {
+          "kind": "modelscope_sdk"
+        }
+      },
+      "files": [
+        {
+          "path": "model.pt",
+          "size_bytes": 900702648,
+          "sha256": "fd7c1c6fa7f499377d238b3f3790eb2f6f16318a0e33e33ae50936725f4d8388"
+        },
+        {
+          "path": "config.yaml",
+          "size_bytes": 2899,
+          "sha256": "4f35265cc3c6dd906a2668b62847183e441310d82df6438bace9b8f6dab3bf7d"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 693,
+          "sha256": "ce737a84e626e8be6b76f26f54f63b4f47ac85e1073bd81b657518149e907247"
+        },
+        {
+          "path": "am.mvn",
+          "size_bytes": 11203,
+          "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
+        },
+        {
+          "path": "tokens.json",
+          "size_bytes": 93676,
+          "sha256": "2b20c2b12572d682afff84ce1c8d560f67b8b32a4c1f21567411d141ed352127"
+        },
+        {
+          "path": "seg_dict",
+          "size_bytes": 8287834,
+          "sha256": "59a2ef803a3f1648ad03a2e1480db1c1ee0c0d7dc4ef4dbd16cea33944329022"
+        }
+      ]
+    },
+    {
+      "resource_id": "emotion2vec-plus-base",
+      "kind": "model",
+      "title": "emotion2vec+ base 情绪背景模型",
+      "destination": "analysis/emotion2vec-plus-base",
+      "version": "b318240bfe67db81a8c572ecb37ce9c3759b81c9",
+      "required": false,
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "emotion2vec/emotion2vec_plus_base",
+        "revision": "b318240bfe67db81a8c572ecb37ce9c3759b81c9",
+        "page_url": "https://huggingface.co/emotion2vec/emotion2vec_plus_base",
+        "license_url": "https://huggingface.co/emotion2vec/emotion2vec_plus_base",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "mirror_policy": "origin_only",
+        "mirror_policy_zh": "仅使用已核验的固定上游版本；未登记相同摘要的 ModelScope（魔搭）镜像。"
+      },
+      "files": [
+        {
+          "path": "model.pt",
+          "size_bytes": 1118245678,
+          "sha256": "60710b5aae1dbe69bdac8920028fb05882d4314fd09031922b4b61ee9e7aadbd"
+        },
+        {
+          "path": "config.yaml",
+          "size_bytes": 3170,
+          "sha256": "50674ec187406b4f1208925594ceaf1f28f16a22333b5f2ac5b3d0cbffdd670e"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 343,
+          "sha256": "8b6a745213025c7d4565f9f074cfef1b5cd5ef76e38e2a8f7f8a3db271e735b2"
+        },
+        {
+          "path": "tokens.txt",
+          "size_bytes": 119,
+          "sha256": "866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f"
+        }
+      ]
+    },
+    {
+      "resource_id": "yamnet",
+      "kind": "model",
+      "title": "YAMNet 声学事件模型",
+      "destination": "analysis/yamnet",
+      "version": "f25b741c2f0bdc6d7e6db24b5fddda23347dbafd",
+      "required": false,
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "audiomagic/yamnet-onnx",
+        "revision": "f25b741c2f0bdc6d7e6db24b5fddda23347dbafd",
+        "page_url": "https://huggingface.co/audiomagic/yamnet-onnx",
+        "license_url": "https://huggingface.co/audiomagic/yamnet-onnx",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "mirror_policy": "origin_only",
+        "mirror_policy_zh": "仅使用已核验的固定上游版本；未登记相同摘要的 ModelScope（魔搭）镜像。"
+      },
+      "files": [
+        {
+          "path": "yamnet.onnx",
+          "size_bytes": 16093355,
+          "sha256": "d3835ffbbd4a1bb3e777f0ca217b5007907f5171dd5d17c4236b95b2af8f908e"
+        },
+        {
+          "path": "yamnet_class_map.csv",
+          "size_bytes": 14096,
+          "sha256": "cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2"
+        }
+      ]
     }
   ],
   "fields": {

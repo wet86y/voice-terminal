@@ -5,7 +5,7 @@ use crate::{LaunchContext,download::DownloadFile,resources::{self,Progress},work
 // ENVIRONMENT_GROUPS（完整语音环境）：语音服务、各模型及轻量 VAD（语音活动检测）所需的六个必需依赖组。
 const ENVIRONMENT_GROUPS: [&str; 6] = ["voice-core", "torch-cpu", "onnx-cpu", "sherpa-cpu", "modelscope-download", "onnx-vad"];
 pub fn model_group(id:&str)->&'static str {match id {
-    "paraformer-streaming"|"fsmn-vad"|"sensevoice-small"=>"torch-cpu",
+    "paraformer-streaming"|"paraformer-offline"|"fsmn-vad"|"emotion2vec-plus-base"=>"torch-cpu",
     "kws-sherpa-onnx"=>"sherpa-cpu",_=>"onnx-cpu"
 }}
 pub fn lock(context:&LaunchContext)->Result<Value,String>{resources::load(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))}

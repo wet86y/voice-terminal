@@ -106,6 +106,7 @@ class RuntimeState:
                 "first_segment_ms": None,
                 "smart_turn_ms": None,
                 "sensevoice_refine_ms": None,
+                "paraformer_refine_ms": None,  # Paraformer（离线片段精修）耗时。
                 "commit_to_final_llm_ms": None,
             },
         }

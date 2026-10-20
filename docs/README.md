@@ -34,6 +34,7 @@
 - [DSH 插件维护](guides/dsh-plugin-maintenance.md)
 - [本地目录与覆盖发布](guides/local-layout.md)
 - [本地模型运行设备](guides/local-model-compute.md)
+- [音频增强：双路精修、情绪背景与声学信箱](guides/audio-enhancements.md)
 - [本地 TTS（语音合成）接入](guides/local-tts-integration-20261014.md)
 - [本地 TTS 日志与可观测性](guides/local-tts-observability-20261015.md)
 - [LLM JSON Schema（结构化数据约束）迁移](guides/llm-json-schema-migration.md)
@@ -68,6 +69,7 @@
 - [0.9.2 一代 TTS 播放失败调查与修复验证](testing/tts-v1-playback-investigation-20261018.md)
 - [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
+- [音频增强替换验收记录](testing/audio-enhancements-20261020.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)
 - 本地 TTS 诊断记录仅保存在维护者本机，不纳入源码仓库。
 - [内存优化验收](testing/memory-optimization-20261010.md)

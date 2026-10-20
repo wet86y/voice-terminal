@@ -23,8 +23,6 @@ def required_model_resources(config: Any) -> dict[str, list[str]]:
     analysis: list[str] = []
     if config.smart_turn.smart_turn:
         analysis.append("smart-turn")
-    if config.smart_turn.sensevoice:
-        analysis.extend(("sensevoice-small", "fsmn-vad"))
     if analysis:
         requirements["analysis"] = analysis
     if config.speaker.mode != "off" or config.speaker.owner_only_barge_in:

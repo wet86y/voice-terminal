@@ -170,7 +170,7 @@ function rowCategory(row: LocalComponentRow): LocalComponentCategory {
   if (row.id === 'voice-system' || row.id === 'voice-server') return 'voice-server'
   if (row.id === 'tts') return 'tts'
   if (row.id === 'dsh' || row.id === 'deepseek') return 'inference'
-  if (['paraformer', 'sensevoice', 'smart_turn', 'punctuation', 'streaming-punctuation', 'paraformer-streaming', 'sensevoice-small'].includes(row.id)) return 'speech'
+  if (['paraformer', 'smart_turn', 'punctuation', 'streaming-punctuation', 'paraformer-streaming', 'paraformer-offline'].includes(row.id)) return 'speech'
   return 'extensions'
 }
 function rowResource(row: LocalComponentRow, fallback: ManagedResourceRow): ManagedResourceRow {
@@ -504,7 +504,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                     <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转</button>
                   </div>
                 </div>
-                <button v-if="row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
+                <button v-if="row.enhancement || row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
                   {{ expandedComponents.has(row.id) ? '收起' : '详情' }}
                   <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedComponents.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
@@ -557,6 +557,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
                 <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>
                 <dl v-if="detailFacts(row).length" class="local-detail-facts"><div v-for="fact in detailFacts(row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
+                <button v-if="row.enhancement" class="save-button" type="button" role="switch" :aria-checked="row.enhancement.enabled" :disabled="row.enhancement.busy" @click="row.enhancement.toggle()">{{ row.enhancement.label }}：{{ row.enhancement.busy ? '切换中' : row.enhancement.enabled ? '已开启' : '已关闭' }}</button>
                 <div v-if="row.device" class="local-device-editor">
                   <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
                   <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>

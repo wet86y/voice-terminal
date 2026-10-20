@@ -121,31 +121,31 @@ class ProductSidecarTests(unittest.TestCase):
         )
 
         selected = dict(devices)
-        selected["sensevoice"] = "cuda"
+        selected["emotion"] = "cuda"
         legacy.save_compute(
             {"devices": selected},
             active_devices={key: "cpu" for key in selected},
         )
-        self.assertEqual(self.store().snapshot()["compute"]["devices"]["sensevoice"], "cuda")
+        self.assertEqual(self.store().snapshot()["compute"]["devices"]["emotion"], "cuda")
 
         reverted = self.store().revert_failed_compute_devices({
-            "sensevoice": {
+            "emotion": {
                 "device": "cpu",
                 "requested_device": "cuda",
                 "load_error": "CUDA 初始化失败",
             },
         })
-        self.assertEqual(reverted, {"sensevoice": "cpu"})
+        self.assertEqual(reverted, {"emotion": "cpu"})
         saved = self.store().snapshot()["compute"]
-        self.assertEqual(saved["devices"]["sensevoice"], "cpu")
-        self.assertEqual(saved["fallback_devices"]["sensevoice"], "cpu")
+        self.assertEqual(saved["devices"]["emotion"], "cpu")
+        self.assertEqual(saved["fallback_devices"]["emotion"], "cpu")
 
     def test_compute_settings_reject_incomplete_or_invalid_device_maps(self) -> None:
         store = self.store()
         with self.assertRaises(ProductSettingsError):
-            store.save_compute({"devices": {"sensevoice": "cuda"}})
+            store.save_compute({"devices": {"emotion": "cuda"}})
         devices = dict(store.snapshot()["compute"]["devices"])
-        devices["sensevoice"] = "gpu"
+        devices["emotion"] = "gpu"
         with self.assertRaises(ProductSettingsError):
             store.save_compute({"devices": devices})
 

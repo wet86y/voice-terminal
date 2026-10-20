@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-audio-enhancements-settings"
+description = "Enables the audio_enhancements_settings command without any pre-configured scope."
+commands.allow = ["audio_enhancements_settings"]
+
+[[permission]]
+identifier = "deny-audio-enhancements-settings"
+description = "Denies the audio_enhancements_settings command without any pre-configured scope."
+commands.deny = ["audio_enhancements_settings"]
