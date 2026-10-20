@@ -352,7 +352,7 @@ def test_original_frame_path_processes_buffered_audio_once_before_vad_replay():
         controller.workspace = None
         controller.wake_preroll_ms = 0
         controller.vad = SimpleNamespace(feed=lambda pcm: SimpleNamespace(
-            speech_started=False, speech_end_sample=None, is_speech=False))
+            speech_started=False, speech_ended=False, speech_end_sample=None, is_speech=False))
         await controller._activate_kws_detection()
         context = controller._wake_preparation
         for index in range(2):

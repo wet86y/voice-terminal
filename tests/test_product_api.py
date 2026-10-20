@@ -314,7 +314,8 @@ class ProductApiTests(unittest.TestCase):
             },
         ))
         self.assertEqual(valid_persona.status_code, 200)
-        self.assertEqual(valid_persona.json()["effective_from"], "next_request")
+        self.assertEqual(valid_persona.json()["effective_from"], "next_session")
+        self.assertTrue(valid_persona.json()["pending"])
         entry = {
             "id": "search", "trigger": "帮我查查", "target": "shadow",
             "instruction": "查询用户所问的资料。", "enabled": True,

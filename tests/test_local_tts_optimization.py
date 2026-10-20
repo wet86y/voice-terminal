@@ -7,6 +7,7 @@ import threading
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.gpu_performance import GpuSnapshot
@@ -265,7 +266,7 @@ def test_formal_local_retry_freezes_voice_steps_and_transaction_lease(tmp_path):
     asyncio.run(scenario())
 
 
-def test_continuation_context_is_transaction_owned_and_released():
+def test_streaming_segments_do_not_create_continuation_context():
     async def scenario():
         bodies, released = [], []
         async def handler(request):
@@ -285,14 +286,15 @@ def test_continuation_context_is_transaction_owned_and_released():
             await session.finish()
             assert len([chunk async for chunk in session.audio_chunks()]) == len(texts)
             await session.close()
-        assert bodies[0]["continuation_id"] == bodies[1]["continuation_id"]
-        assert bodies[2]["continuation_id"] != bodies[1]["continuation_id"]
-        assert released == [bodies[0]["continuation_id"], bodies[2]["continuation_id"]]
+        assert [body["input"] for body in bodies] == ["第一句。", "第二句。", "新事务。"]
+        assert all("continuation_id" not in body for body in bodies)
+        assert all("prompt_audio" not in body for body in bodies)
+        assert released == []
         await client.close()
     asyncio.run(scenario())
 
 
-def test_continuation_falls_back_once_before_audio_only():
+def test_noncontinuation_failure_is_not_retried():
     async def scenario():
         calls = []
         async def handler(request):
@@ -306,10 +308,10 @@ def test_continuation_falls_back_once_before_audio_only():
         client.server.capabilities = {"acoustic_continuation": True}
         session = client.session()
         await session.start()
-        await session.send_text("新尾巴。")
-        await session.finish()
-        assert b"".join([pcm async for pcm in session.audio_chunks()]) == b"\x01\x00"*5
-        assert len(calls) == 2
+        with pytest.raises(httpx.HTTPStatusError):
+            await session.send_text("新尾巴。")
+        assert len(calls) == 1
+        assert "continuation_id" not in calls[0]
         await session.close()
         await client.close()
     asyncio.run(scenario())

@@ -8,13 +8,15 @@
 | --- | --- | --- |
 | 运行操作、增强切换、语音合成接口、音色任务、即时设置、组件宿主和声纹专项 | 147 通过、2 跳过 | `.local/reports/runtime-operations-delivery-focused.log` |
 | 推理模式回归 | 22 通过 | `tests/test_reasoning_modes.py`；验证有效模式成功终态、非法模式无更新 |
-| 全量后端 | 1663 通过、24 失败、3 跳过，130.92 秒 | `.local/reports/runtime-operations-backend-full.log` |
+| 全量后端（首次运行） | 1663 通过、24 失败、3 跳过，130.92 秒 | `.local/reports/runtime-operations-backend-full.log` |
+| 24 项失败所属 7 个测试文件（清理后） | 141 通过，17.07 秒 | `tests/test_audio_cpp_tts.py`、`tests/test_local_tts_optimization.py`、`tests/test_tts_revision_guards.py`、`tests/test_kws_acceleration.py`、`tests/test_kws_wake_window.py`、`tests/test_v05_reliability.py`、`tests/test_product_api.py` |
+| 全量后端（清理后） | 1687 通过、0 失败、3 跳过、7 条弃用警告，187.53 秒 | `python -X utf8 -m pytest tests -q --tb=short` |
 | 前端全量 | 355 通过、34 个测试文件通过 | `.local/reports/runtime-operations-frontend.log` |
 | 最终文案相关组件复核 | 弹窗与语音设置 10 通过 | `OperationNotice.test.ts`（操作提示测试）、`TtsSettings.test.ts`（语音设置测试） |
 | 前端类型检查及本地构建 | 通过 | `.local/reports/runtime-operations-build.log` |
 | 桌面原生调试构建 | 通过，保留既有 5 项未使用代码警告 | `.local/reports/runtime-operations-native-build.log` |
 
-全量后端的 24 个失败节点与本轮之前的基线报告完全一致，新增失败为 0。既有问题集中在旧语音合成控制／续接测试、部分启动替身签名、关键词唤醒测试替身以及人格资料生效时机断言；本轮没有据此宣称全量测试全部通过。
+首次全量后端回归中的 24 个失败节点均在清理后消除。17 项本地 TTS（文本转语音）测试原先仍要求已关闭的声学续接字段或回退流程，现改为检查当前参考音频配方和不创建续接上下文；3 项启动测试修正了在线密钥、模型资源和采样率组合；3 个 VAD（语音活动检测）替身补齐语音结束字段；人格设置断言更新为新会话生效。清理没有重新启用声学续接。清理后的全量后端回归为 1687 通过、0 失败、3 跳过。
 
 项目本机程序已通过正式发布流程换入 `.local/app`（日常运行本体），启动入口为 `.local/VoiceTerminal.exe`（正式启动器）。`app/release.json`（本体清单）和 `build/program-package/package-info.json`（程序包记录）的构建编号一致，均为 `product-b6dea0d93ee2c021`；程序包 SHA-256（文件摘要）为 `6f5521606bae46c088044bf90c0a2322fbf3f2817d6380c7b95af02858e7efc4`。桌面宿主大小 16,145,920 字节，构建时间为 2026-10-20 22:07（香港时间）。`.local/Verify-Package.ps1`（本机本体校验脚本）验证通过；模型、Python 运行环境、DSH（代理宿主）和 WebView2（网页运行引擎）目录均保留。前端构建输出位于 `.local/build/frontend`（本地界面构建目录）。
 

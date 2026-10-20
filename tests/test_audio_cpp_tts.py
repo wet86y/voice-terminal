@@ -289,7 +289,8 @@ def test_voxcpm2_ignores_legacy_emotions_and_formal_style_fields(emotion, instru
         assert payload["options"]["num_inference_steps"] == 20
         assert payload["voice_ref"] == str(Path("voice2.wav").resolve())
         assert payload["reference_text"] == "准确的参考转写。"
-        assert payload["prompt_audio"] == payload["voice_ref"]
+        assert "prompt_audio" not in payload
+        assert "continuation_id" not in payload
         assert "voice" not in payload and "style" not in payload
         assert receipt.text_chars == len(original)
 
@@ -362,13 +363,13 @@ def test_emotion_off_omits_dynamic_voxcpm2_instruction_and_invalid_labels_defaul
     assert asyncio.run(run("happy", "off")) == "测试情绪控制是否只影响模型提示。"
 
 
-@pytest.mark.parametrize("emotion_mode,style,emotion,expected", [
-    ("agent", "", "happy", True),
-    ("off", "温暖自然", None, True),
-    ("off", "", None, True),
+@pytest.mark.parametrize("emotion_mode,style,emotion", [
+    ("agent", "", "happy"),
+    ("off", "温暖自然", None),
+    ("off", "", None),
 ])
-def test_voxcpm2_formal_clone_uses_continuation_without_control(emotion_mode, style, emotion, expected):
-    """验证旧情绪和风格不会阻断同一回答内续接，保留原音色和上下文释放。"""
+def test_voxcpm2_formal_clone_uses_reference_recipe_without_continuation(emotion_mode, style, emotion):
+    """正式克隆使用参考配方；旧情绪和风格选项不会启用声学续接。"""
     async def scenario():
         bodies, releases = [], []
         async def handler(request):
@@ -389,13 +390,14 @@ def test_voxcpm2_formal_clone_uses_continuation_without_control(emotion_mode, st
         await session.finish()
         assert len([chunk async for chunk in session.audio_chunks()]) == 2
         await session.close()
-        assert all(("continuation_id" in body) == expected for body in bodies)
+        assert all("continuation_id" not in body for body in bodies)
+        assert all("prompt_audio" not in body for body in bodies)
         assert all(body["options"]["num_inference_steps"] == 20 for body in bodies)
         assert [body["input"] for body in bodies] == ["第一句完整正文。", "第二句完整正文。"]
-        assert bodies[0]["continuation_id"] == bodies[1]["continuation_id"]
-        assert bodies[0]["voice_ref"] == bodies[1]["voice_ref"]
-        assert len(releases) == int(expected)
-        assert all(metrics["continuation_enabled"] == expected for metrics in session.request_metrics)
+        assert all(body["voice_ref"] == str(voice.reference_path.resolve()) for body in bodies)
+        assert all(body["reference_text"] == voice.reference_text for body in bodies)
+        assert releases == []
+        assert all(metrics["continuation_enabled"] is False for metrics in session.request_metrics)
         assert session._segment_receipts[1].text_chars == len("第二句完整正文。")
         await client.close()
     asyncio.run(scenario())
@@ -419,7 +421,7 @@ def test_local_emotion_diagnostics_distinguish_prompt_request_from_unsupported_m
     asyncio.run(scenario())
 
 
-def test_steps_hot_update_is_frozen_per_answer_and_new_answer_has_new_context():
+def test_steps_hot_update_is_frozen_per_answer_and_new_answer_uses_new_steps():
     async def scenario():
         bodies = []
         async def handler(request):
@@ -444,9 +446,9 @@ def test_steps_hot_update_is_frozen_per_answer_and_new_answer_has_new_context():
         _ = [chunk async for chunk in second.audio_chunks()]
         await second.close()
         assert [body['options']['num_inference_steps'] for body in bodies] == [20, 20, 24]
-        assert all(body['prompt_audio'] == body['voice_ref'] for body in bodies)
+        assert all('prompt_audio' not in body for body in bodies)
+        assert all('continuation_id' not in body for body in bodies)
         assert all('voxcpm2.full_decode' not in body['options'] for body in bodies)
-        assert bodies[0]['continuation_id'] == bodies[1]['continuation_id'] != bodies[2]['continuation_id']
         await client.close()
     asyncio.run(scenario())
 
@@ -1160,7 +1162,8 @@ def test_voxcpm2_formal_clone_sends_reference_transcript():
         assert bodies[0]["voice_ref"] == str(voice.reference_path.resolve())
         assert bodies[0]["reference_text"] == voice.reference_text
 
-        assert bodies[0]["prompt_audio"] == bodies[0]["voice_ref"]
+        assert "prompt_audio" not in bodies[0]
+        assert "continuation_id" not in bodies[0]
         # 旧的空转写音色保留存档，但不能静默退回低保真播报。
         blank = replace(voice, reference_text="   ")
         session = client.session(voice_snapshot=blank)
@@ -1241,7 +1244,7 @@ def test_router_exposes_playback_reserve_from_active_client():
 
 
 def test_native_rate_multi_segment_streaming_keeps_transport_and_receipts():
-    """48 kHz 下行不得破坏流式 TTS：SSE 入口、分块投递、分段回执与续接全部保留。"""
+    """48 kHz 下行保持 SSE 流式入口、分块投递与分段回执，不创建续接上下文。"""
     async def scenario():
         paths, bodies = [], []
 
@@ -1274,9 +1277,11 @@ def test_native_rate_multi_segment_streaming_keeps_transport_and_receipts():
         assert all(path.endswith("/v1/audio/speech") for path in paths), "流式仍走 SSE 入口"
         assert [body["input"] for body in bodies] == [
             "第一句完整正文。", "第二句完整正文。", "第三句完整正文。"]
-        # 音色参考保持不变；续接仅在同一事务内共享上下文。
+        # 音色参考保持不变；当前性能策略不创建跨分段续接上下文。
         assert len({body["voice_ref"] for body in bodies}) == 1
-        assert len({body["continuation_id"] for body in bodies}) == 1
+        assert all("continuation_id" not in body for body in bodies)
+        assert all("prompt_audio" not in body for body in bodies)
+        assert all(metric["continuation_enabled"] is False for metric in session.request_metrics)
         assert [metric["segment_index"] for metric in session.request_metrics] == [0, 1, 2]
         assert all(metric["native_pcm_bytes"] == metric["pcm_bytes"]
                    for metric in session.request_metrics), "48 kHz 直通：原生字节等于下行字节"
