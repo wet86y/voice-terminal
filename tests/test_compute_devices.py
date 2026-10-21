@@ -21,13 +21,24 @@ class ComputeDeviceTests(unittest.TestCase):
         from voice_terminal.asr.worker import AsrWorkerEngine
 
         engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
+        class Child:
+            alive = True
+            device = "cpu"
+            requested_device = "cuda"
+            warmed = True
+            load_error = "FunASR（语音模型加载器）未使用请求的 CUDA，实际运行于 CPU。"
+            resource_footprint = {"rss_bytes": 123}
+            resource_status = {"rss_bytes": 456}
+            runtime = "PyTorch（推理框架）"
+            pid = 101
+            def close(self): self.alive = False
         with (
-            patch("voice_terminal.compute.startup_device", return_value="cuda"),
-            patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime,
-            patch("funasr.AutoModel", return_value=SimpleNamespace(kwargs={"device": "cpu"}, generate=lambda **_: [])),
+            patch("voice_terminal.model_process.ModelProcess", return_value=Child()) as process,
         ):
             engine.load()
-        tensor_runtime.assert_called_once_with("cuda")
+        process.assert_called_once()
+        self.assertEqual(process.call_args.args[:2], ("streaming", Path(".")))
+        self.assertEqual(process.call_args.kwargs["device"], "cuda")
         self.assertEqual(engine.requested_device, "cuda")
         self.assertEqual(engine.device, "cpu")
         self.assertTrue(engine.model_loaded)
@@ -37,9 +48,8 @@ class ComputeDeviceTests(unittest.TestCase):
 
     def test_asr_gpu_warmup_failure_falls_back_before_becoming_ready(self) -> None:
         """权重加载成功但 CUDA（图形处理器加速）真实推理失败时回退。"""
-        from voice_terminal.asr.worker import AsrWorkerEngine
-        engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
-        expected_warmup_samples = engine.chunk_stride_samples
+        from voice_terminal.asr.streaming_model import StreamingParaformer
+        expected_warmup_samples = 8 * 960
         calls = []
         def factory(**options):
             device = options["device"]
@@ -50,20 +60,18 @@ class ComputeDeviceTests(unittest.TestCase):
                 self.assertEqual(len(kwargs["input"]), 0 if kwargs["is_final"] else expected_warmup_samples)
                 return []
             return SimpleNamespace(kwargs={"device": device}, generate=generate)
-        try:
-            with (patch("voice_terminal.compute.startup_device", return_value="cuda"),
-                  patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime,
-                  patch("funasr.AutoModel", side_effect=factory), patch("torch.cuda.empty_cache")):
-                engine.load()
-            tensor_runtime.assert_called_once_with("cuda")
-            self.assertEqual(calls, ["cuda", "cpu"])
-            self.assertEqual(engine.device, "cpu")
-            self.assertTrue(engine.model_warmed)
-            self.assertIn("kernel unavailable", engine.load_error)
-            self.assertEqual(engine._cache_by_turn, {})
-            self.assertEqual(engine._model_call_count_by_turn, {})
-        finally:
-            engine.close()
+        with (patch("voice_terminal.compute.startup_device", return_value="cuda"),
+              patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime,
+              patch("voice_terminal.asr.model_loader.auto_model_class", return_value=factory),
+              patch("torch.cuda.empty_cache")):
+            model = StreamingParaformer(Path("."), device="cuda")
+        tensor_runtime.assert_called_once_with("cuda")
+        self.assertEqual(calls, ["cuda", "cpu"])
+        self.assertEqual(model.device, "cpu")
+        self.assertTrue(model.warmed)
+        self.assertIn("kernel unavailable", model.load_error)
+        self.assertEqual(model._cache_by_turn, {})
+        model.close()
 
     def test_sensevoice_and_internal_vad_report_their_own_resolved_device(self) -> None:
         from voice_terminal.analysis.sensevoice import SenseVoice
@@ -152,6 +160,43 @@ class ComputeDeviceTests(unittest.TestCase):
 
 
 class ComputeHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compute_status_trusts_a_ready_model_running_on_cuda_over_stale_host_capability(self):
+        """GPU（图形处理器）模型已真实就绪时，CPU（中央处理器）宿主快照不能误报不可用。"""
+        from voice_terminal.config import AppConfig
+        from voice_terminal.core.state import RuntimeState
+        from voice_terminal.server.websocket import SessionRuntime
+
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime.config = AppConfig()
+        runtime.state = RuntimeState()
+        runtime._compute_models = {}
+        runtime.asr = object()
+        runtime._asr_compute_health = AsyncMock(return_value={
+            "status": "READY", "model_loaded": True, "model_warmed": True,
+            "device": "cuda:0", "requested_device": "cuda", "runtime": "PyTorch（推理框架）",
+            "resource_status": {"rss_bytes": 100},
+        })
+        runtime.speaker = None
+        runtime.speaker_status = lambda: {"service": "DISABLED", "last_error": None}
+        runtime._speaker_warmed = False
+        runtime.startup_errors = []
+        hardware = {"gpu": {"available": False}, "models": {
+            name: {"gpu_available": False, "reason": "当前宿主环境不含 GPU 运行库"}
+            for name in COMPUTE_MODEL_IDS
+        }}
+        analysis = SimpleNamespace(health=AsyncMock(return_value={
+            "acoustic": {"status": "DISABLED"}, "emotion": {"status": "DISABLED"},
+            "endpoint": {"status": "DISABLED"},
+        }))
+        with (patch("voice_terminal.server.websocket.hardware_status", return_value=hardware),
+              patch("voice_terminal.compute.model_hardware_status", return_value=hardware),
+              patch("voice_terminal.server.websocket.AnalysisClient", return_value=analysis)):
+            result = (await runtime.compute_status())["models"]["paraformer"]
+
+        self.assertEqual(result["device"], "cuda:0")
+        self.assertTrue(result["gpu_available"])
+        self.assertIsNone(result["gpu_unavailable_reason"])
+
     async def test_speaker_compute_status_keeps_runtime_faults_despite_ready_model_health(self):
         """模型仍加载时，声纹通信或推理故障仍投影为不可用，并保留原因。"""
         from voice_terminal.config import AppConfig

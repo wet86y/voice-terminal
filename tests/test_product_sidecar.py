@@ -149,6 +149,22 @@ class ProductSidecarTests(unittest.TestCase):
         with self.assertRaises(ProductSettingsError):
             store.save_compute({"devices": devices})
 
+    def test_compute_single_model_save_preserves_other_rows_and_rolls_back_write_failure(self) -> None:
+        store = self.store()
+        before = store.snapshot()["compute"]
+        saved = store.save_compute_model("paraformer", "cuda", active_device="cuda:0")
+        self.assertEqual(saved["devices"]["paraformer"], "cuda")
+        self.assertEqual(saved["fallback_devices"]["paraformer"], "cuda")
+        for name in before["devices"]:
+            if name != "paraformer":
+                self.assertEqual(saved["devices"][name], before["devices"][name])
+                self.assertEqual(saved["fallback_devices"][name], before["fallback_devices"][name])
+
+        with patch.object(store, "_save_settings", side_effect=OSError("模拟设置文件写入失败")):
+            with self.assertRaisesRegex(OSError, "模拟设置文件写入失败"):
+                store.save_compute_model("emotion", "cuda", active_device="cuda")
+        self.assertEqual(store.snapshot()["compute"], saved)
+
     def test_settings_are_atomic_reloadable_and_corruption_is_reported(self) -> None:
         store = self.store()
         asyncio.run(store.save_silence({"seconds": 60}))

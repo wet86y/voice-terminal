@@ -53,7 +53,8 @@ class DualPassLane:
         self.epoch = 0
         self.resource_footprint = None
 
-    async def configure(self, enabled: bool, device: str, *, strict: bool = False):
+    async def configure(self, enabled: bool, device: str, *, strict: bool = False,
+                        ignore_host_fallback: bool = False):  # ignore_host_fallback（切换时忽略宿主强制中央处理器回退）。
         self.epoch += 1
         self.enabled = enabled
 
@@ -68,7 +69,9 @@ class DualPassLane:
                 try:
                     with model_load_footprint() as footprint:
                         from ..model_process import ModelProcess
-                        model = ModelProcess("offline", self.model_dir, device=device)
+                        model = ModelProcess("offline", self.model_dir, device=device,
+                                             require_cuda=str(device).startswith("cuda"),
+                                             ignore_host_fallback=ignore_host_fallback)
                     self.model = model
                     self.resource_footprint = model.resource_footprint or footprint
                 except Exception as exc:

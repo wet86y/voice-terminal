@@ -1144,6 +1144,28 @@ class ProductSettingsStore:
         self._save_settings()
         return deepcopy(self._settings["compute"])
 
+    def save_compute_model(self, model_id: str, device: str, *, active_device: str | None = None) -> dict[str, Any]:
+        """只保存一个模型的设备选择；热切换时可记录本次核验成功的实际设备。"""
+        if model_id not in COMPUTE_MODEL_IDS:
+            raise ProductSettingsError("model_id（目标模型编号）无效。")
+        if not isinstance(device, str) or device not in COMPUTE_DEVICE_MODES:
+            raise ProductSettingsError("device（目标设备模式）必须是 auto、cpu 或 cuda。")
+        if active_device is not None and active_device not in {"cpu", "cuda", "cuda:0"}:
+            raise ProductSettingsError("active_device（核验后的实际设备）无效。")
+        previous = self._settings["compute"]
+        devices = dict(previous.get("devices", {}))
+        fallbacks = dict(previous.get("fallback_devices", {}))
+        devices[model_id] = device
+        if active_device is not None:
+            fallbacks[model_id] = "cuda" if str(active_device).startswith("cuda") else "cpu"
+        self._settings["compute"] = {"devices": devices, "fallback_devices": fallbacks}
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["compute"] = previous
+            raise
+        return deepcopy(self._settings["compute"])
+
     def revert_failed_compute_devices(self, model_status: Mapping[str, Any]) -> dict[str, str]:
         """把显式 CUDA 启动失败的偏好恢复为上次成功设备。"""
         compute = self._settings.get("compute", {})

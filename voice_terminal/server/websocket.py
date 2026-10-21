@@ -1866,6 +1866,20 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         runtime_operations(self).intent(False)
         self._enhancement_resume_requested = False
         self._closed = True
+        compute_switches = tuple(getattr(self, "_compute_switch_tasks", {}).items())  # compute_switches（退出前需回收的设备切换任务）。
+        for task, _ticket in compute_switches:
+            if task is not asyncio.current_task() and not task.done():
+                task.cancel()
+        if compute_switches:
+            await asyncio.gather(*(task for task, _ticket in compute_switches), return_exceptions=True)
+            # Usually the operation context releases each reservation itself.
+            # This also covers cancellation before a scheduled task first runs.
+            for _task, ticket in compute_switches:
+                if not ticket.released:
+                    try:
+                        await runtime_operations(self).finish(ticket, asyncio.CancelledError())
+                    except Exception:
+                        logger.exception("计算设备切换关闭时释放运行租约失败")
         update_task = getattr(self, "_tts_update_task", None)
         if not preserve_tts_updates and update_task is not None and update_task is not asyncio.current_task() and not update_task.done():
             update_task.cancel()
@@ -2341,13 +2355,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         return payload
 
     async def _asr_compute_health(self) -> dict[str, Any]:
-        """停止监听后，用独立探测连接查询识别模型，不改变会话连接。"""
-        if self.asr.connected:
-            return await self.asr.health(timeout_s=2.0)
+        """在独立连接查询识别模型，避免排在设备切换命令后面。"""
         probe = AsrWorkerClient(self.asr.url)
         try:
             await probe.connect()
-            return await probe.health(timeout_s=2.0)
+            return await probe.health(timeout_s=2.0, allow_starting=True)
         finally:
             await probe.close()
 
@@ -2407,9 +2419,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 if isinstance(offline.get("resource_status"), dict):
                     resource_rows.append(offline["resource_status"])
                 auxiliary["dual_pass"] = {"service": offline.get("status", "DISABLED"),
-                    "runtime": "PyTorch（双路离线识别）", "device": status.get("device"),
+                    "runtime": "PyTorch（双路离线识别）", "device": offline.get("device"),
                     "resource_status": offline.get("resource_status") or status.get("resource_status"),
-                    "resource_footprint": offline.get("resource_footprint"), "load_error": offline.get("error")}
+                    "resource_footprint": offline.get("resource_footprint"), "load_error": offline.get("error"),
+                    "model_loaded": offline.get("model_loaded"), "model_warmed": offline.get("model_warmed")}
                 models["paraformer"].update({
                     "resource_status": status.get("resource_status"),
                     "runtime": status.get("runtime"),
@@ -2417,6 +2430,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     "requested_device": status.get("requested_device", requests.get("paraformer", "auto")),
                     "service": status.get("status", "READY"),
                     "load_error": status.get("load_error"),
+                    "model_loaded": status.get("model_loaded"),
+                    "model_warmed": status.get("model_warmed"),
+                    "resource_footprint": status.get("resource_footprint"),
                     "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
                 })
             except Exception as exc:
@@ -2451,6 +2467,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                         "requested_device": lane.get("requested_device", requests.get(model_name, "cpu")),
                         "service": lane.get("status", "UNKNOWN"),
                         "load_error": lane.get("load_error") or lane.get("error"),
+                        "model_loaded": lane.get("model_loaded"),
+                        "model_warmed": lane.get("model_warmed"),
                         "process_memory_rss_bytes": lane.get("process_memory_rss_bytes"),
                     })
                     if model_name == "emotion":
@@ -2476,6 +2494,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     "requested_device": status.get("requested_device", requests.get("campplus", "cpu")),
                     "service": "ERROR" if speaker_runtime["service"] == "DEGRADED" else speaker_runtime["service"],
                     "load_error": status.get("load_error"),
+                    "model_loaded": status.get("model_loaded"),
+                    "model_warmed": bool(getattr(self, "_speaker_warmed", False)),
                     "runtime_error": speaker_runtime["last_error"] if speaker_runtime["service"] == "DEGRADED" else None,
                     "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
                 })
@@ -2490,8 +2510,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             })
 
         for name, status in models.items():
-            status["gpu_available"] = bool(hardware["models"].get(name, {}).get("gpu_available"))
-            status["gpu_unavailable_reason"] = hardware["models"].get(name, {}).get("reason")
+            running_on_cuda = (str(status.get("device") or "").lower().startswith("cuda")
+                               and status.get("service") == "READY"
+                               and status.get("model_loaded") is True)
+            capability = hardware["models"].get(name, {})
+            status["gpu_available"] = bool(capability.get("gpu_available") or running_on_cuda)
+            status["gpu_unavailable_reason"] = None if running_on_cuda else capability.get("reason")
         return {"hardware": hardware, "models": models, "auxiliary": auxiliary,
                 "resource_status": aggregate_resource_status(resource_rows, missing_roles=missing_resource_roles)}  # resource_status（资源状态）。
 

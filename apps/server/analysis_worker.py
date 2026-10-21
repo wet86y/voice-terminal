@@ -48,10 +48,15 @@ def main():
     if __name__ != "__main__":
         configure_logging(paths.logs / "analysis-worker.log")
     lanes = {}
+    def emotion_factory(device=None, *, fallback_device=None, allow_cuda_fallback=False):  # fallback_device（最近成功实际设备）；allow_cuda_fallback（回滚允许回退）。
+        selected = device or config.compute.devices.get("emotion", "cpu")
+        return ModelProcess("emotion", config.model_dir / "analysis/emotion2vec-plus-base",
+            device=selected, fallback_device=(fallback_device or config.compute.fallback_devices.get("emotion", "cpu")),
+            require_cuda=device == "cuda" and not allow_cuda_fallback,
+            ignore_host_fallback=device == "cuda")
+
     factories = {
-        "emotion": lambda: ModelProcess("emotion", config.model_dir / "analysis/emotion2vec-plus-base",
-            device=config.compute.devices.get("emotion", "cpu"),
-            fallback_device=config.compute.fallback_devices.get("emotion", "cpu")),
+        "emotion": emotion_factory,
         "acoustic": lambda: ModelProcess("acoustic", config.model_dir / "analysis/yamnet"),
     }
     report("analysis", "加载语句结束判断与语音精修模型")

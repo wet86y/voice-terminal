@@ -10,7 +10,7 @@ from voice_terminal.model_process import ModelProcess
 
 @pytest.fixture
 def child_command(monkeypatch, tmp_path):
-    def configure(*, failure=False):
+    def configure(*, failure=False, kind="emotion"):
         source = f'''
 import sys
 from pathlib import Path
@@ -18,17 +18,28 @@ sys.path.insert(0, {str(Path(__file__).parents[1])!r})
 from voice_terminal import model_process
 class Model:
     device = "cpu"
+    requested_device = "cpu"
+    runtime = "test-runtime"
+    model_file = "test-model"
     warmed = False
     def __init__(self):
         if {failure!r}:
             raise RuntimeError("模拟加载失败")
+        self.cache_by_turn = {{}}
         self.weight = bytearray(16 * 1024 * 1024)
     def warmup(self):
         self.warmed = True
     def __call__(self, pcm):
         return {{"bytes": len(pcm)}}
+    def infer(self, turn_id, pcm, is_final):
+        cache = self.cache_by_turn.setdefault(turn_id, {{}})
+        cache["calls"] = cache.get("calls", 0) + 1
+        result = cache["calls"]
+        if is_final: self.cache_by_turn.pop(turn_id, None)
+        return result
+    def clear_turn(self, turn_id): self.cache_by_turn.pop(turn_id, None)
 model_process._create_model = lambda *args: Model()
-sys.argv = ["model_process", "emotion", {str(tmp_path)!r}]
+sys.argv = ["model_process", {kind!r}, {str(tmp_path)!r}]
 model_process.main()
 '''
         monkeypatch.setattr("voice_terminal.paths.python_command", lambda *args, **kwargs:
@@ -75,23 +86,49 @@ def test_host_cpu_fallback_is_not_bypassed_by_optional_gpu_model(child_command, 
         model.close()
 
 
+def test_streaming_model_child_keeps_turn_caches_separate_and_clears_final_turn(child_command, tmp_path):
+    child_command(kind="streaming")
+    model = ModelProcess("streaming", tmp_path)
+    try:
+        assert model.warmed and model.device == "cpu"
+        assert model.infer_stream("turn-a", b"\0\0", False) == 1
+        assert model.infer_stream("turn-a", b"\0\0", False) == 2
+        assert model.infer_stream("turn-b", b"\0\0", False) == 1
+        assert model.infer_stream("turn-a", b"\0\0", True) == 3
+        assert model.infer_stream("turn-a", b"\0\0", False) == 1
+        model.clear_turn("turn-b")
+    finally:
+        process = psutil.Process(model.pid)
+        model.close()
+    assert not process.is_running()
+
+
 def test_analysis_toggle_exits_model_process_and_resets_footprint(child_command, tmp_path):
     from starlette.testclient import TestClient
     from voice_terminal.analysis.worker import AnalysisLane, create_analysis_app
 
     child_command()
     lane = AnalysisLane(error="disabled")
-    factory = lambda: ModelProcess("emotion", tmp_path)
+    factory = lambda device=None, **_options: ModelProcess("emotion", tmp_path, device=device or "cpu")
     with TestClient(create_analysis_app({"emotion": lane}, {"emotion": factory})) as client:
-        def configure(enabled):
+        def configure(enabled, *, devices=None, allow_cuda_fallback=None):
             with client.websocket_connect("/analysis") as socket:
-                socket.send_json({"operation": "configure", "enabled": {"emotion": enabled}})
+                socket.send_json({"operation": "configure", "enabled": {"emotion": enabled},
+                                  "devices": devices or {},
+                                  "allow_cuda_fallback": allow_cuda_fallback or {}})
                 return socket.receive_json()["emotion"]
         assert configure(False)["status"] == "DISABLED"
         ready = configure(True)
         assert ready["status"] == "READY"
         assert ready["resource_status"]["pid"] == lane.model.pid
         assert ready["resource_footprint"]["pid"] == lane.model.pid
+        process = psutil.Process(lane.model.pid)
+        status = configure(True, devices={"emotion": "cuda"},
+                           allow_cuda_fallback={"emotion": True})
+        assert status["status"] == "READY"
+        assert status["requested_device"] == "cuda" and status["device"] == "cpu"
+        assert lane.device_preference == "cuda"
+        assert not process.is_running()
         process = psutil.Process(lane.model.pid)
         status = configure(False)
         assert status["status"] == "DISABLED" and not status["model_loaded"]
@@ -130,7 +167,7 @@ def test_analysis_child_crash_is_degraded_and_can_be_reloaded(child_command, tmp
 
     child_command()
     lane = AnalysisLane(error="disabled")
-    factory = lambda: ModelProcess("emotion", tmp_path)
+    factory = lambda device=None: ModelProcess("emotion", tmp_path, device=device or "cpu")
     with TestClient(create_analysis_app({"emotion": lane}, {"emotion": factory})) as client:
         def enable():
             with client.websocket_connect("/analysis") as socket:

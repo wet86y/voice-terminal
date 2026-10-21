@@ -641,6 +641,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "所有权"):
                 await AnalysisClient("ws://127.0.0.1:1").health()
 
+    async def test_initialization_control_sends_live_worker_ownership(self):
+        app = ApplicationHost(Path.cwd())
+        app.state.component("asr", state="ready")
+        app.state.component("analysis", state="external")
+        captured = {}
+
+        def response(request, timeout):
+            captured.update(json.loads(request.data))
+            return io.BytesIO(b"{}")
+
+        try:
+            with patch("urllib.request.urlopen", side_effect=response):
+                await app.http("http://127.0.0.1:8765/internal/application/control",
+                               action="initialize-session")
+            self.assertTrue(captured["asr_available"])
+            self.assertFalse(captured["analysis_available"])
+            self.assertTrue(captured["asr_managed"])
+            self.assertFalse(captured["analysis_managed"])
+        finally:
+            app.outer_job.close()
+
     async def test_shared_process_metrics_are_identical_and_not_double_counted(self):
         import psutil
         app = ApplicationHost(Path.cwd())

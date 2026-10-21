@@ -1,6 +1,6 @@
 {
   "name": "voice-terminal",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "license": "Apache-2.0",
   "private": true,
   "description": "本地模块化实时语音终端",

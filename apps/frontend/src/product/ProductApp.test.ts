@@ -514,7 +514,7 @@ describe('正式界面的真实控件交互', () => {
     value.computeSavedDevices.value.paraformer = 'cuda'
     await flushPromises()
     expect(row.text()).not.toContain('草稿尚未保存')
-    expect(row.text()).toContain('已保存配置下次启动生效')
+    expect(row.text()).toContain('设备请求与当前运行状态不一致')
     expect(row.get('select').element.value).toBe('cuda')
     expect(row.text()).toContain('CPU（中央处理器）')
   })
@@ -1264,8 +1264,9 @@ describe('正式界面的真实控件交互', () => {
       else Reflect.deleteProperty(navigator,'mediaDevices')
     }
   })
-  it('保存声纹、计算设备及指令时，迟到响应保留发送后的草稿', async () => {
+  it('异步设置响应保留草稿，计算设备只提交所选模型', async () => {
     const { value } = liveAdapter()
+    allowBusinessReady(value)
     const speaker = deferred<Awaited<ReturnType<typeof productApi.saveSpeaker>>>()
     vi.spyOn(productApi, 'saveSpeaker').mockReturnValue(speaker.promise)
     value.speakerForm.confirm_threshold = 0.6
@@ -1277,13 +1278,19 @@ describe('正式界面的真实控件交互', () => {
     expect(value.speakerForm.confirm_threshold).toBe(0.8)
 
     const compute = deferred<Awaited<ReturnType<typeof productApi.saveCompute>>>()
-    vi.spyOn(productApi, 'saveCompute').mockReturnValue(compute.promise)
+    const saveCompute = vi.spyOn(productApi, 'saveCompute').mockReturnValue(compute.promise)
     value.settings.compute.devices.paraformer = 'cpu'
-    const computeSave = value.saveComputeSettings(); await flushPromises()
+    value.settings.compute.devices.emotion = 'cuda'
+    const computeSave = value.saveComputeSettings('paraformer'); await flushPromises()
+    expect(saveCompute).toHaveBeenCalledWith({ model_id: 'paraformer', device: 'cpu' })
     value.settings.compute.devices.paraformer = 'auto'
-    compute.resolve({ settings: { compute: { devices: { paraformer: 'cpu' } } } } as never)
+    compute.resolve({ settings: { compute: { devices: { ...DEFAULT_SETTINGS.compute.devices, paraformer: 'cpu' } } },
+      effective_from: 'immediate', restart_required: false, pending: false } as never)
     await computeSave
     expect(value.settings.compute.devices.paraformer).toBe('auto')
+    expect(value.settings.compute.devices.emotion).toBe('cuda')
+    expect(value.computeSavedDevices.value.paraformer).toBe('cpu')
+    expect(value.computeSavedDevices.value.emotion).toBe(DEFAULT_SETTINGS.compute.devices.emotion)
 
     const instructions = deferred<Awaited<ReturnType<typeof productApi.saveCustomInstructions>>>()
     vi.spyOn(productApi, 'saveCustomInstructions').mockReturnValue(instructions.promise)

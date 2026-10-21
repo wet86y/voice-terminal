@@ -577,8 +577,8 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 </label>
                 <div v-if="row.device" class="local-device-editor">
                   <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
-                  <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
-                  <small v-if="row.device.draft || row.device.pending"><span v-if="row.device.draft">运行位置草稿尚未保存</span><span v-if="row.device.draft && row.device.pending"> · </span><span v-if="row.device.pending">已保存配置下次启动生效</span></small>
+                  <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ row.device.busy ? '切换中' : saving ? '保存中' : '保存' }}</button>
+                  <small v-if="row.device.draft || row.device.pending"><span v-if="row.device.draft">运行位置草稿尚未保存</span><span v-if="row.device.draft && row.device.pending"> · </span><span v-if="row.device.pending">设备请求与当前运行状态不一致</span></small>
                 </div>
                 <div v-else-if="!row.resource || !resourceRuntimeFacts(row.resource, row).length" class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
                 <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>

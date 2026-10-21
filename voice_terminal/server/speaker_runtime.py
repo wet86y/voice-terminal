@@ -54,6 +54,7 @@ class SpeakerRuntimeMixin:
         the profile stale and makes ``available`` false; filter（拦截模式）
         closes input admission while observe（仅标记模式）keeps input available.
         """
+        self._speaker_warmed = False
         try:
             response = await client.fingerprint(timeout_s=5.0)
         except Exception as exc:
@@ -67,6 +68,7 @@ class SpeakerRuntimeMixin:
             },
             probe if isinstance(probe, list) else None,
         )
+        self._speaker_warmed = isinstance(probe, list) and bool(probe)
         if self.speaker_profile.stale:
             logger.warning("speaker.profile_stale reason=%s", self.speaker_profile.stale_reason)
 
@@ -96,7 +98,8 @@ class SpeakerRuntimeMixin:
                     logger.debug("speaker.stale_client_cleanup_failed", exc_info=True)
 
             self.state.set_service("speaker", "STARTING")
-            managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
+            managed = bool(os.environ.get("VOICE_APP_ORIGIN") or
+                           getattr(self, "_speaker_compute_restarting", False))
             process = self._speaker_worker_process
             # 受管模式只连接本次 Voice 进程实际启动的 sidecar（附属进程），不附着到占用首选端口的未知服务。
             # 受管子进程统一先通过应用层就绪探测，再创建有降级状态的业务客户端。
@@ -172,6 +175,68 @@ class SpeakerRuntimeMixin:
             else:
                 reason = f"Speaker Worker 已退出（exit code {process.returncode}）：{last_error or '无 health 响应'}"
             return self._speaker_start_failed(reason)
+
+    async def switch_speaker_compute_device(self, device: str, *, allow_cuda_fallback: bool = False) -> dict[str, Any]:  # allow_cuda_fallback（回滚旧 GPU 偏好时允许实际设备回退）。
+        """Replace the owned CAM++ worker and verify its device with a probe inference."""
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device（目标设备模式）必须是 auto、cpu 或 cuda")
+        if not hasattr(self, "_speaker_compute_switch_lock"):
+            self._speaker_compute_switch_lock = asyncio.Lock()
+        async with self._speaker_compute_switch_lock:
+            process = self._speaker_worker_process
+            if not getattr(self, "_speaker_compute_switch_owned", False):
+                if process is None or process.returncode is not None:
+                    raise RuntimeError("CAM++ 声纹工作进程由外部管理，拒绝热切换设备。")
+                self._speaker_compute_switch_owned = True
+            previous_pid = process.pid if process is not None else None
+            client, self.speaker = self.speaker, None
+            controller = getattr(self, "controller", None)
+            if controller is not None:
+                active_analysis = getattr(controller, "_speaker_analysis_task", None)
+                if active_analysis is not None and not active_analysis.done():
+                    await asyncio.wait_for(asyncio.shield(active_analysis), timeout=30)
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.queue.join(), timeout=10)
+                    pending = [*client.pending_embed.values(), *client.pending_finish.values()]
+                    if pending:
+                        await asyncio.wait_for(asyncio.gather(*(asyncio.shield(item) for item in pending),
+                                                              return_exceptions=True), timeout=30)
+                except asyncio.TimeoutError as exc:
+                    self.speaker = client
+                    raise RuntimeError("等待 CAM++ 原生推理结束超时，未退出旧工作进程。") from exc
+            if controller is not None:
+                controller.speaker_client = None
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    logger.debug("speaker.compute_old_client_close_failed", exc_info=True)
+            await self._stop_managed_speaker_worker()
+            self._speaker_warmed = False
+            self._speaker_compute_restarting = True
+            self._speaker_compute_device_override = device
+            try:
+                if not await self.ensure_speaker_worker() or self.speaker is None:
+                    reason = next((str(item).split(": ", 1)[-1] for item in reversed(self.startup_errors)
+                                   if str(item).startswith("speaker:")), "CAM++ 声纹工作进程未就绪。")
+                    raise RuntimeError(reason)
+                current = await self.speaker.health(timeout_s=5.0)
+                actual = str(current.get("device") or "").lower()
+                actual = "cuda" if actual.startswith("cuda") else "cpu" if actual.startswith("cpu") else actual
+                if device == "cuda" and actual != "cuda" and not allow_cuda_fallback:
+                    raise RuntimeError("显式请求 cuda（图形处理器），但 CAM++ 实际运行于 cpu（中央处理器）。")
+                if current.get("model_loaded") is not True:
+                    raise RuntimeError("CAM++ 模型未完成加载。")
+                if not self._speaker_warmed:
+                    raise RuntimeError("CAM++ 真实推理预热未通过。")
+                new_process = self._speaker_worker_process
+                if previous_pid is not None and new_process is not None and new_process.pid == previous_pid:
+                    raise RuntimeError("CAM++ 切换后仍连接到旧工作进程。")
+                return {**current, "model_warmed": True}
+            finally:
+                self._speaker_compute_device_override = None
+                self._speaker_compute_restarting = False
 
     def _speaker_worker_host_is_local(self) -> bool:
         host = urlsplit(self.config.speaker_worker_url).hostname or ""
@@ -263,11 +328,22 @@ class SpeakerRuntimeMixin:
             rotate_oversized_log(stream_path, max_bytes=2 * 1024 * 1024, backups=1)
         enforce_log_budget(log_dir)
         from ..paths import python_command
-        command = python_command(sys.executable, "voice_terminal.speaker.worker",
+        selected_device = (getattr(self, "_speaker_compute_device_override", None) or
+                           self.config.compute.devices.get("campplus", "cpu"))
+        cpu_python = os.environ.get("VOICE_CPU_PYTHON", sys.executable)
+        from ..gpu_environment import worker_python
+        interpreter = worker_python(self.paths.install_root,
+            self.paths.data_root or self.paths.install_root / "data", "voice", cpu_python,
+            {"voice_vad": "cpu", "kws": "cpu", "campplus": selected_device})
+        command = python_command(interpreter, "voice_terminal.speaker.worker",
                                  "--config", str(self._speaker_worker_config_path), root=self._project_root)
         from ..resources import ResourcePolicy
         child_env = ResourcePolicy.load().environment("speaker", model_dir=self.config.model_dir)
-        child_env["VOICE_TENSOR_DEVICE"] = self.config.compute.devices.get("campplus", "cpu")
+        child_env["VOICE_TENSOR_DEVICE"] = selected_device
+        child_env["VOICE_MODEL_DEVICE"] = selected_device
+        child_env["VOICE_CPU_PYTHON"] = cpu_python
+        if selected_device == "cuda":
+            child_env.pop("VOICE_GPU_FALLBACK", None)
         child_env["VOICE_PROCESS_STARTED_AT"] = str(time.time())  # 子进程入口日志的统一时间起点。
         child_env["PYTHONUNBUFFERED"] = "1"
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:

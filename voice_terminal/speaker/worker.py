@@ -357,7 +357,7 @@ async def run(config_path: Path | None = None) -> None:
         min_speech_ms=config.speaker.min_speech_ms,
         min_window_speech_ratio=config.speaker.min_window_speech_ratio,
         model_id=config.speaker.model_id,
-        device=config.compute.devices.get("campplus", "cpu"),
+        device=os.environ.get("VOICE_MODEL_DEVICE") or config.compute.devices.get("campplus", "cpu"),
         fallback_device=config.compute.fallback_devices.get("campplus", "cpu"),
     )
     try:

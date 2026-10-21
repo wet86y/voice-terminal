@@ -259,6 +259,7 @@ class ApplicationHost:
                        VOICE_FRONTEND_SESSION=self.frontend_session,
                        VOICE_APP_INSTANCE_ID=self.state.value["instance_id"])
         env.update(self.paths.environment())
+        env["VOICE_CPU_PYTHON"] = self.python  # VOICE_CPU_PYTHON（按需模型子进程的中央处理器解释器）。
         if key in self.gpu_fallback_roles:
             env["VOICE_GPU_FALLBACK"] = "1"  # VOICE_GPU_FALLBACK（当前进程强制中央处理器回退）。
         env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
@@ -285,6 +286,8 @@ class ApplicationHost:
             rows = {c["id"]: c for c in self.state.snapshot()["components"]}
             env["VOICE_APP_ASR_AVAILABLE"] = "1" if rows["asr"]["state"] in {"ready", "external"} else "0"
             env["VOICE_APP_ANALYSIS_AVAILABLE"] = "1" if rows["analysis"]["state"] == "ready" else "0"
+            env["VOICE_APP_ASR_MANAGED"] = "1" if rows["asr"]["state"] == "ready" else "0"  # VOICE_APP_ASR_MANAGED（应用管理的识别工作进程）。
+            env["VOICE_APP_ANALYSIS_MANAGED"] = "1" if rows["analysis"]["state"] == "ready" else "0"  # VOICE_APP_ANALYSIS_MANAGED（应用管理的分析工作进程）。
             if self.manifest.get("hardware_capabilities"):
                 env["VOICE_HARDWARE_CAPABILITIES"] = json.dumps(self.manifest["hardware_capabilities"])
         output = self.paths.logs / f"application-{key}.log"
@@ -452,7 +455,9 @@ class ApplicationHost:
                 rows = {c["id"]: c for c in self.state.snapshot()["components"]}
                 body = {"action": action,
                     "asr_available": rows["asr"]["state"] in {"ready", "external"},
-                    "analysis_available": rows["analysis"]["state"] == "ready"}
+                    "analysis_available": rows["analysis"]["state"] == "ready",
+                    "asr_managed": rows["asr"]["state"] == "ready",  # asr_managed（应用宿主是否拥有识别工作进程）。
+                    "analysis_managed": rows["analysis"]["state"] == "ready"}  # analysis_managed（应用宿主是否拥有分析工作进程）。
                 if action in {"initialize-session", "reinitialize"}:
                     endpoints = self.state.snapshot().get("endpoints", {})
                     body["endpoints"] = {key: row.get("url") or row.get("preferred_url")
@@ -519,7 +524,7 @@ class ApplicationHost:
             future.cancel()
             raise RuntimeError("权限决定尚未确认，请等待请求状态刷新。")
 
-    async def probe(self, key):
+    async def probe(self, key) -> bool | None:
         if key == "asr":
             import websockets
             async with websockets.connect(self.manifest["asr_url"], open_timeout=2) as connection:
@@ -529,6 +534,11 @@ class ApplicationHost:
                 self.manifest.setdefault("cpu_restart", {})[key] = data.get("device") == "cpu" and data.get("tensor_cuda_build") is True
                 if isinstance(data.get("hardware_capabilities"), dict):
                     self.manifest["hardware_capabilities"] = data["hardware_capabilities"]
+                if data.get("request_id") != request_id:
+                    return False
+                if data.get("status") == "STARTING":
+                    # STARTING（启动中）是模型切换/重载的正常阶段，不累计为健康故障。
+                    return None
                 return data.get("status") == "READY" and data.get("model_loaded") is True and data.get("request_id") == request_id
         if key == "analysis":
             url = urlsplit(self.manifest["analysis_url"])
@@ -764,9 +774,11 @@ class ApplicationHost:
                     if abs(process.create_time() - owned.created_at) < 2:
                         memory = process.memory_info()
                         resident, commit = memory.rss, getattr(memory, "private", 0) or 0
-                        if key == "voice":
-                            self.state.update(voice_api_ready=False)
-                            # 声纹与代理子树都属于语音进程，预算只扣除实际已使用部分。
+                        if key in {"voice", "asr", "analysis"}:
+                            if key == "voice":
+                                self.state.update(voice_api_ready=False)
+                            # Nested model processes belong to their managed component and are
+                            # included in startup admission so their memory is not double-budgeted.
                             for child in process.children(recursive=True):
                                 try:
                                     child_memory = child.memory_info()
@@ -1109,15 +1121,43 @@ class ApplicationHost:
                         log.info("组件状态查询失败：组件=voice，错误=%s: %s", type(exc).__name__, str(exc)[:200])
                 for key in ("asr", "analysis"):
                     row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
-                    if row["state"] not in {"ready", "external"}:
+                    process = self.processes.get(key)
+                    process_alive = process is not None and process.poll() is None
+                    external = row.get("external") is True or row["state"] == "external"
+                    # 热切换时模型健康接口会短暂返回 STARTING（启动中）；
+                    # 临时连接故障也可能已进入 failed（失败），只要受管进程仍活着就继续探测，
+                    # 避免 READY（就绪）后卡片和全局语音门禁一直保留旧的终态故障。
+                    probeable_starting = row["state"] == "starting" and (external or process_alive)
+                    probeable_failed = (row["state"] == "failed" and row["phase"] == "应用层探测失败"
+                                        and (external or process_alive))
+                    if row["state"] not in {"ready", "external"} and not probeable_starting and not probeable_failed:
                         continue
                     failure: Exception | None = None
                     try:
                         healthy = await self.probe(key)
                     except Exception as exc:
                         healthy, failure = False, exc
+                    if healthy is None:
+                        self._reset_probe_failure(key)
+                        latest = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
+                        if latest["state"] in {"starting", "failed"}:
+                            self.state.component(key, state="starting", phase="模型重建中", error="")
+                        continue
                     if healthy:
                         self._reset_probe_failure(key)
+                        latest = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
+                        if latest["state"] in {"starting", "failed"}:
+                            current_process = self.processes.get(key)
+                            current_process_alive = current_process is not None and current_process.poll() is None
+                            if latest.get("external") is True:
+                                recovered_state = "external"
+                            elif current_process_alive:
+                                recovered_state = "ready"
+                            else:
+                                continue
+                            self.state.component(key, state=recovered_state,
+                                phase="应用层健康检查已恢复", error="")
+                            log.info("组件健康检查恢复：组件=%s，状态=%s", key, recovered_state)
                     elif self._note_probe_failure(key, failure):
                         self.state.component(key, state="failed", phase="应用层探测失败", error="组件连接或模型状态不可用，请重试")
                         if key == "asr":

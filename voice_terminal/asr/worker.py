@@ -13,8 +13,7 @@ from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
 from ..compute import process_memory_bytes, hardware_status
-from ..tensor_runtime import cuda_tensor_loaded
-from ..resources import model_thread_budget, process_resource_status, registry, model_load_footprint
+from ..resources import registry, model_load_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +59,12 @@ class AsrWorkerEngine:
         self.encoder_chunk_look_back = encoder_chunk_look_back
         self.decoder_chunk_look_back = decoder_chunk_look_back
         self._model: Any = None
+        self._model_loading = False  # model_loading（模型子进程正在加载）。
+        self._device_switching = False  # device_switching（设备热切换事务进行中）。
         self.punctuation = None  # punctuation（与识别共用专用线程的实时标点通道）。
         if punctuation_model_dir is not None:
             from .punctuation import StreamingPunctuation
             self.punctuation = StreamingPunctuation(punctuation_model_dir, punctuation_device)
-        self._np: Any = None
-        self._cache_by_turn: dict[str, dict[str, Any]] = {}
         # paraformer-zh-streaming emits text for the current streaming
         # window, not a complete transcript for the whole turn.  Keep the
         # cumulative transcript separately so later windows cannot replace
@@ -86,6 +85,7 @@ class AsrWorkerEngine:
         self._span_revisions: dict[str, int] = {}
         self._current_spans: list[dict] = []
         self.model_warmed = False  # model_warmed（已完成真实推理预热）。
+        self.resource_footprint = None  # resource_footprint（Paraformer 子进程的加载及预热内存增量）。
         self.startup_timings_ms = {}  # startup_timings_ms（各启动阶段耗时，毫秒）。
         registry.observe(self, "asr_pending_pcm", lambda value: sum(len(p) for p in value._pending_audio_by_turn.values()))
 
@@ -104,7 +104,13 @@ class AsrWorkerEngine:
     def model_loaded(self) -> bool:
         """Whether the real recognizer has completed loading."""
 
-        return self._model is not None
+        return self._model is not None and getattr(self._model, "alive", True)
+
+    @property
+    def model_loading(self) -> bool:
+        """model_loading（模型加载或设备切换期间的只读状态）。"""
+
+        return self._model_loading or self._device_switching
 
     @property
     def chunk_stride_bytes(self) -> int:
@@ -120,88 +126,46 @@ class AsrWorkerEngine:
                         self.punctuation.load()
                     self.punctuation.resource_footprint = footprint
 
-    def _load_model(self) -> None:
-        if self._model is not None:
-            return
-        if not self.model_dir.is_dir():
-            raise FileNotFoundError(f"Paraformer（流式识别）模型目录不存在：{self.model_dir}")
-        started = time.perf_counter()
-        from ..compute import startup_device, loaded_funasr_device
-        initial = startup_device(self.requested_device, "paraformer")
-        self.startup_timings_ms["hardware"] = (time.perf_counter() - started) * 1000
-        from ..tensor_runtime import activate_tensor_runtime
-        activate_tensor_runtime(initial)
-        started = time.perf_counter()
-        try:
-            import numpy as np  # type: ignore
-            from .model_loader import auto_model_class
-            AutoModel = auto_model_class(self.model_dir)
-        except ImportError as exc:
-            raise RuntimeError("缺少 NumPy（数值计算库）或 FunASR（语音框架），请先运行 scripts\\setup.ps1（环境安装脚本）。") from exc
-        self.startup_timings_ms["imports"] = (time.perf_counter() - started) * 1000  # imports（依赖导入）。
-        self._np = np
-        fallback = self.fallback_device if self.fallback_device in {"cpu", "cuda"} else "cpu"
-        candidates = [initial]
-        if initial == "cuda":
-            if fallback != initial:
-                candidates.append(fallback)
-            if "cpu" not in candidates:
-                candidates.append("cpu")
-        last_error: Exception | None = None
-        for candidate in candidates:
-            try:
-                started = time.perf_counter()
-                self._model = AutoModel(
-                    model=str(self.model_dir),
-                    device=candidate,
-                    disable_update=True,
-                    disable_pbar=True,
-                    ncpu=model_thread_budget(),
-                )
-                self.startup_timings_ms["model"] = (time.perf_counter() - started) * 1000  # model（模型构造与权重加载）。
-                self.device = loaded_funasr_device(self._model, candidate)
-                # 首次原生算子／CUDA（图形处理器加速）初始化在开放接口前完成；
-                # 实际推理失败也进入设备回退，不能只凭权重加载宣称 GPU（图形处理器）可用。
-                self._warm_up_model()
-                self.load_error = (
-                    f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"
-                    if last_error is not None else
-                    "FunASR（语音模型加载器）未使用请求的 CUDA（图形处理器），实际运行于 CPU（中央处理器）。"
-                    if candidate == "cuda" and self.device == "cpu" else None
-                )
-                logger.info("asr.worker.model_ready model_dir=%s device=%s", self.model_dir, self.device)
-                logger.info("识别启动阶段（毫秒）：依赖导入=%.1f，设备探测=%.1f，模型加载=%.1f，真实预热=%.1f",
-                    self.startup_timings_ms["imports"], self.startup_timings_ms["hardware"],
-                    self.startup_timings_ms["model"], self.startup_timings_ms["warmup"])
+    def _load_model(self, *, require_cuda: bool = False, ignore_host_fallback: bool = False) -> None:
+        # _load_lock（模型生命周期锁）必须覆盖所有加载入口，包括热切换与
+        # 惰性推理加载；否则健康检查和切换可能同时启动两个 GPU 子进程。
+        with self._load_lock:
+            if self.model_loaded:
                 return
-            except Exception as exc:
-                last_error = exc
-                self._model = None
-                self.model_warmed = False
-                if candidate == "cuda":
-                    try:
-                        import torch  # type: ignore
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-        self._model = None
-        self.load_error = str(last_error) if last_error else "模型加载失败"
-        raise RuntimeError(self.load_error) from last_error
-
-    def _warm_up_model(self) -> None:
-        """用独立的静音缓存预热完整窗和空最终刷新，不进入用户转写状态。"""
-        started = time.perf_counter()
-        cache: dict[str, Any] = {}
-        for final in (False, False, True):
-            audio = self._np.zeros(0 if final else self.chunk_stride_samples, dtype=self._np.float32)
-            self._model.generate(
-                input=audio, cache=cache, is_final=final, chunk_size=list(self.chunk_size),
-                encoder_chunk_look_back=self.encoder_chunk_look_back,
-                decoder_chunk_look_back=self.decoder_chunk_look_back,
-            )
-        self.model_warmed = True
-        self.startup_timings_ms["warmup"] = (time.perf_counter() - started) * 1000  # warmup（真实推理预热）。
-        logger.info("asr.worker.warmed device=%s elapsed_ms=%.1f", self.device, (time.perf_counter() - started) * 1000)
+            self._model_loading = True
+            try:
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                if not self.model_dir.is_dir():
+                    raise FileNotFoundError(f"Paraformer（流式识别）模型目录不存在：{self.model_dir}")
+                from ..model_process import ModelProcess
+                started = time.perf_counter()
+                try:
+                    model = ModelProcess(
+                        "streaming", self.model_dir, device=self.requested_device,
+                        fallback_device=self.fallback_device,
+                        require_cuda=require_cuda, ignore_host_fallback=ignore_host_fallback,
+                        model_options={"sample_rate": self.sample_rate, "chunk_size": self.chunk_size,
+                            "encoder_chunk_look_back": self.encoder_chunk_look_back,
+                            "decoder_chunk_look_back": self.decoder_chunk_look_back},
+                    )
+                    self._model = model
+                    self.device = "cuda" if str(model.device).startswith("cuda") else "cpu"
+                    self.model_warmed = bool(model.warmed)
+                    self.load_error = model.load_error
+                    self.resource_footprint = model.resource_footprint
+                    self.startup_timings_ms["model_process"] = (time.perf_counter() - started) * 1000
+                    logger.info("asr.worker.model_ready model_dir=%s pid=%s requested_device=%s device=%s warmed=%s",
+                                self.model_dir, model.pid, self.requested_device, self.device, self.model_warmed)
+                except Exception as exc:
+                    self._model = None
+                    self.model_warmed = False
+                    self.resource_footprint = None
+                    self.load_error = str(exc)
+                    raise
+            finally:
+                self._model_loading = False
 
     async def prepare(self) -> None:
         """prepare（准备）：在识别专用线程完成加载和预热。"""
@@ -210,8 +174,66 @@ class AsrWorkerEngine:
         if self.offline is not None:
             await self.offline.configure(self.dual_pass_enabled, self.device)
 
+    async def configure_device(self, device: str, *, allow_cuda_fallback: bool = False) -> dict[str, Any]:  # allow_cuda_fallback（仅回滚允许 GPU 偏好恢复到原 CPU 实际设备）。
+        """替换 Paraformer 模型子进程；调用方须先暂停输入并处理失败回滚。"""
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device（目标设备模式）必须是 auto、cpu 或 cuda")
+        async with self._inference_lock:
+            self._device_switching = True
+            try:
+                dual_pass_was_enabled = bool(self.offline is not None and self.dual_pass_enabled)
+                previous_actual = self.device
+                active_turns = set().union(
+                    self._transcript_by_turn, self._pending_audio_by_turn, self._chunk_count_by_turn,
+                    self._byte_count_by_turn, self._model_call_count_by_turn, self._last_log_at_by_turn,
+                    self._span_positions, self._span_revisions, self._segment_offsets,
+                )
+                for turn_id in active_turns:
+                    self._clear_turn(turn_id)
+                if dual_pass_was_enabled:
+                    await self.offline.configure(False, previous_actual)
+
+                def unload_primary():
+                    with self._load_lock:
+                        model, self._model = self._model, None
+                        self.model_warmed = False
+                        self.resource_footprint = None
+                        self.device = "unknown"
+                        close = getattr(model, "close", None)
+                        if callable(close):
+                            close()
+
+                future = asyncio.get_running_loop().run_in_executor(self._executor, unload_primary)
+                await self._await_native(future)
+                self.requested_device = device
+                future = asyncio.get_running_loop().run_in_executor(
+                    self._executor, lambda: self._load_model(require_cuda=device == "cuda" and not allow_cuda_fallback,
+                                                              ignore_host_fallback=device == "cuda"))
+                await self._await_native(future)
+                if device == "cuda" and self.device != "cuda":
+                    raise RuntimeError("显式请求 cuda（图形处理器），但 Paraformer 实际运行于 cpu（中央处理器）。")
+                if dual_pass_was_enabled:
+                    await self.offline.configure(True, self.device, strict=True,
+                                                  ignore_host_fallback=device == "cuda")
+                self.fallback_device = self.device
+                return {"requested_device": self.requested_device, "device": self.device,
+                        "model_warmed": self.model_warmed, "resource_status": self._model.resource_status,
+                        "resource_footprint": self.resource_footprint,
+                        "offline": self.offline.status() if self.offline is not None else {"status": "DISABLED"}}
+            except BaseException:
+                # Keep the last requested mode visible while the runtime performs
+                # its explicit rollback to the previous preference.
+                self.requested_device = device
+                raise
+            finally:
+                self._device_switching = False
+
     def close(self) -> None:
         """close（关闭）：工作进程结束时回收专用通道。"""
+        with self._load_lock:
+            model, self._model = self._model, None
+            if model is not None:
+                model.close()
         self._executor.shutdown(wait=True, cancel_futures=True)
         if self.offline is not None:
             self.offline.close()
@@ -242,25 +264,9 @@ class AsrWorkerEngine:
 
     def _infer_owned_sync(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         self.load()
-        if len(pcm) % 2:
-            pcm = pcm[:-1]
-        audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype(self._np.float32) / 32768.0
-        cache = self._cache_by_turn.setdefault(turn_id, {})
         started = time.perf_counter_ns()
-        result = self._model.generate(
-            input=audio,
-            cache=cache,
-            is_final=is_final,
-            chunk_size=list(self.chunk_size),
-            encoder_chunk_look_back=self.encoder_chunk_look_back,
-            decoder_chunk_look_back=self.decoder_chunk_look_back,
-        )
+        text = self._model.infer_stream(turn_id, pcm, is_final)
         self._timing.model_ms = (time.perf_counter_ns() - started) / 1_000_000
-        text = ""
-        if isinstance(result, list) and result and isinstance(result[0], dict):
-            value = result[0].get("text")
-            if isinstance(value, str):
-                text = value
         # Do not strip each window before concatenating.  A leading space can
         # be meaningful at an English word boundary; trim only when the
         # cumulative transcript is published.
@@ -270,7 +276,11 @@ class AsrWorkerEngine:
         self._segment_offsets.pop(turn_id, None)
         if self.punctuation is not None:
             self.punctuation.clear_turn(turn_id)
-        self._cache_by_turn.pop(turn_id, None)
+        if self._model is not None and getattr(self._model, "alive", True):
+            try:
+                self._model.clear_turn(turn_id)
+            except Exception:
+                logger.debug("asr.worker.turn_cache_clear_failed turn_id=%s", turn_id, exc_info=True)
         self._transcript_by_turn.pop(turn_id, None)
         self._pending_audio_by_turn.pop(turn_id, None)
         self._chunk_count_by_turn.pop(turn_id, None)
@@ -413,7 +423,6 @@ class AsrWorkerEngine:
             # model cache and aggregation state.
             self._clear_turn(turn_id)
         elif is_final:
-            self._cache_by_turn.pop(turn_id, None)
             self._model_call_count_by_turn[turn_id] = 0
         return AsrInferenceResult(text=text, emitted=bool(emitted_text), segments=list(self._current_spans), latency=dict(self._call_latency))
 
@@ -479,9 +488,28 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                         if message["dual_pass"] and not engine.model_loaded:
                             raise ValueError("主识别模型尚未就绪，无法确定双路实际设备")
                         await engine.offline.configure(message["dual_pass"], engine.device, strict=True)
+                        engine.dual_pass_enabled = message["dual_pass"]
                         await send({"type": "health", "request_id": request_id, "status": "READY",
                                     "model_loaded": engine.model_loaded, "device": engine.device,
                                     "offline": engine.offline.status()})
+                    except Exception as exc:
+                        await send({"type": "error", "request_id": request_id, "message": str(exc)})
+                    continue
+                if message_type == "compute.configure":
+                    request_id = message.get("request_id")
+                    try:
+                        device = message.get("device")
+                        allow_cuda_fallback = message.get("allow_cuda_fallback", False)  # allow_cuda_fallback（回滚 GPU 偏好标记）。
+                        if device not in {"auto", "cpu", "cuda"} or type(allow_cuda_fallback) is not bool:
+                            raise ValueError("device（目标设备模式）或 allow_cuda_fallback（GPU 回滚标记）无效")
+                        status = await engine.configure_device(device, allow_cuda_fallback=allow_cuda_fallback)
+                        await send({"type": "health", "request_id": request_id, "status": "READY",
+                                    "model_loaded": engine.model_loaded,  # model_loaded（模型是否已加载）。
+                                    "model_warmed": engine.model_warmed,  # model_warmed（是否通过真实推理预热）。
+                                    "requested_device": engine.requested_device, "device": engine.device,
+                                    "resource_status": status["resource_status"],
+                                    "resource_footprint": status["resource_footprint"],
+                                    "offline": status["offline"]})
                     except Exception as exc:
                         await send({"type": "error", "request_id": request_id, "message": str(exc)})
                     continue
@@ -512,36 +540,37 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     request_id = message.get("request_id")
                     if request_id is not None and not isinstance(request_id, str):
                         raise ValueError("health request_id 必须是字符串")
-                    try:
-                        engine.load()
-                        response = {
-                            "type": "health",
-                            "status": "READY",
-                            "model_loaded": engine.model_loaded,
-                            "tensor_cuda_build": cuda_tensor_loaded(),
-                            "model_warmed": getattr(engine, "model_warmed", None),  # model_warmed（真实推理预热完成）。
-                            "runtime": "PyTorch（推理框架）" if engine.model_loaded else None,  # runtime（实际加载引擎）。
-                            "device": getattr(engine, "device", None),
-                            "requested_device": getattr(engine, "requested_device", None),
-                            "load_error": getattr(engine, "load_error", None),
-                            "offline": engine.offline.status() if getattr(engine, "offline", None) is not None else {"status": "DISABLED"},
-                            "punctuation": engine.punctuation.status() if getattr(engine, "punctuation", None) is not None else {"status": "DISABLED"},  # punctuation（标点通道健康状态）。
-                            "process_memory_rss_bytes": process_memory_bytes(),
-                            "resource_status": process_resource_status(),  # resource_status（资源状态）。
-                        }
-                    except Exception as exc:
-                        # Keep the connection available long enough for the
-                        # caller to receive a classified readiness failure.
-                        response = {
-                            "type": "health",
-                            "status": "ERROR",
-                            "model_loaded": False,
-                            "error": str(exc),
-                            "device": getattr(engine, "device", None),
-                            "requested_device": getattr(engine, "requested_device", None),
-                            "process_memory_rss_bytes": process_memory_bytes(),
-                        }
-                    if response.get("status") == "READY" and os.environ.get("VOICE_RESOURCE_ROLE") == "asr":
+                    # health（健康检查）必须是只读且非阻塞的。prepare（启动预热）和
+                    # compute.configure（设备切换）负责加载；这里若调用 engine.load()，
+                    # 会在切换间隙启动第二个 GPU 子进程，并阻塞整个 WebSocket 事件循环。
+                    switching_or_loading = engine.model_loading
+                    model_loaded = engine.model_loaded and not switching_or_loading
+                    status = "STARTING" if switching_or_loading else "READY" if model_loaded else "ERROR"
+                    model = engine._model if status == "READY" else None
+                    load_error = getattr(engine, "load_error", None)
+                    if status == "ERROR" and not load_error:
+                        load_error = getattr(engine._model, "error", None) or "Paraformer 模型当前未加载。"
+                    resource_status = getattr(model, "resource_status", None)
+                    response = {
+                        "type": "health",
+                        "status": status,
+                        "model_loaded": model_loaded,
+                        "tensor_cuda_build": getattr(model, "tensor_cuda_build", False),
+                        "model_warmed": bool(getattr(engine, "model_warmed", False)) if model_loaded else False,
+                        "resource_footprint": getattr(engine, "resource_footprint", None) if model_loaded else None,
+                        "runtime": getattr(model, "runtime", None),  # runtime（实际加载引擎）。
+                        "device": getattr(engine, "device", None),
+                        "requested_device": getattr(engine, "requested_device", None),
+                        "load_error": load_error if status == "ERROR" else getattr(engine, "load_error", None),
+                        "offline": engine.offline.status() if getattr(engine, "offline", None) is not None else {"status": "DISABLED"},
+                        "punctuation": engine.punctuation.status() if getattr(engine, "punctuation", None) is not None else {"status": "DISABLED"},  # punctuation（标点通道健康状态）。
+                        "process_memory_rss_bytes": (resource_status or {}).get("rss_bytes"),
+                        "resource_status": resource_status,  # resource_status（模型子进程资源状态）。
+                    }
+                    if status == "ERROR":
+                        response["error"] = load_error
+                        response["process_memory_rss_bytes"] = process_memory_bytes()
+                    if status == "READY" and os.environ.get("VOICE_RESOURCE_ROLE") == "asr":
                         response["hardware_capabilities"] = hardware_status()  # hardware_capabilities（重型后端能力）。
                     if isinstance(request_id, str):
                         response["request_id"] = request_id

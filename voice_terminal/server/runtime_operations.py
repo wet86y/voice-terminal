@@ -101,7 +101,7 @@ class RuntimeOperations:
                 if on_release is not None:
                     on_release()
             finally:
-                cleanup = asyncio.create_task(self.finish(ticket, failure or operation.failure))
+                cleanup = asyncio.create_task(self.finish(ticket, operation.failure or failure))
                 cancelled = False
                 while True:
                     try:

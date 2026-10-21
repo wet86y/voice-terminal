@@ -13,6 +13,185 @@ logger = logging.getLogger(__name__)
 
 
 class ProductSettingsRuntimeMixin:
+    async def switch_compute_device(self, payload: Mapping[str, Any], *, ticket=None) -> dict[str, Any]:
+        """事务式替换一个受支持模型的计算设备，核验后才提交偏好。"""
+        from ..config import COMPUTE_DEVICE_MODES
+
+        if not isinstance(payload, Mapping) or set(payload) != {"model_id", "device"}:
+            raise ValueError("计算设备请求必须只包含 model_id（目标模型编号）和 device（目标设备模式）。")
+        model_id, device = payload.get("model_id"), payload.get("device")
+        if not isinstance(model_id, str) or model_id not in {"paraformer", "emotion", "campplus"}:
+            raise ValueError("model_id（目标模型编号）只支持 paraformer、emotion 和 campplus。")
+        if not isinstance(device, str) or device not in COMPUTE_DEVICE_MODES:
+            raise ValueError("device（目标设备模式）必须是 auto、cpu 或 cuda。")
+
+        label = {"paraformer": "Paraformer", "emotion": "emotion2vec", "campplus": "CAM++"}[model_id]
+        target = f"compute_device:{model_id}"
+        async with runtime_operation(self, target, f"{label}运行设备切换", pause=True, ticket=ticket) as operation:
+            try:
+                return await self._switch_compute_device_transaction(model_id, device, operation)
+            except BaseException as failure:
+                if not isinstance(failure, asyncio.CancelledError):
+                    operation.fail(str(failure))
+                raise
+
+    async def _switch_compute_device_transaction(self, model_id: str, device: str, operation) -> dict[str, Any]:
+        """在一个已登记的运行操作中执行检查、替换、核验、保存和回滚。"""
+        import os
+        from ..analysis.client import AnalysisClient
+        from ..application.resource_readiness import inspect_model_resources
+        from ..config import ComputeConfig
+        from ..compute import model_hardware_status
+
+        if self.product_settings is None:
+            raise ValueError("产品设置存储不可用，未切换计算设备。")
+        if not hasattr(self, "_compute_switch_lock"):
+            self._compute_switch_lock = asyncio.Lock()
+
+        async with self._compute_switch_lock:
+            await operation.update("checking")
+            old_compute = self.config.compute
+            old_device = old_compute.devices.get(model_id, "cpu")
+            requirements = {
+                "paraformer": ("Paraformer", ["paraformer-streaming"]),
+                "emotion": ("emotion2vec", ["emotion2vec-plus-base"]),
+                "campplus": ("CAM++", ["campplus-zh-cn-common"]),
+            }
+            label, resources = requirements[model_id]
+            issues = await asyncio.to_thread(
+                inspect_model_resources, self._project_root, self.config.model_dir,
+                {label: resources},
+            )
+            if issues:
+                raise ValueError("；".join(issues.values()))
+
+            if device == "cuda":
+                from . import websocket as session_module
+                hardware = await asyncio.to_thread(session_module.hardware_status, refresh=True)
+                hardware = await asyncio.to_thread(model_hardware_status, hardware, self.config, verify=True)
+                capability = hardware.get("models", {}).get(model_id, {})
+                if not capability.get("gpu_available"):
+                    reason = capability.get("reason") or "GPU 后端不可用。"
+                    raise ValueError(f"{model_id} 暂不能使用 GPU：{reason}")
+
+            if model_id == "campplus":
+                process = getattr(self, "_speaker_worker_process", None)
+                if process is None or process.returncode is not None:
+                    raise ValueError("CAM++ 声纹工作进程由外部管理或未启动，拒绝热切换。")
+            if os.environ.get("VOICE_APP_ORIGIN"):
+                owner_flag = "VOICE_APP_ASR_MANAGED" if model_id == "paraformer" else "VOICE_APP_ANALYSIS_MANAGED" if model_id == "emotion" else None
+                if owner_flag and os.environ.get(owner_flag) != "1":
+                    raise ValueError(f"{model_id} 工作进程由外部管理，拒绝热切换。")
+
+            model_status = await self.compute_status()
+            current = model_status.get("models", {}).get(model_id, {})
+            if current.get("service") != "READY" or current.get("model_loaded") is not True:
+                raise ValueError(f"{model_id} 模型当前未由本应用加载，拒绝热切换。")
+            if model_id in {"paraformer", "emotion"} and current.get("model_warmed") is not True:
+                raise ValueError(f"{model_id} 模型尚未完成真实推理预热，拒绝热切换。")
+            if model_id == "campplus" and current.get("model_warmed") is not True:
+                raise ValueError("CAM++ 尚未完成真实推理预热，拒绝热切换。")
+            if model_id == "paraformer" and self.config.audio_enhancements.dual_pass:
+                dual = model_status.get("auxiliary", {}).get("dual_pass", {})
+                if dual.get("service") != "READY" or dual.get("model_warmed") is not True:
+                    raise ValueError("已启用的 Paraformer 离线精修模型未就绪，拒绝设备切换。")
+                current_device = str(current.get("device") or "").lower()
+                dual_device = str(dual.get("device") or "").lower()
+                current_device = "cuda" if current_device.startswith("cuda") else "cpu" if current_device.startswith("cpu") else current_device
+                dual_device = "cuda" if dual_device.startswith("cuda") else "cpu" if dual_device.startswith("cpu") else dual_device
+                if current_device not in {"cpu", "cuda"} or dual_device != current_device:
+                    raise ValueError("当前 Paraformer 主路与离线精修设备不一致，拒绝设备切换。")
+
+            current_actual = str(current.get("device") or "").lower()
+            current_actual = "cuda" if current_actual.startswith("cuda") else "cpu" if current_actual.startswith("cpu") else current_actual
+            if current_actual not in {"cpu", "cuda"}:
+                raise ValueError(f"{model_id} 未报告有效的当前运行设备，拒绝热切换。")
+            current_request = current.get("requested_device", old_device)
+            already_applied = (old_device == device and current.get("service") == "READY"
+                               and current.get("model_loaded") is True and current.get("model_warmed") is True
+                               and current_request == device
+                               and (device == "auto" or current_actual == device))
+            if already_applied:
+                return self.product_settings.snapshot()["compute"]
+
+            previous_actual = current_device if model_id == "paraformer" and self.config.audio_enhancements.dual_pass else current.get("device")
+            previous_actual = "cuda" if str(previous_actual).startswith("cuda") else "cpu"
+
+            client = AnalysisClient(self.config.smart_turn.analysis_url) if model_id == "emotion" else None
+
+            async def apply(mode: str, *, restoring: bool = False) -> dict[str, Any]:  # restoring（恢复旧模型时放宽旧 GPU 偏好限制）。
+                if model_id == "paraformer":
+                    if self.asr is None:
+                        raise RuntimeError("ASR Worker（语音识别工作进程）不可用。")
+                    return await self.asr.configure_compute(mode, allow_cuda_fallback=restoring)
+                if model_id == "emotion":
+                    result = await client.configure({}, devices={"emotion": mode},
+                                                    allow_cuda_fallback={"emotion": restoring})
+                    return result.get("emotion", {})
+                return await self.switch_speaker_compute_device(mode, allow_cuda_fallback=restoring)
+
+            def verify(status: Mapping[str, Any], requested: str, *, expected_actual: str | None = None,
+                       allow_cuda_fallback: bool = False) -> str:  # allow_cuda_fallback（仅允许回滚恢复旧 GPU 偏好）。
+                if status.get("status", "READY") != "READY" or status.get("model_loaded") is not True:
+                    raise RuntimeError(f"{model_id} 目标模型未加载就绪。")
+                if status.get("model_warmed") is not True:
+                    raise RuntimeError(f"{model_id} 未通过真实推理预热核验。")
+                actual = str(status.get("device") or "").lower()
+                actual = "cuda" if actual.startswith("cuda") else "cpu" if actual.startswith("cpu") else actual
+                if actual not in {"cpu", "cuda"}:
+                    raise RuntimeError(f"{model_id} 未报告有效的实际运行设备。")
+                if requested in {"cpu", "cuda"} and actual != requested \
+                        and not (allow_cuda_fallback and requested == "cuda" and actual == "cpu"):
+                    raise RuntimeError(f"请求 {requested}，但 {model_id} 实际运行于 {actual}。")
+                if expected_actual in {"cpu", "cuda"} and actual != expected_actual:
+                    raise RuntimeError(f"回滚要求恢复到 {expected_actual}，但 {model_id} 实际运行于 {actual}。")
+                if model_id == "paraformer":
+                    offline = status.get("offline", {})
+                    if self.config.audio_enhancements.dual_pass:
+                        offline_device = str(offline.get("device") or "").lower()
+                        offline_device = ("cuda" if offline_device.startswith("cuda") else
+                                          "cpu" if offline_device.startswith("cpu") else None)
+                        if (offline.get("status") != "READY" or offline.get("model_loaded") is not True
+                                or offline.get("model_warmed") is not True or offline_device != actual):
+                            raise RuntimeError("双路离线精修未就绪，或实际设备与 Paraformer 主路不一致。")
+                    elif offline.get("status") != "DISABLED" or offline.get("model_loaded") is True:
+                        raise RuntimeError("双路离线精修未启用，但检测到其进程被启动。")
+                return actual
+
+            self._compute_switching = True
+            try:
+                await operation.update("loading")
+                target_status = await apply(device)
+                await operation.update("verifying")
+                actual = verify(target_status, device)
+                devices = {**old_compute.devices, model_id: device}
+                fallbacks = {**old_compute.fallback_devices, model_id: actual}
+                new_config = replace(self.config, compute=ComputeConfig(devices, fallbacks))
+                saved = await asyncio.to_thread(
+                    self.product_settings.save_compute_model, model_id, device, active_device=actual)
+                self.config = new_config
+                return saved
+            except BaseException as failure:
+                if isinstance(failure, asyncio.CancelledError) and (
+                        getattr(self, "_closed", False) or getattr(self, "_application_stopping", False)):
+                    # Shutdown owns final model reclamation; do not reload the
+                    # previous device while the application is closing.
+                    operation.prevent_resume()
+                    raise
+                await operation.update("rolling_back")
+                try:
+                    restored = await apply(old_device, restoring=True)
+                    verify(restored, old_device, expected_actual=previous_actual, allow_cuda_fallback=True)
+                except BaseException as rollback_error:
+                    logger.exception("计算设备切换失败且模型恢复失败，保持停止监听")
+                    operation.prevent_resume()
+                    if isinstance(failure, asyncio.CancelledError):
+                        raise RuntimeError(f"计算设备切换取消且恢复原模型失败，已停止监听：{rollback_error}") from failure
+                    raise RuntimeError(f"{label}设备切换失败且恢复原模型失败，已停止监听：{rollback_error}") from failure
+                raise
+            finally:
+                self._compute_switching = False
+
     async def switch_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
         """音频增强切换事务：立即停听、等待原生调用、核验并保存、恢复监听意图。"""
         from ..audio_enhancements import AudioEnhancements
