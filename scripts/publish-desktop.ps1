@@ -1,5 +1,6 @@
-﻿param([string]$InstallRoot='', [string]$Build='', [switch]$SkipBuild)
+﻿param([string]$InstallRoot='', [string]$Build='', [switch]$SkipBuild, [switch]$BuildDemo) # BuildDemo（显式更新本机演示宿主）。
 $ErrorActionPreference='Stop'
+if ($SkipBuild -and $BuildDemo) {throw '复用已有构建与重建演示不能同时指定。'}
 . (Join-Path $PSScriptRoot 'local-context.ps1')
 $DesktopRepo=Get-ProjectRoot
 if (-not $InstallRoot) {$InstallRoot=Join-Path $DesktopRepo '.local'}
@@ -8,9 +9,11 @@ $Context=Get-LocalContext
 if (-not $SkipBuild) {
   & (Join-Path $PSScriptRoot 'prepare-7zip.ps1');if ($LASTEXITCODE) {throw '压缩工具准备失败。'}
   & $Context.Node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal/build.mjs');if ($LASTEXITCODE) {throw '代理插件构建失败。'}
-  # 本地演示单独构建，使用隔离缓存；不进入正式程序包或用户工作区。
-  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -DesktopOnly -SkipFrontend
-  if ($LASTEXITCODE) {throw '本地演示宿主构建失败。'}
+  # 常规覆盖发布只构建正式程序；演示按显式请求构建，避免每次维护两套编译配置。
+  if ($BuildDemo) {
+    & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -DesktopOnly -SkipFrontend
+    if ($LASTEXITCODE) {throw '本地演示宿主构建失败。'}
+  }
   & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel release
   if ($LASTEXITCODE) {throw '正式程序构建失败。'}
 }

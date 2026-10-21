@@ -29,6 +29,7 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 ## 快速开始
 
 本地布局与覆盖更新的权威说明见[本地目录与覆盖发布](docs/guides/local-layout.md)。构建编号只记录在清单，常态不保留整包或环境备份。
+开发过程的资产归属、覆盖更新、失败现场保留与提交大小约束见[开发资产治理](docs/development/asset-governance.md)。需要自动提交检查时，可执行 `npm run assets:hook`（启用本地提交钩子）；容量维护按需使用 `npm run assets:audit`（只读预算审计）。这些命令不作为启动或日常调试的前置条件。
 
 当前目录结构、空间规则、备份与恢复方式见[本地目录与覆盖发布](docs/guides/local-layout.md)。
 

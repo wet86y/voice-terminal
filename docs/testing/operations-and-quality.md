@@ -1,6 +1,7 @@
 # 测试、启动与现场验收入口
 
 本文集中记录自动化测试入口、人工验收步骤和测试边界。架构与协议约束见[架构目录](../architecture/architecture.md)，当前交付状态见[正式程序与分发安装器](../releases/current-release.md)，未关闭风险见[当前已知问题](known-issues.md)。历史测试数字以各专项报告中的日期为准，不作为当前全量结果。
+新验证的现场、报告与保留规则遵循[开发资产治理](../development/asset-governance.md)。后端、更新交接和音色设计验证已接入受管任务；成功回收现场，正常失败有限保留，未知中断不自动删除。提交前运行 `npm run assets:check`（暂存资产检查），维护时运行 `npm run assets:audit`（只读预算审计）。
 
 ## 自动化门槛
 

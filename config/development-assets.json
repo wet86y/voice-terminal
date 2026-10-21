@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "commit": {
+    "max_file_bytes": 1048576,
+    "max_changed_bytes": 5242880,
+    "blocked_parts": [".local", "node_modules", "target", "__pycache__", ".pytest_cache", ".vite"],
+    "blocked_roots": ["logs", "reports", "data", ".runtime", "workspace"],
+    "blocked_suffixes": [".log", ".pyc", ".pyo", ".part", ".exe", ".dll", ".pdb", ".obj", ".lib", ".gguf", ".pt", ".onnx", ".zip", ".7z", ".whl", ".wav", ".mp3", ".flac", ".ogg", ".pcm", ".mp4", ".webm"],
+    "asset_roots": ["config/resources/assets", "assets", "tests/fixtures", "apps/frontend/src/assets", "apps/desktop/src-tauri/icons", "apps/desktop/bootstrap/icons", "apps/desktop/installer/icons"],
+    "pinned_assets": {
+      "config/resources/assets/audiocpp/voxcpm-patch.zip": {"sha256": "ff6ef48a3bd0bf570730afd1a352cca8bef7e6e0827ae0f3a25d24e1b11a2a4b", "reason": "既有固定原生补丁，安装链路依赖；变更前评估外部发布资产，不静默扩容"},
+      "config/resources/assets/fsmn-vad/onnx/model.onnx": {"sha256": "443ac237b4a33ea22b5ae5a6527888bc237d460fa7a20de7b632727a2c7db56f", "reason": "既有固定语音检测种子，与资源目录清单共同审查"},
+      "config/resources/assets/tokenizers/o200k_base.tiktoken": {"sha256": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d", "reason": "既有离线分词器种子，与下载摘要共同审查"}
+    }
+  },
+  "tasks": {"keep_failed": 2, "max_age_days": 7, "max_failed_bytes": 536870912},
+  "budgets": {
+    ".local/build/desktop/product/debug": 17179869184,
+    ".local/build/desktop/product/release": 10737418240,
+    ".local/cache/reports": 1073741824,
+    ".local/cache/pnpm": 3221225472,
+    ".local/tmp": 4294967296
+  },
+  "fields": {
+    "schema": "开发资产策略格式版本",
+    "commit": "暂存区提交检查；明确生成物阻止提交，大小与摘要默认提示",
+    "max_file_bytes": "普通单文件建议值，1 MiB（兆二进制字节）；默认提示，严格模式才拦截",
+    "max_changed_bytes": "本次提交不同内容对象总字节建议值，5 MiB；默认提示，不要求拆分正常提交",
+    "blocked_parts": "禁止进入提交的路径组成部分",
+    "blocked_roots": "禁止进入提交的仓库根目录",
+    "blocked_suffixes": "仅允许资源白名单目录收录的二进制或生成物后缀",
+    "asset_roots": "允许收录经过审查的小型种子资源的固定目录，仍受文件与提交预算限制",
+    "pinned_assets": "既有超限资源的精确路径和摘要例外；不允许通配放行",
+    "sha256": "批准内容的 SHA-256（内容摘要）",
+    "reason": "例外的用途与审查理由",
+    "tasks": "已登记测试任务的保留规则；活动任务和未知目录不删除",
+    "keep_failed": "每种任务最多保留的正常失败或显式保留的成功现场数；未知中断不自动回收",
+    "max_age_days": "已结束现场的最长保留天数",
+    "max_failed_bytes": "每种任务已结束现场的逻辑字节预算，512 MiB",
+    "budgets": "目录逻辑体积告警线，非磁盘实际占用，超限不自动删除"
+  }
+}

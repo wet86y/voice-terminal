@@ -9,6 +9,10 @@
     "apps/frontend"
   ],
   "scripts": {
+    "assets:audit": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py audit",
+    "assets:check": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py check-index",
+    "assets:prune": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py prune",
+    "assets:hook": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py install-hook",
     "dev": "npm run desktop:dev",
     "dev:ui": "npm run desktop:ui",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -Dev",
