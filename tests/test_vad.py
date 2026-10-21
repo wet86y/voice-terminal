@@ -89,11 +89,13 @@ class VadTests(unittest.TestCase):
                    return_value=ResourcePolicy({}, vad_backend="auto")), \
              patch("voice_terminal.vad.onnx_backend.OnnxStreamingModel") as onnx, \
              patch("voice_terminal.asr.model_loader.auto_model_class", return_value=fallback_factory), \
-             patch("voice_terminal.compute.device_candidates", return_value=["cuda"]):
+             patch("voice_terminal.compute.device_candidates", return_value=["cuda"]), \
+             patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime:
             detector = FsmnVadDetector(model_dir=Path("unused"), device="cuda")
 
         self.assertEqual(detector.backend, "funasr")
         self.assertEqual(detector.device, "cuda")
+        tensor_runtime.assert_called_once_with("cuda")
         onnx.assert_not_called()
 
     def test_explicit_funasr_policy_skips_onnx_even_on_cpu(self) -> None:

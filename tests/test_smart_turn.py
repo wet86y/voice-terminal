@@ -61,7 +61,10 @@ def backend(monkeypatch, tmp_path, *, available=True, silent_fallback=False, war
     ))
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(WhisperFeatureExtractor=Extractor))
     monkeypatch.setattr("voice_terminal.compute.device_candidates", lambda *args:["cuda", "cpu"])
+    selections = []
+    monkeypatch.setattr("voice_terminal.tensor_runtime.activate_tensor_runtime", selections.append)
     model = SmartTurn(tmp_path, device="cuda")
+    assert selections == ["cuda"]
     return model, sessions, extracted, preloads
 
 

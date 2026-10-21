@@ -58,41 +58,38 @@ class DualPassLane:
         self.enabled = enabled
 
         def change():
-            previous_device = getattr(self.model, "device", None)
+            close = getattr(self.model, "close", None)
+            if callable(close):
+                close()
             self.model = None
-            import gc
-            gc.collect()
-            if previous_device and str(previous_device).startswith("cuda"):
-                import torch
-                torch.cuda.empty_cache()
+            self.resource_footprint = None
             self.error = None
             if enabled:
                 try:
                     with model_load_footprint() as footprint:
-                        model = OfflineParaformer(self.model_dir, device)
-                        model.warmup()
+                        from ..model_process import ModelProcess
+                        model = ModelProcess("offline", self.model_dir, device=device)
                     self.model = model
-                    self.resource_footprint = footprint
+                    self.resource_footprint = model.resource_footprint or footprint
                 except Exception as exc:
                     self.error = str(exc)
                     if strict:
                         raise
-            else:
-                import gc
-                gc.collect()
 
         from .worker import AsrWorkerEngine
         future = asyncio.get_running_loop().run_in_executor(self.executor, change)
         await AsrWorkerEngine._await_native(future)
 
     def status(self):
-        return {"status": "DISABLED" if not self.enabled else "READY" if self.model else "DEGRADED",
-                "model": "BiCifParaformer（离线精修）", "model_loaded": self.model is not None,
+        loaded = self.model is not None and getattr(self.model, "alive", True)
+        return {"status": "DISABLED" if not self.enabled else "READY" if loaded else "DEGRADED",
+                "model": "BiCifParaformer（离线精修）", "model_loaded": loaded,
                 "identity": getattr(self.model, "identity", None),  # identity（固定模型身份）。
-                "model_warmed": bool(self.model and self.model.warmed),
+                "model_warmed": bool(loaded and self.model.warmed),
                 "device": self.model.device if self.model else None,
-                "runtime": "PyTorch（推理框架）", "error": self.error,
-                "resource_footprint": self.resource_footprint}
+                "runtime": "PyTorch（推理框架）", "error": self.error or getattr(self.model, "error", None),
+                "resource_status": getattr(self.model, "resource_status", None) if loaded else None,
+                "resource_footprint": self.resource_footprint if loaded else None}
 
     async def infer(self, pcm: bytes):
         epoch = self.epoch
@@ -115,4 +112,8 @@ class DualPassLane:
     def close(self):
         self.epoch += 1
         self.executor.shutdown(wait=True, cancel_futures=True)
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()
         self.model = None
+        self.resource_footprint = None

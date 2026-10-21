@@ -267,6 +267,15 @@ class ApplicationHost:
         model_dir = self.manifest.get("model_dir")
         env = ResourcePolicy.load(Path(env["VOICE_RESOURCE_POLICY"])).environment(
             key, model_dir=Path(model_dir) if model_dir else None, parent=env)
+        from ..gpu_environment import ROLES
+        devices = self.manifest.get("compute_devices", {})
+        tensor_models = ROLES.get(key, ())
+        if key == "analysis":
+            tensor_models = ("smart_turn",) if "endpoint" in self.manifest.get("analysis_lanes", ()) else ()
+        elif key == "voice":
+            tensor_models = ("voice_vad", "kws")
+        env["VOICE_TENSOR_DEVICE"] = ("cpu" if key in self.gpu_fallback_roles else
+            "cuda" if any(devices.get(name, "cpu") != "cpu" for name in tensor_models) else "cpu")
         if self.llm_provider:
             env["VOICE_LLM_PROVIDER"] = self.llm_provider
         if key == "voice":
@@ -517,12 +526,15 @@ class ApplicationHost:
                 request_id = uuid.uuid4().hex
                 await connection.send(json.dumps({"type": "health", "request_id": request_id}))
                 data = json.loads(await asyncio.wait_for(connection.recv(), 2))
+                self.manifest.setdefault("cpu_restart", {})[key] = data.get("device") == "cpu" and data.get("tensor_cuda_build") is True
                 if isinstance(data.get("hardware_capabilities"), dict):
                     self.manifest["hardware_capabilities"] = data["hardware_capabilities"]
                 return data.get("status") == "READY" and data.get("model_loaded") is True and data.get("request_id") == request_id
         if key == "analysis":
             url = urlsplit(self.manifest["analysis_url"])
             data = await self.http(f"http://{url.netloc}/health")
+            endpoint = data.get("endpoint", {})
+            self.manifest.setdefault("cpu_restart", {})[key] = endpoint.get("device") == "cpu" and endpoint.get("tensor_cuda_build") is True
             return all(data.get(lane, {}).get("status") == "READY" for lane in self.manifest["analysis_lanes"])
         if key == "voice":
             data = await self.http(self.state.value["voice_api_url"] + "/health")
@@ -574,6 +586,7 @@ class ApplicationHost:
         from ..gpu_environment import worker_python
         interpreter = worker_python(self.paths.install_root, self.paths.data_root or self.paths.install_root / "data", key, self.python,
                                     self.manifest.get("compute_devices", {}))
+        using_gpu = interpreter != self.python or key in self.manifest.get("startup_gpu_roles", ())
         if force_cpu:
             interpreter = self.python
             self.gpu_fallback_roles.add(key)
@@ -582,7 +595,7 @@ class ApplicationHost:
         try:
             process = self.spawn(key, python_command(interpreter, module, "--config", self.config, root=self.root))
         except OSError:
-            if interpreter != self.python and not force_cpu:
+            if using_gpu and not force_cpu:
                 log.warning("显卡解释器无法建立进程，%s（组件）恢复中央处理器环境。", key)
                 return await self.start_service(key, entry_only=entry_only, force_cpu=True)
             raise
@@ -596,7 +609,7 @@ class ApplicationHost:
                 if key == "voice":
                     for dependent in ("speaker", "dsh"):
                         self.state.clear_endpoint(dependent, generation=generation)
-                if interpreter != self.python and not force_cpu:
+                if using_gpu and not force_cpu:
                     log.warning("显卡解释器启动失败，%s（组件）恢复中央处理器环境。", key)
                     self.stop_group(key)
                     return await self.start_service(key, entry_only=entry_only, force_cpu=True)
@@ -605,6 +618,9 @@ class ApplicationHost:
                 endpoint = self.state.snapshot().get("endpoints", {}).get(key, {})
                 endpoint_registered = endpoint.get("generation") == generation and bool(endpoint.get("url"))
                 if endpoint_registered and await self.probe(key):
+                    if not force_cpu and self.manifest.get("cpu_restart", {}).get(key):
+                        self.stop_group(key)
+                        return await self.start_service(key, entry_only=entry_only, force_cpu=True)
                     if key == "voice" and entry_only:
                         self.state.component(key, state="waiting", phase="接口已监听，等待本地模型加载", error="")
                         self.voice_entry_ready = True
@@ -621,7 +637,7 @@ class ApplicationHost:
         if key == "voice":
             for dependent in ("speaker", "dsh"):
                 self.state.clear_endpoint(dependent, generation=generation)
-        if interpreter != self.python and not force_cpu:
+        if using_gpu and not force_cpu:
             return await self.start_service(key, entry_only=entry_only, force_cpu=True)
         raise RuntimeError("组件启动等待超时；请查看对应组件日志。")
 

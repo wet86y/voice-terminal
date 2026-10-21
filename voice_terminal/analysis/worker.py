@@ -8,7 +8,7 @@ from typing import Callable
 
 from .protocol import decode_request, open_request_audio
 from ..resources import process_resource_status, registry, ResourcePolicy, model_load_footprint
-from ..compute import process_memory_bytes
+from ..tensor_runtime import cuda_tensor_loaded
 
 
 class AnalysisLane:
@@ -28,6 +28,7 @@ class AnalysisLane:
         self.active_run_options = None
         self.resource_footprint = None  # resource_footprint（加载及预热的内存增量估算）。
         self.changing = False  # changing（模型正在装卸，暂停新任务准入）。
+        self._closed = False
         self._managed_audio = ResourcePolicy.load().shared_audio
 
     def prepare(self, factory: Callable) -> None:
@@ -38,18 +39,22 @@ class AnalysisLane:
                 warmup = getattr(model, "warmup", None)
                 if callable(warmup):
                     warmup()
-            self.resource_footprint = footprint
+            self.resource_footprint = getattr(model, "resource_footprint", None) or footprint
             return model
         self.model = self.executor.submit(load).result()
         self.model_name = getattr(self.model, "model_file", self.model_name)
 
     def health_payload(self) -> dict:
         model = self.model
+        alive = getattr(model, "alive", True)
+        loaded = model is not None and alive
+        resources = (getattr(model, "resource_status", None) or process_resource_status()) if alive else None
         return {
-            "status": "DISABLED" if self.error == "disabled" else "READY" if self.model else "DEGRADED",
+            "status": "DISABLED" if self.error == "disabled" else "READY" if loaded else "DEGRADED",
             "model": self.model_name,
             "identity": getattr(model, "identity", None),  # identity（固定模型身份与来源修订）。
-            "model_loaded": self.model is not None,
+            "model_loaded": loaded,
+            "tensor_cuda_build": getattr(model, "tensor_cuda_build", cuda_tensor_loaded()),
             "model_warmed": getattr(model, "warmed", None),  # model_warmed（是否完成真实推理预热）。
             "model_file": getattr(model, "model_file", None),  # model_file（实际模型文件）。
             "providers": getattr(model, "providers", None),  # providers（实际推理后端）。
@@ -58,10 +63,10 @@ class AnalysisLane:
             "device": getattr(model, "device", None),  # device（实际设备）。
             "internal_vad_device": getattr(model, "internal_vad_device", None),  # internal_vad_device（内部语音检测设备）。
             "load_error": getattr(model, "load_error", None),  # load_error（加载或回退原因）。
-            "process_memory_rss_bytes": process_memory_bytes(),
-            "resource_status": process_resource_status(),  # resource_status（资源状态）。
-            "resource_footprint": self.resource_footprint,  # resource_footprint（同进程内加载增量估算）。
-            "error": self.error,
+            "process_memory_rss_bytes": resources["rss_bytes"] if resources else None,
+            "resource_status": resources,  # resource_status（模型所在进程最近一次采样）。
+            "resource_footprint": self.resource_footprint if loaded else None,  # resource_footprint（同进程内加载增量估算）。
+            "error": self.error or getattr(model, "error", None),
         }
 
     async def run(self, pcm: bytes, request_id: str, audio_owner=None) -> dict:
@@ -125,7 +130,19 @@ class AnalysisLane:
         return True
 
     def close(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        if self._closed:
+            return
+        self._closed = True
+        self.executor.submit(self.release).result()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def release(self) -> None:
+        """release（卸载）：在推理线程退出模型进程，等待原生内存真正释放。"""
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()
+        self.model = None
+        self.resource_footprint = None
 
 
 def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None = None):
@@ -164,7 +181,6 @@ def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None =
                 await socket.send_json(await health())
                 return
             if request.get("operation") == "configure":
-                import gc
                 changes = request.get("enabled")
                 if not isinstance(changes, dict) or not factories or any(
                     name not in factories or type(enabled) is not bool for name, enabled in changes.items()
@@ -177,15 +193,11 @@ def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None =
                         try:
                             if selected.active is not None:
                                 await asyncio.gather(asyncio.shield(selected.active), return_exceptions=True)
-                            previous_device = getattr(selected.model, "device", None)
-                            selected.model = None
-                            gc.collect()
-                            if previous_device and str(previous_device).startswith("cuda"):
-                                import torch
-                                torch.cuda.empty_cache()
+                            from ..asr.worker import AsrWorkerEngine
+                            await AsrWorkerEngine._await_native(asyncio.get_running_loop().run_in_executor(
+                                selected.executor, selected.release))
                             selected.error = "disabled" if not enabled else None
                             if enabled:
-                                from ..asr.worker import AsrWorkerEngine
                                 await AsrWorkerEngine._await_native(asyncio.ensure_future(
                                     asyncio.to_thread(selected.prepare, factories[name])))
                         except Exception as exc:

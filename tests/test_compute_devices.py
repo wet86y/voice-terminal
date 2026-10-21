@@ -23,9 +23,11 @@ class ComputeDeviceTests(unittest.TestCase):
         engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
         with (
             patch("voice_terminal.compute.startup_device", return_value="cuda"),
+            patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime,
             patch("funasr.AutoModel", return_value=SimpleNamespace(kwargs={"device": "cpu"}, generate=lambda **_: [])),
         ):
             engine.load()
+        tensor_runtime.assert_called_once_with("cuda")
         self.assertEqual(engine.requested_device, "cuda")
         self.assertEqual(engine.device, "cpu")
         self.assertTrue(engine.model_loaded)
@@ -50,8 +52,10 @@ class ComputeDeviceTests(unittest.TestCase):
             return SimpleNamespace(kwargs={"device": device}, generate=generate)
         try:
             with (patch("voice_terminal.compute.startup_device", return_value="cuda"),
+                  patch("voice_terminal.tensor_runtime.activate_tensor_runtime") as tensor_runtime,
                   patch("funasr.AutoModel", side_effect=factory), patch("torch.cuda.empty_cache")):
                 engine.load()
+            tensor_runtime.assert_called_once_with("cuda")
             self.assertEqual(calls, ["cuda", "cpu"])
             self.assertEqual(engine.device, "cpu")
             self.assertTrue(engine.model_warmed)

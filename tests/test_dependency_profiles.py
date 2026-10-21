@@ -31,3 +31,15 @@ def test_gpu_alias_still_checks_missing_dependency_and_version(monkeypatch):
     errors = dependency_errors()
     assert len(errors) == 2
     assert "onnxruntime>=2" in errors[0] and "missing-package>=1" in errors[1]
+
+
+def test_managed_onnx_packages_are_allowed_only_in_separate_directories(monkeypatch, tmp_path):
+    cpu = distribution("onnxruntime", "1.24.3")
+    gpu = distribution("onnxruntime-gpu")
+    cpu.locate_file = lambda _: tmp_path / "Lib/cpu-packages"
+    gpu.locate_file = lambda _: tmp_path / "Lib/site-packages"
+    monkeypatch.setattr("voice_terminal.dependencies.sys.executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr("voice_terminal.dependencies.metadata.distributions", lambda **kwargs: [cpu, gpu])
+    assert dependency_errors() == []
+    cpu.locate_file = gpu.locate_file
+    assert "不能同时安装" in dependency_errors()[0]

@@ -10,6 +10,16 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml'
 ONNX_GPU_VERSION = "1.24.4"  # ONNX_GPU_VERSION（已验证的显卡推理运行库版本）。
 
 
+def _isolated_onnx_pair(cpu, gpu) -> bool:
+    """仅允许受管解释器的两个独立目录，不放行同目录的模块覆盖。"""
+    root = Path(sys.executable).parent.resolve()
+    try:
+        return (Path(cpu.locate_file("")).resolve() == root / "Lib/cpu-packages"
+                and Path(gpu.locate_file("")).resolve() == root / "Lib/site-packages")
+    except AttributeError:
+        return False
+
+
 def dependency_errors(directory: Path | None = None) -> list[str]:
     """dependency_errors（依赖闭包错误）：显卡运行库提供相同的 ONNX（模型格式）模块。"""
     from packaging.requirements import Requirement
@@ -17,7 +27,8 @@ def dependency_errors(directory: Path | None = None) -> list[str]:
     options = {"path": [str(directory)]} if directory is not None else {}
     installed = {canonicalize_name(item.metadata["Name"]): item for item in metadata.distributions(**options)}
     failures = []
-    if "onnxruntime" in installed and "onnxruntime-gpu" in installed:
+    if ("onnxruntime" in installed and "onnxruntime-gpu" in installed
+            and not _isolated_onnx_pair(installed["onnxruntime"], installed["onnxruntime-gpu"])):
         failures.append("ONNX Runtime（模型推理运行时）中央处理器版与显卡版不能同时安装，模块文件会相互覆盖")
     for package in installed.values():
         for raw in package.requires or []:
@@ -85,7 +96,9 @@ def diagnose(*, candidate=False, check_dependencies=True) -> dict:
     except metadata.PackageNotFoundError:
         pass
     else:
-        mismatches.append({"package": "onnxruntime / onnxruntime-gpu", "expected": "仅安装一种模型推理运行库", "actual": "两者同时存在"})
+        isolated = _isolated_onnx_pair(metadata.distribution("onnxruntime"), metadata.distribution("onnxruntime-gpu"))
+        if not isolated:
+            mismatches.append({"package": "onnxruntime / onnxruntime-gpu", "expected": "仅安装一种模型推理运行库，或使用受管隔离目录", "actual": "两者同时存在"})
     # funasr-onnx（语音推理包装）元数据只声明中央处理器包名；同模块的显卡发行包是有效替代。
     # 不能同时安装两个发行包来让 pip check（包名依赖检查）表面通过。
     failures = dependency_errors() if check_dependencies else None

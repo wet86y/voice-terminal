@@ -13,6 +13,7 @@ from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
 from ..compute import process_memory_bytes, hardware_status
+from ..tensor_runtime import cuda_tensor_loaded
 from ..resources import model_thread_budget, process_resource_status, registry, model_load_footprint
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,12 @@ class AsrWorkerEngine:
         if not self.model_dir.is_dir():
             raise FileNotFoundError(f"Paraformer（流式识别）模型目录不存在：{self.model_dir}")
         started = time.perf_counter()
+        from ..compute import startup_device, loaded_funasr_device
+        initial = startup_device(self.requested_device, "paraformer")
+        self.startup_timings_ms["hardware"] = (time.perf_counter() - started) * 1000
+        from ..tensor_runtime import activate_tensor_runtime
+        activate_tensor_runtime(initial)
+        started = time.perf_counter()
         try:
             import numpy as np  # type: ignore
             from .model_loader import auto_model_class
@@ -134,11 +141,6 @@ class AsrWorkerEngine:
         self.startup_timings_ms["imports"] = (time.perf_counter() - started) * 1000  # imports（依赖导入）。
         self._np = np
         fallback = self.fallback_device if self.fallback_device in {"cpu", "cuda"} else "cpu"
-        requested = self.requested_device
-        from ..compute import startup_device, loaded_funasr_device
-        started = time.perf_counter()
-        initial = startup_device(requested, "paraformer")
-        self.startup_timings_ms["hardware"] = (time.perf_counter() - started) * 1000  # hardware（设备探测）。
         candidates = [initial]
         if initial == "cuda":
             if fallback != initial:
@@ -516,6 +518,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "type": "health",
                             "status": "READY",
                             "model_loaded": engine.model_loaded,
+                            "tensor_cuda_build": cuda_tensor_loaded(),
                             "model_warmed": getattr(engine, "model_warmed", None),  # model_warmed（真实推理预热完成）。
                             "runtime": "PyTorch（推理框架）" if engine.model_loaded else None,  # runtime（实际加载引擎）。
                             "device": getattr(engine, "device", None),

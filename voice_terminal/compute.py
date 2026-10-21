@@ -230,7 +230,7 @@ def hardware_status(*, refresh: bool = False, onnx_only: bool = False) -> dict[s
             cached = _capabilities
         if not onnx_only and (_capabilities is None or refresh):
             serialized = os.environ.get("VOICE_HARDWARE_CAPABILITIES")
-            if os.environ.get("VOICE_RESOURCE_ROLE") != "voice":
+            if os.environ.get("VOICE_RESOURCE_ROLE") not in {"voice", "asr", "analysis", "speaker"}:
                 _capabilities = _backend_hardware_status()
             elif serialized and not refresh:
                 _capabilities = json.loads(serialized)

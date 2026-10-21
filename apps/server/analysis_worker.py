@@ -19,7 +19,7 @@ from voice_terminal.config import load_config
 from voice_terminal.paths import AppPaths
 from voice_terminal.analysis.worker import AnalysisLane, create_analysis_app
 from voice_terminal.analysis.smart_turn import SmartTurn
-from voice_terminal.analysis.perception import Emotion2vec, Yamnet
+from voice_terminal.model_process import ModelProcess
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.application.managed import report, report_endpoint, run_uvicorn
@@ -49,10 +49,10 @@ def main():
         configure_logging(paths.logs / "analysis-worker.log")
     lanes = {}
     factories = {
-        "emotion": lambda: Emotion2vec(config.model_dir / "analysis/emotion2vec-plus-base",
+        "emotion": lambda: ModelProcess("emotion", config.model_dir / "analysis/emotion2vec-plus-base",
             device=config.compute.devices.get("emotion", "cpu"),
             fallback_device=config.compute.fallback_devices.get("emotion", "cpu")),
-        "acoustic": lambda: Yamnet(config.model_dir / "analysis/yamnet"),
+        "acoustic": lambda: ModelProcess("acoustic", config.model_dir / "analysis/yamnet"),
     }
     report("analysis", "加载语句结束判断与语音精修模型")
     for name, enabled, model_name, factory in (

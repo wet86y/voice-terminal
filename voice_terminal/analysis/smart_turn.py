@@ -5,6 +5,10 @@ import time
 class SmartTurn:
     def __init__(self, model_dir: Path, *, device: str = "cpu",
                  fallback_device: str = "cpu") -> None:
+        from ..compute import device_candidates
+        candidates = device_candidates(device, "smart_turn", fallback_device)
+        from ..tensor_runtime import activate_tensor_runtime
+        activate_tensor_runtime(candidates[0])
         import onnxruntime as ort
         from transformers import WhisperFeatureExtractor
         self.requested_device = device
@@ -13,9 +17,8 @@ class SmartTurn:
         self.last_latency: dict[str, float] = {}  # last_latency（最近一次调用的分阶段耗时）。
         self.load_error: str | None = None
         self.extractor = WhisperFeatureExtractor.from_pretrained(str(model_dir), local_files_only=True)
-        from ..compute import device_candidates
         last_error: Exception | None = None
-        for candidate in device_candidates(device, "smart_turn", fallback_device):
+        for candidate in candidates:
             session = None
             try:
                 model_file = "smart-turn-v3.2-gpu.onnx" if candidate == "cuda" else "smart-turn-v3.2-cpu.onnx"
