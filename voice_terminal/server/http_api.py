@@ -181,7 +181,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise HTTPException(status_code=422, detail="组件能力标识无效。")
         if payload["action"] in {"reinitialize", "initialize-session"}:
             fields = (("asr_available", "VOICE_APP_ASR_AVAILABLE"),
-                      ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE"))
+                      ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE"),
+                      ("asr_managed", "VOICE_APP_ASR_MANAGED"),
+                      ("analysis_managed", "VOICE_APP_ANALYSIS_MANAGED"))
             # 全部字段验证成功后再更新环境，避免无效请求留下半份依赖状态。
             if any(type(payload.get(field)) is not bool for field, _ in fields):
                 raise HTTPException(status_code=422, detail="缺少受管工作进程状态。")
@@ -701,35 +703,84 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.put("/api/v1/product/settings/compute")
     async def update_product_compute(body: dict[str, Any]) -> dict[str, Any]:
         try:
-            store = product_store_or_404()
-            if set(body) != {"devices"} or not isinstance(body.get("devices"), dict):
-                raise ProductSettingsError("计算设备设置字段必须仅包含 devices（模型设备选项）。")
-            # Resolve through the historical module so existing diagnostics
-            # and test hooks observe the same hardware probe.
-            from . import websocket as session_module
-            from ..compute import model_hardware_status
-            hardware = await asyncio.to_thread(session_module.hardware_status, refresh=True) if any(mode == "cuda" for mode in body["devices"].values()) else await asyncio.to_thread(session_module.hardware_status)
-            hardware = await asyncio.to_thread(model_hardware_status, hardware, runtime.config, verify=True)
-            for name, mode in body["devices"].items():
-                if mode == "cuda" and not hardware.get("models", {}).get(name, {}).get("gpu_available"):
-                    reason = hardware.get("models", {}).get(name, {}).get("reason") or "GPU 后端不可用。"
-                    raise ProductSettingsError(f"{name} 暂不能使用 GPU：{reason}")
-            current = await runtime.compute_status()
-            active_devices = {
-                name: str(item.get("device") or "cpu")
-                for name, item in current["models"].items()
-            }
-            value = await asyncio.to_thread(store.save_compute, body, active_devices=active_devices)
+            # 未开放热切换的设备项沿用旧契约：保存单项偏好，重启应用后生效。
+            model_id = body.get("model_id") if isinstance(body, dict) else None
+            if (set(body) == {"model_id", "device"} and isinstance(model_id, str)
+                    and model_id in {"voice_vad", "kws", "smart_turn"}):
+                store = product_store_or_404()
+                device = body.get("device")
+                if device == "cuda":
+                    from . import websocket as session_module
+                    from ..compute import model_hardware_status
+                    hardware = await asyncio.to_thread(session_module.hardware_status, refresh=True)
+                    hardware = await asyncio.to_thread(model_hardware_status, hardware, runtime.config, verify=True)
+                    capability = hardware.get("models", {}).get(model_id, {})
+                    if not capability.get("gpu_available"):
+                        reason = capability.get("reason") or "GPU 后端不可用。"
+                        raise ValueError(f"{model_id} 暂不能使用 GPU：{reason}")
+                value = await asyncio.to_thread(store.save_compute_model, model_id, device)
+                return {
+                    "settings": {"compute": value},
+                    "effective_from": "application_restart",  # effective_from（生效时机）：重启应用后生效。
+                    "restart_required": True,  # restart_required（是否需要重启）：是。
+                    "pending": True,  # pending（待生效标记）：设置尚未作用于当前运行实例。
+                    "message": "该模型暂不支持热切换；设备设置已保存，重新启动应用后生效。",
+                }
+            if not isinstance(body, dict) or set(body) != {"model_id", "device"}:
+                raise ValueError("计算设备请求必须只包含 model_id（目标模型编号）和 device（目标设备模式）。")
+            model_id, device = body.get("model_id"), body.get("device")
+            if not isinstance(model_id, str) or model_id not in {"paraformer", "emotion", "campplus"}:
+                raise ValueError("model_id（目标模型编号）只支持 paraformer、emotion 和 campplus。")
+            if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
+                raise ValueError("device（目标设备模式）必须是 auto、cpu 或 cuda。")
+
+            # 切换耗时主要在模型进程重建和推理预热；HTTP（网页接口）只负责接纳，
+            # 实际阶段由同一运行操作快照持续发布给状态卡，避免“保存中”占住按钮十余秒。
+            label = {"paraformer": "Paraformer", "emotion": "emotion2vec", "campplus": "CAM++"}[model_id]
+            operations = runtime_operations(runtime)
+            ticket = operations.reserve(f"compute_device:{model_id}", f"{label}运行设备切换",
+                                        phase="switching", pause=True)
+            tasks = getattr(runtime, "_compute_switch_tasks", None)
+            if tasks is None:
+                tasks = runtime._compute_switch_tasks = {}
+
+            async def run_compute_switch():
+                try:
+                    await runtime.switch_compute_device(body, ticket=ticket)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("计算设备切换后台操作失败：model_id=%s", model_id)
+
+            task = asyncio.create_task(run_compute_switch(), name=f"compute-switch-{model_id}")
+            tasks[task] = ticket
+
+            def release_unstarted(done):
+                tasks.pop(done, None)
+                # If shutdown cancels the task before its coroutine enters
+                # RuntimeOperations.run, release the synchronous reservation.
+                if ticket.started or ticket.released:
+                    return
+                failure = asyncio.CancelledError() if done.cancelled() else done.exception()
+                asyncio.create_task(operations.finish(ticket, failure))
+
+            task.add_done_callback(release_unstarted)
+            await operations.publish()
             return {
-                "settings": {"compute": value},
-                "effective_from": "application_restart",
-                "restart_required": True,
-                "pending": True,
-                "message": "本地模型运行设备设置已保存，重新启动应用后生效。",
+                "effective_from": "immediate",  # effective_from（生效时机）：即时生效。
+                "restart_required": False,  # restart_required（是否需要重启）：否。
+                "accepted": True,  # accepted（已接纳标记）：操作已交给后台，最终状态由运行状态卡发布。
+                "operation_id": ticket.key,  # operation_id（运行操作编号）：用于关联本次状态卡进度。
+                "pending": True,  # pending（待生效标记）：切换完成并核验前仍待生效。
+                "message": "设备切换已开始，进度与结果会显示在运行状态中。",
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
                 raise
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if isinstance(exc, (RuntimeError, OSError)):
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
             registry_error(exc)
             raise AssertionError("unreachable")
 

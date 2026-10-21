@@ -44,6 +44,23 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(card.get('.component-enhancement-copy small').text()).toContain('切换中')
     wrapper.unmount()
   })
+
+  it('设备热切换阶段同步显示在模型状态卡和保存按钮', async () => {
+    const value = model()
+    value.rows = [{ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）', category: 'speech',
+      state: 'loading', status: '切换中', available: false, runtime: 'PyTorch（推理框架）',
+      description: '加载与预热中', facts: [],
+      device: { value: 'cuda', current: 'GPU（图形处理器）', locked: true, busy: true,
+        options: [{ value: 'cpu', label: 'CPU（中央处理器）' }, { value: 'cuda', label: 'GPU（图形处理器）' }] } }]
+    const wrapper = mount(LocalComponents, { props: { model: value, saving: true } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    expect(card.get('.local-state').text()).toBe('切换中')
+    expect(card.text()).toContain('加载与预热中')
+    expect(card.get('.save-button').text()).toBe('切换中')
+    expect(card.get('.save-button').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
   it('资源齐全时保留一键下载与资源导入入口，标题不显示旧说明', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
     const heading = wrapper.get('.local-managed-heading')

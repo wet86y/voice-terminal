@@ -10,7 +10,7 @@ export interface RuntimeOperation {
 }
 
 export const operationPhaseLabel = (value: RuntimeOperation) => value.detail || ({
-  queued: '等待切换', pausing: '正在暂停监听', waiting_output: '等待当前回答与播报结束',
+  queued: '等待切换', pausing: '正在暂停监听', checking: '检查模型资源与运行环境', waiting_output: '等待当前回答与播报结束',
   switching: '切换中', restarting: '重启中', loading: '加载与预热中', verifying: '核验中',
   rolling_back: '正在恢复原设置', resuming: '正在恢复监听', processing: '处理中',
   recording: '录音中', ready: '已就绪', failed: '操作失败',

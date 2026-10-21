@@ -20,8 +20,11 @@ class AnalysisLane:
         error: str | None = None,
         *,
         model_name: str | None = None,
+        device_preference: str | None = None,
     ) -> None:
         self.model, self.error, self.model_name = model, error, model_name
+        self.device_preference = device_preference
+        self.device_fallback = "cpu"  # device_fallback（该模型最近核验成功的实际设备）。
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speech-analysis")
         self.active: asyncio.Future | None = None
         self.active_request_id: str | None = None
@@ -43,6 +46,12 @@ class AnalysisLane:
             return model
         self.model = self.executor.submit(load).result()
         self.model_name = getattr(self.model, "model_file", self.model_name)
+        requested = getattr(self.model, "requested_device", None)
+        if isinstance(requested, str):
+            self.device_preference = requested
+        actual = getattr(self.model, "device", None)
+        if isinstance(actual, str):
+            self.device_fallback = "cuda" if actual.startswith("cuda") else "cpu"
 
     def health_payload(self) -> dict:
         model = self.model
@@ -181,14 +190,21 @@ def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None =
                 await socket.send_json(await health())
                 return
             if request.get("operation") == "configure":
-                changes = request.get("enabled")
-                if not isinstance(changes, dict) or not factories or any(
+                changes = request.get("enabled", {})
+                devices = request.get("devices", {})
+                allow_cuda_fallback = request.get("allow_cuda_fallback", {})  # allow_cuda_fallback（GPU 回滚标记）。
+                if (not isinstance(changes, dict) or not isinstance(devices, dict)
+                    or not isinstance(allow_cuda_fallback, dict) or not factories or any(
                     name not in factories or type(enabled) is not bool for name, enabled in changes.items()
-                ):
+                ) or any(name not in {"emotion"} or not isinstance(mode, str) or mode not in {"auto", "cpu", "cuda"}
+                         for name, mode in devices.items())
+                or any(name != "emotion" or type(enabled) is not bool
+                       for name, enabled in allow_cuda_fallback.items()) or not (changes or devices)):
                     raise ValueError("背景感知模型设置无效")
                 async with configuration_lock:
-                    for name, enabled in changes.items():
+                    for name in dict.fromkeys((*changes.keys(), *devices.keys())):
                         selected = lanes[name]
+                        enabled = changes.get(name, selected.error != "disabled")
                         selected.changing = True
                         try:
                             if selected.active is not None:
@@ -198,8 +214,29 @@ def create_analysis_app(lanes: dict[str, AnalysisLane], factories: dict | None =
                                 selected.executor, selected.release))
                             selected.error = "disabled" if not enabled else None
                             if enabled:
+                                factory = factories[name]
+                                device = devices.get(name, selected.device_preference)
+                                allow_fallback = allow_cuda_fallback.get(name, False)
+                                if name == "emotion" and device is not None:
+                                    import inspect
+                                    try:
+                                        parameters = inspect.signature(factory).parameters
+                                        accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                                              for parameter in parameters.values())
+                                    except (TypeError, ValueError):
+                                        parameters, accepts_kwargs = {}, False
+                                    factory_options = {}
+                                    if accepts_kwargs or "fallback_device" in parameters:
+                                        factory_options["fallback_device"] = selected.device_fallback
+                                    if accepts_kwargs or "allow_cuda_fallback" in parameters:
+                                        factory_options["allow_cuda_fallback"] = allow_fallback
+                                    prepare = lambda: factory(device, **factory_options)
+                                else:
+                                    prepare = factory
                                 await AsrWorkerEngine._await_native(asyncio.ensure_future(
-                                    asyncio.to_thread(selected.prepare, factories[name])))
+                                    asyncio.to_thread(selected.prepare, prepare)))
+                                if name in devices:
+                                    selected.device_preference = devices[name]
                         except Exception as exc:
                             selected.error = str(exc)
                             raise

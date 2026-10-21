@@ -10,6 +10,7 @@ import type {
   ProductAssignments,
   ProductComputeStatus,
   ProductLocalModelId,
+  ProductHotSwitchModelId,
   ProductModel,
   ProductModelRegistry,
   ProductMutationResult,
@@ -31,6 +32,7 @@ export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
 const NOTICE_DISPLAY_MS = 5000
 const NOTICE_FADE_MS = 420
+const hotSwitchComputeModelIds = new Set<ProductHotSwitchModelId>(['paraformer', 'emotion', 'campplus'])
 /** AudioEnhancementKey（音频增强字段编号）：和持久化设置字段一致。 */
 type AudioEnhancementKey = keyof NonNullable<ProductSettingsSnapshot['audio_enhancements']>
 const audioEnhancementKeys: AudioEnhancementKey[] = ['dual_pass', 'emotion', 'acoustic_events'] // audioEnhancementKeys（可同步的音频增强字段）。
@@ -104,6 +106,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let computeStatusRevision = 0 // computeStatusRevision（组件状态代次）：旧进程的采样不能覆盖新状态。
   let computeStatusRequest = 0 // computeStatusRequest（采样请求代次）：并发请求只接纳最新结果。
   const computeSavedDevices = ref(structuredClone(DEFAULT_SETTINGS.compute.devices)) // computeSavedDevices（已持久化设备偏好）。
+  const computeOperationStates = new Map<string, string>() // computeOperationStates（设备切换上次状态）：只在后台操作结束时同步设置与模型状态。
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
   let registryRevision = 0 // registryRevision（注册表响应代次）：旧快照不能覆盖已经完成的扫描或保存。
   const initialComputeDevices = structuredClone(DEFAULT_SETTINGS.compute.devices)
@@ -383,6 +386,33 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
+  watch(() => voice.runtimeOperations.value
+    .filter(operation => operation.target.startsWith('compute_device:'))
+    .map(operation => ({ ...operation })), operations => {
+    for (const operation of operations) {
+      const previous = computeOperationStates.get(operation.id)
+      computeOperationStates.set(operation.id, operation.state)
+      if (previous !== 'running' || operation.state === 'running') continue
+      const modelId = operation.target.slice('compute_device:'.length) as ProductHotSwitchModelId
+      if (!hotSwitchComputeModelIds.has(modelId)) continue
+      void (async () => {
+        await loadSnapshot()
+        if (operation.state !== 'succeeded') {
+          // 失败或取消时，保留旧设备偏好，撤掉这行未提交的目标草稿。
+          settings.compute.devices[modelId] = computeSavedDevices.value[modelId]
+        }
+        await refreshComputeStatus()
+      })()
+    }
+    if (computeOperationStates.size > 256) {
+      for (const id of computeOperationStates.keys()) {
+        if (operations.some(operation => operation.id === id)) continue
+        computeOperationStates.delete(id)
+        if (computeOperationStates.size <= 128) break
+      }
+    }
+  }, { deep: true, flush: 'sync' })
+
   /** saveAudioEnhancement（音频增强开关事务）：即时预览目标值，失败时回滚，并保护它不被旧快照覆盖。 */
   async function saveAudioEnhancement(key: AudioEnhancementKey) {
     if (pendingAudioEnhancements.has(key)) return
@@ -407,19 +437,32 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
-  async function saveComputeSettings() {
+  async function saveComputeSettings(modelId: string) {
+    if (!hotSwitchComputeModelIds.has(modelId as ProductHotSwitchModelId)) return
+    const selectedModelId = modelId as ProductHotSwitchModelId
     await enqueue(async () => {
       saving.value = true
       try {
-        const submitted = { ...settings.compute.devices }
-        const result = await productApi.saveCompute({ devices: submitted })
-        const newerDraft = JSON.stringify(settings.compute.devices) !== JSON.stringify(submitted) ? { ...settings.compute.devices } : null
+        const submitted = settings.compute.devices[selectedModelId]
+        const draftsBefore = { ...settings.compute.devices }
+        const result = await productApi.saveCompute({ model_id: selectedModelId, device: submitted })
+        if (result.accepted === true) {
+          // 后端已将切换登记到运行操作状态卡；这里结束按钮等待，不提前标记设置已保存。
+          void refreshComputeStatus()
+          return
+        }
+        const latestDrafts = { ...settings.compute.devices }
         updateSettingsFromResponse(settings, result)
-        computeSavedDevices.value = { ...settings.compute.devices }
-        if (newerDraft) Object.assign(settings.compute.devices, newerDraft)
+        for (const id of Object.keys(draftsBefore) as ProductLocalModelId[]) {
+          if (id !== selectedModelId || latestDrafts[id] !== submitted) {
+            settings.compute.devices[id] = latestDrafts[id] ?? draftsBefore[id]
+          }
+        }
+        computeSavedDevices.value = { ...computeSavedDevices.value, [selectedModelId]: submitted }
         setNotice(result.message || (result.restart_required
           ? '本地模型运行设备设置已保存，重新启动应用后生效。'
-          : '本地模型运行设备设置已保存。'))
+          : '本地模型运行设备已切换并即时生效。'))
+        await refreshComputeStatus()
       } catch (error) {
         setError(error)
       } finally {

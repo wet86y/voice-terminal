@@ -20,7 +20,10 @@ _PREFIX = "VOICE_MODEL_RESULT="
 
 
 class ModelProcess:
-    def __init__(self, kind: str, model_dir: Path, *, device="cpu", fallback_device="cpu"):
+    def __init__(self, kind: str, model_dir: Path, *, device="cpu", fallback_device="cpu",
+                 require_cuda: bool = False,  # require_cuda（严格使用图形处理器）。
+                 ignore_host_fallback: bool = False,  # ignore_host_fallback（忽略宿主强制中央处理器回退）。
+                 model_options: dict | None = None):  # model_options（模型专用参数）。
         self._lock = threading.RLock()
         self._responses = queue.Queue()
         self._process = None
@@ -28,20 +31,29 @@ class ModelProcess:
         self.resource_status = None
         self.tensor_cuda_build = False
         self.requested_device = device
-        attempts = (("cpu",) if os.environ.get("VOICE_GPU_FALLBACK") else
+        self.fallback_device = fallback_device
+        self.model_options = model_options or {}
+        host_fallback = bool(os.environ.get("VOICE_GPU_FALLBACK")) and not ignore_host_fallback
+        attempts = (("cpu",) if host_fallback else
                     (device, "cpu") if kind == "emotion" and device != "cpu" else (device,))
-        previous_error = "宿主已切换到独立 CPU（中央处理器）依赖" if attempts == ("cpu",) and device != "cpu" else None
+        previous_error = "宿主已切换到独立 CPU（中央处理器）依赖" if host_fallback and device != "cpu" else None
         for selected in attempts:
             try:
-                metadata = self._start(kind, model_dir, selected, fallback_device)
+                metadata = self._start(kind, model_dir, selected, fallback_device,
+                                       ignore_host_fallback, self.model_options)
                 if selected != "cpu" and metadata.get("device") == "cpu" and len(attempts) > 1:
                     previous_error = metadata.get("load_error") or "显卡模型已回退到独立处理器进程"
                     self.close()
                     continue
                 self.__dict__.update(metadata)
                 self.requested_device = device
+                self.fallback_device = fallback_device
                 if previous_error:
                     self.load_error = str(previous_error)
+                if require_cuda and str(self.device).startswith("cpu"):
+                    error = self.load_error or "显式请求 cuda（图形处理器），但模型实际运行于 cpu（中央处理器）。"
+                    self.close()
+                    raise RuntimeError(error)
                 return
             except BaseException as error:
                 self.close()
@@ -49,13 +61,37 @@ class ModelProcess:
                     raise
                 previous_error = error
 
-    def _start(self, kind, model_dir, device, fallback_device):
+    def _start(self, kind, model_dir, device, fallback_device, ignore_host_fallback=False,
+               model_options=None):
         from .paths import python_command
 
         self._responses = queue.Queue()
         environment = {**os.environ, "VOICE_TENSOR_DEVICE": device, "PYTHONDONTWRITEBYTECODE": "1"}
-        command = python_command(sys.executable, "voice_terminal.model_process", kind, str(model_dir),
-                                 "--device", device, "--fallback-device", fallback_device)
+        cpu_python = environment.get("VOICE_CPU_PYTHON")
+        executable = sys.executable
+        if cpu_python:
+            from .paths import AppPaths
+            from .gpu_environment import worker_python
+            paths = AppPaths.resolve()
+            model_id = {"streaming": "paraformer", "offline": "paraformer", "emotion": "emotion",
+                        "acoustic": "smart_turn"}.get(kind)
+            role = {"streaming": "asr", "offline": "asr", "emotion": "analysis",
+                    "acoustic": "analysis"}.get(kind)
+            if model_id is not None:
+                devices = {model_id: device}
+                if role == "analysis":
+                    # The nested process only owns this model; another model's
+                    # auto preference must not pull a CPU child into the GPU runtime.
+                    devices.update({name: "cpu" for name in ("emotion", "smart_turn") if name != model_id})
+                executable = worker_python(paths.install_root, paths.data_root or paths.install_root / "data",
+                                           role, cpu_python, devices)
+        if ignore_host_fallback:
+            environment.pop("VOICE_GPU_FALLBACK", None)
+        environment["VOICE_RESOURCE_ROLE"] = {"streaming": "asr", "offline": "asr", "emotion": "analysis",
+                                               "acoustic": "analysis"}.get(kind, environment.get("VOICE_RESOURCE_ROLE", "analysis"))
+        command = python_command(executable, "voice_terminal.model_process", kind, str(model_dir),
+                                 "--device", device, "--fallback-device", fallback_device,
+                                 "--model-options", json.dumps(model_options or {}, separators=(",", ":")))
         self._process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=None, text=True, encoding="utf-8", bufsize=1, env=environment,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -100,18 +136,32 @@ class ModelProcess:
             raise RuntimeError(response["error"])
         return response["result"]
 
-    def __call__(self, pcm):
+    def _request(self, payload, timeout=120):
         with self._lock:
             if not self.alive:
                 raise RuntimeError(self.error)
-            payload = {"pcm": base64.b64encode(pcm).decode("ascii")}
             try:
                 self._process.stdin.write(json.dumps(payload) + "\n")
                 self._process.stdin.flush()
-                return self._receive(120)
+                return self._receive(timeout)
             except (OSError, TimeoutError):
                 self.close()
                 raise
+
+    def __call__(self, pcm):
+        return self._request({"pcm": base64.b64encode(pcm).decode("ascii")})
+
+    def infer_stream(self, turn_id: str, pcm: bytes, is_final: bool):
+        """infer_stream（流式识别）：turn_id（发言轮次编号）隔离模型缓存。"""
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("turn_id（发言轮次编号）必须是非空字符串")
+        return self._request({"operation": "infer", "turn_id": turn_id,
+                              "pcm": base64.b64encode(pcm).decode("ascii"), "is_final": bool(is_final)})
+
+    def clear_turn(self, turn_id: str):
+        if not isinstance(turn_id, str) or not turn_id:
+            return None
+        return self._request({"operation": "clear_turn", "turn_id": turn_id}, timeout=10)
 
     def warmup(self):
         return None
@@ -143,7 +193,7 @@ class ModelProcess:
             self.resource_status = None
 
 
-def _create_model(kind, model_dir, device, fallback_device):
+def _create_model(kind, model_dir, device, fallback_device, model_options=None):
     if kind == "offline":
         from .asr.dual_pass import OfflineParaformer
         return OfflineParaformer(model_dir, device)
@@ -153,15 +203,21 @@ def _create_model(kind, model_dir, device, fallback_device):
     if kind == "acoustic":
         from .analysis.perception import Yamnet
         return Yamnet(model_dir)
+    if kind == "streaming":
+        from .asr.streaming_model import StreamingParaformer
+        options = model_options or {}
+        return StreamingParaformer(model_dir, device=device, fallback_device=fallback_device,
+                                   **options)
     raise ValueError("未知的按需模型")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("kind", choices=("offline", "emotion", "acoustic"), help="按需模型类型")
+    parser.add_argument("kind", choices=("offline", "streaming", "emotion", "acoustic"), help="按需模型类型")
     parser.add_argument("model_dir", type=Path, help="受管本地模型目录")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "auto"), help="请求计算设备")
     parser.add_argument("--fallback-device", default="cpu", choices=("cpu", "cuda"), help="失败时的回退设备")
+    parser.add_argument("--model-options", default="{}", help="模型专用配置")
     arguments = parser.parse_args()
 
     def emit(result=None, error=None):
@@ -173,10 +229,17 @@ def main():
 
     model = None
     try:
+        try:
+            model_options = json.loads(arguments.model_options)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("模型专用配置无效") from exc
+        if not isinstance(model_options, dict):
+            raise ValueError("模型专用配置必须是对象")
         from .resources import model_load_footprint, bootstrap_resources
         bootstrap_resources(os.environ.get("VOICE_RESOURCE_ROLE", "analysis"))
         with model_load_footprint() as footprint:
-            model = _create_model(arguments.kind, arguments.model_dir, arguments.device, arguments.fallback_device)
+            model = _create_model(arguments.kind, arguments.model_dir, arguments.device,
+                                  arguments.fallback_device, model_options)
             model.warmup()
         names = ("identity", "device", "requested_device", "runtime", "model_file", "warmed", "load_error",
                  "providers", "internal_vad_device")
@@ -186,10 +249,20 @@ def main():
         for line in sys.stdin:
             try:
                 request = json.loads(line)
-                pcm = base64.b64decode(request["pcm"], validate=True)
-                if not pcm or len(pcm) % 2 or len(pcm) > 16000 * 2 * 62:
-                    raise ValueError("模型输入音频无效")
-                emit(model(pcm))
+                if arguments.kind == "streaming" and request.get("operation") == "clear_turn":
+                    model.clear_turn(request.get("turn_id"))
+                    emit(True)
+                else:
+                    pcm = base64.b64decode(request["pcm"], validate=True)
+                    if len(pcm) % 2 or len(pcm) > 16000 * 2 * 62:
+                        raise ValueError("模型输入音频无效")
+                    if arguments.kind == "streaming":
+                        result = model.infer(request.get("turn_id"), pcm, request.get("is_final") is True)
+                    else:
+                        if not pcm:
+                            raise ValueError("模型输入音频无效")
+                        result = model(pcm)
+                    emit(result)
             except Exception as error:
                 emit(error=f"{type(error).__name__}: {error}")
             finally:

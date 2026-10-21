@@ -10,8 +10,9 @@ import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
 import { componentResources, modelComponentOwners as owners } from '../component-resources'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
+import { operationPhaseLabel, type RuntimeOperation } from '../../runtime/runtime-operations'
 
-const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources> }>()
+const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources>; operations?: RuntimeOperation[] }>()
 const { settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
@@ -47,6 +48,16 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
 }
 // deviceSelectableModelIds（可切换 CPU／GPU 的模型）：Paraformer（识别）、emotion2vec+ base（情绪）与 CAM++（声纹）。
 const deviceSelectableModelIds = new Set<ProductLocalModelId>(['paraformer', 'emotion', 'campplus'])
+const switchOperationLabels: Partial<Record<ProductLocalModelId, string>> = {
+  paraformer: 'Paraformer', emotion: 'emotion2vec', campplus: 'CAM++',
+}
+function computeSwitchOperation(id: ProductLocalModelId) {
+  const label = switchOperationLabels[id]
+  if (!label) return undefined
+  return props.operations?.find(operation => (operation.target === 'compute_device'
+    || operation.target === `compute_device:${id}`)
+    && operation.state === 'running' && operation.label.startsWith(label))
+}
 // availableModelServices（可用模型状态）：与后端就绪契约一致，工作中的状态同样可用。
 // READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
 const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
@@ -109,6 +120,8 @@ function facts(component?: ApplicationComponent) {
 const rows = computed<LocalComponentRow[]>(() => {
   const models = computeModelRows.map<LocalComponentRow>(item => {
     const status = computeStatus.value?.models?.[item.id]
+    const switchOperation = computeSwitchOperation(item.id)
+    const switching = Boolean(switchOperation)
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
     const managed = managedResource(modelResourceIds[item.id])
@@ -126,7 +139,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const ownerLoading = ['waiting', 'starting', 'stopping'].includes(owner?.state ?? '')
     const disabled = !busy && !ownerUnavailable && (owner?.state === 'disabled' || (!ownerLoading && application.snapshot.value?.startup_complete !== false && status?.service === 'DISABLED'))
     const awaitingStartup = application.snapshot.value?.startup_complete === false && !availableModelServices.has(status?.service ?? '')
-    const loading = busy || (!ownerUnavailable && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
+    const loading = switching || busy || (!ownerUnavailable && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
     // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
     const updateRequired = managed?.updateAvailable === true
     const available = !updateRequired && !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
@@ -139,8 +152,8 @@ const rows = computed<LocalComponentRow[]>(() => {
     return {
       id: item.id, name: item.title, category,
       enhancement: item.id === 'paraformer' ? enhancement('dual_pass', '双路精修') : item.id === 'emotion' ? enhancement('emotion', '情绪背景') : undefined,
-      state: updateRequired ? 'failed' : available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: updateRequired ? '需更新' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
+      state: updateRequired ? 'failed' : switching ? 'loading' : available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
+      status: updateRequired ? '需更新' : switching ? '切换中' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
       available, retryable: !updateRequired && !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供',
       location: deviceLabel(status?.device),
@@ -152,7 +165,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         privateCommit: countedHere ? metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes ?? undefined : undefined,
         vram: countedHere ? measuredVram : undefined,
       },
-      description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
+      description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : switching && switchOperation ? operationPhaseLabel(switchOperation) : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: sharedEstimate ? countedHere ? analysisModel ? '包含模型加载增量及共享分析进程余量；共享内存按已加载模型均分，显存计入报告 GPU（图形处理器）的模型。' : '加载与预热的内存增量估算，已从所属进程扣除；共享运行库与后续缓存仍计入进程余量。' : '尚无加载增量采样，资源暂计入所属进程。' : '所属进程当前余量；已扣除单列模型的加载增量估算，显存仍按进程计量。',
       facts: [
         ...(item.id === 'paraformer' && computeStatus.value?.auxiliary?.dual_pass?.load_error ? [{ label: '离线精修错误', value: computeStatus.value.auxiliary.dual_pass.load_error }] : []),
@@ -164,14 +177,19 @@ const rows = computed<LocalComponentRow[]>(() => {
       resourceChoices: item.id === 'paraformer' ? [managedResource('paraformer-offline')].filter((row): row is ManagedResourceRow => Boolean(row)) : undefined,
       ...(deviceSelectableModelIds.has(item.id) ? { device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
-        locked: updateRequired || !available || !status || refreshing.value,
-        draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
-        pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
+        locked: updateRequired || switching || !available || !status || refreshing.value,
+        busy: switching,
+        draft: !switching && settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
+        pending: Boolean(status && (
+          status.requested_device && computeSavedDevices.value[item.id] !== status.requested_device
+          || computeSavedDevices.value[item.id] === 'cpu' && status.device !== 'cpu'
+          || computeSavedDevices.value[item.id] === 'cuda' && !String(status.device || '').toLowerCase().startsWith('cuda')
+        )),
         options: [
           { value: 'auto', label: '自动选择' }, { value: 'cpu', label: 'CPU（中央处理器）' },
-          ...(gpuAvailable ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : settings.compute.devices[item.id] === 'cuda' ? [{ value: 'cuda', label: 'GPU（当前不可用）', disabled: true }] : []),
+          ...(gpuAvailable || switching ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : settings.compute.devices[item.id] === 'cuda' ? [{ value: 'cuda', label: 'GPU（当前不可用）', disabled: true }] : []),
         ],
-        hint: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
+        hint: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : switching && switchOperation ? operationPhaseLabel(switchOperation) : status?.load_error && available ? status.load_error : !gpuAvailable && !switching ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
       } } : {}),
     }
   })

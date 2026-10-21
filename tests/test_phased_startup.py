@@ -230,6 +230,8 @@ def test_loading_api_allows_settings_but_blocks_recording_and_validates_flags_at
     monkeypatch.setenv("VOICE_APP_INTERNAL_TOKEN", "startup-test")
     monkeypatch.setenv("VOICE_APP_ASR_AVAILABLE", "0")
     monkeypatch.setenv("VOICE_APP_ANALYSIS_AVAILABLE", "0")
+    monkeypatch.setenv("VOICE_APP_ASR_MANAGED", "0")
+    monkeypatch.setenv("VOICE_APP_ANALYSIS_MANAGED", "0")
     app = create_app(runtime, product_settings=runtime.product_settings)
     async def run():
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
@@ -244,11 +246,38 @@ def test_loading_api_allows_settings_but_blocks_recording_and_validates_flags_at
                 assert blocked.status_code == 503
                 capture.assert_not_awaited()
             invalid = await client.post("/internal/application/control", headers={"Authorization": "Bearer startup-test"},
-                json={"action": "initialize-session", "asr_available": True, "analysis_available": "invalid"})
+                json={"action": "initialize-session", "asr_available": True, "analysis_available": "invalid",
+                      "asr_managed": True, "analysis_managed": True})
             assert invalid.status_code == 422
             assert os.environ["VOICE_APP_ASR_AVAILABLE"] == os.environ["VOICE_APP_ANALYSIS_AVAILABLE"] == "0"
+            assert os.environ["VOICE_APP_ASR_MANAGED"] == os.environ["VOICE_APP_ANALYSIS_MANAGED"] == "0"
             denied = await client.post("/internal/application/control", json={"action": "initialize-local"})
             assert denied.status_code == 403
+    asyncio.run(run())
+
+
+def test_loading_api_refreshes_live_worker_ownership_before_session_initialization(runtime, monkeypatch):
+    monkeypatch.setenv("VOICE_APP_INTERNAL_TOKEN", "startup-test")
+    for name in ("VOICE_APP_ASR_AVAILABLE", "VOICE_APP_ANALYSIS_AVAILABLE",
+                 "VOICE_APP_ASR_MANAGED", "VOICE_APP_ANALYSIS_MANAGED"):
+        monkeypatch.setenv(name, "0")
+    app = create_app(runtime, product_settings=runtime.product_settings)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 1234))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            with patch.object(runtime, "application_control", new=AsyncMock(return_value={"ok": True})):
+                response = await client.post("/internal/application/control",
+                    headers={"Authorization": "Bearer startup-test"},
+                    json={"action": "initialize-session", "asr_available": True,
+                          "analysis_available": True, "asr_managed": True,
+                          "analysis_managed": False})
+            assert response.status_code == 200
+            assert os.environ["VOICE_APP_ASR_AVAILABLE"] == "1"
+            assert os.environ["VOICE_APP_ANALYSIS_AVAILABLE"] == "1"
+            assert os.environ["VOICE_APP_ASR_MANAGED"] == "1"
+            assert os.environ["VOICE_APP_ANALYSIS_MANAGED"] == "0"
+
     asyncio.run(run())
 
 

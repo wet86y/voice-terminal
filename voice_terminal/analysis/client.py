@@ -25,11 +25,14 @@ class AnalysisClient:
             self._shared_peer = result.get("shared_audio") or False
             return result
 
-    async def configure(self, enabled: dict[str, bool]) -> dict:
+    async def configure(self, enabled: dict[str, bool], *, devices: dict[str, str] | None = None,
+                        allow_cuda_fallback: dict[str, bool] | None = None) -> dict:  # allow_cuda_fallback（回滚旧 GPU 偏好时允许恢复原实际设备）。
         """configure（模型切换）：只允许停止监听后的受管调用。"""
         import websockets
         async with websockets.connect(self.url, open_timeout=5, close_timeout=0.2) as socket:
-            await socket.send(json.dumps({"operation": "configure", "enabled": enabled}))
+            await socket.send(json.dumps({"operation": "configure", "enabled": enabled,
+                                          "devices": devices or {},
+                                          "allow_cuda_fallback": allow_cuda_fallback or {}}))  # allow_cuda_fallback（按模型传递回滚标记）。
             result = json.loads(await asyncio.wait_for(socket.recv(), 240))
             if result.get("error"):
                 raise RuntimeError(result["error"])

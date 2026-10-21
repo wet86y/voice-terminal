@@ -19,6 +19,12 @@ export type ProductModelOrigin = 'runtime_config' | 'local_scan' | 'product_mana
 export type ComputeDeviceMode = 'auto' | 'cpu' | 'cuda'
 /** 可调度的非 TTS 本地模型标识。 */
 export type ProductLocalModelId = 'paraformer' | 'emotion' | 'voice_vad' | 'kws' | 'smart_turn' | 'campplus'
+/** ProductHotSwitchModelId（支持即时切换设备的模型编号）。 */
+export type ProductHotSwitchModelId = Extract<ProductLocalModelId, 'paraformer' | 'emotion' | 'campplus'>
+export interface ProductComputeDeviceSwitch {
+  model_id: ProductHotSwitchModelId // model_id（目标模型编号）。
+  device: 'auto' | 'cpu' | 'cuda' // device（目标运行模式）。
+}
 
 export interface ProductComputeSettings {
   /** devices（设备选项）：每个本地模型选择自动、仅 CPU 或 GPU。 */
@@ -371,7 +377,9 @@ export interface ProductMutationResult {
   settings?: ProductSettingsSnapshot | Record<string, unknown>
   effective_from?: 'immediate' | 'components_ready' | 'next_request' | 'next_session' | 'retry_required' | 'application_restart' | string // effective_from（生效时机）：即时、加载结束、后续请求、新会话、重试或重启。
   pending?: boolean // pending（待生效标记）：设置已保存但尚未作用于当前会话。
-  /** restart_required（需要重启）：修改计算设备后必须重启整个应用。 */
+  accepted?: boolean // accepted（已接纳标记）：长操作已转入后台，最终结果由运行状态卡发布。
+  operation_id?: string // operation_id（运行操作编号）：关联后台操作及其状态卡进度。
+  /** restart_required（需要重启）：当前设置是否需要重启应用。 */
   restart_required?: boolean
   message?: string
   [key: string]: unknown

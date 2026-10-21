@@ -228,6 +228,23 @@ class AsrWorkerClient:
         finally:
             self._health_waiters.pop(request_id, None)
 
+    async def configure_compute(self, device: str, *, allow_cuda_fallback: bool = False) -> dict:  # allow_cuda_fallback（恢复旧偏好时允许 GPU 回退到原实际设备）。
+        """替换 Paraformer 模型子进程并核验设备与预热状态。"""
+        await self.connect()
+        request_id = uuid.uuid4().hex
+        waiter = asyncio.get_running_loop().create_future()
+        self._health_waiters[request_id] = waiter
+        try:
+            await self._send({"type": "compute.configure", "request_id": request_id,
+                              "device": device,
+                              "allow_cuda_fallback": allow_cuda_fallback})  # device（目标设备模式）；allow_cuda_fallback（回滚时允许旧 GPU 偏好恢复到原 CPU 实际设备）。
+            result = await asyncio.wait_for(waiter, 300)
+            if result.get("type") == "error":
+                raise AsrWorkerError(str(result.get("message")), code="ASR_COMPUTE_SWITCH_FAILED")
+            return result
+        finally:
+            self._health_waiters.pop(request_id, None)
+
     async def transcribe_reference(self, pcm: bytes) -> dict:
         """transcribe_reference（人工上传参考音频转写），与实时 VAD（语音活动检测）路线分离。"""
         import base64
@@ -245,12 +262,14 @@ class AsrWorkerClient:
         finally:
             self._health_waiters.pop(request_id, None)
 
-    async def health(self, timeout_s: float = 2.0) -> dict[str, Any]:
+    async def health(self, timeout_s: float = 2.0,
+                     *, allow_starting: bool = False) -> dict[str, Any]:  # allow_starting（允许返回启动中快照）。
         """Perform an application-level readiness check.
 
         Opening a WebSocket only proves that something is listening on the
         configured endpoint.  The Worker must echo this request after its
-        model has loaded before callers may mark ASR READY.
+        model has loaded before callers may mark ASR READY. Status callers may
+        opt into receiving a correlated STARTING snapshot during model rebuild.
         """
 
         if self._socket is None:
@@ -281,6 +300,8 @@ class AsrWorkerClient:
                 str(response.get("message") or "ASR Worker health 失败"),
                 code=str(response.get("code") or "ASR_WORKER_NOT_READY"),
             )
+        if allow_starting and response.get("status") == "STARTING" and response.get("model_loaded") is False:
+            return response
         if response.get("status") != "READY":
             status = response.get("status", "UNKNOWN")
             raise AsrWorkerError(f"ASR Worker 未就绪：{status}", code="ASR_WORKER_NOT_READY")

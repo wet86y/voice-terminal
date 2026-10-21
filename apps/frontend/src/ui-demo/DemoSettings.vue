@@ -52,12 +52,12 @@ const instructionRows = computed(() => props.scene === 'empty' ? [] : instructio
 const loading = computed(() => props.scene === 'loading')
 const updatePreview = computed<AppUpdateStatus>(() => ({
   state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
-  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.4',
+  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.5',
   release_notes: props.scene === 'empty' ? null : [
-    'Voice Terminal（语音终端）v0.9.4', '',
-    '音色试听', '• 用户主动试听不再受被动静默时段阻塞。', '• 普通助手播报继续遵循静默策略。', '',
-    '语音与对话', '• 改善在线音色选择与试听，修正本地音色样音播放。', '• SmartTurn 判定说完后及时放行待播语音。',
-    '• 改善跨轮次人格修订、热词入口及截图消费。',
+    'Voice Terminal（语音终端）v0.9.5', '',
+    'CPU/GPU 设备热切换', '• Paraformer、emotion2vec 和 CAM++ 可在详情页保存后热切换运行设备。',
+    '• 状态卡显示模型加载、预热、核验与失败恢复进度。',
+    '• Paraformer 离线精修跟随主路使用相同设备。',
     ...(props.scene === 'long' ? Array.from({ length: 12 }, () => `• ${longText}`) : []),
   ].join('\n'),
   completed_bytes: 43 * 1024 ** 2, total_bytes: 107 * 1024 ** 2,

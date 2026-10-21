@@ -23,6 +23,7 @@
 ## 说明
 
 - [组件设置与分类下载](guides/component-settings.md)
+- [CPU/GPU 设备热切换生命周期](guides/compute-device-hot-switch.md)
 - [在线切换、自动停听与状态提示](guides/runtime-switching.md)
 - [国内镜像与原站回退](guides/download-sources.md)
 - [模型运行环境配置指南](guides/模型运行环境配置指南.md)
@@ -91,6 +92,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.5 CPU/GPU 设备热切换与进程回收](releases/v0.9.5.md)
 - [v0.9.4 语音音色试听、对话与影子执行修复](releases/v0.9.4.md)
 - [v0.9.1 下载改进与应用更新修订](releases/v0.9.1.md)
 - [v0.9.2 日志导出、感知延迟与语音合成修复](releases/v0.9.2.md)

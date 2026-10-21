@@ -1,10 +1,13 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
 import unittest
 from pathlib import Path
 
-from voice_terminal.asr.worker import AsrWorkerEngine
+import pytest
+
+from voice_terminal.asr.worker import AsrWorkerEngine, handle_asr_connection
 
 
 class AsrWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -30,10 +33,16 @@ class AsrWorkerTests(unittest.IsolatedAsyncioTestCase):
         """取消不能让原生线程在清理后重新创建轮次缓存。"""
         engine = AsrWorkerEngine(model_dir=Path("."), device="cpu")
         entered, release = threading.Event(), threading.Event()
+        class StreamingChild:
+            alive = True
+            def __init__(self): self.cache_by_turn = {}
+            def clear_turn(self, turn_id): self.cache_by_turn.pop(turn_id, None)
+            def close(self): self.alive = False
+        child = engine._model = StreamingChild()
         def native(turn_id, *_):
             entered.set()
             release.wait(timeout=2)
-            engine._cache_by_turn[turn_id] = {"finished": True}
+            child.cache_by_turn[turn_id] = {"finished": True}
             return "完成"
         engine._infer_sync = native
         task = asyncio.create_task(engine.infer("cancel", b"\x00" * engine.chunk_stride_bytes, False))
@@ -46,7 +55,7 @@ class AsrWorkerTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertNotIn("cancel", engine._cache_by_turn)
+            self.assertNotIn("cancel", child.cache_by_turn)
             self.assertNotIn("cancel", engine._pending_audio_by_turn)
         finally:
             release.set()
@@ -134,6 +143,229 @@ class AsrWorkerTests(unittest.IsolatedAsyncioTestCase):
             calls,
             [(engine.chunk_stride_bytes, False), (640, True)],
         )
+
+
+@pytest.mark.asyncio
+async def test_compute_device_rebuild_exits_old_model_child_before_spawning_target(tmp_path, monkeypatch):
+    events = []
+
+    class Child:
+        def __init__(self, name, requested, device):
+            self.name, self.device = name, device
+            self.requested_device = requested
+            self.warmed = True
+            self.load_error = None
+            self.runtime = "PyTorch（推理框架）"
+            self.resource_status = {"rss_bytes": 100}
+            self.resource_footprint = {"rss_bytes": 50}
+            self.pid = 101 if name == "old" else 202
+            self.alive = True
+        def close(self):
+            self.alive = False
+            events.append(f"exit:{self.name}")
+
+    old = Child("old", "cpu", "cpu")
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cpu")
+    engine._model = old
+    engine.model_warmed = True
+
+    def process(kind, model_dir, **options):
+        assert kind == "streaming"
+        assert events[-1].startswith("exit:")
+        requested = options["device"]
+        if requested == "cuda":
+            assert options["require_cuda"] is True
+        actual = "cpu" if requested == "cpu" else "cuda"
+        events.append(f"start:{requested}")
+        return Child(requested, requested, actual)
+
+    monkeypatch.setattr("voice_terminal.model_process.ModelProcess", process)
+    try:
+        status = await engine.configure_device("cuda")
+        assert events == ["exit:old", "start:cuda"]
+        assert status["device"] == "cuda" and status["model_warmed"] is True
+        assert engine.requested_device == "cuda" and engine.device == "cuda"
+        assert engine.fallback_device == "cuda"
+        status = await engine.configure_device("cpu")
+        assert events[-2:] == ["exit:cuda", "start:cpu"]
+        assert status["device"] == "cpu" and engine.device == "cpu"
+        assert engine.fallback_device == "cpu"
+        status = await engine.configure_device("auto")
+        assert events[-2:] == ["exit:cpu", "start:auto"]
+        assert status["device"] == "cuda" and engine.requested_device == "auto"
+    finally:
+        engine.close()
+    assert events[-1] == "exit:auto"
+
+
+@pytest.mark.asyncio
+async def test_paraformer_device_rebuild_switches_enabled_offline_lane_to_same_device(tmp_path, monkeypatch):
+    events = []
+
+    class Child:
+        def __init__(self, name, device):
+            self.name, self.device = name, device
+            self.requested_device = device
+            self.warmed = True
+            self.load_error = None
+            self.resource_status = {"rss_bytes": 100}
+            self.resource_footprint = {"rss_bytes": 50}
+            self.pid = 101 if name == "old" else 202
+            self.alive = True
+        def close(self):
+            self.alive = False
+            events.append(f"exit:{self.name}")
+
+    class Offline:
+        enabled = True
+        device = "cpu"
+        async def configure(self, enabled, device, **_options):
+            events.append(f"offline:{'start' if enabled else 'stop'}:{device}")
+            self.enabled = enabled
+            self.device = device if enabled else None
+        def status(self):
+            return {"status": "READY" if self.enabled else "DISABLED", "model_loaded": self.enabled,
+                    "model_warmed": self.enabled, "device": self.device}
+        def close(self):
+            self.enabled = False
+
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cpu")
+    engine._model = Child("old", "cpu")
+    engine.offline = Offline()
+    engine.dual_pass_enabled = True
+
+    def process(kind, _model_dir, **options):
+        assert kind == "streaming"
+        assert events[-1] == "exit:old"
+        events.append(f"start:{options['device']}")
+        return Child(options["device"], "cuda")
+
+    monkeypatch.setattr("voice_terminal.model_process.ModelProcess", process)
+    try:
+        status = await engine.configure_device("cuda")
+        assert status["device"] == "cuda"
+        assert status["offline"]["device"] == "cuda"
+        assert events == ["offline:stop:cpu", "exit:old", "start:cuda", "offline:start:cuda"]
+    finally:
+        engine.close()
+
+
+@pytest.mark.asyncio
+async def test_paraformer_device_rebuild_does_not_start_disabled_offline_lane(tmp_path, monkeypatch):
+    events = []
+
+    class Child:
+        def __init__(self, name, device):
+            self.name, self.device, self.requested_device = name, device, device
+            self.warmed, self.load_error, self.alive = True, None, True
+            self.resource_status, self.resource_footprint = {"rss_bytes": 100}, {"rss_bytes": 50}
+            self.pid = 101 if name == "old" else 202
+        def close(self):
+            self.alive = False
+            events.append(f"exit:{self.name}")
+
+    class Offline:
+        enabled = False
+        async def configure(self, *_args, **_kwargs):
+            raise AssertionError("disabled offline lane must stay unloaded")
+        def status(self):
+            return {"status": "DISABLED", "model_loaded": False, "model_warmed": False}
+        def close(self):
+            pass
+
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cpu")
+    engine._model = Child("old", "cpu")
+    engine.offline = Offline()
+    engine.dual_pass_enabled = False
+
+    def process(kind, _model_dir, **options):
+        assert kind == "streaming" and events[-1] == "exit:old"
+        events.append(f"start:{options['device']}")
+        return Child(options["device"], "cpu")
+
+    monkeypatch.setattr("voice_terminal.model_process.ModelProcess", process)
+    try:
+        status = await engine.configure_device("cpu")
+        assert status["offline"]["status"] == "DISABLED"
+        assert events == ["exit:old", "start:cpu"]
+    finally:
+        engine.close()
+
+
+@pytest.mark.asyncio
+async def test_health_during_device_switch_is_nonblocking_and_does_not_start_a_second_model(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    starts = []
+
+    class Child:
+        def __init__(self, device):
+            self.device = device
+            self.requested_device = device
+            self.warmed = True
+            self.load_error = None
+            self.runtime = "PyTorch（推理框架）"
+            self.resource_status = {"rss_bytes": 100}
+            self.resource_footprint = {"rss_bytes": 50}
+            self.tensor_cuda_build = device == "cuda"
+            self.alive = True
+            self.pid = 202 if device == "cuda" else 101
+
+        def close(self):
+            self.alive = False
+
+    class Socket:
+        remote_address = None
+
+        def __init__(self):
+            self.messages = [json.dumps({"type": "health", "request_id": "health-during-switch"})]
+            self.responses = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.messages:
+                raise StopAsyncIteration
+            return self.messages.pop(0)
+
+        async def send(self, value):
+            self.responses.append(json.loads(value))
+
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cpu")
+    engine._model = Child("cpu")
+    engine.device = "cpu"
+    engine.model_warmed = True
+
+    def create_process(_kind, _model_dir, **options):
+        starts.append(options["device"])
+        entered.set()
+        assert release.wait(3), "test did not release the target model load"
+        return Child(options["device"])
+
+    monkeypatch.setattr("voice_terminal.model_process.ModelProcess", create_process)
+    switch = asyncio.create_task(engine.configure_device("cuda"))
+    try:
+        for _ in range(200):
+            if entered.is_set():
+                break
+            await asyncio.sleep(.01)
+        assert entered.is_set(), "target model load did not start"
+
+        socket = Socket()
+        await asyncio.wait_for(handle_asr_connection(socket, engine), timeout=1)
+
+        assert socket.responses[0]["status"] == "STARTING"
+        assert socket.responses[0]["model_loaded"] is False
+        assert starts == ["cuda"]
+        release.set()
+        status = await asyncio.wait_for(switch, timeout=2)
+        assert status["device"] == "cuda"
+        assert starts == ["cuda"]
+    finally:
+        release.set()
+        if not switch.done():
+            await asyncio.wait_for(switch, timeout=2)
+        engine.close()
 
 
 if __name__ == "__main__":
