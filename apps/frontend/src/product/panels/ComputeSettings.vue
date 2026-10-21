@@ -269,7 +269,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
         ...system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
       ],
-      note: '系统进程余量已扣除单列模型的加载增量估算；应用总量仍取真实进程采样，共享进程只计一次。',
+      note: '已扣除单列模型的加载增量；尚未归属模型的分析进程资源暂计入本项，采样同步后自动分摊。应用总量取真实进程采样，共享进程只计一次。',
     })
   }
   const ttsResource = props.resourceController?.resources.value.find(row => row.resource_id === 'tts')

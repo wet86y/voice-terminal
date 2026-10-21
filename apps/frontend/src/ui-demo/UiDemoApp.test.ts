@@ -194,7 +194,7 @@ describe('桌面样例回放交互', () => {
     expect(row.get('[data-metric="memory"]').text()).toBe('常驻内存／提交内存420 MB / 525 MB')
     expect(row.get('.local-component-identity .local-state').text()).toBe('运行中')
     const sensevoice = await expandComponent(wrapper, 'emotion', 'extensions')
-    expect(sensevoice.get('[data-metric="vram"]').text()).toBe('显存740 MB')
+    expect(sensevoice.get('[data-metric="memory"]').text()).toBe('常驻内存／提交内存／显存610 MB / 763 MB / 740 MB')
     await row.get('select').setValue('cuda')
     await row.get('.save-button').trigger('click')
     expect(wrapper.get('.save-notice').text()).toContain('运行位置已保存')

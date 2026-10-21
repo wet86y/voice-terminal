@@ -87,6 +87,12 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
       const gpuOwners = loaded.filter(candidate => candidate.status?.device?.startsWith('cuda'))
       distribute('gpu_dedicated_bytes', gpuOwners)
       for (const [id, share] of analysisShares) groups.set(id, [...(groups.get(id) ?? []), share])
+      // 尚未匹配模型身份或设备信息的已知余量暂计入语音服务，采样同步后自动转归模型。
+      // 保留缺失指标的未知状态，不把剩余显存错误分配给使用 CPU（中央处理器）的模型。
+      if (!loaded.length || (['memory_rss_bytes', 'memory_private_commit_bytes', 'gpu_dedicated_bytes'] as const)
+        .some(key => residual[key] !== 0)) {
+        groups.set('voice-system', [...(groups.get('voice-system') ?? []), residual])
+      }
     } else {
       groups.set(group, [...(groups.get(group) ?? []), residual])
     }

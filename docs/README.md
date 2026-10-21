@@ -73,6 +73,8 @@
 - [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [音频增强替换验收记录](testing/audio-enhancements-20261020.md)
+- [开发工作区独立恢复验收](testing/workspace-development-recovery-20261021.md)
+- [前端十项失败归因与产品逻辑修订验收](testing/frontend-ten-failures-audit-20261021.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)
 - 本地 TTS 诊断记录仅保存在维护者本机，不纳入源码仓库。
 - [内存优化验收](testing/memory-optimization-20261010.md)

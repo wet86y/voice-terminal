@@ -22,6 +22,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   const inventoryRead = vi.fn()
   const environment = vi.fn()
   const saveCredentials = vi.fn()
+  const audioEnhancements = vi.fn() // audioEnhancements（音频增强设置接口替身）。
 
   async function expandCategory(category: string) {
     const toggle = wrapper!.get(`[data-category="${category}"] .local-category-toggle`)
@@ -53,8 +54,10 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
         : null }))
     inventoryRead.mockReset().mockImplementation(async () => inventory)
     environment.mockReset().mockImplementation(async () => ({ interpreter_ready: false, service_ready: false, python: '', groups: {}, jobs }))
+    audioEnhancements.mockReset().mockResolvedValue({ dual_pass: true, emotion: true, acoustic_events: true })
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({
       available: true,
+      audioEnhancements,
       workspaceInfo: async () => ({ root: 'D:/测试/测试123', data_dir: 'D:/测试/测试123/data', version: '0.9.0', can_manage: true }),
       resourceInventory: inventoryRead,
       environmentStatus: environment,
@@ -516,8 +519,47 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await wrapper.get('[data-provider="deepseek"] .provider-key-settings input').setValue('test-draft-key')
     await wrapper.get('[data-provider="deepseek"] .save-button').trigger('click')
     await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('系统凭据存储不可用')
+    expect(wrapper.get('[data-provider="deepseek"] [role="alert"]').text()).toContain('系统凭据存储不可用')
     expect(wrapper.get<HTMLInputElement>('[data-provider="deepseek"] .provider-key-settings input').element.value).toBe('test-draft-key')
+    expect(start).not.toHaveBeenCalled()
+  })
+
+  it('音频增强读取失败不遮蔽缺组件的启动原因，刷新恢复后仍保留启动门禁', async () => {
+    audioEnhancements.mockRejectedValueOnce(new Error('音频增强设置暂不可用'))
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    await wrapper.get('button[aria-label="返回工作台"]').trigger('click')
+    expect(wrapper.get('[data-error-source="audio-enhancements"]').text()).toContain('音频增强设置暂不可用')
+    expect(wrapper.text()).toContain('全部组件完备后再启动')
+    expect(start).not.toHaveBeenCalled()
+
+    await wrapper.get('.local-refresh').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-error-source="audio-enhancements"]').exists()).toBe(false)
+    expect(wrapper.get('.management-start').text()).toContain('请先下载或导入缺失组件')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    expect(start).not.toHaveBeenCalled()
+  })
+
+  it('音频增强读取与凭据保存同时失败时保留两种错误及密钥草稿', async () => {
+    inventory = inventory.map(item => ({ ...item, can_start: true }))
+    configured = { deepseek: false, minimax: false }
+    audioEnhancements.mockRejectedValueOnce(new Error('音频增强设置暂不可用'))
+    saveCredentials.mockRejectedValueOnce(new Error('系统凭据存储不可用'))
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    await wrapper.get('button[aria-label="返回工作台"]').trigger('click')
+    expect(wrapper.get('[data-error-source="credentials"]').text()).toContain('请配置 DeepSeek 接口密钥')
+    const provider = await expandComponent('deepseek', 'inference')
+    const input = provider.get<HTMLInputElement>('.provider-key-settings input')
+    await input.setValue('test-draft-key')
+    await provider.get('.save-button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-error-source="audio-enhancements"]').text()).toContain('音频增强设置暂不可用')
+    expect(wrapper.get('[data-error-source="credentials"]').text()).toContain('系统凭据存储不可用')
+    expect(provider.get('[role="alert"]').text()).toContain('系统凭据存储不可用')
+    expect(input.element.value).toBe('test-draft-key')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(start).not.toHaveBeenCalled()
   })
 })

@@ -159,12 +159,13 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.text()).not.toContain('自动准备共用运行程序')
     wrapper.unmount()
   })
-  it('全部安装就绪后隐藏批量导入，并保持语音服务详情入口', async () => {
+  it('全部安装就绪后保留批量导入，并保持语音服务详情入口与运行时摘要', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
     expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
     const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
-    expect(card.get('.local-managed-resource').text()).toContain('本地系统服务')
+    expect(card.get('[data-metric="runtime"]').text()).toBe('运行时本地系统服务')
+    expect(card.find('.local-managed-resource').exists()).toBe(true)
     expect(wrapper.emitted('resourceRefresh')).toEqual([[], []])
     wrapper.unmount()
   })
@@ -231,7 +232,8 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.find('[data-job]').exists()).toBe(false)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
     await card.get('.local-component-action').trigger('click')
-    expect(card.get('.local-component-detail').text()).toContain('本地系统服务')
+    expect(card.find('.local-component-detail').exists()).toBe(true)
+    expect(card.get('[data-metric="runtime"]').text()).toBe('运行时本地系统服务')
     wrapper.unmount()
   })
 

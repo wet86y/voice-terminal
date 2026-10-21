@@ -185,6 +185,8 @@ export interface LocalComponentsModel {
   resourceLoading?: boolean
   /** resourceError（资源任务或原生清单错误）。 */
   resourceError?: string
+  /** errors（独立设置错误）：id（来源标识）与 message（中文错误说明），多项错误同时保留。 */
+  errors?: Array<{ id: string; message: string }>
   /** resourceEventError（桌面进度事件订阅错误）。 */
   resourceEventError?: string
   /** resourceTasksBusy（是否已有资源任务运行，防止重复导入覆盖）。 */
