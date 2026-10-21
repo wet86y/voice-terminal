@@ -63,12 +63,15 @@ class CamPlusPlusFunAsrEngine:
         digest = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
         if digest != WEIGHT_SHA256:
             raise SpeakerModelError("CAM++ 官方权重摘要不匹配，请修复模型资源")
+        from ..compute import device_candidates, loaded_funasr_device
+        candidates = device_candidates(self.requested_device, self.device_model_key, self.fallback_device)
+        from ..tensor_runtime import activate_tensor_runtime
+        activate_tensor_runtime(candidates[0])
         import torch
         from ..asr.model_loader import auto_model_class
-        from ..compute import device_candidates, loaded_funasr_device
         AutoModel = auto_model_class(self.model_path.parent, family="campplus")
         last_error: Exception | None = None
-        for candidate in device_candidates(self.requested_device, self.device_model_key, self.fallback_device):
+        for candidate in candidates:
             try:
                 model = AutoModel(model="CAMPPlus", model_conf={"feat_dim": 80, "embedding_size": 192},
                                   init_param=str(self.model_path), ignore_init_mismatch=False,

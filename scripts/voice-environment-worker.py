@@ -215,7 +215,7 @@ def inventory(names, lock, compatible_gpu=False):
         except Exception as error: rejected[name]=str(error)[:300]
     return {'reused':reused,'rejected':rejected}
 
-def check(names, lock=None, compatible_gpu=False):
+def check(names, lock=None, compatible_gpu=False, tensor_device=None):
     errors={}
     modules={'fastapi':'fastapi','pyyaml':'yaml','pydantic':'pydantic','numpy':'numpy','psutil':'psutil',
              'httpx':'httpx','uvicorn':'uvicorn','sounddevice':'sounddevice','soundfile':'soundfile',
@@ -228,6 +228,12 @@ def check(names, lock=None, compatible_gpu=False):
                 module = importlib.import_module(modules[name])
                 if name == 'torch' and module.tensor([1., 2.], device='cpu').sum().item() != 3.:
                     raise ValueError('张量运行库的 CPU（中央处理器）计算验证失败')
+                if tensor_device == 'cpu' and name == 'torch' and module.version.cuda is not None:
+                    raise ValueError('处理器依赖不得使用显卡张量构建')
+                if tensor_device == 'cpu' and name in {'torch', 'torchaudio', 'onnxruntime'}:
+                    overlay = Path(sys.executable).parent / 'Lib/cpu-packages'
+                    if (overlay / name).is_dir() and not Path(module.__file__).resolve().is_relative_to(overlay.resolve()):
+                        raise ValueError('处理器依赖未从隔离目录加载')
         except Exception as error: errors[name]=f'{type(error).__name__}: {error}'[:300]
     if lock and not errors:
         try: dynamic_library_closure()
@@ -240,8 +246,14 @@ def main():
     parser.add_argument('--selection') # selection（显式选择的语音后端与模型）。
     parser.add_argument('--compatible-gpu',action='store_true') # compatible_gpu（允许复用项目已验证的显卡组合）。
     parser.add_argument('--gpu-lock')  # gpu_lock（可选显卡依赖锁文件）。
+    parser.add_argument('--tensor-device', choices=('cpu', 'cuda'), help='进程使用的处理器或显卡张量依赖')
     parser.add_argument('--lock');parser.add_argument('--names',default='[]');parser.add_argument('--target');parser.add_argument('--wheels',default='[]');parser.add_argument('--model');parser.add_argument('--program');parser.add_argument('--install-root');args=parser.parse_args()
     names=json.loads(args.names)
+    if args.operation in {'check', 'inventory', 'reuse', 'gpu'} and (
+            set(names) & {'torch', 'torchaudio', 'funasr', 'onnxruntime'} or args.operation == 'gpu'):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from voice_terminal.tensor_runtime import activate_tensor_runtime
+        activate_tensor_runtime(args.tensor_device or ('cuda' if args.gpu_lock or args.operation == 'gpu' or args.compatible_gpu else 'cpu'))
     if args.operation=='tts-selection':
         sys.path.insert(0,args.program)
         from voice_terminal.config import load_config
@@ -267,7 +279,7 @@ def main():
             except Exception as error: result.update(gpu_available=False,reason=f'{type(error).__name__}: {error}'[:400])
         else:result.update(gpu_available=False,reason='共享工作进程所需依赖缺失：'+str(result['errors']))
         result.update(environment_fingerprint=fingerprint(Path(sys.executable).parent),models_fingerprint=fingerprint(root/'models'))
-    else: result=check(names,runtime_lock(args.lock,args.gpu_lock) if args.lock else None,args.compatible_gpu)
+    else: result=check(names,runtime_lock(args.lock,args.gpu_lock) if args.lock else None,args.compatible_gpu,args.tensor_device)
     emit({'ok':True,'result':result})
 
 if __name__=='__main__':

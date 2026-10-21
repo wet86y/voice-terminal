@@ -18,6 +18,8 @@ class Emotion2vec:
         last = None
         for candidate in device_candidates(device, "emotion", fallback_device):
             try:
+                from ..tensor_runtime import activate_tensor_runtime
+                activate_tensor_runtime(candidate)
                 self.model = auto_model_class(model_dir)(model=str(model_dir), device=candidate,
                     disable_update=True, disable_pbar=True, ncpu=4)
                 self.device = loaded_funasr_device(self.model, candidate)

@@ -2404,9 +2404,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     "load_error": punctuation.get("load_error") or punctuation.get("last_error"),
                 }
                 offline = status.get("offline", {})
+                if isinstance(offline.get("resource_status"), dict):
+                    resource_rows.append(offline["resource_status"])
                 auxiliary["dual_pass"] = {"service": offline.get("status", "DISABLED"),
                     "runtime": "PyTorch（双路离线识别）", "device": status.get("device"),
-                    "resource_status": status.get("resource_status"),
+                    "resource_status": offline.get("resource_status") or status.get("resource_status"),
                     "resource_footprint": offline.get("resource_footprint"), "load_error": offline.get("error")}
                 models["paraformer"].update({
                     "resource_status": status.get("resource_status"),
@@ -2429,6 +2431,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         try:
             analysis = await AnalysisClient(self.config.smart_turn.analysis_url).health()
             acoustic = analysis.get("acoustic", {})
+            if isinstance(acoustic.get("resource_status"), dict):
+                resource_rows.append(acoustic["resource_status"])
             auxiliary["acoustic_events"] = {"service": acoustic.get("status", "DISABLED"),
                 "runtime": acoustic.get("runtime"), "device": "cpu", "resource_status": acoustic.get("resource_status"),
                 "resource_footprint": acoustic.get("resource_footprint"), "load_error": acoustic.get("error")}

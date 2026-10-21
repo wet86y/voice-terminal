@@ -267,6 +267,7 @@ class SpeakerRuntimeMixin:
                                  "--config", str(self._speaker_worker_config_path), root=self._project_root)
         from ..resources import ResourcePolicy
         child_env = ResourcePolicy.load().environment("speaker", model_dir=self.config.model_dir)
+        child_env["VOICE_TENSOR_DEVICE"] = self.config.compute.devices.get("campplus", "cpu")
         child_env["VOICE_PROCESS_STARTED_AT"] = str(time.time())  # 子进程入口日志的统一时间起点。
         child_env["PYTHONUNBUFFERED"] = "1"
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:

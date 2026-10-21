@@ -46,7 +46,11 @@ class FsmnVadDetector:
         policy = ResourcePolicy.load()
         registry.observe(self, "vad_pending_audio", lambda value: int(
             getattr(value._cache.get("onnx_state", {}).get("pending"), "nbytes", 0)))
-        if device == "cpu" and policy.vad_backend in {"auto", "onnx"}:
+        from ..compute import device_candidates
+        candidates = device_candidates(device, "voice_vad", fallback_device)
+        from ..tensor_runtime import activate_tensor_runtime
+        activate_tensor_runtime(candidates[0])
+        if candidates[0] == "cpu" and policy.vad_backend in {"auto", "onnx"}:
             try:
                 import numpy as np
                 from .onnx_backend import OnnxStreamingModel
@@ -66,9 +70,8 @@ class FsmnVadDetector:
             raise VadError("缺少 numpy/funasr，请先运行 scripts\\setup.ps1。") from exc
 
         self._np = np
-        from ..compute import device_candidates
         last_error: Exception | None = None
-        for candidate in device_candidates(device, "voice_vad", fallback_device):
+        for candidate in candidates:
             try:
                 self._model = AutoModel(
                     model=str(model_dir),
