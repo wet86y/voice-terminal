@@ -46,7 +46,8 @@ def assemble(desktop: Path, build: str = '') -> Path:
     if stage.exists():
         if stage.is_symlink() or stage.is_junction() or stage.resolve().parent != cache.resolve():
             raise ValueError('正式程序包暂存目录越界')
-        shutil.rmtree(stage)
+        from voice_terminal.local_files import remove_tree
+        remove_tree(stage, cache)
     stage.mkdir()
     assembler.collect_program(stage / 'app', desktop)
     speaker_migration = bundle_speaker_seed(stage / 'app')

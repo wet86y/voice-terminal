@@ -25,6 +25,11 @@ config/speaker/
 
 # Runtime artifacts (always local; do not version generated logs or reports)
 /.local/
+# Generated native outputs（生成的原生产物）：任何源码子目录均不收录第二套构建缓存。
+target/
+*.pdb
+*.obj
+*.pending.zip
 /logs/
 /reports/
 /.runtime/

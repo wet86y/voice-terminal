@@ -8,14 +8,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
+import sys
 import time
 import zipfile
 
 import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.workspace_assets import ManagedRun, guarded, maintenance_warning, task_folder, write_record
+from voice_terminal.local_files import remove_tree
 
 
 def digest(path: Path) -> str:
@@ -106,11 +109,14 @@ def exit_previous(workspace: Path, parent: psutil.Process) -> None:
 
 def cleanup_workspace(workspace: Path, base: Path) -> None:
     """cleanup_workspace（回收独立验收目录）：等待网页引擎异步释放缓存文件。"""
-    assert workspace.resolve().parent == base.resolve() and base.parent == ROOT / '.local/tmp'
+    base = guarded(ROOT, str(base))
+    workspace = guarded(ROOT, str(workspace))
+    if workspace.parent != base or base.parent != ROOT / '.local/tmp/tasks' / task_folder('app-update-handoff'):
+        raise ValueError('更新验收只允许回收本轮受管任务的具体子工作区')
     deadline = time.monotonic() + 20
     while workspace.exists():
         try:
-            shutil.rmtree(workspace)
+            remove_tree(workspace, base)
             return
         except PermissionError:
             if time.monotonic() >= deadline:
@@ -214,8 +220,8 @@ def main() -> None:
     assert digest(previous_package) == args.previous_sha256.lower(), '旧版程序包与公开交付记录摘要不一致'
     package_root = ROOT / '.local/build/program-package'
     package = json.loads((package_root / 'payload/program-package.json').read_text(encoding='utf-8'))
-    base = ROOT / '.local/tmp' / f'app-update-handoff-{time.time_ns():x}'
-    base.mkdir()
+    run = ManagedRun('app-update-handoff', ROOT)
+    base = run.path
     cases = []
     try:
         for mode in ('parent-waiting', 'parent-exited'):
@@ -224,13 +230,25 @@ def main() -> None:
             print(json.dumps(result, ensure_ascii=False), flush=True)
             # 成功后只回收本轮独立子目录，保留验收报告。
             workspace = base / mode
-            cleanup_workspace(workspace, base)
-        write_json(base / 'report.json', {'ok': True, 'cases': cases, 'fields': {'ok': '全部真实更新交接验收通过', 'cases': '逐场景验收记录'}})
+            try:
+                cleanup_workspace(workspace, base)
+            except OSError as error:
+                maintenance_warning(error)
+        report = {'ok': True, 'cases': cases, 'fields': {'ok': '全部真实更新交接验收通过', 'cases': '逐场景验收记录'}}
+        try:
+            write_record(ROOT, '.local/cache/reports/app-update-handoff-latest.json', report)
+        except (OSError, ValueError) as error:
+            maintenance_warning(error)
     except Exception as error:
-        write_json(base / 'report.json', {'ok': False, 'error': str(error), 'cases': cases,
-                                        'fields': {'ok': '是否全部通过', 'error': '失败原因', 'cases': '已通过场景'}})
+        try:
+            write_json(base / 'report.json', {'ok': False, 'error': str(error), 'cases': cases,
+                                            'fields': {'ok': '是否全部通过', 'error': '失败原因', 'cases': '已通过场景'}})
+        except OSError as report_error:
+            maintenance_warning(report_error)
+        run.finish(1)
         raise
-    print(f'旧版更新交接验收通过：{base / "report.json"}', flush=True)
+    run.finish(0)
+    print(f'旧版更新交接验收通过：{ROOT / ".local/cache/reports/app-update-handoff-latest.json"}', flush=True)
 
 
 if __name__ == '__main__':

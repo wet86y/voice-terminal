@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,6 @@ import socket
 import sys
 import time
 from types import SimpleNamespace
-from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,6 +17,7 @@ from voice_terminal.providers.audio_cpp_tts import AudioCppTtsClient, AudioCppTt
 from voice_terminal.providers.minimax_tts import MiniMaxTtsClient
 from voice_terminal.tts.voices import ModelVoiceLibraries
 from voice_terminal.config import load_config
+from scripts.workspace_assets import ManagedRun
 
 
 async def playback_gate_case(client):
@@ -185,11 +186,15 @@ async def repeated_generation_case(client):
                        "pcm_sha256": "原生音频样本校验摘要", "sample_rate": "实际下行采样率"}}
 
 
-async def voice_design_case(client):
+async def voice_design_case(client, *, keep_artifacts=False):
+    with ManagedRun('tts-voice-design', ROOT, keep_success=keep_artifacts) as run:
+        return await _voice_design_case(client, run.path, keep_artifacts=keep_artifacts)
+
+
+async def _voice_design_case(client, root, *, keep_artifacts=False):
     """二代纯设计与混合设计走正式候选管线，保存目标样音并验证正式克隆快照。"""
     from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager, DESIGN_SAMPLE_TEXT
     from voice_terminal.audio.player import PcmPlayer
-    root = ROOT / ".local/cache/reports/tts-integration/design" / uuid4().hex
     libraries = ModelVoiceLibraries(root)
     library = libraries.for_model("voxcpm2")
     seed = ROOT / ".local/models/audiocpp/voice-seed"
@@ -276,7 +281,9 @@ async def voice_design_case(client):
                             "formal_steps": formal_body["options"]["num_inference_steps"],
                             "high_fidelity_rate": asset_meta["high_fidelity"]["sample_rate"],
                             "high_fidelity_bytes": hifi.stat().st_size})
-            results[-1]["sample_path"] = str(hifi)
+            results[-1]["sample_sha256"] = hashlib.sha256(hifi.read_bytes()).hexdigest()
+            if keep_artifacts:
+                results[-1]["sample_path"] = str(hifi)
         return results
     finally:
         http.event_hooks["request"].remove(record_request)
@@ -324,7 +331,7 @@ async def sample_cancellation_case(client):
         client._warmed = False
 
 
-async def local(report, *, design_only=False):
+async def local(report, *, design_only=False, keep_artifacts=False):
     runtime = ROOT / ".local"
     with socket.socket() as probe:
         if probe.connect_ex(("127.0.0.1", 18883)) == 0:
@@ -351,7 +358,7 @@ async def local(report, *, design_only=False):
             if model == "voxcpm2":
                 if not design_only:
                     report[model]["repeated_generation"] = await repeated_generation_case(client)
-                report.setdefault(model, {})["voice_design"] = await voice_design_case(client)
+                report.setdefault(model, {})["voice_design"] = await voice_design_case(client, keep_artifacts=keep_artifacts)
                 report[model]["sample_cancellation"] = await sample_cancellation_case(client)
             print(json.dumps({model: report[model]}, ensure_ascii=False), flush=True)
     finally:
@@ -394,15 +401,16 @@ async def main(args):
     report["fields"].update(mixed="是否混合设计", duration_ms="样音时长毫秒", target_asset_id="生成目标样音标识",
                             sample_cancellation="完整样音取消与后续正式请求交接", late_audio_discarded="迟到样音未进入播放队列",
                             sample_steps="样音实际制作步数", formal_steps="正式播报实际设置步数",
-                            sample_path="用于本机内容核对的原生样音路径，仅诊断报告包含",
+                            sample_sha256="本轮原生样音摘要；验证成功后回收样音，不保留失效路径",
+                            sample_path="显式保留成功现场时可供人工听音的样音路径",
                             preview_endpoint="试音实际调用的原生接口",
                             formal_uses_target_sample="正式克隆使用已保存目标样音", formal_pcm_bytes="正式目标样音克隆返回的完整音频字节",
                             high_fidelity_rate="高保真旁路副本的原生采样率", high_fidelity_bytes="高保真旁路副本字节数")
     try:
         if args.local:
-            await local(report)
+            await local(report, keep_artifacts=getattr(args, 'keep_artifacts', False))
         elif args.design:
-            await local(report, design_only=True)
+            await local(report, design_only=True, keep_artifacts=getattr(args, 'keep_artifacts', False))
         if args.online:
             await online(report)
     finally:
@@ -414,6 +422,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local", action="store_true", help="local（本地模型真实验证）")
+    parser.add_argument("--keep-artifacts", action="store_true", help="keep-artifacts（保留成功样音供人工听音，仍有限期回收）")
     parser.add_argument("--online", action="store_true", help="online（在线真实验证，会产生少量合成用量）")
     parser.add_argument("--design", action="store_true", help="design（仅验证二代纯设计与混合样音，保留其他验证记录）")
     asyncio.run(main(parser.parse_args()))

@@ -1,0 +1,37 @@
+#!/bin/sh
+# pre-commit（提交前检查）：优先使用本机已恢复解释器，仅检查暂存内容。
+set -u
+cd "$(git rev-parse --show-toplevel)"
+if [ -n "$(git diff --cached --name-only --diff-filter=D -- config/development-assets.json)" ]; then
+  echo '开发入口依赖资产策略，禁止在普通修订中删除该文件。' >&2
+  exit 1
+fi
+if [ ! -f scripts/workspace-assets.py ] || [ ! -f scripts/workspace_assets.py ] || [ ! -f config/development-assets.json ]; then
+  echo '资产检查未安装于当前分支/工作树，跳过本地钩子；正常提交继续。' >&2
+  exit 0
+fi
+run_check() {
+  # 解释器缺文件、版本太旧或初始化失败时尝试下一候选，不把环境故障当成违规。
+  "$@" -B -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 2)' >/dev/null 2>&1
+  if [ "$?" -ne 0 ]; then
+    return
+  fi
+  "$@" -B -X utf8 scripts/workspace-assets.py check-index --brief --hook
+  result=$?
+  case "$result" in
+    0) exit 0 ;;
+    3) exit 1 ;;
+    *) echo '资产检查环境不可用，已提示；正常提交继续，可稍后显式运行 assets:check（暂存检查）。' >&2; exit 0 ;;
+  esac
+}
+if [ -f .local/runtimes/python/python.exe ]; then
+  run_check .local/runtimes/python/python.exe
+fi
+if command -v python >/dev/null 2>&1; then
+  run_check python
+fi
+if command -v python3 >/dev/null 2>&1; then
+  run_check python3
+fi
+echo '未找到资产检查解释器，跳过本地钩子；正常提交继续。' >&2
+exit 0
