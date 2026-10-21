@@ -35,6 +35,7 @@
     "allow-resource-download-required",
     "allow-tts-selection-status",
     "allow-tts-selection-save",
+    "allow-audio-enhancements-settings",
     "allow-app-update-check",
     "allow-app-update-download",
     "allow-app-update-cancel",

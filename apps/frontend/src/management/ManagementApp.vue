@@ -224,7 +224,11 @@ const model = computed<LocalComponentsModel>(() => {
     resourceActionsAvailable: resources.resourcesCanManage.value,
     resourceLoading: resources.loading.value || resources.refreshing.value || resources.inventoryRefreshing.value || resources.preparingDownloadBundle.value,
     resourceTasksBusy: tasksBusy.value,
-    resourceError: enhancementFailure.value || resources.resourceError.value || credentials.error.value || undefined,
+    resourceError: resources.resourceError.value || undefined,
+    errors: [
+      { id: 'audio-enhancements', message: enhancementFailure.value },
+      { id: 'credentials', message: credentials.error.value },
+    ].filter(error => error.message),
     resourceEventError: resources.eventError.value || undefined,
     resourceBatchRetry: failedJobs.some(job => job.resource_id === 'batch'),
     managedResourceJobs: resources.resourceJobs.value.map(job => {

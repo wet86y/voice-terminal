@@ -20,6 +20,7 @@ import { provideProductContext } from './product-context'
 import { useWorkspaceResources } from './useWorkspaceResources'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
+import type { ProductComputeStatus } from './types'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { APPLICATION_EXIT_EVENT } from '../runtime/application-motion'
 const application = {
@@ -571,7 +572,7 @@ describe('正式界面的真实控件交互', () => {
     await flushPromises()
     expect(wrapper.get('[data-resource="vram"]').text()).toBe('显存768 MB/ 8 GB')
     const paraformer = await expandComponent(wrapper, 'paraformer', 'speech')
-    expect(paraformer.get('[data-metric="vram"]').text()).toContain('512 MB')
+    expect(paraformer.get('[data-metric="memory"]').text()).toBe('显存512 MB')
     expect(wrapper.find('[data-component="setup"]').exists()).toBe(false)
     const system = wrapper.get('[data-component="voice-system"]')
     expect(system.find('[data-metric="memory"]').exists()).toBe(false)
@@ -622,9 +623,16 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toContain('100 MB / 1000 MB')
     expect(wrapper.find('[data-component="emotion"] [data-metric="memory"]').exists()).toBe(false)
     expect(wrapper.find('[data-component="analysis-runtime"]').exists()).toBe(false)
-    expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toContain('440 MB')
+    expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toBe('常驻内存／提交内存640 MB / 6.25 GB')
     for (const id of ['voice_vad', 'kws', 'smart_turn']) expect(wrapper.find(`[data-component="${id}"] [data-metric="memory"]`).exists()).toBe(false)
     for (const id of ['voice', 'host', 'desktop', 'web', 'setup']) expect(wrapper.find(`[data-component="${id}"]`).exists()).toBe(false)
+    // 模型采样补齐进程身份后，共享开销从语音服务转回模型，页面不再重复计算。
+    const emotion = (value.computeStatus.value as ProductComputeStatus).models.emotion!
+    emotion.resource_status!.pid = 2
+    emotion.resource_status!.created_at = 10
+    await flushPromises()
+    expect(wrapper.get('[data-component="emotion"] [data-metric="memory"]').text()).toBe('常驻内存／提交内存200 MB / 1.95 GB')
+    expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toBe('常驻内存／提交内存440 MB / 4.3 GB')
     application.snapshot.value!.resource_processes![0]!.memory_private_commit_bytes = null
     await flushPromises()
     expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toBe('常驻内存100 MB')
@@ -786,7 +794,8 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(14)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(13)
+    expect(wrapper.find('[data-component="analysis-runtime"]').exists()).toBe(false)
     expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(0)
     expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
