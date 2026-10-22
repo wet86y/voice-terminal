@@ -4,8 +4,15 @@
 .startup-icon{display:block;width:72px;height:72px;margin:0 auto 24px}
 .startup-icon svg{display:block;width:100%;height:100%}
 .startup-title{margin:0;color:var(--text,#edf0f7);font-size:18px;font-weight:570;line-height:1.5;letter-spacing:-.02em}
-.startup-status{min-height:20px;margin:8px 0 24px;color:var(--muted,#a3adbf);font-size:12px;line-height:1.65;overflow-wrap:anywhere}
-.startup-status.is-error{color:var(--danger,#efa0b1)}
+.startup-status{min-height:20px;margin:8px 0 24px;color:var(--muted,#a3adbf);font-size:12px;line-height:1.65;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.startup-status.is-error{color:var(--danger,#efa0b1);white-space:normal;overflow-wrap:anywhere}
+.startup-status-components{display:flex;align-items:center;justify-content:center;gap:4px;text-align:left}
+.startup-status-prefix{flex:none}
+.startup-status-marquee{flex:0 1 auto;min-width:0;overflow:hidden}
+.startup-status-track{display:flex;width:max-content}
+/* --startup-marquee-duration（组件名称滚动一周所需时间）。 */
+.startup-status-track.is-overflowing{animation:startup-status-scroll var(--startup-marquee-duration,8s) linear infinite}
+.startup-status-item{flex:none;padding-right:32px}
 .startup-progress{height:4px;overflow:hidden;border-radius:999px;background:var(--line,#ffffff12)}
 .startup-progress-fill{display:block;height:100%;border-radius:inherit;background:var(--mint,#88dbc3);transition:width 220ms ease}
 .startup-progress[data-indeterminate="true"] .startup-progress-fill{width:32%;animation:startup-travel 1.6s ease-in-out infinite}
@@ -16,6 +23,7 @@
 .startup-button:disabled{opacity:.45;cursor:default}
 .startup-screen [hidden]{display:none!important}
 @keyframes startup-travel{0%{transform:translateX(-100%)}100%{transform:translateX(413%)}}
+@keyframes startup-status-scroll{to{transform:translateX(-50%)}}
 /* Exit motion（退出动效）：先淡出整个界面，图标缩放入场，文字与滚动条在一秒内淡入。 */
 .startup-screen.is-exiting{pointer-events:none;animation:startup-exit-cover var(--application-motion-duration,1000ms) ease both}
 .startup-screen.is-exiting .startup-icon{animation:startup-exit-logo var(--application-motion-duration,1000ms) cubic-bezier(.22,1,.36,1) both}
