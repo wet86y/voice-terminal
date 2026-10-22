@@ -825,22 +825,24 @@ fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:
     let result=(||{
         let context=state.context().ok_or("缺少当前工作区上下文")?;
         if state.workspace_busy.load(Ordering::Acquire){return Err("工作区正在切换或迁移，更新已停止。".into());}
-        let installer=voice_desktop_common::app_update::installer_path(&context.install)?;
+        let installer=if action==MaintenanceAction::Update{
+            voice_desktop_common::app_update::update_installer_path(&context.install)?
+        }else{
+            voice_desktop_common::app_update::installer_path(&context.install)?
+        };
+        fs::create_dir_all(installer.parent().ok_or("分发器目录无效")?).map_err(|error|format!("无法准备分发器目录：{error}"))?;
+        let installer=if action==MaintenanceAction::Update{
+            voice_desktop_common::app_update::update_installer_path(&context.install)?
+        }else{
+            voice_desktop_common::app_update::installer_path(&context.install)?
+        };
         let retained=if action==MaintenanceAction::CheckIntegrity{
             voice_desktop_common::app_update::retained(&context.install,env!("CARGO_PKG_VERSION"),&integrity_commands::local_build(&context)?)?
         }else{voice_desktop_common::app_update::delivery(&manifest)?};
         if action!=MaintenanceAction::Update&&!retained.matches(env!("CARGO_PKG_VERSION"),&integrity_commands::local_build(&context)?){return Err("发行校验程序与当前本地构建不一致；不会下载或运行其他构建。".into());}
         let source=manifest.asset_url();
         let file=voice_desktop_common::download::DownloadFile{url:source,size:manifest.size,sha256:manifest.sha256.clone(),sha512:String::new(),path:manifest.asset.clone(),download_variants:vec![]};
-        let mut adopted=false;
-        if action!=MaintenanceAction::CheckIntegrity&&!installer.exists(){
-            let legacy=workspace::safe_path(&context.install,"tmp/app-update/VoiceTerminalSetup.exe")?;
-            if legacy.is_file()&&fs::metadata(&legacy).map_err(|e|e.to_string())?.len()==manifest.size&&workspace::file_hash(&legacy)?.eq_ignore_ascii_case(&manifest.sha256){
-                fs::create_dir_all(installer.parent().unwrap()).map_err(|e|e.to_string())?;
-                fs::rename(&legacy,&installer).map_err(|e|format!("无法将已验证下载缓存移入维护目录：{e}"))?;adopted=true;
-            }
-        }
-        if action!=MaintenanceAction::CheckIntegrity&&!adopted{ for attempt in 1..=3{
+        if action!=MaintenanceAction::CheckIntegrity{ for attempt in 1..=3{
             let result=voice_desktop_common::download::with_attempt(Some(attempt),||voice_desktop_common::download::download_with_progress(&file,&installer,state.app_update.cancel.clone(),&mut|phase,done,total|{
                 let phase=format!("第 {attempt} / 3 轮 · {phase}");
                 let payload=maintenance_payload(action,"downloading",Some(&manifest),done,total,Some(&phase),None,true);emit_app_update(&state,&app,payload);
@@ -862,7 +864,7 @@ fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:
         if action==MaintenanceAction::CheckIntegrity&&(fs::metadata(&installer).map_err(|error|error.to_string())?.len()!=manifest.size||workspace::file_hash(&installer)?!=manifest.sha256.to_lowercase()){
             let _=fs::remove_file(&installer);return Err("分发安装器大小或 SHA-256 摘要校验失败。".into());
         }
-        voice_desktop_common::app_update::save_retained(&context.install,&retained)?;
+        if action!=MaintenanceAction::Update{voice_desktop_common::app_update::save_retained(&context.install,&retained)?;}
         if action==MaintenanceAction::DownloadIntegrity{
             emit_app_update(&state,&app,maintenance_payload(action,"current",Some(&manifest),manifest.size,manifest.size,Some("当前版本校验程序已准备；点击校验完整性开始检查与修复。"),None,false));return Ok(());
         }
