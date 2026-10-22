@@ -23,6 +23,8 @@
 
 ## 说明
 
+- [更新日志填写规范](development/release-notes.md)
+- [GitHub（代码托管平台）源码与发行发布](development/github-release.md)
 - [组件设置与分类下载](guides/component-settings.md)
 - [CPU/GPU 设备热切换生命周期](guides/compute-device-hot-switch.md)
 - [在线切换、自动停听与状态提示](guides/runtime-switching.md)

@@ -1,25 +1,32 @@
-# GitHub source and release publishing
+# GitHub（代码托管平台）源码与发行发布
 
-The public repository is `wet86y/voice-terminal`. Source uses Apache-2.0. Windows release assets are built on the maintainer's local Windows machine because the package step consumes local runtime resources.
+公开仓库为 `wet86y/voice-terminal`，源码采用 Apache-2.0（开源许可证）。Windows（操作系统）发行资产使用本机运行资源打包，由维护者在本机构建。
 
-## Publish a release
+## 发布前填写更新日志
 
-1. Commit and push the intended source to `main`.
-2. Sign in to GitHub CLI（GitHub 命令行工具）with permission to publish releases.
-3. Run `npm run github:release` from the repository root on Windows.
+遵循[更新日志填写规范](release-notes.md)，在 `docs/releases/v版本号.md`（对应版本更新文档）中只填写“新增与改进”“修复”“升级注意”。对照上一次实际对外更新与本次本地程序的完整变化，本机已更新但尚未公开的内容应一并合入；不能只汇总最近几次 Git（版本控制）提交。
 
-The script runs `npm run desktop:dist`, then validates `package.json`, the product build stamp, installer build stamp, `package-info.json`, `delivery.json`, the installer file size, and its SHA-256 digest. It creates `update.json` with Chinese field descriptions and `SHA256SUMS.txt` for the release assets. Any mismatch stops publication before `gh release create` or `gh release upload`.
+GitHub 发行正文与程序内日志共用该文档，不能另写一份。发行脚本只转换标题及列表符号，再写入 `update.json`（更新清单）的 `releaseNotes`（中文发行说明），因此条目使用简单文本列表。测试、构建和交付证据保留在内部记录，不混入用户日志。
 
-The first release is `v0.9.0`. Later releases use the version from the root package manifest and a matching `v<version>` tag. The script refuses a dirty worktree or a local `main` that has not been pushed to `origin/main`.
+## 发布发行版
 
-## Release assets
+1. 核对更新日志与本轮实际程序一致，将目标源码与对应版本文档一并提交并推送到 `main`（源码主分支）。
+2. 登录 GitHub CLI（GitHub 命令行工具），确保拥有发行权限。
+3. 在 Windows 的仓库根目录运行 `npm run github:release`（构建并发布发行版）。
+4. 成功后在内部交付记录登记实际交付版本、构建及本轮对照依据，作为后续更新的起点。
 
-- `VoiceTerminalSetup.exe` — the self-contained distribution installer.
-- `delivery.json` — the validated build and installer record.
-- `update.json` — the app updater manifest.
-- `SHA256SUMS.txt` — SHA-256 digests for the installer and JSON records.
+脚本先运行 `npm run desktop:dist`（分发构建），再核对 `package.json`（项目清单）、产品与安装器构建戳、`package-info.json`（程序包信息）、`delivery.json`（交付记录）、安装器大小和 SHA-256（完整文件摘要），生成带中文字段说明的更新清单和资产摘要列表。不一致时在上传前停止。
 
-The app reads `update.json` from the latest public GitHub Release. It downloads the installer only after the user starts the update and verifies the exact size and SHA-256 before handing it to the current workspace's installer transaction.
+首个发行版为 `v0.9.0`。后续版本使用根项目清单的版本号与对应的 `v<version>`（发行标签）。脚本拒绝未提交的工作区，或尚未与 `origin/main`（远程源码主分支）同步的本地 `main`。
+
+## 发行资产
+
+- `VoiceTerminalSetup.exe`（自包含分发安装器）。
+- `delivery.json`（已核验的程序包与安装器交付记录）。
+- `update.json`（包含同一份中文更新日志的应用更新清单）。
+- `SHA256SUMS.txt`（安装器及两份记录的完整文件摘要列表）。
+
+程序读取最新公开发行的更新清单。用户主动开始更新后才下载安装器，核对准确字节数与完整摘要，再交给当前工作区的安装事务。
 
 ## 旧版在线更新兼容验收
 
