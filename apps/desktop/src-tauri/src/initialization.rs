@@ -52,11 +52,11 @@ pub fn auto_start(app:tauri::AppHandle,state:Arc<Desktop>)->Result<(),String>{
 }
 pub(super) fn manage(app:&tauri::AppHandle,state:&Arc<Desktop>)->Result<(),String>{
     if state.context().is_none(){return Err("请先选择工作区并完成本体展开。".into());}
-    if let Some(startup)=app.get_webview_window("startup"){
+    if app.get_webview_window("startup").is_some(){
         let target_app=app.clone();let target_state=state.clone();
         app.run_on_main_thread(move||{
             match super::create_window(&target_app,target_state.clone(),true){
-                Ok(_)=>{let _=startup.destroy();let cache=target_state.data.clone();std::thread::spawn(move||super::cleanup_initialization_cache(&cache));},
+                Ok(_)=>{}, // 旧窗口由 desktop_page_ready（新页面挂载确认）收尾。
                 Err(error)=>{*target_state.error.lock().unwrap()=Some(error);}
             }
         }).map_err(|e|e.to_string())?;

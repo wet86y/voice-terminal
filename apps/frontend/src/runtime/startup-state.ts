@@ -11,13 +11,17 @@ export function startupActivity(snapshot: ApplicationSnapshot | null): string {
   if (snapshot.stopping) return '正在停止本地服务'
   if (snapshot.state === 'stopped') return '从程序入口重新打开即可启动'
   const starting = snapshot.components.filter(row => row.state === 'starting' || row.retrying)
-  if (starting.length) return '正在启动' + starting.map(row => COMPONENT_NAMES[row.id] || row.name).join('、')
+  if (starting.length) {
+    const summary = '正在启动' + starting.map(row => COMPONENT_NAMES[row.id] || row.name).join('、')
+    const phases = starting.filter(row => row.phase?.trim()).map(row => starting.length === 1 ? row.phase : `${COMPONENT_NAMES[row.id] || row.name}：${row.phase}`)
+    return phases.length ? `${summary} · ${phases.join('；')}` : summary
+  }
   if (snapshot.startup_complete && !snapshot.core_available) {
     const failed = snapshot.components.find(row => ['failed', 'blocked'].includes(row.state))
     return failed ? `${COMPONENT_NAMES[failed.id] || failed.name}未能启动` : '请到本地组件查看运行情况'
   }
   const waiting = snapshot.components.find(row => row.state === 'waiting')
-  return waiting ? '正在准备' + (COMPONENT_NAMES[waiting.id] || waiting.name) : '正在完成启动检查'
+  return waiting ? '正在准备' + (COMPONENT_NAMES[waiting.id] || waiting.name) + (waiting.phase ? ` · ${waiting.phase}` : '') : snapshot.phase?.trim() || '正在完成启动检查'
 }
 
 /** startupProgress（启动完成比例）：只使用宿主报告的真实组件计数。 */

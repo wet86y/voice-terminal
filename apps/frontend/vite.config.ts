@@ -2,10 +2,11 @@ import { resolve } from 'node:path'
 import { copyFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { startupFallback } from './startup-plugin'
 
 export default defineConfig({
   cacheDir: resolve(__dirname, '../../.local/cache/vite-product'), // cacheDir（产品界面开发缓存）。
-  plugins: [vue(), {
+  plugins: [startupFallback(), vue(), {
     name: 'desktop-owned-development',
     closeBundle() {
       const output = resolve(__dirname, '../../.local/build/frontend')

@@ -430,14 +430,20 @@ fn create_floating_window(app: &tauri::AppHandle, state: &Desktop) -> Result<Web
             navigation_state.allows_floating_url(url)
         })
         .on_page_load(move |window, payload| {
+            if payload.event()==PageLoadEvent::Started {
+                page_state.floating_ready.store(false,Ordering::Release);
+                let _=window.hide();
+                if page_state.floating_mode.load(Ordering::Acquire)&&!page_state.stopping.load(Ordering::Acquire){
+                    if let Some(main)=window.app_handle().get_webview_window("main"){let _=main.show();}
+                }
+            }
             if payload.event() != PageLoadEvent::Finished
                 || payload.url().path() != "/floating.html"
                 || !page_state.allows_floating_url(payload.url())
             {
                 return;
             }
-            page_state.floating_ready.store(true, Ordering::Release);
-            if page_state.floating_mode.load(Ordering::Acquire) && !page_state.stopping.load(Ordering::Acquire) {
+            if page_state.floating_ready.load(Ordering::Acquire)&&page_state.floating_mode.load(Ordering::Acquire) && !page_state.stopping.load(Ordering::Acquire) {
                 if window.show().is_ok() {
                     if let Some(main) = window.app_handle().get_webview_window("main") {
                         let _ = main.hide();
@@ -515,6 +521,10 @@ fn publish_floating_model(
 #[tauri::command]
 fn get_floating_model(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<serde_json::Value, String> {
     trusted_floating(&window, &state)?;
+    // 此请求由悬浮界面挂载后发出；单纯网页加载完成不足以隐藏主工作台。
+    if !state.floating_ready.swap(true,Ordering::AcqRel)&&state.floating_mode.load(Ordering::Acquire){
+        set_floating_mode(window.app_handle(),&state,true)?;
+    }
     Ok(state.floating_model.lock().map_err(|error| error.to_string())?.clone())
 }
 
@@ -581,7 +591,16 @@ fn desktop_page_ready(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Re
     let management=url.path()=="/management.html"&&boot_page_url(&url);
     if !management&&!(state.is_settled_frontend_url(&url)&&state.allows_frontend_url(&url)){return Err("页面尚未进入管理界面或产品界面。".into());}
     let context=state.context().ok_or("缺少正式工作区")?;
-    workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"role":"product","ready":true,"management_ready":management,"development":context.dev,"fields":{"schema":"页面就绪记录格式","pid":"桌面进程编号","workspace_id":"工作区编号","role":"product（正式程序）","ready":"界面已真实挂载","management_ready":"组件管理页已挂载","development":"显式源码调试"}}))
+    workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"role":"product","ready":true,"management_ready":management,"development":context.dev,"fields":{"schema":"页面就绪记录格式","pid":"桌面进程编号","workspace_id":"工作区编号","role":"product（正式程序）","ready":"界面已真实挂载","management_ready":"组件管理页已挂载","development":"显式源码调试"}}))?;
+    window.show().map_err(|error|error.to_string())?;
+    // 新界面完成挂载及绘制后才撤走临时启动窗口，加载失败时旧画面仍可见。
+    if window.label()=="main" {
+        if let Some(startup)=window.app_handle().get_webview_window("startup"){
+            startup.destroy().map_err(|error|error.to_string())?;
+            let cache=state.data.clone();std::thread::spawn(move||cleanup_initialization_cache(&cache));
+        }
+    }
+    Ok(())
 }
 #[tauri::command]
 fn skip_startup(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
@@ -1321,6 +1340,8 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
             let page_state = build_state.clone();
             let main_window =
                 WebviewWindowBuilder::new(app, if pending {"startup"}else{"main"}, WebviewUrl::App(if management {"management.html".into()}else{"startup.html".into()}))
+                    .background_color(tauri::window::Color(14,17,24,255))
+                    .visible(false)
                     .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
                     .title(if build_state.mode == FrontendMode::UiPreview {
                         "Voice Terminal · 前端演示（无业务后端）"

@@ -121,6 +121,7 @@ pub fn run(task: PathBuf, locator: Locator) -> Result<(), String> {
         .setup(move |app| {
             let handle = app.handle().clone();
             let window = WebviewWindowBuilder::new(app, "startup", WebviewUrl::App("index.html".into()))
+                .background_color(tauri::window::Color(14,17,24,255)).visible(false)
                 .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
                 .title("Voice Terminal · 程序迁移中").inner_size(1000., 640.).min_inner_size(400., 480.)
                 .incognito(true).data_directory(window_cache)
@@ -128,6 +129,7 @@ pub fn run(task: PathBuf, locator: Locator) -> Result<(), String> {
                     && ((url.scheme() == "tauri" && url.host_str() == Some("localhost"))
                         || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost") && url.port().is_none())))
                 .on_page_load(move |window, payload| {
+                    if payload.event()==tauri::webview::PageLoadEvent::Finished {let _=window.show();}
                     if payload.event() != tauri::webview::PageLoadEvent::Finished || trusted(&window).is_err()
                         || setup_state.requested.swap(true, Ordering::SeqCst) { return; }
                     let state = setup_state.clone();

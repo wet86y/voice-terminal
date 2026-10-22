@@ -75,6 +75,8 @@ function frontendModeLabel(mode: DesktopFrontendMode) {
 }
 
 export interface DesktopPreflightOptions {
+  /** management（本地管理入口）：业务故障时仍允许进入，但必须核验产品窗口身份。 */
+  management?: boolean
   /** expectedMode（预期前端模式）：必须与桌面授权模式完全一致。 */
   expectedMode: DesktopFrontendMode
   /** startApplication（启动应用）：状态核验成功后才会执行动态导入。 */
@@ -127,7 +129,7 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
       content.append(progress)
     }
     const actions = makeElement('div', '', 'startup-actions')
-    if (!error && invoke) {
+    if (!error && invoke && !options.management) {
       const skip = makeElement('button', skipRequested ? '正在打开主页' : '跳过', 'startup-button')
       skip.type = 'button'
       skip.disabled = skipRequested
@@ -145,7 +147,10 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
       const retry = makeElement('button', '重试', 'startup-button')
       retry.type = 'button'
       retry.disabled = busy
-      retry.addEventListener('click', () => { void attempt() })
+      retry.addEventListener('click', () => {
+        if (startupGuard()?.failed) window.location.reload()
+        else void attempt()
+      })
       actions.append(retry)
     }
     if (invoke && error) {
@@ -158,6 +163,7 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
     if (actions.childElementCount) content.append(actions)
     section.append(content)
     root.replaceChildren(section)
+    if (error) finishStartupFallback()
   }
 
   async function exitApplication() {
@@ -175,18 +181,21 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
   async function attempt() {
     if (busy) return
     busy = true
+    startupGuard()?.start()
     show('应用启动中', '正在加载应用界面', false)
     try {
       if (!invoke) throw new Error('没有检测到桌面原生运行时。')
       const status = await invoke.invoke<unknown>('desktop_status')
       if (root?.dataset.applicationExiting === 'true') return
-      const problem = validateDesktopStatus(status, options.expectedMode)
+      assertStartupActive()
+      const problem = options.management ? validateManagementStatus(status) : validateDesktopStatus(status, options.expectedMode)
       if (problem) throw new Error(problem)
       if (skipRequested || (status as DesktopStatus).startup_skipped === true) {
         skipRequested = true
         options.onSkip?.()
       }
       await options.startApplication({ ...status as DesktopStatus, startup_skipped: skipRequested })
+      finishStartupFallback()
       busy = false
     } catch (reason) {
       busy = false
@@ -196,4 +205,26 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
 
   show('应用启动中', '正在加载应用界面', false)
   await attempt()
+}
+
+/** finishStartupFallback（结束首屏兜底）：界面或受控错误页已接管。 */
+export function finishStartupFallback() {
+  startupGuard()?.ready()
+}
+
+function startupGuard() {
+  return (window as Window & { __VOICE_STARTUP__?: { start: () => void; ready: () => void; failed: boolean } }).__VOICE_STARTUP__
+}
+
+/** assertStartupActive（拒绝迟到挂载）：超时或退出之后，不再用异步加载结果覆盖错误及退出画面。 */
+export function assertStartupActive() {
+  if (startupGuard()?.failed || document.getElementById('app')?.dataset.applicationExiting === 'true') throw new Error('本次界面加载已中止，请重新加载应用。')
+}
+
+/** validateManagementStatus（管理页身份核验）：业务故障在管理页修复，仍拒绝错误的入口身份。 */
+function validateManagementStatus(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '桌面启动程序返回了无效状态。'
+  const state = value as Partial<DesktopStatus>
+  if (state.role !== 'product' || state.frontend_mode !== 'product' || typeof state.development !== 'boolean') return '组件管理入口未获得正式程序授权。'
+  return null
 }
