@@ -30,8 +30,17 @@
 - `.local/Verify-Package.ps1`（本机完整性校验脚本）退出码为 0；本机 `app/release.json`（程序版本清单）、最终程序包和最终安装器构建戳的版本、构建编号及摘要关系一致。
 - 强制兼容记录为 `status=compatible`（兼容）、`stable=true`（结果稳定），18 项任务完成；有效运行组件已复用。
 - 桌面宿主输出 5 条未使用代码警告，没有构建错误；本轮未运行独立回归测试套件。本记录不代表完成所有设备上的现场语音验收。
-- `npm run assets:check`（暂存资产检查）通过 3 个文档路径；GitHub 发布结果待源码提交推送后补录。
+- `npm run assets:check`（暂存资产检查）通过 3 个文档路径；源码和版本文档随发行提交推送，公开资产核验结果见下节。
 
 ## GitHub 公开发行
 
-待完成：源码提交推送、`v0.9.6` 正式发行、四项资产回下载摘要核对及 latest（最新发行）入口复核。
+正式发行标签 [`v0.9.6`](https://github.com/wet86y/voice-terminal/releases/tag/v0.9.6) 指向提交 `8778fa6885398c890382c1601ca13b084117efcf`，其中产品程序构建基线为 `d6bb9cdadb3f82e80229c71636bf8bd475f994ae`。GitHub 发行版为公开正式发行，非草稿、非预发布版；公开 latest（最新发行）入口已返回 v0.9.6。发行正文与本地[v0.9.6 发行说明](../releases/v0.9.6.md)一致，`update.json`（更新清单）的 `releaseNotes`（中文发行说明）也与该文档转换后的正文一致。
+
+| GitHub 发行资产 | 大小 | SHA-256（完整文件摘要） |
+| --- | ---: | --- |
+| `VoiceTerminalSetup.exe`（普通分发安装器） | 115,339,776 字节 | `dbbceb40063378057c683177fd463b4e176f36f936aef74bbb3904a9feaca36f` |
+| `delivery.json`（交付记录） | 892 字节 | `1a163d6840072a527b15e095ac321a6165b69de2fb839ead6f3f4ca184940bee` |
+| `update.json`（更新清单） | 2,220 字节 | `0fa999184bda9fc2f1f844f23e9649dddecbf6ab480d1bb8f1592b939cbfb1a1` |
+| `SHA256SUMS.txt`（摘要列表） | 247 字节 | `6124de6536caa2b96082c4763cd723fe096b5864f0d578d89746baec6e545882` |
+
+发行脚本 `scripts/publish-github-release.ps1 -SkipBuild`（复用已构建资产发布发行版）完成发布；四项资产均通过 `gh release download`（GitHub 发行下载）回下载，与本机构建输出的大小及 SHA-256 完整一致。发行前的源码与版本说明提交已推送至 `main`（源码主分支）提交 `8778fa6885398c890382c1601ca13b084117efcf`；本次公开资产记录的 `assets:check`（暂存资产检查）通过 2 个文档路径，发行前也曾通过 3 个文档路径。
