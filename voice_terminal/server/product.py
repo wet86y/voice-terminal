@@ -16,10 +16,12 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 from collections import deque
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -612,10 +614,20 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
                        settings.get("audio_enhancements", config.audio_enhancements.snapshot())))
 
 
+def _settings_locked(method):
+    """_settings_locked（设置互斥）：读改写及完整文件替换共用可重入锁。"""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._settings_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class ProductSettingsStore:
     """Atomic, non-secret product settings plus allowlisted Persona writes."""
 
     def __init__(self, *, path: Path, config: AppConfig) -> None:
+        self._settings_lock = threading.RLock()  # _settings_lock（设置锁）：保护后台保存与界面快照。
         self.path = path
         self.config = config
         self.persona_directory = (config.paths.persona if config.paths and config.paths.separated
@@ -667,6 +679,7 @@ class ProductSettingsStore:
                 )
         return merged
 
+    @_settings_locked
     def snapshot(self) -> dict[str, Any]:
         value = self.settings_only()
         if self._malformed_schema_marker:
@@ -675,6 +688,7 @@ class ProductSettingsStore:
         value["warnings"] = list(self.warnings)
         return value
 
+    @_settings_locked
     def settings_only(self) -> dict[str, Any]:
         result = deepcopy(self._settings)
         selections = getattr(self, "_tts_voice_selections", None)
@@ -682,6 +696,7 @@ class ProductSettingsStore:
             result["tts"]["active_voice_by_model"] = selections()
         return result
 
+    @_settings_locked
     def save_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
         """保存三个独立开关，写入失败恢复原值。"""
         current = self._settings["audio_enhancements"]
@@ -694,6 +709,7 @@ class ProductSettingsStore:
             raise
         return dict(value)
 
+    @_settings_locked
     def save_hotwords(self, payload: dict) -> dict:
         """save_hotwords（保存热词）：写入失败不改变内存配置。"""
         try:
@@ -709,6 +725,7 @@ class ProductSettingsStore:
             raise
         return deepcopy(value)
 
+    @_settings_locked
     def save_tts_local_model(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """在运行切换成功后保存 backend（语音后端）及 local_model（本地模型）。"""
         if not payload or set(payload) - {
@@ -758,6 +775,7 @@ class ProductSettingsStore:
             raise
         return deepcopy(self._settings["tts"])
 
+    @_settings_locked
     def save_tts_voice_selection(self, model: str, selection: Mapping[str, Any]) -> dict[str, Any]:
         """原子保存 model（本地模型）的 voice_id（音色标识）和 revision（音色版本）。"""
         if model not in {"voxcpm1", "voxcpm2"}:
@@ -792,6 +810,7 @@ class ProductSettingsStore:
                 result[key] = ""
         return result
 
+    @_settings_locked
     def save_custom_instructions(self, value: Any) -> dict[str, Any]:
         try:
             entries = validate_entries(value)
@@ -802,14 +821,22 @@ class ProductSettingsStore:
         self._save_settings()
         return self.snapshot()
 
+    @_settings_locked
     def effective_config(self) -> AppConfig:
         return apply_settings_to_config(self.config, self._settings)
 
+    @_settings_locked
     def _save_settings(self) -> None:
         saved = deepcopy(self._settings)
         if getattr(self, "_tts_voice_selections", None):
             saved["tts"].pop("active_voice_by_model", None)
         _atomic_write_json(self.path, saved)
+        from ..compatibility import record_settings_validation
+        # 校验凭据是可重建派生资料；写入失败不把已成功保存的设置误报为失败。
+        try:
+            record_settings_validation(self.path, PRODUCT_SETTINGS_SCHEMA_VERSION)
+        except OSError:
+            pass
         # A successful explicit save repairs a previously unreadable settings
         # artifact.  Keep the warning until that point, but do not continue
         # advertising a stale recovery warning after the file is valid.
@@ -872,7 +899,8 @@ class ProductSettingsStore:
                 ) from exc
 
     async def save_wake(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if payload.get("enabled") is False and self._settings["quiet_hours"]["enabled"]:
+        settings = self.settings_only()
+        if payload.get("enabled") is False and settings["quiet_hours"]["enabled"]:
             raise ProductSettingsError("请先关闭被动静默时间，再禁用 KWS（关键词唤醒）。")
         if type(payload.get("enabled")) is not bool:
             raise ProductSettingsError("enabled 必须是布尔值。")
@@ -911,7 +939,7 @@ class ProductSettingsStore:
             raise ProductSettingsError(f"唤醒词无法生成有效标签：{str(exc)[:200]}") from exc
         if len(keywords) > MAX_WAKE_KEYWORDS:  # defensive: normalize already caps
             raise ProductSettingsError(f"最多支持 {MAX_WAKE_KEYWORDS} 个唤醒词。")
-        previous = self._settings["wake"]
+        previous = settings["wake"]
         try:
             previous_keywords = normalize_keyword_list(
                 previous.get("keywords") if isinstance(previous.get("keywords"), (list, tuple))
@@ -928,14 +956,26 @@ class ProductSettingsStore:
                 compile_required = True
         if compile_required:
             await asyncio.to_thread(self._compile_keyword, tuple(zip(keywords, labels)))
-        self._settings["wake"] = {
+        return self._save_wake_value({
             "enabled": payload["enabled"],
             "keyword": keywords[0],
             "keyword_label": labels[0],
             "keywords": list(keywords),
             "sensitivity": sensitivity,
-        }
-        self._save_settings()
+        })
+
+    @_settings_locked
+    def _save_wake_value(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """编译完成后串行提交，并用最新设置重新核验被动静默依赖。"""
+        if not value["enabled"] and self._settings["quiet_hours"]["enabled"]:
+            raise ProductSettingsError("请先关闭被动静默时间，再禁用 KWS（关键词唤醒）。")
+        previous = self._settings["wake"]
+        self._settings["wake"] = dict(value)
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["wake"] = previous
+            raise
         return self.snapshot()
 
     def _compile_keyword(self, entries: Sequence[tuple[str, str]]) -> None:
@@ -1015,6 +1055,7 @@ class ProductSettingsStore:
                         pass
                 raise ProductSettingsError(f"KWS 关键词文件替换失败：{type(exc).__name__}。") from exc
 
+    @_settings_locked
     def save_quiet_hours(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != {"enabled", "start", "end"}:
             raise ProductSettingsError("被动静默字段必须为 enabled（启用）、start（开始时间）、end（结束时间）。")
@@ -1034,6 +1075,10 @@ class ProductSettingsStore:
         return self.snapshot()
 
     async def save_silence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._save_silence(payload)
+
+    @_settings_locked
+    def _save_silence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         raw_seconds = payload.get("seconds")
         if type(raw_seconds) is not int:
             raise ProductSettingsError("seconds（静默秒数）必须是整数。")
@@ -1052,6 +1097,20 @@ class ProductSettingsStore:
             raise
         return self.snapshot()
 
+    @_settings_locked
+    def save_screen_capture(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """save_screen_capture（屏幕图像设置）：与其他字段共用原子保存边界。"""
+        value = ScreenCaptureConfig(**dict(payload)).snapshot()
+        previous = self._settings
+        self._settings = {**previous, "screen_capture": value, "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION}
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings = previous
+            raise
+        return value
+
+    @_settings_locked
     def save_approvals(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """save_approvals（保存审批确认偏好）：不保存已授予的连续授权。"""
         fields = {"voice_confirmation_enabled", "continuous_enabled"}
@@ -1066,6 +1125,7 @@ class ProductSettingsStore:
             raise
         return deepcopy(self._settings["approvals"])
 
+    @_settings_locked
     def save_shadow(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != {"experimental_context_gate_enabled"}:
             raise ProductSettingsError(
@@ -1080,6 +1140,7 @@ class ProductSettingsStore:
         self._save_settings()
         return deepcopy(self._settings["shadow"])
 
+    @_settings_locked
     def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """原子保存声纹策略；兼容旧四字段请求，不清除新增参数。"""
         base = {"mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in"}
@@ -1116,6 +1177,7 @@ class ProductSettingsStore:
         self._save_settings()
         return deepcopy(saved)
 
+    @_settings_locked
     def save_compute(self, payload: Mapping[str, Any], *,
                      active_devices: Mapping[str, str] | None = None) -> dict[str, Any]:
         """保存本地模型设备选择，并记录每项最近成功设备作为启动回退。"""
@@ -1144,6 +1206,7 @@ class ProductSettingsStore:
         self._save_settings()
         return deepcopy(self._settings["compute"])
 
+    @_settings_locked
     def save_compute_model(self, model_id: str, device: str, *, active_device: str | None = None) -> dict[str, Any]:
         """只保存一个模型的设备选择；热切换时可记录本次核验成功的实际设备。"""
         if model_id not in COMPUTE_MODEL_IDS:
@@ -1166,6 +1229,7 @@ class ProductSettingsStore:
             raise
         return deepcopy(self._settings["compute"])
 
+    @_settings_locked
     def revert_failed_compute_devices(self, model_status: Mapping[str, Any]) -> dict[str, str]:
         """把显式 CUDA 启动失败的偏好恢复为上次成功设备。"""
         compute = self._settings.get("compute", {})

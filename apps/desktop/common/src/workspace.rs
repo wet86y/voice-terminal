@@ -1158,8 +1158,9 @@ pub fn recover_install(root:&Path)->Result<(),String>{
     let rows=record["items"].as_array().ok_or("更新恢复记录无效")?;
     for row in rows {
         let relative=row["path"].as_str().ok_or("恢复路径缺失")?;
-        let retired_profile=crate::installation::RETIRED_PROFILE_PATHS.contains(&relative)&&row["delete_only"]==true&&row["original"]==true;
-        if !(retired_profile||relative=="app"||relative.starts_with("models/")||relative.starts_with("runtimes/")||["models","portable.json","VoiceTerminal.exe","VoiceTerminalUIDemo.exe","Verify-Package.ps1","使用与环境说明.md","app/release.json","models/manifest.json"].contains(&relative)) {return Err("更新恢复路径不在受管范围。".into());}
+        let allowed_data=(crate::installation::RETIRED_PROFILE_PATHS.contains(&relative)&&row["delete_only"]==true&&row["original"]==true)
+            || crate::compatibility::is_transaction_path(relative)&&row["delete_only"]!=true;
+        if !(allowed_data||relative=="app"||relative.starts_with("models/")||relative.starts_with("runtimes/")||["models","portable.json","VoiceTerminal.exe","VoiceTerminalUIDemo.exe","Verify-Package.ps1","使用与环境说明.md","app/release.json","models/manifest.json"].contains(&relative)) {return Err("更新恢复路径不在受管范围。".into());}
         safe_path(root,relative)?;
     }
     if !committed {for row in rows.iter().rev(){

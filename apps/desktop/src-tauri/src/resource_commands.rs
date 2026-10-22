@@ -161,14 +161,15 @@ impl ResourceManager {
 
     /// Inventory（资源清单）：normalize the Python resource result for the frontend.
     pub fn inventory(&self) -> Result<Vec<Value>, String> {
-        let mut rows=voice_desktop_common::resources::inventory(&self.context)?;
+        voice_desktop_common::compatibility::inventory_with(&self.context, |rows| {
         let failures=self.validation_failures.lock().map_err(|_|"组件校验状态不可用。")?;
-        for row in &mut rows{if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
+        for row in rows.iter_mut(){if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
             row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
         }}
-        voice_desktop_common::resources::update_tts_readiness(&self.context,&mut rows)?;
+        voice_desktop_common::resources::update_tts_readiness(&self.context,rows)?;
         if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
-        Ok(rows)
+        Ok(())
+        })
     }
     pub fn record_validation(&self,readiness:&Value){
         if let Ok(mut failures)=self.validation_failures.lock(){failures.clear();
@@ -883,6 +884,8 @@ impl ResourceManager {
             snapshot.state = state.into(); snapshot.phase = phase.into(); snapshot.error = error;
             snapshot.can_cancel = false; for id in installed{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}}snapshot.import_preview=None;
         });
+        // 成功、失败及取消均重读实际组件；任务完成本身不代表兼容检查通过。
+        if let Err(error)=self.inventory(){eprintln!("兼容性组件重新盘点失败：{error}");}
     }
 
     fn set_phase(&self, job_id: &str, phase: &str, can_cancel: bool, done: u64, total: Option<u64>) {

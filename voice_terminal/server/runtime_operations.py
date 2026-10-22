@@ -40,6 +40,10 @@ class RuntimeOperations:
     def intent(self, listening: bool):
         self.resume_requested = listening
 
+    def listening_start_allowed(self) -> bool:
+        """listening_start_allowed（采集启动许可）：预热结束后核对新租约及停止意图。"""
+        return not self.closed and not self.holds and (not self.restoring or self.resume_requested)
+
     def reserve(self, target, label, *, phase="switching", pause=False):
         """同步预约，确保 202（已接纳）返回前确定先后顺序。"""
         pause = pause and hasattr(self.runtime, "_session_lock")

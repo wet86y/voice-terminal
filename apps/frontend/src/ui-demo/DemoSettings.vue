@@ -52,9 +52,9 @@ const instructionRows = computed(() => props.scene === 'empty' ? [] : instructio
 const loading = computed(() => props.scene === 'loading')
 const updatePreview = computed<AppUpdateStatus>(() => ({
   state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
-  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.5',
+  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.6',
   release_notes: props.scene === 'empty' ? null : [
-    'Voice Terminal（语音终端）v0.9.5', '',
+    'Voice Terminal（语音终端）v0.9.6', '',
     'CPU/GPU 设备热切换', '• Paraformer、emotion2vec 和 CAM++ 可在详情页保存后热切换运行设备。',
     '• 状态卡显示模型加载、预热、核验与失败恢复进度。',
     '• Paraformer 离线精修跟随主路使用相同设备。',

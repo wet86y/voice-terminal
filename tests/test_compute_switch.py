@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,37 @@ def gpu_preflight():
         patch("voice_terminal.compute.model_hardware_status", side_effect=lambda value, *_args, **_kwargs: value),
         patch("voice_terminal.application.resource_readiness.inspect_model_resources", return_value={}),
     )
+
+
+@pytest.mark.asyncio
+async def test_compute_commit_preserves_settings_applied_during_save(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+    runtime.asr = SimpleNamespace(configure_compute=AsyncMock(return_value=model_status("cuda", requested="auto")))
+    saved = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_save = runtime.product_settings.save_compute_model
+
+    def delayed_save(*args, **kwargs):
+        result = original_save(*args, **kwargs)
+        loop.call_soon_threadsafe(saved.set)
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(runtime.product_settings, "save_compute_model", delayed_save)
+    with patch("voice_terminal.application.resource_readiness.inspect_model_resources", return_value={}):
+        task = asyncio.create_task(runtime.switch_compute_device({"model_id": "paraformer", "device": "auto"}))
+        try:
+            await asyncio.wait_for(saved.wait(), 5)
+            await asyncio.to_thread(runtime.product_settings.save_speaker,
+                                    {"mode": "observe", "confirm_threshold": 0.6, "owner_only_barge_in": False})
+            runtime.config = replace(runtime.config, speaker=replace(runtime.config.speaker, mode="observe"))
+        finally:
+            release.set()
+        await task
+    assert runtime.config.speaker.mode == "observe"
+    assert runtime.config.compute.devices["paraformer"] == "auto"
+    assert runtime.product_settings.settings_only()["speaker"]["mode"] == "observe"
 
 
 @pytest.mark.asyncio

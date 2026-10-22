@@ -164,12 +164,13 @@ class ProductSettingsRuntimeMixin:
                 target_status = await apply(device)
                 await operation.update("verifying")
                 actual = verify(target_status, device)
-                devices = {**old_compute.devices, model_id: device}
-                fallbacks = {**old_compute.fallback_devices, model_id: actual}
-                new_config = replace(self.config, compute=ComputeConfig(devices, fallbacks))
                 saved = await asyncio.to_thread(
                     self.product_settings.save_compute_model, model_id, device, active_device=actual)
-                self.config = new_config
+                # 保存期间其他设置可正常应用；只在最新配置上替换本次模型的计算字段。
+                current_compute = self.config.compute
+                devices = {**current_compute.devices, model_id: device}
+                fallbacks = {**current_compute.fallback_devices, model_id: actual}
+                self.config = replace(self.config, compute=ComputeConfig(devices, fallbacks))
                 return saved
             except BaseException as failure:
                 if isinstance(failure, asyncio.CancelledError) and (

@@ -12,6 +12,8 @@
 
 ## 按需参考
 
+- 涉及环境依赖、资源组件或持久化设置格式变更时，查阅[兼容性组件](docs/architecture/compatibility-component.md)；相关兼容判断与迁移优先经该组件统一维护。
+
 - 涉及开发入口、环境布局或覆盖发布时，查阅[本地目录与覆盖发布](docs/guides/local-layout.md)。
 - 涉及资产收录、测试现场保留、容量或回收时，查阅[开发资产治理](docs/development/asset-governance.md)；具体参数见 `config/development-assets.json`（开发资产策略）。文档中的实现类、命令及预算只适用于相应工作，不要求每个任务安装钩子、运行审计或采用指定实现。
 

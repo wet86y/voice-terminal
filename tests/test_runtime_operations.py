@@ -8,6 +8,8 @@ import pytest
 from voice_terminal.server.runtime_operations import runtime_operation, runtime_operations
 from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager
 from voice_terminal.application.state import ApplicationState
+from voice_terminal.controller.turn_controller import InputController
+from voice_terminal.core.state import RuntimeState
 
 
 class Runtime:
@@ -66,6 +68,78 @@ async def test_consecutive_operations_do_not_reopen_microphone_between_tasks():
     await asyncio.gather(first, second)
     runtime.start_listening.assert_awaited_once()
     assert runtime.stop_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["queued", "stop", "close"])
+async def test_restore_rechecks_permission_after_asr_health_before_opening_microphone(interruption):
+    runtime = Runtime()
+    runtime.state = RuntimeState()
+    runtime.state.listening = True
+    for service in ("audio", "asr", "llm", "tts"):
+        runtime.state.set_service(service, "READY")
+    runtime.state.set_service("kws", "DISABLED")
+    checking, release_health, second_entered, release_second = (asyncio.Event() for _ in range(4))
+
+    async def health():
+        checking.set()
+        await release_health.wait()
+
+    class LifecycleController(InputController):
+        async def _on_asr_result(self, *_):
+            pass
+
+    capture = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+    controller = LifecycleController(
+        state=runtime.state, bus=runtime.bus, history=SimpleNamespace(records=[]), capture=capture,
+        kws=None, vad=SimpleNamespace(reset=lambda: None),
+        asr=SimpleNamespace(connected=True, health=health), llm=None, tts=None, player=None,
+        wake_enabled=False, wake_keyword="你好", wake_preroll_ms=0, vad_min_speech_ms=45,
+        vad_end_silence_ms=500, max_turn_ms=30000, bridge_min_chars=1, bridge_max_chars=36,
+        bridge_max_wait_ms=100, bridge_breaks="。", listening_start_allowed=runtime_operations(runtime).listening_start_allowed,
+    )
+    controller.stop_listening = runtime.stop
+    controller._listen_loop = lambda: asyncio.Event().wait()
+    runtime.controller = controller
+    runtime.start_listening = controller.start_listening
+
+    async def first():
+        async with runtime_operation(runtime, "first", "设备切换", pause=True):
+            pass
+
+    async def second():
+        async with runtime_operation(runtime, "second", "后续维护", pause=True):
+            second_entered.set()
+            await release_second.wait()
+
+    first_task = asyncio.create_task(first())
+    second_task = None
+    try:
+        await asyncio.wait_for(checking.wait(), 5)
+        if interruption == "queued":
+            second_task = asyncio.create_task(second())
+            await asyncio.sleep(0)
+            assert runtime_operations(runtime).holds == 1
+        elif interruption == "stop":
+            runtime_operations(runtime).intent(False)
+        else:
+            runtime._application_stopping = True
+        release_health.set()
+        await asyncio.wait_for(first_task, 5)
+        if second_task is not None:
+            await asyncio.wait_for(second_entered.wait(), 5)
+        capture.start.assert_not_awaited()
+        assert not runtime.state.listening
+    finally:
+        release_health.set()
+        release_second.set()
+        await asyncio.gather(first_task, *([second_task] if second_task else []), return_exceptions=True)
+        if controller._listen_task is not None:
+            controller._listen_task.cancel()
+            await asyncio.gather(controller._listen_task, return_exceptions=True)
+    if interruption == "queued":
+        capture.start.assert_awaited_once()
+        assert runtime.state.listening
 
 
 @pytest.mark.asyncio

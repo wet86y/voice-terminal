@@ -34,11 +34,14 @@ fn start()->Result<(),String>{
     let args:Vec<String>=std::env::args().skip(1).collect();
     if args==["--verify-package"]{return installation::verify_installed(std::env::current_exe().map_err(|e|e.to_string())?.parent().ok_or("入口缺少工作区")?);}
     if let Some(path)=value(&args,"--workspace-task"){return run_task(Path::new(path));}
-    // install-package（本地发布辅助模式）：与安装器共用校验和事务替换，不要求后端环境。
+    // install-package（本地发布辅助模式）：与安装器共用本体事务及强制兼容处理。
     if let Some(package)=value(&args,"--install-package"){
         let root=Path::new(value(&args,"--target-root").ok_or("本地发布缺少目标工作区")?);
         let payload=std::fs::read(package).map_err(|e|e.to_string())?;
-        return installation::install(&payload,root,Arc::new(AtomicBool::new(false)),&mut|phase,done,total|{if done==0||done==total{println!("{phase}：{done}/{total}");}});
+        let cancel=Arc::new(AtomicBool::new(false));
+        let mut progress=|phase:&str,done,total|{if done==0||done==total{println!("{phase}：{done}/{total}");}};
+        installation::install(&payload,root,cancel.clone(),&mut progress)?;
+        return voice_desktop_common::compatibility::enforce_upgrade(root,cancel,&mut progress);
     }
     let executable=std::env::current_exe().map_err(|e|e.to_string())?;
     let root=executable.parent().ok_or("正式入口缺少工作区目录")?;
