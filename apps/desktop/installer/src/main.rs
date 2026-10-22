@@ -66,6 +66,13 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         }
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
         complete_compatibility(&root,state.cancel.clone(),&mut progress)?;
+        if !cfg!(feature="qualification"){
+            progress("正在保存当前版本校验程序",0,0);
+            let version=installation::package_version(PACKAGE)?;
+            let build=installation::package_build(PACKAGE)?;
+            let executable=std::env::current_exe().map_err(|error|format!("无法定位当前分发器：{error}"))?;
+            voice_desktop_common::app_update::retain_local_installer(&root,&executable,&version,&build)?;
+        }
         if state.shortcut{progress("创建桌面快捷方式",0,0);shortcuts::create(&root,None)?;}
         progress("正在启动正式程序",0,0);let pid=installation::launch(&root)?;
         let record=json!({"ok":true,"target_root":root,"product_pid":pid,"installer_pid":std::process::id(),"fields":{"ok":"首次窗口交接成功","target_root":"目标工作区","product_pid":"独立正式宿主进程编号","installer_pid":"交接后退出的安装器进程编号"}});

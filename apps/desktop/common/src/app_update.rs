@@ -1,5 +1,5 @@
 //! App update manifest（应用更新清单）：仅接受当前公开仓库的固定安装器资产。
-use std::{collections::BTreeMap, ffi::CString, path::{Path, PathBuf}};
+use std::{collections::BTreeMap, ffi::CString, fs, path::{Path, PathBuf}};
 use serde::{Deserialize, Serialize};
 
 pub const LATEST_MANIFEST_URL: &str =
@@ -8,6 +8,7 @@ pub const INSTALLER_ASSET: &str = "VoiceTerminalSetup.exe";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 pub const MAINTENANCE_INSTALLER: &str = "maintenance/VoiceTerminalSetup.exe"; // MAINTENANCE_INSTALLER（长期保留的维护分发器）。
 const MAINTENANCE_RECORD: &str = "maintenance/installer.json"; // MAINTENANCE_RECORD（分发器身份记录）。
+pub const UPDATE_INSTALLER: &str = "tmp/app-update/VoiceTerminalSetup.exe"; // UPDATE_INSTALLER（与长期校验器分开的更新暂存分发器）。
 
 #[cfg(windows)]
 unsafe extern "C" {
@@ -121,6 +122,7 @@ pub fn delivery(manifest:&AppUpdateManifest)->Result<RetainedInstaller,String>{
         ("build".into(),"内嵌程序构建编号".into()),("fields".into(),"字段中文说明".into())])})
 }
 pub fn installer_path(root:&Path)->Result<PathBuf,String>{crate::workspace::safe_path(root,MAINTENANCE_INSTALLER)}
+pub fn update_installer_path(root:&Path)->Result<PathBuf,String>{crate::workspace::safe_path(root,UPDATE_INSTALLER)}
 /// installed_build（独立安装身份）：本体清单损坏时，仍能从上次提交身份或兼容记录启动修复。
 pub fn installed_build(root:&Path,version:&str)->Result<String,String>{
     for relative in ["data/state/product-identity.json","app/release.json"]{
@@ -150,6 +152,63 @@ pub fn retained(root:&Path,version:&str,build:&str)->Result<RetainedInstaller,St
 pub fn save_retained(root:&Path,record:&RetainedInstaller)->Result<(),String>{
     crate::workspace::atomic_json(&crate::workspace::safe_path(root,MAINTENANCE_RECORD)?,&serde_json::to_value(record).map_err(|e|e.to_string())?)
 }
+
+/// retain_local_installer（保存本地当前版本校验器）：将刚完成安装的分发器固定到维护目录。
+pub fn retain_local_installer(root:&Path,source:&Path,version:&str,build:&str)->Result<(),String>{
+    let parsed=semver::Version::parse(version).map_err(|_|"当前程序版本无效。")?;
+    if !parsed.pre.is_empty()||!parsed.build.is_empty()||build.trim().is_empty(){return Err("当前安装器缺少正式版本或构建身份。".into());}
+    let source=fs::canonicalize(source).map_err(|error|format!("无法定位当前分发器：{error}"))?;
+    let source_metadata=fs::metadata(&source).map_err(|error|error.to_string())?;
+    let size=source_metadata.len();
+    if !(1024*1024..=2*1024*1024*1024).contains(&size){return Err("当前分发器大小不符合维护器要求。".into());}
+    let sha256=crate::workspace::file_hash(&source)?;
+    let destination=installer_path(root)?;
+    let parent=destination.parent().ok_or("维护器目录无效")?;
+    fs::create_dir_all(parent).map_err(|error|format!("无法创建校验维护目录：{error}"))?;
+    let destination=installer_path(root)?;
+    let same_file=destination.exists()&&fs::canonicalize(&destination).map_err(|error|error.to_string())?==source;
+    if !same_file{
+        let temporary_relative=format!("maintenance/.VoiceTerminalSetup-{}.tmp",crate::workspace::new_id());
+        let temporary=crate::workspace::safe_path(root,&temporary_relative)?;
+        let copy_result=(||{
+            fs::copy(&source,&temporary).map_err(|error|format!("无法复制当前校验分发器：{error}"))?;
+            if fs::metadata(&temporary).map_err(|error|error.to_string())?.len()!=size||crate::workspace::file_hash(&temporary)?!=sha256{
+                return Err("当前校验分发器复制后摘要不匹配。".into());
+            }
+            replace_file(&temporary,&destination)
+        })();
+        if let Err(error)=copy_result{let _=fs::remove_file(&temporary);return Err(error);}
+    }
+    if fs::metadata(&destination).map_err(|error|error.to_string())?.len()!=size||crate::workspace::file_hash(&destination)?!=sha256{
+        return Err("已保存的当前校验分发器摘要不匹配。".into());
+    }
+    let manifest=AppUpdateManifest{
+        version:version.to_owned(),tag:format!("v{version}"),asset:INSTALLER_ASSET.to_owned(),size,sha256,
+        release_notes:"当前分发器用于校验本地版本的受管组件。".into(),
+        fields:BTreeMap::from([
+            ("version".into(),"产品版本".into()),("tag".into(),"发行标签".into()),
+            ("asset".into(),"分发器文件名".into()),("size".into(),"分发器字节数".into()),
+            ("sha256".into(),"分发器 SHA-256 摘要".into()),("releaseNotes".into(),"维护用途说明".into()),
+        ]),
+    };
+    manifest.validate()?;
+    let record=RetainedInstaller{schema:1,manifest,build:build.to_owned(),fields:BTreeMap::from([
+        ("schema".into(),"长期分发器记录格式".into()),("manifest".into(),"当前分发器文件身份".into()),
+        ("build".into(),"内嵌程序构建编号".into()),("fields".into(),"字段中文说明".into()),
+    ])};
+    save_retained(root,&record)
+}
+
+#[cfg(windows)]
+fn replace_file(source:&Path,destination:&Path)->Result<(),String>{
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {fn MoveFileExW(from:*const u16,to:*const u16,flags:u32)->i32;}
+    let from:Vec<_>=source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to:Vec<_>=destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe{MoveFileExW(from.as_ptr(),to.as_ptr(),1|8)}==0{Err(std::io::Error::last_os_error().to_string())}else{Ok(())}
+}
+#[cfg(not(windows))]
+fn replace_file(source:&Path,destination:&Path)->Result<(),String>{fs::rename(source,destination).map_err(|error|error.to_string())}
 
 #[cfg(test)]
 mod tests {

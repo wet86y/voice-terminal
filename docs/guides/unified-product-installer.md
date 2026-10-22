@@ -62,4 +62,4 @@ Voice Server（语音服务）必需基础环境的更新计划覆盖以下六�
 
 自动化测试入口、隔离安装验收步骤和现场用户检查顺序见[测试、启动与现场验收入口](../testing/operations-and-quality.md)。
 
-完整性维护使用 `--repair-config`（当前构建维修入口），与 `--app-update-config`（程序更新入口）分开。工作区长期保存的分发器位于 `maintenance/VoiceTerminalSetup.exe`（维修/更新程序），匹配身份位于 `maintenance/installer.json`（发行记录）。缺失或版本/构建不符时，关于页只下载对应本地版本，不自动下载最新发行；正常本体完整时维修跳过本体重新展开，再用兼容性组件检查和修复其它受管内容。
+完整性维护使用 `--repair-config`（当前构建维修入口），与 `--app-update-config`（程序更新入口）分开。分发器成功安装后会把自身保存到 `maintenance/VoiceTerminalSetup.exe`（当前版本校验分发器），并在 `maintenance/installer.json`（版本、构建及文件摘要记录）保存匹配身份；应用更新下载独立暂存于 `tmp/app-update/VoiceTerminalSetup.exe`（更新分发器）。更新安装成功后再将新分发器写入维护目录。校验只启动与本地版本、构建及文件摘要匹配的分发器；维护目录没有可用的当前版本分发器时，关于页才下载固定对应版本，不自动下载最新发行。正常本体完整时维修跳过本体重新展开，再用兼容性组件检查和修复其它受管内容。
