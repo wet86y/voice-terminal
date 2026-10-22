@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick } from 'vue'
 import { flushPromises } from '@vue/test-utils'
-import { useApplicationHost, type ApplicationSnapshot } from './application-host'
+import { useApplicationHost, type ApplicationSnapshot, type DesktopRecovery } from './application-host'
+import * as desktop from './desktop-port'
 import { productApi } from './api'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { useProductAdapter } from './useProductAdapter'
@@ -113,6 +114,87 @@ afterEach(() => {
 })
 
 describe('Host 会话失效处理', () => {
+  it('组件维护保留页面，丢弃旧鉴权失败，在新宿主加载期间重接并持续显示热切换', async () => {
+    let deliver!: (event: { payload: DesktopRecovery }) => void
+    const operation = { id: 'native-update', revision: 1, target: 'resources', label: '本地组件',
+      state: 'running', phase: 'switching', detail: '正在启用组件' } as const
+    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue({ runtime_recovery: { revision: 0, suspended: false, operation: null } }) }
+    vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true,
+      listen: vi.fn(async (_name, handler) => { deliver = handler; return vi.fn() }) } as unknown as desktop.DesktopPort)
+    const response = (value: unknown, status = 200) => ({ status, ok: status === 200, json: async () => value }) as Response
+    let releaseOld!: (value: Response) => void
+    const oldRequest = new Promise<Response>(resolve => { releaseOld = resolve })
+    const restoring = { ...readySnapshot, instance_id: 'replacement', revision: 1, startup_complete: false,
+      core_available: false, state: 'starting', voice_api_url: '', voice_ws_url: '' }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(response(readySnapshot))
+      .mockReturnValueOnce(oldRequest).mockResolvedValue(response(restoring)))
+    await host.start()
+    FakeWebSocket.instances[0]!.open()
+    const pending = host.refresh()
+    deliver({ payload: { revision: 1, suspended: true, operation } })
+    expect(host.businessReady.value).toBe(false)
+    expect(host.overlay.value).toBe(false)
+    expect(FakeEventSource.instances[0]!.close).toHaveBeenCalledOnce()
+    releaseOld(response({}, 403))
+    await pending
+    expect(host.sessionInvalid.value).toBe(false)
+    deliver({ payload: { revision: 2, suspended: false, operation: { ...operation, revision: 2, phase: 'loading' } } })
+    await flushPromises()
+    expect(host.snapshot.value?.instance_id).toBe('replacement')
+    expect(host.overlay.value).toBe(false)
+    expect(host.runtimeOperations.value[0]?.state).toBe('running')
+    expect(FakeEventSource.instances).toHaveLength(2)
+    expect(window.__VOICE_APPLICATION__?.origin).toBe('http://127.0.0.1:42123')
+    // 迟到的旧恢复消息不能使新宿主再次暂停。
+    deliver({ payload: { revision: 1, suspended: true, operation } })
+    expect(host.recovery.value?.suspended).toBe(false)
+    FakeEventSource.instances[1]!.onmessage?.({ data: JSON.stringify({ ...readySnapshot, instance_id: 'replacement', revision: 2 }) } as MessageEvent)
+    expect(host.businessReady.value).toBe(true)
+    deliver({ payload: { revision: 3, suspended: false, operation: { ...operation, revision: 3, state: 'succeeded', phase: 'ready' } } })
+    expect(host.runtimeOperations.value[0]?.state).toBe('succeeded')
+    expect(host.overlay.value).toBe(false)
+  })
+
+  it('原生补查恢复丢失的维护事件，恢复失败保留页面和原生重试入口', async () => {
+    let nativeState: DesktopRecovery = { revision: 0, suspended: false, operation: null }
+    const invoke = vi.fn().mockImplementation(async () => ({ runtime_recovery: nativeState }))
+    window.__TAURI_INTERNALS__ = { invoke }
+    vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true } as desktop.DesktopPort)
+    const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => readySnapshot })
+    vi.stubGlobal('fetch', fetchMock)
+    await host.start()
+    nativeState = { revision: 1, suspended: true, operation: { id: 'failed-recovery', revision: 1, target: 'resources',
+      label: '本地组件', state: 'failed', phase: 'failed', detail: '恢复失败' } }
+    await vi.advanceTimersByTimeAsync(2000)
+    const requests = fetchMock.mock.calls.length
+    expect(host.recovery.value?.suspended).toBe(true)
+    expect(host.overlay.value).toBe(false)
+    expect(host.businessReady.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(fetchMock).toHaveBeenCalledTimes(requests)
+    await host.recover()
+    expect(invoke).toHaveBeenCalledWith('desktop_start_service')
+  })
+
+  it('整轮停机与恢复事件均丢失时，从已停止快照重新接入且不闪回启动画面', async () => {
+    let nativeState: DesktopRecovery = { revision: 0, suspended: false, operation: null }
+    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockImplementation(async () => ({ runtime_recovery: nativeState })) }
+    vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true } as desktop.DesktopPort)
+    const response = (value: unknown) => ({ status: 200, ok: true, json: async () => value }) as Response
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(response(readySnapshot))
+      .mockResolvedValue(response({ ...readySnapshot, instance_id: 'restored-after-gap' })))
+    await host.start()
+    FakeEventSource.instances[0]!.onmessage?.({ data: JSON.stringify({ ...readySnapshot, revision: 2, state: 'stopped', stopping: true }) } as MessageEvent)
+    expect(host.overlay.value).toBe(false)
+    nativeState = { revision: 3, suspended: false, operation: { id: 'missed-update', revision: 3, target: 'resources',
+      label: '本地组件', state: 'succeeded', phase: 'ready', detail: '已恢复' } }
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(host.snapshot.value?.instance_id).toBe('restored-after-gap')
+    expect(FakeEventSource.instances).toHaveLength(2)
+    expect(host.businessReady.value).toBe(true)
+    expect(host.overlay.value).toBe(false)
+  })
+
   it('重试确认重新读取状态，不复用操作之前已发出的失败快照请求', async () => {
     const failed = { ...readySnapshot, components: [...readySnapshot.components,
       { ...readySnapshot.components[0]!, id: 'speaker', state: 'failed', error: '旧故障', retry_allowed: true }],

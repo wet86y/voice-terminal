@@ -15,7 +15,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use voice_desktop_common::LaunchContext;
 
 const PROGRESS_EVENT: &str = "desktop://resource-progress";
@@ -242,7 +242,8 @@ impl ResourceManager {
             registration["validation_identity"]=voice_desktop_common::runtime::validation_identity(&context.install,python.parent().unwrap()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
             registration["fields"]["validation_identity"]=json!("解释器及受管清单的轻量身份，日常状态不遍历目录");
             voice_desktop_common::workspace::atomic_json(&path,&registration).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let _=lease.finish();Ok(vec!["gpu-environment".into()])
+            lease.finish().map_err(|message|JobError::Failed{message,installed:vec!["gpu-environment".into()]})?;
+            Ok(vec!["gpu-environment".into()])
         })?;Ok(json!({"job_id":job_id}))
     }
     pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
@@ -529,6 +530,7 @@ impl ResourceManager {
             let mut lease=self.pause_service()?;
             let resumed=self.maybe_resume_service(&mut lease)?;
             clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+            if resumed{self.finish_recovery(None);}
         }Ok(())
     }
 
@@ -720,13 +722,14 @@ impl ResourceManager {
 
     fn pending_service_resume(&self)->Result<bool,String>{Ok(*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?)}
 
-    fn all_resources_ready(&self)->Result<bool,String>{
-        // 服务入口随后执行全量校验；这里仅判定能否进入该入口，避免恢复时连续读取两遍全部组件。
-        Ok(voice_desktop_common::resources::inventory(&self.context)?.iter().filter(|row|row["required"]!=false).all(|row|row["can_start"]==true))
+    fn recovery_environment_ready(&self)->Result<bool,String>{
+        // 恢复原来已运行的降级服务；其它未安装模型不能把组件更新卡在永久停机状态。
+        // 候选在换入前已完整验证，实际模型加载和能力终态仍由新宿主核对。
+        Ok(self.context.python.is_file())
     }
 
     fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{
-        resume_service_if_ready(lease,&self.resume_pending,&self.accepting_jobs,&self.batch_active,||self.all_resources_ready())
+        resume_service_if_ready(lease,&self.resume_pending,&self.accepting_jobs,&self.batch_active,||self.recovery_environment_ready())
     }
 
     fn rollback_failed_activation(&self,lease:&mut ServiceLease<'_>,transaction:&mut voice_desktop_common::resources::PendingActivation,reason:&str)->String{
@@ -882,12 +885,27 @@ impl ResourceManager {
             Err(JobError::Failed { message, installed }) => ("failed", "资源处理失败", Some(message), installed),
         };
         if let Ok(mut failures)=self.validation_failures.lock(){for id in &installed{failures.remove(id);}}
+        let operation_error=error.clone();
         self.update_job(job_id, |snapshot| {
             snapshot.state = state.into(); snapshot.phase = phase.into(); snapshot.error = error;
             snapshot.can_cancel = false; for id in installed{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}}snapshot.import_preview=None;
         });
         // 成功、失败及取消均重读实际组件；任务完成本身不代表兼容检查通过。
         if let Err(error)=self.inventory(){eprintln!("兼容性组件重新盘点失败：{error}");}
+        self.finish_recovery(operation_error.as_deref());
+    }
+
+    fn finish_recovery(&self,error:Option<&str>){
+        if self.pending_service_resume().unwrap_or(true){return;}
+        if let Some(state)=self.app.try_state::<Arc<super::Desktop>>(){
+            let mut recovery=state.recovery.lock().unwrap();
+            let snapshot=recovery.snapshot();
+            if snapshot["operation"]["state"]!="running" || snapshot["suspended"]==true{return;}
+            if recovery.result.as_ref().is_none_or(|(epoch,_)|*epoch!=state.service_epoch.load(Ordering::Acquire)){return;}
+            let error=error.or_else(||recovery.result.as_ref().filter(|(_,value)|value["core_available"]!=true)
+                .map(|_|"组件已启用，部分语音能力仍不可用，请继续补齐或恢复组件。"));
+            recovery.finish(error);drop(recovery);state.publish_recovery(&self.app);
+        }
     }
 
     fn set_phase(&self, job_id: &str, phase: &str, can_cancel: bool, done: u64, total: Option<u64>) {
@@ -1036,7 +1054,7 @@ fn resume_service_if_ready(lease:&mut ServiceLease<'_>,pending:&Mutex<bool>,acce
     if !*pending.lock().map_err(|_|"服务恢复意图不可用。")?{lease.keep_stopped();return Ok(false);}
     match ready(){
         Ok(false)=>{lease.keep_stopped();return Ok(false);},
-        Err(error)=>{lease.keep_stopped();return Err(format!("无法确认全部组件已就绪，语音服务保持停止：{error}"));},
+        Err(error)=>{lease.keep_stopped();return Err(format!("无法确认运行环境可恢复，语音服务保持停止：{error}"));},
         Ok(true)=>{},
     }
     lease.resume_service()?;Ok(true)

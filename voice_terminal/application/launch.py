@@ -141,6 +141,11 @@ def _wait_for_frontend(app: ApplicationHost, process, *, timeout: float = 20) ->
 
 
 async def run(args, root):
+    # 首帧由原生宿主写入私有管道；连续会话不会进入命令参数、环境、登记文件或日志。
+    continuity = None
+    if getattr(args, "desktop_managed", False):
+        from .continuity import read_start
+        continuity = await asyncio.to_thread(read_start, sys.stdin)
     app = ApplicationHost(root, python=args.python, config=args.config,
         no_worker=args.no_worker, no_analysis=args.no_analysis, llm_provider=args.llm_provider)
     app.loop = asyncio.get_running_loop()
@@ -157,7 +162,7 @@ async def run(args, root):
     frontend = root / ".local/build/frontend" if (root / "apps/desktop/Cargo.toml").is_file() else root / "apps/frontend/dist"
     app.frontend_directory = frontend  # frontend_directory（界面路径）：服务、状态和重试共用。
     host_preferred_port = 8764 if args.dev else 5173
-    host = HostWeb(app, frontend, port=host_preferred_port)
+    host = HostWeb(app, frontend, port=host_preferred_port, continuity=continuity)
     app.origin = host.origin  # origin（宿主内部地址）：业务组件报告与内部 Bearer 校验使用此地址。
     app.frontend_origin = host.origin  # frontend_origin（实际界面地址）：启动后更新为 Node 开发界面地址。
     host_created_at = _process_created_at()
@@ -186,8 +191,13 @@ async def run(args, root):
                 raise RuntimeError("缺少受管开发界面脚本 scripts/frontend-dev.mjs")
             app.frontend_cookie_name = host.cookie_name
             app.frontend_session = host.session
+            if continuity:
+                from .continuity import loopback_port
+                app.frontend_port = loopback_port(continuity["frontend_origin"])
             process = app.spawn("dev", [node, str(helper), "--root", str(root), "--mode", "product"])
             app.frontend_origin = _wait_for_frontend(app, process)
+            if continuity and app.frontend_origin != continuity["frontend_origin"]:
+                raise RuntimeError("恢复后的开发界面来源与当前窗口不匹配。")
             app.state.set_endpoint("web", app.frontend_origin,
                 preferred_url="http://127.0.0.1:5173", generation=app.state.value["instance_id"],
                 pid=process.pid, created_at=process.created_at)
@@ -195,6 +205,9 @@ async def run(args, root):
                 pid=process.pid, created_at=process.created_at, shared_with=None, error="")
         except Exception as exc:
             app.stop_group("dev")
+            if continuity:
+                host.close()
+                raise RuntimeError("无法恢复当前开发界面来源。") from exc
             app.frontend_error = str(exc)
             # 开发界面失败时保持本实例 Host（宿主）的会话受控诊断页。
             app.frontend_origin = host.origin
@@ -217,15 +230,24 @@ async def run(args, root):
         if getattr(args, "desktop_managed", False):
             from .desktop import DesktopControl
             desktop = DesktopControl(app)
-            desktop.start(app.frontend_origin, host.issue_launch_token())
+            desktop.owned.set()  # 首帧已确认原生宿主接管。
+            desktop.start(app.frontend_origin, host.issue_launch_token(), continuity={
+                "host_origin": host.origin, "frontend_origin": app.frontend_origin,
+                "cookie_name": host.cookie_name, "session": host.session,
+            })
             await desktop.owned.wait()
         if not args.diagnostic and not app.exit_event.is_set():
             app.enqueue(app.startup())
             app.enqueue(app.monitor())
         reported_startup = False
+        reported_runtime = None  # reported_runtime（最近向桌面上报的核心能力与整体状态）。
         reported_endpoints = -1  # reported_endpoints（已发送给桌面的端点版本）。
         while not app.exit_event.is_set():
             status = app.state.snapshot()
+            current_runtime = (status["core_available"], status["state"])
+            if desktop and status["startup_complete"] and current_runtime != reported_runtime:
+                desktop.send("runtime_status", core_available=status["core_available"], state=status["state"])
+                reported_runtime = current_runtime
             if desktop and status["endpoint_revision"] != reported_endpoints:
                 # 端点均由宿主核验过进程归属；私有管道只传不含令牌的来源。
                 desktop.send("endpoints", endpoints=status["endpoints"], endpoint_revision=status["endpoint_revision"])

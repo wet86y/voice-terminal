@@ -2,7 +2,8 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { operationPhaseLabel, type RuntimeOperation } from '../runtime/runtime-operations'
 
-const props = defineProps<{ operations: RuntimeOperation[] }>()
+const props = defineProps<{ operations: RuntimeOperation[]; retryable?: boolean }>()
+const emit = defineEmits<{ retry: [] }>()
 const rows = ref<RuntimeOperation[]>([])
 const fading = ref(false)
 const revisions = new Map<string, number>()
@@ -18,7 +19,7 @@ watch(() => props.operations, incoming => {
     if ((revisions.get(row.id) ?? 0) >= row.revision) continue
     revisions.set(row.id, row.revision)
     // 首次读取的历史终态不重新弹出；活动操作可在页面刷新后恢复。
-    if (row.state !== 'running' && !next.has(row.id)) continue
+    if (row.state !== 'running' && !next.has(row.id) && !(row.state === 'failed' && props.retryable)) continue
     if (row.state === 'running') {
       for (const [key, value] of next) if (value.state === 'succeeded' || value.state === 'cancelled') next.delete(key)
     }
@@ -58,6 +59,7 @@ onBeforeUnmount(clearTimer)
         <strong>{{ active ? '系统正在更新' : failed ? '操作未完成' : '系统已就绪' }}</strong>
         <div v-for="row in rows" :key="row.id" class="operation-row">{{ row.label }} · {{ row.state === 'cancelled' ? '已取消' : operationPhaseLabel(row) }}</div>
       </div>
+      <button v-if="failed && retryable" @click="dismissErrors(); emit('retry')">重试</button>
       <button v-if="failed" aria-label="关闭操作错误" @click="dismissErrors">×</button>
     </div>
   </Transition>
