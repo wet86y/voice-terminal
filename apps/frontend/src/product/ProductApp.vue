@@ -57,6 +57,8 @@ const operations = computed(() => [
   ...(applicationSnapshot.value?.runtime_operations ?? []),
   ...(application.runtimeOperations?.value ?? []),
 ]);
+const noticeOperations = computed(() => operations.value.filter(operation =>
+  !['reasoning_mode', 'session'].includes(operation.target))); // noticeOperations（通用操作提示列表）：排除主界面已显示状态的运行模式切换、会话重置与清除。
 const floatingUnlisteners: Array<() => void> = [];
 let disposed = false;
 function subscribeFloating<T>(name: string, handler: (payload: T) => void) {
@@ -190,7 +192,7 @@ function exportLogs() {
     ></SettingsFrame>
     <template #overlays>
       <div class="notification-stack">
-      <OperationNotice :operations="operations" :retryable="Boolean(application.recovery?.value?.suspended && application.recovery?.value?.operation?.state === 'failed')" @retry="nativeAction(async () => { await application.recover?.() })" />
+      <OperationNotice :operations="noticeOperations" :retryable="Boolean(application.recovery?.value?.suspended && application.recovery?.value?.operation?.state === 'failed')" @retry="nativeAction(async () => { await application.recover?.() })" />
       <Transition name="save-notice"
         ><div v-if="lastError" class="save-notice error-notice" role="alert">
           <span>!</span>{{ lastError
