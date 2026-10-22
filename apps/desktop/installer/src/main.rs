@@ -17,6 +17,7 @@ struct Installer{
     exiting:AtomicBool, // exiting（取消后退出请求）。
     shortcut:bool, // shortcut（隔离验收可关闭桌面快捷方式）。
     report:Option<PathBuf>, // report（隔离验收结果位置）。
+    auto_requested:AtomicBool, // auto_requested（首屏完成后只自动派发一次维护）。
     repair:bool, // repair（仅检查并修复当前构建，不执行版本更新）。
     update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
@@ -43,7 +44,7 @@ fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,progress:&mut voice_
         }
     }
 }
-#[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","initialization":"本体安装阶段"}}))}
+#[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","operation":if state.repair{"integrity"}else if state.update_parent.is_some(){"update"}else{"install"},"frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","operation":"安装、更新或完整性维护","initialization":"本体安装或维护阶段"}}))}
 fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result<Value,String>{
     if state.busy.swap(true,Ordering::SeqCst){return Err("安装任务正在执行。".into());}
     state.cancel.store(false,Ordering::Release);
@@ -239,11 +240,15 @@ fn run()->Result<(),String>{
     if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。安装后重新运行安装器。");return Ok(());}
     let cache=std::env::temp_dir().join(format!("voice-initialization-installer-{}",std::process::id()));fs::create_dir_all(&cache).map_err(|e|e.to_string())?;
     let initial_phase=if repair{"正在准备完整性校验"}else if update_parent.is_some(){"正在准备应用更新"}else{"请选择文件夹作为整个工作区"};
-    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":initial_phase,"error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report,update_parent,repair});
+    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":initial_phase,"error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report,update_parent,repair,auto_requested:AtomicBool::new(false)});
     let setup_state=state.clone();let cache_window=cache.clone();
     let app=tauri::Builder::default().manage(state.clone()).invoke_handler(tauri::generate_handler![desktop_status,desktop_initialize,desktop_cancel_init,exit_application])
-        .setup(move|app|{let window=WebviewWindowBuilder::new(app,"startup",WebviewUrl::App("index.html".into())).initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU).title(if repair { "Voice Terminal · 校验与修复" } else { "Voice Terminal · 安装语音终端" }).inner_size(1000.,640.).min_inner_size(400.,480.).incognito(true).data_directory(cache_window.clone()).on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())).build()?;app_icon::apply(window.hwnd()?.0).map_err(std::io::Error::other)?;
-            if auto{let handle=app.handle().clone();let state=setup_state.clone();std::thread::spawn(move||{let _=run_install(&handle,state,false);});}Ok(())})
+        .setup(move|app|{let window=WebviewWindowBuilder::new(app,"startup",WebviewUrl::App("index.html".into())).background_color(tauri::window::Color(14,17,24,255)).visible(false).initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU).title(if repair { "Voice Terminal · 校验与修复" } else { "Voice Terminal · 安装语音终端" }).inner_size(1000.,640.).min_inner_size(400.,480.).incognito(true).data_directory(cache_window.clone()).on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())).on_page_load(move|window,payload|{
+                if payload.event()!=tauri::webview::PageLoadEvent::Finished{return;}
+                let _=window.show();
+                // 首屏加载后才自动校验，避免准备阶段先于可见界面。
+                if auto&&!setup_state.auto_requested.swap(true,Ordering::SeqCst){let handle=window.app_handle().clone();let state=setup_state.clone();std::thread::spawn(move||{let _=run_install(&handle,state,false);});}
+            }).build()?;app_icon::apply(window.hwnd()?.0).map_err(std::io::Error::other)?;Ok(())})
         .on_window_event(|window,event|{if let tauri::WindowEvent::CloseRequested{api,..}=event{let state=window.state::<Arc<Installer>>();api.prevent_close();exit(window.app_handle(),&state);}})
         .build(tauri::generate_context!()).map_err(|e|e.to_string())?;
     app.run(move|app,event|{if let tauri::RunEvent::ExitRequested{api,..}=event{if !state.exiting.load(Ordering::Acquire){api.prevent_exit();exit(app,&state);}}});

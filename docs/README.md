@@ -59,6 +59,7 @@
 - [在线切换与自动停听回归（2026-10-20）](testing/runtime-switching-20261020.md)
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [启动与维护界面连续性验收](testing/startup-ui-continuity.md)
 - [当前已知问题](testing/known-issues.md)
 - [桌面现场验收](testing/desktop-acceptance.md)
 - [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)

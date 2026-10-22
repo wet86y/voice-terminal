@@ -32,6 +32,7 @@ git diff --check
 | 区域及中文说明 | 测试入口及中文说明 |
 | --- | --- |
 | 独立应用宿主、启动预算、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_startup_optimizations.py`、`tests/test_dsh_runtime.py`、`apps/frontend/src/product/application-host.test.ts` |
+| 启动首屏、错误兜底、维护进度及窗口交接 | [启动与维护界面连续性验收](startup-ui-continuity.md)，含模块超时、迟到挂载、渲染异常及入口重试回归 |
 | 能力就绪分档、探测去抖与能力级恢复 | `tests/test_state.py`、`tests/test_application_host.py`、`tests/test_capability_recovery.py`、`tests/test_listening_capability_gate.py`、`apps/frontend/src/product/application-host.test.ts`、`apps/frontend/src/product/ProductApp.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |

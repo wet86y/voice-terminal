@@ -11,7 +11,8 @@ void runDesktopPreflight({
     else clearStartupSkip()
     await loadProductApplicationConfig()
     const application = await import('./application')
-    application.mountProductApplication()
-    await locateNativeInvoker()?.invoke('desktop_page_ready') // desktop_page_ready（产品页真实挂载确认）。
+    const app = application.mountProductApplication()
+    try { await locateNativeInvoker()?.invoke('desktop_page_ready') } // desktop_page_ready（产品页真实挂载确认）。
+    catch (error) { app.unmount(); throw error }
   },
 })
