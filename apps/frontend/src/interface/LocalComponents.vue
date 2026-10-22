@@ -487,12 +487,12 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
               </div>
               <button class="local-category-disclosure" type="button" :aria-expanded="expandedCategories.has(category.id)" :aria-controls="`local-category-${category.id}`" @click="toggleCategory(category.id)"><span>{{ expandedCategories.has(category.id) ? '收起' : '展开' }}</span><svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedCategories.has(category.id) }"><path d="m6 9 6 6 6-6" /></svg></button>
             </div>
-            <ManagedResourceProgress v-if="!expandedCategories.has(category.id) && category.progress" class="local-category-progress" :job="category.progress" :label="category.title" />
           </div>
           <div class="local-category-actions">
             <button v-if="category.id !== 'tts' && model.resourceActionsAvailable && category.pendingCount" class="outline-button category-download" type="button" :disabled="model.resourceLoading" @click="downloadCategory(category)">下载组件（{{ category.pendingCount }}）</button>
             <button v-if="category.id !== 'tts' && model.resourceActionsAvailable && batchImportAvailable && category.pendingCount" class="outline-button category-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">导入</button>
           </div>
+          <ManagedResourceProgress v-if="!expandedCategories.has(category.id) && category.progress" class="local-category-progress" :job="category.progress" :label="category.title" />
         </header>
         <div v-if="expandedCategories.has(category.id)" :id="`local-category-${category.id}`" class="local-category-content">
           <label v-if="category.id === 'tts' && model.ttsSelection" class="local-tts-selection form-field">
@@ -629,7 +629,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-category-metrics dd{font-size:var(--font-body);font-weight:650;line-height:1.25;white-space:nowrap}
 .local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:5px 10px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-body);font-weight:600;white-space:nowrap;cursor:pointer}
 .local-category-disclosure svg{width:14px;height:14px}
-.local-category-progress{max-width:620px;margin:8px 0 0 2px}
+.local-category-progress{grid-column:1/-1;align-self:stretch;width:100%;max-width:none;min-width:0;margin:0}
 .local-component-provider-usage{margin:0;align-self:center}
 @container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{min-height:54px}.local-category-metrics{gap:3px 8px}}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
@@ -683,7 +683,8 @@ small,dt{font-size:var(--font-caption)}
 .local-inline-resource-status{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:100%;font-size:var(--font-caption)}
 .local-inline-resource-status strong{min-width:0;overflow-wrap:anywhere}
 .local-inline-resource-action button{min-height:var(--compact-control-height);padding:5px 8px;font-size:var(--font-caption);white-space:nowrap}
-.local-component-inline-progress{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;padding:0 14px 12px}
+.local-component-inline-progress{display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch;gap:10px;padding:0 14px 12px}
+.local-component-inline-progress>.local-resource-cancel,.component-enhancement-progress>.local-resource-cancel{justify-self:end}
 .local-component-state-group{display:flex;align-items:center;justify-content:flex-end;gap:8px 14px;min-width:0;flex-wrap:wrap}
 .local-component-identity .local-component-provider-usage{flex:1 1 0;margin:0;min-width:0;align-self:center}
 dl,dd{margin:0}
@@ -707,7 +708,7 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .component-enhancement-copy{display:grid;gap:3px;min-width:0}
 .component-enhancement-copy small{font-size:var(--font-caption);line-height:1.35;color:var(--subtle)}
 .component-enhancement-install{display:grid;grid-template-columns:minmax(0,1fr) auto;cursor:default;gap:10px 16px}
-.component-enhancement-progress{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px}
+.component-enhancement-progress{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch;gap:10px}
 .component-enhancement-install>.local-error{grid-column:1/-1}
 @container (max-width:440px){.component-enhancement-install,.component-enhancement-progress{grid-template-columns:minmax(0,1fr)}}
 .local-detail-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}

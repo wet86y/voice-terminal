@@ -49,12 +49,11 @@ function formatBytes(value: number | null | undefined) {
 .managed-job-phase,.managed-job-error{margin:0;font-size:var(--font-caption);color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}
 .managed-job-error{color:var(--danger)}
 .managed-job-progresses{display:grid;gap:7px;min-width:0}
-.managed-job-progress-wrap{display:grid;grid-template-columns:minmax(60px,1fr) auto;align-items:center;gap:10px}
-.managed-job-progress-wrap small{white-space:nowrap;font-size:var(--font-caption);font-variant-numeric:tabular-nums;color:var(--muted)}
-.managed-job-progress{height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
+.managed-job-progress-wrap{display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch;gap:6px;min-width:0}
+.managed-job-progress-wrap small{justify-self:end;max-width:100%;white-space:normal;text-align:right;overflow-wrap:anywhere;font-size:var(--font-caption);font-variant-numeric:tabular-nums;color:var(--muted)}
+.managed-job-progress{width:100%;min-width:0;height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
 .managed-job-progress span{display:block;height:100%;background:var(--accent);transition:width 150ms ease}
 .managed-job-progress.indeterminate span{width:30%;animation:resource-progress 1.5s ease-in-out infinite alternate}
 @keyframes resource-progress{from{transform:translateX(0)}to{transform:translateX(230%)}}
-@container (max-width:440px){.managed-job-progress-wrap{grid-template-columns:1fr;gap:6px}.managed-job-progress-wrap small{text-align:right}}
 @media (prefers-reduced-motion:reduce){.managed-job-progress span{transition:none;animation:none}}
 </style>
