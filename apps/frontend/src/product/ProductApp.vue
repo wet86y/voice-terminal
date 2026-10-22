@@ -55,6 +55,7 @@ const desktop = desktopPort();
 const operations = computed(() => [
   ...(controls.voice.runtimeOperations?.value ?? []),
   ...(applicationSnapshot.value?.runtime_operations ?? []),
+  ...(application.runtimeOperations?.value ?? []),
 ]);
 const floatingUnlisteners: Array<() => void> = [];
 let disposed = false;
@@ -108,6 +109,7 @@ if (desktop.available && desktop.publishFloatingModel) {
 }
 // resourceMaintenance（资源维护）：服务停机不等于应用退出，组件操作和下载进度继续可用。
 const resourceMaintenance = computed(() => workspaceResources.startingResources.value.size > 0
+  || application.recovery?.value?.suspended || application.runtimeOperations?.value.some(row => row.state === 'running')
   || workspaceResources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)));
 // unavailableCapabilityLabel（不可用能力文案）：运行期故障用横幅提示，并用组件页单独恢复。
 const unavailableCapabilityLabel = computed(() => {
@@ -188,7 +190,7 @@ function exportLogs() {
     ></SettingsFrame>
     <template #overlays>
       <div class="notification-stack">
-      <OperationNotice :operations="operations" />
+      <OperationNotice :operations="operations" :retryable="Boolean(application.recovery?.value?.suspended && application.recovery?.value?.operation?.state === 'failed')" @retry="nativeAction(async () => { await application.recover?.() })" />
       <Transition name="save-notice"
         ><div v-if="lastError" class="save-notice error-notice" role="alert">
           <span>!</span>{{ lastError

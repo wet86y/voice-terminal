@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline'
 import { createServer as createViteServer } from 'vite'
+import { frontendContinuity } from './frontend-continuity.mjs'
 
 const ENTRY_HINT = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Voice Terminal · 桌面入口</title><style>body{font:16px system-ui;background:#101217;color:#edf0f6;margin:10vh auto;max-width:720px;padding:24px}</style><h1>请通过桌面程序打开</h1><p>主产品和样例预览均使用桌面窗口。开发请在项目中执行 npm run dev（真实业务）或 npm run dev:ui（样例展示）。</p><p>如果此说明出现在桌面窗口中，会话已失效，请退出应用后重新启动。</p></html>'
 const startupStyle = readFileSync(new URL('../apps/desktop/boot/startup.css', import.meta.url), 'utf8') // startupStyle（共用加载样式）。
@@ -43,7 +44,7 @@ function trustedHost(value) {
  * root（源码根目录）；mode（产品或样例模式）；cookieName（会话凭据名称）；session（会话随机值）；
  * instanceId（所属实例编号）；hostOrigin（产品宿主地址）；port（端口，仅供本地自动测试注入）。
  */
-export async function createDesktopServer({ root, mode, cookieName, session, instanceId, hostOrigin, port }) {
+export async function createDesktopServer({ root, mode, cookieName, session, instanceId, hostOrigin, port, strictPort = false }) {
   if (!['product', 'ui-preview'].includes(mode)) throw new Error('桌面开发模式无效。')
   const preview = mode === 'ui-preview'
   if (preview) {
@@ -83,6 +84,7 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
   }
 
   const server = http.createServer((request, response) => {
+    if (closing) return send(response, '桌面界面正在交接。', 503)
     if (!validHost(request)) return reject(response)
     let address
     try { address = new URL(request.url, origin) } catch { return reject(response) }
@@ -128,6 +130,8 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
   const close = async () => {
     if (closing) return
     closing = true
+    // Vite（界面开发工具）会在客户端响应后继续预处理依赖；先排空，避免关闭监听器后又补登记文件。
+    await vite?.waitForRequestsIdle()
     await vite?.close()
     for (const socket of sockets) socket.destroy()
     if (server.listening) await new Promise(resolveClose => server.close(resolveClose))
@@ -147,12 +151,13 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     } catch (error) {
       // The bind itself is authoritative; on a collision ask the OS for an
       // available ephemeral port instead of probing and racing another process.
-      if (error.code !== 'EADDRINUSE') throw error
+      if (strictPort || error.code !== 'EADDRINUSE') throw error
       await listen(0)
     }
     const actualPort = server.address().port
     origin = `http://127.0.0.1:${actualPort}`
     vite = await createViteServer({
+      plugins: preview ? [] : [frontendContinuity(session)],
       root: resolve(root, 'apps/frontend'),
       configFile: resolve(root, `apps/frontend/${preview ? 'vite.ui.config.ts' : 'vite.config.ts'}`),
       server: {
@@ -206,7 +211,9 @@ async function main() {
   } else {
     running = await createDesktopServer({ root, mode, hostOrigin: process.env.VOICE_APP_ORIGIN,
       cookieName: process.env.VOICE_FRONTEND_COOKIE_NAME, session: process.env.VOICE_FRONTEND_SESSION,
-      instanceId: process.env.VOICE_APP_INSTANCE_ID })
+      instanceId: process.env.VOICE_APP_INSTANCE_ID,
+      port: process.env.VOICE_FRONTEND_PORT ? Number(process.env.VOICE_FRONTEND_PORT) : undefined,
+      strictPort: Boolean(process.env.VOICE_FRONTEND_PORT) }) // strictPort（恢复时必须保留当前页面来源）。
   }
 }
 

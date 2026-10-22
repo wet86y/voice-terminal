@@ -115,6 +115,22 @@ test('产品开发要求宿主会话，受控入口及配置由已验证本机�
     assert.equal(ready.pid, process.pid)
     assert.equal(ready.frontend_mode, 'product')
     assert.equal((await request(server.origin, '/application-config.js', { Cookie })).status, 200)
+    const client = await request(server.origin, '/@vite/client', { Cookie })
+    assert.equal(client.status, 200)
+    assert.match(client.body, /__VOICE_DESKTOP_RECOVERY__/)
+    assert.match(client.body, /hotModulesMap/)
+    const oldToken = client.body.match(/const wsToken\s*=\s*["']([^"']+)["']/)?.[1]
+    assert.ok(oldToken)
+    const origin = server.origin
+    await assert.rejects(createDesktopServer({ root, mode: 'product', port: Number(new URL(origin).port), strictPort: true,
+      hostOrigin, cookieName, session, instanceId: 'occupied-instance' }), /无法绑定/)
+    await server.close()
+    server = await createDesktopServer({ root, mode: 'product', port: Number(new URL(origin).port), strictPort: true,
+      hostOrigin, cookieName, session, instanceId: 'replacement-instance' })
+    assert.equal(server.origin, origin)
+    assert.equal((await request(origin, '/application-config.js', { Cookie })).status, 200)
+    const restoredClient = await request(origin, '/@vite/client', { Cookie })
+    assert.equal(restoredClient.body.match(/const wsToken\s*=\s*["']([^"']+)["']/)?.[1], oldToken)
     const accepted = await fetch(server.origin + '/api/v1/application/exit', { method: 'POST', headers: { Cookie, Origin: server.origin }, body: '{}' })
     assert.equal((await accepted.json()).origin, hostOrigin)
     assert.equal((await request(server.origin, '/ui-demo.html', { Cookie })).status, 403)

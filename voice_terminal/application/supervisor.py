@@ -258,6 +258,8 @@ class ApplicationHost:
             env.update(VOICE_FRONTEND_COOKIE_NAME=self.frontend_cookie_name,
                        VOICE_FRONTEND_SESSION=self.frontend_session,
                        VOICE_APP_INSTANCE_ID=self.state.value["instance_id"])
+            if getattr(self, "frontend_port", None):
+                env["VOICE_FRONTEND_PORT"] = str(self.frontend_port)
         env.update(self.paths.environment())
         env["VOICE_CPU_PYTHON"] = self.python  # VOICE_CPU_PYTHON（按需模型子进程的中央处理器解释器）。
         if key in self.gpu_fallback_roles:

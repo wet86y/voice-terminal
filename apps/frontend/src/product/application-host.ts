@@ -1,6 +1,15 @@
 import { computed, ref } from 'vue'
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
 import { startupWasSkipped, rememberStartupSkip } from '../runtime/startup-choice'
+import { desktopPort } from './desktop-port'
+import type { RuntimeOperation } from '../runtime/runtime-operations'
+
+/** DesktopRecovery（原生恢复快照）：独立于可能离线的网页宿主。 */
+export interface DesktopRecovery {
+  revision: number // revision（窗口内恢复状态版本）。
+  suspended: boolean // suspended（业务宿主离线期间暂停网络连接）。
+  operation: RuntimeOperation | null // operation（复用现有热切换状态卡）。
+}
 
 export interface ApplicationComponent {
   /** id（组件标识）。 */
@@ -158,6 +167,12 @@ const connected = ref(false)
 const now = ref(Date.now())
 const retryingAll = ref(false)
 const sessionInvalid = ref(false)
+const recovery = ref<DesktopRecovery | null>(null)
+let entered = false // entered（当前页面已经完成首次启动，后续只呈现热切换卡）。
+let hostGeneration = 0 // hostGeneration（连接代次）：丢弃停机前尚未返回的状态与鉴权失败。
+let lifecycle = 0 // lifecycle（页面订阅生命周期）：阻止卸载前的异步监听接入下一次挂载。
+let recoveryTimer: ReturnType<typeof setInterval> | undefined
+let unlistenRecovery: (() => void) | undefined
 const SESSION_INVALID_MESSAGE = '会话已失效，请退出后重新启动。'
 let started = false
 let events: EventSource | null = null
@@ -211,7 +226,7 @@ function isSessionInvalidStatus(status: number) {
 }
 
 function apply(value: ApplicationSnapshot) {
-  if (sessionInvalid.value) return
+  if (sessionInvalid.value || recovery.value?.suspended) return
   if (!acceptApplicationSnapshot(snapshot.value, value)) return
   if (window.__VOICE_APPLICATION__) {
     window.__VOICE_APPLICATION__.voice_api_url = value.voice_api_url
@@ -227,6 +242,7 @@ function apply(value: ApplicationSnapshot) {
     rememberStartupSkip()
   }
   snapshot.value = value
+  if (value.startup_complete) entered = true
   if (value.state === 'stopped' && clock !== undefined) {
     now.value = Date.now()
     clearInterval(clock)
@@ -236,19 +252,22 @@ function apply(value: ApplicationSnapshot) {
 }
 
 function refresh(): Promise<void> {
-  if (sessionInvalid.value) return Promise.resolve()
+  if (sessionInvalid.value || recovery.value?.suspended) return Promise.resolve()
   if (refreshRequest) return refreshRequest
+  const generation = hostGeneration
   const request = (async () => {
     try {
       const response = await fetch('/api/v1/application/snapshot', { cache: 'no-store' })
+      if (generation !== hostGeneration) return
       if (isSessionInvalidStatus(response.status)) {
         invalidateSession()
         return
       }
       if (!response.ok) throw new Error(`应用状态连接不可用（HTTP ${response.status}），正在重试。`)
-      apply(await response.json() as ApplicationSnapshot)
+      const value = await response.json() as ApplicationSnapshot
+      if (generation === hostGeneration) apply(value)
     } catch (reason) {
-      if (!sessionInvalid.value) error.value = reason instanceof Error ? reason.message : '应用状态连接中断'
+      if (generation === hostGeneration && !sessionInvalid.value) error.value = reason instanceof Error ? reason.message : '应用状态连接中断'
     }
   })()
   const tracked = request.finally(() => {
@@ -259,7 +278,7 @@ function refresh(): Promise<void> {
 }
 
 function subscribe() {
-  if (!started || sessionInvalid.value || snapshot.value?.state === 'stopped') return
+  if (!started || sessionInvalid.value || recovery.value?.suspended || snapshot.value?.state === 'stopped') return
   closeEvents()
   let stream: EventSource
   try {
@@ -293,7 +312,10 @@ function subscribe() {
 
 async function post(path: string) {
   if (sessionInvalid.value) throw new Error(SESSION_INVALID_MESSAGE)
+  if (recovery.value?.suspended) throw new Error('组件正在更新，请等待业务服务恢复。')
+  const generation = hostGeneration
   const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+  if (generation !== hostGeneration) return
   if (isSessionInvalidStatus(response.status)) {
     invalidateSession()
     throw new Error(SESSION_INVALID_MESSAGE)
@@ -358,32 +380,88 @@ async function exit() {
 async function start() {
   if (started || !managed.value || sessionInvalid.value) return
   started = true
+  const version = ++lifecycle
+  const port = desktopPort()
+  if (port.available) {
+    void port.listen?.<DesktopRecovery>('desktop://runtime-recovery', event => {
+      if (started && version === lifecycle) applyRecovery(event.payload)
+    }).then(unlisten => { if (!started || version !== lifecycle) unlisten(); else unlistenRecovery = unlisten }).catch(() => undefined)
+    await refreshRecovery(version)
+    if (!started || version !== lifecycle) return
+    recoveryTimer = setInterval(() => { void refreshRecovery() }, 2000)
+  }
   clock = setInterval(() => { now.value = Date.now() }, 1000)
   await refresh()
-  if (!started || sessionInvalid.value) return
+  if (!started || version !== lifecycle || sessionInvalid.value) return
   subscribe()
   fallback = setInterval(() => {
     if (started && !sessionInvalid.value && !connected.value && snapshot.value?.state !== 'stopped') void refresh()
   }, 2000)
 }
 
+function applyRecovery(value: DesktopRecovery) {
+  if (!value || typeof value.revision !== 'number' || recovery.value && value.revision <= recovery.value.revision) return
+  const previous = recovery.value
+  const replaced = value.operation && (previous?.operation?.id !== value.operation.id
+    || ['stopping', 'stopped'].includes(snapshot.value?.state ?? ''))
+  if (!value.operation || previous?.suspended === value.suspended && !replaced) { recovery.value = value; return }
+  hostGeneration++
+  refreshRequest = null
+  closeEvents()
+  if (reconnect !== undefined) clearTimeout(reconnect)
+  reconnect = undefined
+  if (!value.suspended) snapshot.value = null
+  recovery.value = value
+  const configuration = window.__VOICE_APPLICATION__
+  if (configuration) {
+    configuration.voice_api_url = ''; configuration.voice_ws_url = ''; configuration.business_ready = false
+    delete configuration.endpoint_revision
+  }
+  if (value.suspended) {
+    // __VOICE_DESKTOP_RECOVERY__（计划内开发服务重启）：Vite（界面开发工具）仅重连，不刷新整个页面。
+    ;(window as Window & { __VOICE_DESKTOP_RECOVERY__?: boolean }).__VOICE_DESKTOP_RECOVERY__ = true
+  }
+  if (!value.suspended && started) {
+    // 新宿主可能仍在加载模型；保留页面，先重新接入其轻量状态接口。
+    if (clock === undefined) clock = setInterval(() => { now.value = Date.now() }, 1000)
+    void refresh().then(subscribe)
+  }
+}
+
+async function refreshRecovery(version = lifecycle) {
+  try {
+    const value = await locateNativeInvoker()?.invoke<{ runtime_recovery?: DesktopRecovery }>('desktop_status')
+    if (started && version === lifecycle && value?.runtime_recovery) applyRecovery(value.runtime_recovery)
+  } catch { /* 原生事件继续工作；下一次补查会恢复状态。 */ }
+}
+
 function stop() {
   started = false
+  lifecycle++
   closeEvents()
   clearHostTimers()
+  if (recoveryTimer !== undefined) clearInterval(recoveryTimer)
+  recoveryTimer = undefined
+  unlistenRecovery?.()
+  unlistenRecovery = undefined
+  hostGeneration++
+  recovery.value = null
+  entered = false
 }
 
 export function useApplicationHost() {
-  const businessReady = computed(() => applicationApiReady(snapshot.value))
+  const businessReady = computed(() => !recovery.value?.suspended && applicationApiReady(snapshot.value))
   // corePhase（核心能力阶段）：旧宿主没有该字段时按 core_available 回落，保持原有语义。
   const corePhase = computed(() => applicationCorePhase(snapshot.value))
   // overlay（全屏启动画面）：只在尚未完成启动或正在退出时出现。
   // 运行期的组件故障改用页面横幅与“本地组件”入口，不再用启动失败遮住整个界面。
-  const overlay = computed(() => applicationOverlay(snapshot.value, {
+  const overlay = computed(() => entered && !sessionInvalid.value ? false : applicationOverlay(snapshot.value, {
     sessionInvalid: sessionInvalid.value, inspecting: inspecting.value, managed: managed.value }))
   // runtimeFailure（运行期故障）：启动完成后核心能力才失败，据此显示横幅。
   const runtimeFailure = computed(() => applicationRuntimeFailure(snapshot.value))
-  return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid,
+  const runtimeOperations = computed(() => recovery.value?.operation ? [recovery.value.operation] : [])
+  return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid, recovery, runtimeOperations,
     businessReady, overlay, corePhase, runtimeFailure, start, stop, retry, retryCapability, retryFailed, exit,
+    recover: () => locateNativeInvoker()?.invoke<void>('desktop_start_service'), // recover（原生恢复）：网页宿主离线时仍可重试。
     inspect: () => { inspecting.value = true; rememberStartupSkip() }, refresh }
 }

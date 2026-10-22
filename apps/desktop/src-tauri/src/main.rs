@@ -4,6 +4,7 @@ mod integrity_commands;
 use integrity_commands::{app_integrity_status,app_integrity_download,app_integrity_check,MaintenanceAction,maintenance_payload};
 mod resource_commands;
 mod initialization;
+mod runtime_recovery;
 #[cfg(feature="qualification")] mod qualification;
 mod environment_commands;
 mod credential_commands;
@@ -150,8 +151,10 @@ struct Desktop {
     development: bool,              // development（是否显式源码调试）。
     instance_identifier: String,    // instance_identifier（工作区单实例标识；演示单独隔离）。
     service: Mutex<Option<Service>>,
+    service_transition: Mutex<()>, // service_transition（启动检查与维护停机共用的交接锁）。
     credentials_guard: Mutex<()>, // credentials_guard（接口配置互斥锁）：保存与启动共用。
     service_epoch: AtomicU64, // service_epoch（后台服务代次，防止旧读取线程控制新进程）。
+    service_ready_epoch: AtomicU64, // service_ready_epoch（已完成私有入口握手的服务代次）。
     locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
@@ -164,6 +167,7 @@ struct Desktop {
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     service_starting: AtomicBool, // service_starting（本次启动正在校验或建立入口）：拒绝重复启动。
     startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
+    recovery: Mutex<runtime_recovery::RuntimeRecovery>, // recovery（同一窗口的组件热更新与连续会话）。
     origin: Mutex<Option<String>>,
     dsh_origin: Mutex<Option<String>>, // dsh_origin（当前受管 DSH 的实际来源，不含令牌）。
     launch_token: Mutex<Option<String>>, // launch_token（当前入口的一次性启动凭据）。
@@ -181,6 +185,11 @@ struct Desktop {
 
 impl Desktop {
     fn context(&self) -> Option<LaunchContext> { self.context.lock().unwrap().clone() }
+
+    fn publish_recovery(&self,app:&tauri::AppHandle){
+        let value=self.recovery.lock().unwrap().snapshot();
+        let _=app.emit("desktop://runtime-recovery",value);
+    }
 
     fn flush_service_logs(&self) -> Result<(), String> {
         if self.service.lock().map_err(|error| error.to_string())?.is_none() {
@@ -218,6 +227,7 @@ impl Desktop {
             std::thread::sleep(Duration::from_millis(80));
         }
         if let Some(mut service)=self.service.lock().map_err(|e|e.to_string())?.take(){service.job.terminate();let _=service.child.kill();let _=service.child.wait();}
+        *self.launch_token.lock().unwrap()=None;*self.dsh_origin.lock().unwrap()=None;
         if let Some(context)=self.context(){let _=fs::remove_file(context.data.join("state/workspace-ready.json"));}
         Ok(())
     }
@@ -323,8 +333,10 @@ fn trusted(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     if boot_page_url(&url) {
         return Ok(());
     }
+    let service_failed=state.error.lock().unwrap().is_some();
+    let retained_page=state.recovery.lock().unwrap().preserves_page();
     if !state.stopping.load(Ordering::SeqCst)
-        && state.error.lock().unwrap().is_none()
+        && (!service_failed || retained_page)
         && state.allows_frontend_url(&url)
     {
         Ok(())
@@ -427,7 +439,8 @@ fn create_floating_window(app: &tauri::AppHandle, state: &Desktop) -> Result<Web
         .visible(false)
         .data_directory(state.context().map(|context| context.install.join("cache/webview2")).unwrap_or_else(|| state.data.clone()))
         .on_navigation(move |url| {
-            navigation_state.allows_floating_url(url)
+            let available=navigation_state.recovery.lock().unwrap().allows_navigation();
+            available && navigation_state.allows_floating_url(url)
         })
         .on_page_load(move |window, payload| {
             if payload.event()==PageLoadEvent::Started {
@@ -568,9 +581,11 @@ fn desktop_status(
         }
     }
     // ready（是否就绪）、error（错误信息）、frontend_mode（前端模式）、development（是否显式源码调试）。
+    let runtime_recovery=state.recovery.lock().unwrap().snapshot();
     Ok(serde_json::json!({
         "ready": state.origin.lock().unwrap().is_some(),
         "startup_skipped": state.startup_skipped.load(Ordering::Acquire),
+        "runtime_recovery": runtime_recovery, // runtime_recovery（运行期热更新状态，不含私有会话）。
         "error": *state.error.lock().unwrap(),
         "role": state.mode.label(), // role（入口职责）：product（正式程序）或 ui-preview（界面演示）。
         "frontend_mode": state.mode.label(),
@@ -580,7 +595,7 @@ fn desktop_status(
         "initialization_failed":state.initialization.lock().unwrap()["failed"]==true,
         "initialization":*state.initialization.lock().unwrap(),
         "runtime":state.context().and_then(|context|voice_desktop_common::runtime::status(&context).ok()),
-        "fields":{"role":"product（正式程序）或 ui-preview（隔离演示）","frontend_mode":"被授权的界面入口","development":"是否显式源码调试","ready":"界面业务来源已建立","startup_skipped":"已选择跳过加载画面","error":"启动失败原因","workspace_ready":"正式工作区已解析","workspace_busy":"正在切换或迁移","initialization_failed":"初始化失败标识","initialization":"启动阶段与进度","runtime":"本地语音环境状态"}
+        "fields":{"role":"product（正式程序）或 ui-preview（隔离演示）","frontend_mode":"被授权的界面入口","development":"是否显式源码调试","ready":"界面业务来源已建立","startup_skipped":"已选择跳过加载画面","runtime_recovery":"当前窗口的组件热更新与业务恢复","error":"启动失败原因","workspace_ready":"正式工作区已解析","workspace_busy":"正在切换或迁移","initialization_failed":"初始化失败标识","initialization":"启动阶段与进度","runtime":"本地语音环境状态"}
     }))
 }
 // desktop_page_ready（真实页面就绪）：界面挂载后确认；迁移不使用缓存启动状态。
@@ -1045,17 +1060,37 @@ fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, Path
     Ok((program, webview2, data))
 }
 
+#[derive(Clone,Copy,PartialEq)]
+enum ServiceStartKind { Startup, ResourceActivation, RuntimeRecovery } // ServiceStartKind（首次启动、受控资源换入、故障恢复）。
+
+fn pending_start_transaction(install:&Path,kind:ServiceStartKind)->bool{
+    if install.join("tmp/update-transaction.json").exists(){return true;}
+    let journal=install.join("tmp/native-install.json");
+    if !journal.exists(){return false;}
+    // 只有持有资源启用锁的内部恢复，才能验证本次已交换、尚待提交的候选。
+    kind!=ServiceStartKind::ResourceActivation
+        || voice_desktop_common::resources::load(&journal).map(|value|value["state"]!="swapped").unwrap_or(true)
+}
+
 fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), String> {
+    start_service_for(app,state,ServiceStartKind::Startup)
+}
+
+fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceStartKind) -> Result<(), String> {
+    let resource_recovery=kind!=ServiceStartKind::Startup;
+    let _transition=state.service_transition.lock().map_err(|_|"服务交接锁不可用。")?;
     if state.service_starting.swap(true,Ordering::AcqRel){return Ok(());}
     struct StartingGuard<'a>(&'a AtomicBool); // StartingGuard（启动生命周期标记）：成功、失败及取消均释放。
     impl Drop for StartingGuard<'_>{fn drop(&mut self){self.0.store(false,Ordering::Release);}}
     let _starting=StartingGuard(&state.service_starting);
     let _credentials_guard=state.credentials_guard.lock().map_err(|_|"接口配置锁不可用。")?;
     if state.stopping.load(Ordering::Acquire){return Err("桌面正在退出。".into());}
+    if !resource_recovery && app.try_state::<Arc<ResourceManager>>().is_some_and(|manager|manager.has_active_jobs()){
+        return Err("组件任务尚未结束，请等待任务完成后启动。".into());
+    }
     {
         let mut service=state.service.lock().map_err(|_|"服务状态不可用。")?;
         if service.as_mut().is_some_and(|value|matches!(value.child.try_wait(),Ok(None))){
-            if let Some(origin)=state.origin.lock().unwrap().clone(){if let Some(window)=app.get_webview_window("main"){window.navigate(format!("{origin}/").parse().map_err(|_|"服务入口地址无效。")?).map_err(|e|e.to_string())?;}}
             return Ok(());
         }
     }
@@ -1064,6 +1099,8 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
         let context=context.refreshed_components()?;*state.context.lock().unwrap()=Some(context.clone());
         *state.error.lock().unwrap()=None;
         *state.initialization.lock().unwrap()=serde_json::json!({"phase":"检查必要启动条件","can_cancel":true});
+        // 资源恢复只接纳管理器已验证并换入的候选，仍保留解释器、外部事务及凭据门禁。
+        if !resource_recovery {
         let readiness=voice_desktop_common::resources::startup_readiness_with_progress(&context,&state.initialization_cancel,&mut|phase,done,total|{
             *state.initialization.lock().unwrap()=serde_json::json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":true,
                 "fields":{"phase":"启动组件校验阶段","completed_bytes":"全组件累计进度量（语音环境按文件数折算）","total_bytes":"全组件清单字节权重总量","can_cancel":"是否可取消校验"}});
@@ -1079,20 +1116,26 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             "components_ready":readiness["ready"],"missing_components":readiness["missing"],"can_cancel":false,
             "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","missing_components":"待手动补齐的组件","can_cancel":"当前阶段是否可取消"}
         });
+        }
         // 普通组件问题只作提示，业务按实际加载结果降级；解释器缺失或未完成事务仍保留管理界面。
-        let pending=["tmp/update-transaction.json","tmp/native-install.json"].iter().any(|path|context.install.join(path).exists());
+        let pending=pending_start_transaction(&context.install,kind);
         let compatibility=voice_desktop_common::resources::load(&context.data.join("state/compatibility.json")).unwrap_or(serde_json::Value::Null);
         let unfinished=compatibility["enforcement"].is_object()&&compatibility["enforcement"]["phase"]!="complete";
-        if !context.python.is_file()||pending||unfinished{initialization::manage(&app,&state)?;return Ok(());}
+        if !context.python.is_file()||pending||unfinished{
+            if resource_recovery{return Err("运行环境或外部维护事务尚未就绪，无法恢复业务服务。".into());}
+            initialization::manage(&app,&state)?;return Ok(());
+        }
         let credentials=match voice_desktop_common::credentials::status_for_context(&context){
             Ok(value)=>value,
             Err(error)=>{
+                if resource_recovery{return Err(format!("接口配置读取失败：{error}"));}
                 *state.initialization.lock().unwrap()=serde_json::json!({"phase":"接口密钥配置需要处理，请进入模型管理页","components_ready":true,"credentials_ready":false,"credentials_error":error,"can_cancel":false,
                     "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","credentials_ready":"固定服务接口密钥已配置","credentials_error":"接口配置读取错误","can_cancel":"当前阶段是否可取消"}});
                 initialization::manage(&app,&state)?;return Ok(());
             }
         };
         if !voice_desktop_common::credentials::ready(&credentials){
+            if resource_recovery{return Err("接口密钥尚未配置，无法恢复业务服务。".into());}
             *state.initialization.lock().unwrap()=serde_json::json!({"phase":"请先在模型管理页填写接口密钥","components_ready":true,"credentials_ready":false,"can_cancel":false,
                 "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","credentials_ready":"固定服务接口密钥已配置","can_cancel":"当前阶段是否可取消"}});
             initialization::manage(&app,&state)?;return Ok(());
@@ -1173,7 +1216,10 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     if service_slot.as_mut().is_some_and(|service|service.child.try_wait().ok().flatten().is_some()){service_slot.take();}
     if service_slot.is_some(){return Ok(());}
     let epoch=state.service_epoch.fetch_add(1,Ordering::SeqCst)+1;
-    *state.origin.lock().unwrap()=None;*state.error.lock().unwrap()=None;
+    let preserve_page=resource_recovery && state.recovery.lock().unwrap().preserves_page();
+    if !preserve_page{*state.origin.lock().unwrap()=None;}
+    *state.error.lock().unwrap()=None;
+    state.recovery.lock().unwrap().result=None;
     *state.dsh_origin.lock().unwrap()=None;
     let mut child = command.spawn().map_err(|e| {
         format!(
@@ -1195,7 +1241,8 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     *service_slot = Some(Service { child, input, job });
     drop(service_slot);
     // protocol（私有协议版本）、kind（消息类型）；Node（脚本运行时）与 Python（后端语言）均接收 start（启动）。
-    state.send(serde_json::json!({"protocol":1,"kind":"start"}))?;
+    let continuity=if preserve_page{state.recovery.lock().unwrap().continuity.clone()}else{None};
+    state.send(serde_json::json!({"protocol":1,"kind":"start","continuity":continuity}))?;
     if state.mode == FrontendMode::Product {
         // pid（桌面宿主进程号）用于产品运行状态展示。
         state.send(serde_json::json!({
@@ -1247,6 +1294,13 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                         }
                     };
                     let normalized_origin = entry.origin().ascii_serialization();
+                    {
+                        let mut recovery=read_state.recovery.lock().unwrap();
+                        if preserve_page && recovery.continuity.as_ref().is_none_or(|value|value["frontend_origin"]!=normalized_origin){
+                            *read_state.error.lock().unwrap()=Some("恢复后的页面来源与当前窗口不匹配。".into());break;
+                        }
+                        if message["continuity"].is_object(){recovery.continuity=Some(message["continuity"].clone());}
+                    }
                     let capability = frontend_capability(read_state.mode, &normalized_origin, epoch);
                     if let Err(error) = read_app.add_capability(capability.to_string()) {
                         *read_state.error.lock().unwrap() =
@@ -1267,12 +1321,22 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     }
                     *read_state.launch_token.lock().unwrap() = Some(token.into());
                     *read_state.origin.lock().unwrap() = Some(normalized_origin);
-                    if let Some(window) = read_app.get_webview_window("main") {
+                    read_state.service_ready_epoch.store(epoch,Ordering::Release);
+                    if preserve_page {
+                        read_state.recovery.lock().unwrap().ready();
+                        read_state.publish_recovery(&read_app);
+                    } else if let Some(window) = read_app.get_webview_window("main") {
                         if let Err(error) = window.navigate(entry) {
                             *read_state.error.lock().unwrap() = Some(error.to_string());
                         }
                     }
                 }
+                Some("startup_result") => {
+                    let mut recovery=read_state.recovery.lock().unwrap();
+                    recovery.current_core=message["core_available"].as_bool();
+                    recovery.started=true;recovery.result=Some((epoch,message.clone()));
+                }
+                Some("runtime_status")=>{read_state.recovery.lock().unwrap().current_core=message["core_available"].as_bool();}
                 Some("exit_requested") => read_state.shutdown(&read_app),
                 Some("logs_flushed") | Some("logs_flush_failed") => {
                     // request_id（刷新请求编号）绑定桌面宿主的落盘确认。
@@ -1294,7 +1358,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             }
         }
         if read_state.service_epoch.load(Ordering::Acquire)==epoch && !read_state.stopping.load(Ordering::SeqCst) {
-            *read_state.origin.lock().unwrap() = None;
+            if !read_state.recovery.lock().unwrap().preserves_page(){*read_state.origin.lock().unwrap() = None;}
             *read_state.launch_token.lock().unwrap() = None;
             read_state.error.lock().unwrap().get_or_insert_with(|| {
                 if read_state.mode == FrontendMode::UiPreview {
@@ -1303,7 +1367,11 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     "服务入口已异常结束，请检查 logs（日志目录）中的 desktop-service.log（服务入口日志）。".into()
                 }
             });
-            if let Some(window) = read_app.get_webview_window("main") {
+            if read_state.recovery.lock().unwrap().preserves_page(){
+                let error=read_state.error.lock().unwrap().clone().unwrap_or_else(||"业务服务异常退出".into());
+                {let mut recovery=read_state.recovery.lock().unwrap();recovery.suspend();recovery.finish(Some(&error));}
+                read_state.publish_recovery(&read_app);
+            } else if let Some(window) = read_app.get_webview_window("main") {
                 let _ = window.navigate("http://tauri.localhost/management.html".parse().unwrap());
                 let _ = window.show();
             }
@@ -1315,7 +1383,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     let timeout_state = state.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(30));
-        if timeout_state.service_epoch.load(Ordering::Acquire)==epoch && timeout_state.origin.lock().unwrap().is_none()
+        if timeout_state.service_epoch.load(Ordering::Acquire)==epoch && timeout_state.service_ready_epoch.load(Ordering::Acquire)!=epoch
             && !timeout_state.stopping.load(Ordering::SeqCst)
         {
             timeout_state.error.lock().unwrap().get_or_insert_with(|| {
@@ -1354,11 +1422,12 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
                     .data_directory(build_state.context().map(|context|context.install.join("cache/webview2")).unwrap_or_else(||build_state.data.clone()))
                     .incognito(build_state.context().is_none())
                     .on_navigation(move |url| {
+                        let available=navigation_state.recovery.lock().unwrap().allows_navigation();
                         (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
                             || (url.scheme() == "http"
                                 && url.host_str() == Some("tauri.localhost")
                                 && url.port().is_none())
-                            || navigation_state.allows_frontend_url(url)
+                            || (available && navigation_state.allows_frontend_url(url))
                     })
                     .on_page_load(move |window, payload| {
                         #[cfg(feature="qualification")]
@@ -1436,8 +1505,10 @@ fn run() -> Result<(), String> {
         development,
         instance_identifier,
         service: Mutex::new(None),
+        service_transition: Mutex::new(()),
         credentials_guard: Mutex::new(()),
         service_epoch: AtomicU64::new(0),
+        service_ready_epoch: AtomicU64::new(0),
         locator,
         workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
@@ -1450,6 +1521,7 @@ fn run() -> Result<(), String> {
         service_requested: AtomicBool::new(false),
         service_starting: AtomicBool::new(false),
         startup_skipped: AtomicBool::new(false),
+        recovery: Mutex::new(runtime_recovery::RuntimeRecovery::default()),
         origin: Mutex::new(None),
         dsh_origin: Mutex::new(None),
         launch_token: Mutex::new(None),
@@ -1629,6 +1701,28 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tauri::webview::PageLoadEvent;
+
+    #[test]
+    fn startup_only_admits_the_controlled_swapped_resource_transaction(){
+        use super::{pending_start_transaction,ServiceStartKind};
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp")
+            .join(format!("startup-transaction-{}",voice_desktop_common::workspace::new_id()));
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let journal=root.join("tmp/native-install.json");
+        for phase in ["prepared","swapped","committed"]{
+            std::fs::write(&journal,serde_json::json!({"state":phase,"target":"models/optional"}).to_string()).unwrap();
+            assert!(pending_start_transaction(&root,ServiceStartKind::Startup));
+            assert!(pending_start_transaction(&root,ServiceStartKind::RuntimeRecovery));
+            assert_eq!(pending_start_transaction(&root,ServiceStartKind::ResourceActivation),phase!="swapped");
+        }
+        std::fs::write(&journal,"invalid").unwrap();
+        assert!(pending_start_transaction(&root,ServiceStartKind::ResourceActivation));
+        std::fs::write(&journal,r#"{"state":"swapped"}"#).unwrap();
+        std::fs::write(root.join("tmp/update-transaction.json"),"{}").unwrap();
+        assert!(pending_start_transaction(&root,ServiceStartKind::ResourceActivation));
+        std::fs::remove_file(journal).unwrap();std::fs::remove_file(root.join("tmp/update-transaction.json")).unwrap();
+        std::fs::remove_dir(root.join("tmp")).unwrap();std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn update_and_workspace_handoffs_reserve_a_single_maintenance_slot(){

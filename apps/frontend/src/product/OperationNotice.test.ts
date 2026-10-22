@@ -8,6 +8,15 @@ import type { RuntimeOperation } from '../runtime/runtime-operations'
 const running = (id = 'operation'): RuntimeOperation => ({ id, revision: 1, target: 'future', label: '未来组件', state: 'running', phase: 'switching', detail: '' })
 afterEach(() => { vi.useRealTimers() })
 
+it('原生恢复失败可以从现有状态卡重试', async () => {
+  const wrapper = mount(OperationNotice, { props: { retryable: true,
+    operations: [{ ...running(), state: 'failed', phase: 'failed', detail: '服务未恢复' }] } })
+  const retry = wrapper.findAll('button').find(button => button.text() === '重试')!
+  await retry.trigger('click')
+  expect(wrapper.emitted('retry')).toHaveLength(1)
+  wrapper.unmount()
+})
+
 it('shows generic stages and quickly fades only after all work is ready', async () => {
   vi.useFakeTimers()
   const first = running()

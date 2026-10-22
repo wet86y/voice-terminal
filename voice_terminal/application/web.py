@@ -116,13 +116,17 @@ class HostWeb:
 
     launch_token_lifetime_seconds = 60  # launch_token_lifetime_seconds（入口令牌有效秒数）。
 
-    def __init__(self, application, directory: Path, *, port: int = 5173) -> None:
+    def __init__(self, application, directory: Path, *, port: int = 5173, continuity: dict | None = None) -> None:
         self.application = application
         self.directory = directory.resolve()
         self.instance_id = str(application.state.value["instance_id"])  # instance_id（应用实例标识）。
         self.session = secrets.token_urlsafe(32)  # session（随机浏览器会话凭据）。
-        # cookie_name（浏览器会话 Cookie 名称）：每个应用实例有各自的名字，避免旧实例 Cookie 串用。
+        # cookie_name（浏览器会话 Cookie 名称）：首次启动按实例生成，同一窗口受控重建时沿用；其它窗口不复用。
         self.cookie_name = "voice_application_" + "".join(c for c in self.instance_id if c.isalnum())
+        if continuity:
+            from .continuity import loopback_port
+            port = loopback_port(continuity["host_origin"])
+            self.cookie_name, self.session = continuity["cookie_name"], continuity["session"]
         self._token_lock = threading.Lock()  # _token_lock（入口令牌原子消费锁）。
         self._launch_tokens: dict[str, float] = {}  # _launch_tokens（入口令牌到单调时钟过期点的映射）。
         owner = self
@@ -383,7 +387,7 @@ class HostWeb:
         try:
             self.server = OwnedServer(("127.0.0.1", port), Handler)
         except OSError as exc:
-            if not is_address_in_use(exc):
+            if continuity or not is_address_in_use(exc):
                 raise
             # The bind itself arbitrates availability; keep the selected
             # socket open so no other process can claim the returned port.

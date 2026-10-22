@@ -26,11 +26,11 @@ class DesktopControl:
             except (OSError, BrokenPipeError):
                 self.stop(0)
 
-    def start(self, origin: str, launch_token: str) -> None:
+    def start(self, origin: str, launch_token: str, *, continuity: dict | None = None) -> None:
         # ready（就绪消息）字段：origin（界面来源）、launch_token（一次性入口令牌）、pid（进程标识）、instance_id（实例标识）。
         # launch_token（一次性桌面入口令牌）只走外壳私有标准输出控制管道，不进入普通日志或启动登记。
         self.send("ready", origin=origin, launch_token=launch_token, pid=os.getpid(),
-                  instance_id=self.application.state.value["instance_id"])
+                  instance_id=self.application.state.value["instance_id"], continuity=continuity)
         threading.Thread(target=self._read, name="desktop-control", daemon=True).start()
 
     def stop(self, budget_ms: int = 14000) -> None:
