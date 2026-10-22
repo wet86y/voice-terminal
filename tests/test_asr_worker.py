@@ -4,6 +4,8 @@ import json
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -365,6 +367,89 @@ async def test_health_during_device_switch_is_nonblocking_and_does_not_start_a_s
         release.set()
         if not switch.done():
             await asyncio.wait_for(switch, timeout=2)
+        engine.close()
+
+
+@pytest.mark.asyncio
+async def test_device_rollback_restores_cpu_fallback_and_enabled_offline_lane(tmp_path, monkeypatch):
+    """旧显卡偏好已回退处理器时，回滚必须重建同设备的离线精修。"""
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cuda", dual_pass_enabled=True)
+    offline = engine.offline = SimpleNamespace(configure=AsyncMock(), close=lambda: None,
+        status=lambda: {"status": "READY", "model_loaded": True, "model_warmed": True, "device": "cpu"})
+    child = SimpleNamespace(device="cpu", warmed=True, load_error="显卡加载失败", alive=True,
+                            resource_status={}, resource_footprint={}, pid=123, close=lambda: None)
+    options = []
+
+    def create(_kind, _directory, **kwargs):
+        options.append(kwargs)
+        return child
+
+    monkeypatch.setattr("voice_terminal.model_process.ModelProcess", create)
+    try:
+        status = await engine.configure_device("cuda", allow_cuda_fallback=True)
+        assert status["device"] == "cpu" and status["model_warmed"]
+        assert status["offline"]["device"] == "cpu"
+        assert options[0]["require_cuda"] is False
+        assert [call.args for call in offline.configure.await_args_list] == [(False, "cpu"), (True, "cpu")]
+        with pytest.raises(RuntimeError, match="实际运行于 cpu"):
+            await engine.configure_device("cuda")
+        assert options[-1]["require_cuda"] is True
+    finally:
+        engine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_turn_cleanup_keeps_health_responsive_and_owns_cache_until_native_exit(tmp_path, cancel):
+    """清理等待不阻塞健康检查，取消不能提前释放轮次状态及生命周期锁。"""
+    entered, release = threading.Event(), threading.Event()
+    engine = AsrWorkerEngine(model_dir=tmp_path, device="cpu")
+    native_threads = []
+
+    def clear(_turn_id):
+        native_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(3), "测试未释放模型清理"
+
+    engine._model = SimpleNamespace(alive=True, clear_turn=clear, close=lambda: None)
+    engine._pending_audio_by_turn["slow-clear"] = bytearray(b"pcm")
+
+    class Socket:
+        responses = []
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            if self.responses:
+                raise StopAsyncIteration
+            return json.dumps({"type": "health", "request_id": "during-clear"})
+        async def send(self, payload):
+            self.responses.append(json.loads(payload))
+
+    task = asyncio.create_task(engine.clear_turn("slow-clear"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        if cancel:
+            task.cancel()
+        socket = Socket()
+        await asyncio.wait_for(handle_asr_connection(socket, engine), 1)
+        assert socket.responses[0]["request_id"] == "during-clear"
+        assert socket.responses[0]["status"] == "READY"
+        assert not task.done()
+        assert engine._inference_lock.locked()
+        assert "slow-clear" in engine._pending_audio_by_turn
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+        assert len(native_threads) == 1
+        assert native_threads[0] != threading.get_ident()
+        assert not engine._inference_lock.locked()
+        assert "slow-clear" not in engine._pending_audio_by_turn
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
         engine.close()
 
 

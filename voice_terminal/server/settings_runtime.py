@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from functools import partial
 import logging
 from typing import Any, Mapping
 
@@ -10,6 +11,16 @@ from .product import apply_settings_to_config
 from .runtime_operations import runtime_operation
 
 logger = logging.getLogger(__name__)
+
+
+async def _finish_compute_write(future):
+    """等待设备设置写回真正结束；重复取消不能遗留后台写盘线程。"""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            continue
+    return future.result()
 
 
 class ProductSettingsRuntimeMixin:
@@ -114,6 +125,7 @@ class ProductSettingsRuntimeMixin:
             if already_applied:
                 return self.product_settings.snapshot()["compute"]
 
+            previous_saved = (await asyncio.to_thread(self.product_settings.settings_only))["compute"]
             previous_actual = current_device if model_id == "paraformer" and self.config.audio_enhancements.dual_pass else current.get("device")
             previous_actual = "cuda" if str(previous_actual).startswith("cuda") else "cpu"
 
@@ -164,8 +176,28 @@ class ProductSettingsRuntimeMixin:
                 target_status = await apply(device)
                 await operation.update("verifying")
                 actual = verify(target_status, device)
-                saved = await asyncio.to_thread(
-                    self.product_settings.save_compute_model, model_id, device, active_device=actual)
+                loop = asyncio.get_running_loop()
+                save_future = loop.run_in_executor(None, partial(
+                    self.product_settings.save_compute_model, model_id, device, active_device=actual))
+                try:
+                    saved = await asyncio.shield(save_future)
+                except asyncio.CancelledError:
+                    try:
+                        await _finish_compute_write(save_future)
+                    except Exception:
+                        # 保存失败由存储层恢复旧值；仍按取消处理模型回滚。
+                        logger.debug("计算设备保存取消后写盘失败", exc_info=True)
+                    else:
+                        restore_future = loop.run_in_executor(None, partial(
+                            self.product_settings.save_compute_model, model_id,
+                            previous_saved["devices"][model_id],
+                            active_device=previous_saved["fallback_devices"][model_id]))
+                        try:
+                            await _finish_compute_write(restore_future)
+                        except Exception as restore_error:
+                            operation.prevent_resume()
+                            raise RuntimeError(f"设备切换取消后恢复原设置失败，已停止监听：{restore_error}") from restore_error
+                    raise
                 # 保存期间其他设置可正常应用；只在最新配置上替换本次模型的计算字段。
                 current_compute = self.config.compute
                 devices = {**current_compute.devices, model_id: device}
@@ -173,10 +205,8 @@ class ProductSettingsRuntimeMixin:
                 self.config = replace(self.config, compute=ComputeConfig(devices, fallbacks))
                 return saved
             except BaseException as failure:
-                if isinstance(failure, asyncio.CancelledError) and (
-                        getattr(self, "_closed", False) or getattr(self, "_application_stopping", False)):
-                    # Shutdown owns final model reclamation; do not reload the
-                    # previous device while the application is closing.
+                if getattr(self, "_closed", False) or getattr(self, "_application_stopping", False):
+                    # 退出流程负责最终回收；写盘收尾失败也不能再启动旧模型。
                     operation.prevent_resume()
                     raise
                 await operation.update("rolling_back")

@@ -275,8 +275,9 @@ class ApplicationHost:
             tensor_models = ("smart_turn",) if "endpoint" in self.manifest.get("analysis_lanes", ()) else ()
         elif key == "voice":
             tensor_models = ("voice_vad", "kws")
-        env["VOICE_TENSOR_DEVICE"] = ("cpu" if key in self.gpu_fallback_roles else
-            "cuda" if any(devices.get(name, "cpu") != "cpu" for name in tensor_models) else "cpu")
+        tensor_device = (self.manifest.get("asr_parent_device", "cpu") if key == "asr" else
+                         "cuda" if any(devices.get(name, "cpu") != "cpu" for name in tensor_models) else "cpu")
+        env["VOICE_TENSOR_DEVICE"] = "cpu" if key in self.gpu_fallback_roles else tensor_device
         if self.llm_provider:
             env["VOICE_LLM_PROVIDER"] = self.llm_provider
         if key == "voice":
@@ -594,8 +595,12 @@ class ApplicationHost:
             self.state.update(voice_api_ready=False, core_available=False)
         from ..paths import python_command
         from ..gpu_environment import worker_python
+        worker_devices = self.manifest.get("compute_devices", {})
+        if key == "asr":
+            # 识别父进程按标点选择依赖；模型子进程会独立解析主识别设备与解释器。
+            worker_devices = {**worker_devices, "paraformer": self.manifest.get("asr_parent_device", "cpu")}
         interpreter = worker_python(self.paths.install_root, self.paths.data_root or self.paths.install_root / "data", key, self.python,
-                                    self.manifest.get("compute_devices", {}))
+                                    worker_devices)
         using_gpu = interpreter != self.python or key in self.manifest.get("startup_gpu_roles", ())
         if force_cpu:
             interpreter = self.python

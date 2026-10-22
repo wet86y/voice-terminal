@@ -249,21 +249,28 @@ class ComputeHealthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await runtime._asr_compute_health(), status)
         factory.assert_called_once_with(runtime.asr.url)
         probe.connect.assert_awaited_once()
-        probe.health.assert_awaited_once_with(timeout_s=2.0)
+        probe.health.assert_awaited_once_with(timeout_s=2.0, allow_starting=True)
         probe.close.assert_awaited_once()
         self.assertFalse(runtime.asr.connected)
         runtime.asr.health.assert_not_awaited()
 
-    async def test_active_asr_health_reuses_the_session_connection(self):
-        """监听时复用会话健康请求，不额外创建连接或关闭活动输入。"""
+    async def test_active_asr_health_probes_independently_without_interrupting_session(self):
+        """活动连接可能在切换设备；独立探测应返回启动中且不干扰业务连接。"""
         from voice_terminal.server.websocket import SessionRuntime
 
         runtime = SessionRuntime.__new__(SessionRuntime)
-        runtime.asr = SimpleNamespace(connected=True, health=AsyncMock(return_value={"status": "READY"}))
-        with patch("voice_terminal.server.websocket.AsrWorkerClient") as factory:
-            self.assertEqual(await runtime._asr_compute_health(), {"status": "READY"})
-        factory.assert_not_called()
-        runtime.asr.health.assert_awaited_once_with(timeout_s=2.0)
+        runtime.asr = SimpleNamespace(connected=True, url="ws://127.0.0.1:1/asr",
+                                      health=AsyncMock(side_effect=AssertionError("不能排在业务切换请求之后")))
+        status = {"status": "STARTING", "model_loaded": False}
+        probe = SimpleNamespace(connect=AsyncMock(), health=AsyncMock(return_value=status), close=AsyncMock())
+        with patch("voice_terminal.server.websocket.AsrWorkerClient", return_value=probe) as factory:
+            self.assertEqual(await runtime._asr_compute_health(), status)
+        factory.assert_called_once_with(runtime.asr.url)
+        probe.connect.assert_awaited_once()
+        probe.health.assert_awaited_once_with(timeout_s=2.0, allow_starting=True)
+        probe.close.assert_awaited_once()
+        self.assertTrue(runtime.asr.connected)
+        runtime.asr.health.assert_not_awaited()
 
     async def test_failed_idle_probe_is_closed_and_keeps_the_real_error(self):
         """连接与健康检查失败均清理临时连接，真实故障不伪装为就绪。"""
