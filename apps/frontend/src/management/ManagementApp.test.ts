@@ -98,6 +98,45 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(start).toHaveBeenCalledTimes(1)
   })
 
+  it.each(['下载', '导入', '跳转'])('离线精修未就绪时从开关位置%s，完成组件检查后才出现开关', async action => {
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    inventory.push({ ...row('paraformer-offline', '离线精修模型'), required: false })
+    const importResource = vi.fn(async () => ({ job_id: 'offline-import' }))
+    const openResourceSource = vi.fn(async () => {})
+    Object.assign(desktop.desktopPort(), { importResource, openResourceSource })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    const card = await expandComponent('paraformer', 'speech')
+    const area = card.get('[data-enhancement-resource="paraformer-offline"]')
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    expect(card.get('.local-component-summary').text()).not.toContain('离线精修模型')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-category="speech"] .category-download').exists()).toBe(false)
+    await area.get(`button[aria-label="离线精修模型：${action}"]`).trigger('click')
+    await flushPromises()
+    if (action === '下载') {
+      expect(resourcePlan).toHaveBeenCalledWith('paraformer-offline')
+      expect(wrapper.get('#install-plan-title').text()).toContain('离线精修模型')
+      await wrapper.get('.install-plan-actions button').trigger('click')
+      await flushPromises()
+      expect(download).toHaveBeenCalledWith('paraformer-offline')
+      expect(download).not.toHaveBeenCalledWith('paraformer-streaming')
+    } else if (action === '导入') {
+      expect(importResource).toHaveBeenCalledWith('paraformer-offline')
+    } else {
+      expect(openResourceSource).toHaveBeenCalledWith('paraformer-offline')
+    }
+    expect(audioEnhancements.mock.calls.every(call => call.length === 0)).toBe(true)
+    expect(start).not.toHaveBeenCalled()
+    inventory = inventory.map(item => item.resource_id === 'paraformer-offline'
+      ? { ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true } : item)
+    resourceEvent?.({ payload: { job_id: action === '下载' ? 'download-paraformer-offline' : action === '导入' ? 'offline-import' : 'offline-ready', resource_id: 'paraformer-offline', state: 'complete',
+      phase: '组件检查通过', created_at: Date.now(), revision: 1, installed_resources: ['paraformer-offline'] } })
+    await flushPromises()
+    expect(card.find('[data-enhancement-resource]').exists()).toBe(false)
+    expect(card.get('[role="switch"]').attributes('aria-label')).toBe('双路精修开关')
+  })
+
   it('一键下载直接交给原生后台，页面不提前发起模型任务', async () => {
     const required = vi.fn(async () => ({ job_id: 'dl-required' }))
     const port = desktop.desktopPort() as desktop.DesktopPort & desktop.DesktopWorkspacePort

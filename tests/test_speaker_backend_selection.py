@@ -1,6 +1,8 @@
 """可选声纹后端贯通：模型选择、前端指纹及旧资料隔离。"""
 from pathlib import Path
+import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +13,38 @@ from voice_terminal.speaker.native import CamPlusPlusFunAsrEngine
 from voice_terminal.speaker.features import CAMPLUS_FRONTEND_VERSION, FRONTEND_VERSION
 from voice_terminal.speaker.registry import SpeakerProfileStore
 from voice_terminal.speaker.worker import SpeakerWorkerEngine
+
+
+@pytest.mark.parametrize("override,expected", [(None, "cpu"), ("cuda", "cuda")])
+def test_worker_entry_reads_device_override_before_model_load(tmp_path, monkeypatch, override, expected):
+    """走真实工作进程入口，防止设备环境变量读取在模型加载前崩溃。"""
+    from voice_terminal.speaker import worker
+    config = AppConfig(model_dir=tmp_path / "models")
+    monkeypatch.setattr(worker, "load_config", lambda *_: config)
+    monkeypatch.setattr(worker.AppPaths, "resolve", lambda _: SimpleNamespace(config=tmp_path))
+    monkeypatch.setattr(worker, "ProductSettingsStore", lambda **_: SimpleNamespace(effective_config=lambda: config))
+    listener = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(worker, "bind_loopback", lambda *args, **kwargs: (listener, 0))
+    if override is None:
+        monkeypatch.delenv("VOICE_MODEL_DEVICE", raising=False)
+    else:
+        monkeypatch.setenv("VOICE_MODEL_DEVICE", override)
+    selected = {}
+
+    class LoadReached(Exception):
+        """LoadReached（已到达加载阶段）：停止测试，避免加载真实模型。"""
+
+    def build_engine(model_path, **kwargs):
+        selected.update(path=model_path, **kwargs)
+        def load():
+            raise LoadReached()
+        return SimpleNamespace(load=load)
+
+    monkeypatch.setattr(worker, "SpeakerWorkerEngine", build_engine)
+    with pytest.raises(LoadReached):
+        asyncio.run(worker.run())
+    assert selected["device"] == expected
+    assert selected["path"] == config.speaker_model_path
 
 
 @pytest.mark.parametrize("model_id,engine_type,frontend", [

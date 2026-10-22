@@ -32,7 +32,12 @@ function enhancement(resource: string): LocalComponentRow['enhancement'] {
   const keys: Record<string, 'dual_pass' | 'emotion' | 'acoustic_events'> = { 'paraformer-streaming': 'dual_pass', 'emotion2vec-plus-base': 'emotion', yamnet: 'acoustic_events' }
   const key = keys[resource]
   if (!key) return undefined
+  const offline = key === 'dual_pass' ? resources.resources.value.find(row => row.resource_id === 'paraformer-offline') : undefined
   return { label: key === 'dual_pass' ? '双路精修' : key === 'emotion' ? '情绪背景' : '声学事件',
+    resource: key === 'dual_pass' ? offline ? toManagedResource(offline) : {
+        id: 'paraformer-offline', label: 'Paraformer 离线精修模型', state: 'missing' as const,
+        status: '等待组件检查', required: false, ready: false,
+      } : undefined,
     enabled: enhancementSettings.value[key], busy: enhancementBusy.value || enhancementLoading.value,
     busyLabel: enhancementLoading.value ? '读取状态中' : '切换中',
     toggle: async () => {
@@ -108,6 +113,7 @@ function toManagedResource(item: ResourceStatus): ManagedResourceRow {
     status: item.update_available ? '需更新' : item.installation_state === 'installed' ? '已安装' : item.installation_state === 'incomplete' ? '不完整' : '缺失',
     updateAvailable: item.update_available === true,
     required: item.required !== false,
+    ready: item.can_start === true,
     installedVersion: item.installed_version,
     targetVersion: modelResourceIds.has(item.resource_id) ? item.version : undefined,
     error: item.error || failedJob?.error || undefined,
@@ -140,7 +146,6 @@ function resourceRow(item: ResourceStatus, category: LocalComponentCategory): Lo
       ...(item.resource_id === 'voice-server' && item.version ? [{ label: '解释器版本', value: item.version }] : []),
     ],
     resource: managed,
-    resourceChoices: item.resource_id === 'paraformer-streaming' ? resources.resources.value.filter(row => row.resource_id === 'paraformer-offline').map(toManagedResource) : undefined,
     runtimeDependencies: item.runtime_components?.map(toManagedResource),
   }
 }

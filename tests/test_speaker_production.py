@@ -117,6 +117,20 @@ def test_off_plus_owner_only_preserves_selection_but_hides_marks_without_profile
     asyncio.run(scenario())
 
 
+def test_disabling_speaker_clears_its_previous_startup_error_only(tmp_path):
+    """关闭声纹后不必重启即可消除残留错误，同时保留其他组件的真实故障。"""
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(
+            model_dir=tmp_path / "models", persona=PersonaConfig(directory=tmp_path / "persona"),
+        ), runtime_data_dir=tmp_path / ".local")
+        runtime.startup_errors = ["speaker: 工作进程已退出", "asr: 识别组件故障"]
+        await runtime.set_speaker_settings({"mode": "off", "owner_only_barge_in": False})
+        assert runtime.state.services["speaker"] == "DISABLED"
+        assert runtime.startup_errors == ["asr: 识别组件故障"]
+        assert "工作进程已退出" not in str(runtime.speaker_status()["last_error"])
+    asyncio.run(scenario())
+
+
 def test_owner_barge_status_separates_selected_from_current_aec_availability():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
