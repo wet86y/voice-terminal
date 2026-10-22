@@ -14,6 +14,7 @@ from typing import Any
 from .protocol import asr_result, decode_audio_chunk
 from ..compute import process_memory_bytes, hardware_status
 from ..resources import registry, model_load_footprint
+from ..tensor_runtime import cuda_tensor_loaded
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +190,7 @@ class AsrWorkerEngine:
                     self._span_positions, self._span_revisions, self._segment_offsets,
                 )
                 for turn_id in active_turns:
-                    self._clear_turn(turn_id)
+                    await self._clear_turn(turn_id)
                 if dual_pass_was_enabled:
                     await self.offline.configure(False, previous_actual)
 
@@ -210,7 +211,7 @@ class AsrWorkerEngine:
                     self._executor, lambda: self._load_model(require_cuda=device == "cuda" and not allow_cuda_fallback,
                                                               ignore_host_fallback=device == "cuda"))
                 await self._await_native(future)
-                if device == "cuda" and self.device != "cuda":
+                if device == "cuda" and self.device != "cuda" and not allow_cuda_fallback:
                     raise RuntimeError("显式请求 cuda（图形处理器），但 Paraformer 实际运行于 cpu（中央处理器）。")
                 if dual_pass_was_enabled:
                     await self.offline.configure(True, self.device, strict=True,
@@ -272,23 +273,36 @@ class AsrWorkerEngine:
         # cumulative transcript is published.
         return text
 
-    def _clear_turn(self, turn_id: str) -> None:
-        self._segment_offsets.pop(turn_id, None)
-        if self.punctuation is not None:
-            self.punctuation.clear_turn(turn_id)
-        if self._model is not None and getattr(self._model, "alive", True):
-            try:
-                self._model.clear_turn(turn_id)
-            except Exception:
-                logger.debug("asr.worker.turn_cache_clear_failed turn_id=%s", turn_id, exc_info=True)
-        self._transcript_by_turn.pop(turn_id, None)
-        self._pending_audio_by_turn.pop(turn_id, None)
-        self._chunk_count_by_turn.pop(turn_id, None)
-        self._byte_count_by_turn.pop(turn_id, None)
-        self._model_call_count_by_turn.pop(turn_id, None)
-        self._last_log_at_by_turn.pop(turn_id, None)
-        self._span_positions.pop(turn_id, None)
-        self._span_revisions.pop(turn_id, None)
+    async def clear_turn(self, turn_id: str) -> None:
+        """clear_turn（结束轮次）：与推理及设备切换共用同一生命周期锁。"""
+        async with self._inference_lock:
+            await self._clear_turn(turn_id)
+
+    async def _clear_turn(self, turn_id: str) -> None:
+        """持锁调用；子进程通信及标点清理均在识别专用线程完成。"""
+        def release_native():
+            if self.punctuation is not None:
+                self.punctuation.clear_turn(turn_id)
+            if self._model is not None and getattr(self._model, "alive", True):
+                try:
+                    self._model.clear_turn(turn_id)
+                except Exception:
+                    logger.debug("asr.worker.turn_cache_clear_failed turn_id=%s", turn_id, exc_info=True)
+
+        future = asyncio.get_running_loop().run_in_executor(self._executor, release_native)
+        try:
+            await self._await_native(future)
+        finally:
+            # 轮次字典只在事件循环内变更；取消也要等原生清理完成后再释放。
+            self._segment_offsets.pop(turn_id, None)
+            self._transcript_by_turn.pop(turn_id, None)
+            self._pending_audio_by_turn.pop(turn_id, None)
+            self._chunk_count_by_turn.pop(turn_id, None)
+            self._byte_count_by_turn.pop(turn_id, None)
+            self._model_call_count_by_turn.pop(turn_id, None)
+            self._last_log_at_by_turn.pop(turn_id, None)
+            self._span_positions.pop(turn_id, None)
+            self._span_revisions.pop(turn_id, None)
 
     async def _infer_window(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         """在同一专用线程执行识别窗口与实时标点，返回可追加的文本增量。"""
@@ -341,7 +355,7 @@ class AsrWorkerEngine:
             try:
                 return await self._infer_serial(turn_id, pcm, is_final)
             except BaseException:
-                self._clear_turn(turn_id)
+                await self._clear_turn(turn_id)
                 raise
 
     async def flush_segment(self, turn_id: str):
@@ -421,7 +435,7 @@ class AsrWorkerEngine:
         if is_final and close_turn:
             # Return the final cumulative text before releasing per-turn
             # model cache and aggregation state.
-            self._clear_turn(turn_id)
+            await self._clear_turn(turn_id)
         elif is_final:
             self._model_call_count_by_turn[turn_id] = 0
         return AsrInferenceResult(text=text, emitted=bool(emitted_text), segments=list(self._current_spans), latency=dict(self._call_latency))
@@ -556,6 +570,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                         "status": status,
                         "model_loaded": model_loaded,
                         "tensor_cuda_build": getattr(model, "tensor_cuda_build", False),
+                        "parent_tensor_cuda_build": cuda_tensor_loaded(),  # parent_tensor_cuda_build（父进程已加载显卡张量构建）。
                         "model_warmed": bool(getattr(engine, "model_warmed", False)) if model_loaded else False,
                         "resource_footprint": getattr(engine, "resource_footprint", None) if model_loaded else None,
                         "runtime": getattr(model, "runtime", None),  # runtime（实际加载引擎）。
@@ -585,7 +600,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 if message_type == "turn.finish":
                     turn_id = message.get("turn_id")
                     if isinstance(turn_id, str):
-                        engine._clear_turn(turn_id)
+                        await engine.clear_turn(turn_id)
                         completed_segments.difference_update(tuple(key for key in completed_segments if key[0] == turn_id))
                         owned_turns.discard(turn_id)
                         logger.info("asr.worker.turn_finish turn_id=%s", turn_id)
@@ -656,5 +671,5 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
             task.cancel()
         await asyncio.gather(*remaining, return_exceptions=True)
         for turn_id in owned_turns:
-            engine._clear_turn(turn_id)
+            await engine.clear_turn(turn_id)
         logger.info("asr.worker.connection_closed peer=%s", peer)

@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
+import sys
+
+import pytest
 
 from voice_terminal.asr.punctuation import StreamingPunctuation
 from voice_terminal.asr.worker import AsrWorkerEngine, handle_asr_connection
@@ -34,6 +37,40 @@ def _punc(outputs):
     channel = StreamingPunctuation(Path("."))
     channel.model = _Model(outputs)
     return channel
+
+
+@pytest.mark.parametrize("requested,actual", [("cpu", "cpu"), ("cuda", "cuda"), ("auto", "cpu")])
+def test_punctuation_selects_its_own_tensor_packages_before_funasr_import(tmp_path, monkeypatch, requested, actual):
+    """主识别的显卡偏好不能让处理器标点导入显卡构建；显式显卡标点仍有效。"""
+    runtime = tmp_path / "runtime"
+    overlay = runtime / "Lib/cpu-packages"
+    for name in ("torch", "torchaudio"):
+        (overlay / name).mkdir(parents=True)
+        (overlay / name / "__init__.py").touch()
+    (runtime / "runtime.json").write_text('{"gpu_profile":"cu128"}', encoding="utf-8")
+    model = tmp_path / "punctuation"
+    model.mkdir()
+    (model / "config.yaml").write_text("model: CTTransformerStreaming\n", encoding="utf-8")
+    for name in ("model.pt", "tokens.json"):
+        (model / name).touch()
+    monkeypatch.setattr(sys, "executable", str(runtime / "python.exe"))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.delenv("VOICE_GPU_FALLBACK", raising=False)
+    monkeypatch.setenv("VOICE_TENSOR_DEVICE", "cuda")
+    monkeypatch.setattr("voice_terminal.asr.punctuation.device_candidates", lambda *_: [actual])
+
+    def import_model(_directory):
+        assert (str(overlay) in sys.path) == (actual == "cpu")
+        if actual == "cpu":
+            assert sys.path[0] == str(overlay)
+        monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version=SimpleNamespace(cuda=None if actual == "cpu" else "12.8")))
+        return lambda **kwargs: SimpleNamespace(kwargs=kwargs, generate=lambda **_: [])
+
+    monkeypatch.setattr("voice_terminal.asr.punctuation.auto_model_class", import_model)
+    channel = StreamingPunctuation(model, requested)
+    channel.load()
+    assert channel.warmed and channel.device == actual
 
 
 class StreamingPunctuationTests(unittest.TestCase):

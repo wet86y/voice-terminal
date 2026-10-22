@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,3 +232,87 @@ async def test_restore_failure_keeps_listener_stopped_and_reports_both_failures(
     assert runtime.state.listening is False
     runtime.start_listening.assert_not_awaited()
     assert runtime.product_settings.snapshot()["compute"]["devices"]["paraformer"] == "cpu"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", [False, True])
+@pytest.mark.parametrize("already_written", [False, True])
+async def test_cancel_during_device_save_waits_for_disk_and_restores_only_target(
+        tmp_path, monkeypatch, close, already_written):
+    """落盘前后取消都必须等待写线程；其他模型的并发保存仍保留。"""
+    runtime = make_runtime(tmp_path)
+    runtime.asr = SimpleNamespace(configure_compute=AsyncMock(side_effect=[
+        model_status("cuda", requested="auto"), model_status("cpu"),
+    ]))
+    before = runtime.product_settings.settings_only()["compute"]
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    save = runtime.product_settings.save_compute_model
+
+    def delayed_save(model_id, device, **kwargs):
+        if model_id != "paraformer" or device != "auto":
+            return save(model_id, device, **kwargs)
+        result = save(model_id, device, **kwargs) if already_written else None
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "测试未释放设置写盘"
+        return result if already_written else save(model_id, device, **kwargs)
+
+    monkeypatch.setattr(runtime.product_settings, "save_compute_model", delayed_save)
+    with patch("voice_terminal.application.resource_readiness.inspect_model_resources", return_value={}):
+        task = asyncio.create_task(runtime.switch_compute_device({"model_id": "paraformer", "device": "auto"}))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await asyncio.to_thread(runtime.product_settings.save_compute_model, "emotion", "auto", active_device="cpu")
+            runtime._closed = close
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # 重复取消也不能让未完成的写线程脱离事务。
+            await asyncio.sleep(0)
+            assert not task.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    persisted = json.loads(runtime.product_settings.path.read_text("utf-8"))["compute"]
+    assert persisted == runtime.product_settings.settings_only()["compute"]
+    assert persisted["devices"]["paraformer"] == before["devices"]["paraformer"]
+    assert persisted["fallback_devices"]["paraformer"] == before["fallback_devices"]["paraformer"]
+    assert persisted["devices"]["emotion"] == "auto"
+    assert runtime.config.compute.devices["paraformer"] == "cpu"
+    assert [entry.args[0] for entry in runtime.asr.configure_compute.await_args_list] == (["auto"] if close else ["auto", "cpu"])
+    assert runtime.state.listening is (not close)
+
+
+@pytest.mark.asyncio
+async def test_failed_settings_restore_after_cancel_keeps_listener_stopped(tmp_path, monkeypatch):
+    """取消后的旧设置若无法写回，模型可回滚但不得恢复监听或报告成功。"""
+    runtime = make_runtime(tmp_path)
+    runtime.asr = SimpleNamespace(configure_compute=AsyncMock(side_effect=[
+        model_status("cuda", requested="auto"), model_status("cpu"),
+    ]))
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    save = runtime.product_settings.save_compute_model
+
+    def delayed_save(model_id, device, **kwargs):
+        if device == "cpu":
+            raise OSError("模拟旧设置恢复失败")
+        result = save(model_id, device, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(runtime.product_settings, "save_compute_model", delayed_save)
+    with patch("voice_terminal.application.resource_readiness.inspect_model_resources", return_value={}):
+        task = asyncio.create_task(runtime.switch_compute_device({"model_id": "paraformer", "device": "auto"}))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            task.cancel()
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match="恢复原设置失败.*模拟旧设置恢复失败"):
+            await task
+    assert runtime.state.listening is False
+    runtime.start_listening.assert_not_awaited()
+    assert [entry.args[0] for entry in runtime.asr.configure_compute.await_args_list] == ["auto", "cpu"]

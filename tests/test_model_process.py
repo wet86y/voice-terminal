@@ -103,6 +103,37 @@ def test_streaming_model_child_keeps_turn_caches_separate_and_clears_final_turn(
     assert not process.is_running()
 
 
+def test_cpu_parent_can_route_streaming_child_to_registered_gpu_interpreter(child_command, tmp_path, monkeypatch):
+    """父进程选择处理器依赖后，识别子进程仍按自身设备选择显卡解释器。"""
+    from voice_terminal import paths
+    child_command(kind="streaming")
+    selected = []
+    original_command = paths.python_command
+
+    def command(executable, *args, **kwargs):
+        selected.append(executable)
+        return original_command(executable, *args, **kwargs)
+
+    def choose(_install, _data, role, cpu_python, devices):
+        assert role == "asr" and devices == {"paraformer": "cuda"}
+        assert cpu_python == "cpu-python"
+        return "gpu-python"
+
+    monkeypatch.setenv("VOICE_CPU_PYTHON", "cpu-python")
+    monkeypatch.setenv("VOICE_TENSOR_DEVICE", "cpu")
+    monkeypatch.delenv("VOICE_GPU_FALLBACK", raising=False)
+    monkeypatch.setattr(paths, "python_command", command)
+    monkeypatch.setattr("voice_terminal.gpu_environment.worker_python", choose)
+    model = ModelProcess("streaming", tmp_path, device="cuda")
+    process = psutil.Process(model.pid)
+    try:
+        assert selected == ["gpu-python"]
+        assert model.infer_stream("child-routing", b"\0\0", True) == 1
+    finally:
+        model.close()
+    assert not process.is_running()
+
+
 def test_analysis_toggle_exits_model_process_and_resets_footprint(child_command, tmp_path):
     from starlette.testclient import TestClient
     from voice_terminal.analysis.worker import AnalysisLane, create_analysis_app

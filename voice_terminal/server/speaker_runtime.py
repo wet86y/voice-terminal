@@ -189,7 +189,8 @@ class SpeakerRuntimeMixin:
                     raise RuntimeError("CAM++ 声纹工作进程由外部管理，拒绝热切换设备。")
                 self._speaker_compute_switch_owned = True
             previous_pid = process.pid if process is not None else None
-            client, self.speaker = self.speaker, None
+            # 等待及关闭完成前保留客户端所有权，取消后的会话收尾仍能找到它。
+            client = self.speaker
             controller = getattr(self, "controller", None)
             if controller is not None:
                 active_analysis = getattr(controller, "_speaker_analysis_task", None)
@@ -203,15 +204,15 @@ class SpeakerRuntimeMixin:
                         await asyncio.wait_for(asyncio.gather(*(asyncio.shield(item) for item in pending),
                                                               return_exceptions=True), timeout=30)
                 except asyncio.TimeoutError as exc:
-                    self.speaker = client
                     raise RuntimeError("等待 CAM++ 原生推理结束超时，未退出旧工作进程。") from exc
             if controller is not None:
                 controller.speaker_client = None
             if client is not None:
-                try:
-                    await client.close()
-                except Exception:
-                    logger.debug("speaker.compute_old_client_close_failed", exc_info=True)
+                from ..asr.worker import AsrWorkerEngine
+                # 客户端关闭会先解绑连接；必须等连接真实关闭后再传递取消。
+                await AsrWorkerEngine._await_native(asyncio.create_task(client.close()))
+            if self.speaker is client:
+                self.speaker = None
             await self._stop_managed_speaker_worker()
             self._speaker_warmed = False
             self._speaker_compute_restarting = True
@@ -380,8 +381,10 @@ class SpeakerRuntimeMixin:
         return False
 
     async def _stop_managed_speaker_worker(self) -> None:
-        process, self._speaker_worker_process = self._speaker_worker_process, None
-        self._speaker_worker_created_at = None
+        process = self._speaker_worker_process
+        if process is not None and process.returncode is not None:
+            self._speaker_worker_process = None
+            self._speaker_worker_created_at = None
         if process is None or process.returncode is not None:
             return
         try:
@@ -396,6 +399,10 @@ class SpeakerRuntimeMixin:
             except ProcessLookupError:
                 pass
             await process.wait()
+        # 取消等待时仍保留进程引用，后续关闭可以继续等待或强制回收。
+        if self._speaker_worker_process is process:
+            self._speaker_worker_process = None
+            self._speaker_worker_created_at = None
         logger.info("speaker.worker_stopped pid=%s", process.pid)
 
     def speaker_status(self) -> dict[str, Any]:

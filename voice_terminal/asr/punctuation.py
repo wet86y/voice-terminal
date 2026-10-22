@@ -54,10 +54,14 @@ class StreamingPunctuation:
             if config.get("model") != "CTTransformerStreaming":
                 raise ValueError("标点必须使用 CTTransformerStreaming（流式标点）配置")
             started = time.perf_counter()
+            candidates = device_candidates(self.requested_device, "paraformer", "cpu")
+            from ..tensor_runtime import activate_tensor_runtime
+            # 父进程只持有标点，不能沿用流式识别子进程的显卡依赖选择。
+            activate_tensor_runtime(candidates[0])
             auto_model = auto_model_class(self.model_dir)
             self.timings_ms["imports"] = (time.perf_counter() - started) * 1000  # imports（依赖导入）。
             errors = []
-            for candidate in device_candidates(self.requested_device, "paraformer", "cpu"):
+            for candidate in candidates:
                 try:
                     started = time.perf_counter()
                     self.model = auto_model(model=str(self.model_dir), device=candidate,

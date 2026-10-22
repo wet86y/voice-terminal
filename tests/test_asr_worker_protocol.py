@@ -6,6 +6,7 @@ import os
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from voice_terminal.asr.client import AsrWorkerClient, AsrWorkerError
@@ -17,7 +18,12 @@ from voice_terminal.config import load_config
 
 class FakeEngine:
     def __init__(self) -> None:
-        self.model_loaded = False
+        # 假引擎模拟已完成启动准备，健康请求只读状态，不再触发 load（加载）。
+        self.model_loaded = True
+        self.model_loading = False
+        self.model_warmed = True
+        self.device = self.requested_device = "cpu"
+        self._model = SimpleNamespace(tensor_cuda_build=False)
         self.turns: set[str] = set()
 
     def load(self) -> None:
@@ -27,11 +33,17 @@ class FakeEngine:
         self.turns.add(turn_id)
         return AsrInferenceResult("你好" if pcm else "", bool(pcm))
 
-    def _clear_turn(self, turn_id: str) -> None:
+    async def clear_turn(self, turn_id: str) -> None:
         self.turns.discard(turn_id)
 
 
 class FailingEngine(FakeEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model_loaded = self.model_warmed = False
+        self._model = None
+        self.load_error = "model load failed"
+
     def load(self) -> None:
         raise RuntimeError("model load failed")
 

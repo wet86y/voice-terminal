@@ -13,6 +13,7 @@ import pytest
 
 from voice_terminal.core.state import RuntimeState
 from voice_terminal.server.websocket import SessionRuntime
+from voice_terminal.speaker.client import SpeakerWorkerClient
 
 
 def runtime_stub():
@@ -118,3 +119,99 @@ def test_enrollment_rejection_does_not_keep_a_loaded_local_model():
         assert runtime._speaker_engine is None
         assert runtime._speaker_enrollment["enrollment"]["committing"] is False
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_analysis", [False, True])
+async def test_speaker_switch_cancel_preserves_client_until_session_cleanup(pending_analysis):
+    """等待旧分析或嵌入请求时取消，运行时必须仍能关闭旧客户端及发送任务。"""
+    runtime = runtime_stub()
+    client = SpeakerWorkerClient("ws://127.0.0.1:1/speaker")
+    socket = client.socket = SimpleNamespace(close=AsyncMock())
+    sender = client.send_task = asyncio.create_task(client._send_loop())
+    pending = asyncio.get_running_loop().create_future()
+    if not pending_analysis:
+        client.pending_embed["pending"] = pending
+    runtime.controller = SimpleNamespace(speaker_client=client, _speaker_analysis_task=pending if pending_analysis else None)
+    runtime.speaker = client
+    runtime._speaker_worker_process = SimpleNamespace(pid=123, returncode=None)
+    task = asyncio.create_task(runtime.switch_speaker_compute_device("cpu"))
+    try:
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert runtime.speaker is client
+        assert not sender.done()
+        # 对应会话关闭中的真实客户端收尾，必须能找到待关闭对象。
+        await runtime.speaker.close()
+        assert sender.done()
+        assert client.send_task is None and client.socket is None
+        socket.close.assert_awaited_once()
+    finally:
+        pending.cancel()
+        await client.close()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_speaker_process_stop_retains_owned_process_for_retry():
+    """退出等待被取消时保留进程句柄，下次收尾能继续确认其退出。"""
+    runtime = runtime_stub()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def wait():
+        entered.set()
+        await release.wait()
+        process.returncode = 0
+        return 0
+
+    process = SimpleNamespace(pid=123, returncode=None, terminate=Mock(), wait=wait)
+    runtime._speaker_worker_process = process
+    runtime._speaker_worker_created_at = 100
+    task = asyncio.create_task(runtime._stop_managed_speaker_worker())
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runtime._speaker_worker_process is process
+    release.set()
+    await runtime._stop_managed_speaker_worker()
+    assert runtime._speaker_worker_process is None
+    assert runtime._speaker_worker_created_at is None
+
+
+@pytest.mark.asyncio
+async def test_speaker_switch_cancel_waits_until_detached_socket_is_closed():
+    """客户端已解绑连接但尚未关完时取消，不能让连接脱离收尾。"""
+    runtime = runtime_stub()
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def close_socket():
+        entered.set()
+        await release.wait()
+        closed.set()
+
+    client = SpeakerWorkerClient("ws://127.0.0.1:1/speaker")
+    client.socket = SimpleNamespace(close=close_socket)
+    client.send_task = asyncio.create_task(client._send_loop())
+    runtime.speaker = client
+    runtime.controller = SimpleNamespace(speaker_client=client)
+    runtime._speaker_worker_process = SimpleNamespace(pid=123, returncode=None)
+    task = asyncio.create_task(runtime.switch_speaker_compute_device("cpu"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert client.socket is None
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert runtime.speaker is client
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed.is_set()
+        assert client.send_task is None
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
