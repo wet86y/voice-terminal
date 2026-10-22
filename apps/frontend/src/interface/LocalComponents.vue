@@ -342,6 +342,15 @@ function rowActionResources(row: LocalComponentRow) {
   const resources = [row.resource, ...(row.resourceChoices ?? [])].filter((resource): resource is ManagedResourceRow => Boolean(resource))
   return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable)
 }
+function componentDetailsActionAvailable(row: LocalComponentRow) {
+  if (expandedComponents.value.has(row.id) || row.runtimeDependencies?.length) return true
+  const hasUninstalledPrimaryResource = Boolean(row.resource && row.resource.state !== 'installed')
+    || Boolean(row.resourceChoices?.some(resource => resource.state !== 'installed'))
+  // componentDetailsActionAvailable（组件详情入口是否可显示）：增强开关不能绕过未安装主资源的原有操作布局。
+  if (row.enhancement && hasUninstalledPrimaryResource) return false
+  return Boolean(row.enhancement || !rowHasActiveJob(row)
+    && (!rowActionResources(row).length || !props.model.resourceActionsAvailable))
+}
 function rowHasActiveJob(row: LocalComponentRow) {
   return rowJobs(row).some(job => jobIsActive(job))
 }
@@ -531,7 +540,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <div v-if="!row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
                   <ManagedResourceActions v-for="resource in rowActionResources(row)" :key="resource.id" :resource="resource" :download-label="resourceActionLabel(resource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                 </div>
-                <button v-if="row.enhancement || row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
+                <button v-if="componentDetailsActionAvailable(row)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
                   {{ expandedComponents.has(row.id) ? '收起' : '详情' }}
                   <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedComponents.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
