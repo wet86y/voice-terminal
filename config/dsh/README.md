@@ -61,4 +61,4 @@ Wake Tasks 仅迁移旧 Voice `wake-tasks.json`（旧语音任务文件）；不
 任务，已存在的项目任务继续留在 `storages/voice-terminal-wake-tasks.json`（项目任务文件）中。
 
 完整的安装、设置、运行和故障说明见 [`docs/guides/dsh-console.md`](../../docs/guides/dsh-console.md)。许可证快照位于
-`licenses/`。
+[许可快照目录](licenses/README.md)，其中的上游相对引用统一绑定锁定提交，同步方法及来源核对见该目录说明。
