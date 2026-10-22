@@ -90,7 +90,7 @@ pub fn download_bytes(item:&Value)->u64{
     transfer["artifact"]["size_bytes"].as_u64().unwrap_or_else(||item["files"].as_array().into_iter().flatten()
         .filter(|row|row["optional"]!=true&&!row["asset"].is_string()).filter_map(|row|row["size_bytes"].as_u64()).sum())
 }
-fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
+pub(crate) fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
     let relative=spec["destination"].as_str().ok_or("资源缺少固定目录")?;
     safe_path(&context.install,&if spec["kind"]=="model"{format!("models/{relative}")}else{relative.into()})
 }
@@ -285,6 +285,9 @@ pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
 }
 
 pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
+    crate::compatibility::inventory(context)
+}
+pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
     let runtime=crate::runtime::status(context)?;let groups=runtime["groups"].clone();
     let ready=runtime["full_ready"]==true;
     let mut rows=vec![json!({"resource_id":"voice-server","label":"Voice Server（语音服务）","installation_state":if runtime["interpreter_ready"]==true{"installed"}else{"missing"},
@@ -402,9 +405,18 @@ pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool
     // 语音环境启动时快速核对文件集合和大小；模型完整摘要复核，代理复用未变化的近期核验结果。
     if rows.iter().any(|row|row["required"]!=false&&row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
     validate_inventory_hashes(context,&mut rows,cancel,progress)?;
+    // 将本次内容复核失败纳入兼容记录，不把先前的轻量元数据成功当成实际校验成功。
+    rows=crate::compatibility::inventory_with(context,|current|{
+        for failed in rows.iter().filter(|row|row["can_start"]!=true){
+            if let Some(row)=current.iter_mut().find(|row|row["resource_id"]==failed["resource_id"]&&row["version"]==failed["version"]){
+                for key in ["can_start","files_installed","installation_state","error"] {if let Some(value)=failed.get(key){row[key]=value.clone();}}
+            }
+        }
+        Ok(())
+    })?;
     Ok(readiness_from_inventory(&rows))
 }
-fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+pub(crate) fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let environment=context.install.join("runtimes/python");
     let runtime_budget:Result<(u64,u64),String>=(||{
         let manifest=load(&environment.join("manifest.json"))?;
@@ -609,6 +621,7 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     let journal=context.install.join("tmp/native-install.json");let original=target.exists();
     atomic_json(&journal,&json!({"target":relative,"state":"prepared","original":original,
         "fields":{"target":"受管相对路径","state":"启用阶段","original":"原目录是否存在"}}))?;
+    if let Err(error)=crate::compatibility::invalidate(context){let _=fs::remove_file(&journal);return Err(error);}
     if original{if let Err(error)=fs::rename(&target,&old){let _=fs::remove_file(&journal);return Err(error.to_string());}}
     let mut transaction=PendingActivation{relative:relative.into(),target:target.clone(),old,journal,original,swapped:false,committed:false,finished:false};
     if let Err(error)=fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string()).and_then(|_|fs::rename(stage,&target).map_err(|e|e.to_string())){
@@ -1210,6 +1223,14 @@ mod download_tests {
     // Ready test runtime（就绪运行库替身）：仅用于门禁检查，不启动解释器或业务服务。
     fn ready_test_runtime(root:&Path){
         fs::create_dir_all(root.join("app/config/runtime")).unwrap();
+        // 就绪工作区同时声明程序身份；缺少发布清单应由兼容门禁单独阻止启动。
+        if !root.join("app/config/compatibility.json").exists(){
+            let policy=root.join("app/config/compatibility.json");fs::write(&policy,include_bytes!("../../../../config/compatibility.json")).unwrap();
+            let mut release=load(&root.join("app/release.json")).unwrap_or(json!({"build":"test-program"}));
+            release["compatibility_engine"]=json!({"schema":1,"rules_file":"config/compatibility.json"});
+            release["files"]=json!([{"path":"config/compatibility.json","size":fs::metadata(&policy).unwrap().len(),"sha256":file_hash(&policy).unwrap()}]);
+            atomic_json(&root.join("app/release.json"),&release).unwrap();
+        }
         let lock=root.join("app/config/runtime/voice-runtime.lock.json");
         atomic_json(&lock,&json!({"schema":1})).unwrap();
         let runtime=root.join("runtimes/python");fs::create_dir_all(&runtime).unwrap();

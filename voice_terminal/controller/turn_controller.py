@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..asr.client import AsrWorkerClient
@@ -34,13 +34,15 @@ class InputController:
                  wake_keywords: Sequence[str] | None = None,
                  audio_processor: AudioPreprocessor | None = None,
                  aec_failure_policy: str = "pause_recover",
-                 barge_in_gate: BargeInGate | None = None) -> None:
+                 barge_in_gate: BargeInGate | None = None,
+                 listening_start_allowed: Callable[[], bool] | None = None) -> None:
         self.state, self.bus, self.history = state, bus, history
         self.capture, self.kws, self.vad, self.asr = capture, kws, vad, asr
         self.llm, self.tts, self.player = llm, tts, player
         self.audio_processor = audio_processor
         self.aec_failure_policy = aec_failure_policy
         self.barge_in_gate = barge_in_gate or BargeInGate(enabled=True)
+        self.listening_start_allowed = listening_start_allowed  # listening_start_allowed（实际打开麦克风前的许可核验）。
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
         # Every configured spelling is stripped from a transcript; ``wake_keyword``
         # stays the primary phrase for older fixtures and display.
@@ -138,6 +140,11 @@ class InputController:
         try:
             if not self.asr.connected:
                 await self.asr.connect()
+            # 预热和识别健康检查会让出执行权；维护租约或用户停止可能在等待期间到达。
+            # AudioCapture.start（采集启动）内部不再异步等待，核验与打开设备位于同一调度段。
+            allowed = getattr(self, "listening_start_allowed", None)
+            if allowed is not None and not allowed():
+                return
             await self.capture.start()
             if self.audio_processor is not None:
                 self.audio_processor.reset()

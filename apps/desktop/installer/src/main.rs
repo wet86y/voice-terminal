@@ -20,6 +20,27 @@ struct Installer{
     update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
+fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
+    let mut delay=2u64;
+    loop {
+        match voice_desktop_common::compatibility::enforce_upgrade(root,cancel.clone(),progress){
+            Ok(())=>return Ok(()),
+            Err(error)=>{
+                if cancel.load(Ordering::Acquire){return Err(error);}
+                let message=error.to_lowercase();
+                let transient=["网络","连接超时","连接失败","连接被","远程主机","network","timed out","timeout","dns","failed to connect","http 429","http 500","http 502","http 503","http 504"].iter().any(|reason|message.contains(reason));
+                if !transient{return Err(error);}
+                progress(&format!("兼容处理：下载连接暂未恢复，{delay} 秒后自动继续修复"),0,0);
+                let deadline=Instant::now()+Duration::from_secs(delay);
+                while Instant::now()<deadline {
+                    if cancel.load(Ordering::Acquire){return Err("强制修复已中断，进度和下载缓存保留。".into());}
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                delay=(delay*2).min(30);
+            }
+        }
+    }
+}
 #[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","initialization":"本体安装阶段"}}))}
 fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result<Value,String>{
     if state.busy.swap(true,Ordering::SeqCst){return Err("安装任务正在执行。".into());}
@@ -29,9 +50,10 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         let root=match current{Some(root)=>root,None=>native_ui::choose_folder("选择语音终端工作区（空文件夹或已有工作区，支持中文路径）")?.ok_or("已取消目录选择")?};
         if state.target.lock().unwrap().as_ref()!=Some(&root){state.installed.store(false,Ordering::Release);}
         *state.target.lock().unwrap()=Some(root.clone());
-        let mut progress=|phase:&str,done:u64,total:u64|{*state.status.lock().unwrap()=json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":phase.starts_with("正在展开")||phase.starts_with("正在校验"),"error":null,"fields":{"phase":"安装阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"启用前允许取消","error":"失败原因"}});};
+        let mut progress=|phase:&str,done:u64,total:u64|{*state.status.lock().unwrap()=json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":!phase.contains("启用")&&!phase.contains("清除")&&(phase.starts_with("正在展开")||phase.contains("校验")||phase.contains("下载")||phase.starts_with("兼容处理：")),"error":null,"fields":{"phase":"安装及强制兼容阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"替换和清除原子阶段之外可中断，保留修复进度","error":"未完成原因"}});};
         if let Some(parent)=&state.update_parent{progress("正在等待旧程序退出并释放工作区",0,0);wait_for_update_parent(&root,parent,&mut progress)?;}
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
+        complete_compatibility(&root,state.cancel.clone(),&mut progress)?;
         progress("创建桌面快捷方式",0,0);
         if state.shortcut{shortcuts::create(&root,None)?;}
         progress("正在启动正式程序",0,0);let pid=installation::launch(&root)?;

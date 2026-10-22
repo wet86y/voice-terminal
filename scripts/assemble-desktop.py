@@ -198,6 +198,7 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     (program / "config/default.yaml").write_text("\n".join(config)+"\n", encoding="utf-8")
     shutil.copy2(ROOT / "config/runtime-resources.json", program / "config/runtime-resources.json")
     shutil.copy2(ROOT / "config/download-sources.json", program / "config/download-sources.json")
+    shutil.copy2(ROOT / "config/compatibility.json", program / "config/compatibility.json")
     shutil.copy2(ROOT / "scripts/download-sources.mjs", program / "scripts/download-sources.mjs")
     shutil.copy2(ROOT / "scripts/download-sources.ps1", program / "scripts/download-sources.ps1")
     build_profile(ROOT, ROOT / ".local/build/dsh/bundles", program / "config/dsh/profile")
@@ -315,6 +316,8 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime=None, p
                 components.append({'kind': kind, 'path': relative, 'build': record['build'], 'manifest_sha256': digest(effective / 'manifest.json')})
             roots = root_files(candidate, desktop)
             release = manifest(program, kind='app', build=build)
+            release['compatibility_engine'] = {'schema': 1, 'rules_file': 'config/compatibility.json',
+                                        'fields': {'schema': '兼容协议版本', 'rules_file': '随程序固定分发的兼容规则文件'}}
             release.update(display_version=__version__, role='product', required_components=[], optional_components=['python','models','dsh','webview2'], compatibility={'desktop_protocol': 1, 'data_format': 1}, components=components, root_files=roots,
                            fields={'build': '构建编号，仅作记录', 'display_version': '与源码一致的程序显示版本', 'components': '固定组件清单', 'root_files': '根启动入口摘要'})
             atomic_json(program / 'release.json', release)

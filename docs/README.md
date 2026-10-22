@@ -12,6 +12,7 @@
 ## 架构
 
 - [系统架构与生命周期](architecture/architecture.md)
+- [兼容性组件与更新交接](architecture/compatibility-component.md)
 - [Bridge 2.0（第二版桥接协议）](architecture/bridge-2.0-protocol.md)
 - [能力就绪与能力级恢复](architecture/capability-readiness-and-recovery.md)
 - [上下文与工具契约](architecture/context-and-tools.md)
@@ -93,6 +94,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.6 强制兼容处理与发布构建](releases/v0.9.6.md)
 - [v0.9.5 CPU/GPU 设备热切换与进程回收](releases/v0.9.5.md)
 - [v0.9.4 语音音色试听、对话与影子执行修复](releases/v0.9.4.md)
 - [v0.9.1 下载改进与应用更新修订](releases/v0.9.1.md)

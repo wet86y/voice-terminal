@@ -111,7 +111,7 @@ fn verify_package(stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result
     let release=crate::resources::load(&stage.join("app/release.json"))?;
     if release["build"]!=record["build"]{return Err("正式程序包的构建编号不一致。".into());}Ok(())
 }
-fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:&mut Progress)->Result<Vec<Value>,String>{
+pub(crate) fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:&mut Progress)->Result<Vec<Value>,String>{
     let migration=&release["speaker_migration"];
     if migration.is_null(){return Ok(vec![]);}
     if migration["revision"]!=1||migration["from_model"]!="wespeaker-cnceleb-resnet34"||migration["to_model"]!="campplus-zh-cn-common"||migration["delete_legacy_profiles"]!=true{
@@ -232,8 +232,7 @@ fn activate(root:&Path,stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->R
     if let Ok(old)=crate::resources::load(&root.join("app/release.json")){
         if let Some(rows)=old["components"].as_array(){release["components"]=json!(rows.iter().filter(|row|matches!((row["kind"].as_str(),row["path"].as_str()),(Some("python"),Some("runtimes/python"))|(Some("models"),Some("models"))|(Some("dsh"),Some("runtimes/dsh"))|(Some("webview2"),Some("runtimes/webview2")))).collect::<Vec<_>>());atomic_json(&incoming,&release)?;}
     }
-    let mut migration_rows=prepare_speaker_migration(root,stage,&mut release,progress)?;
-    migration_rows.extend(crate::tts_upgrade::prepare(root,stage,&mut release,cancel,progress)?);
+    let mut migration_rows=crate::compatibility::prepare_upgrade(root,stage,&mut release,cancel,progress)?;
     let mut seen=HashSet::new();migration_rows.retain(|row|seen.insert(row["path"].as_str().unwrap_or("").to_lowercase()));
     cancelled(cancel)?;
     atomic_json(&incoming,&release)?;
@@ -301,7 +300,8 @@ pub fn copy_program(source:&Path,target:&Path,cancel:Arc<AtomicBool>,progress:&m
         let mut clean=release.clone();clean["components"]=json!([]);let data=serde_json::to_vec_pretty(&clean).map_err(|e|e.to_string())?;archive.start_file("app/release.json",options).map_err(|e|e.to_string())?;archive.write_all(&data).map_err(|e|e.to_string())?;rows.push(json!({"path":"app/release.json","size":data.len(),"sha256":format!("{:x}",Sha256::digest(&data))}));
         for name in ITEMS.iter().filter(|name|**name!="app"){let path=safe_path(source,name)?;let expected=release["root_files"].as_array().and_then(|rows|rows.iter().find(|row|row["path"]==*name)).ok_or("正式入口缺少固定文件登记")?;if file_hash(&path)?!=expected["sha256"].as_str().ok_or("入口摘要无效")?{return Err("当前正式入口校验失败，不能初始化其他工作区。".into());}let data=fs::read(path).map_err(|e|e.to_string())?;archive.start_file(*name,options).map_err(|e|e.to_string())?;archive.write_all(&data).map_err(|e|e.to_string())?;rows.push(json!({"path":name,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(&data))}));}
         archive.start_file("program-package.json",options).map_err(|e|e.to_string())?;archive.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":release["build"],"files":rows})).unwrap()).map_err(|e|e.to_string())?;archive.finish().map_err(|e|e.to_string())?;
-    }install(bytes.get_ref(),target,cancel,progress)
+    }install(bytes.get_ref(),target,cancel.clone(),progress)?;
+    crate::compatibility::enforce_upgrade(target,cancel,progress)
 }
 
 // acknowledge（首次受控窗口确认）：校验一次性凭据，仅写入工作区暂存区。
@@ -417,6 +417,10 @@ pub fn launch(root:&Path)->Result<u32,String>{
             entries.push(("app/resources/model-seeds/campplus-zh-cn-common/campplus_cn_common.bin",weight));
             app["files"]=json!(entries.iter().map(|(name,data)|json!({"path":name.strip_prefix("app/").unwrap(),"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>());
         }
+        let policy=include_bytes!("../../../../config/compatibility.json").to_vec();
+        app["compatibility_engine"]=json!({"schema":1,"rules_file":"config/compatibility.json"});
+        app["files"].as_array_mut().unwrap().push(json!({"path":"config/compatibility.json","size":policy.len(),"sha256":format!("{:x}",Sha256::digest(&policy))}));
+        entries.push(("app/config/compatibility.json",policy));
         entries.extend([("app/release.json",serde_json::to_vec(&app).unwrap()),("VoiceTerminal.exe",b"formal-entry".to_vec()),("Verify-Package.ps1",b"verify".to_vec()),("使用与环境说明.md",b"instructions".to_vec())]);
         let rows=entries.iter().map(|(path,data)|json!({"path":path,"size":data.len(),"sha256":if corrupt&&*path=="app/business.py"{"0".repeat(64)}else{format!("{:x}",Sha256::digest(data))}})).collect::<Vec<_>>();
         {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()

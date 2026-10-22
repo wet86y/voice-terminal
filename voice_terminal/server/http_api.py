@@ -1131,19 +1131,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.put("/api/v1/product/settings/screen-capture")
     async def save_screen_capture(payload: dict) -> dict:
-        from ..screen_capture import ScreenCaptureConfig
         store = product_store_or_404()
         try:
-            value = ScreenCaptureConfig(**payload).snapshot()
+            value = await asyncio.to_thread(store.save_screen_capture, payload)
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        previous = dict(store._settings)
-        try:
-            store._settings = {**store._settings, "screen_capture": value, "schema_version": 13}
-            store._save_settings()
-        except Exception:
-            store._settings = previous
-            raise
         return {"settings": {"screen_capture": value}, **await apply_saved_product_settings(store, "屏幕图像设置")}
 
     @app.put("/api/v1/product/settings/wake")

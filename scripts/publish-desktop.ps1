@@ -27,9 +27,9 @@ $Helper=Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTermin
 $InstallArguments=@('--install-package',('"'+(Join-Path $DesktopRepo '.local/build/program-package/program.zip')+'"'),'--target-root',('"'+$InstallRoot+'"'))
 # Native GUI（原生图形入口）必须等待退出并检查自身退出码；$LASTEXITCODE（上一命令退出码）不能确认替换已完成。
 $InstallProcess=Start-Process -FilePath $Helper -ArgumentList $InstallArguments -WindowStyle Hidden -Wait -PassThru
-if ($InstallProcess.ExitCode) {throw '正式本体事务替换失败；原程序已恢复或保留恢复日志。'}
+if ($InstallProcess.ExitCode) {throw '发布或强制兼容处理未完成；请核对事务及兼容记录，新本体已提交时继续修复，不回退旧的不兼容组合。'}
 if ($InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminalUIDemo.exe') -Destination (Join-Path $InstallRoot 'VoiceTerminalUIDemo.exe') -Force
 }
 Write-Host "正式入口：$InstallRoot/VoiceTerminal.exe" -ForegroundColor Green
-Write-Host '本地发布与安装器共用同一程序包；数据、模型、运行环境及登记已保留。' -ForegroundColor Green
+Write-Host '本地发布与安装器共用同一程序包及兼容性组件；有效资源已复用，配置、故障资料及必需组件已完成强制处理。' -ForegroundColor Green
