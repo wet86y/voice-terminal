@@ -23,6 +23,10 @@ const enhancementError = ref('') // enhancementError（切换或回滚失败原�
 type EnhancementKey = 'dual_pass' | 'emotion' | 'acoustic_events'
 function enhancement(key: EnhancementKey, label: string) {
   return { label, enabled: settings.audio_enhancements?.[key] !== false,
+    resource: key === 'dual_pass' ? managedResource('paraformer-offline') ?? {
+      id: 'paraformer-offline', label: 'Paraformer 离线精修模型', state: 'missing' as const,
+      status: '等待组件检查', required: false, ready: false,
+    } : undefined,
     busy: enhancementBusy.value || settingsLoading.value, busyLabel: settingsLoading.value ? '读取状态中' : '切换中',
     toggle: async () => {
       if (enhancementBusy.value || settingsLoading.value) return
@@ -103,6 +107,7 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
     status: resource.installation_state === 'installed' ? '已安装' : resource.installation_state === 'incomplete' ? '不完整' : '缺失',
     updateAvailable: resource.update_available === true,
     required: resource.required !== false,
+    ready: resource.can_start === true,
     installedVersion: resource.installed_version,
     targetVersion: resource.resource_id === 'voice-server' || resource.resource_id === 'dsh' ? undefined : resource.version,
     error: resource.error || jobs.find(job => job.state === 'failed')?.error || undefined,
@@ -174,7 +179,6 @@ const rows = computed<LocalComponentRow[]>(() => {
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
       resource: managed,
-      resourceChoices: item.id === 'paraformer' ? [managedResource('paraformer-offline')].filter((row): row is ManagedResourceRow => Boolean(row)) : undefined,
       ...(deviceSelectableModelIds.has(item.id) ? { device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
         locked: updateRequired || switching || !available || !status || refreshing.value,

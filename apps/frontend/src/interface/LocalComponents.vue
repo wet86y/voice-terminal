@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import SettingsPageHeader from './SettingsPageHeader.vue'
 import ManagedResourceProgress from './ManagedResourceProgress.vue'
+import ManagedResourceActions from './ManagedResourceActions.vue'
 import FixedProviderSettings from './FixedProviderSettings.vue'
 import FixedProviderUsage from './FixedProviderUsage.vue'
 import { formatComponentMemory, type LocalComponentCategory, type LocalComponentRow, type LocalComponentsModel, type LocalDownloadItem, type ManagedResourceJob, type ManagedResourceRow } from './local-components'
@@ -55,19 +56,18 @@ const latestJobs = computed(() => {
 })
 const componentCards = computed(() => props.model.rows.flatMap(expandRuntimeDependencies).map(row => {
   const job = rowJobs(row).find(jobIsActive)
+  const enhancementResource = row.enhancement?.resource ? rowResource(row, row.enhancement.resource) : undefined
+  const enhancementJob = enhancementResource ? visibleJob(resourceJob(enhancementResource.id)) : undefined
   // 没有独立安装资源的进程条目仅展示活动任务，历史下载错误不覆盖进程重启状态。
-  return { row, job: job && jobIsActive(job) ? job : undefined, category: rowCategory(row) }
+  return { row, job: job && jobIsActive(job) ? job : undefined, enhancementResource, enhancementJob, category: rowCategory(row) }
 }))
 const batchJob = computed(() => visibleJob(latestJobs.value.get('required-batch')) ?? visibleJob(latestJobs.value.get('batch')))
 const categories = computed(() => categoryDefinitions.map(definition => {
   const rows = componentCards.value.filter(card => card.category === definition.id)
   const entries = rows.flatMap(({ row }) => downloadEntries(row))
   const pendingEntries = entries.filter(entryNeedsDownload)
-  // Voice Server（语音服务）分类顶层操作只针对阻塞启动的 CPU（中央处理器）依赖；
-  // audio.cpp（本地语音合成引擎）和 GPU（图形处理器）依赖仍留在各自子卡片操作。
-  const pendingCount = (definition.id === 'voice-server'
-    ? pendingEntries.filter(entry => entry.optional !== true)
-    : pendingEntries).length
+  // 所有分类顶层只提示必需资源；可选模型与运行依赖在各自子卡片管理。
+  const pendingCount = pendingEntries.filter(entry => entry.optional !== true).length
   return {
     ...definition, rows, entries, pendingCount,
     observation: categoryObservation(rows.map(card => card.row)),
@@ -155,7 +155,7 @@ function needsResource(row: LocalComponentRow) {
     || row.sharedResource?.required !== false && resourceNeedsInstall(row.sharedResource))
 }
 function hasPendingResource(row: LocalComponentRow) {
-  return rowResources(row).some(resourceNeedsInstall)
+  return rowResources(row).some(resourceNeedsInstall) || resourceNeedsInstall(row.enhancement?.resource)
 }
 function resourceRetryable(resource: ManagedResourceRow) {
   return Boolean(resource.retryable || resourceJob(resource.id)?.state === 'failed')
@@ -185,6 +185,7 @@ function downloadEntries(row: LocalComponentRow): LocalDownloadItem[] {
   const entries: LocalDownloadItem[] = []
   if (row.resource) entries.push({ ...rowResource(row, row.resource), optional: row.resource.required === false })
   for (const resource of row.resourceChoices ?? []) entries.push({ ...rowResource(row, resource), optional: true })
+  if (row.enhancement?.resource) entries.push({ ...rowResource(row, row.enhancement.resource), optional: true })
   if (row.sharedResource) {
     const shared = rowResource(row, row.sharedResource)
     entries.push({
@@ -232,9 +233,7 @@ function toggleComponent(row: LocalComponentRow) {
 function refreshProviderUsage() { providerUsageRevision.value += 1 }
 function downloadCategory(category: { id: LocalComponentCategory; title: string; entries: LocalDownloadItem[]; pendingCount: number }) {
   if (!category.entries.length || !props.model.resourceActionsAvailable || props.model.resourceLoading) return
-  const entries = category.id === 'voice-server'
-    ? category.entries.filter(entry => entry.optional !== true && entryNeedsDownload(entry))
-    : category.entries
+  const entries = category.entries.filter(entry => entry.optional !== true && entryNeedsDownload(entry))
   if (!entries.length) return
   emit('resourceBundleDownload', { title: category.title, entries })
 }
@@ -346,25 +345,34 @@ function rowActionResources(row: LocalComponentRow) {
 function rowHasActiveJob(row: LocalComponentRow) {
   return rowJobs(row).some(job => jobIsActive(job))
 }
-function resourceActionLabel(row: LocalComponentRow, resource: ManagedResourceRow) {
+function resourceActionLabel(resource: ManagedResourceRow) {
   return resource.updateAvailable
     ? resourceRetryable(resource) ? '重试更新' : '更新'
     : resourceRetryable(resource) ? '重试下载' : '下载'
 }
+function enhancementReady(resource?: ManagedResourceRow, job?: ManagedResourceJob) {
+  // enhancementReady（增强组件就绪）：沿用系统检查，不把已安装但依赖未就绪的资源当成可启用。
+  return !resource || resource.ready === true && !resourceNeedsInstall(resource) && !resource.busy && !jobIsActive(job)
+}
+function enhancementResourceStatus(resource: ManagedResourceRow) {
+  if (props.model.resourceLoading) return '正在检查组件'
+  if (resource.updateAvailable) return '离线 ASR（语音识别）模型需更新'
+  if (resource.state !== 'installed') return `离线 ASR（语音识别）模型${resource.status || resourceStateLabel(resource.state)}`
+  return '等待模型与运行依赖检查通过'
+}
 function categoryObservation(rows: LocalComponentRow[]) {
-  const activeResource = rows.some(row => rowJobs(row).some(jobIsActive))
-  const healthRows = rows[0]?.category === 'voice-server'
-    ? rows.filter(row => row.resource?.required !== false)
-    : rows
+  const requiredIds = categoryResourceIds(rows)
+  const activeResource = rows.some(row => rowJobs(row).some(job => jobIsActive(job)
+    && (requiredIds.has(job.resourceId) || job.resourceId === 'voice-server' && requiredIds.has('voice-runtime-cpu'))))
+  const healthRows = rows.filter(row => row.resource?.required !== false)
   const blocking = (row: LocalComponentRow) => row.facts.some(fact => fact.label === '语音门禁')
     || row.category === 'voice-server' && row.resource?.required !== false
   const blockingFailure = healthRows.some(row => blocking(row) && row.state === 'failed')
   const blockingMissing = healthRows.some(row => blocking(row) && needsResource(row))
-  // 分类摘要要反映子卡当前的启动过程；可选依赖不参与 Voice Server（语音服务）的汇总状态。
-  const componentLoading = rows.some(row => rowState(row) === 'loading'
-    && (row.category !== 'voice-server' || row.resource?.required !== false))
+  // 可选组件的缺失、失败及启动过程只在子卡显示；运行后的有效资源仍参与汇总。
+  const componentLoading = healthRows.some(row => rowState(row) === 'loading')
   const hasReadyComponent = rows.some(row => rowState(row) === 'ready' && row.available)
-  const hasFailedComponent = rows.some(row => row.state === 'failed')
+  const hasFailedComponent = healthRows.some(row => row.state === 'failed')
   const missing = healthRows.some(needsResource)
   const label = activeResource ? '下载中'
     : blockingFailure ? '错误'
@@ -386,8 +394,13 @@ function categoryObservation(rows: LocalComponentRow[]) {
   return { state, label,
     residentMemory: sum('resident'), privateMemory: sum('privateCommit'), vram: sum('vram') }
 }
+function categoryResourceIds(rows: LocalComponentRow[]) {
+  // categoryResourceIds（分类必需资源编号）：下载按钮、摘要和进度使用相同边界。
+  return new Set(rows.flatMap(downloadEntries).filter(entry => entry.optional !== true && entry.id)
+    .map(entry => entry.id!))
+}
 function categoryProgress(category: LocalComponentCategory, rows: LocalComponentRow[]): ManagedResourceJob | undefined {
-  const ids = new Set(rows.flatMap(rowResourceIds))
+  const ids = categoryResourceIds(rows)
   const jobs = [...new Map([...ids].flatMap(id => {
     const job = resourceJob(id)
     return job && (jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state)) ? [job] : []
@@ -492,7 +505,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
           </label>
           <p v-if="!category.rows.length" class="resource-empty">暂无该分类的组件状态。</p>
           <div v-else class="local-component-list">
-            <article v-for="{ row, job } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
+            <article v-for="{ row, job, enhancementResource, enhancementJob } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
               <div class="local-component-summary">
                 <div class="local-component-body">
                   <div class="local-component-identity" :class="{ 'has-provider-usage': Boolean(row.provider) }">
@@ -512,19 +525,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <div v-if="row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
                   <div v-for="resource in selectedResources(row)" :key="resource.id" class="local-inline-resource-action">
                     <span class="local-inline-resource-status"><strong>{{ resource.label }}</strong><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></span>
-                    <template v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)">
-                      <button class="outline-button" type="button" :aria-label="`${resource.label}：${resourceActionLabel(row, resource)}`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resourceActionLabel(row, resource) }}</button>
-                      <button class="outline-button" type="button" :aria-label="`${resource.label}：导入`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
-                      <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转</button>
-                    </template>
+                    <ManagedResourceActions v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)" :resource="resource" :download-label="resourceActionLabel(resource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                   </div>
                 </div>
                 <div v-if="!row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
-                  <div v-for="resource in rowActionResources(row)" :key="resource.id" class="local-inline-resource-action">
-                    <button class="outline-button" type="button" :aria-label="`${resource.label}：${resourceActionLabel(row, resource)}`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resourceActionLabel(row, resource) }}</button>
-                    <button class="outline-button" type="button" :aria-label="`${resource.label}：导入`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
-                    <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转</button>
-                  </div>
+                  <ManagedResourceActions v-for="resource in rowActionResources(row)" :key="resource.id" :resource="resource" :download-label="resourceActionLabel(resource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                 </div>
                 <button v-if="row.enhancement || row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
                   {{ expandedComponents.has(row.id) ? '收起' : '详情' }}
@@ -547,7 +552,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                     <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
                       <button v-if="jobIsActive(resourceJob(dependency.id))" class="outline-button" type="button" :disabled="!resourceJob(dependency.id)?.canCancel" @click="emit('cancelResource', resourceJob(dependency.id)!.id)">取消任务</button>
                       <template v-else-if="runtimeNeedsAction(dependency)">
-                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：${resourceActionLabel(row, dependency)}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceDownload', dependency.id)">{{ dependency.busy ? '处理中…' : resourceActionLabel(row, dependency) }}</button>
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：${resourceActionLabel(dependency)}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceDownload', dependency.id)">{{ dependency.busy ? '处理中…' : resourceActionLabel(dependency) }}</button>
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：导入`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceImport', dependency.id)">导入</button>
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', dependency.id)">跳转</button>
                       </template>
@@ -570,9 +575,19 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
                 <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>
                 <dl v-if="detailFacts(row).length" class="local-detail-facts"><div v-for="fact in detailFacts(row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
-                <label v-if="row.enhancement" class="switch-row component-enhancement-toggle" :aria-busy="row.enhancement.busy">
+                <section v-if="row.enhancement && enhancementResource && !enhancementReady(enhancementResource, enhancementJob)" class="switch-row component-enhancement-toggle component-enhancement-install" :data-enhancement-resource="enhancementResource.id" :aria-label="row.enhancement.label" :aria-busy="model.resourceLoading || enhancementResource.busy || jobIsActive(enhancementJob)">
+                  <div class="component-enhancement-copy"><strong>{{ row.enhancement.label }}</strong><small aria-live="polite">{{ jobIsActive(enhancementJob) ? '正在准备离线 ASR（语音识别）模型' : enhancementResourceStatus(enhancementResource) }} · 可选组件，不阻塞流式识别</small></div>
+                  <ManagedResourceActions v-if="model.resourceActionsAvailable && !jobIsActive(enhancementJob)" :resource="enhancementResource" :download-label="resourceActionLabel(enhancementResource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
+                  <small v-else-if="!model.resourceActionsAvailable" class="local-detail-note">请在桌面组件管理中准备离线模型。</small>
+                  <div v-if="enhancementJob" class="component-enhancement-progress">
+                    <ManagedResourceProgress :job="enhancementJob" :label="enhancementResource.label" />
+                    <button v-if="jobIsActive(enhancementJob)" class="outline-button local-resource-cancel" type="button" :aria-label="`${enhancementResource.label}：取消任务`" :disabled="!enhancementJob.canCancel" @click="emit('cancelResource', enhancementJob.id)">取消任务</button>
+                  </div>
+                  <p v-if="enhancementResource.error && !enhancementJob && !enhancementResource.busy" class="local-error" role="status">{{ enhancementResource.error }}</p>
+                </section>
+                <label v-else-if="row.enhancement" class="switch-row component-enhancement-toggle" :aria-busy="row.enhancement.busy || model.resourceLoading">
                   <div class="component-enhancement-copy"><strong>{{ row.enhancement.label }}</strong><small aria-live="polite">{{ row.enhancement.busy ? row.enhancement.busyLabel || '切换中' : row.enhancement.enabled ? '已开启' : '已关闭' }}</small></div>
-                  <input type="checkbox" role="switch" :aria-label="`${row.enhancement.label}开关`" :checked="row.enhancement.enabled" :disabled="row.enhancement.busy" @change="row.enhancement.toggle()" />
+                  <input type="checkbox" role="switch" :aria-label="`${row.enhancement.label}开关`" :checked="row.enhancement.enabled" :disabled="row.enhancement.busy || model.resourceLoading" @change="row.enhancement.toggle()" />
                   <i aria-hidden="true"></i>
                 </label>
                 <div v-if="row.device" class="local-device-editor">
@@ -691,6 +706,10 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .component-enhancement-toggle{width:100%;min-height:54px;margin:0;padding:10px 16px;cursor:pointer}
 .component-enhancement-copy{display:grid;gap:3px;min-width:0}
 .component-enhancement-copy small{font-size:var(--font-caption);line-height:1.35;color:var(--subtle)}
+.component-enhancement-install{display:grid;grid-template-columns:minmax(0,1fr) auto;cursor:default;gap:10px 16px}
+.component-enhancement-progress{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px}
+.component-enhancement-install>.local-error{grid-column:1/-1}
+@container (max-width:440px){.component-enhancement-install,.component-enhancement-progress{grid-template-columns:minmax(0,1fr)}}
 .local-detail-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}
 .local-detail-metrics{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));padding-top:4px}.local-detail-metrics .local-runtime-metric{display:flex;flex-direction:column;gap:3px;min-width:0}.local-resource-hint{font-size:var(--font-caption);color:var(--muted);line-height:1.6}
 .local-device-editor{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;align-items:end;max-width:420px}

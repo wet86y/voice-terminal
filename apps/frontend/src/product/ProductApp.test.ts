@@ -518,6 +518,56 @@ describe('正式界面的真实控件交互', () => {
     expect(row.get('select').element.value).toBe('cuda')
     expect(row.text()).toContain('CPU（中央处理器）')
   })
+  it('正式组件页的离线精修独立安装，通过系统检查后切换为原有开关', async () => {
+    let inventory: desktopBridge.ResourceStatus[] = [
+      { resource_id: 'paraformer-streaming', label: '流式识别模型', installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true, required: true },
+      { resource_id: 'paraformer-offline', label: '离线精修模型', installation_state: 'installed', files_installed: true, runtime_ready: false, can_start: false, required: false },
+    ]
+    let resourceEvent: ((event: { payload: desktopBridge.ResourceJob }) => void) | undefined
+    const resourcePlan = vi.fn(async (id: string) => ({ resource_id: id, title: '离线精修模型', model_bytes: 100 }))
+    const download = vi.fn(async () => ({ job_id: 'offline-download' }))
+    const saveEnhancement = vi.fn(async () => {})
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true, resourceInventory: async () => inventory,
+      workspaceInfo: async () => ({ root: 'D:/测试', data_dir: 'D:/测试/data', version: '1.0', can_manage: true }),
+      environmentStatus: async () => ({ jobs: [] }), resourceInstallPlan: resourcePlan, downloadResource: download,
+      listen: async (name: string, handler: typeof resourceEvent) => {
+        if (name === desktopBridge.RESOURCE_PROGRESS_EVENT) resourceEvent = handler
+        return () => undefined
+      },
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() {
+      value = useProductControls(); value.saveAudioEnhancement = saveEnhancement
+      provideProductContext(value)
+      const resourceController = useWorkspaceResources()
+      return () => h(ComputeSettings, { resourceController })
+    } })
+    value.computeStatus.value = { models: { paraformer: { service: 'READY', device: 'cpu' } } } as never
+    application.snapshot.value = { startup_complete: true, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const card = await expandComponent(wrapper, 'paraformer', 'speech')
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    expect(card.get('.local-state').text()).toBe('运行中')
+    const area = card.get('[data-enhancement-resource="paraformer-offline"]')
+    expect(area.text()).toContain('运行依赖检查')
+    await area.get('button[aria-label="离线精修模型：下载"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(resourcePlan).toHaveBeenCalledWith('paraformer-offline')
+    expect(download).toHaveBeenCalledWith('paraformer-offline')
+    expect(card.find('[data-enhancement-resource] [data-job="offline-download"]').exists()).toBe(true)
+    inventory = inventory.map(item => ({ ...item, runtime_ready: true, can_start: true }))
+    resourceEvent?.({ payload: { job_id: 'offline-download', resource_id: 'paraformer-offline', state: 'complete',
+      phase: '组件检查通过', created_at: Date.now(), revision: 1, installed_resources: ['paraformer-offline'] } })
+    await flushPromises()
+    expect(card.find('[data-enhancement-resource]').exists()).toBe(false)
+    expect(saveEnhancement).not.toHaveBeenCalled()
+    await card.get('[role="switch"]').setValue(false)
+    expect(saveEnhancement).toHaveBeenCalledWith('dual_pass')
+  })
+
   it('运行中的组件页把随包更新显示为必需更新操作，并复用既有下载计划', async () => {
     const inventoryRead = vi.fn(async () => [{ resource_id: 'paraformer-streaming', label: 'Paraformer（流式识别）',
       installation_state: 'installed' as const, files_installed: true, runtime_ready: true, can_start: true,
@@ -550,7 +600,8 @@ describe('正式界面的真实控件交互', () => {
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
     expect(card.get('button[aria-label="Paraformer（流式识别）：跳转"]').text()).toBe('跳转')
     expect(card.find('.local-component-action').exists()).toBe(true)
-    expect(card.find('[role="switch"]').exists()).toBe(true)
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    expect(card.find('[data-enhancement-resource="paraformer-offline"]').exists()).toBe(true)
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 Paraformer')

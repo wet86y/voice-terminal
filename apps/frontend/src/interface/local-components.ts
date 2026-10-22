@@ -31,6 +31,7 @@ export interface LocalComponentRow {
     enabled: boolean // enabled（当前已保存或立即预览的开启状态）。
     busy: boolean // busy（正在读取或切换，暂时锁定操作）。
     busyLabel?: string // busyLabel（忙碌状态下显示的中文阶段）。
+    resource?: ManagedResourceRow // resource（启用增强所需的独立可选资源）：就绪前在开关位置安装，不占用主组件下载区。
     toggle: () => Promise<void> // toggle（保存切换；失败时由调用方恢复原状态）。
   }
   /** id（稳定标识）与 name（组件名称）。 */
@@ -114,6 +115,8 @@ export interface ManagedResourceRow {
   updateAvailable?: boolean
   /** required（是否必需）：false（可选）不阻塞整体启动。 */
   required?: boolean
+  /** ready（系统组件检查已通过）：同时确认模型文件和运行依赖，不以文件存在替代就绪检查。 */
+  ready?: boolean
   installedVersion?: string | null
   targetVersion?: string | null
   /** error（最近下载、导入或完整性检查错误）。 */

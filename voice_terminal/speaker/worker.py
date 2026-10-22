@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from ..startup_logging import initialize_worker_logging, worker_imports_ready, startup_stage
 if __name__ == "__main__":
     initialize_worker_logging("speaker", "speaker-worker.log")

@@ -2,7 +2,7 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 import LocalComponents from './LocalComponents.vue'
-import type { LocalComponentsModel } from './local-components'
+import type { LocalComponentsModel, ManagedResourceRow } from './local-components'
 
 function model(): LocalComponentsModel {
   return {
@@ -28,7 +28,126 @@ async function expandComponent(wrapper: ReturnType<typeof mount>, category: stri
   return card
 }
 
+function dualPassModel(resource: Partial<ManagedResourceRow> = {}): LocalComponentsModel {
+  const value = model()
+  value.rows = [{ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）', category: 'speech',
+    resource: { id: 'paraformer-streaming', label: '流式识别模型', state: 'installed', status: '已安装', required: true },
+    enhancement: { label: '双路精修', enabled: false, busy: false, toggle: vi.fn(async () => {}),
+      resource: { id: 'paraformer-offline', label: '离线精修模型', state: 'missing', status: '缺失', required: false, ready: false, ...resource } } }]
+  return value
+}
+
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
+  it.each([
+    { state: 'missing' as const, status: '缺失' },
+    { state: 'incomplete' as const, status: '不完整' },
+    { state: 'installed' as const, status: '已安装', updateAvailable: true, ready: true },
+    { state: 'installed' as const, status: '已安装', ready: false },
+  ])('离线精修资源 $status（未通过组件检查）时只在开关区域显示资源操作', async resource => {
+    const value = dualPassModel(resource)
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    const area = card.get('[data-enhancement-resource="paraformer-offline"]')
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    expect(card.get('.local-state').text()).toBe('运行中')
+    expect(card.get('.local-component-summary').text()).not.toContain('离线精修模型')
+    expect(wrapper.find('[data-category="speech"] .category-download').exists()).toBe(false)
+    await area.get('button[aria-label="离线精修模型：导入"]').trigger('click')
+    await area.get('button[aria-label="离线精修模型：跳转"]').trigger('click')
+    await area.get('button[aria-label="离线精修模型：' + (resource.updateAvailable ? '更新' : '下载') + '"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-offline']])
+    expect(wrapper.emitted('resourceImport')).toEqual([['paraformer-offline']])
+    expect(wrapper.emitted('openResourceSource')).toEqual([['paraformer-offline']])
+    expect(value.rows[0]!.enhancement!.toggle).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('必要流式模型与可选离线模型分别使用自己的下载位置和资源编号', async () => {
+    const value = dualPassModel()
+    value.rows[0]!.resource!.state = 'missing'
+    value.rows[0]!.resource!.status = '缺失'
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    await card.get('.local-component-summary button[aria-label="流式识别模型：下载"]').trigger('click')
+    await card.get('[data-enhancement-resource] button[aria-label="离线精修模型：下载"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming'], ['paraformer-offline']])
+    await wrapper.get('[data-category="speech"] .category-download').trigger('click')
+    const bundle = wrapper.emitted('resourceBundleDownload')![0]![0] as { entries: Array<{ id: string }> }
+    expect(bundle.entries.map(entry => entry.id)).toEqual(['paraformer-streaming'])
+    wrapper.unmount()
+  })
+
+  it('离线资源完成系统检查后自动显示开关，检查未知或再次损坏时恢复安装区', async () => {
+    const value = dualPassModel()
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    const updateResource = async (resource: Partial<ManagedResourceRow>) => {
+      const row = value.rows[0]!
+      await wrapper.setProps({ model: { ...value, rows: [{ ...row, enhancement: { ...row.enhancement!,
+        resource: { ...row.enhancement!.resource!, ...resource } } }] } })
+    }
+    await updateResource({ state: 'installed', ready: undefined })
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    await updateResource({ state: 'installed', ready: true })
+    expect(card.find('[data-enhancement-resource]').exists()).toBe(false)
+    const control = card.get('[role="switch"]')
+    expect((control.element as HTMLInputElement).checked).toBe(false)
+    expect(value.rows[0]!.enhancement!.toggle).not.toHaveBeenCalled()
+    await control.setValue(true)
+    expect(value.rows[0]!.enhancement!.toggle).toHaveBeenCalledOnce()
+    await updateResource({ state: 'incomplete', ready: false })
+    expect(card.find('[role="switch"]').exists()).toBe(false)
+    expect(card.find('[data-enhancement-resource]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('离线下载进度、取消与失败重试留在增强区域，不改变主组件和分类状态', async () => {
+    const value = dualPassModel()
+    value.managedResourceJobs = [{ id: 'offline-task', resourceId: 'paraformer-offline', label: '离线精修模型',
+      state: 'running', phase: '下载中', completedBytes: 10, totalBytes: 100, canCancel: true }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    const area = card.get('[data-enhancement-resource]')
+    expect(area.find('[data-job="offline-task"]').exists()).toBe(true)
+    expect(area.find('.managed-resource-buttons').exists()).toBe(false)
+    expect(card.get('.local-state').text()).toBe('运行中')
+    expect(wrapper.get('[data-category="speech"] .local-category-observability .local-state').text()).toBe('运行中')
+    await area.get('button[aria-label="离线精修模型：取消任务"]').trigger('click')
+    expect(wrapper.emitted('cancelResource')).toEqual([['offline-task']])
+    await wrapper.setProps({ model: { ...value, managedResourceJobs: [{ ...value.managedResourceJobs![0]!,
+      state: 'failed', error: '网络中断', canCancel: false }] } })
+    expect(area.text()).toContain('网络中断')
+    await area.get('button[aria-label="离线精修模型：重试下载"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-offline']])
+    wrapper.unmount()
+  })
+
+  it.each(['running', 'failed'] as const)('可选拓展资源任务 %s（运行或失败）只在子卡显示', async state => {
+    const value = model()
+    value.rows = [{ ...value.rows[0]!, id: 'emotion', category: 'extensions', name: '情绪背景',
+      state: 'failed', available: false, status: '不可用', error: '可选模型缺失',
+      resource: { id: 'emotion2vec-plus-base', label: '情绪模型', state: 'missing', status: '缺失', required: false } }]
+    value.managedResourceJobs = [{ id: 'optional-task', resourceId: 'emotion2vec-plus-base', label: '情绪模型',
+      state, phase: '处理模型', error: state === 'failed' ? '下载失败' : undefined, canCancel: state === 'running' }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const category = wrapper.get('[data-category="extensions"]')
+    expect(category.get('.local-category-observability .local-state').text()).toBe('待配置或已停用')
+    expect(category.find('.category-download').exists()).toBe(false)
+    expect(category.find('.category-import').exists()).toBe(false)
+    expect(category.find('.local-category-progress').exists()).toBe(false)
+    const card = await expandComponent(wrapper, 'extensions', 'emotion')
+    expect(card.find('[data-job="optional-task"]').exists()).toBe(true)
+    if (state === 'running') {
+      await card.get('button[aria-label="情绪背景：取消任务"]').trigger('click')
+      expect(wrapper.emitted('cancelResource')).toEqual([['optional-task']])
+    } else {
+      expect(card.text()).toContain('缺失')
+      await card.get('button[aria-label="情绪模型：重试下载"]').trigger('click')
+      expect(wrapper.emitted('resourceDownload')).toEqual([['emotion2vec-plus-base']])
+    }
+    wrapper.unmount()
+  })
+
   it('增强开关在组件详情可操作，切换期间锁定并显示持久化状态', async () => {
     const value = model()
     const toggle = vi.fn(async () => {})

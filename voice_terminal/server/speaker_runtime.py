@@ -401,7 +401,7 @@ class SpeakerRuntimeMixin:
     def speaker_status(self) -> dict[str, Any]:
         profile = self.speaker_profile.snapshot()
         if not profile.get("available") and getattr(self.speaker_profile, "root", None) is not None and (self.speaker_profile.root.parent / "registry.json").is_file():
-            profile.update(needs_reenrollment=True, stale_reason="speaker_model_changed", warning="已切换CAM++，旧声纹已停用；新版安装器会移除旧档案，请重新录制主人声纹")
+            profile.update(needs_reenrollment=True, stale_reason="speaker_model_changed", warning="旧声纹资料与当前 CAM++（声纹模型）不兼容，已停止使用；请重新录制主人声纹")
         service = self.state.services.get("speaker", "DISABLED")
         # 通信或推理故障必须同步至状态接口；仅模型仍加载不能证明声纹功能可用。
         if ((self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in)

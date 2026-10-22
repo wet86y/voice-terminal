@@ -760,6 +760,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             audio_processor=self.audio_processor,
             aec_failure_policy=self.config.audio.aec_failure_policy,
             barge_in_gate=BargeInGate(enabled=True),
+            listening_start_allowed=runtime_operations(self).listening_start_allowed,
             conversation=self.conversation,
             speaker_client=self.speaker,
             speaker_router=self.speaker_router,
@@ -2129,6 +2130,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await self._stop_managed_speaker_worker()
             await asyncio.to_thread(self._release_speaker_engine)
             self.state.set_service("speaker", "DISABLED")
+            # 主动关闭即结束本次声纹故障；日志保留诊断，设置页不再展示已停用进程的旧错误。
+            self.startup_errors = [item for item in self.startup_errors if not str(item).startswith("speaker:")]
             if self.controller is not None:
                 self.controller.speaker_client = None
         elif self.speaker is None and self.speaker_profile.available:
