@@ -56,6 +56,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     environment.mockReset().mockImplementation(async () => ({ interpreter_ready: false, service_ready: false, python: '', groups: {}, jobs }))
     audioEnhancements.mockReset().mockResolvedValue({ dual_pass: true, emotion: true, acoustic_events: true })
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
       available: true,
       audioEnhancements,
       workspaceInfo: async () => ({ root: 'D:/测试/测试123', data_dir: 'D:/测试/测试123/data', version: '0.9.0', can_manage: true }),
@@ -285,23 +286,21 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
   })
 
-  it('空闲时十秒自动刷新，刷新请求串行且页面聚焦立即补查', async () => {
+  it('空闲及焦点轮询只读取任务快照，不重复盘点安装目录', async () => {
     vi.useFakeTimers()
     const snapshots = vi.fn(async () => jobs)
     Object.assign(desktop.desktopPort(), { resourceJobSnapshots: snapshots })
     wrapper = mount(ManagementApp)
     await flushPromises()
-    await vi.advanceTimersByTimeAsync(9999)
-    expect(inventoryRead).toHaveBeenCalledOnce()
-    inventory = inventory.map(item => ({ ...item, can_start: true }))
-    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(20000)
     await flushPromises()
-    expect(inventoryRead).toHaveBeenCalledTimes(2)
-    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    expect(snapshots).toHaveBeenCalledTimes(3)
+    expect(inventoryRead).toHaveBeenCalledOnce()
     window.dispatchEvent(new Event('focus'))
     await vi.advanceTimersByTimeAsync(0)
     await flushPromises()
-    expect(inventoryRead).toHaveBeenCalledTimes(3)
+    expect(snapshots).toHaveBeenCalledTimes(4)
+    expect(inventoryRead).toHaveBeenCalledOnce()
   })
 
   it('其他组件持续发进度时仍按两秒补查，不推迟丢失终态的恢复', async () => {
@@ -325,7 +324,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(model.find('[data-job="model"]').exists()).toBe(true)
   })
 
-  it('磁盘清单读取超过两秒时，持续进度不叠加补查或不断丢弃当前结果', async () => {
+  it('组件提交才重新盘点，慢盘点期间进度补查继续且不重复读取目录', async () => {
     vi.useFakeTimers()
     jobs = [{ job_id: 'slow-disk', resource_id: 'paraformer-streaming', state: 'running', phase: '下载模型', created_at: 100, revision: 1 }]
     const snapshots = vi.fn(async () => jobs)
@@ -334,13 +333,10 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     let finishRead!: (rows: ResourceStatus[]) => void
     inventoryRead.mockImplementationOnce(() => new Promise<ResourceStatus[]>(resolve => { finishRead = resolve }))
-    await vi.advanceTimersByTimeAsync(2000)
+    resourceEvent?.({ payload: { ...jobs[0], revision: 2, installed_resources: ['voice-server'] } })
     await flushPromises()
-    for (let revision = 2; revision <= 4; revision += 1) {
-      await vi.advanceTimersByTimeAsync(1000)
-      resourceEvent?.({ payload: { ...jobs[0], revision } })
-    }
-    expect(snapshots).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(snapshots).toHaveBeenCalledTimes(3)
     expect(inventoryRead).toHaveBeenCalledTimes(2)
     inventory = inventory.map(item => ({ ...item, can_start: true, files_installed: true, runtime_ready: true, installation_state: 'installed' }))
     finishRead(inventory)

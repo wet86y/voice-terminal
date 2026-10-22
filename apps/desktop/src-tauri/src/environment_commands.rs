@@ -47,8 +47,7 @@ pub async fn voice_environment_status(window:WebviewWindow,desktop:State<'_,Arc<
         status["jobs"]=json!(manager.snapshots());status["gpu"]=resources::load(&context.data.join("config/gpu-environment.json")).unwrap_or(Value::Null);
         if let Some(relative)=status["gpu"]["path"].as_str(){
             let root=safe_path(&context.install,relative)?;
-            let unchanged=status["gpu"]["environment_fingerprint"].as_str()==runtime::fingerprint(&root).ok().as_deref()
-                &&status["gpu"]["models_fingerprint"].as_str()==runtime::fingerprint(&context.install.join("models")).ok().as_deref();
+            let unchanged=if status["gpu"]["validation_identity"].is_object(){runtime::validation_identity(&context.install,&root).is_ok_and(|identity|status["gpu"]["validation_identity"]==identity)}else{root.join("python.exe").is_file()};
             if !unchanged{if let Some(models)=status["gpu"]["models"].as_object_mut(){for capability in models.values_mut(){capability["gpu_available"]=json!(false);capability["reason"]=json!("环境或模型文件已变化，请重新检测。");}}}
         }
         Ok(status)

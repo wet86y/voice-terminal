@@ -52,6 +52,7 @@ export function useWorkspaceResources() {
       error: '更新错误', can_cancel: '当前是否允许取消',
     },
   })
+  const integrity = ref<AppUpdateStatus>({ state: 'idle', operation: 'integrity', installer_ready: false, current_version: '', fields: {} }) // integrity（当前构建维护状态）。
   const startingResources = ref(new Set<string>())
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
@@ -141,7 +142,7 @@ export function useWorkspaceResources() {
       pollDueAt = 0
       pollRunning = true
       // 不叠加定时请求；快照完成后刷新安装状态，再开始下一次计时。
-      void refreshJobSnapshots().then(() => refreshInventory()).finally(() => { pollRunning = false; schedulePoll() })
+      void refreshJobSnapshots().finally(() => { pollRunning = false; schedulePoll() })
     }, wait)
   }
   function refreshOnFocus() { schedulePoll(0) }
@@ -233,7 +234,7 @@ export function useWorkspaceResources() {
       )
       updateUnlisten = await port.listen<AppUpdateStatus>(
         APP_UPDATE_EVENT,
-        event => { if (mounted) appUpdate.value = event.payload },
+        event => { if (mounted) { if (event.payload.operation === 'integrity') integrity.value = event.payload; else appUpdate.value = event.payload } },
       )
       if (!mounted) {
         resourceUnlisten()
@@ -257,7 +258,8 @@ export function useWorkspaceResources() {
     if (!port.available) return
     loading.value = true
     window.addEventListener('focus', refreshOnFocus)
-    unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined)]
+    unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined),
+      Promise.resolve().then(() => port.integrityStatus()).then(value => { if (mounted) integrity.value = value }).catch(error => { if (mounted) integrity.value.error = String(error) })]
     void Promise.all(unlistenRequests).finally(() => { loading.value = false; schedulePoll() })
   })
 
@@ -297,12 +299,21 @@ export function useWorkspaceResources() {
     }
   }
 
+  async function downloadIntegrity() {
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    try { integrity.value = await port.downloadIntegrity() }
+    catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error) } }
+  }
+  async function checkIntegrity() {
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    try { integrity.value = await port.checkIntegrity() }
+    catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error), installer_ready: false } }
+  }
   async function cancelAppUpdate() {
-    if (!appUpdate.value.can_cancel) return
+    const target = integrity.value.can_cancel ? integrity : appUpdate
+    if (!target.value.can_cancel) return
     try { await port.cancelAppUpdate() }
-    catch (error) {
-      appUpdate.value = { ...appUpdate.value, error: error instanceof Error ? error.message : '取消更新失败。' }
-    }
+    catch (error) { target.value = { ...target.value, error: error instanceof Error ? error.message : '取消维护下载失败。' } }
   }
 
   async function chooseWorkspace() {
@@ -489,6 +500,9 @@ export function useWorkspaceResources() {
     workspaceError,
     eventError,
     appUpdate,
+    integrity,
+    downloadIntegrity,
+    checkIntegrity,
     openProjectRepository,
     checkAppUpdate,
     downloadAppUpdate,

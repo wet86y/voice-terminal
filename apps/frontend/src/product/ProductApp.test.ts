@@ -363,6 +363,7 @@ describe('正式界面的真实控件交互', () => {
 
   it('桌面下载期间后台服务停止不会触发应用退出动画或阻断组件操作', async () => {
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
       available: true,
       workspaceInfo: async () => ({ can_manage: true }),
       resourceInventory: async () => [],
@@ -528,6 +529,7 @@ describe('正式界面的真实控件交互', () => {
     const download = vi.fn(async () => ({ job_id: 'offline-download' }))
     const saveEnhancement = vi.fn(async () => {})
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
       available: true, resourceInventory: async () => inventory,
       workspaceInfo: async () => ({ root: 'D:/测试', data_dir: 'D:/测试/data', version: '1.0', can_manage: true }),
       environmentStatus: async () => ({ jobs: [] }), resourceInstallPlan: resourcePlan, downloadResource: download,
@@ -575,6 +577,7 @@ describe('正式界面的真实控件交互', () => {
     const resourcePlan = vi.fn(async (id: string) => ({ resource_id: id, title: 'Paraformer（流式识别）', model_bytes: 100 }))
     const download = vi.fn(async (id: string) => ({ job_id: `download-${id}` }))
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
       available: true,
       resourceInventory: inventoryRead,
       workspaceInfo: async () => ({ root: 'D:/测试', data_dir: 'D:/测试/data', version: '1.0', can_manage: true }),
@@ -1083,7 +1086,8 @@ describe('正式界面的真实控件交互', () => {
   it('桌面控制台取得登录地址后由原生 open_console（打开控制台）处理', async () => {
     const launch = deferred<{ url: string }>()
     const openConsole = vi.fn().mockResolvedValue(undefined)
-    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
       focus: vi.fn(), exportLogs: vi.fn(), openConsole, openMinimaxVoiceLibrary: vi.fn(), exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     vi.spyOn(productApi, 'launchDsh').mockReturnValue(launch.promise)
@@ -1102,7 +1106,8 @@ describe('正式界面的真实控件交互', () => {
   it('原生打开控制台失败时显示错误，入口仍可重试', async () => {
     const openConsole = vi.fn().mockRejectedValueOnce(new Error('无法打开系统默认浏览器。'))
       .mockResolvedValueOnce(undefined)
-    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
       focus: vi.fn(), exportLogs: vi.fn(), openConsole, openMinimaxVoiceLibrary: vi.fn(), exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     vi.spyOn(productApi, 'launchDsh').mockResolvedValue({ url: 'http://127.0.0.1:3081/?token=value' })
@@ -1119,7 +1124,8 @@ describe('正式界面的真实控件交互', () => {
   })
 
   it('原生命令桥不可用时不请求控制台地址或打开浏览器窗口', async () => {
-    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: false,
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: false,
       focus: vi.fn(), exportLogs: vi.fn(), openConsole: vi.fn(), openMinimaxVoiceLibrary: vi.fn(), exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     const launch = vi.spyOn(productApi, 'launchDsh')

@@ -15,6 +15,8 @@ function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResourc
     workspaceError: ref(''),
     eventError: ref(''),
     workspaceOperationStarting: ref(false),
+    integrity: ref({ state: 'idle', operation: 'integrity', installer_ready: false, fields: {} }),
+    downloadIntegrity: vi.fn(), checkIntegrity: vi.fn(),
     appUpdate: ref({ state: 'idle', current_version: '0.9.3' }),
     checkAppUpdate: vi.fn(),
     downloadAppUpdate: vi.fn(),

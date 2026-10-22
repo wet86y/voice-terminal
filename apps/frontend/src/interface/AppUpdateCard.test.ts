@@ -10,6 +10,26 @@ const status: AppUpdateStatus = {
 }
 
 describe('AppUpdateCard（应用更新卡片）', () => {
+  it('完整性入口位于更新右侧，缺失时只请求下载当前版本校验程序，准备后才可启动校验', async () => {
+    const wrapper = mount(AppUpdateCard, { props: { status, integrity: { state: 'idle', current_version: '0.9.0', installer_ready: false, fields: {} } } })
+    expect(wrapper.get('.update-actions').findAll('button').map(button => button.text())).toEqual(['下载并安装', '下载校验程序'])
+    expect(wrapper.get('.integrity-detail').text()).toContain('不会自动获取最新版')
+    await wrapper.get('.integrity-action').trigger('click')
+    expect(wrapper.emitted('downloadIntegrity')).toHaveLength(1)
+    expect(wrapper.emitted('download')).toBeUndefined()
+    expect(wrapper.emitted('checkIntegrity')).toBeUndefined()
+    await wrapper.setProps({ integrity: { state: 'current', current_version: '0.9.0', installer_ready: true, fields: {} } })
+    expect(wrapper.get('.integrity-action').text()).toBe('校验完整性')
+    expect(wrapper.get('.integrity-detail').text()).toContain('将关闭程序')
+    await wrapper.get('.integrity-action').trigger('click')
+    expect(wrapper.emitted('checkIntegrity')).toHaveLength(1)
+  })
+  it('下载校验程序可取消，同时禁止触发更新', async () => {
+    const wrapper = mount(AppUpdateCard, { props: { status, integrity: { state: 'downloading', current_version: '0.9.0', can_cancel: true, fields: {} } } })
+    expect(wrapper.get<HTMLButtonElement>('.update-action').element.disabled).toBe(true)
+    await wrapper.get('.integrity-action').trigger('click')
+    expect(wrapper.emitted('cancel')).toHaveLength(1)
+  })
   it('显示作者并通过独立操作打开项目仓库，不触发更新下载', async () => {
     const wrapper = mount(AppUpdateCard, { props: { status } })
     expect(wrapper.get('.update-about').text()).toContain('作者 wet86y')

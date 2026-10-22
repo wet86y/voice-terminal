@@ -72,6 +72,29 @@ pub fn package_version(payload:&[u8])->Result<String,String>{
     semver::Version::parse(&version).map_err(|_|"正式程序包版本无效。")?;Ok(version)
 }
 
+/// package_build（内嵌构建身份）：完整性维护必须绑定同版本同构建。
+pub fn package_build(payload:&[u8])->Result<String,String>{
+    let mut archive=zip::ZipArchive::new(Cursor::new(payload)).map_err(|e|e.to_string())?;
+    let mut bytes=Vec::new();archive.by_name("program-package.json").map_err(|e|e.to_string())?.read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+    let record:Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    record["build"].as_str().filter(|v|!v.is_empty()).map(str::to_owned).ok_or("内嵌程序包缺少构建编号。".into())
+}
+/// verify_current_package（按内嵌可信清单验证本体）：正常本体无需重复解包和替换。
+pub fn verify_current_package(payload:&[u8],root:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let mut archive=zip::ZipArchive::new(Cursor::new(payload)).map_err(|e|e.to_string())?;
+    let mut bytes=Vec::new();archive.by_name("app/release.json").map_err(|e|e.to_string())?.read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+    let expected:Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    bytes.clear();archive.by_name("program-package.json").map_err(|e|e.to_string())?.read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+    let record:Value=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    if record["schema"]!=1||record["role"]!="product"||record["build"]!=expected["build"]||record["version"]!=expected["version"]{return Err("内嵌程序包身份无效。".into());}
+    verify_package_maps(&record,&expected)?;
+    let actual=crate::resources::load(&safe_path(root,"app/release.json")?)?;
+    let immutable=|mut value:Value|{if let Some(map)=value.as_object_mut(){map.remove("components");map.remove("deferred_migrations");if map.get_mut("fields").and_then(Value::as_object_mut).is_some_and(|fields|{fields.remove("deferred_migrations");fields.is_empty()}){map.remove("fields");}}value};
+    if immutable(actual)!=immutable(expected.clone()){return Err("现用本体清单与维护程序不一致。".into());}
+    workspace::verify_records_with_progress(&root.join("app"),expected["files"].as_array().ok_or("程序文件清单缺失")?,true,cancel,progress)?;
+    workspace::verify_fixed_files_with_progress(root,expected["root_files"].as_array().ok_or("程序入口清单缺失")?,cancel,progress)
+}
+
 pub fn verify_installed(root:&Path)->Result<(),String>{
     workspace::verify_tree(&root.join("app"),"release.json")?;
     let release=crate::resources::load(&root.join("app/release.json"))?;
@@ -87,19 +110,14 @@ fn verify_package(stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result
     let record=crate::resources::load(&stage.join("program-package.json"))?;
     if record["schema"]!=1||record["role"]!="product"{return Err("正式程序包格式无效。".into());}
     let rows=record["files"].as_array().ok_or("正式程序包缺少文件清单")?;
-    let total=rows.iter().try_fold(0u64,|n,row|n.checked_add(row["size"].as_u64().ok_or("程序包文件大小无效")?).ok_or_else(||"程序包大小溢出".to_string()))?;
-    let mut expected=HashSet::new();let mut completed=0;
+    let mut expected=HashSet::new();
     for row in rows{
         cancelled(cancel)?;
         let relative=row["path"].as_str().ok_or("程序包路径无效")?;
         if !ITEMS.contains(&relative)&&!relative.starts_with("app/"){return Err("程序包包含固定本体之外的内容。".into());}
         if !expected.insert(relative.to_lowercase()){return Err("程序包清单有重复路径。".into());}
-        let path=safe_path(stage,relative)?;
-        let mut input=fs::File::open(&path).map_err(|e|e.to_string())?;
-        let mut hash=Sha256::new();let mut buffer=[0;65536];let mut size=0;
-        loop{cancelled(cancel)?;let count=input.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}hash.update(&buffer[..count]);size+=count as u64;completed+=count as u64;progress("正在校验程序本体",completed,total);}
-        if size!=row["size"].as_u64().unwrap()||format!("{:x}",hash.finalize())!=row["sha256"].as_str().ok_or("程序包摘要无效")?{return Err(format!("程序包文件校验失败：{relative}"));}
     }
+    workspace::verify_fixed_files_with_progress(stage,rows,cancel,&mut|_,done,total|progress("正在校验程序本体",done,total))?;
     fn collect(root:&Path,path:&Path,out:&mut HashSet<String>)->Result<(),String>{
         for entry in fs::read_dir(path).map_err(|e|e.to_string())?{let path=entry.map_err(|e|e.to_string())?.path();let relative=path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/");safe_path(root,&relative)?;if path.is_dir(){collect(root,&path,out)?;}else if relative!="program-package.json"{out.insert(relative.to_lowercase());}}
         Ok(())
@@ -107,10 +125,29 @@ fn verify_package(stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result
     let mut actual=HashSet::new();collect(stage,stage,&mut actual)?;
     if actual!=expected{return Err("程序包实际文件与清单不一致。".into());}
     for entry in ITEMS{if !stage.join(entry).exists(){return Err(format!("正式程序包缺少 {entry}（固定本体文件）。"));}}
-    workspace::verify_tree(&stage.join("app"),"release.json")?;
     let release=crate::resources::load(&stage.join("app/release.json"))?;
-    if release["build"]!=record["build"]{return Err("正式程序包的构建编号不一致。".into());}Ok(())
+    if release["build"]!=record["build"]{return Err("正式程序包的构建编号不一致。".into());}
+    verify_package_maps(&record,&release)
 }
+fn verify_package_maps(record:&Value,release:&Value)->Result<(),String>{
+    fn mapped(rows:&[Value])->Result<std::collections::BTreeMap<String,(u64,String)>,String>{
+        let mut map=std::collections::BTreeMap::new();
+        for row in rows{
+            let path=row["path"].as_str().ok_or("清单路径无效")?;workspace::relative_path(path)?;
+            let size=row["size"].as_u64().ok_or("清单大小无效")?;
+            let hash=row["sha256"].as_str().filter(|hash|hash.len()==64&&hash.bytes().all(|byte|byte.is_ascii_hexdigit())).ok_or("清单摘要无效")?;
+            if map.insert(path.to_lowercase(),(size,hash.to_lowercase())).is_some(){return Err("清单存在重复或大小写冲突路径。".into());}
+        }Ok(map)
+    }
+    let package=mapped(record["files"].as_array().ok_or("程序包文件清单缺失")?)?;
+    let app=mapped(release["files"].as_array().ok_or("本体文件清单缺失")?)?;
+    let roots=mapped(release["root_files"].as_array().ok_or("本体入口清单缺失")?)?;
+    let actual_app=package.iter().filter_map(|(path,value)|path.strip_prefix("app/").filter(|path|*path!="release.json").map(|path|(path.to_owned(),value.clone()))).collect::<std::collections::BTreeMap<_,_>>();
+    let actual_roots=package.iter().filter(|(path,_)|!path.starts_with("app/")).map(|(path,value)|(path.clone(),value.clone())).collect::<std::collections::BTreeMap<_,_>>();
+    let required_roots=ITEMS.iter().filter(|path|**path!="app").map(|path|path.to_lowercase()).collect::<std::collections::BTreeSet<_>>();
+    if app!=actual_app||roots!=actual_roots||roots.keys().cloned().collect::<std::collections::BTreeSet<_>>()!=required_roots{return Err("程序包与本体发布清单文件集合或摘要不一致。".into());}Ok(())
+}
+
 pub(crate) fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:&mut Progress)->Result<Vec<Value>,String>{
     let migration=&release["speaker_migration"];
     if migration.is_null(){return Ok(vec![]);}
@@ -285,7 +322,9 @@ pub fn install(payload:&[u8],root:&Path,cancel:Arc<AtomicBool>,progress:&mut Pro
             loop{cancelled(&cancel)?;let count=entry.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}outgoing.write_all(&buffer[..count]).map_err(|e|e.to_string())?;done+=count as u64;progress("正在展开程序本体",done,total);}
             outgoing.sync_all().map_err(|e|e.to_string())?;
         }
-        verify_package(&stage,&cancel,progress)?;cancelled(&cancel)?;activate(&root,&stage,&cancel,progress)
+        verify_package(&stage,&cancel,progress)?;cancelled(&cancel)?;activate(&root,&stage,&cancel,progress)?;
+        let release=crate::resources::load(&safe_path(&root,"app/release.json")?)?;
+        atomic_json(&safe_path(&root,"data/state/product-identity.json")?,&json!({"schema":1,"version":release["version"],"build":release["build"],"fields":{"schema":"已提交本体身份格式","version":"本体版本","build":"本体构建编号"}}))
     })();
     if !root.join("tmp/update-transaction.json").exists(){let _=remove_owned(&root.join("tmp/publish"),&root);}result
 }
@@ -365,6 +404,27 @@ pub fn launch(root:&Path)->Result<u32,String>{
 
 #[cfg(test)] mod tests{
     use super::*;
+    #[test]
+    fn repair_checks_all_immutable_metadata_and_allows_only_workspace_bindings(){
+        let root=fixture();let payload=package("repair-build",false);run(&payload,&root).unwrap();
+        let path=root.join("app/release.json");let mut release=crate::resources::load(&path).unwrap();
+        release["components"]=json!([{"kind":"models","path":"models","build":"workspace"}]);atomic_json(&path,&release).unwrap();
+        verify_current_package(&payload,&root,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+        assert!(verify_current_package(&package("repair-build",true),&root,&AtomicBool::new(false),&mut|_,_,_|{}).is_err());
+        release["required_components"]=json!(["unexpected"]);atomic_json(&path,&release).unwrap();
+        assert!(verify_current_package(&payload,&root,&AtomicBool::new(false),&mut|_,_,_|{}).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn duplicated_inner_files_cannot_hide_an_unlisted_package_file(){
+        let hash="a".repeat(64);let row=|path:&str|json!({"path":path,"size":1,"sha256":hash});
+        let roots=vec![row("VoiceTerminal.exe"),row("Verify-Package.ps1"),row("使用与环境说明.md")];
+        let mut files=vec![row("app/a"),row("app/b"),row("app/release.json")];files.extend(roots.clone());
+        let record=json!({"files":files});let mut release=json!({"files":[row("a"),row("b")],"root_files":roots});
+        verify_package_maps(&record,&release).unwrap();
+        release["files"]=json!([row("a"),row("a")]);assert!(verify_package_maps(&record,&release).is_err());
+        release["files"]=json!([row("a"),row("b")]);release["root_files"].as_array_mut().unwrap().pop();assert!(verify_package_maps(&record,&release).is_err());
+    }
     #[cfg(windows)]
     #[test]
     #[ignore="实际正式程序交接验证；VOICE_HANDOFF_TEST_ROOT（本轮验证工作区）须指向已安装且未运行的工作区"]
@@ -407,7 +467,7 @@ pub fn launch(root:&Path)->Result<u32,String>{
     fn package_options(build:&str,corrupt:bool,speaker:Option<bool>)->Vec<u8>{
         let mut payload=Cursor::new(Vec::new());
         let app_bytes=build.as_bytes();let hash=format!("{:x}",Sha256::digest(app_bytes));
-        let mut app=json!({"schema":1,"kind":"app","build":build,"files":[{"path":"business.py","size":app_bytes.len(),"sha256":hash}],"components":[],"required_components":[],"optional_components":["python","models","dsh","webview2"]});
+        let mut app=json!({"schema":1,"kind":"app","version":env!("CARGO_PKG_VERSION"),"build":build,"files":[{"path":"business.py","size":app_bytes.len(),"sha256":hash}],"components":[],"required_components":[],"optional_components":["python","models","dsh","webview2"]});
         let mut entries=vec![("app/business.py",app_bytes.to_vec())];
         if let Some(invalid)=speaker{
             let mut weight=b"native-model-fixture".to_vec();let expected=format!("{:x}",Sha256::digest(&weight));if invalid{weight[0]^=1;}
@@ -421,9 +481,10 @@ pub fn launch(root:&Path)->Result<u32,String>{
         app["compatibility_engine"]=json!({"schema":1,"rules_file":"config/compatibility.json"});
         app["files"].as_array_mut().unwrap().push(json!({"path":"config/compatibility.json","size":policy.len(),"sha256":format!("{:x}",Sha256::digest(&policy))}));
         entries.push(("app/config/compatibility.json",policy));
+        app["root_files"]=json!([("VoiceTerminal.exe",b"formal-entry".as_slice()),("Verify-Package.ps1",b"verify".as_slice()),("使用与环境说明.md",b"instructions".as_slice())].iter().map(|(path,data)|json!({"path":path,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>());
         entries.extend([("app/release.json",serde_json::to_vec(&app).unwrap()),("VoiceTerminal.exe",b"formal-entry".to_vec()),("Verify-Package.ps1",b"verify".to_vec()),("使用与环境说明.md",b"instructions".to_vec())]);
         let rows=entries.iter().map(|(path,data)|json!({"path":path,"size":data.len(),"sha256":if corrupt&&*path=="app/business.py"{"0".repeat(64)}else{format!("{:x}",Sha256::digest(data))}})).collect::<Vec<_>>();
-        {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()
+        {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","version":env!("CARGO_PKG_VERSION"),"build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()
     }
     fn run(payload:&[u8],root:&Path)->Result<(),String>{install(payload,root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{})}
     fn package_with_tts(build:&str,speaker:bool,invalid_patch:bool)->Vec<u8>{
@@ -445,10 +506,11 @@ pub fn launch(root:&Path)->Result<u32,String>{
         entries.insert("app/config/resources/assets/audiocpp/voxcpm-patch.zip".into(),patch.into_inner());
         let mut release:Value=serde_json::from_slice(&entries.remove("app/release.json").unwrap()).unwrap();
         entries.remove("program-package.json");
+        release["root_files"]=json!(entries.iter().filter(|(name,_)|ITEMS.contains(&name.as_str())&&name.as_str()!="app").map(|(name,data)|json!({"path":name,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>());
         release["files"]=json!(entries.iter().filter_map(|(name,data)|name.strip_prefix("app/").map(|relative|json!({"path":relative,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))}))).collect::<Vec<_>>());
         entries.insert("app/release.json".into(),serde_json::to_vec(&release).unwrap());
         let rows=entries.iter().map(|(name,data)|json!({"path":name,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>();
-        entries.insert("program-package.json".into(),serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap());
+        entries.insert("program-package.json".into(),serde_json::to_vec(&json!({"schema":1,"role":"product","version":env!("CARGO_PKG_VERSION"),"build":build,"files":rows})).unwrap());
         let mut output=Cursor::new(vec![]);{let mut zip=zip::ZipWriter::new(&mut output);for (name,data) in entries{zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(&data).unwrap();}zip.finish().unwrap();}output.into_inner()
     }
     fn old_tts(root:&Path,legacy:bool){

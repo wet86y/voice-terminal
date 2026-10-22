@@ -1,7 +1,6 @@
 """CAM++ 原生 FunASR（语音处理框架）引擎，离线权重与独立进程生命周期。"""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -60,9 +59,7 @@ class CamPlusPlusFunAsrEngine:
             return
         if self.sample_rate != 16000 or not self.model_path.is_file():
             raise SpeakerModelError("CAM++ 需要本地官方权重和 16000 Hz（赫兹）音频")
-        digest = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
-        if digest != WEIGHT_SHA256:
-            raise SpeakerModelError("CAM++ 官方权重摘要不匹配，请修复模型资源")
+        # 权重完整摘要由分发器维护；实际加载继续严格检查权重格式与参数键。
         from ..compute import device_candidates, loaded_funasr_device
         candidates = device_candidates(self.requested_device, self.device_model_key, self.fallback_device)
         from ..tensor_runtime import activate_tensor_runtime

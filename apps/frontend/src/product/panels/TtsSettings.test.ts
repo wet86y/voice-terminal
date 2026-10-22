@@ -83,6 +83,7 @@ describe('音色设置只提供资源完整的本地模型', () => {
   it('桌面模式通过固定原生命令打开官方音色库', async () => {
     const nativeOpen = vi.fn().mockResolvedValue(undefined)
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
       available: true, openMinimaxVoiceLibrary: nativeOpen,
     } as never)
     const open = vi.spyOn(window, 'open').mockReturnValue(null)

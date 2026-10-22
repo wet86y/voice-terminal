@@ -177,6 +177,9 @@ export interface DesktopUpdatePort {
   /** openProjectRepository（打开当前项目的官方仓库）。 */
   openProjectRepository(): Promise<void>
   checkAppUpdate(): Promise<AppUpdateStatus>
+  integrityStatus(): Promise<AppUpdateStatus> // integrityStatus（读取本地校验程序状态，不联网）。
+  downloadIntegrity(): Promise<AppUpdateStatus> // downloadIntegrity（仅下载当前构建校验程序）。
+  checkIntegrity(): Promise<AppUpdateStatus> // checkIntegrity（退出并交接当前构建完整性维护）。
   downloadAppUpdate(): Promise<AppUpdateStatus>
   cancelAppUpdate(): Promise<void>
 }
@@ -286,6 +289,9 @@ export function desktopPort(): DesktopPort {
     fixedCredentials: () => call('model_credentials_status'),
     saveFixedCredentials: request => call('model_credentials_save', { request }),
     checkAppUpdate: () => call<AppUpdateStatus>('app_update_check'),
+    integrityStatus: () => call<AppUpdateStatus>('app_integrity_status'),
+    downloadIntegrity: () => call<AppUpdateStatus>('app_integrity_download'),
+    checkIntegrity: () => call<AppUpdateStatus>('app_integrity_check'),
     openProjectRepository: () => call('project_open_repository'),
     downloadAppUpdate: () => call<AppUpdateStatus>('app_update_download'),
     cancelAppUpdate: () => call('app_update_cancel'),

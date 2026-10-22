@@ -78,17 +78,16 @@ def inspect_model_resources(
         issue = "程序内固定模型资源清单缺失或无效，请修复应用安装后再启动模型组件。"
         return {role: issue for role in requirements}
 
-    # Pending updates（待更新组件）：必需组件保持整体门槛，可选组件仅约束选用它的角色。
+    # 启动仅检查配置选中的资源；未选模型更新不阻塞其它功能。
     pending_updates: dict[str, str] = {}
-    for spec in catalog.specs.values():
-        if spec.kind == "model" and model_update_available(
-                spec, inspect_installed_model(model_root, spec.destination, spec.resource_id)):
+    selected = {resource_id for values in requirements.values() for resource_id in values}
+    for resource_id in selected:
+        try:
+            spec = catalog.get(resource_id)
+        except ResourceError:
+            continue
+        if spec.kind == "model" and model_update_available(spec, inspect_installed_model(model_root, spec.destination, spec.resource_id)):
             pending_updates[spec.resource_id] = spec.title
-    required_updates = [title for resource_id, title in pending_updates.items()
-                        if catalog.get(resource_id).required]
-    if required_updates:
-        issue = "组件有更新，请先更新或导入当前版本：" + "、".join(required_updates) + "。"
-        return {role: issue for role in requirements}
 
     runtime_issue = None
     runtime_path = model_root.parent / "runtimes/python/runtime.json"
@@ -129,7 +128,7 @@ def inspect_model_resources(
                     details.append(f"{spec.title}：{problem}")
         if details:
             labels = "；".join(details)
-            issues[role] = f"请下载或导入所需本地模型资源后再启动。{labels}"
+            issues[role] = f"本地资源需要处理，可在应用维护中校验完整性。{labels}"
     return issues
 
 
@@ -241,5 +240,5 @@ def inspect_startup_resources(
                 expected_bridge=dsh_bridge,
             )
         if issue:
-            issues["dsh"] = issue
+            issues["dsh"] = issue + "；可在应用维护中校验完整性。"
     return issues

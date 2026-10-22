@@ -361,7 +361,7 @@ class ApplicationHost:
         # 子进程已检查代理目录；同一次启动的模型分支只重查各自本地模型资源。
         self._dsh_resource_checked = True
         self._dsh_resource_issue = self.manifest.get("resource_issues", {}).get("dsh")
-        self._refresh_resource_issues()
+        self.resource_issues = dict(self.manifest.get("resource_issues", {}))
         log.info("启动检查完成：耗时秒数=%.1f，资源问题数量=%s", time.monotonic() - started, len(self.resource_issues))
         if self.resource_issues:
             # startup_skipped（跳过模型启动页）让用户先进入产品设置并下载或导入资源。
@@ -714,7 +714,7 @@ class ApplicationHost:
         return data
 
     async def start_delegated(self):
-        issues = self._refresh_resource_issues()
+        issues = self.resource_issues
         if "voice" not in self.processes or self.processes["voice"].poll() is not None:
             for key in ("speaker", "dsh"):
                 issue = issues.get(key)
@@ -750,7 +750,7 @@ class ApplicationHost:
             return
         self.state.update(phase="启动" + next(c["name"] for c in self.state.snapshot()["components"] if c["id"] == key))
         try:
-            issue = self._refresh_resource_issues().get(key)
+            issue = self.resource_issues.get(key)
             if issue:
                 self.state.component(key, state="failed", phase="本地资源缺失", error=issue, pid=None)
                 return
@@ -759,7 +759,7 @@ class ApplicationHost:
             else:
                 await self.start_service(key)
         except Exception as exc:
-            self.state.component(key, state="failed", phase="启动失败", error=str(exc), pid=None)
+            self.state.component(key, state="failed", phase="启动失败", error=f"{exc}；可在应用维护中校验完整性。", pid=None)
 
     def loading_usage(self, keys):
         """loading_usage（加载中已使用的内存）：校验受管进程身份，采样缺失时保留完整预算。"""

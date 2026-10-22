@@ -50,6 +50,15 @@ const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
 const ambient = computed(() => previewRows(demoAmbientRecords, props.scene))
 const instructionRows = computed(() => props.scene === 'empty' ? [] : instructions)
 const loading = computed(() => props.scene === 'loading')
+const integrityReady = ref(false) // integrityReady（演示中已准备对应版本的校验程序）。
+const integrityPreview = computed<AppUpdateStatus>(() => ({
+  operation: 'integrity', state: integrityReady.value ? 'current' : 'idle', current_version: '0.9.0',
+  installer_ready: integrityReady.value, target_version: '0.9.0', can_cancel: false,
+  phase: integrityReady.value ? '将关闭程序，完整校验并修复当前版本，完成后重新启动。'
+    : '仅下载本地 v0.9.0 对应构建的校验程序，不会更新到最新版。',
+  fields: { operation: '维护操作类型', state: '校验准备阶段', current_version: '本地程序版本',
+    installer_ready: '同版本同构建校验程序是否已准备', target_version: '指定校验程序版本', can_cancel: '是否允许取消', phase: '当前阶段说明' },
+}))
 const updatePreview = computed<AppUpdateStatus>(() => ({
   state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
   current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.6',
@@ -285,7 +294,7 @@ function cancelTask(item: DemoWakeTask) {
 
     <template v-else-if="tab === 'workspace'">
       <SettingsPageHeader section="workspace" />
-      <AppUpdateCard :status="updatePreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消更新下载')" @repository="feedback('项目仓库：https://github.com/wet86y/voice-terminal')" />
+      <AppUpdateCard :status="updatePreview" :integrity="integrityPreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消下载')" @download-integrity="integrityReady = true; feedback('模拟已下载本地 v0.9.0 对应构建的校验程序')" @check-integrity="feedback('模拟关闭程序，由对应版本分发器校验并修复工作区')" @repository="feedback('项目仓库：https://github.com/wet86y/voice-terminal')" />
       <WorkspaceLocationCard :root="scene === 'long' ? `D:\\语音终端\\${longIdentifier}\\工作区` : 'D:\\语音终端\\工作区'" can-manage @migrate="feedback('模拟选择目标目录并确认工作区迁移')" />
     </template>
     <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">

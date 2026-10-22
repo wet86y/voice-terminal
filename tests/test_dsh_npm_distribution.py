@@ -137,10 +137,10 @@ def test_installed_binding_and_extra_files_cannot_bypass_integrity(runtime):
     assert ResourceManager(program, root.parents[1])._dsh_state(ResourceManager(program, root.parents[1]).catalog.get('dsh'))['state'] == 'incomplete'
     (root / 'extra.txt').write_text('extra', 'utf-8')
     with pytest.raises(ValueError, match='文件集合'):
-        adapter.inspect_runtime(program, root)
+        adapter.inspect_runtime(program, root, full=True)
 
 
-def test_startup_inventory_reuses_safe_tree_paths_and_still_rejects_damage(runtime, monkeypatch):
+def test_startup_checks_only_entries_and_explicit_maintenance_rejects_damage(runtime, monkeypatch):
     program, root, spec = runtime
     for index in range(100):
         path = root / f'node_modules/sample/nested/{index}.txt'
@@ -153,11 +153,14 @@ def test_startup_inventory_reuses_safe_tree_paths_and_still_rejects_damage(runti
         calls.append(relative)
         return original(base, relative)
     monkeypatch.setattr(adapter, 'safe_path', checked)
-    adapter.inspect_runtime(program, root)
+    with monkeypatch.context() as startup:
+        startup.setattr(adapter, 'files', lambda *_: pytest.fail('启动不应递归盘点依赖树'))
+        adapter.inspect_runtime(program, root)
     assert len(calls) < 30  # 只解析必要入口和目标声明，不为每个依赖重复解析父目录。
     (root / 'node_modules/sample/nested/99.txt').write_text('broken-size', 'utf-8')
-    with pytest.raises(ValueError, match='大小'):
-        adapter.inspect_runtime(program, root)
+    adapter.inspect_runtime(program, root)  # 非入口损坏由手动维护检出，普通启动保持有界检查。
+    with pytest.raises(ValueError):
+        adapter.inspect_runtime(program, root, full=True)
 
 
 def test_tool_requirement_change_requires_update_and_data_stays_in_place(runtime):

@@ -16,11 +16,17 @@ class OnnxStreamingModel:
     def __init__(self, model_dir: Path, *, threads: int = 4):
         exported = model_dir / "onnx"
         manifest = json.loads((exported / "manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("source_sha256") != file_hash(model_dir / "model.pt") or manifest.get("quantized") is not False:
-            raise ValueError("轻量检测资产与当前未量化权重不匹配")
+        from ..local_layout import project_root
+        from ..resource_distribution import ResourceCatalog
+        spec = ResourceCatalog(project_root()).get("fsmn-vad")
+        expected = {record.path: record for record in spec.required_files}
+        if manifest.get("source_sha256") != expected["model.pt"].sha256 or manifest.get("quantized") is not False:
+            raise ValueError("轻量检测资产与当前未量化权重记录不匹配，请校验完整性")
         for name in ("model.onnx", "config.yaml", "am.mvn"):
-            if manifest.get("files", {}).get(name) != file_hash(exported / name):
-                raise ValueError(f"轻量检测资产校验失败：{name}")
+            record = expected[f"onnx/{name}"]
+            path = exported / name
+            if manifest.get("files", {}).get(name) != record.sha256 or not path.is_file() or path.stat().st_size != record.size_bytes:
+                raise ValueError(f"轻量检测必要资产不匹配：{name}，请校验完整性")
         import numpy as np
         from funasr_onnx import Fsmn_vad_online
         from funasr_onnx.utils.frontend import WavFrontendOnline

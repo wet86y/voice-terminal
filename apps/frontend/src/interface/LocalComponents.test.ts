@@ -68,12 +68,16 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.rows[0]!.resource!.status = '缺失'
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'speech', 'paraformer')
-    await card.get('.local-component-summary button[aria-label="流式识别模型：下载"]').trigger('click')
-    await card.get('[data-enhancement-resource] button[aria-label="离线精修模型：下载"]').trigger('click')
-    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming'], ['paraformer-offline']])
+    await card.get('.local-component-controls button[aria-label="流式识别模型：下载"]').trigger('click')
+    expect(card.find('[data-enhancement-resource]').exists()).toBe(false)
     await wrapper.get('[data-category="speech"] .category-download').trigger('click')
     const bundle = wrapper.emitted('resourceBundleDownload')![0]![0] as { entries: Array<{ id: string }> }
     expect(bundle.entries.map(entry => entry.id)).toEqual(['paraformer-streaming'])
+    await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!,
+      resource: { ...value.rows[0]!.resource!, state: 'installed', status: '已安装' } }] } })
+    const readyCard = await expandComponent(wrapper, 'speech', 'paraformer')
+    await readyCard.get('[data-enhancement-resource] button[aria-label="离线精修模型：下载"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming'], ['paraformer-offline']])
     wrapper.unmount()
   })
 

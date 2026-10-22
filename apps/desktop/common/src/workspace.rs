@@ -159,7 +159,7 @@ pub fn recover_base(root:&Path)->Result<(),String>{
     fs::remove_file(journal).map_err(|e|e.to_string())?;Ok(())
 }
 
-const OWNED_ITEMS:&[&str]=&["app","runtimes","models","data","cache","backups","releases","portable.json","VoiceTerminal.exe","Verify-Package.ps1","使用与环境说明.md"];
+const OWNED_ITEMS:&[&str]=&["app","runtimes","models","data","maintenance","cache","backups","releases","portable.json","VoiceTerminal.exe","Verify-Package.ps1","使用与环境说明.md"];
 
 pub fn prepare_task(source:&Path,target:&Path,kind:&str,parent:u32,locator:&Locator)->Result<PathBuf,String>{
     locator.validate_target(target)?; let source=canonical_path(source)?;
@@ -785,6 +785,10 @@ mod migration_copy_tests{
             fs::write(&path,contents).unwrap();
             expected.push((path.strip_prefix(&source).unwrap().to_path_buf(),contents.to_vec()));
         }
+        fs::create_dir_all(source.join("maintenance")).unwrap();
+        for (name,contents) in [("maintenance/VoiceTerminalSetup.exe",b"retained installer".as_slice()),("maintenance/installer.json",b"retained identity".as_slice())]{
+            fs::write(source.join(name),contents).unwrap();expected.push((PathBuf::from(name),contents.to_vec()));
+        }
         let caller=thread::current().id();
         let mut progress_calls=0usize;
         let mut progress=|phase:&str,current:u64,total:u64|{
@@ -849,7 +853,18 @@ pub fn normalize_layout(root:&Path)->Result<(),String>{
     value["fields"]["workspace_id"]=json!("迁移及重装时保留的工作区编号");
     if value!=original{atomic_json(&path,&value)?;}Ok(())
 }
-pub fn new_id()->String {format!("{:x}-{:x}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),std::process::id())}
+pub fn new_id()->String {
+    // Windows（操作系统）时钟粒度可能使并行调用取到相同时间；保留已发布编号格式并保证进程内单调唯一。
+    static LAST:AtomicU64=AtomicU64::new(0);
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let mut prior=LAST.load(Ordering::Acquire);
+    loop{
+        let next=now.max(prior.saturating_add(1));
+        match LAST.compare_exchange_weak(prior,next,Ordering::AcqRel,Ordering::Acquire){
+            Ok(_)=>return format!("{next:x}-{:x}",std::process::id()),Err(current)=>prior=current,
+        }
+    }
+}
 fn component_root(kind:&str)->Result<&'static str,String>{match kind{"app"=>Ok("app"),"python"=>Ok("runtimes/python"),"webview2"=>Ok("runtimes/webview2"),_=>Err("未知基础组件。".into())}}
 
 pub fn available_space(root:&Path)->Result<u64,String>{
@@ -863,6 +878,7 @@ pub fn available_space(root:&Path)->Result<u64,String>{
 }
 pub fn remove_owned(path:&Path,root:&Path)->Result<(),String>{
     if !path.starts_with(root)||path==root{return Err("清理路径越出工作区。".into());}
+    crate::verification::invalidate(path);
     if reparse(path){return fs::remove_dir(path).map_err(|e|e.to_string());}
     if path.is_dir(){
         for entry in fs::read_dir(path).map_err(|e|e.to_string())?{remove_owned(&entry.map_err(|e|e.to_string())?.path(),root)?;}
@@ -958,14 +974,60 @@ pub fn verify_tree_with_progress(root:&Path,manifest_name:&str,cancel:&AtomicBoo
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     let value=load(&safe_path(root,manifest_name)?)?;
     let records=value["files"].as_array().ok_or("组件清单缺少文件集合")?;
-    let files=prepare_validation_files(root,records,true,value["kind"]=="python",cancel,progress)?;
-    hash_validation_files(&files,cancel,progress).map(|_|())
+    let python=value["kind"]=="python";let key=crate::verification::key(records,true,python);
+    if let Some(result)=crate::verification::reuse(root,&key){progress("复用本次维护的组件校验",1,1);return result;}
+    let watch=crate::verification::watch(root);
+    let result=prepare_validation_files(root,records,true,python,true,cancel,progress).and_then(|files|hash_validation_files(&files,cancel,progress).map(|_|()));
+    validation_cancel(cancel)?;crate::verification::remember(root,key,result,watch)
 }
 
 /// verify_records_with_progress（固定文件内容校验）：模型允许清单外辅助文件，运行环境要求完整文件集合。
 pub fn verify_records_with_progress(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
-    let files=prepare_validation_files(root,records,exact,false,cancel,progress)?;
+    validation_cancel(cancel)?;let key=crate::verification::key(records,exact,false);
+    if let Some(result)=crate::verification::reuse(root,&key){progress("复用本次维护的组件校验",1,1);return result;}
+    let watch=crate::verification::watch(root);
+    let result=prepare_validation_files(root,records,exact,false,true,cancel,progress).and_then(|files|hash_validation_files(&files,cancel,progress).map(|_|()));
+    validation_cancel(cancel)?;crate::verification::remember(root,key,result,watch)
+}
+
+/// verify_fixed_files_with_progress（固定入口校验）：不递归工作区用户数据，逐项拒绝链接。
+pub fn verify_fixed_files_with_progress(root:&Path,records:&[Value],cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    let files=prepare_validation_files(root,records,false,false,false,cancel,progress)?;
     hash_validation_files(&files,cancel,progress).map(|_|())
+}
+
+/// verify_batches（单轮大规模检查）：统一文件池，记录每个组件的独立结果，坏文件不取消其它组件核验。
+pub(crate) fn verify_batches(batches:Vec<crate::verification::Batch>,cancel:&AtomicBool,progress:&mut crate::resources::Progress)->Result<(),String>{
+    let mut files=Vec::new();let mut owners=Vec::new();let mut outcomes=vec![Ok(());batches.len()];
+    let mut watches=batches.iter().map(|batch|crate::verification::watch(&batch.root)).collect::<Vec<_>>();
+    let keys=batches.iter().map(|batch|crate::verification::key(&batch.records,batch.exact,batch.python)).collect::<Vec<_>>();
+    for (index,batch) in batches.iter().enumerate(){
+        validation_cancel(cancel)?;
+        if let Some(result)=crate::verification::reuse(&batch.root,&keys[index]){outcomes[index]=result;continue;}
+        match prepare_validation_files(&batch.root,&batch.records,batch.exact,batch.python,true,cancel,progress){
+            Ok(prepared)=>{owners.extend(std::iter::repeat_n(index,prepared.len()));files.extend(prepared);},
+            Err(error)=>outcomes[index]=Err(error),
+        }
+    }
+    let total=files.iter().try_fold(0u64,|sum,file|sum.checked_add(file.size).ok_or("批量校验大小溢出"))?;
+    let next=AtomicUsize::new(0);let completed=AtomicU64::new(0);let stop=AtomicBool::new(false);
+    let failures=Mutex::new(Vec::<(usize,String)>::new());let (sender,receiver)=mpsc::channel();
+    let workers=files.len().min(VALIDATION_WORKERS);progress("批量校验组件文件内容",0,total);
+    thread::scope(|scope|{
+        for _ in 0..workers{let sender=sender.clone();let files=&files;let owners=&owners;let next=&next;let completed=&completed;let stop=&stop;let failures=&failures;
+            scope.spawn(move||{let mut buffer=vec![0;VALIDATION_BUFFER];
+                loop{if cancel.load(Ordering::Acquire){break;}let index=next.fetch_add(1,Ordering::Relaxed);if index>=files.len(){break;}
+                    if let Err(error)=hash_validation_file(&files[index],&mut buffer,cancel,stop,completed){failures.lock().unwrap().push((owners[index],error));}
+                }let _=sender.send(());
+            });
+        }
+        drop(sender);let mut finished=0;
+        while finished<workers{match receiver.recv_timeout(Duration::from_millis(100)){Ok(())=>finished+=1,Err(mpsc::RecvTimeoutError::Timeout)=>{},Err(_)=>break};progress("批量校验组件文件内容",completed.load(Ordering::Relaxed).min(total),total);}
+    });
+    validation_cancel(cancel)?;
+    for (index,error) in failures.into_inner().map_err(|_|"批量校验结果不可用")?{outcomes[index]=Err(error);}
+    for (index,((batch,key),result)) in batches.iter().zip(keys).zip(outcomes).enumerate(){let _=crate::verification::remember(&batch.root,key,result,watches[index].take());}
+    progress("批量校验完成，复用结果并按需修复",total,total);Ok(())
 }
 
 /// verify_tree_sizes（快速盘点）：检查文件集合、路径和字节数，不读取文件内容。
@@ -978,7 +1040,7 @@ pub fn verify_tree_sizes_with_progress(root:&Path,manifest_name:&str,cancel:&Ato
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     progress("核对组件文件清单",0,0);validation_cancel(cancel)?;
     let value=load(&safe_path(root,manifest_name)?)?;
-    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,value["kind"]=="python",cancel,progress).map(|_|())
+    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,value["kind"]=="python",true,cancel,progress).map(|_|())
 }
 
 /// verify_cached_tree_with_progress（复用近期内容复核）：每次盘点文件，内容结果最多复用七天。
@@ -1063,7 +1125,7 @@ fn python_bytecode_source(relative:&str)->Option<String>{
     Some(parent.parent()?.join(format!("{module}.py")).to_string_lossy().replace('\\',"/"))
 }
 
-fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_bytecode:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
+fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_bytecode:bool,scan_tree:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
     validation_cancel(cancel)?;
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     let mut expected=std::collections::HashSet::new();
@@ -1074,7 +1136,14 @@ fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_
     }
     let mut present=std::collections::HashMap::new();let mut last_report=Instant::now();
     progress("核对组件文件清单",0,0);
-    collect_validation_files(root,root,&mut present,cancel,records.len(),&mut last_report,progress)?;
+    if scan_tree{collect_validation_files(root,root,&mut present,cancel,records.len(),&mut last_report,progress)?;}
+    else{for item in records{
+        let relative=item["path"].as_str().unwrap();let path=safe_path(root,relative)?;
+        if let Ok(metadata)=fs::symlink_metadata(&path){
+            if metadata_reparse(&metadata)||!metadata.is_file(){return Err("组件文件不能是链接或目录。".into());}
+            present.insert(relative.to_lowercase(),(path,metadata.len()));
+        }
+    }}
     // 仅解释器组件允许清单外的标准及 pytest 重写字节码缓存，且对应源码必须已列入清单。
     // 已列入清单的缓存仍核验摘要；目录链接、动态库及其它新增文件继续拒绝。
     if allow_python_bytecode{present.retain(|name,_|expected.contains(name)||!python_bytecode_source(name).is_some_and(|source|expected.contains(&source)));}
@@ -1325,6 +1394,8 @@ mod component_validation_tests {
         let status=std::process::Command::new("cmd.exe").args(["/D","/C","mklink","/J"])
             .arg(&linked).arg(&external).creation_flags(0x08000000).stdout(std::process::Stdio::null()).status().unwrap();
         assert!(status.success());assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("链接"));
+        let manifest=load(&root.join("manifest.json")).unwrap();
+        assert!(verify_records_with_progress(&root,manifest["files"].as_array().unwrap(),false,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap_err().contains("链接"));
         assert!(external.join("manifest.json").is_file());fs::remove_dir(&linked).unwrap();fs::remove_dir_all(root).unwrap();fs::remove_dir_all(external).unwrap();
     }
     #[test]

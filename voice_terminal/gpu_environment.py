@@ -29,7 +29,23 @@ def fingerprint(root:Path)->str:
         stat=path.stat();digest.update(f'{path.relative_to(root).as_posix()}:{stat.st_size}:{stat.st_mtime_ns}\n'.encode())
     return digest.hexdigest()
 
-def registered(install:Path,data:Path)->dict|None:
+def validation_identity(install: Path, root: Path) -> dict:
+    """validation_identity（轻量登记身份）：与原生层共用四个固定文件的属性格式。"""
+    rows = []
+    for path in (root/'python.exe', root/'runtime.json', root/'manifest.json', install/'models/manifest.json'):
+        if path.is_symlink() or getattr(path, 'is_junction', lambda: False)():
+            raise ValueError('显卡身份文件不能使用链接')
+        try:
+            info = path.stat()
+            size, modified = info.st_size, info.st_mtime_ns // 1_000_000
+        except FileNotFoundError:
+            size = modified = None
+        rows.append({'path': path.relative_to(install).as_posix(), 'size': size, 'modified_ms': modified})
+    return {'schema': 1, 'files': rows, 'fields': {'schema': '显卡轻量身份格式', 'files': '解释器及受管清单的文件属性',
+            'path': '工作区相对路径', 'size': '字节数', 'modified_ms': '修改时间毫秒'}}
+
+
+def registered(install:Path,data:Path, *, verify_files: bool = False)->dict|None:
     try:
         value=json.loads((data/'config/gpu-environment.json').read_text('utf-8'))
         relative=Path(value['path'])
@@ -44,9 +60,11 @@ def registered(install:Path,data:Path)->dict|None:
             runtime = json.loads((root / 'runtime.json').read_text('utf-8')) if (root / 'runtime.json').is_file() else {}
             if runtime.get('gpu_profile') and not managed_runtime(install, program):
                 return None
-        if value.get('environment_fingerprint')!=fingerprint(root):return None
-        # 模型文件变更后也必须重新检测。
-        if value.get('models_fingerprint')!=fingerprint(install/'models'):return None
+        if isinstance(value.get('validation_identity'), dict) and value['validation_identity'] != validation_identity(install, root):
+            return None
+        # 旧登记沿用历史检测结果，实际后端仍核验设备；全目录指纹只由显式维护读取。
+        if verify_files and (value.get('environment_fingerprint')!=fingerprint(root)
+                or value.get('models_fingerprint')!=fingerprint(install/'models')):return None
         return value
     except (OSError,ValueError,KeyError,TypeError,AttributeError):return None
 

@@ -12,6 +12,24 @@ from voice_terminal.config import AppConfig, COMPUTE_MODEL_IDS
 from voice_terminal.gpu_memory import aggregate_gpu_counters, process_vram_bytes
 
 
+def test_registered_gpu_uses_fixed_identity_without_tree_scans(tmp_path, monkeypatch):
+    from voice_terminal import gpu_environment
+    runtime = tmp_path / 'runtimes/python-gpu'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'python')
+    (tmp_path / 'models').mkdir()
+    data = tmp_path / 'data'
+    record = data / 'config/gpu-environment.json'
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({'path': 'runtimes/python-gpu', 'validation_identity': gpu_environment.validation_identity(tmp_path, runtime),
+        'models': {'paraformer': {'gpu_available': True}}}), encoding='utf-8')
+    monkeypatch.setattr(gpu_environment, 'fingerprint', lambda *_: pytest.fail('普通启动不应扫描环境或模型树'))
+    monkeypatch.setattr(gpu_environment, 'managed_runtime', lambda *_: False)
+    assert gpu_environment.registered(tmp_path, data) is not None
+    (tmp_path / 'models/manifest.json').write_text('{}', encoding='utf-8')
+    assert gpu_environment.registered(tmp_path, data) is None
+
+
 def test_process_gpu_memory_combines_adapters_and_preserves_invalid_samples():
     values = aggregate_gpu_counters([
         ('pid_12_luid_0_phys_0', 0, 100), ('pid_12_luid_1_phys_0', 1, 200),
