@@ -128,26 +128,11 @@ def inspect_runtime(program: Path, root: Path, *, full: bool = False) -> dict:
             raise ValueError("DSH（代理宿主）必要入口缺失。")
     if full:
         verify(root, manifest)
-    else:
-        # tree inventory（安全目录盘点）：files（文件枚举）已经逐层拒绝目录及文件链接。
-        # 精确集合匹配后复用盘点路径，避免为每个依赖再次解析相同的父目录。
-        actual = {path.relative_to(root).as_posix(): path for path in files(root) if path != root / "manifest.json"}
-        if actual.keys() != entries or len(entries) != len(manifest["files"]):
-            raise ValueError("DSH（代理宿主）文件集合与清单不一致。")
-        for index, row in enumerate(manifest["files"], 1):
-            path = actual[row["path"]]
-            info = path.lstat()
-            if (not stat.S_ISREG(info.st_mode)
-                    or getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
-                    or info.st_size != row["size"]):
-                raise ValueError("DSH（代理宿主）文件缺失或大小不符。")
-            if index % 5000 == 0:
-                startup_event("代理组件文件盘点", event="progress", files_checked=index,
-                              elapsed_ms=(time.perf_counter() - started) * 1000)
+    # 常规启动只检查上述必要入口；完整扫描由 full（完整维护模式）负责。
     spec = target_spec(program)
     if is_current(metadata, spec):
         check_plugin(program, spec)
-    startup_event("代理组件文件盘点", event="completed", files_checked=len(entries),
+    startup_event("代理组件文件盘点", event="completed", files_checked=len(entries) if full else len(required),
                   elapsed_ms=(time.perf_counter() - started) * 1000)
     return metadata
 

@@ -59,6 +59,18 @@ pub fn fingerprint(root:&Path)->Result<String,String>{
     }rows.sort_by(|a,b|a.0.cmp(&b.0));let mut hash=Sha256::new();
     for (name,size,time) in rows{hash.update(format!("{name}:{size}:{time}\n").as_bytes());}Ok(format!("{:x}",hash.finalize()))
 }
+/// validation_identity（显卡登记的轻量身份）：只访问解释器及三个清单，不遍历环境或模型树。
+pub fn validation_identity(install:&Path,root:&Path)->Result<Value,String>{
+    let paths=[root.join("python.exe"),root.join("runtime.json"),root.join("manifest.json"),install.join("models/manifest.json")];
+    let mut files=vec![];
+    for path in paths{
+        let relative=path.strip_prefix(install).map_err(|_|"显卡身份路径越出工作区")?.to_string_lossy().replace('\\',"/");
+        let path=safe_path(install,&relative)?;
+        let metadata=fs::metadata(path).ok();let size=metadata.as_ref().map(|info|info.len());
+        let modified=metadata.and_then(|info|info.modified().ok()).and_then(|time|time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time|time.as_millis());
+        files.push(json!({"path":relative,"size":size,"modified_ms":modified}));
+    }Ok(json!({"schema":1,"files":files,"fields":{"schema":"显卡轻量身份格式","files":"解释器及受管清单的文件属性","path":"工作区相对路径","size":"字节数","modified_ms":"修改时间毫秒"}}))
+}
 fn registered_gpu_environment(context:&LaunchContext,root:&Path)->bool{
     let Some(record)=resources::load(&context.data.join("config/gpu-environment.json")).ok()else{return false;};
     if record["path"]!="runtimes/python"||root!=context.install.join("runtimes/python"){return false;}

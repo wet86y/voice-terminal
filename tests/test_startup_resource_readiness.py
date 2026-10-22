@@ -73,7 +73,7 @@ class StartupResourceReadinessTests(unittest.TestCase):
 
         self.assertNotIn("asr", issues)
         self.assertIn("analysis", issues)
-        self.assertIn("请下载或导入", issues["analysis"])
+        self.assertIn("校验完整性", issues["analysis"])
         self.assertIn("model.onnx", issues["analysis"])
 
     def test_model_readiness_reports_catalog_size_mismatch(self) -> None:
@@ -180,6 +180,7 @@ class StartupResourceReadinessTests(unittest.TestCase):
         host.no_worker = False
         host.no_analysis = False
         host.state = ApplicationState()
+        host.resource_issues = inspect_model_resources(self.program, self.models, {"asr": ["asr-demo"]})
 
         with patch.object(host, "start_service", new_callable=AsyncMock) as start_service:
             asyncio.run(host.start_component("asr"))
@@ -187,7 +188,7 @@ class StartupResourceReadinessTests(unittest.TestCase):
         start_service.assert_not_awaited()
         asr = next(item for item in host.state.snapshot()["components"] if item["id"] == "asr")
         self.assertEqual(asr["state"], "failed")
-        self.assertIn("请下载或导入", asr["error"])
+        self.assertIn("校验完整性", asr["error"])
 
 
 if __name__ == "__main__":

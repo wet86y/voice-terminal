@@ -6,12 +6,15 @@ const props = withDefaults(defineProps<{
   /** status（原生更新状态）。 */ status: AppUpdateStatus
   /** currentVersion（工作区当前版本）。 */ currentVersion?: string
   /** disabled（工作区操作或管理权限限制）。 */ disabled?: boolean
+  /** integrity（当前本地版本完整性维护状态）。 */ integrity?: AppUpdateStatus
 }>(), { currentVersion: '', disabled: false })
 const emit = defineEmits<{
   /** check（检查发行版）、download（下载更新）、cancel（取消下载）。 */
   check: []
   download: []
   cancel: []
+  downloadIntegrity: [] // downloadIntegrity（下载匹配本地构建的校验程序）。
+  checkIntegrity: [] // checkIntegrity（关闭程序并开始完整性维护）。
   /** repository（在系统浏览器打开项目仓库）。 */ repository: []
 }>()
 const progress = computed(() => {
@@ -29,8 +32,23 @@ const actionLabel = computed(() => {
   return props.status.state === 'current' ? '重新检查' : '检查更新'
 })
 const actionDisabled = computed(() => props.disabled
+  || integrityBusy.value
   || ['checking', 'handing_off'].includes(props.status.state)
   || (props.status.state === 'downloading' && !props.status.can_cancel))
+const integrityBusy = computed(() => ['checking', 'downloading', 'handing_off'].includes(props.integrity?.state ?? 'idle'))
+const integrityDisabled = computed(() => props.disabled || ['checking', 'handing_off'].includes(props.integrity?.state ?? '')
+  || ['checking', 'downloading', 'handing_off'].includes(props.status.state)
+  || (props.integrity?.state === 'downloading' && !props.integrity.can_cancel))
+const integrityLabel = computed(() => props.integrity?.state === 'downloading' ? '取消下载校验程序'
+  : props.integrity?.state === 'checking' ? '正在准备校验程序…'
+    : props.integrity?.state === 'handing_off' ? '正在启动完整性校验…'
+      : props.integrity?.installer_ready ? '校验完整性' : '下载校验程序')
+function runIntegrity() {
+  if (integrityDisabled.value) return
+  if (props.integrity?.state === 'downloading') emit('cancel')
+  else if (props.integrity?.installer_ready) emit('checkIntegrity')
+  else emit('downloadIntegrity')
+}
 const stateLabel = computed(() => ({
   idle: '保持应用为最新版本', checking: '正在检查更新', current: '已是最新版本', available: '发现新版本',
   downloading: '正在下载更新', handing_off: '正在准备安装', cancelled: '下载已取消', failed: '更新未完成',
@@ -67,7 +85,13 @@ function formatBytes(value: number | null | undefined) {
     </header>
     <div class="update-summary">
       <div class="update-copy"><strong role="status" aria-live="polite">{{ stateLabel }}</strong><p>当前版本 v{{ currentVersion || status.current_version || '—' }}</p><p class="update-description">{{ stateDetail }}</p></div>
-      <button class="update-action" :class="canDownload ? 'save-button' : 'outline-button'" type="button" :disabled="actionDisabled" @click="runAction">{{ actionLabel }}</button>
+      <div class="update-actions"><button class="update-action" :class="canDownload ? 'save-button' : 'outline-button'" type="button" :disabled="actionDisabled" @click="runAction">{{ actionLabel }}</button>
+      <button class="outline-button integrity-action" type="button" :disabled="integrityDisabled" @click="runIntegrity">{{ integrityLabel }}</button></div>
+    </div>
+    <div class="integrity-detail" aria-live="polite">
+      <p>{{ integrity?.phase || (integrity?.installer_ready ? '将关闭程序，完整校验并修复受管组件，完成后重新启动。' : '校验程序尚未准备。仅下载与本地版本、构建一致的分发器，不会自动获取最新版。') }}</p>
+      <p v-if="integrity?.state === 'downloading'">{{ formatBytes(integrity.completed_bytes ?? 0) }} / {{ formatBytes(integrity.total_bytes) }}</p>
+      <p v-if="integrity?.error" class="update-error" role="alert">{{ integrity.error }}</p>
     </div>
     <div v-if="status.state === 'downloading'" class="update-download">
       <div class="update-progress" :class="{ indeterminate: progress === undefined }" role="progressbar" aria-label="安装器下载进度" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="progress"><span :style="progress === undefined ? undefined : { width: `${progress}%` }"></span></div>
@@ -91,6 +115,9 @@ function formatBytes(value: number | null | undefined) {
 .update-icon svg{width:21px;height:21px}
 .update-version-tag{flex:none;max-width:100%;padding:5px 10px;border:1px solid #b2baff30;border-radius:999px;background:#b2baff0a;color:var(--accent);font-size:var(--font-caption);overflow-wrap:anywhere}
 .update-summary{display:flex;align-items:center;gap:18px;flex-wrap:wrap;min-width:0}
+.update-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.integrity-action{min-height:var(--compact-control-height);padding:8px 16px;white-space:nowrap}
+.integrity-detail{font-size:var(--font-caption);color:var(--muted);line-height:1.65;overflow-wrap:anywhere}
 .update-copy{display:grid;gap:5px;flex:1 1 220px;min-width:0;overflow-wrap:anywhere}
 .update-copy strong{font-size:var(--font-section);font-weight:600;color:var(--text)}
 .update-copy p{font-size:var(--font-body);color:var(--muted);line-height:1.65}

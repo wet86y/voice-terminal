@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-app-integrity-download"
+description = "Enables the app_integrity_download command without any pre-configured scope."
+commands.allow = ["app_integrity_download"]
+
+[[permission]]
+identifier = "deny-app-integrity-download"
+description = "Denies the app_integrity_download command without any pre-configured scope."
+commands.deny = ["app_integrity_download"]

@@ -385,8 +385,7 @@ fn legacy_tts_runtime_ready(context:&LaunchContext)->Result<bool,String>{
         let Some(name)=row["path"].as_str()else{return Ok(false)};
         let path=if name=="cuda/audiocpp_server.exe"{context.install.join("runtimes/audiocpp").join(name)}
             else{context.install.join("sources/audio.cpp").join(name)};
-        if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().unwrap_or(0)
-            ||file_hash(&path)?!=row["sha256"].as_str().unwrap_or(""){return Ok(false);}
+        if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().unwrap_or(0){return Ok(false);}
     }
     // 旧自编译程序静态链接 CUDA runtime（计算运行时），其必需运行库与官方归档的动态布局不同。
     Ok(["ggml.dll","ggml-base.dll","ggml-cuda.dll","cublas64_13.dll","cublasLt64_13.dll"].iter()
@@ -398,24 +397,33 @@ pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
 }
 /// startup_readiness_with_progress（启动校验进度）：模型完整摘要复核，代理复用近期内容复核，语音环境快速盘点。
 pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
-    check_cancel(cancel)?;progress("正在校验：Voice Server（语音服务）",0,0);
-    let mut rows=inventory(context)?;
-    check_cancel(cancel)?;
-    // 已有缺失、待更新或依赖未就绪时直接进入管理页，不反复读取不能运行的旧组件。
-    // 语音环境启动时快速核对文件集合和大小；模型完整摘要复核，代理复用未变化的近期核验结果。
-    if rows.iter().any(|row|row["required"]!=false&&row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
-    validate_inventory_hashes(context,&mut rows,cancel,progress)?;
-    // 将本次内容复核失败纳入兼容记录，不把先前的轻量元数据成功当成实际校验成功。
-    rows=crate::compatibility::inventory_with(context,|current|{
-        for failed in rows.iter().filter(|row|row["can_start"]!=true){
-            if let Some(row)=current.iter_mut().find(|row|row["resource_id"]==failed["resource_id"]&&row["version"]==failed["version"]){
-                for key in ["can_start","files_installed","installation_state","error"] {if let Some(value)=failed.get(key){row[key]=value.clone();}}
-            }
-        }
-        Ok(())
-    })?;
-    Ok(readiness_from_inventory(&rows))
+    check_cancel(cancel)?;progress("检查必要入口与兼容状态",0,0);
+    let rows=inventory(context)?;check_cancel(cancel)?;
+    let mut result=readiness_from_inventory(&rows);
+    result["integrity_notice"]=json!(if result["ready"]==true{Value::Null}else{json!("检测到组件问题，可在应用维护中下载当前版本校验程序并校验完整性。")});
+    Ok(result)
 }
+
+/// prepare_maintenance_verification（单轮维护计划）：大组件内容汇总到统一并行池，后续只修复异常项。
+pub(crate) fn prepare_maintenance_verification(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let mut plans=Vec::new();let environment=context.install.join("runtimes/python");
+    if let Ok(manifest)=load(&environment.join("manifest.json")){if let Some(records)=manifest["files"].as_array(){
+        plans.push(crate::verification::Batch{root:environment,records:records.clone(),exact:true,python:manifest["kind"]=="python"});
+    }}
+    for item in specs(context).unwrap_or_default(){
+        let root=destination(context,&item)?;if !root.is_dir(){continue;}
+        if item["kind"]=="model"{
+            let records=item["files"].as_array().ok_or("模型文件清单缺失")?.iter()
+                .filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap_or("")).is_file())
+                .map(|file|json!({"path":file["path"],"size":file["size_bytes"],"sha256":file["sha256"]})).collect();
+            plans.push(crate::verification::Batch{root,records,exact:false,python:false});
+        }else if let Ok(manifest)=load(&root.join("manifest.json")){if let Some(records)=manifest["files"].as_array(){
+            plans.push(crate::verification::Batch{root,records:records.clone(),exact:true,python:false});
+        }}
+    }
+    crate::verification::check(plans,cancel,progress)
+}
+#[cfg(test)] // 旧启动算法仅供回归对照，正式启动不再执行。
 pub(crate) fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let environment=context.install.join("runtimes/python");
     let runtime_budget:Result<(u64,u64),String>=(||{
@@ -617,6 +625,7 @@ pub fn recover(context:&LaunchContext)->Result<(),String>{
 pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Result<PendingActivation,String>{
     let dsh_proof=if relative=="runtimes/dsh"{load(&stage.with_extension("verified.json")).ok().filter(|record|record["root"].as_str().is_some_and(|path|Path::new(path)==stage))}else{None};
     recover(context)?;let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
+    crate::verification::invalidate(&target);
     if old.exists(){return Err("上次资源备份尚未清理，无法开始新的激活。".into());}
     let journal=context.install.join("tmp/native-install.json");let original=target.exists();
     atomic_json(&journal,&json!({"target":relative,"state":"prepared","original":original,
@@ -760,7 +769,7 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
 fn refresh_models(context:&LaunchContext,activated:Option<&str>)->Result<(),String>{
     let root=context.install.join("models");let manifest_path=root.join("manifest.json");
     let mut known=std::collections::HashMap::<String,Value>::new();
-    // 启用时复用已签发清单与新组件的复制校验结果；正式启动始终再次核验全部文件内容。
+    // 启用时复用已签发清单与新组件的复制校验结果；手动维护统一核验文件内容。
     if let Ok(record)=load(&manifest_path){for row in record["files"].as_array().into_iter().flatten(){
         if let Some(path)=row["path"].as_str(){if row["sha256"].as_str().is_some_and(valid_sha256){known.insert(path.to_owned(),row.clone());}}
     }}
@@ -789,7 +798,7 @@ fn refresh_models(context:&LaunchContext,activated:Option<&str>)->Result<(),Stri
         files.push(json!({"path":relative,"size":size,"sha256":digest}));
     }
     atomic_json(&manifest_path,&json!({"schema":1,"kind":"models","build":crate::workspace::new_id(),"files":files,
-        "fields":{"schema":"清单格式","kind":"资源类别","build":"启用登记编号","files":"已校验的安装文件记录","path":"相对路径","size":"字节数","sha256":"文件摘要；启动前再次完整核验"}}))?;
+        "fields":{"schema":"清单格式","kind":"资源类别","build":"启用登记编号","files":"已校验的安装文件记录","path":"相对路径","size":"字节数","sha256":"文件摘要；手动完整性维护时核验"}}))?;
     bind_component(context,"models","models",&root)
 }
 pub fn download_resource(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
@@ -993,7 +1002,8 @@ fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cance
     }else if item["legacy_export"]["supported"]!=true||item["legacy_export"]["manifest_sha256"]!=digest||metadata["version"].as_str().is_none(){
         return Err("旧 DSH 目录与兼容清单不匹配".into());
     }
-    if full{crate::workspace::verify_tree_with_progress(source,"manifest.json",cancel,progress)?;}else{crate::workspace::verify_tree_sizes(source,"manifest.json")?;}
+    // 日常启动与状态读取仅验证上述身份和必要入口；完整目录检查只在维护任务执行。
+    if full{crate::workspace::verify_tree_with_progress(source,"manifest.json",cancel,progress)?;}
     check_cancel(cancel)?;
     Ok(metadata)
 }
@@ -1193,7 +1203,7 @@ mod download_tests {
     }
 
     #[test]
-    fn startup_blocks_same_size_model_corruption() {
+    fn startup_is_lightweight_and_maintenance_detects_same_size_model_corruption() {
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
         let root=owner.join(format!("voice-integrity-resources-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();
@@ -1214,9 +1224,9 @@ mod download_tests {
         let installed=root.join("models/test-model/model.bin");
         fs::write(&installed,vec![0x42u8;expected.len()]).unwrap(); // 相同文件长度，仅 SHA-256（内容摘要）不同。
         let readiness=startup_readiness(&context).unwrap();
-        assert_eq!(readiness["ready"],false);
-        let corrupted=readiness["missing"].as_array().unwrap().iter().find(|row|row["resource_id"]=="test-model").unwrap();
-        assert!(corrupted["reason"].as_str().unwrap().contains("摘要"));
+        assert_eq!(readiness["ready"],true);
+        let target=spec(&context,"test-model").unwrap();
+        assert!(model_validate(&context,&target,&root.join("models/test-model")).is_err());
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
@@ -1248,14 +1258,16 @@ mod download_tests {
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[]})).unwrap();ready_test_runtime(&root);let context=LaunchContext::portable(&root).unwrap();
         assert_eq!(startup_readiness(&context).unwrap()["ready"],true);let before=file_hash(&root.join("runtimes/python/manifest.json")).unwrap();
         let cancel=AtomicBool::new(false);let caller=std::thread::current().id();
-        let mut component_reports=0;let result=startup_readiness_with_progress(&context,&cancel,&mut|phase,_,_|{assert_eq!(std::thread::current().id(),caller);if phase=="正在校验：Voice Server（语音服务）"{component_reports+=1;if component_reports==2{cancel.store(true,Ordering::Release);}}});
+        let mut component_reports=0;let result=startup_readiness_with_progress(&context,&cancel,&mut|phase,_,_|{assert_eq!(std::thread::current().id(),caller);if phase=="检查必要入口与兼容状态"{component_reports+=1;cancel.store(true,Ordering::Release);}});
         assert!(result.unwrap_err().contains("取消"));assert_eq!(file_hash(&root.join("runtimes/python/manifest.json")).unwrap(),before);
         fs::write(root.join("runtimes/python/python.exe"),b"same-length!").unwrap();
         assert_eq!(inventory(&context).unwrap()[0]["can_start"],true);let readiness=startup_readiness(&context).unwrap();
         assert_eq!(readiness["ready"],true);
         fs::write(root.join("runtimes/python/python.exe"),b"different-size").unwrap();
         let readiness=startup_readiness(&context).unwrap();
-        assert_eq!(readiness["ready"],false);assert!(readiness["missing"][0]["reason"].as_str().unwrap().contains("文件清单或大小"));crate::workspace::remove_owned(&root,&owner).unwrap();
+        assert_eq!(readiness["ready"],true);
+        assert!(crate::workspace::verify_tree(&root.join("runtimes/python"),"manifest.json").is_err());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
     }
     #[test]
     fn gpu_choice_installs_missing_optional_weights_and_later_updates_preserve_them(){
@@ -1338,8 +1350,8 @@ mod download_tests {
         assert!(pending["missing"].as_array().unwrap().iter().any(|row|row["resource_id"]=="test-model"&&row["reason"].as_str().unwrap().contains("更新")));
         spec["version"]=json!("1");atomic_json(&catalog,&json!({"resources":[spec]})).unwrap();
         let corrupted=startup_readiness(&context).unwrap();
-        assert_eq!(corrupted["ready"],false);
-        assert!(corrupted["missing"].as_array().unwrap().iter().any(|row|row["resource_id"]=="test-model"&&row["reason"].as_str().unwrap().contains("摘要")));
+        assert_eq!(corrupted["ready"],true);
+        assert!(model_validate(&context,&super::spec(&context,"test-model").unwrap(),&root.join("models/test-model")).is_err());
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 

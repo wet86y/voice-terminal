@@ -65,7 +65,7 @@ function formatBytes(value: number | null | undefined) {
   <section class="workspace-settings" aria-labelledby="workspace-settings-title">
     <SettingsPageHeader section="workspace" title-id="workspace-settings-title" />
 
-    <AppUpdateCard :status="updateStatus" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
+    <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
 
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
     <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>

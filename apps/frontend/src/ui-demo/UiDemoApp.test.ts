@@ -198,7 +198,7 @@ describe('桌面样例回放交互', () => {
     await row.get('select').setValue('cuda')
     await row.get('.save-button').trigger('click')
     expect(wrapper.get('.save-notice').text()).toContain('运行位置已保存')
-    expect(row.get('.local-device-editor').text()).toContain('下次启动生效')
+    expect(row.get('.local-device-editor').text()).toContain('设备请求与当前运行状态不一致')
     await wrapper.get('.settings-back-button').trigger('click')
     await wrapper.get('.conversation-column .workbench-settings-button').trigger('click')
     await wrapper.get('.settings-tabs button[aria-label="组件设置"]').trigger('click')

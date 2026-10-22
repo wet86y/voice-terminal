@@ -128,11 +128,16 @@ async def test_vad_segment_closure_is_separate_from_business_final():
 @async_test
 async def test_streaming_cache_flush_retains_cumulative_transcript():
     engine = AsrWorkerEngine(model_dir=Path("."), device="cpu")
-    calls = []
-    def infer(turn_id, pcm, final):
-        calls.append((turn_id, final))
-        return "尾" if final else "字"
-    engine._infer_sync = infer
+    from voice_terminal.asr.streaming_model import StreamingParaformer
+    import numpy as np
+    model = object.__new__(StreamingParaformer)
+    model._np = np
+    model._cache_by_turn = {}
+    model.chunk_size = engine.chunk_size
+    model.encoder_chunk_look_back = engine.encoder_chunk_look_back
+    model.decoder_chunk_look_back = engine.decoder_chunk_look_back
+    model.model = SimpleNamespace(generate=lambda **kwargs: [{"text": "尾" if kwargs["is_final"] else "字"}])
+    engine._infer_sync = model.infer
     try:
         await engine.infer("turn", b"\0" * engine.chunk_stride_bytes, False)
         first, piece = await engine.flush_segment("turn")
@@ -141,7 +146,7 @@ async def test_streaming_cache_flush_retains_cumulative_transcript():
         second, piece = await engine.flush_segment("turn")
         assert second.text == "字尾字尾" and piece == "字尾"
         assert "turn" in engine._transcript_by_turn
-        assert "turn" not in engine._cache_by_turn
+        assert "turn" not in model._cache_by_turn
     finally:
         engine.close()
 

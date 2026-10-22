@@ -17,10 +17,12 @@ struct Installer{
     exiting:AtomicBool, // exiting（取消后退出请求）。
     shortcut:bool, // shortcut（隔离验收可关闭桌面快捷方式）。
     report:Option<PathBuf>, // report（隔离验收结果位置）。
+    repair:bool, // repair（仅检查并修复当前构建，不执行版本更新）。
     update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
 fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
+    let _verification=voice_desktop_common::verification::VerificationSession::begin();
     let mut delay=2u64;
     loop {
         match voice_desktop_common::compatibility::enforce_upgrade(root,cancel.clone(),progress){
@@ -52,10 +54,18 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         *state.target.lock().unwrap()=Some(root.clone());
         let mut progress=|phase:&str,done:u64,total:u64|{*state.status.lock().unwrap()=json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":!phase.contains("启用")&&!phase.contains("清除")&&(phase.starts_with("正在展开")||phase.contains("校验")||phase.contains("下载")||phase.starts_with("兼容处理：")),"error":null,"fields":{"phase":"安装及强制兼容阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"替换和清除原子阶段之外可中断，保留修复进度","error":"未完成原因"}});};
         if let Some(parent)=&state.update_parent{progress("正在等待旧程序退出并释放工作区",0,0);wait_for_update_parent(&root,parent,&mut progress)?;}
+        if state.repair&&!state.installed.load(Ordering::Acquire){
+            installation::ensure_idle(&root)?;
+            let guard=installation::WorkspaceGuard::acquire(&root)?;
+            workspace::recover_install(&root)?;
+            progress("正在校验当前版本程序本体",0,0);
+            let valid=installation::verify_current_package(PACKAGE,&root,&state.cancel,&mut progress).is_ok();
+            if state.cancel.load(Ordering::Acquire){return Err("完整性校验已取消。".into());}
+            drop(guard);if valid{state.installed.store(true,Ordering::Release);}
+        }
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
         complete_compatibility(&root,state.cancel.clone(),&mut progress)?;
-        progress("创建桌面快捷方式",0,0);
-        if state.shortcut{shortcuts::create(&root,None)?;}
+        if state.shortcut{progress("创建桌面快捷方式",0,0);shortcuts::create(&root,None)?;}
         progress("正在启动正式程序",0,0);let pid=installation::launch(&root)?;
         let record=json!({"ok":true,"target_root":root,"product_pid":pid,"installer_pid":std::process::id(),"fields":{"ok":"首次窗口交接成功","target_root":"目标工作区","product_pid":"独立正式宿主进程编号","installer_pid":"交接后退出的安装器进程编号"}});
         if let Some(path)=&state.report{workspace::atomic_json(path,&record)?;}
@@ -125,11 +135,12 @@ fn mark_update_consumed(path:&Path,nonce:&str)->Result<(),String>{
     fs::remove_file(path).map_err(|error|format!("无法消费一次性更新配置：{error}"))
 }
 
-fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
+fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{consume_maintenance_config(path,false)}
+fn consume_maintenance_config(path:&Path,repair:bool)->Result<(PathBuf,UpdateParent),String>{
     let supplied=voice_desktop_common::canonical_path(path)?;
     let config=voice_desktop_common::resources::load(&supplied)?;
     if config["schema"]!=1{return Err("应用更新配置格式无效。".into());}
-    let allowed=["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256","fields"];
+    let allowed=["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256","build","fields"];
     if !config.as_object().is_some_and(|object|object.keys().all(|key|allowed.contains(&key.as_str()))){return Err("应用更新配置含有未识别字段。".into());}
     let nonce=config["nonce"].as_str().ok_or("应用更新配置缺少单次编号")?;
     let pid=config["parent_pid"].as_u64().and_then(|value|u32::try_from(value).ok()).filter(|value|*value!=0).ok_or("旧程序进程编号无效")?;
@@ -151,6 +162,14 @@ fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
     semver::Version::parse(version).map_err(|_|"更新配置版本无效。")?;
     if config["tag"].as_str()!=Some(&format!("v{version}"))||installation::package_version(PACKAGE)?!=version{
         return Err("发行标签、更新配置与内嵌程序版本不匹配。".into());
+    }
+    if repair{
+        let build=installation::package_build(PACKAGE)?;
+        let installed_build=voice_desktop_common::app_update::installed_build(&root,version)?;
+        if config["build"].as_str()!=Some(build.as_str())||installed_build!=build{
+            return Err("完整性维护要求分发器与本地版本及构建完全一致。".into());
+        }
+        if !config["fields"]["build"].as_str().is_some_and(has_chinese){return Err("维护构建字段缺少中文说明。".into());}
     }
     let installer_size=config["installer_size"].as_u64().filter(|size|*size>0).ok_or("更新配置缺少安装器字节数")?;
     let installer_sha256=config["installer_sha256"].as_str().filter(|hash|hash.len()==64&&hash.bytes().all(|byte|byte.is_ascii_hexdigit())).ok_or("更新配置缺少安装器摘要")?;
@@ -191,7 +210,7 @@ fn wait_for_update_parent(root:&Path,parent:&UpdateParent,progress:&mut dyn FnMu
 }
 fn run()->Result<(),String>{
     if PACKAGE.is_empty(){return Err("安装器未内嵌正式程序包，请重新构建。".into());}
-    let args=std::env::args().skip(1).collect::<Vec<_>>();let mut target=None;let mut report=None;let mut shortcut=true;let mut auto=false;let mut update_parent=None;
+    let args=std::env::args().skip(1).collect::<Vec<_>>();let mut target=None;let mut report=None;let mut shortcut=true;let mut auto=false;let mut update_parent=None;let mut repair=false;
     if !args.is_empty(){
         if args.len()!=2{return Err("安装器参数数量无效。".into());}
         match args[0].as_str(){
@@ -205,6 +224,10 @@ fn run()->Result<(),String>{
                 if !root.starts_with(sandbox)||root==sandbox{return Err("自动验收目标须位于配置目录的独立子目录内。".into());}
                 target=Some(root);report=Some(sandbox.join("installer-result.json"));shortcut=config["shortcut"]!=false;auto=true;
             }
+            "--repair-config"=>{
+                let (root,parent)=consume_maintenance_config(Path::new(&args[1]),true)?;
+                target=Some(root);update_parent=Some(parent);shortcut=false;auto=true;repair=true;
+            }
             "--app-update-config"=>{
                 let (root,parent)=consume_update_config(Path::new(&args[1]))?;
                 target=Some(root);update_parent=Some(parent);shortcut=false;auto=true;
@@ -215,11 +238,11 @@ fn run()->Result<(),String>{
     std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
     if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。安装后重新运行安装器。");return Ok(());}
     let cache=std::env::temp_dir().join(format!("voice-initialization-installer-{}",std::process::id()));fs::create_dir_all(&cache).map_err(|e|e.to_string())?;
-    let initial_phase=if update_parent.is_some(){"正在准备应用更新"}else{"请选择文件夹作为整个工作区"};
-    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":initial_phase,"error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report,update_parent});
+    let initial_phase=if repair{"正在准备完整性校验"}else if update_parent.is_some(){"正在准备应用更新"}else{"请选择文件夹作为整个工作区"};
+    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":initial_phase,"error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report,update_parent,repair});
     let setup_state=state.clone();let cache_window=cache.clone();
     let app=tauri::Builder::default().manage(state.clone()).invoke_handler(tauri::generate_handler![desktop_status,desktop_initialize,desktop_cancel_init,exit_application])
-        .setup(move|app|{let window=WebviewWindowBuilder::new(app,"startup",WebviewUrl::App("index.html".into())).initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU).title("Voice Terminal · 安装语音终端").inner_size(1000.,640.).min_inner_size(400.,480.).incognito(true).data_directory(cache_window.clone()).on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())).build()?;app_icon::apply(window.hwnd()?.0).map_err(std::io::Error::other)?;
+        .setup(move|app|{let window=WebviewWindowBuilder::new(app,"startup",WebviewUrl::App("index.html".into())).initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU).title(if repair { "Voice Terminal · 校验与修复" } else { "Voice Terminal · 安装语音终端" }).inner_size(1000.,640.).min_inner_size(400.,480.).incognito(true).data_directory(cache_window.clone()).on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())).build()?;app_icon::apply(window.hwnd()?.0).map_err(std::io::Error::other)?;
             if auto{let handle=app.handle().clone();let state=setup_state.clone();std::thread::spawn(move||{let _=run_install(&handle,state,false);});}Ok(())})
         .on_window_event(|window,event|{if let tauri::WindowEvent::CloseRequested{api,..}=event{let state=window.state::<Arc<Installer>>();api.prevent_close();exit(window.app_handle(),&state);}})
         .build(tauri::generate_context!()).map_err(|e|e.to_string())?;
@@ -308,6 +331,20 @@ mod tests{
         workspace::atomic_json(&path,&record).unwrap();let (accepted,parent)=consume_update_config(&path).unwrap();assert_eq!(accepted,root);
         assert!(!path.exists());assert!(path.with_extension("json.consumed").is_file());
         workspace::atomic_json(&path,&record).unwrap();assert!(consume_update_config(&path).err().unwrap().contains("已使用"));
+        // repair fixture（同版本修复夹具）：清单损坏时采用独立身份，拒绝不同构建，且不执行安装。
+        let repair_nonce="123e4567-e89b-12d3-a456-426614174001";
+        let repair_path=root.join(format!("tmp/app-update-{repair_nonce}.json"));
+        let build=installation::package_build(PACKAGE).unwrap();
+        workspace::atomic_json(&root.join("data/state/product-identity.json"),&json!({"schema":1,"version":version,"build":build})).unwrap();
+        fs::write(root.join("app/release.json"),b"damaged release manifest").unwrap();
+        let mut repair_record=record.clone();repair_record["nonce"]=json!(repair_nonce);repair_record["build"]=json!("different-build");repair_record["fields"]["build"]=json!("指定维护构建身份");
+        workspace::atomic_json(&repair_path,&repair_record).unwrap();
+        assert!(consume_maintenance_config(&repair_path,true).err().unwrap().contains("构建完全一致"));
+        assert!(repair_path.exists());assert!(!repair_path.with_extension("json.consumed").exists());
+        repair_record["build"]=json!(build);workspace::atomic_json(&repair_path,&repair_record).unwrap();
+        let (repair_root,repair_parent)=consume_maintenance_config(&repair_path,true).unwrap();
+        assert_eq!(repair_root,root);assert_eq!(repair_parent.pid,parent.pid);
+        assert!(!repair_path.exists());assert!(repair_path.with_extension("json.consumed").is_file());
         let held=installation::WorkspaceGuard::acquire(&root).unwrap();
         let release=std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(200));child.0.kill().unwrap();child.0.wait().unwrap();std::thread::sleep(Duration::from_millis(400));drop(held);});
         let mut phases=vec![];wait_for_update_parent(&root,&parent,&mut|phase,_,_|phases.push(phase.to_owned())).unwrap();release.join().unwrap();

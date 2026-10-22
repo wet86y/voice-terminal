@@ -237,8 +237,10 @@ impl ResourceManager {
                 }
             }
             registration["models"]=json!(results);
-            registration["environment_fingerprint"]=json!(voice_desktop_common::runtime::fingerprint(python.parent().unwrap()).map_err(|message|JobError::Failed{message,installed:vec![]})?);
-            registration["models_fingerprint"]=json!(voice_desktop_common::runtime::fingerprint(&context.install.join("models")).map_err(|message|JobError::Failed{message,installed:vec![]})?);
+            registration["environment_fingerprint"]=json!(environment_fingerprint);
+            registration["models_fingerprint"]=json!(models_fingerprint);
+            registration["validation_identity"]=voice_desktop_common::runtime::validation_identity(&context.install,python.parent().unwrap()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            registration["fields"]["validation_identity"]=json!("解释器及受管清单的轻量身份，日常状态不遍历目录");
             voice_desktop_common::workspace::atomic_json(&path,&registration).map_err(|message|JobError::Failed{message,installed:vec![]})?;
             let _=lease.finish();Ok(vec!["gpu-environment".into()])
         })?;Ok(json!({"job_id":job_id}))

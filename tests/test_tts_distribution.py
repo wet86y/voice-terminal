@@ -90,8 +90,12 @@ def test_legacy_corrupt_selected_model_keeps_selection_and_reports_error(tmp_pat
     config = AppConfig()
     runtime = SessionRuntime(replace(config, tts=replace(config.tts, backend="voxcpm1", local_model="voxcpm2")), runtime_data_dir=tmp_path / "data")
     runtime._api_key = lambda name: "configured-test-key"
-    with pytest.raises(RuntimeError, match="所选 voxcpm2"):
-        runtime._select_available_tts()
+    assert "voxcpm2" not in available(tmp_path, program_root=program, verify_hashes=True)
+    if len(bad_content) == 4:
+        runtime._select_available_tts()  # 同尺寸潜伏损坏由手动维护检出，实际加载仍负责格式错误。
+    else:
+        with pytest.raises(RuntimeError, match="所选 voxcpm2"):
+            runtime._select_available_tts()
     assert runtime.config.tts.backend == "voxcpm1"
     assert runtime.config.tts.local_model == "voxcpm2"
 
@@ -180,7 +184,7 @@ def test_native_build_and_migration_pins_match_distributed_runtime(script, hash_
     assert getattr(module, hash_field) == server.sha256
 
 
-def test_same_size_corrupt_installed_model_is_not_a_startup_candidate(tmp_path):
+def test_same_size_corrupt_installed_model_is_detected_by_explicit_maintenance(tmp_path):
     from voice_terminal.model_installation import model_receipt
     program = _legacy_model_catalog(tmp_path / "program", b"good")
     weight = tmp_path / "models/audiocpp/tts/VoxCPM1-GGUF/voxcpm-0.5b-q8_0-audiovae-f16.gguf"
@@ -195,7 +199,8 @@ def test_same_size_corrupt_installed_model_is_not_a_startup_candidate(tmp_path):
     (runtime / "model_specs/voxcpm1.json").write_text("{}")
     assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == ["voxcpm1"]
     weight.write_bytes(b"bad!")
-    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == []
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == ["voxcpm1"]
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program, verify_hashes=True) == []
 
 
 @pytest.mark.parametrize("receipt_version,content,corrupt_file", [
@@ -229,7 +234,7 @@ def test_local_tts_rejects_self_consistent_but_outdated_native_runtime(tmp_path,
     weight.parent.mkdir(parents=True)
     weight.write_bytes(b"weight")
     expected = ["voxcpm1"] if content == b"new-native" and not corrupt_file else []
-    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == expected
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program, verify_hashes=True) == expected
     if not expected:
         assert "runtime_update_required" in caplog.text
 

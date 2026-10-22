@@ -114,8 +114,8 @@ def test_same_version_changed_weights_still_show_update(workspace):
     assert "更新" in inspect_model_resources(program, root / "models", {"voice": ["test-model"]})["voice"]
 
 
-def test_updates_to_inactive_models_block_every_startup_role(workspace):
-    """Global update gate（全局更新门禁）：关闭模型功能不能绕过组件更新。"""
+def test_updates_to_inactive_models_are_reported_without_blocking_other_roles(workspace):
+    """启动只检查所选资源；完整性维护及组件管理继续报告未选资源更新。"""
     program, root, _ = workspace
     _catalog(program, "v2", {"model.pt": b"new-weight", "config.yaml": b"config"})
     catalog_path = program / "config/resources/catalog.json"
@@ -128,8 +128,8 @@ def test_updates_to_inactive_models_block_every_startup_role(workspace):
     (root / "models/active").mkdir()
     (root / "models/active/model.pt").write_bytes(b"ok")
     issues = inspect_model_resources(program, root / "models", {"asr": ["active-model"], "voice": []})
-    assert set(issues) == {"asr", "voice"}
-    assert all("更新验收模型" in message and "组件有更新" in message for message in issues.values())
+    assert issues == {}
+    assert ResourceManager(program, root)._model_state(ResourceManager(program, root).catalog.get("test-model"))["update_available"] is True
 
 
 def test_optional_inactive_model_updates_do_not_block_other_roles(workspace):

@@ -138,7 +138,7 @@ class AudioCppTtsServer:
 
     @classmethod
     def _runtime_update_error(cls, runtime_root: Path, *, program_root: Path | None = None,
-                              verify_hashes: bool = True) -> str | None:
+                              verify_hashes: bool = False) -> str | None:
         """_runtime_update_error（原生版本门禁）：自有收据有效也必须达到当前随包目标。"""
         from ..model_installation import inspect_installed_model, model_update_available
         from ..resource_distribution import ResourceCatalog, ResourceError
@@ -163,8 +163,10 @@ class AudioCppTtsServer:
                 path = runtime / item.path
                 if not path.is_file() or path.stat().st_size != item.size_bytes:
                     return f"本地语音运行组件不符合当前版本：{item.path}。请在组件管理中更新本地语音共用运行程序。"
-                with path.open("rb") as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != item.sha256:
+                if verify_hashes:
+                    with path.open("rb") as stream:
+                        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+                    if actual != item.sha256:
                         return f"本地语音运行组件摘要不符合当前版本：{item.path}。请在组件管理中更新本地语音共用运行程序。"
         except (OSError, ResourceError) as exc:
             return f"无法核验本地语音运行组件：{exc}。请修复程序或在组件管理中更新语音运行程序。"
@@ -172,7 +174,7 @@ class AudioCppTtsServer:
 
     @classmethod
     def available_models(cls, runtime_root: Path, *, program_root: Path | None = None,
-                         verify_hashes: bool = True, local_model: str | None = None) -> list[str]:
+                         verify_hashes: bool = False, local_model: str | None = None) -> list[str]:
         """available_models（完整本地候选）：权重、原生程序和模型规格均存在才算可启动。"""
         root = Path(runtime_root).resolve()
         runtime = cls.runtime_directory(root)

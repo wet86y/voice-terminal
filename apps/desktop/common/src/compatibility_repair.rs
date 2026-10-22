@@ -75,6 +75,7 @@ fn selected_local(context:&LaunchContext)->Option<String>{
 pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<(),String>{
     installation::ensure_idle(root)?;
     let _guard=WorkspaceGuard::acquire(root)?;
+    let _verification=crate::verification::VerificationSession::begin();
     let context=LaunchContext::portable(root)?;
     resources::recover(&context)?;
     let policy=rules(&context.program,false)?;
@@ -83,6 +84,7 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
     let mut reset_devices=state["enforcement"]["reset_devices"]==true;
     let result=(||{
         repair_bootstrap_policy(&context)?;
+        resources::prepare_maintenance_verification(&context,&cancel,progress)?;
         checkpoint(&context,"repair_environment",reset_devices,None)?;
         progress("兼容处理：尝试修复现有运行环境",0,0);
         // 两阶段共享进度由 RefCell（同线程可变借用）串行借用，不创建并行安装。
@@ -135,8 +137,8 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
         checkpoint(&context,"verify",reset_devices,None)?;
         progress("正在校验强制兼容处理结果",0,0);
         settings(&context,reset_devices,&cancel)?;
-        let mut rows=resources::inventory_raw(&context)?;
-        resources::validate_inventory_hashes(&context,&mut rows,&cancel,progress)?;
+        let rows=resources::inventory_raw(&context)?;
+        // 环境与每项受管组件已在本轮验证或修复换入；这里只复核组合状态，不再重读全部内容。
         if let Some(row)=rows.iter().find(|row|row["required"]!=false&&row["can_start"]!=true){
             return Err(format!("{}仍待修复：{}",row["label"].as_str().unwrap_or("必需组件"),row["error"].as_str().unwrap_or("未通过实际校验")));
         }
@@ -157,12 +159,14 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
         if ready.first().is_none_or(|row|row["can_start"]!=true || row["compatibility"]["status"]!="compatible") {
             return Err("最终启动条件在复核后发生变化，修复尚未完成。".into());
         }
+        // 浅盘点和状态写回完成后再确认本轮凭据仍有效；失败统一回写 repair_pending（待修复）。
+        crate::verification::ensure_unchanged()?;
         progress("兼容处理完成，准备启动正式程序",1,1);
         Ok(())
     })();
     if let Err(error)=&result {
         checkpoint(&context,"repair_pending",reset_devices,Some(error))?;
-        return Err(format!("新版本体已更新，强制修复进度已保留；继续安装将重试未完成项：{error}"));
+        return Err(format!("程序本体已就位，兼容修复进度已保留；继续处理将重试未完成项：{error}"));
     }
     result
 }

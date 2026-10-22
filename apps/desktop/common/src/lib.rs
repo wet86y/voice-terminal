@@ -12,6 +12,7 @@ pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单
 pub mod native_ui;
 pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志。
 pub mod workspace;
+pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
 pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
