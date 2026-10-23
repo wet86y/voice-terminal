@@ -99,6 +99,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.7 发行说明](releases/v0.9.7.md)
 - [v0.9.6 强制兼容处理与发布构建](releases/v0.9.6.md)
 - [v0.9.5 CPU/GPU 设备热切换与进程回收](releases/v0.9.5.md)
 - [v0.9.4 语音音色试听、对话与影子执行修复](releases/v0.9.4.md)
