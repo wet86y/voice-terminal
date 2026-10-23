@@ -12,12 +12,10 @@ from ..model_installation import inspect_installed_model, model_update_available
 def required_model_resources(config: Any) -> dict[str, list[str]]:
     """Return selected resource ids（已选资源编号）for each model-loading role."""
     requirements: dict[str, list[str]] = {
-        "asr": ["paraformer-streaming"],
+        "asr": ["paraformer-streaming", "streaming-punctuation"],
         # Voice（语音服务）的活动检测器始终初始化，KWS（关键词唤醒）按配置选择。
         "voice": ["fsmn-vad"],
     }
-    if getattr(getattr(config, "asr", None), "punctuation_enabled", False):
-        requirements["asr"].append("streaming-punctuation")
     if config.wake.enabled:
         requirements["voice"].append("kws-sherpa-onnx")
     analysis: list[str] = []

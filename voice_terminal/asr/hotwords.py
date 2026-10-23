@@ -12,9 +12,11 @@ import logging
 import math
 import re
 import time
+import csv
+import io
 
 logger = logging.getLogger(__name__)
-DEFAULT_HOTWORDS = {"enabled": True, "threshold": 0.85, "entries": []}  # 默认配置。
+DEFAULT_HOTWORDS = {"enabled": True, "stream_enabled": True, "threshold": 0.85, "entries": []}  # 默认配置。
 MAX_HOTWORDS = 5000  # MAX_HOTWORDS（最大目标词数）。
 MAX_FILE_BYTES = 1024 * 1024  # MAX_FILE_BYTES（导入文件上限）。
 _BOUNDARIES = re.compile(r"([，。！？；,!?;\r\n]+|\.(?=\s|$))")  # 不跨短句边界；保留名称内部的点号。
@@ -22,9 +24,12 @@ _BOUNDARIES = re.compile(r"([，。！？；,!?;\r\n]+|\.(?=\s|$))")  # 不跨�
 
 def validate_hotwords(value: object) -> dict:
     """validate_hotwords（严格校验）：字段只接受明确的用户配置。"""
-    if not isinstance(value, dict) or set(value) != {"enabled", "threshold", "entries"}:
+    if not isinstance(value, dict) or set(value) not in ({"enabled", "threshold", "entries"}, {"enabled", "stream_enabled", "threshold", "entries"}):
         raise ValueError("热词设置须包含 enabled（启用）、threshold（相似度阈值）和 entries（词表）。")
     enabled, threshold, entries = value["enabled"], value["threshold"], value["entries"]
+    stream_enabled = value.get("stream_enabled", True)
+    if type(stream_enabled) is not bool:
+        raise ValueError("stream_enabled（流式热词开关）必须是布尔值。")
     if not isinstance(enabled, bool):
         raise ValueError("热词启用状态必须是布尔值。")
     if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or not 0.5 <= threshold <= 1:
@@ -54,7 +59,7 @@ def validate_hotwords(value: object) -> dict:
             row[name] = list(dict.fromkeys(word(v) for v in values))
         row["aliases"] = [v for v in row["aliases"] if v != target]
         cleaned.append(row)
-    result = {"enabled": enabled, "threshold": float(threshold), "entries": cleaned}
+    result = {"enabled": enabled, "stream_enabled": stream_enabled, "threshold": float(threshold), "entries": cleaned}
     if len(to_hotword_text(cleaned).encode("utf-8")) > MAX_FILE_BYTES:
         raise ValueError("热词文件不能超过 1MiB（二进制兆字节）。")
     return result
@@ -70,6 +75,8 @@ def parse_hotword_text(text: object) -> list[dict]:
     """parse_hotword_text（导入文本）：注释、空行和重复目标合并。"""
     if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_FILE_BYTES:
         raise ValueError("请导入不超过 1MiB（二进制兆字节）的文本文件。")
+    if text.lstrip("\ufeff \r\n").startswith("热词,") or text.lstrip("\ufeff \r\n").startswith('"热词",'):
+        return parse_hotword_csv(text)
     rows = {}
     for number, line in enumerate(text.lstrip("\ufeff").splitlines(), 1):
         line = line.strip()
@@ -85,6 +92,40 @@ def parse_hotword_text(text: object) -> list[dict]:
         row = rows.setdefault(words[0], {"word": words[0], "aliases": [], "blacklist": []})
         row["aliases"] = list(dict.fromkeys([*row["aliases"], *words[1:]]))
         row["blacklist"] = list(dict.fromkeys([*row["blacklist"], *blacklist]))
+    return validate_hotwords({**DEFAULT_HOTWORDS, "entries": list(rows.values())})["entries"]
+
+
+def parse_hotword_csv(text: str) -> list[dict]:
+    """标准 CSV（逗号分隔文件），多值仅拆分分号、顿号和换行。"""
+    reader = csv.reader(io.StringIO(text.lstrip("\ufeff")), strict=True)
+    rows = {}
+    try:
+        if next(reader, None) != ["热词", "别名", "排除词"]:
+            raise ValueError("第 1 行表头必须为：热词,别名,排除词")
+        for cells in reader:
+            number = reader.line_num
+            if not cells or all(not cell.strip() for cell in cells):
+                continue
+            if len(cells) != 3:
+                raise ValueError(f"第 {number} 行须有热词、别名、排除词三列")
+            row = {"word": cells[0].strip(), "aliases": [], "blacklist": []}
+            for column, field in ((1, "aliases"), (2, "blacklist")):
+                row[field] = [part.strip() for part in re.split(r"[;；、\r\n]+", cells[column]) if part.strip()]
+            for column, field in enumerate(("word", "aliases", "blacklist"), 1):
+                try:
+                    probe = {"word": "校验词", "aliases": [], "blacklist": [], field: row[field]}
+                    validate_hotwords({**DEFAULT_HOTWORDS, "entries": [probe]})
+                except ValueError as exc:
+                    raise ValueError(f"第 {number} 行第 {column} 列：{exc}") from exc
+            existing = rows.setdefault(row["word"], {"word": row["word"], "aliases": [], "blacklist": []})
+            for field in ("aliases", "blacklist"):
+                existing[field] = list(dict.fromkeys([*existing[field], *row[field]]))
+            try:
+                validate_hotwords({**DEFAULT_HOTWORDS, "entries": [existing]})
+            except ValueError as exc:
+                raise ValueError(f"第 {number} 行合并后：{exc}") from exc
+    except csv.Error as exc:
+        raise ValueError(f"第 {reader.line_num} 行 CSV（逗号分隔文件）格式错误：{exc}") from exc
     return validate_hotwords({**DEFAULT_HOTWORDS, "entries": list(rows.values())})["entries"]
 
 
@@ -110,7 +151,7 @@ class HotwordService:
     def prepare(value: object) -> HotwordBank:
         settings = validate_hotwords(value)
         bank = HotwordBank(settings)
-        if settings["enabled"] and settings["entries"]:
+        if settings["enabled"] and settings["stream_enabled"] and settings["entries"]:
             from ..vendor.asr_hotword import PhonemeCorrector
             text = to_hotword_text(settings["entries"])
             for lane in ("stream", "final"):
@@ -143,6 +184,11 @@ class HotwordService:
         self.turns.move_to_end(key)
         return self.turns[key]
 
+    def native_targets(self, key) -> tuple[str, ...]:
+        """native_targets（原生目标词）：复用同轮快照，不包含别名和排除词。"""
+        settings = self._turn(key)["bank"].settings
+        return tuple(row["word"] for row in settings["entries"]) if settings["enabled"] else ()
+
     @staticmethod
     def run(matcher, text: str) -> dict:
         output, matches = [], []
@@ -164,7 +210,8 @@ class HotwordService:
             return deepcopy(turn["cache"][cache_key])
         matcher = turn["bank"].matchers.get(lane)
         started = time.perf_counter()
-        status, result = "disabled" if not turn["bank"].settings["enabled"] else "empty", {"text": text, "matches": []}
+        active = turn["bank"].settings["enabled"] and turn["bank"].settings["stream_enabled"]
+        status, result = "empty" if active else "disabled", {"text": text, "matches": []}
         if matcher and text.strip():
             previous = self.pending.get(lane)
             if previous is not None and not previous.done():
@@ -247,7 +294,7 @@ class HotwordService:
     def protect_boundary(self, text: str, limit: int, key, min_chars: int) -> int:
         """protect_boundary（强制分句保护）：已知名称或别名完整出现时避开中间切点。"""
         settings = self._turn(key)["bank"].settings
-        if not settings["enabled"]:
+        if not settings["enabled"] or not settings["stream_enabled"]:
             return limit
         for entry in settings["entries"]:
             for word in (entry["word"], *entry["aliases"]):

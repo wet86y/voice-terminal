@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 16
+PRODUCT_SETTINGS_SCHEMA_VERSION = 17
 PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。

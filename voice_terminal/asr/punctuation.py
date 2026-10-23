@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..compute import device_candidates, loaded_funasr_device
@@ -163,3 +165,33 @@ class StreamingPunctuation:
             "startup_timings_ms": dict(self.timings_ms),  # startup_timings_ms（启动耗时）。
             "resource_footprint": self.resource_footprint,  # resource_footprint（共享进程加载增量估算）。
         }
+
+
+class TextPunctuationLane:
+    """整段标点：独立模型及执行线程，每次快照使用全新缓存。"""
+
+    def __init__(self, model_dir: Path, device: str = "cpu"):
+        self.model = StreamingPunctuation(model_dir, device)
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-text-punctuation")
+
+    async def process(self, text: str, *, final: bool) -> dict:
+        from .text import normalize_asr_text
+        from .worker import AsrWorkerEngine
+        def run():
+            self.model.load()
+            key = "snapshot"
+            try:
+                raw = normalize_asr_text(text).strip()
+                output = self.model.process(key, raw, final=final)
+                state = self.model._turns.get(key)
+                failed = self.model.model is None or bool(state and state.failed)
+                return {"text": normalize_asr_text(output).strip(),
+                        "punctuation_status": "DEGRADED" if failed else "READY",
+                        "punctuation_error": (self.model.last_error or self.model.load_error) if failed else None}
+            finally:
+                self.model.clear_turn(key)
+        return await AsrWorkerEngine._await_native(asyncio.get_running_loop().run_in_executor(self.executor, run))
+
+    def close(self):
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.model.close()

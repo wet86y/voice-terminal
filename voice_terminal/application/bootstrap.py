@@ -58,7 +58,7 @@ def main() -> None:
     print(json.dumps({
         "asr_url": config.asr.worker_url,
         "compute_devices": config.compute.devices,  # compute_devices（逐模型运行设备）：宿主按登记环境选择解释器。
-        "asr_parent_device": config.asr.punctuation_device if config.asr.punctuation_enabled else "cpu",  # asr_parent_device（识别父进程的标点设备；主识别由子进程独立选设备）。
+        "asr_parent_device": config.asr.punctuation_device,  # asr_parent_device（必需标点设备；主识别子进程独立选设备）。
         "model_dir": str(config.model_dir),  # model_dir（统一模型与下载缓存根目录）。
         "dependency_status": dependencies,  # dependency_status（同一版本清单的检查结果，兼容现用环境）。
         "analysis_url": config.smart_turn.analysis_url,
@@ -76,7 +76,7 @@ def main() -> None:
             ("voice", True, ("voice_vad", "kws") +
              (("campplus",) if config.speaker.mode != "off" or config.speaker.owner_only_barge_in else ())),
         ) if enabled and (any(config.compute.devices.get(name, "auto") != "cpu" for name in models)
-                          or (role == "asr" and config.asr.punctuation_enabled and config.asr.punctuation_device != "cpu"))],
+                          or (role == "asr" and config.asr.punctuation_device != "cpu"))],
         # startup_gpu_roles（启动时可能使用显卡的组件）：仅用于并行资源预留，不更改模型设备选择。
         "worker_timeout_seconds": 240 if paths.separated else 180,  # worker_timeout_seconds（模型进程启动预算）：首次解压的导入与缓存初始化较慢。
         "voice_host": config.server.host, "voice_port": config.server.port,

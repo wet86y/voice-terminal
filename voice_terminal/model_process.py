@@ -148,8 +148,8 @@ class ModelProcess:
                 self.close()
                 raise
 
-    def __call__(self, pcm):
-        return self._request({"pcm": base64.b64encode(pcm).decode("ascii")})
+    def __call__(self, pcm, **options):
+        return self._request({"pcm": base64.b64encode(pcm).decode("ascii"), **options})
 
     def infer_stream(self, turn_id: str, pcm: bytes, is_final: bool):
         """infer_stream（流式识别）：turn_id（发言轮次编号）隔离模型缓存。"""
@@ -261,7 +261,9 @@ def main():
                     else:
                         if not pcm:
                             raise ValueError("模型输入音频无效")
-                        result = model(pcm)
+                        result = (model(pcm, hotwords=request.get("hotwords"),
+                                        purpose=request.get("purpose", "conversation"))
+                                  if arguments.kind == "offline" else model(pcm))
                     emit(result)
             except Exception as error:
                 emit(error=f"{type(error).__name__}: {error}")

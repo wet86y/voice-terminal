@@ -8,7 +8,7 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 16,
+  schema_version: 17,
   audio_enhancements: { dual_pass: true, emotion: true, acoustic_events: true },
   screen_capture: { enabled: true, crop_width: 960, crop_height: 640, global_max_edge: 1920, app_overrides: [] },
   tts: { backend: 'minimax', local_model: 'voxcpm2', online_model: 'speech-2.8-hd', online_voice_id: 'female-shaonv', inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20 } },

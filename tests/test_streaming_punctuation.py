@@ -119,7 +119,7 @@ class StreamingPunctuationTests(unittest.TestCase):
         self.assertFalse(channel._turns)
 
     def test_defaults_select_realtime_model_and_cpu(self):
-        self.assertTrue(AsrConfig().punctuation_enabled)
+        self.assertFalse(hasattr(AsrConfig(), "punctuation_enabled"))
         self.assertEqual(AsrConfig().punctuation_device, "cpu")
         self.assertEqual(AppConfig().punctuation_model_dir.name,
                          "punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727")

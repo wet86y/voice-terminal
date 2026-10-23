@@ -35,11 +35,13 @@ class AudioSegment:
     end_sample: int
     is_final: bool = False
     revision: int = 1  # revision（声学段精修修订号）。
+    hotwords: tuple[str, ...] = ()  # hotwords（原输入轮次冻结的原生目标词）。
 
     def to_dict(self):
         return {**AudioChunk(self.turn_id, self.pcm).to_dict(), "type": "audio.segment",
                 "segment_id": self.segment_id, "start_sample": self.start_sample,
                 "end_sample": self.end_sample, "revision": self.revision,
+                "hotwords": list(self.hotwords),
                 "parent_turn_id": self.turn_id.split("/asr/", 1)[0]}  # parent_turn_id（原业务轮次）。
 
 

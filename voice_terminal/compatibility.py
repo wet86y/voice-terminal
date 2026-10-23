@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import tempfile
 import wave
 from uuid import uuid4
 
@@ -100,6 +101,24 @@ def _repair_settings(program: Path, data: Path, archive: Archive, *, reset_devic
     from .server.product import PRODUCT_SETTINGS_SCHEMA_VERSION, _default_settings, apply_settings_to_config
     default_path = program / "config/default.yaml"
     local = _safe(data, "config/local.yaml")
+    if local.is_file() and local.stat().st_size <= 4 * 1024 * 1024:
+        try:
+            legacy = yaml.safe_load(local.read_text(encoding="utf-8-sig"))
+            asr = legacy.get("asr") if isinstance(legacy, dict) else None
+            if isinstance(asr, dict) and "punctuation_enabled" in asr:
+                asr.pop("punctuation_enabled")
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=local.parent, prefix=".punctuation-", suffix=".yaml", delete=False) as stream:
+                    stream.write(yaml.safe_dump(legacy, allow_unicode=True, sort_keys=False))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    temporary = Path(stream.name)
+                try:
+                    archive.move("config/local.yaml", "标点升级为必需组件，移除旧标点开关并保留其余配置")
+                    temporary.replace(local)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except (UnicodeError, yaml.YAMLError, RecursionError):
+            pass  # 下方权威加载入口统一归档损坏配置。
     try:
         if local.is_file() and local.stat().st_size > 4 * 1024 * 1024:
             raise ValueError("本机覆盖配置超过兼容处理大小限制")

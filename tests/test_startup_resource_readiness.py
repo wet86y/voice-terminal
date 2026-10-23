@@ -95,7 +95,7 @@ class StartupResourceReadinessTests(unittest.TestCase):
 
         requirements = required_model_resources(config)
 
-        self.assertEqual(requirements["asr"], ["paraformer-streaming"])
+        self.assertEqual(requirements["asr"], ["paraformer-streaming", "streaming-punctuation"])
         self.assertEqual(requirements["voice"], ["fsmn-vad", "kws-sherpa-onnx"])
         self.assertEqual(requirements["analysis"], ["smart-turn"])
         self.assertEqual(requirements["speaker"], ["wespeaker-cnceleb-resnet34"])

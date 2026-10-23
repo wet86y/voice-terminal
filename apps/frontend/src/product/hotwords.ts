@@ -5,7 +5,8 @@ export interface HotwordEntry {
   blacklist: string[] // blacklist（邻近排除词）。
 }
 export interface HotwordSettings {
-  enabled: boolean // enabled（是否启用识别后纠正）。
+  enabled: boolean // enabled（热词总开关）。
+  stream_enabled: boolean // stream_enabled（主流式后置热词开关）。
   threshold: number // threshold（音素相似度门槛）。
   entries: HotwordEntry[] // entries（热词列表）。
 }
@@ -17,6 +18,7 @@ export interface HotwordPreview {
   elapsed_ms: number // elapsed_ms（处理耗时，毫秒）。
 }
 export function exportHotwordText(entries: HotwordEntry[]) {
-  return entries.map(entry => [entry.word, ...entry.aliases].join(' | ')
-    + (entry.blacklist.length ? ` ~~~ ${entry.blacklist.join(' | ')}` : '')).join('\n')
+  const cell = (value: string) => `"${value.replaceAll('"', '""')}"`
+  return '热词,别名,排除词\r\n' + entries.map(entry =>
+    [entry.word, entry.aliases.join('；'), entry.blacklist.join('；')].map(cell).join(',')).join('\r\n')
 }

@@ -262,12 +262,14 @@ class TtsVoiceOperationManager:
         try:
             result = await client.transcribe_reference(samples.astype("<i2").tobytes())
         except TimeoutError as exc:
-            raise TtsVoiceOperationError("离线转写超过 30 秒，音频已保留，可重试或手填。") from exc
+            raise TtsVoiceOperationError("参考音频转写超过 30 秒，音频已保留，可重试或手填。") from exc
         finally:
             await client.close()
         if not result.get("complete") or not isinstance(result.get("text"), str) or not result["text"].strip():
             raise TtsVoiceOperationError("未识别到完整人声，音频已保留，请校对或重试。")
-        return {"asset_id": operation.request["asset_id"], "text": result["text"].strip()}
+        return {"asset_id": operation.request["asset_id"], "text": result["text"].strip(),
+                "route": result.get("route"), "fallback_reason": result.get("fallback_reason"),
+                "punctuation_status": result.get("punctuation_status"), "punctuation_error": result.get("punctuation_error")}
 
     async def _preview(self, operation):
         model = operation.request["model"]

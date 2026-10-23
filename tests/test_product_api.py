@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 import httpx
-from unittest.mock import AsyncMock, PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch, ANY
 
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.config import COMPUTE_MODEL_IDS
@@ -37,6 +37,24 @@ class FakeVault:
 
 
 class ProductApiTests(unittest.TestCase):
+    async def _mock_compute_operation(self, body, *, ticket, result=None, failure=None):
+        """模拟已接纳的后台事务，保留真实运行状态及失败记录。"""
+        from voice_terminal.server.runtime_operations import runtime_operation
+        async with runtime_operation(self.runtime, f"compute_device:{body['model_id']}", "测试设备切换", ticket=ticket):
+            if failure:
+                raise failure
+            return result
+
+    def _compute_request_and_finish(self, payload):
+        async def run():
+            response = await self._request("PUT", "/api/v1/product/settings/compute", json=payload)
+            tasks = tuple(getattr(self.runtime, "_compute_switch_tasks", {}))
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            row = self.runtime._runtime_operations.registry.items[response.json()["operation_id"]]
+            return response, row
+        return asyncio.run(run())
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -152,16 +170,18 @@ class ProductApiTests(unittest.TestCase):
         }
         saved_compute = {"devices": devices, "fallback_devices": dict(before["fallback_devices"])}
         saved_compute["fallback_devices"]["emotion"] = "cuda"
-        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(return_value=saved_compute)) as switch:
-            saved = asyncio.run(self._request(
-                "PUT", "/api/v1/product/settings/compute", json={"model_id": "emotion", "device": "cuda"},
-            ))
+        async def apply(body, *, ticket):
+            return await self._mock_compute_operation(body, ticket=ticket, result=saved_compute)
+        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(side_effect=apply)) as switch:
+            saved, operation = self._compute_request_and_finish({"model_id": "emotion", "device": "cuda"})
         self.assertEqual(saved.status_code, 200)
         self.assertFalse(saved.json()["restart_required"])
-        self.assertFalse(saved.json()["pending"])
+        self.assertTrue(saved.json()["pending"])
+        self.assertTrue(saved.json()["accepted"])
         self.assertEqual(saved.json()["effective_from"], "immediate")
-        switch.assert_awaited_once_with({"model_id": "emotion", "device": "cuda"})
-        self.assertEqual(saved.json()["settings"]["compute"]["devices"], devices)
+        switch.assert_awaited_once_with({"model_id": "emotion", "device": "cuda"}, ticket=ANY)
+        self.assertEqual(operation["state"], "succeeded")
+        self.assertEqual(operation["target"], "compute_device:emotion")
         self.assertEqual({key: value for key, value in devices.items() if key != "emotion"},
                          {key: value for key, value in before["devices"].items() if key != "emotion"})
         with patch.object(
@@ -194,25 +214,26 @@ class ProductApiTests(unittest.TestCase):
 
     def test_compute_api_rejects_gpu_when_model_backend_is_missing(self) -> None:
         previous = self.runtime.product_settings.snapshot()["compute"]["devices"]["emotion"]
-        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(
-                side_effect=ValueError("emotion 暂不能使用 GPU：后端未安装"))):
-            response = asyncio.run(self._request(
-                "PUT", "/api/v1/product/settings/compute", json={"model_id": "emotion", "device": "cuda"},
-            ))
-        self.assertEqual(response.status_code, 422)
+        async def apply(body, *, ticket):
+            return await self._mock_compute_operation(body, ticket=ticket, failure=ValueError("emotion 暂不能使用 GPU：后端未安装"))
+        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(side_effect=apply)):
+            response, operation = self._compute_request_and_finish({"model_id": "emotion", "device": "cuda"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["accepted"])
+        self.assertEqual(operation["state"], "failed")
         self.assertEqual(
             self.runtime.product_settings.snapshot()["compute"]["devices"]["emotion"],
             previous,
         )
 
     def test_compute_api_reports_model_switch_and_rollback_failures(self) -> None:
-        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(
-                side_effect=RuntimeError("设备切换失败且恢复原模型失败，已停止监听：工作进程加载失败"))):
-            response = asyncio.run(self._request(
-                "PUT", "/api/v1/product/settings/compute", json={"model_id": "paraformer", "device": "cuda"},
-            ))
-        self.assertEqual(response.status_code, 503)
-        self.assertIn("恢复原模型失败", response.json()["detail"])
+        async def apply(body, *, ticket):
+            return await self._mock_compute_operation(body, ticket=ticket, failure=RuntimeError("设备切换失败且恢复原模型失败"))
+        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(side_effect=apply)):
+            response, operation = self._compute_request_and_finish({"model_id": "paraformer", "device": "cuda"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["pending"])
+        self.assertEqual(operation["state"], "failed")
 
     def test_compute_refresh_requests_new_environment_check(self) -> None:
         with patch.object(self.runtime, "compute_status", new=AsyncMock(return_value={"models": {}, "hardware": {}})) as probe:
@@ -222,12 +243,12 @@ class ProductApiTests(unittest.TestCase):
 
     def test_compute_rejects_gpu_when_framework_exists_but_model_file_is_missing(self) -> None:
         previous = self.runtime.product_settings.snapshot()["compute"]["devices"]["paraformer"]
-        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(
-                side_effect=ValueError("Paraformer 资源未配置完整"))):
-            response = asyncio.run(self._request("PUT", "/api/v1/product/settings/compute",
-                json={"model_id": "paraformer", "device": "cuda"}))
-        self.assertEqual(response.status_code, 422)
-        self.assertIn("资源未配置完整", response.json()["detail"])
+        async def apply(body, *, ticket):
+            return await self._mock_compute_operation(body, ticket=ticket, failure=ValueError("Paraformer 资源未配置完整"))
+        with patch.object(self.runtime, "switch_compute_device", new=AsyncMock(side_effect=apply)):
+            response, operation = self._compute_request_and_finish({"model_id": "paraformer", "device": "cuda"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(operation["state"], "failed")
         self.assertEqual(self.runtime.product_settings.snapshot()["compute"]["devices"]["paraformer"], previous)
 
     def test_owner_only_barge_in_requires_profile_and_worker_even_when_mode_off(self) -> None:
