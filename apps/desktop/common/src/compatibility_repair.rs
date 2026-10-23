@@ -70,39 +70,62 @@ fn selected_local(context:&LaunchContext)->Option<String>{
     (selection["backend"]=="voxcpm1").then(||format!("tts-{}",selection["local_model"].as_str().unwrap_or("voxcpm2")))
 }
 
-/// enforce_upgrade（强制完成升级）：持有产品互斥锁，完成前不启动正式业务。
-/// 外部条件失败保留新版本体、修复阶段和已验证下载缓存，下次继续，不回滚旧配置。
+/// enforce_upgrade（完成普通升级）：复用静态登记匹配的组件，只修复缺失或变更项。
 pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<(),String>{
+    maintain(root,cancel,progress,false)
+}
+
+/// verify_and_repair（全面完整性维修）：由 --repair-config（当前构建维修参数）显式进入。
+pub fn verify_and_repair(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<(),String>{
+    maintain(root,cancel,progress,true)
+}
+
+/// maintain（共用维护流程）：full_verification（全面内容校验）由入口决定，事务及故障恢复共用。
+fn maintain(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,full_verification:bool)->Result<(),String>{
+    maintain_with_settings(root,cancel,progress,full_verification,settings)
+}
+
+// settings_repair（权威设置处理入口）供微型工作区回归注入，正式路径始终使用上方工作进程。
+fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,full_verification:bool,
+    mut settings_repair:impl FnMut(&LaunchContext,bool,&AtomicBool)->Result<(),String>)->Result<(),String>{
     installation::ensure_idle(root)?;
     let _guard=WorkspaceGuard::acquire(root)?;
     let _verification=crate::verification::VerificationSession::begin();
     let context=LaunchContext::portable(root)?;
     resources::recover(&context)?;
-    let policy=rules(&context.program,false)?;
-    let release=read(&context.program.join("release.json"))?;
+    rules(&context.program,false)?;
     let state=read(&state_path(&context)?).unwrap_or(Value::Null);
     let mut reset_devices=state["enforcement"]["reset_devices"]==true;
     let result=(||{
         repair_bootstrap_policy(&context)?;
-        checkpoint(&context,"verify_components",reset_devices,None)?;
-        progress("兼容处理：完整核对现有环境、模型与代理组件",0,0);
-        resources::prepare_maintenance_verification(&context,&cancel,progress)?;
+        if full_verification{
+            checkpoint(&context,"verify_components",reset_devices,None)?;
+            progress("完整性维护：单轮核对现有环境、模型与代理组件",0,0);
+            resources::prepare_maintenance_verification(&context,&cancel,progress)?;
+        }
         checkpoint(&context,"repair_environment",reset_devices,None)?;
-        progress("兼容处理：尝试修复现有运行环境",0,0);
-        // 两阶段共享进度由 RefCell（同线程可变借用）串行借用，不创建并行安装。
-        let reporter=std::cell::RefCell::new(&mut *progress);
-        repair_twice(&cancel,|rebuild|runtime::configure(&context,if rebuild{"cpu"}else{"all"},cancel.clone(),&mut **reporter.borrow_mut()),||{
-            resources::recover(&context)?;
-            if runtime::validate_current(&context,&cancel,&mut **reporter.borrow_mut()).is_ok(){return Ok(());}
-            resources::check_cancel(&cancel)?;
-            reporter.borrow_mut()("兼容处理：清除未通过修复的旧运行环境",0,0);
-            reset_devices=true;
-            checkpoint(&context,"rebuild_environment",true,None)?; // 清除前持久化，重试不能丢失设备回退要求。
-            remove_invalid(&context,&context.install.join("runtimes/python"))
-        })?;
+        resources::check_cancel(&cancel)?;
+        if !full_verification && runtime::current_for_upgrade(&context)?{
+            progress("复用登记与依赖锁匹配的语音环境",1,1);
+        }else{
+            progress("兼容处理：尝试修复现有运行环境",0,0);
+            // 两阶段共享进度由 RefCell（同线程可变借用）串行借用，不创建并行安装。
+            let reporter=std::cell::RefCell::new(&mut *progress);
+            repair_twice(&cancel,|rebuild|runtime::configure(&context,if rebuild{"cpu"}else{"all"},cancel.clone(),&mut **reporter.borrow_mut()),||{
+                resources::recover(&context)?;
+                if runtime::validate_current(&context,&cancel,&mut **reporter.borrow_mut()).is_ok(){return Ok(());}
+                resources::check_cancel(&cancel)?;
+                reporter.borrow_mut()("兼容处理：清除未通过修复的旧运行环境",0,0);
+                reset_devices=true;
+                checkpoint(&context,"rebuild_environment",true,None)?; // 清除前持久化，重试不能丢失设备回退要求。
+                remove_invalid(&context,&context.install.join("runtimes/python"))
+            })?;
+        }
         checkpoint(&context,"repair_settings",reset_devices,None)?;
         progress("兼容处理：归档故障资料并恢复有效设置",0,0);
-        settings(&context,reset_devices,&cancel)?;
+        settings_repair(&context,reset_devices,&cancel)?;
+        let settings_path=safe_path(&context.data,"config/product-settings.json")?;
+        let validated_settings_hash=file_hash(&settings_path)?;
         if crate::credentials::configured_tts_selection(&context.data)["backend"]!="voxcpm1"
             && crate::credentials::status(&context.data)?["providers"]["minimax"]["configured"]!=true {
             fallback_tts(&context)?;
@@ -117,6 +140,10 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
                 || (local.is_some()&&id=="tts-audiocpp-runtime");
             // 可选组件缺失仍非阻塞；已经安装的可选组件进入同样的强制修复路径。
             if !needed&&!destination.exists(){continue;}
+            if !full_verification && resources::current_for_upgrade(&context,&item){
+                progress(&format!("复用静态记录匹配的组件：{id}（组件编号）"),1,1);
+                continue;
+            }
             progress(&format!("兼容处理：核对并修复 {id}（组件编号）"),0,0);
             let attempt=resources::download_resource(&context,id,cancel.clone(),progress);
             if attempt.is_err(){
@@ -138,26 +165,12 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
         }
         checkpoint(&context,"verify",reset_devices,None)?;
         progress("正在校验强制兼容处理结果",0,0);
-        settings(&context,reset_devices,&cancel)?;
-        let rows=resources::inventory_raw(&context)?;
-        // 环境与每项受管组件已在本轮验证或修复换入；这里只复核组合状态，不再重读全部内容。
-        if let Some(row)=rows.iter().find(|row|row["required"]!=false&&row["can_start"]!=true){
-            return Err(format!("{}仍待修复：{}",row["label"].as_str().unwrap_or("必需组件"),row["error"].as_str().unwrap_or("未通过实际校验")));
-        }
-        let checked=inventory(&context)?;
-        let compatibility=&checked.first().ok_or("最终兼容盘点缺少语音服务")?["compatibility"];
-        if compatibility["stable"]!=true || compatibility["tasks"].as_array().is_none_or(|tasks|tasks.iter().any(|task|task["required"]==true&&task["status"]!="compatible")) {
-            return Err("最终兼容盘点仍有必需修复事项，继续强制修复。".into());
-        }
-        checkpoint(&context,"complete",reset_devices,None)?;
-        // 最终结论绑定当前工作区、构建、规则和实际设置；不复用上次升级的成功标记。
-        let mut current=read(&state_path(&context)?)?;
-        current["workspace_id"]=json!(context.workspace_id);
-        current["target_build"]=release["build"].clone();
-        current["rules_digest"]=json!(digest(&policy));
-        current["settings_sha256"]=json!(file_hash(&safe_path(&context.data,"config/product-settings.json")?)?);
-        atomic_json(&state_path(&context)?,&current)?;
-        let ready=inventory(&context)?;
+        // 仅当组件处理或在线语音回退改变设置时，才重新运行权威设置修复及业务资料检查。
+        if file_hash(&settings_path)?!=validated_settings_hash{settings_repair(&context,reset_devices,&cancel)?;}
+        resources::check_cancel(&cancel)?;
+        crate::verification::ensure_unchanged()?;
+        // 单次即时盘点核对组件、规则、配置回执及事务，并仅在全部通过后提交 complete（完成）。
+        let ready=complete_maintenance(&context)?;
         if ready.first().is_none_or(|row|row["can_start"]!=true || row["compatibility"]["status"]!="compatible") {
             return Err("最终启动条件在复核后发生变化，修复尚未完成。".into());
         }
@@ -175,6 +188,40 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn ordinary_update_reuses_components_and_only_revalidates_changed_settings(){
+        for fallback in [false,true]{
+            let fixture=super::super::tests::Fixture::new();let root=&fixture.root;
+            let lock=root.join("app/config/runtime/voice-runtime.lock.json");
+            atomic_json(&lock,&json!({"schema":1,"python":{"version":"3.12.10"}})).unwrap();
+            let runtime=root.join("runtimes/python");fs::create_dir_all(&runtime).unwrap();
+            fs::write(runtime.join("python.exe"),b"unexecutable fixture").unwrap();
+            atomic_json(&runtime.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":"cpu-private",
+                "lock_sha256":file_hash(&lock).unwrap(),"groups":["voice-core","torch-cpu","onnx-cpu","sherpa-cpu","modelscope-download","onnx-vad"]})).unwrap();
+            atomic_json(&runtime.join("manifest.json"),&resources::manifest(&runtime,"python","fixture").unwrap()).unwrap();
+            let component=root.join("models/test-model");fs::create_dir_all(&component).unwrap();fs::write(component.join("model.bin"),b"good").unwrap();
+            let item=json!({"resource_id":"test-model","kind":"model","version":"1","destination":"test-model",
+                "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&component.join("model.bin")).unwrap()}]});
+            resources::write_model_receipt(&component,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+            atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[item]})).unwrap();
+            let before=fs::read(component.join("resource-install.json")).unwrap();let mut calls=0;let mut phases=vec![];
+            maintain_with_settings(root,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|phases.push(phase.to_owned()),false,|context,_,_|{
+                calls+=1;
+                let path=context.data.join("config/product-settings.json");
+                let settings=if calls==1{json!({"schema_version":rules(&context.program,false)?["settings_schema_max"],
+                    "tts":{"backend":if fallback{"minimax"}else{"voxcpm1"},"local_model":"voxcpm2"}})}else{read(&path)?};
+                atomic_json(&path,&settings)?;
+                atomic_json(&context.data.join("state/settings-validation.json"),&json!({"schema":1,"settings_schema":settings["schema_version"],"sha256":file_hash(&path)?}))
+            }).unwrap();
+            assert_eq!(calls,if fallback{2}else{1});
+            assert!(phases.iter().any(|phase|phase=="复用登记与依赖锁匹配的语音环境"));
+            assert!(phases.iter().any(|phase|phase.starts_with("复用静态记录匹配的组件")));
+            assert!(!phases.iter().any(|phase|phase.contains("校验组件文件内容")));
+            assert_eq!(fs::read(component.join("resource-install.json")).unwrap(),before);
+            assert_eq!(read(&root.join(TRANSACTION_PATHS[0])).unwrap()["enforcement"]["phase"],"complete");
+        }
+    }
+
     #[test] fn cleanup_rejects_unregistered_data_and_root(){
         let fixture=super::super::tests::Fixture::new();
         assert!(remove_invalid(&fixture.context,&fixture.root.join("data/speaker")).is_err());

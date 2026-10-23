@@ -116,6 +116,21 @@ pub fn status(context:&LaunchContext)->Result<Value,String>{
     Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"full_ready":full_ready,"python":context.python,"version":record["python"],"update_available":update_available,"groups":groups,"components":components,
         "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"六个必需语音依赖组与基础锁定清单一致，不要求安装可选显卡或原生语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"必需运行环境的依赖锁版本可更新","groups":"内部共享依赖组","components":"语音服务下三个运行依赖卡片","ready":"该组就绪","reason":"未就绪原因"}}))
 }
+/// current_for_upgrade（更新复用条件）：既有完整安装登记及依赖锁匹配，不创建解释器探测进程。
+pub(crate) fn current_for_upgrade(context:&LaunchContext)->Result<bool,String>{
+    let root=context.install.join("runtimes/python");
+    let record=resources::load(&safe_path(&root,"runtime.json")?).unwrap_or(Value::Null);
+    if status(context)?["full_ready"]!=true || record["python"].as_str().is_none_or(str::is_empty) || record["python"]!=lock(context)?["python"]["version"]
+        || (managed_gpu(&record)&&!gpu_current(context,&record)){return Ok(false);}
+    // 只读取安装清单的记录结构，不访问其中的依赖文件；坏清单不能继承环境复用资格。
+    let manifest=resources::load(&safe_path(&root,"manifest.json")?).unwrap_or(Value::Null);
+    let Some(files)=manifest["files"].as_array()else{return Ok(false)};
+    if manifest["schema"]!=1||manifest["kind"]!="python"||!files.iter().any(|row|row["path"]=="python.exe"){return Ok(false);}
+    let mut seen=std::collections::HashSet::new();
+    Ok(files.iter().all(|row|row["path"].as_str().is_some_and(|path|crate::workspace::relative_path(path).is_ok()&&seen.insert(path.to_lowercase()))
+        &&row["size"].as_u64().is_some()&&row["sha256"].as_str().is_some_and(|hash|hash.len()==64&&hash.bytes().all(|byte|byte.is_ascii_hexdigit()))))
+}
+
 pub fn system_candidates()->Vec<PathBuf>{
     // qualification（隔离验收）允许检查纯下载路线，正式构建不接受此开关。
     if cfg!(feature="qualification")&&std::env::var_os("VOICE_QUALIFICATION_NO_SYSTEM_REUSE").is_some(){return vec![];}
@@ -491,6 +506,29 @@ mod tests {
         assert_eq!(rows[2]["resource_id"],GPU_RESOURCE);assert_eq!(rows[2]["required"],false);assert_eq!(rows[2]["can_start"],false);
         assert!(effective_lock(&context,false).is_ok());assert!(effective_lock(&context,true).is_err());
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn update_reuses_recorded_runtime_without_starting_interpreter_or_hashing_its_tree(){
+        let (owner,root,context)=runtime_workspace();
+        assert!(!current_for_upgrade(&context).unwrap());
+        let runtime=root.join("runtimes/python");
+        let manifest=resources::manifest(&runtime,"python","fixture").unwrap();
+        fs::write(runtime.join("manifest.json"),b"{invalid json").unwrap();
+        assert!(!current_for_upgrade(&context).unwrap());
+        for files in [json!([]),json!([{"path":"python.exe","sha256":"00".repeat(32)}]),json!([{"path":"../python.exe","size":1,"sha256":"00".repeat(32)}])]{
+            atomic_json(&runtime.join("manifest.json"),&json!({"schema":1,"kind":"python","files":files})).unwrap();
+            assert!(!current_for_upgrade(&context).unwrap());
+        }
+        atomic_json(&runtime.join("manifest.json"),&manifest).unwrap();
+        // python.exe（解释器）是不可执行的微型替身；复用判断不应创建进程，也不重读其内容。
+        assert!(current_for_upgrade(&context).unwrap());
+        fs::write(runtime.join("python.exe"),b"changed").unwrap();
+        assert!(current_for_upgrade(&context).unwrap());
+        let lock_path=root.join("app/config/runtime/voice-runtime.lock.json");
+        let mut changed=fs::read(&lock_path).unwrap();changed.push(b'\n');fs::write(&lock_path,changed).unwrap();
+        assert!(!current_for_upgrade(&context).unwrap());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
     #[test]

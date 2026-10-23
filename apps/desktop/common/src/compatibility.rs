@@ -9,7 +9,7 @@ const DEFAULT_RULES: &str = include_str!("../../../../config/compatibility.json"
 static EVALUATION: Mutex<()> = Mutex::new(()); // EVALUATION（评估互斥）：扫描和写回串行，旧扫描不能晚写覆盖新结果。
 #[path = "compatibility_repair.rs"]
 mod forced_repair;
-pub use forced_repair::enforce_upgrade;
+pub use forced_repair::{enforce_upgrade, verify_and_repair};
 
 fn lock() -> Result<MutexGuard<'static, ()>, String> { EVALUATION.lock().map_err(|_| "兼容性评估锁不可用。".into()) }
 fn now() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
@@ -208,6 +208,16 @@ pub fn inventory(context: &LaunchContext) -> Result<Vec<Value>, String> {
 
 /// inventory_with（带实际校验结论的盘点）：宿主的已知失败在同一次评估内合并，避免先记录成功再覆盖界面。
 pub fn inventory_with(context: &LaunchContext, validate: impl FnOnce(&mut Vec<Value>) -> Result<(), String>) -> Result<Vec<Value>, String> {
+    inventory_evaluated(context,validate,false)
+}
+
+/// complete_maintenance（最终盘点并提交）：在同一评估锁内生成兼容结论，成功后才标记维护完成。
+fn complete_maintenance(context:&LaunchContext)->Result<Vec<Value>,String>{
+    inventory_evaluated(context,|_|Ok(()),true)
+}
+
+/// inventory_evaluated（统一兼容评估）：completing（提交本轮维护完成）只在最终核对成功后生效。
+fn inventory_evaluated(context:&LaunchContext,validate:impl FnOnce(&mut Vec<Value>)->Result<(),String>,completing:bool)->Result<Vec<Value>,String>{
     let _guard = lock()?;
     let path = state_path(context)?;
     let mut rows = resources::inventory_raw(context)?;
@@ -232,8 +242,10 @@ pub fn inventory_with(context: &LaunchContext, validate: impl FnOnce(&mut Vec<Va
     };
     let settings_hash=crate::workspace::file_hash(&settings).ok();
     let receipt=read(&safe_path(&context.data,"state/settings-validation.json")?).unwrap_or(Value::Null);
-    if prior["enforcement"]["phase"]=="complete" && !(settings_hash.as_deref()==prior["settings_sha256"].as_str() && settings_hash.is_some())
-        && !(receipt["schema"]==1 && receipt["settings_schema"]==policy["settings_schema_max"] && settings_hash.is_some() && receipt["sha256"].as_str()==settings_hash.as_deref()) {
+    let settings_validated=receipt["schema"]==1 && receipt["settings_schema"]==policy["settings_schema_max"]
+        && settings_hash.is_some() && receipt["sha256"].as_str()==settings_hash.as_deref();
+    if (completing && !settings_validated) || (prior["enforcement"]["phase"]=="complete"
+        && !(settings_hash.as_deref()==prior["settings_sha256"].as_str() && settings_hash.is_some()) && !settings_validated) {
         settings_issue=Some("设置已在最近一次实际校验后发生变化，需要重新执行兼容修复。");
     }
     state["settings_sha256"]=if settings_issue.is_none(){json!(settings_hash)}else{prior["settings_sha256"].clone()};
@@ -262,10 +274,15 @@ pub fn inventory_with(context: &LaunchContext, validate: impl FnOnce(&mut Vec<Va
         state["applied_settings_rules"] = prior["applied_settings_rules"].clone();
         state["preserved_settings"] = prior["preserved_settings"].clone();
         state["enforcement"] = prior["enforcement"].clone();
-        if prior["enforcement"].is_object() && prior["enforcement"]["phase"]!="complete" {
+        if !completing && prior["enforcement"].is_object() && prior["enforcement"]["phase"]!="complete" {
             state["status"]=json!("needs_repair");
             if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("升级兼容处理尚未完成，请继续运行安装器完成强制修复。");}
         }
+    }
+    if completing && state["status"]=="compatible"{
+        state["enforcement"]=prior["enforcement"].clone();
+        state["enforcement"]["phase"]=json!("complete");
+        state["enforcement"]["reason"]=Value::Null;
     }
     state["observation_digest"] = json!(digest(&json!({"rows":rows,"settings":settings_value.as_ref().ok().map(digest),"build":release["build"],"rules":policy,"stable":stable})));
     // 相同观测不反复刷盘；返回值的核对时间仍是本次真实读取时间。

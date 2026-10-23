@@ -1156,7 +1156,7 @@ fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_
     for item in records{
         validation_cancel(cancel)?;
         let (path,size)=present.remove(&item["path"].as_str().unwrap().to_lowercase()).unwrap();
-        if size!=item["size"].as_u64().unwrap(){return Err(format!("组件文件校验失败：{}",path.display()));}
+        if size!=item["size"].as_u64().ok_or("清单大小无效")?{return Err(format!("组件文件校验失败：{}",path.display()));}
         let sha256=item["sha256"].as_str().ok_or("清单摘要无效")?;
         if sha256.len()!=64||!sha256.bytes().all(|byte|byte.is_ascii_hexdigit()){return Err("清单摘要无效".into());}
         files.push(ValidationFile{path,size,sha256:sha256.to_lowercase()});
@@ -1276,6 +1276,21 @@ mod component_validation_tests {
         fs::write(root.join("empty.bin"),b"").unwrap();
         atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"fixture","1").unwrap()).unwrap();root
     }
+    #[test]
+    fn malformed_file_sizes_return_errors_instead_of_panicking(){
+        let root=fixture();let original=load(&root.join("manifest.json")).unwrap();
+        for size in [Value::Null,json!("4096"),json!(-1),json!({})]{
+            let mut manifest=original.clone();manifest["files"][0]["size"]=size;
+            atomic_json(&root.join("manifest.json"),&manifest).unwrap();
+            assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("清单大小无效"));
+            let _session=crate::verification::VerificationSession::begin();
+            let records=manifest["files"].as_array().unwrap().clone();let key=crate::verification::key(&records,true,false);
+            verify_batches(vec![crate::verification::Batch{root:root.clone(),records,exact:true,python:false}],&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+            assert!(crate::verification::reuse(&root,&key).unwrap().unwrap_err().contains("清单大小无效"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn complete_hashes_report_progress_on_caller_and_accept_empty_unicode_files(){
         let root=fixture();let caller=thread::current().id();let mut bytes=vec![];let mut phases=vec![];

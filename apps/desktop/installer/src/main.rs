@@ -22,11 +22,13 @@ struct Installer{
     update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
-fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
+fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,repair:bool,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
     let _verification=voice_desktop_common::verification::VerificationSession::begin();
     let mut delay=2u64;
     loop {
-        match voice_desktop_common::compatibility::enforce_upgrade(root,cancel.clone(),progress){
+        let result=if repair{voice_desktop_common::compatibility::verify_and_repair(root,cancel.clone(),progress)}
+            else{voice_desktop_common::compatibility::enforce_upgrade(root,cancel.clone(),progress)};
+        match result{
             Ok(())=>return Ok(()),
             Err(error)=>{
                 if cancel.load(Ordering::Acquire){return Err(error);}
@@ -65,7 +67,7 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
             drop(guard);if valid{state.installed.store(true,Ordering::Release);}
         }
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
-        complete_compatibility(&root,state.cancel.clone(),&mut progress)?;
+        complete_compatibility(&root,state.cancel.clone(),state.repair,&mut progress)?;
         if !cfg!(feature="qualification"){
             progress("正在保存当前版本校验程序",0,0);
             let version=installation::package_version(PACKAGE)?;

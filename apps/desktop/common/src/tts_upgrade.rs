@@ -38,6 +38,12 @@ fn prepare_with_space(root:&Path,stage:&Path,release:&mut Value,cancel:&AtomicBo
         safe_path(&source,name)?;
         if !seen.insert(name.to_lowercase())||row["size_bytes"].as_u64().is_none()||row["sha256"].as_str().is_none(){return Err("原生文件清单无效或重复。".into());}
     }
+    // 目标收据及必要文件大小一致时，无需再次核验、复制基础库，也无需预留迁移空间。
+    // 全面内容检查由显式维修统一处理，避免迁移入口先读一遍未变化组件。
+    if source==managed&&resources::model_receipt_current(&source,spec){
+        progress("本地语音运行组件记录匹配，复用当前安装",1,1);
+        return Ok(vec![]);
+    }
     // 基础库只接受新清单的实际内容；旧收据缺失或失效可由此次强校验修复。
     // 基础库不兼容时仍允许本体升级，新后端会明确阻止过期组件参与本地语音。
     for row in files.iter().filter(|row|row["archive_id"]!="patch"&&row["optional"]!=true){
@@ -58,20 +64,6 @@ fn prepare_with_space(root:&Path,stage:&Path,release:&mut Value,cancel:&AtomicBo
         defer(release,format!("暂存语音组件空间不足：需要 {required} 字节，可用 {available} 字节"),"清理磁盘空间后重新运行安装器，或在组件管理中更新本地语音共用运行程序");
         progress("语音组件暂存空间不足：保留旧组件，先更新程序本体",1,1);
         return Ok(vec![]);
-    }
-    // 已安装目标组件时只核验，不重复写入近一千兆字节基础库。
-    if source==managed{
-        if let Ok((id,version,records))=resources::read_model_receipt(&source){
-            let mut current=id=="tts-audiocpp-runtime"&&version.as_deref()==spec["version"].as_str()
-                &&files.iter().filter(|row|row["optional"]!=true).all(|row|records.iter().any(|prior|prior["path"]==row["path"]&&prior["size"]==row["size_bytes"]&&prior["sha256"]==row["sha256"]));
-            for row in files.iter().filter(|row|row["archive_id"]=="patch"&&row["optional"]!=true){
-                if !current{break;}check_cancel(cancel)?;
-                let path=safe_path(&source,row["path"].as_str().unwrap())?;
-                current=path.is_file()&&path.metadata().map_err(|e|e.to_string())?.len()==row["size_bytes"].as_u64().unwrap()
-                    &&workspace::file_hash_with_progress(&path,cancel,progress)?==row["sha256"].as_str().unwrap();
-            }
-            if current{progress("本地语音运行组件已是当前修复版本",1,1);return Ok(vec![]);}
-        }
     }
     let patch=&spec["source"]["transfer"]["patch"];
     let asset=patch["asset"].as_str().ok_or("随包语音补丁路径缺失")?;
@@ -120,6 +112,30 @@ fn prepare_with_space(root:&Path,stage:&Path,release:&mut Value,cancel:&AtomicBo
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn current_tts_receipt_skips_content_scan_and_staging_space_check(){
+        let root=std::env::temp_dir().join(format!("voice-tts-current-{}",workspace::new_id()));
+        let runtime=root.join(RUNTIME);let stage=root.join("tmp/publish/new");
+        fs::create_dir_all(runtime.join("cuda")).unwrap();fs::create_dir_all(stage.join("app/config/resources")).unwrap();
+        fs::write(runtime.join("cuda/audiocpp_server.exe"),b"native").unwrap();
+        fs::write(runtime.join("cuda/base.dll"),b"base").unwrap();
+        let spec=json!({"resource_id":"tts-audiocpp-runtime","destination":"audiocpp/runtime","version":"current",
+            "source":{"transfer":{"kind":"official_audiocpp_patch"}},"files":[
+                {"path":"cuda/audiocpp_server.exe","archive_id":"patch","size_bytes":6,"sha256":file_hash(&runtime.join("cuda/audiocpp_server.exe")).unwrap()},
+                {"path":"cuda/base.dll","archive_id":"binary","size_bytes":4,"sha256":file_hash(&runtime.join("cuda/base.dll")).unwrap()}]});
+        resources::write_model_receipt(&runtime,&spec,spec["files"].as_array().unwrap().iter()
+            .map(|row|json!({"path":row["path"],"size":row["size_bytes"],"sha256":row["sha256"],"optional":false})).collect()).unwrap();
+        atomic_json(&stage.join("app/config/resources/catalog.json"),&json!({"resources":[spec]})).unwrap();
+        fs::write(runtime.join("cuda/base.dll"),b"same").unwrap(); // 隐蔽内容损坏交由全面维修发现。
+        let mut release=json!({"build":"next"});
+        assert!(prepare_with_space(&root,&stage,&mut release,&AtomicBool::new(false),&mut|_,_,_|{},||panic!("未变化组件不需要暂存空间")).unwrap().is_empty());
+        assert!(release["deferred_migrations"].is_null());
+        fs::remove_file(runtime.join("cuda/base.dll")).unwrap();
+        assert!(prepare_with_space(&root,&stage,&mut release,&AtomicBool::new(false),&mut|_,_,_|{},||panic!("缺失基础库应在复制前退出")).unwrap().is_empty());
+        assert!(release["deferred_migrations"]["tts_audiocpp"]["reason"].as_str().unwrap().contains("base.dll"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn low_disk_space_defers_tts_before_copy_without_blocking_program_upgrade(){
         let root=std::env::temp_dir().join(format!("voice-tts-space-{}",workspace::new_id()));

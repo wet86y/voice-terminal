@@ -53,6 +53,13 @@ pub(crate) fn remember(root:&Path,key:String,result:Result<(),String>,watch:Opti
 }
 /// invalidate（写入前撤销）：成功和失败结果都不能跨组件替换沿用。
 pub(crate) fn invalidate(root:&Path){CURRENT.with(|current|{if let Some(current)=current.borrow_mut().as_mut(){current.retain(|(path,_),_|!path.starts_with(root)&&!root.starts_with(path));}})}
+/// observe_activation（观察换入结果）：新目标继续受本轮监视，不据此签发可复用的内容校验凭据。
+pub(crate) fn observe_activation(root:&Path){
+    if let Some(watch)=watch(root){CURRENT.with(|current|{if let Some(current)=current.borrow_mut().as_mut(){
+        // 内容缓存键始终是十六进制摘要；独立键只供 ensure_unchanged（最终变更检查）使用。
+        current.insert((root.to_path_buf(),"activation".into()),Receipt{result:Ok(()),watch});
+    }});}
+}
 pub(crate) fn ensure_unchanged()->Result<(),String>{CURRENT.with(|current|{
     if current.borrow().as_ref().is_some_and(|map|map.values().any(|receipt|receipt.result.is_ok()&&!receipt.watch.unchanged())){Err("维护期间受管组件发生外部变更，请重试完整性校验。".into())}else{Ok(())}
 })}
