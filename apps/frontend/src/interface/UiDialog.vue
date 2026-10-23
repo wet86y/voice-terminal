@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, watch } from "vue";
-const props = defineProps<{ open: boolean; title: string; busy?: boolean }>();
+const props = defineProps<{
+  open: boolean;
+  title: string;
+  busy?: boolean;
+  /** kicker（标题上方说明）：为空时沿用确认弹窗文案。 */
+  kicker?: string;
+  /** wide（宽弹窗）：为编辑器等长内容提供更宽的可读区域。 */
+  wide?: boolean;
+}>();
 const emit = defineEmits<{ close: [] }>();
 const panel = ref<HTMLElement | null>(null);
 let previous: HTMLElement | null = null;
@@ -52,12 +60,13 @@ onBeforeUnmount(() => document.removeEventListener("keydown", key));
       <section
         ref="panel"
         class="apply-dialog"
+        :class="{ 'apply-dialog-wide': props.wide }"
         role="dialog"
         aria-modal="true"
         aria-labelledby="dialog-title"
         tabindex="-1"
       >
-        <p class="panel-kicker">请确认</p>
+        <p class="panel-kicker">{{ props.kicker ?? "请确认" }}</p>
         <h2 id="dialog-title">{{ title }}</h2>
         <slot />
         <footer><slot name="actions" /></footer>

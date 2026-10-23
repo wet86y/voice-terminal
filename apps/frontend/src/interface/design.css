@@ -3179,6 +3179,9 @@ time {
   background: var(--panel);
   box-shadow: 0 24px 70px #0009;
 }
+.apply-dialog-wide {
+  max-width: min(900px, calc(100vw - 48px));
+}
 .apply-dialog h2 {
   margin: 8px 0 14px;
 }
