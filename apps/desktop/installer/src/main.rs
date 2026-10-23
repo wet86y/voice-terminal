@@ -23,28 +23,8 @@ struct Installer{
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
 fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,repair:bool,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
-    let _verification=voice_desktop_common::verification::VerificationSession::begin();
-    let mut delay=2u64;
-    loop {
-        let result=if repair{voice_desktop_common::compatibility::verify_and_repair(root,cancel.clone(),progress)}
-            else{voice_desktop_common::compatibility::enforce_upgrade(root,cancel.clone(),progress)};
-        match result{
-            Ok(())=>return Ok(()),
-            Err(error)=>{
-                if cancel.load(Ordering::Acquire){return Err(error);}
-                let message=error.to_lowercase();
-                let transient=["网络","连接超时","连接失败","连接被","远程主机","network","timed out","timeout","dns","failed to connect","http 429","http 500","http 502","http 503","http 504"].iter().any(|reason|message.contains(reason));
-                if !transient{return Err(error);}
-                progress(&format!("兼容处理：下载连接暂未恢复，{delay} 秒后自动继续修复"),0,0);
-                let deadline=Instant::now()+Duration::from_secs(delay);
-                while Instant::now()<deadline {
-                    if cancel.load(Ordering::Acquire){return Err("强制修复已中断，进度和下载缓存保留。".into());}
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                delay=(delay*2).min(30);
-            }
-        }
-    }
+    if repair{voice_desktop_common::compatibility::verify_and_repair(root,cancel,progress)}
+    else{voice_desktop_common::compatibility::enforce_upgrade(root,cancel,progress)}
 }
 #[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","operation":if state.repair{"integrity"}else if state.update_parent.is_some(){"update"}else{"install"},"frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","operation":"安装、更新或完整性维护","initialization":"本体安装或维护阶段"}}))}
 fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result<Value,String>{

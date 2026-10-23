@@ -16,6 +16,7 @@ pub struct PendingActivation {
     swapped:bool, // swapped（新目录是否已交换到固定目标）。
     committed:bool, // committed（宿主恢复就绪后是否已提交）。
     finished:bool, // finished（备份/记录是否已完成清理）。
+    companions:Vec<Value>, // companions（同事务资料）：模型清单、组件登记及已确认的旧声纹资料。
 }
 impl PendingActivation {
     pub fn is_committed(&self)->bool{self.committed} // is_committed（资源替换是否已持久提交）。
@@ -273,7 +274,9 @@ pub(crate) fn model_receipt_current(component:&Path,spec:&Value)->bool{
 /// current_for_upgrade（更新时复用）：仅核对当前目标及必要入口；完整内容验证由维修或实际写入负责。
 pub(crate) fn current_for_upgrade(context:&LaunchContext,item:&Value)->bool{
     if item["kind"]=="model"{
-        inspect_installed_model(context,item,false).is_ok_and(|installed|!model_update_available(item,&installed))
+        let Ok(root)=destination(context,item)else{return false;};
+        if root.join(MODEL_RECEIPT).is_file(){model_receipt_current(&root,item)}
+        else{inspect_installed_model(context,item,false).is_ok_and(|installed|!model_update_available(item,&installed))}
     }else if item["kind"]=="dsh"{
         destination(context,item).is_ok_and(|root|dsh_validate_with_progress(context,&root,false,&AtomicBool::new(false),&mut|_,_,_|{}).is_ok())
     }else{false}
@@ -447,6 +450,63 @@ pub(crate) fn prepare_maintenance_verification(context:&LaunchContext,cancel:&At
         }}
     }
     crate::verification::check(plans,cancel,progress)
+}
+/// maintenance_issues（收集维护问题）：只校验，不下载、安装或清除现用组件。
+pub(crate) fn maintenance_issues(context:&LaunchContext,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<Vec<Value>,String>{
+    let mut issues=vec![];
+    let mut issue=|id:&str,reason:String,content:bool|issues.push(json!({"resource_id":id,"reason":reason,"content_failure":content,"dispatched":false}));
+    let environment=context.install.join("runtimes/python");
+    let current=crate::runtime::current_for_upgrade(context)?;
+    let verified=if full&&environment.is_dir(){Some(crate::workspace::verify_tree_with_progress(&environment,"manifest.json",cancel,progress))}else{None};
+    check_cancel(cancel)?;
+    if let Some(Err(error))=verified{issue(crate::runtime::CPU_RESOURCE,format!("语音运行依赖完整性校验失败：{error}"),true);}
+    else if !current{issue(crate::runtime::CPU_RESOURCE,"语音运行依赖缺失或需要更新，请在系统组件中处理。".into(),false);}
+    let runtime=crate::runtime::status(context)?;
+    if runtime["components"].as_array().into_iter().flatten().any(|row|row["resource_id"]==crate::runtime::GPU_RESOURCE&&row["files_installed"]==true&&row["can_start"]!=true){
+        issue(crate::runtime::GPU_RESOURCE,"已安装的显卡运行依赖需要更新。".into(),false);
+    }
+    let prior=crate::component_maintenance::load(context)?;
+    for item in specs(context)?{
+        check_cancel(cancel)?;
+        let id=item["resource_id"].as_str().ok_or("组件编号缺失")?;
+        let root=destination(context,&item)?;
+        let known_failure=prior.as_ref().is_some_and(|record|record["issues"].as_array().unwrap().iter().any(|row|row["resource_id"]==id&&row["content_failure"]==true));
+        if item["required"]==false&&!root.exists()&&!known_failure{continue;}
+        let valid=if full&&root.is_dir(){
+            if item["kind"]=="model"{validate_model_files_with_progress(context,&item,&root,false,cancel,progress)}
+            else{dsh_validate_with_progress(context,&root,true,cancel,progress)}
+        }else{Ok(())};
+        check_cancel(cancel)?;
+        if let Err(error)=valid{issue(id,format!("组件完整性校验失败：{error}"),true);}
+        else if !current_for_upgrade(context,&item){issue(id,"组件缺失、版本或安装记录需要更新，请在组件列表中处理。".into(),false);}
+    }
+    Ok(issues)
+}
+
+/// disable_unavailable_enhancements（停用不可用增强）：沿用轻量收据检查，更新模型后由用户重新开启。
+pub fn disable_unavailable_enhancements(context:&LaunchContext)->Result<(),String>{
+    let selected=audio_enhancements(&context.data,None)?;
+    let mut disabled=vec![];
+    let report=crate::component_maintenance::load(context)?;
+    let catalog=specs(context)?;
+    for (field,id) in [("dual_pass","paraformer-offline"),("emotion","emotion2vec-plus-base"),("acoustic_events","yamnet")]{
+        let failed=report.as_ref().is_some_and(|record|record["issues"].as_array().unwrap().iter().any(|row|row["resource_id"]==id&&row["content_failure"]==true));
+        if selected[field]==true&&catalog.iter().find(|item|item["resource_id"]==id).is_some_and(|item|failed||!current_for_upgrade(context,item)){disabled.push(field);}
+    }
+    if disabled.is_empty(){return Ok(());}
+    let path=safe_path(&context.data,"config/product-settings.json")?;
+    let mut settings=if path.exists(){load(&path)?}else{json!({})};
+    if !settings.is_object(){return Err("产品设置文件无效，请先修复程序设置。".into());}
+    let receipt_path=safe_path(&context.data,"state/settings-validation.json")?;
+    let mut receipt=load(&receipt_path).unwrap_or(Value::Null);
+    let previously_valid=receipt["schema"]==1&&path.is_file()&&receipt["sha256"].as_str()==Some(file_hash(&path)?.as_str());
+    let mut enhancements=selected;
+    for field in disabled{enhancements[field]=json!(false);}
+    settings["audio_enhancements"]=enhancements;
+    atomic_json(&path,&settings)?;
+    // 仅续接原本有效的权威回执；已定义布尔开关变更不为未校验配置签发新凭据。
+    if previously_valid{receipt["sha256"]=json!(file_hash(&path)?);atomic_json(&receipt_path,&receipt)?;}
+    Ok(())
 }
 #[cfg(test)] // 旧启动算法仅供回归对照，正式启动不再执行。
 pub(crate) fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
@@ -639,12 +699,56 @@ pub fn recover(context:&LaunchContext)->Result<(),String>{
     if !(relative.starts_with("models/")||["runtimes/python","runtimes/dsh"].contains(&relative)){return Err("安装记录目标不在受管资源范围".into());}
     let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
     let committed=record["state"]=="committed";
+    let companions=activation_companions(&record)?;
     if !committed {
         if old.exists(){remove_owned(&target,&context.install)?;fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;fs::rename(&old,&target).map_err(|e|e.to_string())?;}
         else if record["original"]==false{remove_owned(&target,&context.install)?;}
-        if record["state"]=="swapped"{refresh_target_binding(context,relative,&target)?;}
-    }else{refresh_target_binding(context,relative,&target)?;}
+        restore_companions(context,&companions)?;
+        if companions.is_empty()&&record["state"]=="swapped"{refresh_target_binding(context,relative,&target)?;}
+    }else if companions.is_empty(){refresh_target_binding(context,relative,&target)?;}
+    remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     remove_owned(&old,&context.install)?;fs::remove_file(journal).map_err(|e|e.to_string())?;Ok(())
+}
+
+fn activation_companions(record:&Value)->Result<Vec<Value>,String>{
+    let Some(rows)=record.get("companions")else{return Ok(vec![])};
+    let mut seen=std::collections::HashSet::new();
+    let rows=rows.as_array().ok_or("组件事务附属资料格式无效。")?;
+    for row in rows{
+        let path=row["path"].as_str().ok_or("组件事务附属路径缺失。")?;
+        let metadata=matches!(path,"models/manifest.json"|"app/release.json");
+        let retired=path=="models/speaker/wespeaker-cnceleb-resnet34"||crate::installation::RETIRED_PROFILE_PATHS.contains(&path);
+        if !seen.insert(path)||!row["original"].is_boolean()||!((metadata&&row["copied"]==true)||(retired&&row["copied"]==false&&row["original"]==true&&record["target"]=="models/speaker/campplus-zh-cn-common")){
+            return Err("组件事务附属路径不在允许范围。".into());
+        }
+    }
+    Ok(rows.clone())
+}
+
+fn restore_companions(context:&LaunchContext,rows:&[Value])->Result<(),String>{
+    for row in rows.iter().rev(){
+        let relative=row["path"].as_str().unwrap();
+        let target=safe_path(&context.install,relative)?;
+        let backup=safe_path(&context.install,&format!("tmp/native-companions/{relative}"))?;
+        let backup_exists=match fs::symlink_metadata(&backup){Ok(_)=>true,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>false,Err(error)=>return Err(error.to_string())};
+        if backup_exists{
+            if row["copied"]==true&&target.is_file()&&file_hash(&target)?==file_hash(&backup)?{continue;}
+            remove_owned(&target,&context.install)?;
+            fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;
+            fs::rename(backup,target).map_err(|e|e.to_string())?;
+        }else if row["original"]==false{remove_owned(&target,&context.install)?;}
+        else{match fs::symlink_metadata(&target){
+            Ok(_)=>{},
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Err(format!("组件事务原件及备份均缺失，保留恢复记录：{relative}")),
+            Err(error)=>return Err(error.to_string()),
+        }}
+    }
+    Ok(())
+}
+
+fn activation_record(transaction:&PendingActivation,state:&str)->Value{
+    json!({"target":transaction.relative,"state":state,"original":transaction.original,"companions":transaction.companions,
+        "fields":{"target":"受管组件相对路径","state":"组件启用阶段","original":"原组件是否存在","companions":"同事务回滚的登记及旧资料","path":"受控相对路径","copied":"登记文件复制保留；旧资料先移动保留"}})
 }
 
 pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Result<PendingActivation,String>{
@@ -652,12 +756,33 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     recover(context)?;let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
     crate::verification::invalidate(&target);
     if old.exists(){return Err("上次资源备份尚未清理，无法开始新的激活。".into());}
+    let mut companions=vec![];
+    for path in if relative.starts_with("models/"){vec!["models/manifest.json","app/release.json"]}else{vec!["app/release.json"]}{
+        companions.push(json!({"path":path,"original":safe_path(&context.install,path)?.exists(),"copied":true}));
+    }
+    for path in crate::component_upgrade::speaker_retirements(context,relative)?{
+        companions.push(json!({"path":path,"original":true,"copied":false}));
+    }
+    remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     let journal=context.install.join("tmp/native-install.json");let original=target.exists();
-    atomic_json(&journal,&json!({"target":relative,"state":"prepared","original":original,
-        "fields":{"target":"受管相对路径","state":"启用阶段","original":"原目录是否存在"}}))?;
-    if let Err(error)=crate::compatibility::invalidate(context){let _=fs::remove_file(&journal);return Err(error);}
-    if original{if let Err(error)=fs::rename(&target,&old){let _=fs::remove_file(&journal);return Err(error.to_string());}}
-    let mut transaction=PendingActivation{relative:relative.into(),target:target.clone(),old,journal,original,swapped:false,committed:false,finished:false};
+    let mut transaction=PendingActivation{relative:relative.into(),target:target.clone(),old,journal,original,swapped:false,committed:false,finished:false,companions};
+    atomic_json(&transaction.journal,&activation_record(&transaction,"prepared"))?;
+    let saved=(||{
+        for row in transaction.companions.iter().filter(|row|row["copied"]==true&&row["original"]==true){
+            let relative=row["path"].as_str().unwrap();
+            let backup=safe_path(&context.install,&format!("tmp/native-companions/{relative}"))?;
+            fs::create_dir_all(backup.parent().unwrap()).map_err(|e|e.to_string())?;
+            // 先写临时文件并落盘，崩溃不能将半份清单当作原件恢复。
+            let temporary=backup.with_extension("saving");
+            fs::copy(safe_path(&context.install,relative)?,&temporary).map_err(|e|e.to_string())?;
+            fs::OpenOptions::new().write(true).open(&temporary).and_then(|file|file.sync_all()).map_err(|e|e.to_string())?;
+            fs::rename(temporary,backup).map_err(|e|e.to_string())?;
+        }
+        Ok::<(),String>(())
+    })();
+    if let Err(error)=saved{rollback_activation(context,&mut transaction)?;return Err(error);}
+    if let Err(error)=crate::compatibility::invalidate(context){rollback_activation(context,&mut transaction)?;return Err(error);}
+    if original{if let Err(error)=fs::rename(&target,&transaction.old){rollback_activation(context,&mut transaction)?;return Err(error.to_string());}}
     if let Err(error)=fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string()).and_then(|_|fs::rename(stage,&target).map_err(|e|e.to_string())){
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
@@ -665,7 +790,16 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     transaction.swapped=true;
     // 候选已按写入路径验证；换入后立即接续监视，最终交接不遗漏新组件的外部变更。
     crate::verification::observe_activation(&target);
-    if let Err(error)=atomic_json(&transaction.journal,&json!({"target":relative,"state":"swapped","original":original})){
+    let retired=(||{
+        for row in transaction.companions.iter().filter(|row|row["copied"]==false){
+            let relative=row["path"].as_str().unwrap();
+            let backup=safe_path(&context.install,&format!("tmp/native-companions/{relative}"))?;
+            fs::create_dir_all(backup.parent().unwrap()).map_err(|e|e.to_string())?;
+            fs::rename(safe_path(&context.install,relative)?,backup).map_err(|e|e.to_string())?;
+        }
+        atomic_json(&transaction.journal,&activation_record(&transaction,"swapped"))
+    })();
+    if let Err(error)=retired{
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
     }
@@ -687,7 +821,9 @@ pub fn rollback_activation(context:&LaunchContext,transaction:&mut PendingActiva
         fs::create_dir_all(transaction.target.parent().unwrap()).map_err(|e|e.to_string())?;
         fs::rename(&transaction.old,&transaction.target).map_err(|e|e.to_string())?;
     }else if !transaction.original&&transaction.swapped{remove_owned(&transaction.target,&context.install)?;}
-    if transaction.swapped{refresh_target_binding(context,&transaction.relative,&transaction.target)?;}
+    restore_companions(context,&transaction.companions)?;
+    if transaction.companions.is_empty()&&transaction.swapped{refresh_target_binding(context,&transaction.relative,&transaction.target)?;}
+    remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     remove_owned(&transaction.old,&context.install)?;
     if transaction.journal.exists(){fs::remove_file(&transaction.journal).map_err(|e|e.to_string())?;}
     transaction.finished=true;Ok(())
@@ -696,10 +832,11 @@ pub fn rollback_activation(context:&LaunchContext,transaction:&mut PendingActiva
 pub fn commit_activation(context:&LaunchContext,transaction:&mut PendingActivation)->Result<(),String>{
     if transaction.finished{return Err("资源事务已清理。".into());}
     if !transaction.committed{
-        atomic_json(&transaction.journal,&json!({"target":transaction.relative,"state":"committed","original":transaction.original}))?;
+        atomic_json(&transaction.journal,&activation_record(transaction,"committed"))?;
         transaction.committed=true;
     }
     remove_owned(&transaction.old,&context.install)?;
+    remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     if transaction.journal.exists(){fs::remove_file(&transaction.journal).map_err(|e|e.to_string())?;}
     transaction.finished=true;Ok(())
 }
@@ -775,7 +912,8 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
                 let name=v["path"].as_str().unwrap_or("");!path.join(name).is_file()||current.join(name).is_file()
             })};
         check_cancel(&cancel)?;
-        if identical{progress(&format!("跳过相同完整资源：{key}（编号）"),1,1);installed.push(key);continue;}
+        let retire_speaker=key==crate::component_upgrade::SPEAKER&&crate::component_upgrade::speaker_pending(context)?;
+        if identical&&!retire_speaker{progress(&format!("跳过相同完整资源：{key}（编号）"),1,1);installed.push(key);continue;}
         if key=="dsh"&&path.is_file(){extract_dsh(context,&path,&candidate,&cancel,progress)?;}
         else if key=="dsh"{copy_verified(&path,&candidate,&cancel,progress)?;inspect_dsh_with_progress(context,&candidate,true,&cancel,progress)?;}
         else {
@@ -845,7 +983,14 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         else{inspect_installed_model(context,&item,false).is_ok_and(|current|
             !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
     check_cancel(&cancel)?;
-    if current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    let retire_speaker=id==crate::component_upgrade::SPEAKER&&crate::component_upgrade::speaker_pending(context)?;
+    if current&&!retire_speaker {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    if id==crate::component_upgrade::SPEAKER{
+        if let Some(seed)=crate::component_upgrade::bundled_speaker(context)?{
+            progress("使用随包声纹种子完成离线兼容迁移",0,0);
+            return import_review_with_activation(context,&seed,Some(id),cancel,progress,&mut|_|Ok(()),enable);
+        }
+    }
     // 收据损坏不代表权重损坏：按目标内容复核后从本机重建，沿用既有候选及启用事务。
     // 不直接并发改写现用收据或模型总清单，也不为修复登记重新下载完整组件。
     if item["kind"]=="model"&&installed.is_dir()&&inspect_installed_model(context,&item,false).is_err(){
@@ -857,7 +1002,7 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         }
     }
     if item["source"]["transfer"]["kind"]=="official_audiocpp_patch"{
-        return download_patched_audiocpp(context,&item,cancel,progress,enable);
+        return download_patched_audiocpp(context,&item,cancel,progress,enable,true);
     }
     if id=="dsh"&&item["origin"]=="npm_package"{
         let root=safe_path(&context.install,"tmp/resource-downloads/dsh")?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
@@ -898,7 +1043,7 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
     import_review_with_activation(context,&root,Some(id),cancel,progress,&mut|_|Ok(()),enable)
 }
 /// download_patched_audiocpp（官方原生包加随包补丁）：逐层校验后才原子启用，无客户机编译。
-fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation)->Result<Vec<String>,String>{
+fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation,allow_download:bool)->Result<Vec<String>,String>{
     let transfer=&item["source"]["transfer"];
     let task=safe_path(&context.install,"tmp/resource-downloads/tts-audiocpp-runtime")?;
     fs::create_dir_all(&task).map_err(|e|e.to_string())?;
@@ -908,6 +1053,16 @@ fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<Atomi
         ||crate::workspace::file_hash_with_progress(&patch_file,&cancel,progress)?!=patch["sha256"].as_str().ok_or("补丁摘要缺失")?{
         return Err("audio.cpp（原生语音框架）随包补丁损坏，请修复本体安装。".into());
     }
+    remove_owned(&task.join("unpacked/patch"),&context.install)?;
+    unpack_zip(&patch_file,&task.join("unpacked/patch"),&cancel,progress)?;
+    let candidate=task.join("candidate");
+    remove_owned(&candidate,&context.install)?;
+    if crate::component_upgrade::offline_tts(context,item,&candidate,&cancel,progress)?{
+        check_cancel(&cancel)?;progress("正在启用离线迁移的本地语音运行程序",1,1);
+        enable(&candidate,"models/audiocpp/runtime")?;
+        return Ok(vec!["tts-audiocpp-runtime".into()]);
+    }
+    if !allow_download{return Err("现有语音基础库需要修复，原组件保持不变；请在组件列表更新共用运行程序。".into());}
     let archives=transfer["artifacts"].as_array().ok_or("官方原生归档清单缺失")?;
     for artifact in archives{
         check_cancel(&cancel)?;
@@ -920,9 +1075,6 @@ fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<Atomi
         unpack_zip(&path,&out,&cancel,progress)?;
     }
     progress("正在应用本地语音补丁",0,0);
-    remove_owned(&task.join("unpacked/patch"),&context.install)?;
-    unpack_zip(&patch_file,&task.join("unpacked/patch"),&cancel,progress)?;
-    let candidate=task.join("candidate");
     if candidate.exists(){remove_owned(&candidate,&context.install)?;}
     fs::create_dir_all(&candidate).map_err(|e|e.to_string())?;
     let mut verified=vec![];let mut buffer=vec![0;1024*1024];
@@ -940,6 +1092,22 @@ fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<Atomi
     check_cancel(&cancel)?;progress("正在启用本地语音运行程序",1,1);
     enable(&candidate,"models/audiocpp/runtime")?;
     Ok(vec!["tts-audiocpp-runtime".into()])
+}
+
+/// upgrade_bundled_with_activation（本体离线迁移任务）：普通更新交接只使用随包资源和已验证的本机基础库。
+pub fn upgrade_bundled_with_activation(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation)->Result<Vec<String>,String>{
+    match id{
+        "campplus-zh-cn-common"=>{
+            let source=crate::component_upgrade::bundled_speaker(context)?.ok_or("本体没有声纹离线迁移声明。")?;
+            import_review_with_activation(context,&source,Some(id),cancel,progress,&mut|_|Ok(()),enable)
+        },
+        "tts-audiocpp-runtime"=>{
+            let item=spec(context,id)?;
+            if current_for_upgrade(context,&item){return Ok(vec![id.into()]);}
+            download_patched_audiocpp(context,&item,cancel,progress,enable,false)
+        },
+        _=>Err("不支持的离线组件迁移。".into()),
+    }
 }
 /// model_file_url（模型文件来源）：直接访问固定版本，下载过程不调用 Python（运行环境）。
 fn model_file_url(item:&Value,row:&Value)->Result<String,String>{

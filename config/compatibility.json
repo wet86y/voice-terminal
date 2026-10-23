@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "revision": 3,
+  "revision": 4,
   "settings_schema_max": 17,
   "upgrade_handlers": ["speaker", "tts_audiocpp"],
   "settings_rules": [],
@@ -8,8 +8,8 @@
     "schema": "兼容规则格式版本；未知版本拒绝执行",
     "revision": "规则修订号；内容摘要同时参与即时性核对",
     "settings_schema_max": "当前支持的最高产品设置格式版本；未来或损坏格式归档后强制回退默认值",
-    "upgrade_handlers": "内建迁移处理器；声纹与原生语音组件沿用原有事务迁移",
+    "upgrade_handlers": "内建组件迁移声明；判断及规则保留，组件安装更新由正式程序组件任务承担",
     "settings_rules": "先尝试精确设置迁移；完整设置由新版正式程序的权威校验入口修复，无效值回退默认",
-    "enforcement": "强制路径：尝试修复、清除非法受管资源、恢复默认、固定来源下载、实际校验；完成前禁止业务启动"
+    "enforcement": "本体及配置维护阶段；组件校验问题交接正式程序，不在分发器内下载或安装组件"
   }
 }

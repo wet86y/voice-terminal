@@ -28,6 +28,21 @@ def ready(root, pid):
         record = load(root / 'data/state/workspace-ready.json')
         return record if record['pid'] == pid and record['ready'] and record['role'] == 'product' else None
     except (OSError, ValueError, KeyError): return None
+
+def wait_bundled_migrations(root):
+    """Bundled migrations（随包离线迁移）：真实管理页挂载后等待本体组件任务，保持原有结果断言。"""
+    def completed():
+        handoff = root / 'data/state/component-maintenance.json'
+        if not handoff.is_file(): return True
+        record = load(handoff)
+        if record.get('build') != load(root / 'app/release.json').get('build'): return True
+        jobs_path = root / 'data/state/resource-jobs.json'
+        jobs = load(jobs_path).get('jobs', []) if jobs_path.is_file() else []
+        migrations = [job for job in jobs if job.get('job_id', '').startswith('migration-')]
+        failures = [job for job in migrations if job.get('state') in {'failed', 'cancelled'}]
+        if failures: raise AssertionError({'离线迁移失败': failures})
+        return not record.get('migrations') and all(job.get('state') == 'complete' for job in migrations)
+    until(completed, 90)
 def stop(root, pid):
     process = psutil.Process(pid)
     expected = root / 'app/VoiceTerminalDesktop.exe'
@@ -75,6 +90,7 @@ def native_task(source, target, kind, environment, *, committed=False, expect_fa
     assert final['state']=='completed'
     page = until(lambda: ready(target, final['target_pid']))
     assert page['management_ready']
+    wait_bundled_migrations(target)
     if process: process.wait(25);assert process.returncode==0
     assert not (source/'data/state/workspace-task.json').exists()
     return final['target_pid']
@@ -109,6 +125,7 @@ def main():
         assert page['management_ready']
         assert psutil.pid_exists(pid)
         assert Path(psutil.Process(pid).exe()).resolve() == (root / 'app/VoiceTerminalDesktop.exe').resolve()
+        wait_bundled_migrations(root)
         return pid
     pid = install()
     results['checks'].append('安装器退出后正式宿主独立存活；没有后端环境，真实组件管理页已挂载')
@@ -165,7 +182,7 @@ def main():
     for relative, expected in hashes.items(): assert digest(root / relative) == expected, relative
     assert digest(abandoned_marker) == abandoned_hash and not abandoned_target.exists()
     results['checks'].append('同版本损坏修复保留工作区编号、用户设置、会话、模型、运行环境和组件登记')
-    results['checks'].append('重装离线安装官方CAM++并删除旧WeSpeaker模型与根档案，保留新模型档案并同步模型清单及组件登记')
+    results['checks'].append('重装后由本体组件任务离线安装官方CAM++并删除已确认的旧WeSpeaker模型与根档案，保留新模型档案并同步模型清单及组件登记')
     results['checks'].append('退出迁移后目标事务已移除，原目录可重装和启动，旧引用及用户数据保留且不重建旧目标')
     stop(root, pid)
     # 从另一个启动工作目录再次启动正式入口。
