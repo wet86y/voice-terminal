@@ -63,7 +63,7 @@ fn current_inventory_supersedes_old_success_and_preserves_optional_semantics() {
 fn changed_rules_build_and_settings_are_observed_without_restart() {
     let fixture = Fixture::new(); fixture.ready_runtime(); inventory(&fixture.context).unwrap();
     let prior = fixture.state();
-    let mut policy = rules(&fixture.context.program,false).unwrap(); policy["revision"] = json!(3);
+    let mut policy = rules(&fixture.context.program,false).unwrap(); policy["revision"] = json!(policy["revision"].as_u64().unwrap()+1);
     publish_policy(&fixture.root, &policy);
     let mut release=read(&fixture.root.join("app/release.json")).unwrap();release["build"]=json!("second");
     atomic_json(&fixture.root.join("app/release.json"), &release).unwrap();
@@ -126,6 +126,30 @@ fn known_validation_failure_is_persisted_with_the_actual_inventory() {
     }).unwrap();
     assert_eq!(rows[0]["compatibility"]["status"], "needs_repair");
     assert!(fixture.state()["tasks"].as_array().unwrap().iter().any(|task| task["reason"] == "完整文件摘要复核失败"));
+}
+
+#[test]
+fn maintenance_completion_requires_validated_settings_and_no_unfinished_transaction(){
+    let fixture=Fixture::new();fixture.ready_runtime();
+    inventory(&fixture.context).unwrap();
+    let mut prior=fixture.state();prior["enforcement"]=json!({"phase":"verify","reset_devices":true});
+    atomic_json(&fixture.root.join(TRANSACTION_PATHS[0]),&prior).unwrap();
+    let schema=serde_json::from_str::<Value>(DEFAULT_RULES).unwrap()["settings_schema_max"].clone();
+    let settings=fixture.root.join(TRANSACTION_PATHS[1]);
+    atomic_json(&settings,&json!({"schema_version":schema})).unwrap();
+    assert_eq!(complete_maintenance(&fixture.context).unwrap()[0]["can_start"],false);
+    assert_eq!(fixture.state()["enforcement"]["phase"],"verify");
+    atomic_json(&fixture.root.join("data/state/settings-validation.json"),&json!({"schema":1,"settings_schema":schema,"sha256":file_hash(&settings).unwrap()})).unwrap();
+    let transaction=fixture.root.join("tmp/native-install.json");fs::write(&transaction,b"pending").unwrap();
+    assert_eq!(complete_maintenance(&fixture.context).unwrap()[0]["can_start"],false);
+    assert_ne!(fixture.state()["enforcement"]["phase"],"complete");
+    fs::remove_file(transaction).unwrap();
+    let ready=complete_maintenance(&fixture.context).unwrap();
+    assert_eq!(ready[0]["can_start"],true);
+    assert_eq!(ready[0]["compatibility"]["status"],"compatible");
+    assert_eq!(fixture.state()["enforcement"]["phase"],"complete");
+    assert_eq!(fixture.state()["enforcement"]["reset_devices"],true);
+    assert_eq!(fixture.state()["settings_sha256"],file_hash(&settings).unwrap());
 }
 
 #[test]
@@ -289,16 +313,17 @@ fn oversized_derived_record_is_stream_preserved_and_rebuilt() {
 #[test]
 fn configuration_changed_outside_validated_save_cannot_inherit_upgrade_success() {
     let fixture=Fixture::new();fixture.ready_runtime();
+    let schema=rules(&fixture.context.program,false).unwrap()["settings_schema_max"].clone();
     let settings=fixture.root.join(TRANSACTION_PATHS[1]);
-    atomic_json(&settings,&json!({"schema_version":16,"wake":{"enabled":true}})).unwrap();
+    atomic_json(&settings,&json!({"schema_version":schema,"wake":{"enabled":true}})).unwrap();
     inventory(&fixture.context).unwrap();
     let mut state=fixture.state();state["enforcement"]=json!({"phase":"complete"});
     atomic_json(&fixture.root.join(TRANSACTION_PATHS[0]),&state).unwrap();
     assert_eq!(inventory(&fixture.context).unwrap()[0]["can_start"],true);
-    atomic_json(&settings,&json!({"schema_version":16,"wake":{"enabled":"invalid"}})).unwrap();
+    atomic_json(&settings,&json!({"schema_version":schema,"wake":{"enabled":"invalid"}})).unwrap();
     for _ in 0..2 {assert_eq!(inventory(&fixture.context).unwrap()[0]["can_start"],false);}
-    atomic_json(&settings,&json!({"schema_version":16,"wake":{"enabled":false}})).unwrap();
-    atomic_json(&fixture.root.join("data/state/settings-validation.json"),&json!({"schema":1,"settings_schema":16,"sha256":file_hash(&settings).unwrap()})).unwrap();
+    atomic_json(&settings,&json!({"schema_version":schema,"wake":{"enabled":false}})).unwrap();
+    atomic_json(&fixture.root.join("data/state/settings-validation.json"),&json!({"schema":1,"settings_schema":schema,"sha256":file_hash(&settings).unwrap()})).unwrap();
     assert_eq!(inventory(&fixture.context).unwrap()[0]["can_start"],true);
 }
 

@@ -157,6 +157,13 @@ pub(crate) fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Valu
     let catalog=crate::resources::load(&stage.join("app/config/resources/catalog.json"))?;
     let spec=catalog["resources"].as_array().and_then(|rows|rows.iter().find(|row|row["resource_id"]=="campplus-zh-cn-common")).ok_or("升级包缺少CAM++资源描述")?;
     if spec["version"]!="v1.0.0"||spec["destination"]!="speaker/campplus-zh-cn-common"{return Err("CAM++升级目标不匹配。".into());}
+    let legacy_registry=safe_path(root,"data/speaker/registry.json")?;
+    let legacy_flat=legacy_registry.is_file()&&crate::resources::load(&legacy_registry).is_ok_and(|value|value["model_id"]=="wespeaker-cnceleb-resnet34");
+    let retired=safe_path(root,LEGACY_MODEL)?.exists()||safe_path(root,RETIRED_PROFILE_PATHS[0])?.exists()||legacy_flat;
+    if !retired&&crate::resources::model_receipt_current(&safe_path(root,CURRENT_MODEL)?,spec){
+        progress("声纹迁移已完成，复用当前组件及模型清单",1,1);
+        return Ok(vec![]);
+    }
     let candidate=safe_path(root,&format!("tmp/publish/new/{CURRENT_MODEL}"))?;
     fs::create_dir_all(&candidate).map_err(|e|e.to_string())?;
     let mut receipt_files=vec![];
@@ -178,8 +185,6 @@ pub(crate) fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Valu
     let mut rows=vec![json!({"path":CURRENT_MODEL,"original":safe_path(root,CURRENT_MODEL)?.exists()})];
     let old=safe_path(root,LEGACY_MODEL)?;
     if old.exists(){rows.push(json!({"path":LEGACY_MODEL,"original":true,"delete_only":true}));}
-    let legacy_registry=safe_path(root,"data/speaker/registry.json")?;
-    let legacy_flat=legacy_registry.is_file()&&crate::resources::load(&legacy_registry).is_ok_and(|value|value["model_id"]=="wespeaker-cnceleb-resnet34");
     for relative in RETIRED_PROFILE_PATHS{
         let path=safe_path(root,relative)?;
         if path.exists()&&(*relative==RETIRED_PROFILE_PATHS[0]||legacy_flat){rows.push(json!({"path":relative,"original":true,"delete_only":true}));}
@@ -680,6 +685,18 @@ pub fn launch(root:&Path)->Result<u32,String>{
         run(&package_options("new",false,Some(false)),&root).unwrap();assert_eq!(fs::read(root.join("data/speaker/campplus-zh-cn-common/registry.json")).unwrap(),b"current-registration");
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]fn completed_speaker_migration_does_not_rebuild_or_scan_unrelated_models(){
+        let root=fixture();run(&package_options("first",false,Some(false)),&root).unwrap();
+        let manifest=root.join("models/manifest.json");let before=fs::read(&manifest).unwrap();
+        let receipt=root.join(CURRENT_MODEL).join("resource-install.json");let installed=fs::read(&receipt).unwrap();
+        fs::write(root.join("models/unrelated.bin"),b"unrelated model outside this migration").unwrap();
+        run(&package_options("next",false,Some(false)),&root).unwrap();
+        assert_eq!(fs::read(&manifest).unwrap(),before);
+        assert_eq!(fs::read(&receipt).unwrap(),installed);
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"next");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]fn invalid_seed_leaves_old_body_model_and_profile_untouched(){
         let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
         assert!(run(&package_options("new",false,Some(true)),&root).is_err());

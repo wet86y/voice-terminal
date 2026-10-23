@@ -239,19 +239,44 @@ fn inspect_installed_model(context:&LaunchContext,spec:&Value,verify_hashes:bool
         }
         (None,rows)
     };
+    inspect_model_files(&root,&files,spec,verify_hashes)?;
+    Ok(InstalledModel{version,files})
+}
+
+fn inspect_model_files(root:&Path,files:&[Value],spec:&Value,verify_hashes:bool)->Result<(),String>{
     if files.is_empty(){return Err("模型安装清单没有该组件的文件记录".into());}
+    // 当前选择可以把旧收据中的可选权重提升为必需；存在性以本轮要求为准。
+    let required=spec["files"].as_array().into_iter().flatten().filter(|row|row["optional"]!=true)
+        .filter_map(|row|row["path"].as_str()).collect::<std::collections::HashSet<_>>();
     let mut seen=std::collections::HashSet::new();
-    for row in &files{
+    for row in files{
         let relative=row["path"].as_str().ok_or("模型安装文件记录缺少路径")?;
         if relative==MODEL_RECEIPT||!seen.insert(relative.to_lowercase())||row["size"].as_u64().is_none()||
             !row["sha256"].as_str().is_some_and(valid_sha256)||
             (row.get("optional").is_some()&&row["optional"].as_bool().is_none()) {return Err("模型安装文件记录无效或重复".into());}
-        let path=safe_path(&root,relative)?;let optional=row["optional"]==true;
+        let path=safe_path(&root,relative)?;let optional=row["optional"]==true&&!required.contains(relative);
         if !path.is_file()&&optional{continue;}
         if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size"].as_u64().unwrap(){return Err(format!("已安装模型文件缺失或大小不符：{relative}"));}
         if verify_hashes&&file_hash(&path)?!=row["sha256"].as_str().unwrap(){return Err(format!("已安装模型文件摘要不符：{relative}"));}
     }
-    Ok(InstalledModel{version,files})
+    Ok(())
+}
+
+/// model_receipt_current（静态组件复用）：读取既有收据、目标记录与文件大小，不重读权重内容。
+pub(crate) fn model_receipt_current(component:&Path,spec:&Value)->bool{
+    let Ok((id,version,files))=read_model_receipt(component)else{return false;};
+    id==spec["resource_id"].as_str().unwrap_or("")
+        &&!model_update_available(spec,&InstalledModel{version,files:files.clone()})
+        &&inspect_model_files(component,&files,spec,false).is_ok()
+}
+
+/// current_for_upgrade（更新时复用）：仅核对当前目标及必要入口；完整内容验证由维修或实际写入负责。
+pub(crate) fn current_for_upgrade(context:&LaunchContext,item:&Value)->bool{
+    if item["kind"]=="model"{
+        inspect_installed_model(context,item,false).is_ok_and(|installed|!model_update_available(item,&installed))
+    }else if item["kind"]=="dsh"{
+        destination(context,item).is_ok_and(|root|dsh_validate_with_progress(context,&root,false,&AtomicBool::new(false),&mut|_,_,_|{}).is_ok())
+    }else{false}
 }
 
 fn installed_model_content_matches(spec:&Value,installed:&InstalledModel)->bool{
@@ -395,7 +420,7 @@ fn legacy_tts_runtime_ready(context:&LaunchContext)->Result<bool,String>{
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
     startup_readiness_with_progress(context,&AtomicBool::new(false),&mut|_,_,_|{})
 }
-/// startup_readiness_with_progress（启动校验进度）：模型完整摘要复核，代理复用近期内容复核，语音环境快速盘点。
+/// startup_readiness_with_progress（启动校验进度）：只盘点必要入口及兼容状态，不读取大组件完整内容。
 pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
     check_cancel(cancel)?;progress("检查必要入口与兼容状态",0,0);
     let rows=inventory(context)?;check_cancel(cancel)?;
@@ -638,6 +663,8 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
     }
     transaction.swapped=true;
+    // 候选已按写入路径验证；换入后立即接续监视，最终交接不遗漏新组件的外部变更。
+    crate::verification::observe_activation(&target);
     if let Err(error)=atomic_json(&transaction.journal,&json!({"target":relative,"state":"swapped","original":original})){
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
@@ -819,6 +846,16 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
             !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
     check_cancel(&cancel)?;
     if current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    // 收据损坏不代表权重损坏：按目标内容复核后从本机重建，沿用既有候选及启用事务。
+    // 不直接并发改写现用收据或模型总清单，也不为修复登记重新下载完整组件。
+    if item["kind"]=="model"&&installed.is_dir()&&inspect_installed_model(context,&item,false).is_err(){
+        let valid=validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok();
+        check_cancel(&cancel)?;
+        if valid{
+            progress("组件内容完整，使用本机文件修复安装记录",1,1);
+            return import_review_with_activation(context,&installed,Some(id),cancel,progress,&mut|_|Ok(()),enable);
+        }
+    }
     if item["source"]["transfer"]["kind"]=="official_audiocpp_patch"{
         return download_patched_audiocpp(context,&item,cancel,progress,enable);
     }
@@ -1221,12 +1258,26 @@ mod download_tests {
         ready_test_runtime(&root);
         let context=LaunchContext::portable(&root).unwrap();
         import_review_with_activation(&context,&source,Some("test-model"),Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_|Ok(()),&mut|stage,relative|activate(&context,stage,relative)).unwrap();
+        let target=spec(&context,"test-model").unwrap();
+        {
+            let _session=crate::verification::VerificationSession::begin();
+            prepare_maintenance_verification(&context,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+            for _ in 0..2{
+                let mut reread=false;
+                validate_model_files_with_progress(&context,&target,&root.join("models/test-model"),false,&AtomicBool::new(false),&mut|phase,_,_|reread|=phase=="校验组件文件内容").unwrap();
+                assert!(!reread,"全面维护的模型修复和复核应复用同轮验证结果");
+            }
+        }
         let installed=root.join("models/test-model/model.bin");
         fs::write(&installed,vec![0x42u8;expected.len()]).unwrap(); // 相同文件长度，仅 SHA-256（内容摘要）不同。
         let readiness=startup_readiness(&context).unwrap();
         assert_eq!(readiness["ready"],true);
-        let target=spec(&context,"test-model").unwrap();
+        assert!(current_for_upgrade(&context,&target));
+        assert!(model_receipt_current(&root.join("models/test-model"),&target));
         assert!(model_validate(&context,&target,&root.join("models/test-model")).is_err());
+        fs::remove_file(&installed).unwrap();
+        assert!(!current_for_upgrade(&context,&target));
+        assert!(!model_receipt_current(&root.join("models/test-model"),&target));
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
@@ -1269,6 +1320,55 @@ mod download_tests {
         assert!(crate::workspace::verify_tree(&root.join("runtimes/python"),"manifest.json").is_err());
         crate::workspace::remove_owned(&root,&owner).unwrap();
     }
+    #[test]
+    fn broken_model_receipt_is_rebuilt_from_valid_local_files_without_download(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-local-receipt-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/config/resources")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
+        let component=root.join("models/test-model");fs::create_dir_all(&component).unwrap();fs::write(component.join("model.bin"),b"good").unwrap();
+        let item=json!({"resource_id":"test-model","kind":"model","version":"1","destination":"test-model",
+            "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&component.join("model.bin")).unwrap()}]});
+        // 此微型清单没有网络来源；发生下载会立即失败。
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[item.clone()]})).unwrap();
+        fs::write(component.join(MODEL_RECEIPT),b"{broken receipt").unwrap();
+        let context=LaunchContext::portable(&root).unwrap();let _session=crate::verification::VerificationSession::begin();
+        assert!(!current_for_upgrade(&context,&item));
+        prepare_maintenance_verification(&context,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+        let mut rebuilt=false;
+        download_resource(&context,"test-model",Arc::new(AtomicBool::new(false)),&mut|phase,_,_|rebuilt|=phase=="组件内容完整，使用本机文件修复安装记录").unwrap();
+        assert!(rebuilt);assert!(current_for_upgrade(&context,&item));
+        assert_eq!(fs::read(component.join("model.bin")).unwrap(),b"good");
+        crate::verification::ensure_unchanged().unwrap();
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn current_requirements_override_optional_flags_in_old_receipts(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-required-file-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/config/resources")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
+        let component=root.join("models/test-model");fs::create_dir_all(&component).unwrap();
+        fs::write(component.join("cpu.bin"),b"cpu").unwrap();fs::write(component.join("gpu.bin"),b"gpu").unwrap();
+        let item=json!({"resource_id":"test-model","kind":"model","version":"1","destination":"test-model","files":[
+            {"path":"cpu.bin","size_bytes":3,"sha256":file_hash(&component.join("cpu.bin")).unwrap()},
+            {"path":"gpu.bin","size_bytes":3,"sha256":file_hash(&component.join("gpu.bin")).unwrap()}]});
+        write_model_receipt(&component,&item,item["files"].as_array().unwrap().iter().map(|row|
+            json!({"path":row["path"],"size":row["size_bytes"],"sha256":row["sha256"],"optional":row["path"]=="gpu.bin"})).collect()).unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[item.clone()]})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        assert!(current_for_upgrade(&context,&item));assert!(model_receipt_current(&component,&item));
+        fs::remove_file(component.join("gpu.bin")).unwrap();
+        assert!(!current_for_upgrade(&context,&item));assert!(!model_receipt_current(&component,&item));
+        assert_eq!(inventory(&context).unwrap()[1]["can_start"],false);
+        let mut optional=item;optional["files"][1]["optional"]=json!(true);
+        assert!(current_for_upgrade(&context,&optional));assert!(model_receipt_current(&component,&optional));
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
     #[test]
     fn gpu_choice_installs_missing_optional_weights_and_later_updates_preserve_them(){
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-gpu-model-update-{}",crate::workspace::new_id()));
@@ -1573,6 +1673,7 @@ mod download_tests {
         write_model_receipt(&candidate,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
         assert_eq!(fs::metadata(folder.join(MODEL_RECEIPT)).unwrap().len(),fs::metadata(candidate.join(MODEL_RECEIPT)).unwrap().len());
         assert_ne!(old_receipt,file_hash(&candidate.join(MODEL_RECEIPT)).unwrap());
+        let session=crate::verification::VerificationSession::begin();
         let mut transaction=begin_activation(&context,&candidate,"models/audiocpp/runtime").unwrap();
         commit_activation(&context,&mut transaction).unwrap();
         // 收据不在自己的文件清单里：总清单必须以磁盘内容为准重新登记，不能沿用换版前的摘要。
@@ -1581,6 +1682,11 @@ mod download_tests {
         let record=manifest["files"].as_array().unwrap().iter().find(|row|row["path"]==path).unwrap();
         assert_eq!(record["sha256"],json!(file_hash(&root.join("models").join(path)).unwrap()));
         assert_ne!(record["sha256"],json!(old_receipt));
+        crate::verification::ensure_unchanged().unwrap();
+        fs::write(folder.join("model.bin"),b"cccc").unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while crate::verification::ensure_unchanged().is_ok(){assert!(Instant::now()<deadline,"新换入组件也必须纳入维护期间的变更检查");std::thread::sleep(Duration::from_millis(10));}
+        drop(session);fs::write(folder.join("model.bin"),b"bbbb").unwrap();
         crate::workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
         crate::workspace::remove_owned(&root,&owner).unwrap();
     }
