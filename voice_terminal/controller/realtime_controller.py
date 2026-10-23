@@ -668,6 +668,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 hard_boundary = ws.hard_closed or frame.captured_at - ws.started_at >= self.options.max_turn_ms / 1000
                 if not has_started and not hard_boundary:
                     await self._resume(frame)
+                    if activity.speech_ended:
+                        self._close_acoustic_segment(ws)
                 elif decision.confirmed or hard_boundary:
                     # Invalidate the old generation before publishing the
                     # interruption state so a concurrent LLM delta cannot
@@ -812,6 +814,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         output = getattr(self, "output", None)
         if not bool(getattr(output, "playback_hold_active", False)):
             self._stop_playback_snapshot(ws.playback_key)
+        self._capture_refinement_admission(ws)
         ws.resume()
         # A resumed same-turn segment is a new semantic speech segment.  Pick
         # up a mode change made while the previous segment was finalizing, but
@@ -833,8 +836,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._reset_tool_scope(ws.turn_id)
         ws.tools.clear()
         ws.paraformer_final = ""
-        ws.refined_text = ""
-        ws.refinement_available = False
+        ws._refinement_input_finished = False
         ws.analysis = {
             name: dict(details)
             for name, details in self.analysis_health.items()
@@ -896,6 +898,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             return
         ws = self.workspace
         self._active_input = False
+        ws._refinement_input_finished = True
+        self._schedule_segment_refinements(ws)
         token = ws.freeze()
         if ws.hard_closed and self._speech_start_sample is not None:
             self._resume_started = frame.end_sample

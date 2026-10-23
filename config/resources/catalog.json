@@ -728,16 +728,16 @@
     {
       "resource_id": "paraformer-offline",
       "kind": "model",
-      "title": "Paraformer 离线精修模型",
+      "title": "Paraformer Contextual 热词增强离线精修模型",
       "destination": "funasr/paraformer-zh-offline",
       "version": "v2.0.4",
       "required": false,
       "source": {
         "platform": "modelscope",
-        "repo_id": "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "repo_id": "iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404",
         "revision": "v2.0.4",
-        "page_url": "https://modelscope.cn/models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-        "license_url": "https://modelscope.cn/models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "page_url": "https://modelscope.cn/models/iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404",
+        "license_url": "https://modelscope.cn/models/iic/speech_paraformer-large-contextual_asr_nat-zh-cn-16k-common-vocab8404",
         "transfer": {
           "kind": "modelscope_sdk"
         }
@@ -745,18 +745,18 @@
       "files": [
         {
           "path": "model.pt",
-          "size_bytes": 900702648,
-          "sha256": "fd7c1c6fa7f499377d238b3f3790eb2f6f16318a0e33e33ae50936725f4d8388"
+          "size_bytes": 912662894,
+          "sha256": "2d448b72b2b5e5fdf9ba865ff54c8c207f5cf8fced742b0160ef505b026c44a7"
         },
         {
           "path": "config.yaml",
-          "size_bytes": 2899,
-          "sha256": "4f35265cc3c6dd906a2668b62847183e441310d82df6438bace9b8f6dab3bf7d"
+          "size_bytes": 2525,
+          "sha256": "aa8a65827b8f37f8426bf5e2cda4971601934270abd4d9a7c61eeb364277dc31"
         },
         {
           "path": "configuration.json",
-          "size_bytes": 693,
-          "sha256": "ce737a84e626e8be6b76f26f54f63b4f47ac85e1073bd81b657518149e907247"
+          "size_bytes": 475,
+          "sha256": "a473db9019718bccdfca39bc7e2f20b2a0a8e26c9fd9ddb135ddaa56ee46650c"
         },
         {
           "path": "am.mvn",

@@ -133,12 +133,8 @@ class TurnWorkspace:
         self.staged_response = ""
         self.final_text = ""
         self.raw_final_text = ""
-        self.raw_refined_text = ""
         self.hotword_final.clear()
         self.paraformer_final = ""
-        self.refined_text = ""
-        self.refinement_available = False
-        self.transcript_updates.clear()
         self.audio_cues.clear()
         self.agent_phase = "IDLE"
         self.tts_segments.clear()

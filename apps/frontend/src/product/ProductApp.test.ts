@@ -311,7 +311,7 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = render(ProductApp)
     const loading = wrapper.get('.application-startup')
     expect(loading.text()).toContain('应用启动中')
-    expect(loading.text()).toContain('正在启动语音识别')
+    expect(loading.text()).toContain('正在启动：语音识别')
     expect(loading.find('ul').exists()).toBe(false)
     expect(loading.text()).not.toContain('已耗时')
     await loading.get('button').trigger('click')

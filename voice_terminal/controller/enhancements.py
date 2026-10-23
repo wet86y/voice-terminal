@@ -15,6 +15,8 @@ class AudioEnhancementsMixin:
         self.audio_enhancements = settings
         self.perception = {"voice_emotion": None, "acoustic": AcousticMailbox(), "scope": 0, "speaker_scope": 0}
         self._enhancement_epoch = 0
+        self._dual_epoch = 0  # dual_epoch（独立精修代次，不干扰情绪与声学背景）。
+        self._refinement_tasks: set[asyncio.Task] = set()
         self._enhancement_streams: dict[str, dict] = {}
         self._enhancement_segment = 0
         self._enhancement_start: int | None = None
@@ -36,7 +38,7 @@ class AudioEnhancementsMixin:
             self._retire_enhancement_streams(ws)
         self._enhancement_streams[self._sub_id] = {
             "workspace": self.workspace, "text": "", "segments": {},
-            "sequence": self._sub_sequence, "epoch": self._enhancement_epoch,
+            "sequence": self._sub_sequence, "epoch": self._dual_epoch,
             "session_scope": self.perception["scope"],
         }
 
@@ -56,26 +58,31 @@ class AudioEnhancementsMixin:
             return
         start = max(start, ws.audio.start_sample or 0)
         end = min(end, ws.audio.end_sample)
-        if end <= start or self._sub_id not in self._enhancement_streams:
+        if end <= start:
             return
+        if self._sub_id not in self._enhancement_streams:
+            self._register_enhancement_stream()
         self._enhancement_segment += 1
         segment_id = f"{ws.turn_id}/vad/{self._enhancement_segment}"
         offset = start - (ws.audio.start_sample or 0)
         pcm = bytes(ws.audio.pcm[offset * 2:(offset + end - start) * 2])
         self._enhancement_streams[self._sub_id]["segments"][segment_id] = {
-            "start_sample": start, "end_sample": end, "text": None,
+            "start_sample": start, "end_sample": end, "revision": 1, "text": None,
         }
-        self._queue_asr(AudioSegment(self._sub_id, pcm, segment_id, start, end))
+        hotwords = self.hotwords.native_targets(ws.token) if getattr(self, "hotwords", None) is not None else ()
+        self._queue_asr(AudioSegment(self._sub_id, pcm, segment_id, start, end, hotwords=hotwords))
 
     async def _enhancement_result(self, message: dict) -> bool:
         kind = message.get("type")
         if kind not in {"asr.refined", "asr.refinement_failed"}:
             return False
         stream = getattr(self, "_enhancement_streams", {}).get(message.get("turn_id"))
-        if (stream is None or stream["epoch"] != self._enhancement_epoch
+        if (stream is None or stream["epoch"] != self._dual_epoch
                 or stream.get("session_scope", self.perception["scope"]) != self.perception["scope"]):
             return True
         segment = stream["segments"].get(message.get("segment_id"))
+        if segment is not None and message.get("revision", 1) != segment.get("revision", 1):
+            return True
         if segment is None or kind == "asr.refinement_failed":
             if kind == "asr.refinement_failed":
                 logger.warning("双路片段精修失败：%s", message.get("error"))
@@ -88,86 +95,146 @@ class AudioEnhancementsMixin:
                 message.get("start_sample"), message.get("end_sample")):
             return True
         text = message.get("text")
-        if not isinstance(text, str) or not text.strip() or segment["text"] is not None:
+        if not isinstance(text, str) or not text.strip():
+            segment["failed"] = True
+            if getattr(self, "workspace", None) is not stream["workspace"]:
+                self._retire_enhancement_streams(stream["workspace"])
             return True
-        first, last = message.get("start_char", 0), message.get("end_char", 0)
-        if (type(first) is not int or type(last) is not int or not 0 <= first <= last <= len(stream["text"])
-                or message.get("parent_turn_id", stream["workspace"].turn_id) != stream["workspace"].turn_id):
+        if segment["text"] is not None:
             return True
-        segment.update(text=text, start_char=message.get("start_char", 0),
-                       end_char=message.get("end_char", 0))
+        if message.get("parent_turn_id", stream["workspace"].turn_id) != stream["workspace"].turn_id:
+            return True
+        segment["text"] = text
         stream["workspace"].timings["paraformer_refine_ms"] = message.get("elapsed_ms")
-        await self._publish_segment_refinements(stream["workspace"])
+        self._schedule_segment_refinements(stream["workspace"])
         return True
+
+    def _schedule_segment_refinements(self, ws) -> None:
+        """收包回调不等待整段标点；独立任务可继续接收主路及标点响应。"""
+        ws._punctuation_pending = getattr(ws, "_punctuation_pending", 0) + 1
+        async def publish():
+            try:
+                if not hasattr(ws, "_dual_publish_lock"):
+                    ws._dual_publish_lock = asyncio.Lock()
+                async with ws._dual_publish_lock:
+                    await self._publish_segment_refinements(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("精修快照发布失败：turn_id（轮次）=%s", ws.turn_id)
+            finally:
+                ws._punctuation_pending -= 1
+                if getattr(self, "workspace", None) is not ws:
+                    self._retire_enhancement_streams(ws)
+        task = asyncio.create_task(publish())
+        self._refinement_tasks.add(task)
+        task.add_done_callback(self._refinement_tasks.discard)
 
     async def _publish_segment_refinements(self, ws) -> None:
         if getattr(ws, "_enhancement_invalidated", False):
             return
         streams = sorted((value for value in getattr(self, "_enhancement_streams", {}).values()
-                          if value["workspace"] is ws and value["epoch"] == self._enhancement_epoch),
+                          if value["workspace"] is ws and value["epoch"] == self._dual_epoch),
                          key=lambda value: value["sequence"])
-        pieces, available = [], False
-        for stream in streams:
-            original = stream["text"]
-            cursor = 0
-            for segment in sorted(stream["segments"].values(), key=lambda row: row["start_sample"]):
-                if segment["text"] is None:
-                    continue
-                start, end = int(segment["start_char"]), int(segment["end_char"])
-                if not cursor <= start <= end <= len(original):
-                    continue
-                pieces.extend((original[cursor:start], segment["text"]))
-                cursor, available = end, True
-            pieces.append(original[cursor:])
-        text = "".join(pieces)
+        from ..asr.text import join_asr_segments
+        rows = sorted((segment for stream in streams for segment in stream["segments"].values()
+                       if segment["text"] is not None), key=lambda row: row["start_sample"])
+        text = join_asr_segments([row["text"] for row in rows])
+        available = bool(rows)
         if ws.speaker_mode == "filter":
             text, available = self._admitted_segment_text(ws, streams)
-        if available and text and text != getattr(ws, "_last_dual_text", None):
-            ws._last_dual_text = text
+        final = bool(getattr(ws, "_refinement_input_finished", False))
+        request_key = (text, final, self._dual_epoch)
+        if available and text and request_key != getattr(ws, "_last_dual_request", None):
+            epoch = self._dual_epoch
+            result = {"text": text, "punctuation_status": "DEGRADED", "punctuation_error": "整段标点服务不可用"}
+            punctuate = getattr(getattr(self, "asr", None), "punctuate_text", None)
+            if callable(punctuate):
+                try:
+                    result = await punctuate(text, final=final)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    result["punctuation_error"] = str(exc)
+                    logger.exception("精修标点失败，保留正文")
+            if epoch != self._dual_epoch or getattr(ws, "_enhancement_invalidated", False):
+                return
+            if final != bool(getattr(ws, "_refinement_input_finished", False)):
+                self._schedule_segment_refinements(ws)
+                return  # 续说已撤销结束状态；旧标点快照不能以结束稿发布。
+            streams = [value for value in self._enhancement_streams.values()
+                       if value["workspace"] is ws and value["epoch"] == self._dual_epoch]
+            current_rows = sorted((segment for stream in streams for segment in stream["segments"].values()
+                                   if segment["text"] is not None), key=lambda row: row["start_sample"])
+            current_text = join_asr_segments([row["text"] for row in current_rows])
+            if ws.speaker_mode == "filter":
+                current_text, _ = self._admitted_segment_text(ws, streams)
+            if current_text != text:
+                self._schedule_segment_refinements(ws)
+                return  # 等标点期间新增片段或准入改变，重算最新快照。
+            ws._last_dual_request = request_key
+            ws._last_dual_text = result["text"]
+            ws.analysis["refinement_punctuation"] = {"status": result["punctuation_status"], "error": result.get("punctuation_error")}
             ws._dual_revision = getattr(ws, "_dual_revision", 0) + 1
-            await self._refinement_completed(ws, {"text": text, "source": "paraformer_offline",
+            await self._refinement_completed(ws, {"text": result["text"], "source": "paraformer_offline",
                 "source_revision": ws._dual_revision, **({"admission_checked": True} if ws.speaker_mode == "filter" else {})})
         if getattr(self, "workspace", None) is not ws and streams:
             self._retire_enhancement_streams(ws)
 
     def _admitted_segment_text(self, ws, streams):
-        """只替换身份已获准的原音频跨度，待定或拒绝的原稿也不能混入精修稿。"""
-        pieces = [piece for piece in self.speaker_policy.pieces if piece.turn_id == ws.turn_id]
+        """准入归属于输入音频片段，续说的输出代次不能撤销已批准片段。"""
+        from ..asr.text import join_asr_segments
+        self._capture_refinement_admission(ws)
+        pieces = getattr(ws, "_refinement_speaker_pieces", [])
         segments = sorted((row for stream in streams for row in stream["segments"].values()
                            if row["text"] is not None), key=lambda row: row["start_sample"])
         admitted = []
         for segment in segments:
             overlapping = [piece for piece in pieces
                            if piece.start < segment["end_sample"] and piece.end > segment["start_sample"]]
-            if overlapping and all(piece.status == "admitted" for piece in overlapping):
-                admitted.append(segment)
-        output, inserted = [], set()
-        for piece in sorted(pieces, key=lambda value: (value.start, value.revision)):
-            if piece.status != "admitted":
+            if not overlapping or any(piece.status != "admitted" for piece in overlapping):
                 continue
-            overlapping = [index for index, segment in enumerate(admitted)
-                           if piece.start < segment["end_sample"] and piece.end > segment["start_sample"]]
-            if not overlapping:
-                output.append(piece.text)
-            else:
-                for index in overlapping:
-                    if index not in inserted:
-                        output.append(admitted[index]["text"])
-                        inserted.add(index)
-        return "".join(output), bool(inserted)
+            cursor = segment["start_sample"]
+            for piece in sorted(overlapping, key=lambda value: value.start):
+                if piece.start > cursor:
+                    break
+                cursor = max(cursor, piece.end)
+            if cursor >= segment["end_sample"]:
+                admitted.append(segment)
+        return join_asr_segments([row["text"] for row in admitted]), bool(admitted)
+
+    def _capture_refinement_admission(self, ws) -> None:
+        if ws.speaker_mode != "filter":
+            return
+        previous = {id(piece): piece for piece in getattr(ws, "_refinement_speaker_pieces", [])}
+        previous.update({id(piece): piece for piece in self.speaker_policy.pieces if piece.turn_id == ws.turn_id})
+        ws._refinement_speaker_pieces = list(previous.values())
+
+    async def _invalidate_dual_refinements(self) -> None:
+        """只作废精修通道，不停止输入，不改变主路缓存和声学背景。"""
+        self._dual_epoch += 1
+        self._enhancement_start = None  # 不回放跨越开关边界的半段音频。
+        self._enhancement_streams.clear()
+        tasks = tuple(self._refinement_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _retire_enhancement_streams(self, ws) -> None:
         """已完成精修的退休输入释放音频工作区；未回包段仍保留原归属。"""
         self._enhancement_streams = {key: row for key, row in getattr(self, "_enhancement_streams", {}).items()
-                                    if row["epoch"] == self._enhancement_epoch
+                                    if row["epoch"] == self._dual_epoch
                                     and row.get("session_scope", self.perception["scope"]) == self.perception["scope"]}
         streams = [row for row in getattr(self, "_enhancement_streams", {}).values() if row["workspace"] is ws]
+        if getattr(ws, "_punctuation_pending", 0):
+            return
         if any(segment["text"] is None and not segment.get("failed")
                for row in streams for segment in row["segments"].values()):
             return
-        if ws.speaker_mode == "filter" and any(piece.status == "pending" for piece in self.speaker_policy.pieces
-                                              if piece.turn_id == ws.turn_id):
-            return  # 身份待定片段仍可由同一会话稍后的声纹证据恢复；拒绝和过期片段释放。
+        if ws.speaker_mode == "filter":
+            self._capture_refinement_admission(ws)
+            if any(piece.status == "pending" for piece in ws._refinement_speaker_pieces):
+                return  # 身份待定片段仍可由同一会话稍后的声纹证据恢复；拒绝和过期片段释放。
         self._enhancement_streams = {key: row for key, row in getattr(self, "_enhancement_streams", {}).items()
                                     if row["workspace"] is not ws}
 
@@ -255,7 +322,7 @@ class AudioEnhancementsMixin:
         self.perception["scope"] += 1
         for row in self._enhancement_streams.values():
             row["workspace"]._enhancement_invalidated = True
-        self._enhancement_streams.clear()
+        await self._invalidate_dual_refinements()
         tasks = tuple(self._perception_tasks.values())
         for task in tasks:
             task.cancel()

@@ -193,7 +193,7 @@ class EpisodeController(RealtimeController):
                                activation_id=self.speaker_policy.activation_id)
             for ws in {id(value["workspace"]): value["workspace"]
                        for value in getattr(self, "_enhancement_streams", {}).values()}.values():
-                await self._publish_segment_refinements(ws)
+                self._schedule_segment_refinements(ws)
 
     def _speaker_heartbeat_pulse(self, pulse) -> None:
         if self.speaker_sensor is None:
@@ -1174,13 +1174,6 @@ class EpisodeController(RealtimeController):
         if key == getattr(ws, "_published_refinement", None):
             return
         text = raw_text
-        if getattr(self, "hotwords", None) is not None:
-            token = ws.token
-            correction = await self.hotwords.correct(raw_text, token, lane="final",
-                                                       cache_key=f"refinement:{revision}")
-            if ws.token != token or getattr(ws, "_enhancement_invalidated", False):
-                return
-            text = correction["text"]
         ws._published_refinement = key
         ws.raw_refined_text, ws.refined_text = raw_text, text
         ws.refinement_available = True

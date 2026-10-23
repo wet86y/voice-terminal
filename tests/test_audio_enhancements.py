@@ -62,7 +62,7 @@ class Controller(AudioEnhancementsMixin):
 
 
 @async_test
-async def test_refinement_out_of_order_keeps_original_tail_and_turn():
+async def test_refinement_out_of_order_accumulates_only_offline_segments():
     controller = Controller()
     ws = TurnWorkspace("first")
     controller._enhancement_streams["first/asr/1"] = {
@@ -74,11 +74,12 @@ async def test_refinement_out_of_order_keeps_original_tail_and_turn():
         await controller._enhancement_result({"type": "asr.refined", "turn_id": "first/asr/1",
             "segment_id": segment, "start_sample": start, "end_sample": end, "text": text,
             "start_char": first, "end_char": last})
+        await asyncio.gather(*tuple(controller._refinement_tasks))
     await result("b", 16000, 32000, "二", 1, 2)
     assert controller._refinement_completed.await_args.args == (ws, {
-        "text": "甲二尾", "source": "paraformer_offline", "source_revision": 1})
+        "text": "二", "source": "paraformer_offline", "source_revision": 1})
     await result("a", 0, 16000, "一", 0, 1)
-    assert controller._refinement_completed.await_args.args[1]["text"] == "一二尾"
+    assert controller._refinement_completed.await_args.args[1]["text"] == "一二"
     await result("a", 0, 16000, "重复", 0, 1)
     assert controller._refinement_completed.await_count == 2
     await controller._stop_enhancements()
@@ -126,7 +127,7 @@ async def test_vad_segment_closure_is_separate_from_business_final():
 
 
 @async_test
-async def test_streaming_cache_flush_retains_cumulative_transcript():
+async def test_streaming_cache_is_retained_until_business_final():
     engine = AsrWorkerEngine(model_dir=Path("."), device="cpu")
     from voice_terminal.asr.streaming_model import StreamingParaformer
     import numpy as np
@@ -140,12 +141,14 @@ async def test_streaming_cache_flush_retains_cumulative_transcript():
     engine._infer_sync = model.infer
     try:
         await engine.infer("turn", b"\0" * engine.chunk_stride_bytes, False)
-        first, piece = await engine.flush_segment("turn")
-        assert first.text == piece == "字尾"
+        assert engine._transcript_by_turn["turn"] == "字"
+        assert "turn" in model._cache_by_turn
         await engine.infer("turn", b"\0" * engine.chunk_stride_bytes, False)
-        second, piece = await engine.flush_segment("turn")
-        assert second.text == "字尾字尾" and piece == "字尾"
+        assert engine._transcript_by_turn["turn"] == "字字"
         assert "turn" in engine._transcript_by_turn
+        result = await engine.infer("turn", b"", True)
+        assert result.text == "字字尾"
+        assert "turn" not in engine._transcript_by_turn
         assert "turn" not in model._cache_by_turn
     finally:
         engine.close()
@@ -197,7 +200,7 @@ async def test_acoustic_audit_failure_and_retry_snapshot_preserve_new_observatio
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "load", "save", "rollback"])
-async def test_switch_stops_first_rolls_back_and_saves_only_verified_state(tmp_path, monkeypatch, failure):
+async def test_dual_switch_keeps_primary_running_and_saves_only_verified_state(tmp_path, monkeypatch, failure):
     from dataclasses import replace
     from voice_terminal.server.settings_runtime import ProductSettingsRuntimeMixin
     monkeypatch.setattr("voice_terminal.application.resource_readiness.inspect_model_resources", lambda *_: {})
@@ -217,6 +220,7 @@ async def test_switch_stops_first_rolls_back_and_saves_only_verified_state(tmp_p
         calls.append("stop")
         runtime.state.listening = False
     async def configure(enabled):
+        assert not runtime._enhancement_switching  # 纯双路切换不能挂起新的监听请求。
         calls.append(enabled)
         if failure in {"load", "rollback"} and enabled or failure == "rollback":
             raise RuntimeError("加载失败")
@@ -225,7 +229,8 @@ async def test_switch_stops_first_rolls_back_and_saves_only_verified_state(tmp_p
         calls.append("save")
         if failure == "save":
             raise OSError("保存失败")
-    runtime.controller = SimpleNamespace(stop_listening=stop, perception={"acoustic": AcousticMailbox()})
+    runtime.controller = SimpleNamespace(stop_listening=stop, perception={"acoustic": AcousticMailbox()},
+                                         _invalidate_dual_refinements=AsyncMock())
     runtime.asr = SimpleNamespace(configure_enhancements=configure)
     runtime.bus = SimpleNamespace(publish=AsyncMock())
     runtime.product_settings = SimpleNamespace(save_audio_enhancements=save)
@@ -233,13 +238,14 @@ async def test_switch_stops_first_rolls_back_and_saves_only_verified_state(tmp_p
         with pytest.raises((RuntimeError, OSError)):
             await runtime.switch_audio_enhancements({"dual_pass": True})
         assert runtime.config.audio_enhancements.dual_pass is False
-        assert runtime.state.listening is (failure != "rollback")
+        assert runtime.state.listening
     else:
         await runtime.switch_audio_enhancements({"dual_pass": True})
         assert runtime.config.audio_enhancements.dual_pass is True
         assert runtime.state.listening
-        assert calls == ["stop", True, "save", "resume"]
-    assert calls[0] == "stop"
+        assert calls == [True, "save"]
+    assert calls[0] is True
+    assert "stop" not in calls and "resume" not in calls
 
 
 @pytest.mark.asyncio
@@ -262,7 +268,8 @@ async def test_user_stop_during_switch_revokes_resume(tmp_path, monkeypatch):
         await release.wait()
         return {"device": "cpu", "offline": {"device": "cpu", "status": "READY"}}
     runtime.asr = SimpleNamespace(configure_enhancements=configure)
-    runtime.controller = SimpleNamespace(stop_listening=AsyncMock(), perception={"acoustic": AcousticMailbox()})
+    runtime.controller = SimpleNamespace(stop_listening=AsyncMock(), perception={"acoustic": AcousticMailbox()},
+                                         _invalidate_dual_refinements=AsyncMock())
     runtime.bus = SimpleNamespace(publish=AsyncMock())
     runtime.product_settings = None
     task = asyncio.create_task(runtime.switch_audio_enhancements({"dual_pass": True}))
@@ -313,6 +320,99 @@ async def test_segment_admission_does_not_wait_for_unrelated_pending_tail():
     controller._refinement_completed.reset_mock()
     await controller._publish_segment_refinements(ws)
     controller._refinement_completed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refinement_requires_admission_covering_the_entire_audio_segment():
+    controller = Controller()
+    ws = controller.workspace = TurnWorkspace("voice", speaker_mode="filter")
+    controller.speaker_policy = SimpleNamespace(pieces=[
+        SimpleNamespace(turn_id="voice", start=0, end=8000, revision=1, status="admitted", text="已知"),
+    ])
+    controller._enhancement_streams["voice/asr/1"] = {"workspace": ws, "sequence": 1, "epoch": 0,
+        "segments": {"a": {"start_sample": 0, "end_sample": 16000, "text": "完整离线正文"}}}
+    await controller._publish_segment_refinements(ws)
+    controller._refinement_completed.assert_not_called()
+    controller.speaker_policy.pieces.append(SimpleNamespace(turn_id="voice", start=8000, end=16000,
+                                                            revision=2, status="admitted", text="后半段"))
+    await controller._publish_segment_refinements(ws)
+    assert controller._refinement_completed.await_args.args[1]["text"] == "完整离线正文"
+
+
+@pytest.mark.asyncio
+async def test_slow_punctuation_rechecks_continuation_and_latest_segment_snapshot():
+    controller = Controller()
+    ws = controller.workspace = TurnWorkspace("voice")
+    controller._enhancement_streams["voice/asr/1"] = {"workspace": ws, "sequence": 1, "epoch": 0,
+        "segments": {"a": {"start_sample": 0, "end_sample": 16000, "text": "前段"}}}
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def punctuate(text, *, final):
+        entered.set()
+        await release.wait()
+        return {"text": text + ("。" if final else ""), "punctuation_status": "READY"}
+    controller.asr = SimpleNamespace(punctuate_text=punctuate)
+    ws._refinement_input_finished = True
+    task = asyncio.create_task(controller._publish_segment_refinements(ws))
+    await entered.wait()
+    ws._refinement_input_finished = False
+    controller._enhancement_streams["voice/asr/1"]["segments"]["b"] = {
+        "start_sample": 16000, "end_sample": 32000, "text": "后段"}
+    release.set()
+    await task
+    await asyncio.gather(*tuple(controller._refinement_tasks))
+    assert controller._refinement_completed.await_count == 1
+    assert controller._refinement_completed.await_args.args[1]["text"] == "前段后段"
+
+
+@pytest.mark.asyncio
+async def test_slow_punctuation_includes_new_continuation_substream():
+    controller = Controller()
+    ws = controller.workspace = TurnWorkspace("voice")
+    controller._enhancement_streams["voice/asr/1"] = {"workspace": ws, "sequence": 1, "epoch": 0,
+        "segments": {"a": {"start_sample": 0, "end_sample": 16000, "text": "前段"}}}
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def punctuate(text, *, final):
+        entered.set()
+        await release.wait()
+        return {"text": text, "punctuation_status": "READY"}
+    controller.asr = SimpleNamespace(punctuate_text=punctuate)
+    task = asyncio.create_task(controller._publish_segment_refinements(ws))
+    await entered.wait()
+    controller._enhancement_streams["voice/asr/2"] = {"workspace": ws, "sequence": 2, "epoch": 0,
+        "segments": {"b": {"start_sample": 16000, "end_sample": 32000, "text": "续说"}}}
+    release.set()
+    await task
+    await asyncio.gather(*tuple(controller._refinement_tasks))
+    assert controller._refinement_completed.await_count == 1
+    assert controller._refinement_completed.await_args.args[1]["text"] == "前段续说"
+
+
+def test_retirement_preserves_pending_admission_from_previous_substream():
+    controller = Controller()
+    ws = TurnWorkspace("voice", speaker_mode="filter")
+    piece = SimpleNamespace(turn_id="voice", start=0, end=16000, status="pending")
+    ws._refinement_speaker_pieces = [piece]
+    controller.speaker_policy = SimpleNamespace(pieces=[])
+    controller._enhancement_streams["voice/asr/1"] = {"workspace": ws, "epoch": 0,
+        "segments": {"a": {"text": "前段"}}}
+    controller._retire_enhancement_streams(ws)
+    assert "voice/asr/1" in controller._enhancement_streams
+    piece.status = "admitted"
+    controller._retire_enhancement_streams(ws)
+    assert not controller._enhancement_streams
+
+
+@pytest.mark.asyncio
+async def test_stale_segment_revision_cannot_replace_or_fail_current_segment():
+    controller = Controller()
+    ws = controller.workspace = TurnWorkspace("voice")
+    segment = {"start_sample": 0, "end_sample": 16000, "revision": 2, "text": None}
+    controller._enhancement_streams["voice/asr/1"] = {"workspace": ws, "epoch": 0, "segments": {"a": segment}}
+    base = {"turn_id": "voice/asr/1", "segment_id": "a", "revision": 1,
+            "start_sample": 0, "end_sample": 16000, "text": "旧回包"}
+    await controller._enhancement_result({**base, "type": "asr.refined"})
+    await controller._enhancement_result({**base, "type": "asr.refinement_failed"})
+    assert segment["text"] is None and not segment.get("failed")
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from voice_terminal.server.product import ProductSettingsStore
 
 
 def settings(word="Claude", alias="克劳得"):
-    return {"enabled": True, "threshold": .85,
+    return {"enabled": True, "stream_enabled": True, "threshold": .85,
             "entries": [{"word": word, "aliases": [alias], "blacklist": []}]}
 
 
@@ -232,7 +232,7 @@ async def test_reset_keeps_busy_native_lane_until_worker_really_exits():
 
 
 @pytest.mark.asyncio
-async def test_late_refinement_keeps_both_raw_sources_and_corrects_agent_input():
+async def test_late_refinement_keeps_sources_without_post_hotword_correction():
     from unittest.mock import AsyncMock
     from voice_terminal.controller.episode_controller import EpisodeController
     from voice_terminal.controller.turn_workspace import TurnWorkspace
@@ -263,7 +263,8 @@ async def test_late_refinement_keeps_both_raw_sources_and_corrects_agent_input()
         entry = next(entry for entry in ledger.entries if entry.kind == "input")
         assert entry.metadata["raw_text"] == "请让克劳得检查。"
         assert entry.metadata["raw_refined_text"] == raw_refined
-        assert controller.episode.observe.call_args.kwargs["text"] == "请让Claude检查代码。"
+        assert controller.episode.observe.call_args.kwargs["text"] == raw_refined
+        assert ws.refined_text == raw_refined
         assert ws.paraformer_final == "请让克劳得检查。"
     finally:
         service.close()

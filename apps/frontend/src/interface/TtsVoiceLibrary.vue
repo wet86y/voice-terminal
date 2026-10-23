@@ -100,6 +100,12 @@ async function transcribe(draft: VoiceDraft) {
       if (props.demo) { draft.transcript = '这是一段参考音频的演示转写，可以在这里校对。'; return }
       const result = await monitor(draft, () => productApi.startTtsTranscribe(model, asset.asset_id), generation)
       if (draft.generation === generation && draft.source?.asset_id === asset.asset_id && draft.transcript === initialText && result.result?.text) draft.transcript = result.result.text
+      if (draft.generation === generation) {
+        const notices = []
+        if (result.result?.fallback_reason) notices.push('离线识别未完成，已改用流式模型转写。')
+        if (result.result?.punctuation_status === 'DEGRADED') notices.push('标点处理失败，已保留识别正文，请校对。')
+        draft.notice = notices.join(' ')
+      }
     })
   } finally { transcribingKey.value = '' }
 }

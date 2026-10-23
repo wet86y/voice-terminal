@@ -80,6 +80,7 @@
 - [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [音频增强替换验收记录](testing/audio-enhancements-20261020.md)
+- [热词增强精修、主路隔离与本机更新验收](testing/contextual-dual-pass-20261023.md)
 - [开发工作区独立恢复验收](testing/workspace-development-recovery-20261021.md)
 - [前端十项失败归因与产品逻辑修订验收](testing/frontend-ten-failures-audit-20261021.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)

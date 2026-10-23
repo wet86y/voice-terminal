@@ -744,22 +744,24 @@ describe('V0.6 session protocol', () => {
     expect(terminal.current.capture_diagnostics?.dropped_chunks).toBe(2)
   })
 
-  it('keeps late SenseVoice text supplemental and applies turn latency payloads', () => {
+  it('ignores every refinement source for UI text and applies turn latency payloads', () => {
     const { socket, terminal } = openTerminal()
     socket.push('input.started', 1, {}, { turn_id: 'input_a' })
     socket.push('input.finalized', 2, { text: 'Paraformer 主文本', source: 'paraformer' }, { turn_id: 'input_a' })
-    socket.push('input.finalized', 3, { text: 'SenseVoice 精修文本', source: 'sensevoice' }, { turn_id: 'input_a' })
-    socket.push('metrics.snapshot', 4, {
+    for (const [index, source] of ['sensevoice', 'paraformer_offline', 'paraformer_contextual'].entries()) {
+      socket.push('input.finalized', 3 + index, { text: '精修文本', source }, { turn_id: 'input_a' })
+    }
+    socket.push('metrics.snapshot', 6, {
       turn_id: 'input_a', input_id: 'input_a', speech_id: 'speech_a',
       latency: { speech_end_to_first_pcm_ms: 812, replacement_count: 1 },
     }, { turn_id: 'input_a', speech_id: 'speech_a' })
-    socket.push('speech.progress', 5, {
+    socket.push('speech.progress', 7, {
       event: 'tts.prewarm', status: 'READY', turn_id: 'input_a',
     }, { turn_id: 'input_a' })
 
     expect(terminal.current.final_text).toBe('Paraformer 主文本')
-    expect(terminal.current.refined_text).toBe('SenseVoice 精修文本')
-    expect(terminal.current.refinement_available).toBe(true)
+    expect(terminal.current.refined_text).toBe('')
+    expect(terminal.current.refinement_available).toBe(false)
     expect(terminal.currentLatency.speech_end_to_first_pcm_ms).toBe(812)
     expect(terminal.currentLatency.replacement_count).toBe(1)
     expect(terminal.current.tts_prewarm_status).toBe('READY')

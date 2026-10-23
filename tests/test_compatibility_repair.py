@@ -17,6 +17,24 @@ def workspace(tmp_path):
     return program, data
 
 
+def test_hotwords_and_required_punctuation_migrate_without_resetting_other_settings(tmp_path):
+    import yaml
+    program, data = workspace(tmp_path)
+    local = data / "config/local.yaml"
+    original = "asr:\n  punctuation_enabled: false\n  punctuation_device: cpu\n  chunk_size: [0, 8, 4]\n"
+    local.write_text(original, encoding="utf-8")
+    (data / "config/product-settings.json").write_text(json.dumps({"schema_version": 16, "hotwords": {
+        "enabled": False, "threshold": .91, "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}}), encoding="utf-8")
+    assert repair(program, data)["ready"]
+    settings = json.loads((data / "config/product-settings.json").read_text(encoding="utf-8"))
+    assert settings["schema_version"] == 17
+    assert settings["hotwords"] == {"enabled": False, "stream_enabled": True, "threshold": .91,
+                                      "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}
+    assert yaml.safe_load(local.read_text(encoding="utf-8")) == {"asr": {"punctuation_device": "cpu", "chunk_size": [0, 8, 4]}}
+    assert any(path.read_text(encoding="utf-8") == original for path in (data / "archives").rglob("local.yaml"))
+    assert repair(program, data)["archived_items"] == 0
+
+
 @pytest.mark.parametrize("raw", [
     "broken JSON", "[]", '{"schema_version":999,"private_preference":"保留原件"}',
     '{"schema_version":16,"wake":{"enabled":"错误"},"tts":{"backend":[]},"speaker":{"confirm_threshold":false}}',
@@ -31,7 +49,7 @@ def test_invalid_settings_are_repaired_persisted_and_original_is_archived(tmp_pa
     value = json.loads(settings.read_text(encoding="utf-8"))
     assert _settings_validation_warning(value) is None
     apply_settings_to_config(load_config(program / "config/default.yaml"), value)
-    assert value["schema_version"] == 16
+    assert value["schema_version"] == 17
     assert any(path.read_text(encoding="utf-8") == raw
                for path in (data / "archives").rglob("product-settings.json"))
     # 默认回退已经落盘；再执行不能再次归档，也不能恢复故障值。

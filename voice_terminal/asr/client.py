@@ -6,6 +6,7 @@ import os
 import logging
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +34,7 @@ class AsrWorkerClient:
         self._receive_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._health_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._retired_requests: deque[str] = deque(maxlen=256)  # retired_requests（忽略已取消或已结束请求的迟到回包）。
         self._sent_count_by_turn: dict[str, int] = {}
         self._sent_bytes_by_turn: dict[str, int] = {}
         self._last_log_at_by_turn: dict[str, float] = {}
@@ -70,6 +72,8 @@ class AsrWorkerClient:
                 try:
                     message = json.loads(raw)
                 except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict) and message.get("request_id") in self._retired_requests:
                     continue
                 if isinstance(message, dict) and message.get("type") == "health":
                     request_id = message.get("request_id")
@@ -160,6 +164,10 @@ class AsrWorkerClient:
             if not waiter.done():
                 waiter.set_exception(error)
 
+    def _retire_request(self, request_id: str) -> None:
+        self._health_waiters.pop(request_id, None)
+        self._retired_requests.append(request_id)
+
     async def _send(self, payload: dict[str, Any]) -> None:
         socket = self._socket
         if socket is None:
@@ -213,7 +221,7 @@ class AsrWorkerClient:
         self._last_log_at_by_turn.pop(turn_id, None)
 
     async def configure_enhancements(self, dual_pass: bool) -> dict:
-        """configure_enhancements（停止监听后的模型切换请求）。"""
+        """configure_enhancements（独立离线通道切换，不停止主路）。"""
         await self.connect()
         request_id = uuid.uuid4().hex
         waiter = asyncio.get_running_loop().create_future()
@@ -226,7 +234,7 @@ class AsrWorkerClient:
                 raise AsrWorkerError(str(result.get("message")))
             return result
         finally:
-            self._health_waiters.pop(request_id, None)
+            self._retire_request(request_id)
 
     async def configure_compute(self, device: str, *, allow_cuda_fallback: bool = False) -> dict:  # allow_cuda_fallback（恢复旧偏好时允许 GPU 回退到原实际设备）。
         """替换 Paraformer 模型子进程并核验设备与预热状态。"""
@@ -243,7 +251,7 @@ class AsrWorkerClient:
                 raise AsrWorkerError(str(result.get("message")), code="ASR_COMPUTE_SWITCH_FAILED")
             return result
         finally:
-            self._health_waiters.pop(request_id, None)
+            self._retire_request(request_id)
 
     async def transcribe_reference(self, pcm: bytes) -> dict:
         """transcribe_reference（人工上传参考音频转写），与实时 VAD（语音活动检测）路线分离。"""
@@ -260,7 +268,22 @@ class AsrWorkerClient:
                 raise AsrWorkerError(str(response.get("message")))
             return response["result"]
         finally:
-            self._health_waiters.pop(request_id, None)
+            self._retire_request(request_id)
+
+    async def punctuate_text(self, text: str, *, final: bool) -> dict:
+        """punctuate_text（整段标点）：由独立后台任务调用，不阻塞主路收包回调。"""
+        await self.connect()
+        request_id = uuid.uuid4().hex
+        waiter = asyncio.get_running_loop().create_future()
+        self._health_waiters[request_id] = waiter
+        try:
+            await self._send({"type": "text.punctuate", "request_id": request_id, "text": text, "final": final})
+            response = await asyncio.wait_for(waiter, 30)
+            if response.get("type") == "error":
+                raise AsrWorkerError(str(response.get("message")))
+            return response["result"]
+        finally:
+            self._retire_request(request_id)
 
     async def health(self, timeout_s: float = 2.0,
                      *, allow_starting: bool = False) -> dict[str, Any]:  # allow_starting（允许返回启动中快照）。
@@ -291,7 +314,7 @@ class AsrWorkerClient:
             except Exception as exc:
                 raise AsrWorkerError(f"ASR Worker health 失败：{exc}", code="ASR_WORKER_PROTOCOL_ERROR") from exc
         finally:
-            self._health_waiters.pop(request_id, None)
+            self._retire_request(request_id)
             if not waiter.done():
                 waiter.cancel()
 

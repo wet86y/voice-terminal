@@ -42,7 +42,8 @@ export interface ProductTtsAsset { asset_id: string; duration_ms: number }
 export interface ProductTtsOperation {
   operation_id: string; model: ProductLocalTtsModelId | ProductOnlineTtsModelId; kind: string // 操作标识、本地或在线模型、任务种类。
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'; error?: string | null // 状态和错误。
-  result?: { asset_id?: string; duration_ms?: number; voice_id?: string; text?: string; voice?: Partial<ProductTtsVoice> } // 音频素材标识与时长、在线音色标识、精修文本或生成音色参数。
+  result?: { asset_id?: string; duration_ms?: number; voice_id?: string; text?: string; voice?: Partial<ProductTtsVoice>;
+    route?: string; fallback_reason?: string | null; punctuation_status?: string; punctuation_error?: string | null } // 实际识别路线、回退原因及标点状态。
 }
 /** TtsVoicePort（音色业务接口）：共享展示组件由正式页面注入，演示页无需连接。 */
 export interface TtsVoicePort {

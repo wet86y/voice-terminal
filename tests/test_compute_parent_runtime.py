@@ -53,13 +53,13 @@ async def test_asr_parent_environment_follows_punctuation_instead_of_main_model(
         host.outer_job.close()
 
 
-@pytest.mark.parametrize("enabled,device,expected", [(True, "cpu", "cpu"), (True, "cuda", "cuda"), (False, "cuda", "cpu")])
+@pytest.mark.parametrize("device,expected", [("cpu", "cpu"), ("cuda", "cuda")])
 def test_bootstrap_reports_parent_device_and_budgets_explicit_gpu_punctuation(
-        tmp_path, monkeypatch, capsys, enabled, device, expected):
+        tmp_path, monkeypatch, capsys, device, expected):
     """启动清单按实际标点用途选父进程依赖，显卡标点也要进入加载预算。"""
     from voice_terminal.application import bootstrap
     config = replace(AppConfig(model_dir=tmp_path / "models"),
-        asr=AsrConfig(device="cpu", punctuation_enabled=enabled, punctuation_device=device),
+        asr=AsrConfig(device="cpu", punctuation_device=device),
         compute=ComputeConfig(devices={name: "cpu" for name in COMPUTE_MODEL_IDS}))
     paths = SimpleNamespace(env_file=tmp_path / ".env", config=tmp_path / "config", install_root=tmp_path, separated=False)
     monkeypatch.setattr(sys, "argv", ["bootstrap", "--config", str(tmp_path / "local.yaml")])

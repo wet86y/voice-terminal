@@ -15,7 +15,7 @@ class ProtocolSequencer:
     _EVENTS = {
         "turn.started": "input.started", "transcript.partial": "input.updated",
         "transcript.segment": "input.updated", "transcript.final": "input.finalized",
-        "transcript.refined": "input.finalized", "turn.completed": "input.completed",
+        "turn.completed": "input.completed",
         "agent.episode": "agent.state", "llm.context": "context.snapshot",
         "agent.tool": "tool.state", "speech.text_delta": "speech.delta",
         "tts.status": "speech.progress", "tts.progress": "speech.progress",

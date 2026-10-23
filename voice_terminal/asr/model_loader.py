@@ -27,6 +27,8 @@ _SOURCE_HASHES = {
 
 # 每项格式为注册名称、注册表和实现模块；组件集合按本地 config.yaml 精确识别。
 _COMPONENTS = {
+    "contextual_model": ("ContextualParaformer", "model_classes", "funasr.models.contextual_paraformer.model"),
+    "contextual_decoder": ("ContextualParaformerDecoder", "decoder_classes", "funasr.models.contextual_paraformer.decoder"),
     "offline_model": ("BiCifParaformer", "model_classes", "funasr.models.bicif_paraformer.model"),
     "offline_encoder": ("SANMEncoder", "encoder_classes", "funasr.models.sanm.encoder"),
     "offline_predictor": ("CifPredictorV3", "predictor_classes", "funasr.models.bicif_paraformer.cif_predictor"),
@@ -50,6 +52,12 @@ _COMPONENTS = {
     "streaming_punc_encoder": ("SANMVadEncoder", "encoder_classes", "funasr.models.ct_transformer_streaming.encoder"),
 }
 _MODEL_CONFIGS = {
+    "contextual": (
+        {"model": "ContextualParaformer", "encoder": "SANMEncoder", "decoder": "ContextualParaformerDecoder",
+         "predictor": "CifPredictorV2", "frontend": "WavFrontend", "tokenizer": "CharTokenizer"},
+        ("contextual_model", "offline_encoder", "contextual_decoder", "paraformer_predictor",
+         "wav_frontend", "char_tokenizer", "specaug"),
+    ),
     "offline": (
         {"model": "BiCifParaformer", "encoder": "SANMEncoder", "predictor": "CifPredictorV3",
          "frontend": "WavFrontend", "tokenizer": "CharTokenizer"},

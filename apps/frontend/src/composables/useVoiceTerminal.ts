@@ -1149,6 +1149,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         }
         break
       case 'input.finalized':
+        if (['sensevoice', 'paraformer_offline', 'paraformer_contextual'].includes(readString(payload, 'source') ?? '')) break
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
           // FINALIZING normally starts the timer earlier.  Keep this as a
           // compatibility fallback for servers that only send transcript
@@ -1156,13 +1157,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           startPerceptualLatency(message.turn_id ?? readString(payload, 'turn_id'), message.timestamp)
           const text = readString(payload, 'text')
           if (text !== null) {
-            if (readString(payload, 'source') === 'sensevoice') {
-              current.refined_text = text
-              current.refinement_available = true
-            } else {
-              current.final_text = text
-              current.partial_text = ''
-            }
+            current.final_text = text
+            current.partial_text = ''
           }
         }
         break

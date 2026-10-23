@@ -224,13 +224,15 @@ class ProductSettingsRuntimeMixin:
                 self._compute_switching = False
 
     async def switch_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
-        """音频增强切换事务：立即停听、等待原生调用、核验并保存、恢复监听意图。"""
+        """双路独立切换不暂停主路；其他增强沿用现有暂停事务。"""
         from ..audio_enhancements import AudioEnhancements
         from ..analysis.client import AnalysisClient
         from ..application.resource_readiness import inspect_model_resources
         if not hasattr(self, "_enhancement_switch_lock"):
             self._enhancement_switch_lock = asyncio.Lock()
-        async with self._enhancement_switch_lock:
+        if not hasattr(self, "_compute_switch_lock"):
+            self._compute_switch_lock = asyncio.Lock()
+        async with self._enhancement_switch_lock, self._compute_switch_lock:
             old = self.config.audio_enhancements
             new = AudioEnhancements.from_mapping({**old.snapshot(), **dict(payload)})
             if old == new:
@@ -247,6 +249,7 @@ class ProductSettingsRuntimeMixin:
             changed = {"emotion": new.emotion, "acoustic": new.acoustic_events}
             changed = {key: value for key, value in changed.items()
                        if value != (old.emotion if key == "emotion" else old.acoustic_events)}
+            dual_changed = new.dual_pass != old.dual_pass
             async def apply(settings):
                 if new.dual_pass != old.dual_pass:
                     status = await self.asr.configure_enhancements(settings.dual_pass)
@@ -260,17 +263,30 @@ class ProductSettingsRuntimeMixin:
                     for key, enabled in selected.items():
                         if status.get(key, {}).get("status") != ("READY" if enabled else "DISABLED"):
                             raise RuntimeError(f"音频增强通道 {key} 未达到预期状态")
+            async def persist(settings):
+                task = asyncio.create_task(asyncio.to_thread(self.product_settings.save_audio_enhancements, settings.snapshot()))
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await _finish_compute_write(task)
+                    raise
             self._enhancement_resume_requested = True
             labels = {"dual_pass": "双路精修", "emotion": "情绪背景", "acoustic_events": "声学事件"}
             label = "、".join(labels[key] for key in labels if getattr(new, key) != getattr(old, key))
-            async with runtime_operation(self, "audio_enhancements", label, pause=True) as operation:
-                self._enhancement_switching = True
+            async with runtime_operation(self, "audio_enhancements", label, pause=bool(changed)) as operation:
+                # 只有需要暂停输入的背景通道切换才挂起新的监听请求。
+                self._enhancement_switching = bool(changed)
+                saving_started = False
                 try:
                     await operation.update("loading")
+                    if controller is not None and dual_changed:
+                        controller.audio_enhancements = new
+                        await controller._invalidate_dual_refinements()
                     await apply(new)
                     await operation.update("verifying")
                     if self.product_settings is not None:
-                        await asyncio.to_thread(self.product_settings.save_audio_enhancements, new.snapshot())
+                        saving_started = True
+                        await persist(new)
                     self.config = replace(self.config, audio_enhancements=new)
                     if controller is not None:
                         controller.audio_enhancements = new
@@ -278,13 +294,19 @@ class ProductSettingsRuntimeMixin:
                             controller.perception["acoustic"].clear()
                 except BaseException as failure:
                     await operation.update("rolling_back")
+                    if controller is not None and dual_changed:
+                        controller.audio_enhancements = old
+                        await controller._invalidate_dual_refinements()
                     try:
                         await apply(old)
+                        if saving_started:
+                            await persist(old)
                     except Exception as rollback_error:
-                        logger.exception("音频增强恢复失败，保持停止监听")
-                        operation.prevent_resume()
+                        logger.exception("音频增强恢复失败")
+                        if changed:
+                            operation.prevent_resume()
                         if not isinstance(failure, asyncio.CancelledError):
-                            raise RuntimeError(f"音频增强切换失败且恢复原模型失败，已停止监听：{rollback_error}") from failure
+                            raise RuntimeError(f"音频增强切换失败且恢复原模型失败：{rollback_error}") from failure
                     raise
                 finally:
                     self._enhancement_switching = False
