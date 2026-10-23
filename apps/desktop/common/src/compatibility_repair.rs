@@ -84,6 +84,8 @@ pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)
     let mut reset_devices=state["enforcement"]["reset_devices"]==true;
     let result=(||{
         repair_bootstrap_policy(&context)?;
+        checkpoint(&context,"verify_components",reset_devices,None)?;
+        progress("兼容处理：完整核对现有环境、模型与代理组件",0,0);
         resources::prepare_maintenance_verification(&context,&cancel,progress)?;
         checkpoint(&context,"repair_environment",reset_devices,None)?;
         progress("兼容处理：尝试修复现有运行环境",0,0);

@@ -45,7 +45,7 @@ npm run desktop:start
 
 组件与构建依赖默认采用国内镜像优先、失败回退原站，版本及内容校验保持不变。来源映射、离线安装及验证边界见[国内镜像与原站回退](docs/guides/download-sources.md)。
 
-普通无参数启动从可执行文件位置确定工作区，读取已发布 `app`（程序本体）内的业务和静态界面；不查找源码祖先，也不读取或更新系统用户目录中的工作区定位记录。`npm run desktop:start`（正式启动）与本地双击完全一致。`npm run dev`（源码热更新）通过同一正式入口显式传入 `--dev`（调试开关）及 `--source-root`（源码目录），沿用正式工作区、组件管理、单实例及退出流程。`npm run desktop:publish`（本地发布）使用统一程序包事务替换本体，保留用户数据与组件。
+普通无参数启动从可执行文件位置确定工作区，读取已发布 `app`（程序本体）内的业务和静态界面；不查找源码祖先，也不读取或更新系统用户目录中的工作区定位记录。`npm run desktop:start`（正式启动）与本地双击完全一致。`npm run dev`（源码热更新）通过同一正式入口显式传入 `--dev`（调试开关）及 `--source-root`（源码目录），沿用正式工作区、组件管理、单实例及退出流程。`npm run desktop:publish`（本地发布）使用统一程序包事务替换本体，保留用户数据与组件。各构建、更新与发行入口的选择和复用规则见[开发、构建与同包交付流程](docs/development/desktop-pipeline.md)。
 
 设置、历史、声纹、DSH（代理宿主）状态及凭据引用按当前工作区的 `data`（用户数据）目录加载；凭据继续使用 Windows Credential Manager（系统凭据管理器）。不要将开发凭据提交到 Git（源码管理工具）：
 
@@ -91,8 +91,11 @@ MINIMAX_API_KEY=
 npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
 npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
 npm run build    # 统一正式界面、原生宿主及根入口；别名 npm run desktop:build
-npm run desktop:publish # 退出业务实例后，事务更新固定本体及正式入口
-npm run desktop:dist # 独立 EXE（安装器），嵌入同一正式程序包
+npm run desktop:prepare # 按内容复用或准备正式程序包，不安装
+npm run desktop:publish # 准备程序包并更新本机正式入口
+npm run desktop:dist # 准备程序包并构建独立 EXE（安装器）
+npm run desktop:deliver # 更新本机并构建安装器，共用同一程序包
+npm run github:release:local # 同包更新本机并发布 GitHub（代码托管平台）发行
 ```
 
 正式启动直接读取已发布本体。源码调试使用同一正式入口和工作区，显式切换业务源码与前端输入；普通模式与调试模式共享单实例，冲突时提示退出后重启。前端演示使用隔离缓存，只启动界面服务，可与正式程序同时运行。实际端点以宿主端点表为准。启动诊断见[独立应用启动与系统管理](docs/guides/application-lifecycle.md)，入口、安装与恢复规则见[统一正式程序与分发安装器](docs/guides/unified-product-installer.md)。

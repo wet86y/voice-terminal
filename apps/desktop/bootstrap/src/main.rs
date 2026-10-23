@@ -39,7 +39,13 @@ fn start()->Result<(),String>{
         let root=Path::new(value(&args,"--target-root").ok_or("本地发布缺少目标工作区")?);
         let payload=std::fs::read(package).map_err(|e|e.to_string())?;
         let cancel=Arc::new(AtomicBool::new(false));
-        let mut progress=|phase:&str,done,total|{if done==0||done==total{println!("{phase}：{done}/{total}");}};
+        let mut previous=String::new();
+        let mut reported=std::time::Instant::now();
+        let mut progress=|phase:&str,done,total|{
+            if previous!=phase||done==total||reported.elapsed()>=std::time::Duration::from_secs(1){
+                println!("{phase}：{done}/{total}");previous=phase.to_owned();reported=std::time::Instant::now();
+            }
+        };
         installation::install(&payload,root,cancel.clone(),&mut progress)?;
         return voice_desktop_common::compatibility::enforce_upgrade(root,cancel,&mut progress);
     }

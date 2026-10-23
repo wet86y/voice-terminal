@@ -13,6 +13,9 @@
 | `npm run dev` | 同一正式入口显式启用源码热更新，传入 `--dev`（调试开关）与 `--source-root`（源码目录） |
 | `npm run desktop:publish` | 构建并组装统一程序包，事务替换正式本体，保留用户数据与组件 |
 | `npm run desktop:dist` | 先组装正式包，再嵌入独立安装器 |
+| `npm run desktop:prepare` | 按输入与产物内容准备产品包，不安装 |
+| `npm run desktop:deliver` | 产品包、分发安装器和本机更新统一完成一次 |
+| `npm run github:release:local` | 同一发行包更新本机并公开发行，自动回下载核验 |
 | `scripts/distribute-desktop.ps1 -SkipProductBuild` | 使用上次本地发布的同一程序包构建安装器 |
 | `npm run dev:ui` | 构建并运行隔离的前端演示，不启动业务后端 |
 | `VoiceTerminal.exe --exit` | 请求同一工作区已有正式实例正常退出 |

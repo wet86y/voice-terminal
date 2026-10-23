@@ -35,6 +35,7 @@ git diff --check
 | 启动首屏、错误兜底、维护进度及窗口交接 | [启动与维护界面连续性验收](startup-ui-continuity.md)，含模块超时、迟到挂载、渲染异常及入口重试回归 |
 | 能力就绪分档、探测去抖与能力级恢复 | `tests/test_state.py`、`tests/test_application_host.py`、`tests/test_capability_recovery.py`、`tests/test_listening_capability_gate.py`、`apps/frontend/src/product/application-host.test.ts`、`apps/frontend/src/product/ProductApp.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
+| 构建内容复用、同包交付、安装失败与进度 | `tests/test_desktop_pipeline.py`、`scripts/test-start-desktop-build-arguments.ps1`；执行规范见[同包交付流程](../development/desktop-pipeline.md) |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | 资源下载、复制、摘要与首次安装启动 | `apps/frontend/src/management/ManagementApp.test.ts`（管理页状态回归）；`cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common -p voice-terminal-desktop --locked`（原生资源与宿主回归）；公共模块可增加 `--features qualification`（隔离下载验收） |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
@@ -100,8 +101,7 @@ python -X utf8 scripts/dsh-diagnose/plugin-install-smoke.py
 通过应用内退出业务实例并关闭演示窗口，再执行：
 
 ```powershell
-npm run desktop:publish
-./scripts/distribute-desktop.ps1 -SkipProductBuild
+npm run desktop:deliver
 ./.local/Verify-Package.ps1
 ./.local/runtimes/python/python.exe -B -X utf8 scripts/test-backend.py -q
 npm test
@@ -111,7 +111,7 @@ npm --prefix integrations/dsh/voice-terminal test
 git diff --check
 ```
 
-`npm run desktop:dist`（完整分发构建）可独立重建正式包和安装器。需要核对本机正式包与安装器逐文件一致时，先发布，再以 `-SkipProductBuild`（复用已发布程序包）构建安装器，避免比较两个不同构建。安装器的 `delivery.json`（交付记录）与 `build-stamp.json`（构建戳）中的 `program_package_sha256`（内嵌程序包摘要）应与当前统一程序包一致；正常交付的 `qualification`（隔离验收开关）为 `false`（关闭）。
+`npm run desktop:dist`（分发构建）按内容复用或构建正式包和安装器，不更新本机。需要同时更新本机并核对交付资产时使用 `npm run desktop:deliver`（同包交付），避免串行执行两个默认完整入口。安装器的 `delivery.json`（交付记录）与 `build-stamp.json`（构建戳）中的 `program_package_sha256`（内嵌程序包摘要）应与当前统一程序包一致；正常交付的 `qualification`（隔离验收开关）为 `false`（关闭）。完整入口及复用参数见[开发、构建与同包交付流程](../development/desktop-pipeline.md)。
 
 ## 用户测试顺序
 

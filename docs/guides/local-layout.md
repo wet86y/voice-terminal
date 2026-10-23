@@ -55,12 +55,16 @@ Node（脚本解释器）由代理宿主的 `runtime.json`（运行清单）内 
 
 常用命令：
 
+开发、构建与组合发布的统一步骤见[开发、构建与同包交付流程](../development/desktop-pipeline.md)。同时更新本机与分发安装器使用 `npm run desktop:deliver`（同包交付）；同时公开发行使用 `npm run github:release:local`（同包本机更新与发行）。无需先后运行多个默认完整流程。
+
 ```powershell
 npm run dev                  # 真实业务桌面开发
 npm run dev:ui               # 前端演示开发
 npm run desktop:start        # 已发布静态正式程序
 npm run desktop:build        # 固定构建目录，包含界面和原生程序
 npm run desktop:publish      # 构建、校验、停机检查、固定目录换入、验证、回收
+npm run desktop:prepare      # 按内容准备统一产品包，不安装
+npm run desktop:deliver      # 统一产品包、安装器与本机更新一次完成
 .\scripts\start.ps1          # 无界面后端，使用同一业务环境
 .\.local\Verify-Package.ps1  # 校验当前正式安装全部清单与文件摘要
 .\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q # 后端测试

@@ -76,14 +76,31 @@ function Invoke-SourceCargo {
   param([string]$Executable, [string[]]$Arguments)
   $Policy = Get-DownloadPolicy
   $SavedDist = $env:RUSTUP_DIST_SERVER; $SavedUpdate = $env:RUSTUP_UPDATE_ROOT
+  $Directory=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../.local/cache/cargo'))
+  [IO.Directory]::CreateDirectory($Directory) | Out-Null
+  $Config=Join-Path $Directory 'source.toml'
+  # 配置文件保留 TOML（配置格式）的字符串引号，不依赖脚本宿主的原生参数转义。
+  $Registry=ConvertTo-Json -InputObject ([string]$Policy.rust_index) -Compress
+  [IO.File]::WriteAllText($Config,('[source.crates-io]'+"`n"+'replace-with = "voice-mirror"'+"`n"+'[source.voice-mirror]'+"`n"+'registry = '+$Registry+"`n"),[Text.UTF8Encoding]::new($false))
+  $Log=Join-Path $Directory 'build-latest.log'
+  $SavedPreference=$ErrorActionPreference
   try {
     $env:RUSTUP_DIST_SERVER = $Policy.rust_dist; $env:RUSTUP_UPDATE_ROOT = $Policy.rust_update
-    & $Executable @Arguments --config 'source.crates-io.replace-with="voice-mirror"' --config ('source.voice-mirror.registry="' + $Policy.rust_index + '"')
+    $Lines=[Collections.Generic.List[string]]::new()
+    $ErrorActionPreference='Continue' # 原生标准错误作为日志读取，实际成功由退出码决定。
+    & $Executable @Arguments --config $Config 2>&1 | ForEach-Object {$Line=if ($_ -is [Management.Automation.ErrorRecord]) {$_.Exception.Message} else {[string]$_};$Lines.Add($Line);Write-Host $Line}
+    $ErrorActionPreference=$SavedPreference
+    [IO.File]::WriteAllLines($Log,$Lines,[Text.UTF8Encoding]::new($false))
     if ($LASTEXITCODE -in @(130,3221225786,-1073741510)) { throw '原生构建已取消。' }
     if (-not $LASTEXITCODE) { return }
-    Write-Host '原生依赖镜像或构建失败，使用原站重试并复用编译缓存。'
+    $Message=$Lines -join "`n"
+    if ($Message -notmatch '(?i)failed to (download|fetch|update.*registry|query.*registry)|download of .+ failed|Could not resolve|Timeout was reached|failed to get .+ as a dependency') {throw '原生编译或配置失败；未切换软件源重复编译，详见 .local/cache/cargo/build-latest.log。'}
+    Write-Host '原生依赖来源访问失败，使用原站重试；编译及配置错误不会触发来源重试。'
     $env:RUSTUP_DIST_SERVER = $SavedDist; $env:RUSTUP_UPDATE_ROOT = $SavedUpdate
-    & $Executable @Arguments
+    $ErrorActionPreference='Continue'
+    & $Executable @Arguments 2>&1 | ForEach-Object {$Line=if ($_ -is [Management.Automation.ErrorRecord]) {$_.Exception.Message} else {[string]$_};$Lines.Add($Line);Write-Host $Line}
+    $ErrorActionPreference=$SavedPreference
+    [IO.File]::WriteAllLines($Log,$Lines,[Text.UTF8Encoding]::new($false))
     if ($LASTEXITCODE) { throw '原生构建失败，请检查构建日志。' }
-  } finally { $env:RUSTUP_DIST_SERVER = $SavedDist; $env:RUSTUP_UPDATE_ROOT = $SavedUpdate }
+  } finally { $ErrorActionPreference=$SavedPreference;$env:RUSTUP_DIST_SERVER = $SavedDist; $env:RUSTUP_UPDATE_ROOT = $SavedUpdate }
 }
