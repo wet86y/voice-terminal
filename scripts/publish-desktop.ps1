@@ -20,11 +20,11 @@ $PackageHash=Get-Sha256File -LiteralPath $Package
 if ($LASTEXITCODE) {throw '现有正式程序未能安全退出。'}
 $Helper=Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminal.exe'
 $InstallArguments=@('--install-package',$Package,'--target-root',$InstallRoot)
-Invoke-DesktopStage '安装已有程序包与强制兼容处理' {Invoke-DesktopInstallProcess -Executable $Helper -Arguments $InstallArguments}
+Invoke-DesktopStage '安装已有程序包与组件状态检查' {Invoke-DesktopInstallProcess -Executable $Helper -Arguments $InstallArguments}
 if ((Get-Sha256File -LiteralPath $Package) -ne $PackageHash) {throw '安装期间程序包发生变化，拒绝将本轮标记为同包交付。'}
 if ($BuildDemo -and $InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminalUIDemo.exe') -Destination (Join-Path $InstallRoot 'VoiceTerminalUIDemo.exe') -Force
 }
 Write-Host "正式入口：$InstallRoot/VoiceTerminal.exe" -ForegroundColor Green
-Write-Host '本地发布与安装器共用同一程序包及兼容性组件；有效资源已复用，配置、故障资料及必需组件已完成强制处理。' -ForegroundColor Green
+Write-Host '本地发布与安装器共用同一程序包；本体及兼容检查已完成，组件问题请在正式程序组件列表处理。' -ForegroundColor Green
 } finally {Exit-DesktopPipeline}

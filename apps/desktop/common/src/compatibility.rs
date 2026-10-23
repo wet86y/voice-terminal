@@ -9,7 +9,7 @@ const DEFAULT_RULES: &str = include_str!("../../../../config/compatibility.json"
 static EVALUATION: Mutex<()> = Mutex::new(()); // EVALUATION（评估互斥）：扫描和写回串行，旧扫描不能晚写覆盖新结果。
 #[path = "compatibility_repair.rs"]
 mod forced_repair;
-pub use forced_repair::{enforce_upgrade, verify_and_repair};
+pub use forced_repair::{enforce_upgrade, verify_and_repair, finish_deferred_settings};
 
 fn lock() -> Result<MutexGuard<'static, ()>, String> { EVALUATION.lock().map_err(|_| "兼容性评估锁不可用。".into()) }
 fn now() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
@@ -140,17 +140,11 @@ fn record(workspace: &str, build: &Value, policy: &Value, prior: &Value, origin:
             "settings_sha256":"最近实际校验通过的配置摘要，外部修改后必须重新校验"}})
 }
 
-/// prepare_upgrade（准备升级）：复用内建迁移，精确设置与交接记录同本体事务换入。
+/// prepare_upgrade（准备本体升级）：精确设置与交接记录同事务换入，组件安装更新由本体承担。
 pub fn prepare_upgrade(root: &Path, stage: &Path, release: &mut Value, cancel: &AtomicBool, progress: &mut Progress) -> Result<Vec<Value>, String> {
     let policy = rules(&stage.join("app"), false)?;
     let mut rows = Vec::new();
-    for handler in policy["upgrade_handlers"].as_array().unwrap() {
-        match handler.as_str().unwrap() {
-            "speaker" => rows.extend(crate::installation::prepare_speaker_migration(root, stage, release, progress)?),
-            "tts_audiocpp" => rows.extend(crate::tts_upgrade::prepare(root, stage, release, cancel, progress)?),
-            _ => return Err("迁移处理器无效。".into()),
-        }
-    }
+    resources::check_cancel(cancel)?;
     let path = safe_path(root, TRANSACTION_PATHS[0])?;
     let (prior, preserve) = previous(&path)?;
     let portable = resources::load(&root.join("portable.json"))?;
@@ -179,7 +173,7 @@ pub fn prepare_upgrade(root: &Path, stage: &Path, release: &mut Value, cancel: &
     rows.push(json!({"path":TRANSACTION_PATHS[1],"original":settings_path.exists()}));
     state["applied_settings_rules"]=json!(applied);
     state["enforcement"]=json!({"phase":"pending","reset_devices":prior["enforcement"]["phase"]!="complete"&&prior["enforcement"]["reset_devices"]==true,
-        "reason":"本体已准备，必须完成配置及受管组件强制修复后才能启动"});
+        "reason":"本体已准备，等待本体配置检查及组件状态交接"});
     atomic_json(&safe_path(stage, TRANSACTION_PATHS[0])?, &state)?;
     rows.push(json!({"path":TRANSACTION_PATHS[0],"original":path.exists()}));
     progress("准备兼容性规则与交接记录", 1, 1);
@@ -221,6 +215,7 @@ fn inventory_evaluated(context:&LaunchContext,validate:impl FnOnce(&mut Vec<Valu
     let _guard = lock()?;
     let path = state_path(context)?;
     let mut rows = resources::inventory_raw(context)?;
+    crate::component_maintenance::apply(context,&mut rows)?;
     validate(&mut rows)?;
     let policy_result = rules(&context.program, context.dev);
     let mut program_issue = policy_result.as_ref().err().cloned();
@@ -255,6 +250,8 @@ fn inventory_evaluated(context:&LaunchContext,validate:impl FnOnce(&mut Vec<Valu
         json!({"resource_id":row["resource_id"],"required":row["required"]!=false,"status":if ready{"compatible"}else{"needs_repair"},
             "action":if ready{"none"}else{"repair_component"},"reason":row["error"].as_str().unwrap_or(if ready{"当前组件元数据匹配"}else{"组件缺失、版本不符或依赖未就绪"})})
     }).collect();
+    let settings_complete=settings_issue.is_none()&&settings_validated;
+    let program_complete=program_issue.is_none();
     if let Some(reason) = settings_issue {
         tasks.push(json!({"resource_id":"product-settings","required":true,"status":"needs_repair","action":"force_repair","reason":reason}));
         if let Some(server) = rows.first_mut() { server["can_start"] = json!(false); server["error"] = json!(reason); }
@@ -276,10 +273,11 @@ fn inventory_evaluated(context:&LaunchContext,validate:impl FnOnce(&mut Vec<Valu
         state["enforcement"] = prior["enforcement"].clone();
         if !completing && prior["enforcement"].is_object() && prior["enforcement"]["phase"]!="complete" {
             state["status"]=json!("needs_repair");
-            if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("升级兼容处理尚未完成，请继续运行安装器完成强制修复。");}
+            if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!(if prior["enforcement"]["phase"]=="settings_pending"{"请在系统组件配置运行依赖，随后完成本次设置维护。"}else{"本体兼容维护尚未完成，请继续本次维护。"});}
         }
     }
-    if completing && state["status"]=="compatible"{
+    // 本体维护完成与业务组件就绪分别记录；组件问题继续按既有必要性门禁显示。
+    if completing && stable && program_complete && settings_complete && prior["enforcement"]["phase"]!="settings_pending"{
         state["enforcement"]=prior["enforcement"].clone();
         state["enforcement"]["phase"]=json!("complete");
         state["enforcement"]["reason"]=Value::Null;

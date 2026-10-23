@@ -20,7 +20,7 @@ pub fn app_integrity_status(window:WebviewWindow,state:tauri::State<'_,Arc<Deskt
     let context=state.context().ok_or("缺少工作区")?;
     let ready=app_update::retained(&context.install,env!("CARGO_PKG_VERSION"),&local_build(&context)?).is_ok();
     let mut payload=maintenance_payload(if ready{MaintenanceAction::CheckIntegrity}else{MaintenanceAction::DownloadIntegrity},if ready{"current"}else{"idle"},None,0,0,None,None,false);
-    payload["phase"]=serde_json::json!(if ready{"将关闭程序，完整校验并修复受管组件，完成后重新启动。"}else{"尚未准备与本地版本一致的校验程序；下载固定版本，不会自动获取最新版。"});Ok(payload)
+    payload["phase"]=serde_json::json!(if ready{"将关闭程序并完整校验；本体由校验程序修复，组件问题在重新打开后由组件列表修复。"}else{"尚未准备与本地版本一致的校验程序；下载固定版本，不会自动获取最新版。"});Ok(payload)
 }
 #[tauri::command]
 pub fn app_integrity_download(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle)->Result<serde_json::Value,String>{

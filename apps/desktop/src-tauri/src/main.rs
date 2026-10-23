@@ -607,6 +607,12 @@ fn desktop_page_ready(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Re
     if !management&&!(state.is_settled_frontend_url(&url)&&state.allows_frontend_url(&url)){return Err("页面尚未进入管理界面或产品界面。".into());}
     let context=state.context().ok_or("缺少正式工作区")?;
     workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"role":"product","ready":true,"management_ready":management,"development":context.dev,"fields":{"schema":"页面就绪记录格式","pid":"桌面进程编号","workspace_id":"工作区编号","role":"product（正式程序）","ready":"界面已真实挂载","management_ready":"组件管理页已挂载","development":"显式源码调试"}}))?;
+    if management{if let Some(manager)=window.app_handle().try_state::<Arc<ResourceManager>>(){
+        if let Err(error)=manager.inner().resume_maintenance(){
+            // 页面已经真实挂载；任务准入失败保留交接并显示原因，不能让前端卸载已确认的管理界面。
+            *state.error.lock().unwrap()=Some(format!("组件维护任务未能启动，交接记录已保留，可在组件列表重试：{error}"));
+        }
+    }}
     window.show().map_err(|error|error.to_string())?;
     // 新界面完成挂载及绘制后才撤走临时启动窗口，加载失败时旧画面仍可见。
     if window.label()=="main" {
@@ -1405,6 +1411,7 @@ fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceSta
 
 // create_window（统一窗口）：选定工作区后销毁临时窗口，将网页缓存切换到工作区。
 fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)->Result<WebviewWindow,String>{
+    let repair_handoff=management&&build_state.context().is_some_and(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).unwrap_or(false));
     let pending=build_state.mode==FrontendMode::Product&&build_state.context().is_none();
             let navigation_state = build_state.clone();
             let page_state = build_state.clone();
@@ -1440,6 +1447,7 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
                             let _=window.show();
                             if let Some(context)=page_state.context(){let arguments=std::env::args().skip(1).collect::<Vec<_>>();let _=voice_desktop_common::installation::acknowledge(&context.install,&arguments);}
                         }
+                        if repair_handoff{return;}
                         if !request_service_start(
                             payload.url(),
                             payload.event(),
@@ -1583,7 +1591,8 @@ fn run() -> Result<(), String> {
                 *build_state.workspace_guard.lock().unwrap()=Some(voice_desktop_common::installation::WorkspaceGuard::acquire(&context.install).map_err(std::io::Error::other)?);
                 initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
             }
-            create_window(app.handle(),build_state.clone(),false).map_err(std::io::Error::other)?;
+            let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context)).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
+            create_window(app.handle(),build_state.clone(),maintenance).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
                 let floating_item = CheckMenuItem::with_id(app, "floating", "悬浮窗模式", true, false, None::<&str>)?;

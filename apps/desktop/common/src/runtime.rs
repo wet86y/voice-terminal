@@ -121,7 +121,7 @@ pub(crate) fn current_for_upgrade(context:&LaunchContext)->Result<bool,String>{
     let root=context.install.join("runtimes/python");
     let record=resources::load(&safe_path(&root,"runtime.json")?).unwrap_or(Value::Null);
     if status(context)?["full_ready"]!=true || record["python"].as_str().is_none_or(str::is_empty) || record["python"]!=lock(context)?["python"]["version"]
-        || (managed_gpu(&record)&&!gpu_current(context,&record)){return Ok(false);}
+        {return Ok(false);}
     // 只读取安装清单的记录结构，不访问其中的依赖文件；坏清单不能继承环境复用资格。
     let manifest=resources::load(&safe_path(&root,"manifest.json")?).unwrap_or(Value::Null);
     let Some(files)=manifest["files"].as_array()else{return Ok(false)};
@@ -290,20 +290,6 @@ fn copy_interpreter(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut P
 pub fn configure(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
     resources::recover(context)?; // 单独调用时先恢复；并行宿主在启动及串行启用时恢复事务。
     configure_with_activation(context,group,cancel,progress,&mut|stage,relative|resources::activate(context,stage,relative))
-}
-/// validate_current（修复失败后的实际环境复核）：确认恢复事务是否已经提交有效新环境。
-pub(crate) fn validate_current(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
-    if status(context)?["full_ready"]!=true{return Err("当前环境未满足新版完整依赖要求".into());}
-    let root=context.install.join("runtimes/python");
-    crate::workspace::verify_tree_with_progress(&root,"manifest.json",cancel,progress)?;
-    let record=resources::load(&root.join("runtime.json"))?;
-    let gpu=managed_gpu(&record);
-    let names=requested(&effective_lock(context,gpu)?,"all")?;
-    let mut args=vec!["--names".into(),serde_json::to_string(&names).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
-    if gpu{args.extend(["--gpu-lock".into(),gpu_lock_path(context).to_string_lossy().into_owned()]);}
-    if record["compatible_gpu"]==true{args.push("--compatible-gpu".into());}
-    if worker(context,&context.python,"check",&args,cancel)?["ready"]!=true{return Err("当前环境实际加载检查失败".into());}
-    Ok(())
 }
 pub fn configure_with_activation(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     if !matches!(group,"all"|"base"|"cpu"|CPU_RESOURCE|"gpu"|GPU_RESOURCE)&&!ENVIRONMENT_GROUPS.contains(&group){return Err("未知的语音运行依赖卡片".into());}
