@@ -1,7 +1,9 @@
-﻿param([switch]$SkipBuild)
+﻿param([switch]$SkipBuild,[switch]$UpdateLocal) # UpdateLocal（将同一发行包安装到本机一次）。
 $ErrorActionPreference='Stop'
-. (Join-Path $PSScriptRoot 'local-context.ps1')
+. (Join-Path $PSScriptRoot 'desktop-pipeline.ps1')
+. (Join-Path $PSScriptRoot 'github-release-target.ps1')
 $Repo=Get-ProjectRoot
+Enter-DesktopPipeline
 Push-Location $Repo
 try {
   if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw '未找到 GitHub CLI（GitHub 命令行工具）gh。' }
@@ -23,12 +25,23 @@ try {
   if ($LASTEXITCODE) { throw '找不到公开仓库 wet86y/voice-terminal。' }
   $RepositoryInfo=$Repository | ConvertFrom-Json
   if ($RepositoryInfo.nameWithOwner -ne 'wet86y/voice-terminal' -or $RepositoryInfo.visibility -ne 'PUBLIC') { throw 'GitHub 发行目标必须是公开仓库 wet86y/voice-terminal。' }
+  $Version=[string](Get-Content -LiteralPath (Join-Path $Repo 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
+  $ReleaseExists=Assert-GitHubReleaseTarget -Tag ('v'+$Version) -Head $Head
 
   if (-not $SkipBuild) {
-    & npm run desktop:dist
+    & (Join-Path $PSScriptRoot 'distribute-desktop.ps1')
     if ($LASTEXITCODE) { throw '本机 Windows 分发构建失败，未发布 GitHub Release（GitHub 发行版）。' }
   }
 
+  Assert-DesktopPackage
+  if ($SkipBuild) {
+    & (Join-Path $PSScriptRoot 'distribute-desktop.ps1') -SkipProductBuild -SkipInstallerBuild
+    if ($LASTEXITCODE) {throw '复用发行产物的输入与摘要核验失败。'}
+  }
+  if ($UpdateLocal) {
+    & (Join-Path $PSScriptRoot 'publish-desktop.ps1') -SkipBuild
+    if ($LASTEXITCODE) {throw '同包本机更新未完成，未上传发行资产。'}
+  }
   $Manifest=Get-Content -LiteralPath (Join-Path $Repo 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   $Version=[string]$Manifest.version
   if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $Manifest.license -ne 'Apache-2.0') { throw '根项目版本格式无效，或许可证声明不是 Apache-2.0。' }
@@ -73,10 +86,8 @@ try {
   $Checksums=@("$InstallerHash  VoiceTerminalSetup.exe","$DeliveryHash  delivery.json","$UpdateHash  update.json") -join "`n"
   [IO.File]::WriteAllText($ChecksumPath,$Checksums+"`n",[Text.UTF8Encoding]::new($false))
 
-  $ReleaseList=(& gh release list --limit 100 --json tagName)
-  if ($LASTEXITCODE) { throw '无法读取 GitHub Release（GitHub 发行版）列表。' }
-  $ExistingTags=@(($ReleaseList | ConvertFrom-Json) | ForEach-Object tagName)
-  $ReleaseExists=$Tag -in $ExistingTags
+  # 构建或安装可能耗时；在第一次远端写入前再次核对，避免期间标签发生变化。
+  $ReleaseExists=Assert-GitHubReleaseTarget -Tag $Tag -Head $Head
   $Assets=@($Installer,$DeliveryPath,$UpdatePath,$ChecksumPath)
   if ($ReleaseExists) {
     & gh release upload $Tag @Assets --clobber
@@ -96,4 +107,8 @@ try {
   $RemoteInstaller=$PublishedInfo.assets | Where-Object name -eq 'VoiceTerminalSetup.exe' | Select-Object -First 1
   if ($RemoteInstaller.size -ne $InstallerSize) { throw 'GitHub 上的安装器资产大小与本机构建不一致。' }
   Write-Host "GitHub Release 已发布：https://github.com/wet86y/voice-terminal/releases/tag/$Tag" -ForegroundColor Green
-} finally { Pop-Location }
+  Invoke-DesktopStage '公开发行资产回下载与一致性核验' {
+    & (Join-Path $PSScriptRoot 'verify-github-release.ps1') -Tag $Tag
+    if ($LASTEXITCODE) {throw '发行已上传，但公开核验未完成，请保留诊断并重试核验入口。'}
+  }
+} finally { Pop-Location;Exit-DesktopPipeline }

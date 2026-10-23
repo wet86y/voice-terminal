@@ -18,6 +18,24 @@ from voice_terminal import __version__
 from voice_terminal.distribution import digest, files, manifest, verify
 from voice_terminal.paths import atomic_json
 
+
+def write_archive(stage: Path, archive: Path) -> None:
+    """Stable archive（稳定归档）：固定时间、权限与顺序，不把本机元数据带入发行摘要。"""
+    candidate = archive.with_suffix('.pending.zip')
+    with zipfile.ZipFile(candidate, 'w', zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as output:
+        for path in files(stage):
+            entry = zipfile.ZipInfo(path.relative_to(stage).as_posix(), (1980, 1, 1, 0, 0, 0))
+            entry.create_system = 3
+            entry.external_attr = 0o100644 << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry._compresslevel = 3
+            with path.open('rb') as incoming, output.open(entry, 'w', force_zip64=True) as outgoing:
+                shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+    if archive.is_file() and digest(candidate) == digest(archive):
+        candidate.unlink()
+    else:
+        candidate.replace(archive)
+
 def bundle_speaker_seed(program: Path) -> dict:
     """CAM++升级种子：官方摘要校验后随本体交付，安装时离线装入外置模型目录。"""
     from voice_terminal.resource_distribution import ResourceCatalog
@@ -82,11 +100,7 @@ def assemble(desktop: Path, build: str = '') -> Path:
               'fields': {'schema': '统一程序包格式', 'role': 'product（正式程序）', 'version': '产品版本', 'build': '构建编号', 'files': '固定文件集合，组件登记单独核验', 'path': '相对路径', 'size': '字节数', 'sha256': 'SHA-256（文件摘要）'}}
     atomic_json(stage / 'program-package.json', record)
     archive = cache / 'program.zip'
-    candidate = archive.with_suffix('.pending.zip')
-    with zipfile.ZipFile(candidate, 'w', zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as output:
-        for path in files(stage):
-            output.write(path, path.relative_to(stage).as_posix())
-    candidate.replace(archive)
+    write_archive(stage, archive)
     atomic_json(cache / 'package-info.json', {'schema': 1, 'build': build, 'version': __version__, 'size': archive.stat().st_size, 'sha256': digest(archive), 'files': len(record['files']),
                 'fields': {'schema': '程序包记录格式', 'build': '构建编号', 'version': '产品版本', 'size': '压缩包字节数', 'sha256': '压缩包摘要', 'files': '固定本体文件数'}})
     print(f'统一正式程序包：{archive}；构建 {build}；{archive.stat().st_size / 1024**2:.1f} MiB（兆二进制字节）。')

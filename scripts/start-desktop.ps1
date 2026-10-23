@@ -5,8 +5,10 @@ $ErrorActionPreference='Stop'
 $DesktopRepo=Get-ProjectRoot
 if ($UiPreview) {
   if ($Dev -or $Diagnostic -or $InstallRoot) {throw '演示使用隔离缓存，不接受业务运行参数。'}
-  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -SkipFrontend
+  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -DesktopOnly -SkipFrontend
   if ($LASTEXITCODE) {throw '演示宿主构建失败。'}
+  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -DemoLauncherOnly -SkipFrontend
+  if ($LASTEXITCODE) {throw '演示启动器构建失败。'}
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/debug/VoiceTerminalUIDemo.exe') -Destination (Join-Path $DesktopRepo '.local/VoiceTerminalUIDemo.exe') -Force
   & (Join-Path $DesktopRepo '.local/build/desktop/product/debug/VoiceTerminalDesktop.exe') '--root' $DesktopRepo '--ui-preview'
   exit $LASTEXITCODE

@@ -9,10 +9,15 @@ npm run desktop:start        # 与双击同一正式入口，读取已发布静�
 npm run dev                  # 显式源码调试，沿用正式环境与用户数据
 npm run dev:ui               # 构建演示宿主，只启动界面服务
 npm run desktop:build        # 构建到缓存，不换入正式本体
-npm run desktop:publish      # 组装并事务换入统一正式程序包
-npm run desktop:dist         # 构建内嵌同一正式包的独立安装器
+npm run desktop:prepare      # 按内容准备统一程序包，不安装
+npm run desktop:publish      # 准备程序包并事务换入本机正式本体
+npm run desktop:dist         # 准备程序包并构建独立分发安装器
+npm run desktop:deliver      # 本机更新与安装器共用一份程序包
+npm run github:release:local # 同包本机更新并公开发行
 .\.local\Verify-Package.ps1  # 原生固定本体摘要校验，无后端环境也可执行
 ```
+
+常规入口会按输入与产物内容复用有效阶段；组合交付使用单一命令，避免重复组包和安装。完整步骤及精确复用参数见[开发、构建与同包交付流程](../development/desktop-pipeline.md)。
 
 ### 项目本地 Rust 工具链
 

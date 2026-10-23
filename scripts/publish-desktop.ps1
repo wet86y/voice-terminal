@@ -1,35 +1,30 @@
 ﻿param([string]$InstallRoot='', [string]$Build='', [switch]$SkipBuild, [switch]$BuildDemo) # BuildDemo（显式更新本机演示宿主）。
 $ErrorActionPreference='Stop'
 if ($SkipBuild -and $BuildDemo) {throw '复用已有构建与重建演示不能同时指定。'}
-. (Join-Path $PSScriptRoot 'local-context.ps1')
+. (Join-Path $PSScriptRoot 'desktop-pipeline.ps1')
+Enter-DesktopPipeline
+try {
 $DesktopRepo=Get-ProjectRoot
 if (-not $InstallRoot) {$InstallRoot=Join-Path $DesktopRepo '.local'}
 $InstallRoot=[IO.Path]::GetFullPath($InstallRoot)
 $Context=Get-LocalContext
 if (-not $SkipBuild) {
-  & (Join-Path $PSScriptRoot 'prepare-7zip.ps1');if ($LASTEXITCODE) {throw '压缩工具准备失败。'}
-  & $Context.Node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal/build.mjs');if ($LASTEXITCODE) {throw '代理插件构建失败。'}
-  # 常规覆盖发布只构建正式程序；演示按显式请求构建，避免每次维护两套编译配置。
-  if ($BuildDemo) {
-    & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -DesktopOnly -SkipFrontend
-    if ($LASTEXITCODE) {throw '本地演示宿主构建失败。'}
-  }
-  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel release
-  if ($LASTEXITCODE) {throw '正式程序构建失败。'}
+  & (Join-Path $PSScriptRoot 'prepare-desktop-product.ps1') -Build $Build -BuildDemo:$BuildDemo
+  if ($LASTEXITCODE) {throw '正式程序包准备失败。'}
 }
-$PackageArgs=@('-B','-X','utf8',(Join-Path $PSScriptRoot 'assemble-program-package.py'))
-if ($Build) {$PackageArgs+=@('--build',$Build)}
-& $Context.Python @PackageArgs;if ($LASTEXITCODE) {throw '统一正式程序包组装失败。'}
+Assert-DesktopPackage -Build $Build
+$Package=Join-Path $DesktopRepo '.local/build/program-package/program.zip'
+$PackageHash=Get-Sha256File -LiteralPath $Package
 # 本体替换前通过现有实例的正式退出流程停机，模型与用户内容不参与替换。
 & $Context.Python '-B' '-X' 'utf8' '-c' 'import sys; sys.path.insert(0,sys.argv[2]); from pathlib import Path; from voice_terminal.distribution import require_stopped; root=Path(sys.argv[1]); require_stopped(root, root)' $InstallRoot $DesktopRepo
 if ($LASTEXITCODE) {throw '现有正式程序未能安全退出。'}
 $Helper=Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminal.exe'
-$InstallArguments=@('--install-package',('"'+(Join-Path $DesktopRepo '.local/build/program-package/program.zip')+'"'),'--target-root',('"'+$InstallRoot+'"'))
-# Native GUI（原生图形入口）必须等待退出并检查自身退出码；$LASTEXITCODE（上一命令退出码）不能确认替换已完成。
-$InstallProcess=Start-Process -FilePath $Helper -ArgumentList $InstallArguments -WindowStyle Hidden -Wait -PassThru
-if ($InstallProcess.ExitCode) {throw '发布或强制兼容处理未完成；请核对事务及兼容记录，新本体已提交时继续修复，不回退旧的不兼容组合。'}
-if ($InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
+$InstallArguments=@('--install-package',$Package,'--target-root',$InstallRoot)
+Invoke-DesktopStage '安装已有程序包与强制兼容处理' {Invoke-DesktopInstallProcess -Executable $Helper -Arguments $InstallArguments}
+if ((Get-Sha256File -LiteralPath $Package) -ne $PackageHash) {throw '安装期间程序包发生变化，拒绝将本轮标记为同包交付。'}
+if ($BuildDemo -and $InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminalUIDemo.exe') -Destination (Join-Path $InstallRoot 'VoiceTerminalUIDemo.exe') -Force
 }
 Write-Host "正式入口：$InstallRoot/VoiceTerminal.exe" -ForegroundColor Green
 Write-Host '本地发布与安装器共用同一程序包及兼容性组件；有效资源已复用，配置、故障资料及必需组件已完成强制处理。' -ForegroundColor Green
+} finally {Exit-DesktopPipeline}
