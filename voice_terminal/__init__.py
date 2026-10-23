@@ -1,3 +1,3 @@
 """Local modular real-time voice terminal backend."""
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
