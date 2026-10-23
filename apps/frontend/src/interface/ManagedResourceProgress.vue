@@ -51,8 +51,8 @@ function formatBytes(value: number | null | undefined) {
 .managed-job-progresses{display:grid;gap:7px;min-width:0}
 .managed-job-progress-wrap{display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch;gap:6px;min-width:0}
 .managed-job-progress-wrap small{justify-self:end;max-width:100%;white-space:normal;text-align:right;overflow-wrap:anywhere;font-size:var(--font-caption);font-variant-numeric:tabular-nums;color:var(--muted)}
-.managed-job-progress{width:100%;min-width:0;height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
-.managed-job-progress span{display:block;height:100%;background:var(--accent);transition:width 150ms ease}
+.managed-job-progress{position:relative;width:100%;min-width:0;height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
+.managed-job-progress span{position:absolute;inset:0 auto 0 0;display:block;border-radius:inherit;background:var(--accent);transition:width 150ms ease}
 .managed-job-progress.indeterminate span{width:30%;animation:resource-progress 1.5s ease-in-out infinite alternate}
 @keyframes resource-progress{from{transform:translateX(0)}to{transform:translateX(230%)}}
 @media (prefers-reduced-motion:reduce){.managed-job-progress span{transition:none;animation:none}}
