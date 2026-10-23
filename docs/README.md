@@ -72,6 +72,7 @@
 - [0.9.2 构建、本机安装与公开发行验收](testing/release-0.9.2-20261018.md)
 - [0.9.3 构建、本机安装与公开发行验收](testing/release-0.9.3-20261019.md)
 - [0.9.6 构建、本机更新与 GitHub 发布验收](testing/release-0.9.6-20261022.md)
+- [0.9.7 本机更新与公开发行验收](testing/release-0.9.7-20261023.md)
 - [0.9.5 构建与公开发行验收](testing/release-0.9.5-20261021.md)
 - [0.9.4 构建、本机安装与公开发行验收](testing/release-0.9.4-20261020.md)
 - [GitHub 节点测速择优与四路下载接入验证](testing/github-node-selection-20261019.md)
