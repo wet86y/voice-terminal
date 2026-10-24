@@ -49,7 +49,15 @@ def request_snapshot(messages):
 
 
 def shadow_state(messages):
-    return request_snapshot(messages)["shadow"]
+    packet = request_snapshot(messages)
+    state = dict(packet["shadow"])
+    assert "progress" not in state
+    progress = sorted(({"text": row["payload"]["text"], "source": row["source"]}
+                       for row in packet["runtime"].get("secondary_items", [])
+                       if row["kind"] == "shadow_progress"), key=lambda row: row["source"])
+    if progress:
+        state["progress"] = progress
+    return state
 
 
 async def wait_for_calls(provider, count):
@@ -311,7 +319,7 @@ def test_transport_retry_keeps_secondary_scope_and_does_not_consume_new_progress
         assert runtime.active_dispatch_context["prompt_kind"] == "secondary_mailbox"
         assert runtime.active_dispatch_context["system_check_id"] == original["system_check_id"]
         assert shadow_state(provider.messages[-1])["progress"] == [{"text": "原请求进度", "source": "agent"}]
-        assert runtime._secondary_snapshot()["agent"]["text"] == "后来新进度"
+        assert runtime.ledger.shadow_progress_snapshot()["agent"]["text"] == "后来新进度"
         await _finish_blocking_request(runtime, provider)
         await runtime._on_heartbeat(8.0)
         await wait_for_calls(provider, 3)
@@ -441,7 +449,7 @@ def test_protocol_recovery_reuses_the_frozen_secondary_snapshot():
         assert "secondary_mailbox" in entries
         assert "不要重新回答历史用户请求" in entries["immediate_recovery"]
         assert shadow_state(provider.messages[-1])["progress"] == [{"text": "原评估进度", "source": "agent"}]
-        assert runtime._secondary_snapshot()["agent"]["text"] == "恢复期间新进度"
+        assert runtime.ledger.shadow_progress_snapshot()["agent"]["text"] == "恢复期间新进度"
         assert runtime.max_request_concurrency == 1
 
     asyncio.run(scenario())
@@ -468,7 +476,7 @@ def test_transport_retry_after_protocol_recovery_keeps_secondary_scope():
         assert runtime.active_dispatch_context["system_check_id"] == original["system_check_id"]
         assert "secondary_mailbox" in tail_entries(provider.messages[-1])
         assert shadow_state(provider.messages[-1])["progress"] == [{"text": "原评估进度", "source": "agent"}]
-        assert runtime._secondary_snapshot()["agent"]["text"] == "恢复期间新进度"
+        assert runtime.ledger.shadow_progress_snapshot()["agent"]["text"] == "恢复期间新进度"
         await runtime._finish_active_request(retry)
         assert provider.calls == 3
         assert runtime.max_request_concurrency == 1
@@ -528,7 +536,7 @@ def test_live_server_bridge_delivers_progress_to_secondary_and_information_to_no
         assert await bridge.accept_event(progress) == "accepted"
         assert session.shadow_product.summary == "真实投递进度"
         assert runtime.pending == set()
-        assert runtime._secondary_snapshot()["agent"]["text"] == "真实投递进度"
+        assert runtime.ledger.shadow_progress_snapshot()["agent"]["text"] == "真实投递进度"
         await runtime._on_heartbeat(4.0)
         await wait_for_calls(provider, 1)
         assert "secondary_mailbox" in tail_entries(provider.messages[-1])
@@ -548,7 +556,7 @@ def test_live_server_bridge_delivers_progress_to_secondary_and_information_to_no
         await bridge._publish_observer_status(summary, 3)
         assert session._shadow_product_snapshot() == before_product
         assert runtime.pending == set()
-        assert runtime._secondary_snapshot()["observer"]["text"] == summary
+        assert runtime.ledger.shadow_progress_snapshot()["observer"]["text"] == summary
         await runtime._on_heartbeat(8.0)
         await wait_for_calls(provider, 3)
         assert shadow_state(provider.messages[-1])["progress"] == [{"text": summary, "source": "observer"}]
@@ -562,7 +570,7 @@ def test_live_server_bridge_delivers_progress_to_secondary_and_information_to_no
         assert len(queued) == 1 and queued[0].source == "observer"
         session.state.listening = True
         await accept(queued)
-        assert runtime._secondary_snapshot()["observer"]["text"] == deferred_summary
+        assert runtime.ledger.shadow_progress_snapshot()["observer"]["text"] == deferred_summary
         assert runtime.max_request_concurrency == 1
         await bridge.cancel()
         assert session.history.shadow_progress_snapshot() == {}

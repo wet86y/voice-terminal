@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from typing import Mapping
+from typing import Mapping, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .session.secondary_mailbox import SecondaryMailbox
 
 
 @dataclass(frozen=True)
@@ -30,8 +33,11 @@ class AudioEnhancements:
 class AcousticMailbox:
     """AcousticMailbox（声学信箱）：仅确认请求捕获的观察前缀。"""
 
-    def __init__(self):
-        self._rows: list[dict] = []
+    def __init__(self, mailbox: SecondaryMailbox | None = None):
+        # 设置页只读取选项；实例化声学适配器时才加载会话模块。
+        from .session.secondary_mailbox import SecondaryMailbox
+        self.mailbox = SecondaryMailbox() if mailbox is None else mailbox
+        self._mailbox_scope = self.mailbox.new_scope()
         self._active: int | None = None
         self._continuous: dict | None = None  # 已消费后仍保留当前持续观察的开始时间。
         self._sequence = 0
@@ -39,11 +45,31 @@ class AcousticMailbox:
         self._last_end = -1
 
     def clear(self):
-        self._rows.clear()
+        self.mailbox.invalidate(self._mailbox_scope)
+        self._mailbox_scope = self.mailbox.new_scope()
         self._active = None
         self._continuous = None
         self._last_end = -1
         self._scope += 1
+
+    def bind_mailbox(self, mailbox: SecondaryMailbox):
+        """接入账本唯一存储；独立实例继续可用于音频聚合测试。"""
+        if mailbox is self.mailbox:
+            return
+        rows = self.snapshot()
+        self.mailbox.invalidate(self._mailbox_scope)
+        self.mailbox = mailbox
+        self._mailbox_scope = mailbox.new_scope()
+        for row in rows:
+            self._publish(row)
+
+    def _publish(self, row: dict):
+        if not self.mailbox.scope_valid(self._mailbox_scope):
+            self._mailbox_scope = self.mailbox.new_scope()
+        self.mailbox.publish(source="acoustic", kind="acoustic_observation",
+            payload=self.project([row])[0], scope=self._mailbox_scope,
+            coalesce_key=str(row["id"]),
+            metadata={key: row[key] for key in ("id", "scope", "start_sample", "end_sample")})
 
     def interrupt(self):
         """暂停观察形成断点，保留未消费记录。"""
@@ -63,29 +89,28 @@ class AcousticMailbox:
         active = self._continuous
         if active is not None and active["labels"] == labels:
             active["end_sample"] = end_sample
-            if not any(row["id"] == active["id"] for row in self._rows):
-                self._rows.append(active)
+            self._publish(active)
             return
         self._sequence += 1
         self._active = self._sequence
-        self._rows.append({"id": self._sequence, "scope": self._scope, "labels": labels,
-                           "start_sample": start_sample, "end_sample": end_sample})
-        self._continuous = self._rows[-1]
+        self._continuous = {"id": self._sequence, "scope": self._scope, "labels": labels,
+                            "start_sample": start_sample, "end_sample": end_sample}
+        self._publish(self._continuous)
 
     def snapshot(self) -> list[dict]:
-        return deepcopy(self._rows)
+        return [{**row["metadata"], "labels": list(row["payload"]["labels"]),
+                 "_mailbox_id": row["id"], "_mailbox_version": row["version"],
+                 "_mailbox_scope": row["scope"]}
+                for row in self.mailbox.snapshot().values() if row["scope"] == self._mailbox_scope]
 
     def valid(self, rows: list[dict]) -> list[dict]:
-        return deepcopy([row for row in rows if row.get("scope") == self._scope])
+        return deepcopy([row for row in rows if row.get("scope") == self._scope
+                         and self.mailbox.scope_valid(row.get("_mailbox_scope"))])
 
     def consume(self, captured: list[dict]):
-        for old in self.valid(captured):
-            for current in tuple(self._rows):
-                if current["id"] != old["id"]:
-                    continue
-                if current["end_sample"] <= old["end_sample"]:
-                    self._rows.remove(current)
-                # 持续观察已延长时保留新版本及原开始时间；旧快照只确认旧的最近观测。
+        self.mailbox.consume({row["_mailbox_id"]: {
+            "id": row["_mailbox_id"], "version": row["_mailbox_version"],
+            "scope": row["_mailbox_scope"]} for row in self.valid(captured)})
 
     @staticmethod
     def project(rows: list[dict]) -> list[dict]:

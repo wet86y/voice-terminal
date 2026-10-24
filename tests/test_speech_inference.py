@@ -347,7 +347,7 @@ def test_secondary_retry_uses_its_valid_snapshot_when_the_mailbox_is_empty():
             "progress", "progress", "需要重试的原进度", 1, "activation",
         ))
         captured = runtime._secondary_snapshot()
-        runtime.ledger.consume_shadow_progress(captured)
+        runtime._consume_secondary(captured, prompt_kind="normal")
         assert not runtime._secondary_snapshot()
         runtime._retry_secondary_by_turn["turn"] = captured
         runtime._system_check_is_stale = lambda _context: False

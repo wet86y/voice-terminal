@@ -84,8 +84,8 @@ def test_request_shadow_contract_is_content_free_and_strict():
     for invalid in ({}, {"request": False}, {"request": True, "text": "x"}, True):
         with pytest.raises(ValueError):
             parse_shadow_wake(invalid)
-    assert VoiceShadowRegistry(available=False).action_definitions() == []
-    assert VoiceShadowRegistry(available=True).action_definitions() == [definition]
+    assert [row["name"] for row in VoiceShadowRegistry(available=False).action_definitions()] == ["continue_listening"]
+    assert [row for row in VoiceShadowRegistry(available=True).action_definitions() if row["name"] == "request_shadow"] == [definition]
 
 
 def test_shadow_event_prompts_report_facts_without_directing_main_speech():

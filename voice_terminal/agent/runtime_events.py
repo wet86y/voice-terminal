@@ -29,6 +29,7 @@ class RecoverySignal:
     dispatch_context: dict | None = None
     shadow_information: dict | None = None
     secondary_context: dict | None = None  # 二等进度冻结快照，只供原请求的协议恢复使用。
+    listening_context: dict | None = None  # 持续倾听状态及输入作用域的冻结快照。
     error_id: str = ""
     consumed: bool = False
     queued_at_monotonic: float = 0.0

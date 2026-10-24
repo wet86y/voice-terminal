@@ -189,8 +189,9 @@ def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpo
         tail = _request_tail_by_kind(provider.messages)
         snapshot = _request_snapshot(provider.messages)
         assert "secondary_mailbox" in tail
-        assert "agent" in tail["secondary_update"]
-        assert snapshot["shadow"]["progress"] == [{"text": "正在核对", "source": "agent"}]
+        assert "runtime.secondary_items" in tail["secondary_update"]
+        assert "progress" not in snapshot["shadow"]
+        assert [(row["source"], row["payload"]["text"]) for row in snapshot["runtime"]["secondary_items"]] == [("agent", "正在核对")]
         assert all(entry.kind != "shadow_event" for entry in runtime.ledger.entries)
         await _finish_blocking_request(runtime, provider)
         await runtime._on_heartbeat(8.0)
@@ -773,7 +774,8 @@ def test_secondary_and_final_prompts_are_mutually_exclusive():
     assert SECONDARY_MAILBOX_PROMPT in secondary
     assert "系统即将进入静默状态" not in secondary
     assert "actions 必须为 []" not in secondary
-    assert "没有必要的新内容时必须 wait（保持等待）" in secondary
+    assert "可以继续等待，也可以在输出空闲时适时回应或询问" in secondary
+    assert "没有必要的新内容时必须 wait（保持等待）" not in secondary
     assert "actions（动作列表）与 speak（语音决策）独立判断" in secondary
     assert FINAL_SILENCE_PROMPT in final
     assert SECONDARY_MAILBOX_PROMPT not in final
