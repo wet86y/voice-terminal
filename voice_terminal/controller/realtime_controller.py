@@ -433,9 +433,43 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         elif type_ in {"turn.started", "turn.endpoint_candidate", "turn.committed", "turn.completed"}:
             speaker_audit(type_+"（输入时间线）", turn_id=ws.turn_id, generation=ws.generation,
                           timings=dict(ws.timings), speaker_summary=dict(ws.speaker_summary))
+        if type_.startswith("transcript.") and ws.speaker_mode == "filter":
+            if not self._speaker_text_visible(ws) or not str(payload.get("text") or "").strip():
+                return
+            published = (payload.get("text"), payload.get("source"), payload.get("revision"))
+            # 两种内部流式事件映射为同一界面更新，正文相同时只发一次。
+            publish_key = "transcript.live" if type_ in {"transcript.partial", "transcript.segment"} else type_
+            if ws.published_transcripts.get(publish_key) == published:
+                return
+            ws.published_transcripts[publish_key] = published
         self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
         await self._publish(event(type_, ws.turn_id, output_generation=ws.generation,
                                   workspace=ws.snapshot(), **payload))
+
+    def _speaker_text_visible(self, ws: TurnWorkspace) -> bool:
+        """普通显示与对话提交共用准入；仅观察、关闭模式不等待声纹。"""
+        if ws.speaker_mode != "filter":
+            return True
+        turn = self.speaker_policy.turns.get(ws.turn_id)
+        if turn is not None:
+            return turn.admitted
+        return ws.transcript_visible or self.speaker_policy.fully_admitted(ws.turn_id)
+
+    async def _publish_partial_transcript(self, ws: TurnWorkspace) -> None:
+        """待判原文只缓存；通过后一次补齐句首，后续只发布变化后的正文。"""
+        if self.workspace is not ws or not getattr(self, "_active_input", False) or not self._speaker_text_visible(ws):
+            return
+        if ws.speaker_mode == "filter":
+            text = self.speaker_policy.admitted_text(ws.turn_id)
+            if text.strip() and text != ws.published_partial_text:
+                ws.published_partial_text = text
+                self.state.current["partial_text"] = text
+                await self._detail("transcript.partial", text=text)
+                await self._segment(text)
+        else:
+            self.state.current["partial_text"] = ws.raw_partial
+            await self._detail("transcript.partial", text=ws.raw_partial)
+            await self._segment(ws.raw_partial)
 
     async def initialize(self) -> None:
         await super().initialize()
@@ -982,7 +1016,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             ws.timings["commit"] = time.monotonic()
             if "asr_final" in ws.timings:
                 ws.timings["asr_final_to_commit_ms"] = round((ws.timings["commit"] - ws.timings["asr_final"]) * 1000)
-            self.state.current.update(final_text=ws.final_text, partial_text="")
+            self.state.current.update(final_text=ws.final_text if self._speaker_text_visible(ws) else "", partial_text="")
             await self._detail("transcript.final", text=ws.final_text, source="paraformer")
             await self._detail("turn.committed")
             # EpisodeController retires the audio workspace as soon as the
@@ -1068,18 +1102,20 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             ws.timings.setdefault("asr_final", time.monotonic())
             self._sub_finals[sub_id].set()
         if self._active_input:
-            self.state.current["partial_text"] = ws.raw_partial
-            await self._detail("transcript.partial", text=ws.raw_partial)
-            await self._segment(ws.raw_partial)
+            await self._publish_partial_transcript(ws)
         await self._latency(ws)
 
     async def _segment(self, text: str, *, pause: bool = False) -> None:
         ws = self.workspace
+        if ws is None or (ws.speaker_mode == "filter" and not self._speaker_text_visible(ws)):
+            return
         result = self.segmenter.feed(text, pause=pause)
         if result is None or ws is None:
             return
         if ws.speaker_mode == "filter":
             admitted = self.speaker_policy.admitted_text(ws.turn_id)
+            if not admitted.strip():
+                return
             # text（过滤后正文）保持分段结果契约，热词修订只能读取已准入内容。
             result = {"text": admitted, "new_segment": "",
                       "segments": [admitted] if admitted else [],
@@ -1094,6 +1130,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             result["text"] = "".join(result["segments"])
             result["new_segment"] = "".join(row["text"] for row in result["sentences"] if row.get("sentence_id") in result["changed_ids"])
         ws.segments = list(result.get("sentences") or [{"text": s} for s in result["segments"]])
+        if ws.speaker_mode == "filter":
+            self.state.current["partial_text"] = result["text"]
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)
 

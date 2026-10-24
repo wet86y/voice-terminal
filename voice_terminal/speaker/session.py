@@ -186,7 +186,8 @@ class SessionSpeakerPolicy:
     def observe_turn(self, turn_id: str, vector, *, end: int, start: int,
                      speech_ms: int, first: bool = False, quality: str = "ready",
                      sequence: int = 0, latency_ms: float = 0, now: float | None = None,
-                     window_speech_ms: int | None = None) -> SpeakerState:
+                     window_speech_ms: int | None = None,
+                     first_final: bool = False) -> SpeakerState:
         turn = self.turns.get(turn_id) or self.candidates.get(turn_id)
         if turn is None or turn.closed:
             return SpeakerState.UNKNOWN
@@ -208,7 +209,7 @@ class SessionSpeakerPolicy:
                 # 当前样本可以完成校准，但不能在同次判断中与自身混分。
                 self._collect(vector, start, end, speech_ms, now)
         except Exception as exc:
-            # 模型/资料评分异常与无有效分数一致，首段必须走未确认放行。
+            # 模型/资料评分异常与无有效分数一致，继续等待；闭段或到期仍未知则拦截。
             permanent = temporary = None
             quality = "unavailable"
             audit("scoring_failed（评分异常）", turn_id=turn_id,
@@ -227,7 +228,7 @@ class SessionSpeakerPolicy:
                   "identity_result": ("owner" if score >= threshold else "non_owner") if score is not None else None}
         was_recovered = turn.recovered
         previous_state = turn.state
-        changed = turn.observe(scores, self.config, end=end, first=first)
+        changed = turn.observe(scores, self.config, end=end, first=first, first_final=first_final)
         if (turn_id in self.candidates and previous_state in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY}
                 and turn.state == SpeakerState.NON_OWNER_CONFIRMED and turn.negative_ticks < self.config.non_owner_ticks):
             turn.observation_state = previous_state  # 独立打断保留既有短时波动容忍。

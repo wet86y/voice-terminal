@@ -152,12 +152,17 @@ async def test_speaker_filtered_segment_keeps_hotword_text_contract(admitted):
     try:
         await service.configure(settings())
         ws = TurnWorkspace("input", generation=1, speaker_mode="filter")
-        controller = SimpleNamespace(
-            workspace=ws, segmenter=TranscriptSegmenter(), hotwords=service,
-            speaker_policy=SimpleNamespace(admitted_text=lambda _turn: admitted),
-            _detail=AsyncMock(),
-        )
-        await RealtimeController._segment(controller, "未准入内容。请让克劳得检查一下。", pause=True)
+        controller = object.__new__(RealtimeController)
+        controller.workspace, controller.segmenter, controller.hotwords = ws, TranscriptSegmenter(), service
+        controller.speaker_policy = SimpleNamespace(
+            turns={"input": SimpleNamespace(admitted=bool(admitted))}, admitted_text=lambda _turn: admitted)
+        controller.state = SimpleNamespace(current={})
+        controller._detail = AsyncMock()
+        await controller._segment("未准入内容。请让克劳得检查一下。", pause=True)
+        if not admitted:
+            controller._detail.assert_not_awaited()
+            assert not ws.segments and not controller.state.current.get("partial_text")
+            return
         payload = controller._detail.call_args.kwargs
         assert payload["raw_text"] == admitted
         assert payload["text"] == admitted.replace("克劳得", "Claude")
@@ -282,7 +287,8 @@ async def test_speaker_recovery_corrects_only_admitted_text_and_preserves_source
         controller.hotwords = service
         controller.speaker_mode = "filter"
         controller.workspace = SimpleNamespace(turn_id="turn")
-        controller.speaker_policy = SimpleNamespace(activation_id="activation", admitted_text=lambda _: raw,
+        controller.speaker_policy = SimpleNamespace(turns={}, settings_revision=0,
+            activation_id="activation", admitted_text=lambda _: raw,
             admitted_turns=lambda: [{"turn_id": "turn", "generation": 1, "text": raw}])
         controller._speaker_published = {}
         controller._detail = AsyncMock()

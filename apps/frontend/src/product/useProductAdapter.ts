@@ -930,9 +930,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const playingKeys = new Set(voice.playbackQueue.value
       .filter(item => item.state === 'playing')
       .map(item => `${item.conversation_id}\u0000${item.speech_id}`))
-    // empty_input（空输入）：只过滤产品气泡，诊断记录与 seq（服务端顺序号）保留。
+    // empty_input（空输入）、speaker_blocked（声纹拦截）：不创建空产品气泡，保留诊断记录及服务端顺序号。
     return railEntries.value
-      .filter(entry => !(entry.kind === 'user_turn' && entry.status === 'empty_input' && !entry.text.trim()))
+      .filter(entry => !(entry.kind === 'user_turn'
+        && ['empty_input', 'speaker_blocked'].includes(entry.status ?? '') && !entry.text.trim()))
       .map(entry => ({
         key: entry.kind === 'user_turn'
           ? userMessageKey(entry.turn_id || `${entry.conversation_id}:${entry.seq}`)

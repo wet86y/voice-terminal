@@ -24,6 +24,8 @@ describe('产品对话区的空输入展示', () => {
         entry({ seq: 5, kind: 'assistant_speech', speech_id: 'speech_1', text: '回复' }),
         entry({ seq: 6, kind: 'system_speech', speech_id: 'wake_1', text: '我在，请说。' }),
         entry({ seq: 7, turn_id: 'error_1', status: 'error' }),
+        entry({ seq: 8, turn_id: 'blocked_1', status: 'speaker_blocked' }),
+        entry({ seq: 9, turn_id: 'blocked_2', status: 'speaker_blocked', text: ' \n\t' }),
       ]
       const app = createSSRApp({
         setup() {
@@ -40,8 +42,8 @@ describe('产品对话区的空输入展示', () => {
       })
 
       expect(await renderToString(app)).toBe('<div><p>嗯</p><p>最终转写</p><p>回复</p><p>我在，请说。</p><p></p></div>')
-      expect(entries).toHaveLength(7)
-      expect(entries.map(item => item.seq)).toEqual([1, 2, 3, 4, 5, 6, 7])
+      expect(entries).toHaveLength(9)
+      expect(entries.map(item => item.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
     })
   }
 })

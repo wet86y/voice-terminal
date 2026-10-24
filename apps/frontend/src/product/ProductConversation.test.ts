@@ -127,6 +127,24 @@ function speech(text: string, speechId = 'speech-a', turnId = 'input-a') {
 }
 
 describe('会话气泡跨流式与结算阶段的连续显示', () => {
+  it('连续声纹拦截只保留诊断记录，不显示空转写占位，随后主人正文正常显示', async () => {
+    const { controls, wrapper } = await renderConversation()
+    for (let index = 1; index <= 3; index++) {
+      const turnId = `blocked-${index}` // turnId（被拦截的输入轮次）。
+      await socket.push('input.started', {}, turnId)
+      await socket.push('conversation.append', {
+        ...userEntry('', index, turnId), status: 'speaker_blocked', termination: 'speaker_blocked',
+      }, turnId)
+      expect(wrapper.findAll('.user-message')).toHaveLength(0)
+      expect(wrapper.text()).not.toContain('没有可显示的转写')
+    }
+    expect(controls.voice.conversationEntries.value).toHaveLength(3)
+    await socket.push('input.started', {}, 'owner-input')
+    await socket.push('input.updated', { text: '完整句首和后续文字' }, 'owner-input')
+    await advance(250)
+    expect(wrapper.findAll('.user-message')).toHaveLength(1)
+    expect(visible(wrapper.get('.user-message'))).toBe('完整句首和后续文字')
+  })
   it('实时截图通过会话连接加载双图，发送状态更新保留同一气泡和图片', async () => {
     const createObjectURL = vi.fn().mockReturnValueOnce('blob:global').mockReturnValueOnce('blob:local') // createObjectURL（图片资源地址）。
     const revokeObjectURL = vi.fn() // revokeObjectURL（图片资源释放）。
