@@ -85,25 +85,33 @@ function add() {
   <div v-if="hotwordLoading" class="pool-empty" role="status">正在读取热词…</div>
   <button v-if="!hotwordLoaded && !hotwordLoading" class="outline-button" @click="loadHotwords">重新读取</button>
   <fieldset :disabled="hotwordBusy || !hotwordLoaded" class="hotword-fields">
-    <label class="switch-row">
-      <div><strong>启用热词</strong><span>总开关：控制主流式纠正和双路离线模型的原生热词增强。音色参考转写始终不使用热词。</span></div>
-      <input v-model="hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i></i>
-    </label>
-    <label class="switch-row">
-      <div><strong>流式热词修订</strong><span>只控制主流式文本的后置纠正；关闭后，已开启双路的离线模型仍可使用目标热词。</span></div>
-      <input v-model="hotwordForm.stream_enabled" :disabled="!hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i></i>
-    </label>
-    <div class="hotword-toolbar">
-      <label class="form-field hotword-search"><span>搜索热词</span><input v-model="search" placeholder="输入名称或别名" /></label>
-      <div class="hotword-actions">
-        <button class="outline-button" :disabled="hotwordForm.entries.length >= 5000" @click="add">添加热词</button>
-        <button class="outline-button" :disabled="hotwordBusy || !hotwordLoaded" @click="openJsonEditor">导入词表</button>
-      </div>
+    <div class="hotword-switches">
+      <label class="switch-row">
+        <div><strong>启用热词</strong><span>总开关：控制主流式纠正和双路离线模型的原生热词增强。音色参考转写始终不使用热词。</span></div>
+        <input v-model="hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i aria-hidden="true"></i>
+      </label>
+      <label class="switch-row hotword-stream-option">
+        <div><strong>流式热词修订</strong><span>只控制主流式文本的后置纠正；关闭后，已开启双路的离线模型仍可使用目标热词。</span></div>
+        <input v-model="hotwordForm.stream_enabled" :disabled="!hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i aria-hidden="true"></i>
+      </label>
     </div>
-    <p class="hotword-help">多个别名或排除词可用英文分号、中文分号、顿号或换行分隔，斜杠与词内空格保留。别名和邻近排除词仅用于流式修订，离线模型只使用目标热词。</p>
-    <section class="hotword-list-window" aria-label="热词词条列表">
+    <section class="hotword-list-window" aria-labelledby="hotword-list-title">
+      <header class="hotword-list-heading">
+        <h3 id="hotword-list-title">热词表</h3>
+        <span class="hotword-count"><template v-if="search.trim()">匹配 {{ filtered.length }} 条 · </template>共 {{ hotwordForm.entries.length }} / 5000 条</span>
+      </header>
+      <div class="hotword-toolbar">
+        <label class="form-field hotword-search"><span>搜索热词</span><input v-model="search" placeholder="输入名称或别名" /></label>
+        <div class="hotword-actions">
+          <button class="outline-button" :disabled="hotwordForm.entries.length >= 5000" @click="add">添加热词</button>
+          <button class="outline-button" :disabled="hotwordBusy || !hotwordLoaded" @click="openJsonEditor">导入词表</button>
+        </div>
+      </div>
       <div ref="listScroll" class="hotword-list-scroll" tabindex="0" aria-label="当前页热词列表，滚动查看更多词条">
-        <div v-if="!filtered.length" class="pool-empty">{{ hotwordForm.entries.length ? '没有匹配的热词。' : '还没有热词。添加名称，或打开 JSON 编辑器粘贴完整词表。' }}</div>
+        <div v-if="!filtered.length" class="hotword-empty" role="status">
+          <strong>{{ hotwordForm.entries.length ? '没有匹配的热词' : '还没有热词' }}</strong>
+          <p>{{ hotwordForm.entries.length ? '试试其他名称或别名。' : '点击“添加热词”逐条填写，或通过“导入词表”批量添加。' }}</p>
+        </div>
         <div v-for="{ entry, index } in visible" :key="index" class="hotword-row">
           <label class="form-field"><span>目标词 {{ index + 1 }}</span><input v-model="entry.word" maxlength="96" :aria-label="`目标词 ${index + 1}`" placeholder="希望输出的正确名称" @input="hotwordsChanged" /></label>
           <div v-for="field in (['aliases', 'blacklist'] as const)" :key="field" class="form-field">
@@ -114,8 +122,8 @@ function add() {
           <button class="ghost-action hotword-remove" :aria-label="`删除热词 ${index + 1}`" @click="hotwordForm.entries.splice(index, 1); hotwordsChanged()">删除</button>
         </div>
       </div>
-      <footer class="hotword-list-footer">
-        <nav v-if="pageCount > 1" class="hotword-pagination" aria-label="热词分页">
+      <footer v-if="pageCount > 1" class="hotword-list-footer">
+        <nav class="hotword-pagination" aria-label="热词分页">
           <button class="outline-button hotword-page-edge" :disabled="page === 0" @click="page = Math.max(0, page - 1)">上一页</button>
           <template v-for="item in paginationItems" :key="item.type === 'page' ? `page-${item.value}` : item.key">
             <button v-if="item.type === 'page'" class="hotword-page-number" :class="{ 'is-current': item.value === page + 1 }" :aria-current="item.value === page + 1 ? 'page' : undefined" @click="page = item.value - 1">{{ item.value }}</button>
@@ -123,8 +131,12 @@ function add() {
           </template>
           <button class="outline-button hotword-page-edge" :disabled="page + 1 >= pageCount" @click="page = Math.min(pageCount - 1, page + 1)">下一页</button>
         </nav>
-        <span class="hotword-count">共 {{ hotwordForm.entries.length }} / 5000 条</span>
       </footer>
+      <details class="hotword-list-guide">
+        <summary>填写说明</summary>
+        <p class="hotword-help">目标词填写希望输出的正确名称，别名和排除词为可选项。多个值可用英文分号、中文分号、顿号或换行分隔，斜杠与词内空格保留。</p>
+        <p class="hotword-help">别名和邻近排除词仅用于流式修订，离线模型只使用目标热词。</p>
+      </details>
     </section>
     <details class="hotword-advanced"><summary>高级设置</summary><label class="form-field"><span>相似度门槛</span><input v-model.number="hotwordForm.threshold" type="number" min="0.5" max="1" step="0.01" @input="hotwordsChanged" /></label><p class="hotword-help">默认 0.85。提高门槛可减少近音匹配；这不是纠正准确率。</p></details>
     <footer class="hotword-save"><span role="status">{{ hotwordDirty ? '有未保存的修改' : '保存后从下一轮发言生效，无需重启' }}</span><button class="save-button" @click="saveHotwords">{{ hotwordSaving ? '正在构建并保存…' : '保存热词设置' }}</button></footer>
@@ -161,30 +173,42 @@ function add() {
 
 <style scoped>
 .hotword-settings-section{display:flex;flex-direction:column;gap:20px;min-width:0}
-.hotword-fields{border:0;padding:0;margin:0;min-width:0}
-.hotword-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin-top:20px}
-.hotword-search{flex:1;min-width:180px}
+.hotword-fields{display:flex;flex-direction:column;gap:24px;border:0;padding:0;margin:0;min-width:0}
+/* hotword-switches（热词开关组）：纵向留出间距，缩进流式子选项。 */
+.hotword-switches{display:grid;gap:12px;min-width:0}
+.hotword-switches .switch-row>div{min-width:0}
+.hotword-switches .switch-row>i{flex-shrink:0}
+.hotword-stream-option{margin-left:20px}
+.hotword-list-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;min-width:0}
+.hotword-list-heading h3{font-size:var(--font-section);font-weight:600}
+.hotword-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;min-width:0}
+.hotword-search{flex:1;min-width:min(180px,100%)}
 .hotword-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
 .hotword-count,.hotword-help,.hotword-save span{font-size:var(--font-caption);color:var(--muted)}
 .hotword-help{line-height:1.7}
-.hotword-list-window{min-width:0;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#ffffff02}
-.hotword-list-scroll{max-height:min(70vh,690px);overflow-y:auto;overscroll-behavior-y:auto;padding:0 14px}
-.hotword-row{display:grid;grid-template-columns:repeat(3,minmax(140px,1fr)) auto;gap:8px 12px;padding:9px 0;border-bottom:1px solid var(--line)}
+.hotword-list-window{display:grid;gap:16px;min-width:0;padding:20px;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#ffffff02;container:hotword-list / inline-size}
+.hotword-list-scroll{max-height:min(70vh,690px);min-width:0;overflow-y:auto;overscroll-behavior-y:auto;border-top:1px solid var(--line)}
+.hotword-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:140px;padding:24px 16px;text-align:center}
+.hotword-empty strong{font-size:var(--font-body);font-weight:500;color:var(--text)}
+.hotword-empty p{max-width:360px;color:var(--muted);font-size:var(--font-caption);line-height:1.7}
+.hotword-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) auto;align-items:end;gap:8px 12px;padding:14px 0;border-bottom:1px solid var(--line)}
+.hotword-row:last-child{border-bottom:0}
 .hotword-row .form-field{min-width:0}
 .hotword-row .form-field>span{margin-bottom:5px}
 .hotword-row .form-field input{height:34px;min-height:34px;padding:6px 9px;font-size:var(--font-body)}
 .hotword-remove{align-self:end;min-height:32px;padding:5px 8px}
-.hotword-list-footer{display:flex;align-items:center;gap:8px 12px;min-height:42px;padding:5px 12px;border-top:1px solid var(--line);background:#ffffff02}
-.hotword-pagination{display:flex;align-items:center;gap:4px;min-width:0;max-width:min(100%,480px);flex:0 1 auto;white-space:nowrap}
+.hotword-list-footer{display:flex;align-items:center;justify-content:center;min-width:0;padding-top:12px;border-top:1px solid var(--line)}
+.hotword-pagination{display:flex;align-items:center;gap:4px;min-width:0;max-width:100%;overflow-x:auto;white-space:nowrap}
 .hotword-pagination .hotword-page-edge{min-height:30px;padding:4px 7px;font-size:var(--font-caption);white-space:nowrap}
 .hotword-page-number{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;min-width:30px;height:30px;padding:0 4px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted);font:inherit;font-size:var(--font-caption);cursor:pointer}
 .hotword-page-number:hover{border-color:var(--line-strong);color:var(--text)}
 .hotword-page-number.is-current{border-color:var(--accent);background:#ffffff0a;color:var(--accent);font-weight:600}
 .hotword-page-ellipsis{display:inline-flex;align-items:center;justify-content:center;flex:0 0 14px;color:var(--muted);font-size:var(--font-caption)}
-.hotword-count{margin-left:auto;white-space:nowrap}
-.hotword-advanced{margin-top:18px}
+.hotword-count{white-space:nowrap}
+.hotword-list-guide summary{cursor:pointer;color:var(--muted);font-size:var(--font-caption)}
+.hotword-list-guide .hotword-help{margin-top:8px}
 .hotword-advanced input{max-width:140px}
-.hotword-save{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:18px 0}
+.hotword-save{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:16px 0 0;border-top:1px solid var(--line)}
 .hotword-tags{display:flex;flex-wrap:wrap;gap:3px;max-height:34px;overflow-y:auto;align-content:start}
 .hotword-tags:empty{display:none}
 .hotword-tags button{font-size:var(--font-caption);padding:1px 7px;border:1px solid var(--line);border-radius:12px;background:transparent;color:var(--muted);cursor:pointer;line-height:1.45}
@@ -202,16 +226,25 @@ function add() {
 .hotword-exclusions{grid-column:1 / -1}
 .hotword-exclusions summary,.hotword-advanced summary{cursor:pointer;color:var(--muted);font-size:var(--font-caption);padding:6px 0}
 .hotword-exclusions .form-field,.hotword-advanced .form-field{margin-top:10px}
-@media(max-width:640px){
+/* hotword-list（热词表容器）：按设置面板实际宽度切换为纵向词条。 */
+@container hotword-list (max-width:600px){
   .hotword-row{grid-template-columns:minmax(0,1fr) auto}
   .hotword-row .form-field{grid-column:1}
   .hotword-remove{grid-column:2;grid-row:1 / 4}
-  .hotword-actions{width:100%;justify-content:flex-end}
+}
+@container hotword-list (max-width:420px){
+  .hotword-toolbar{flex-direction:column;align-items:stretch}
+  .hotword-search{width:100%}
+  .hotword-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}
   .hotword-pagination{gap:3px}
-  .hotword-list-footer{padding-inline:8px}
   .hotword-pagination .hotword-page-edge{padding-inline:5px}
   .hotword-page-number{flex-basis:28px;min-width:28px}
   .hotword-page-ellipsis{flex-basis:10px}
+}
+@media(max-width:640px){
+  .hotword-list-window{padding:16px}
+  .hotword-stream-option{margin-left:12px}
+  .hotword-save{align-items:stretch}
   .hotword-save .save-button{width:100%}
   .hotword-json-guide{grid-template-columns:minmax(0,1fr)}
   .hotword-json-field textarea{height:42vh;min-height:220px}
