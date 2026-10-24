@@ -9,7 +9,7 @@ const DEFAULT_RULES: &str = include_str!("../../../../config/compatibility.json"
 static EVALUATION: Mutex<()> = Mutex::new(()); // EVALUATION（评估互斥）：扫描和写回串行，旧扫描不能晚写覆盖新结果。
 #[path = "compatibility_repair.rs"]
 mod forced_repair;
-pub use forced_repair::{enforce_upgrade, verify_and_repair, finish_deferred_settings};
+pub use forced_repair::{enforce_upgrade, verify_and_repair, finish_deferred_settings, MaintenanceOutcome};
 
 fn lock() -> Result<MutexGuard<'static, ()>, String> { EVALUATION.lock().map_err(|_| "兼容性评估锁不可用。".into()) }
 fn now() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }

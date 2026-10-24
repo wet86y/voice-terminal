@@ -3,6 +3,13 @@ use super::*;
 use std::sync::Arc;
 use crate::{runtime, installation::{self, WorkspaceGuard}};
 
+/// MaintenanceOutcome（维护结束结果）：正常取消与实际维护失败分别返回。
+#[derive(Debug,PartialEq,Eq)]
+pub enum MaintenanceOutcome {
+    Complete, // Complete（本次维护完成）。
+    Cancelled, // Cancelled（取消已收尾，未把取消当作维护失败）。
+}
+
 // remove_invalid（强制校验后的受管故障清除）：路径来自当前组件目录，禁止扩大到用户资料或父目录。
 fn remove_invalid(context:&LaunchContext,path:&Path)->Result<(),String>{
     let relative=path.strip_prefix(&context.install).map_err(|_|"故障组件越出工作区")?.to_string_lossy().replace('\\',"/");
@@ -61,16 +68,19 @@ fn repair_bootstrap_policy(context:&LaunchContext)->Result<(),String>{
 
 /// enforce_upgrade（普通升级检查）：记录组件状态，组件安装和更新留在本体。
 pub fn enforce_upgrade(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<(),String>{
-    maintain_with_settings(root,cancel,progress,false,settings)
+    match maintain_with_settings(root,cancel,progress,false,settings)?{
+        MaintenanceOutcome::Complete=>Ok(()),
+        MaintenanceOutcome::Cancelled=>Err("本体兼容维护已取消。".into()),
+    }
 }
 
 /// verify_and_repair（主动完整性维修）：本体已由安装事务修复，组件校验结果交给本体修复。
-pub fn verify_and_repair(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<(),String>{
+pub fn verify_and_repair(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<MaintenanceOutcome,String>{
     maintain_with_settings(root,cancel,progress,true,settings)
 }
 
 fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,full:bool,
-    mut settings_repair:impl FnMut(&LaunchContext,bool,&AtomicBool)->Result<(),String>)->Result<(),String>{
+    mut settings_repair:impl FnMut(&LaunchContext,bool,&AtomicBool)->Result<(),String>)->Result<MaintenanceOutcome,String>{
     installation::ensure_idle(root)?;
     let _guard=WorkspaceGuard::acquire(root)?;
     let _verification=crate::verification::VerificationSession::begin();
@@ -79,18 +89,23 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
     rules(&context.program,false)?;
     let prior=read(&state_path(&context)?).unwrap_or(Value::Null);
     let mut reset=prior["enforcement"]["reset_devices"]==true;
+    let mut changing=false; // changing（已进入持久变更）：只读扫描取消不写维护门禁。
+    let finish=AtomicBool::new(false); // finish（设置收尾令牌）：已经开始的配置写入须完成后再响应退出。
     let result:Result<(),String>=(||{
-        repair_bootstrap_policy(&context)?;
-        checkpoint(&context,"verify_components",reset,None)?;
+        resources::check_cancel(&cancel)?;
         if full{
             progress("完整性维护：单轮核对现有环境、模型与代理组件",0,0);
             resources::prepare_maintenance_verification(&context,&cancel,progress)?;
         }
         let issues=resources::maintenance_issues(&context,full,&cancel,progress)?;
+        resources::check_cancel(&cancel)?;
+        changing=true;
+        checkpoint(&context,"verify_components",reset,None)?;
+        repair_bootstrap_policy(&context)?;
         // 交接先落盘；清除后即使中断，正式程序仍知道哪些组件必须重新下载修复。
         crate::component_maintenance::save(&context,issues.clone(),full)?;
         if full{for issue in issues.iter().filter(|row|row["content_failure"]==true){
-            resources::check_cancel(&cancel)?;
+            if cancel.load(std::sync::atomic::Ordering::Acquire){break;}
             let id=issue["resource_id"].as_str().ok_or("故障组件编号缺失")?;
             let target=if id==runtime::CPU_RESOURCE{context.install.join("runtimes/python")}
                 else{resources::destination(&context,&resources::spec(&context,id)?)?};
@@ -99,19 +114,20 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
                 checkpoint(&context,"settings_pending",true,Some("故障运行依赖清除后，由系统组件重建并恢复有效计算设备设置。"))?;
             }
             progress(&format!("完整性维护：清除已确认损坏的受管组件 {id}（组件编号）"),0,0);
+            // 先关闭界面的取消入口，再核对先前已经接受的取消，避免清除边界竞态。
+            if cancel.load(std::sync::atomic::Ordering::Acquire){break;}
             remove_invalid(&context,&target)?;
         }}
         // 缺少或损坏的环境由系统组件处理；分发器不为了配置检查安装依赖。
         let environment_ready=!issues.iter().any(|row|row["resource_id"]==runtime::CPU_RESOURCE);
         if environment_ready{
             progress("兼容处理：归档故障资料并恢复有效设置",0,0);
-            settings_repair(&context,reset,&cancel)?;
-            if fallback_tts(&context)?{settings_repair(&context,reset,&cancel)?;}
+            settings_repair(&context,reset,&finish)?;
+            if fallback_tts(&context)?{settings_repair(&context,reset,&finish)?;}
             checkpoint(&context,"verify",false,None)?;
         }else{
             checkpoint(&context,"settings_pending",reset,Some("请在系统组件配置运行依赖，随后完成本次设置维护。"))?;
         }
-        resources::check_cancel(&cancel)?;
         crate::verification::ensure_unchanged()?;
         let rows=complete_maintenance(&context)?;
         let state=&rows.first().ok_or("本体维护没有返回盘点结果。")?["compatibility"];
@@ -123,8 +139,18 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
         progress(if full{"校验完成，组件问题交由正式程序的组件列表修复"}else{"本体更新完成，组件状态交由正式程序显示"},1,1);
         Ok(())
     })();
-    if let Err(error)=&result{checkpoint(&context,"repair_pending",reset,Some(error))?;}
-    result
+    match result{
+        Err(_) if !changing&&cancel.load(std::sync::atomic::Ordering::Acquire)=>{
+            progress("校验已取消，原有组件与维护状态已保留",0,0);
+            Ok(MaintenanceOutcome::Cancelled)
+        }
+        Err(error)=>{checkpoint(&context,"repair_pending",reset,Some(&error))?;Err(error)}
+        Ok(()) if cancel.load(std::sync::atomic::Ordering::Acquire)=>{
+            progress("校验已取消，必要收尾已完成",0,0);
+            Ok(MaintenanceOutcome::Cancelled)
+        }
+        Ok(())=>Ok(MaintenanceOutcome::Complete),
+    }
 }
 
 /// finish_deferred_settings（系统组件操作收尾）：只补做本次维护延期的设置处理，普通启动不调用。
@@ -161,6 +187,112 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
         let path=context.data.join("config/product-settings.json");
         atomic_json(&path,&json!({"schema_version":rules(&context.program,false)?["settings_schema_max"],"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}}))?;
         atomic_json(&context.data.join("state/settings-validation.json"),&json!({"schema":1,"settings_schema":rules(&context.program,false)?["settings_schema_max"],"sha256":file_hash(&path)?}))
+    }
+    #[test]fn cancelled_readonly_integrity_preserves_startup_state_and_policy(){
+        for trigger in ["完整性维护：单轮核对现有环境、模型与代理组件","批量校验组件文件内容","批量校验完成，复用结果并按需修复"]{
+            let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+            maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},false,validate_settings).unwrap();
+            let state=state_path(&fixture.context).unwrap();let before=fs::read(&state).unwrap();
+            let handoff=fixture.context.data.join("state/component-maintenance.json");let handoff_before=fs::read(&handoff).unwrap();
+            let policy=fixture.context.data.join("config/runtime-resources.json");fs::write(&policy,b"invalid-policy").unwrap();
+            let cancel=Arc::new(AtomicBool::new(false));let mut reached=false;
+            let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|phase,_,_|{
+                if phase==trigger{reached=true;assert_eq!(fs::read(&state).unwrap(),before);cancel.store(true,std::sync::atomic::Ordering::Release);}
+            },true,|_,_,_|panic!("只读校验取消后不能启动设置修复")).unwrap();
+            assert!(reached);assert_eq!(outcome,MaintenanceOutcome::Cancelled);
+            assert_eq!(fs::read(&state).unwrap(),before);assert_eq!(fs::read(&handoff).unwrap(),handoff_before);
+            assert_eq!(fs::read(&policy).unwrap(),b"invalid-policy");assert_eq!(fs::read(&fixture.context.python).unwrap(),b"fixture");
+            assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],true);
+        }
+    }
+    #[test]fn cancelled_scan_preserves_existing_repair_and_does_not_create_new_state(){
+        for pending in [false,true]{
+            let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+            let state=state_path(&fixture.context).unwrap();
+            if pending{
+                checkpoint(&fixture.context,"settings_pending",true,Some("原有维修尚未完成")).unwrap();
+                crate::component_maintenance::save(&fixture.context,vec![json!({"resource_id":runtime::CPU_RESOURCE,"reason":"原有环境故障","content_failure":true,"dispatched":false})],true).unwrap();
+            }
+            let before=fs::read(&state).ok();let handoff=crate::component_maintenance::load(&fixture.context).unwrap();
+            let cancel=Arc::new(AtomicBool::new(false));
+            let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|phase,_,_|{
+                if phase=="批量校验组件文件内容"{cancel.store(true,std::sync::atomic::Ordering::Release);}
+            },true,|_,_,_|panic!("取消扫描不能执行设置修复")).unwrap();
+            assert_eq!(outcome,MaintenanceOutcome::Cancelled);assert_eq!(fs::read(&state).ok(),before);
+            assert_eq!(crate::component_maintenance::load(&fixture.context).unwrap(),handoff);
+            if pending{assert_eq!(read(&state).unwrap()["enforcement"]["reset_devices"],true);assert!(crate::component_maintenance::pending_repairs(&fixture.context).unwrap());}
+        }
+    }
+    #[test]fn cancellation_during_settings_finishes_validation_before_releasing_startup(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let cancel=Arc::new(AtomicBool::new(false));let mut calls=0;
+        let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|_,_,_|{},true,|context,reset,finish|{
+            calls+=1;cancel.store(true,std::sync::atomic::Ordering::Release);
+            assert!(!finish.load(std::sync::atomic::Ordering::Acquire));
+            validate_settings(context,reset,finish)
+        }).unwrap();
+        assert_eq!(calls,1);assert_eq!(outcome,MaintenanceOutcome::Cancelled);
+        assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"complete");
+        let settings=fixture.context.data.join("config/product-settings.json");
+        assert_eq!(read(&fixture.context.data.join("state/settings-validation.json")).unwrap()["sha256"],file_hash(&settings).unwrap());
+        assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],true);
+    }
+    #[test]fn cancellation_does_not_hide_a_real_settings_failure(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let cancel=Arc::new(AtomicBool::new(false));
+        let error=maintain_with_settings(&fixture.root,cancel.clone(),&mut|_,_,_|{},true,|_,_,_|{
+            cancel.store(true,std::sync::atomic::Ordering::Release);Err("配置落盘失败".into())
+        }).unwrap_err();
+        assert_eq!(error,"配置落盘失败");
+        assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"repair_pending");
+        assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],false);
+    }
+    #[test]fn cancellation_finishes_tts_fallback_and_revalidates_the_changed_settings(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let cancel=Arc::new(AtomicBool::new(false));let mut calls=0;
+        let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|_,_,_|{},true,|context,reset,finish|{
+            calls+=1;assert!(!finish.load(std::sync::atomic::Ordering::Acquire));
+            validate_settings(context,reset,finish)?;
+            if calls==1{
+                let path=context.data.join("config/product-settings.json");let mut value=read(&path)?;
+                value["tts"]["backend"]=json!("minimax");atomic_json(&path,&value)?;
+                cancel.store(true,std::sync::atomic::Ordering::Release);
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(outcome,MaintenanceOutcome::Cancelled);assert_eq!(calls,2);
+        let settings=fixture.context.data.join("config/product-settings.json");
+        assert_eq!(read(&settings).unwrap()["tts"]["backend"],"voxcpm1");
+        assert_eq!(read(&fixture.context.data.join("state/settings-validation.json")).unwrap()["sha256"],file_hash(&settings).unwrap());
+        assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],true);
+    }
+    #[test]fn cancellation_at_component_cleanup_keeps_confirmed_damage_and_original_files(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let component=fixture.root.join("models/test-model");fs::create_dir_all(&component).unwrap();fs::write(component.join("model.bin"),b"good").unwrap();
+        let item=json!({"resource_id":"test-model","kind":"model","version":"1","required":false,"destination":"test-model",
+            "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&component.join("model.bin")).unwrap()}]});
+        resources::write_model_receipt(&component,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+        atomic_json(&fixture.root.join("app/config/resources/catalog.json"),&json!({"resources":[item]})).unwrap();
+        fs::write(component.join("model.bin"),b"evil").unwrap();
+        let cancel=Arc::new(AtomicBool::new(false));
+        let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|phase,_,_|{
+            if phase.starts_with("完整性维护：清除"){assert!(crate::component_maintenance::pending_repairs(&fixture.context).unwrap());cancel.store(true,std::sync::atomic::Ordering::Release);}
+        },true,validate_settings).unwrap();
+        assert_eq!(outcome,MaintenanceOutcome::Cancelled);assert_eq!(fs::read(component.join("model.bin")).unwrap(),b"evil");
+        assert_eq!(crate::component_maintenance::load(&fixture.context).unwrap().unwrap()["issues"][0]["content_failure"],true);
+        assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"complete");
+        assert_eq!(resources::inventory(&fixture.context).unwrap().iter().find(|row|row["resource_id"]=="test-model").unwrap()["can_start"],false);
+    }
+    #[test]fn cancellation_keeps_missing_environment_handoff_and_device_reset(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);fs::write(&fixture.context.python,b"corrupt").unwrap();
+        let cancel=Arc::new(AtomicBool::new(false));
+        let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|phase,_,_|{
+            if phase.starts_with("校验完成"){cancel.store(true,std::sync::atomic::Ordering::Release);}
+        },true,|_,_,_|panic!("缺失环境不能启动取消收尾工作进程")).unwrap();
+        assert_eq!(outcome,MaintenanceOutcome::Cancelled);assert!(!fixture.context.python.exists());
+        let state=read(&state_path(&fixture.context).unwrap()).unwrap();
+        assert_eq!(state["enforcement"]["phase"],"settings_pending");assert_eq!(state["enforcement"]["reset_devices"],true);
+        assert_eq!(crate::component_maintenance::pending_requests(&fixture.context).unwrap()[0]["resource_id"],runtime::CPU_RESOURCE);
     }
     #[test] fn ordinary_update_preserves_outdated_optional_components(){
         let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);

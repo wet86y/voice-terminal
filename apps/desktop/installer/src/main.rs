@@ -4,7 +4,7 @@
 use std::{fs,io::Write,path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
 use serde_json::{Value,json};
 use tauri::{Manager,WebviewWindow,WebviewWindowBuilder,WebviewUrl};
-use voice_desktop_common::{installation,native_ui,workspace,shortcuts};
+use voice_desktop_common::{installation,native_ui,workspace,shortcuts,compatibility::MaintenanceOutcome};
 const PACKAGE:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/program.zip"));
 #[derive(Clone)]
 struct UpdateParent{pid:u32,create_time:u64,executable:PathBuf} // UpdateParent（待退出的旧程序进程身份）。
@@ -22,9 +22,31 @@ struct Installer{
     update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
-fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,repair:bool,progress:&mut voice_desktop_common::resources::Progress)->Result<(),String>{
+fn complete_compatibility(root:&Path,cancel:Arc<AtomicBool>,repair:bool,progress:&mut voice_desktop_common::resources::Progress)->Result<MaintenanceOutcome,String>{
     if repair{voice_desktop_common::compatibility::verify_and_repair(root,cancel,progress)}
-    else{voice_desktop_common::compatibility::enforce_upgrade(root,cancel,progress)}
+    else{voice_desktop_common::compatibility::enforce_upgrade(root,cancel,progress).map(|_|MaintenanceOutcome::Complete)}
+}
+fn progress_status(state:&Installer,phase:&str,done:u64,total:u64){
+    let mut status=state.status.lock().unwrap();
+    let cancelling=state.cancel.load(Ordering::Acquire);
+    *status=json!({"phase":if cancelling{"正在取消，等待当前操作完成必要收尾"}else{phase},"completed_bytes":done,"total_bytes":total,
+        "cancelling":cancelling,"can_cancel":!cancelling&&!(total>0&&done>=total)&&!phase.contains("启用")&&!phase.contains("清除")
+            &&(phase.starts_with("正在展开")||phase.contains("校验")||phase.contains("下载")||phase.starts_with("兼容处理：")),"error":null,
+        "fields":{"phase":"安装及强制兼容阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"当前是否可以请求取消；必要收尾完成后才能退出","cancelling":"正在等待取消收尾，允许登记退出请求","error":"未完成原因"}});
+}
+fn request_cancel(state:&Installer,exit_after:bool)->Result<(),String>{
+    let mut status=state.status.lock().unwrap();
+    if !state.busy.load(Ordering::Acquire){return Err("当前没有可取消的校验或安装任务。".into());}
+    if status["can_cancel"]!=true&&!state.cancel.load(Ordering::Acquire){return Err("当前阶段需要完成启用及交接，请稍候。".into());}
+    if exit_after{state.exiting.store(true,Ordering::Release);}
+    state.cancel.store(true,Ordering::Release);
+    status["can_cancel"]=json!(false);status["cancelling"]=json!(true);status["phase"]=json!("正在取消，等待当前操作完成必要收尾");
+    Ok(())
+}
+fn cancelled_result(state:&Installer)->Value{
+    *state.status.lock().unwrap()=json!({"phase":"校验已取消，必要收尾已完成，可从原入口重新打开程序","can_cancel":false,"cancelled":true,"error":null,
+        "fields":{"phase":"取消收尾结果","can_cancel":"收尾结束后不再接受重复取消","cancelled":"本次操作已正常取消","error":"收尾失败原因"}});
+    json!({"ok":false,"cancelled":true,"fields":{"ok":"本次校验未执行完成","cancelled":"取消已完成收尾，不表示组件损坏"}})
 }
 #[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","operation":if state.repair{"integrity"}else if state.update_parent.is_some(){"update"}else{"install"},"frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","operation":"安装、更新或完整性维护","initialization":"本体安装或维护阶段"}}))}
 fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result<Value,String>{
@@ -35,7 +57,7 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         let root=match current{Some(root)=>root,None=>native_ui::choose_folder("选择语音终端工作区（空文件夹或已有工作区，支持中文路径）")?.ok_or("已取消目录选择")?};
         if state.target.lock().unwrap().as_ref()!=Some(&root){state.installed.store(false,Ordering::Release);}
         *state.target.lock().unwrap()=Some(root.clone());
-        let mut progress=|phase:&str,done:u64,total:u64|{*state.status.lock().unwrap()=json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":!phase.contains("启用")&&!phase.contains("清除")&&(phase.starts_with("正在展开")||phase.contains("校验")||phase.contains("下载")||phase.starts_with("兼容处理：")),"error":null,"fields":{"phase":"安装及强制兼容阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"替换和清除原子阶段之外可中断，保留修复进度","error":"未完成原因"}});};
+        let mut progress=|phase:&str,done:u64,total:u64|progress_status(&state,phase,done,total);
         if let Some(parent)=&state.update_parent{progress("正在等待旧程序退出并释放工作区",0,0);wait_for_update_parent(&root,parent,&mut progress)?;}
         if state.repair&&!state.installed.load(Ordering::Acquire){
             installation::ensure_idle(&root)?;
@@ -43,11 +65,12 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
             workspace::recover_install(&root)?;
             progress("正在校验当前版本程序本体",0,0);
             let valid=installation::verify_current_package(PACKAGE,&root,&state.cancel,&mut progress).is_ok();
-            if state.cancel.load(Ordering::Acquire){return Err("完整性校验已取消。".into());}
+            if state.cancel.load(Ordering::Acquire){return Ok(cancelled_result(&state));}
             drop(guard);if valid{state.installed.store(true,Ordering::Release);}
         }
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
-        complete_compatibility(&root,state.cancel.clone(),state.repair,&mut progress)?;
+        if complete_compatibility(&root,state.cancel.clone(),state.repair,&mut progress)?==MaintenanceOutcome::Cancelled
+            ||state.cancel.load(Ordering::Acquire){return Ok(cancelled_result(&state));}
         if !cfg!(feature="qualification"){
             progress("正在保存当前版本校验程序",0,0);
             let version=installation::package_version(PACKAGE)?;
@@ -61,14 +84,23 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         if let Some(path)=&state.report{workspace::atomic_json(path,&record)?;}
         state.exiting.store(true,Ordering::Release);app.exit(0);Ok(record)
     })();
-    state.busy.store(false,Ordering::Release);
-    if let Err(error)=&result{state.status.lock().unwrap()["error"]=json!(error);if let Some(path)=&state.report{let _=workspace::atomic_json(path,&json!({"ok":false,"error":error,"fields":{"ok":"安装未完成","error":"失败原因"}}));}}
+    {
+        let mut status=state.status.lock().unwrap();
+        status["can_cancel"]=json!(false);status["cancelling"]=json!(false);
+        if let Err(error)=&result{status["error"]=json!(error);}
+        state.busy.store(false,Ordering::Release);
+    }
+    if let Some(path)=&state.report{match &result{
+        Err(error)=>{let _=workspace::atomic_json(path,&json!({"ok":false,"error":error,"fields":{"ok":"安装未完成","error":"失败原因"}}));}
+        Ok(record) if record["cancelled"]==true=>{let _=workspace::atomic_json(path,record);}
+        _=>{},
+    }}
     if state.exiting.load(Ordering::Acquire){app.exit(0);}result
 }
 #[tauri::command]async fn desktop_initialize(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<'_,Arc<Installer>>,reselect:bool)->Result<Value,String>{trusted(&window)?;let state=state.inner().clone();tauri::async_runtime::spawn_blocking(move||run_install(&app,state,reselect)).await.map_err(|e|e.to_string())?}
-#[tauri::command]fn desktop_cancel_init(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.status.lock().unwrap()["can_cancel"]!=true{return Err("当前阶段需要完成启用及交接，请稍候。".into());}state.cancel.store(true,Ordering::Release);Ok(())}
-fn exit(app:&tauri::AppHandle,state:&Installer){if state.busy.load(Ordering::Acquire){if state.status.lock().unwrap()["can_cancel"]==true{state.exiting.store(true,Ordering::Release);state.cancel.store(true,Ordering::Release);}}else{state.exiting.store(true,Ordering::Release);app.exit(0);}}
-#[tauri::command]fn exit_application(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.busy.load(Ordering::Acquire)&&state.status.lock().unwrap()["can_cancel"]!=true{return Err("启用及启动交接阶段暂不能退出。".into());}exit(&app,&state);Ok(())}
+#[tauri::command]fn desktop_cancel_init(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;request_cancel(&state,false)}
+fn exit(app:&tauri::AppHandle,state:&Installer){if state.busy.load(Ordering::Acquire){let _=request_cancel(state,true);if !state.busy.load(Ordering::Acquire){state.exiting.store(true,Ordering::Release);app.exit(0);}}else{state.exiting.store(true,Ordering::Release);app.exit(0);}}
+#[tauri::command]fn exit_application(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.busy.load(Ordering::Acquire)&&!state.cancel.load(Ordering::Acquire)&&state.status.lock().unwrap()["can_cancel"]!=true{return Err("启用及启动交接阶段暂不能退出。".into());}exit(&app,&state);Ok(())}
 
 fn has_chinese(value:&str)->bool{value.chars().any(|ch|('\u{4e00}'..='\u{9fff}').contains(&ch))}
 /// validate_update_nonce（校验单次编号）：兼容已发布程序的“十六进制时间戳-进程号”。
@@ -249,6 +281,34 @@ fn main(){if let Err(error)=run(){voice_desktop_common::windows::error(&error);s
 mod tests{
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    fn cancelling_fixture()->Installer{
+        Installer{target:Mutex::new(None),status:Mutex::new(json!({})),busy:AtomicBool::new(true),cancel:Arc::new(AtomicBool::new(false)),
+            installed:AtomicBool::new(true),exiting:AtomicBool::new(false),shortcut:false,report:None,auto_requested:AtomicBool::new(false),repair:true,update_parent:None}
+    }
+    #[test]fn cancellation_waits_for_cleanup_and_accepts_a_following_exit_request(){
+        let state=cancelling_fixture();progress_status(&state,"批量校验组件文件内容",1,10);
+        request_cancel(&state,false).unwrap();
+        assert!(state.cancel.load(Ordering::Acquire));assert!(!state.exiting.load(Ordering::Acquire));
+        progress_status(&state,"兼容处理：归档故障资料并恢复有效设置",0,0);
+        let status=state.status.lock().unwrap().clone();
+        assert_eq!(status["can_cancel"],false);assert_eq!(status["cancelling"],true);assert!(status["phase"].as_str().unwrap().contains("收尾"));
+        request_cancel(&state,true).unwrap();assert!(state.exiting.load(Ordering::Acquire));
+        let result=cancelled_result(&state);assert_eq!(result["cancelled"],true);
+        assert_eq!(state.status.lock().unwrap()["error"],Value::Null);assert_eq!(state.status.lock().unwrap()["cancelled"],true);
+    }
+    #[test]fn completed_and_atomic_phases_do_not_accept_late_cancellation(){
+        for (phase,done,total) in [("校验完成，组件问题交由正式程序的组件列表修复",1,1),("完整性维护：清除已确认损坏的受管组件",0,0),("正在启动正式程序",0,0)]{
+            let state=cancelling_fixture();progress_status(&state,phase,done,total);
+            assert!(request_cancel(&state,true).is_err());assert!(!state.cancel.load(Ordering::Acquire));assert!(!state.exiting.load(Ordering::Acquire));
+        }
+    }
+    #[test]fn idle_failure_cannot_turn_into_a_cancellation_without_a_worker(){
+        let state=cancelling_fixture();progress_status(&state,"批量校验组件文件内容",1,10);
+        state.status.lock().unwrap()["error"]=json!("真实校验错误");state.busy.store(false,Ordering::Release);
+        assert!(request_cancel(&state,false).is_err());assert!(!state.cancel.load(Ordering::Acquire));
+        assert_eq!(state.status.lock().unwrap()["error"],"真实校验错误");assert_eq!(state.status.lock().unwrap()["cancelling"],false);
+    }
 
     #[test]
     fn accepts_nonce_generated_by_released_desktop(){
