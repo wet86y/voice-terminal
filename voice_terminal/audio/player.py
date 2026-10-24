@@ -9,6 +9,7 @@ import time
 from typing import Any, Callable
 
 from .devices import resolve_device
+from .replacement import ReplacementTransition
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class PcmPlayer:
         self._last_device_output_time: float | None = None
         self._render_points: deque[tuple[float, int]] = deque(maxlen=256)
         self._last_stop_snapshot: PlaybackSnapshot | None = None
+        self._replacement: ReplacementTransition | None = None  # _replacement（独立旧音收尾及后继淡入）。
         self._resolved_device: str | int | None = None
         self._last_callback_status: str | None = None
         self._first_rendered_at: float | None = None
@@ -113,7 +115,14 @@ class PcmPlayer:
         self._underrun_episodes = 0  # underrun_episodes（欠载片段数：连续静音回调算一次）。
         self._underrun_active = False  # underrun_active（当前是否正处在一次欠载片段内）。
         from ..resources import registry
-        registry.observe(self, "playback_pcm", lambda value: value._buffered_bytes)
+        registry.observe(self, "playback_pcm", lambda value: value._buffered_bytes +
+                         getattr(getattr(value._replacement, "pcm", None), "nbytes", 0))
+
+    @property
+    def replacement_active(self) -> bool:
+        """replacement_active（旧音仍在收尾）：阻止空闲切换后端或设备时钟。"""
+        with self._queue_lock:
+            return self._replacement is not None and not self._replacement.done
 
     @property
     def diagnostics(self) -> dict[str, int | float | str | None]:
@@ -136,6 +145,8 @@ class PcmPlayer:
                 "underrun_callbacks": self._underrun_callbacks,
                 "underrun_ms": round(self._underrun_ms, 1),
                 "underrun_episodes": self._underrun_episodes,
+                "replacement_active": self._replacement is not None and not self._replacement.done,
+                "replacement_old_key": self._replacement.old_key if self._replacement is not None else None,
             }
 
     def allow(self, key: str) -> None:
@@ -147,12 +158,73 @@ class PcmPlayer:
 
     def _allow(self, key: str, *, user_initiated: bool) -> None:
         with self._queue_lock:
+            if self._replacement is not None and self._replacement.successor_key != key:
+                self._abort_replacement_unlocked("different_playback")
             self._render_points.clear()
             self._clear_unlocked()
             self._gated = True
             self._allowed_key = key
             if user_initiated:
                 self._user_initiated_key = key
+
+    def prepare_replacement(self, key: str | None, *, max_ms: int = 600):
+        """prepare_replacement（同步撤销）：仅保留有限收尾，拒收旧键迟到采样。"""
+        with self._queue_lock:
+            snapshot = (self._snapshot_unlocked() if self._active_turn == key
+                        else self._empty_snapshot_unlocked(key))
+            transition = self._replacement
+            reuse = (transition is not None and transition.successor_key == key
+                     and self._started_for_turn != key)
+            if not reuse:
+                self._abort_replacement_unlocked("superseded")
+                limit = round(min(500, max(1, min(600, max_ms))) * self.sample_rate / 1000) * self.channels * 2
+                pieces = []
+                if (snapshot.started and self._held_key != key and self._paused_key != key):
+                    for chunk in self._chunks:
+                        take = min(len(chunk), limit)
+                        pieces.append(chunk[:take])
+                        limit -= take
+                        if limit <= 0:
+                            break
+                retained = b"".join(pieces)
+                retained = retained[:len(retained) // (self.channels * 2) * self.channels * 2]
+                transition = ReplacementTransition(snapshot, retained,
+                    sample_rate=self.sample_rate, channels=self.channels,
+                    max_ms=max_ms, started_at=time.monotonic())
+                self._replacement = transition
+            transition.successor_key = None
+            self._gated, self._allowed_key = True, None
+            self._clear_unlocked()
+            return transition, snapshot
+
+    def bind_replacement(self, transition: ReplacementTransition, key: str) -> bool:
+        """bind_replacement（绑定后继）：普通 allow（允许播放）不能继承旧过渡。"""
+        with self._queue_lock:
+            if self._replacement is not transition:
+                return False
+            transition.successor_key = key
+            return True
+
+    def _abort_replacement_unlocked(self, reason: str):
+        transition, self._replacement = self._replacement, None
+        if transition is not None:
+            transition.finish(reason, time.monotonic())
+
+    def abort_replacement(self, reason: str = "stopped"):
+        """abort_replacement（强制停止过渡）：停止和权限撤销不保留淡出。"""
+        with self._queue_lock:
+            self._abort_replacement_unlocked(reason)
+
+    async def wait_replacement(self, transition: ReplacementTransition):
+        """wait_replacement（只等待旧音结算）：不会阻挡后继合成。"""
+        while True:
+            with self._queue_lock:
+                now = time.monotonic()
+                if not transition.done and now >= transition.expires_at:
+                    transition.finish("deadline" if now >= transition.deadline else "envelope_complete", now)
+                if transition.done:
+                    return transition.snapshot(device_latency_ms=self.device_latency_ms, now=now)
+            await asyncio.sleep(.01)
 
     def hold(self, key: str) -> bool:
         """Atomically pause an unstarted playback generation without clearing it.
@@ -271,12 +343,17 @@ class PcmPlayer:
         """
 
         with self._queue_lock:
+            transition = self._replacement
+            if key is not None and transition is not None and key == transition.old_key:
+                transition.finish("stopped", time.monotonic())
+                return transition.snapshot(device_latency_ms=self.device_latency_ms)
             if key is not None and self._active_turn not in (None, key):
                 if self._held_key == key:
                     self._held_key = None
                 snapshot = self._empty_snapshot_unlocked(key)
                 self._last_stop_snapshot = snapshot
                 return snapshot
+            self._abort_replacement_unlocked("stopped")
             snapshot = self._snapshot_unlocked()
             self._gated = True
             self._allowed_key = None
@@ -462,6 +539,8 @@ class PcmPlayer:
 
         with self._queue_lock:
             same_turn = self._active_turn == policy_key
+            if not permitted and self._replacement is not None:
+                self._abort_replacement_unlocked("permission_revoked")
             if (same_turn and not user_initiated and not permitted and policy_key is not None
                     and self._policy_blocked_key != policy_key):
                 self._policy_blocked_key = self._active_turn
@@ -490,6 +569,16 @@ class PcmPlayer:
                 else:
                     self._stream_waiting = False
                     self._underrun_active = False
+            transition = self._replacement
+            if transition is not None:
+                ready = bool(can_play and self._chunks and transition.successor_key == self._active_turn)
+                old_pcm = transition.render(frames, now=callback_at, successor_ready=ready)
+                target[:len(old_pcm)] = old_pcm
+                offset = len(old_pcm)
+                remaining -= offset
+                if not transition.done:
+                    can_play = False
+            new_offset = offset  # new_offset（后继实际采样起点，不将旧淡出计入新事务）。
             if can_play:
                 while remaining > 0 and self._chunks:
                     chunk = self._chunks.popleft()
@@ -504,16 +593,21 @@ class PcmPlayer:
                         self._chunks.appendleft(chunk[take:])
                         break
 
-            if offset > 0 and self._active_turn and self._started_for_turn != self._active_turn:
+            if (offset > new_offset and transition is not None
+                    and transition.successor_key == self._active_turn):
+                target[new_offset:offset] = transition.fade_in(
+                    bytes(target[new_offset:offset]), now=callback_at + new_offset / (self.sample_rate * self.channels * 2))
+
+            if offset > new_offset and self._active_turn and self._started_for_turn != self._active_turn:
                 self._started_for_turn = self._active_turn
                 playback_turn = self._active_turn
-            if offset > 0 and self._active_turn and self._first_rendered_key != self._active_turn:
+            if offset > new_offset and self._active_turn and self._first_rendered_key != self._active_turn:
                 self._first_rendered_key = self._active_turn
-                self._first_rendered_at = callback_at
+                self._first_rendered_at = callback_at + new_offset / (self.sample_rate * self.channels * 2)
                 first_rendered_turn = self._active_turn
                 if self._first_enqueued_at is not None:
                     queue_to_submit_ms = max(0.0, (callback_at - self._first_enqueued_at) * 1000)
-            if offset > 0:
+            if offset > new_offset:
                 # Keep the wall-clock anchor at the last non-silent buffer
                 # submitted to the device.  PortAudio continues invoking the
                 # callback during an underrun; moving this anchor on every
@@ -586,6 +680,7 @@ class PcmPlayer:
         """播放本地提示音；调用方负责代次校验和正式播报的衔接。"""
         self.start()
         with self._queue_lock:
+            self._abort_replacement_unlocked("wake_cue")
             if self._enqueued_bytes > self._output_estimated_bytes_unlocked(self._played_bytes):
                 raise AudioPlayerError("唤醒提示音不能覆盖正在播放的音频或设备尾音。")
             self._render_points.clear()
@@ -628,6 +723,7 @@ class PcmPlayer:
         with self._queue_lock:
             if turn_id is not None and self._active_turn not in (None, turn_id):
                 return
+            self._abort_replacement_unlocked("cleared")
             self._clear_unlocked()
         logger.info("audio.player_cleared turn_id=%s", turn_id)
 

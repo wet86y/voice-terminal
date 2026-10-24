@@ -13,7 +13,7 @@ class AgentOptions:
     final_silence_ms: int = 30000
     voice_activation_ms: int = 200
     text_debounce_ms: int = 180
-    replace_grace_ms: int = 1000
+    replace_grace_ms: int = 600  # replace_grace_ms（替换过渡上限毫秒）；旧正值兼容读取，出口最多600毫秒。
 
     @classmethod
     def from_mapping(cls, data):

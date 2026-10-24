@@ -478,6 +478,7 @@ class DeliveryResolver:
         *,
         overlap_start_ms: int | None = None,
         overlap_stop_ms: int | None = None,
+        attenuated_range_ms: tuple[int, int] | None = None,  # 降音量源区间，不能确认完整传达。
     ) -> dict[str, Any]:
         if isinstance(snapshot, PlaybackSnapshot):
             played_ms = snapshot.output_estimated_ms
@@ -526,6 +527,16 @@ class DeliveryResolver:
                 # definitely heard.
                 span_end = span.end_ms if span.end_ms is not None else overlap_end
                 if span.start_ms < overlap_end and span_end > overlap_start_ms:
+                    classifications[index] = "uncertain"
+        if attenuated_range_ms is not None:
+            fade_start, fade_end = attenuated_range_ms
+            for index, span in enumerate(spans):
+                if span.valid and span.start_ms >= played_ms:
+                    classifications[index] = "unheard"
+                    continue
+                if (fade_end > fade_start and span.start_ms < fade_end
+                        and (span.end_ms is None or span.end_ms > fade_start)
+                        and classifications[index] != "unheard"):
                     classifications[index] = "uncertain"
         rendered = self._render_spans(spans, classifications, generated_text)
         heard = rendered["heard"]

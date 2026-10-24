@@ -48,6 +48,8 @@ class SpeechHandle:
                                        phase="FINALIZING", committed=True)
         self.reason = None
         self.snapshot = None
+        self.playback_transition = None  # playback_transition（本事务隔离的旧音过渡凭据）。
+        self.replacement_predecessor = None  # replacement_predecessor（后继关联的旧音过渡）。
         self.text = ""
         self.delivered_prefix = None  # delivered_prefix（接播段已结算的固定前缀；普通替换沿用动态前沿）。
         self.task = None
@@ -186,6 +188,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         # as the snapshot's accepted text, so a continuation baseline can never
         # shrink behind what the listener already has.
         self.delivered = {"turn_id": None, "text": ""}
+        self._delivery_segments = {}  # 同轮实际传达按输出代次排序，防止旧清理迟到造成倒退。
+        self._delivery_frontier_generation = -1
         self.inference_boundary = SpeechInferenceBoundary(self)  # inference_boundary（模型推理提交边界）。
         self._init_continuation()
 
@@ -197,6 +201,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
     def busy(self):
         return bool(
             self.active
+            or bool(getattr(self.player, "replacement_active", False))
             or self._settling_speech_ids
             or any(not item.reason and not item.task.done() for item in self._pending)
         )
@@ -253,20 +258,26 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         # 已送达只采用播放器确认的文字，提前合成状态不能替代听到的事实。
         heard = str(delivery.get("heard_text") or "")
         text = heard  # 只有实际听到的正文可进入跨事务送达前沿。
-        self.last_delivery = {
-            "turn_id": turn_id,
-            "text": text,
-            "heard_text": heard,
-            "status": delivery.get("status"),
-            "termination": delivery.get("termination"),
-        }
-        if not isinstance(turn_id, str) or not turn_id or not text:
+        if not isinstance(turn_id, str) or not turn_id:
             return
+        latest_generation = getattr(self, "_delivery_frontier_generation", -1)
+        if not hasattr(self, "_delivery_segments"):
+            self._delivery_segments = {}
+        generation = record.get("output_generation", latest_generation + 1)
         frontier = self.delivered if isinstance(self.delivered, dict) else {}
-        if frontier.get("turn_id") == turn_id:
-            self.delivered = {"turn_id": turn_id, "text": str(frontier.get("text") or "") + text}
-        else:
-            self.delivered = {"turn_id": turn_id, "text": text}
+        if frontier.get("turn_id") != turn_id:
+            if generation < latest_generation:
+                return
+            self._delivery_segments.clear()
+        elif not self._delivery_segments and frontier.get("text"):
+            self._delivery_segments[(-1, "baseline")] = frontier["text"]
+        self._delivery_segments[(generation, str(record.get("speech_id") or generation))] = text
+        self.delivered = {"turn_id": turn_id,
+                          "text": "".join(value for _, value in sorted(self._delivery_segments.items()))}
+        if generation >= latest_generation:
+            self._delivery_frontier_generation = generation
+            self.last_delivery = {"turn_id": turn_id, "text": text, "heard_text": heard,
+                                  "status": delivery.get("status"), "termination": delivery.get("termination")}
 
     def _valid(self, token):
         h, r = self.handle, self.runtime
@@ -471,6 +482,12 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             if self.loop and not self.loop.is_closed():
                 async def publish():
                     if self.handle is h and not h.reason:
+                        transition = getattr(h, "replacement_predecessor", None)
+                        if transition is not None:
+                            h.workspace.timings.update(transition.events)
+                            await self._emit_handle_progress(h, "replacement_audio_started",
+                                old_playback_key=transition.old_key,
+                                transition_events=dict(transition.events))
                         # Preserve the existing latency trace even if the
                         # additional observer event cannot be delivered.
                         await self.runtime.log("TTS_STARTED", identity=h.identity, turn_id=h.turn_id,
@@ -492,7 +509,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
-                    _generation_advanced=False, _fresh_session=False, _continuation_parent=None):
+                    _generation_advanced=False, _fresh_session=False, _continuation_parent=None,
+                    _replacement_transition=None, _expected_generation=None):
+        if _expected_generation is not None and self.generation != _expected_generation:
+            return None
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
         # speak（新播报）只有空闲时可创建；显式 cancel（取消）替换由专用入口授权。
@@ -508,6 +528,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         # 异步准备后再次确认；检查与注册之间没有让出事件循环。
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during preparation")
+        if _expected_generation is not None and self.generation != _expected_generation:
+            return None
         if _continuation_parent is not None and not self._continuation_current(_continuation_parent):
             return None
         if not _generation_advanced and self.busy:
@@ -518,6 +540,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         if _continuation_parent is not None:
             identity = _continuation_parent.continuation_identity or identity
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        if _replacement_transition is not None:
+            if not self.player.bind_replacement(_replacement_transition, h.workspace.playback_key):
+                return None
+            h.replacement_predecessor = _replacement_transition
         if _continuation_parent is not None:
             # 接播严格晚于旧段结算；普通替换的旧段可能还在异步结算，不能提前冻结。
             h.delivered_prefix = _continuation_parent.continuation_base
@@ -610,8 +636,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             raise
         return h
 
-    async def replace_current(self, identity, turn_id, *, emotion="calm"):
+    async def replace_current(self, identity, turn_id, *, emotion="calm", expected_generation=None):
         """Replace all output based on the current decision in one tool call.
+
+        expected_generation（请求快照输出代次）不匹配时拒绝，锁定边界推进不影响取消。
 
         The caller validates the new text incrementally before invoking this
         method.  Stopping the old generation first closes the player gate and
@@ -620,16 +648,27 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
 
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during replacement")
+        if expected_generation is not None and expected_generation != self.generation:
+            return None
         # Advance the transaction generation before closing the old PCM gate.
         # Late audio/progress from the old token will fail ``_valid`` even if
         # its socket has not finished its provider-side cancellation.
         self.generation += 1
+        replacement_generation = self.generation
         old = self.handle
         old_candidate = (
             old if old and not old.task.done() and not old.reason else
             next((item for item in self._pending if not item.task.done() and not item.reason), None)
         )
         old_speech_id = old_candidate.speech_id if old_candidate else None
+        replacement = None
+        prepare = getattr(self.player, "prepare_replacement", None)
+        if callable(prepare):
+            options = getattr(self.runtime, "options", None)
+            replacement = prepare(old_candidate.workspace.playback_key if old_candidate else None,
+                                  max_ms=min(600, getattr(options, "replace_grace_ms", 600)))
+        # 撤销和启动降音量必须早于任何异步诊断、音色准备及服务端清理。
+        self.cancel_all("replaced", replacement=replacement)
         self.last_replacement = {
             "old_speech_id": old_speech_id,
             "new_speech_id": None,
@@ -644,9 +683,12 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             old_candidate.workspace.timings["replacement_detected"] = time.monotonic()
             await self._emit_handle_progress(old_candidate, "replacement_detected",
                                              reason="replaced", new_generation=self.generation)
-        self.cancel_all("replaced")
         handle = await self.begin(identity, turn_id, emotion=emotion, kind="formal",
-                                  _generation_advanced=True, _fresh_session=True)
+                                  _generation_advanced=True, _fresh_session=True,
+                                  _replacement_transition=replacement[0] if replacement else None,
+                                  _expected_generation=replacement_generation)
+        if handle is None or handle.reason or handle.workspace.generation != self.generation:
+            return None
         self.last_replacement["new_speech_id"] = handle.speech_id
         handle.workspace.timings["replacement_detected"] = time.monotonic()
         if old_candidate is not None:
@@ -780,7 +822,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         await h.finish()
         return h
 
-    def cancel_all(self, reason):
+    def cancel_all(self, reason, *, replacement=None):
         """Explicitly cancel the current output scope.
 
         This is deliberately not a semantic invalidation hook: transcript
@@ -796,6 +838,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             "input_unavailable", "stopped", "reset", "failed", "fatal_error", "scope_closed",
         }
         self._invalidate_revision_window()
+        if reason != "replaced":
+            abort = getattr(self.player, "abort_replacement", None)
+            if callable(abort):
+                abort(reason)
         if lifecycle_cancel:
             self._playback_hold = False
             self._playback_release.set()
@@ -831,12 +877,20 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             h.workspace.playback_started,
             )
             if self.player:
-                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
-            h.workspace.timings["local_playback_stopped"] = time.monotonic()
+                if replacement is not None:
+                    transition, stopped = replacement
+                    if transition.old_key == h.workspace.playback_key:
+                        h.playback_transition = transition
+                    else:
+                        h.snapshot = stopped
+                else:
+                    h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            local_event = "local_playback_revoked" if h.playback_transition is not None else "local_playback_stopped"
+            h.workspace.timings[local_event] = time.monotonic()
             if self.loop and not self.loop.is_closed():
                 self.loop.call_soon_threadsafe(
-                    lambda h=h, reason=reason: self.controller._track(asyncio.create_task(
-                        self._emit_handle_progress(h, "local_playback_stopped", reason=reason)
+                    lambda h=h, reason=reason, event=local_event: self.controller._track(asyncio.create_task(
+                        self._emit_handle_progress(h, event, reason=reason)
                     ))
                 )
             h.task.cancel()
@@ -862,6 +916,9 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             h.continuation_tickets.clear()
             h.continuation_signal.set()
             h.reason = reason
+            abort = getattr(self.player, "abort_replacement", None)
+            if h is self.handle and callable(abort):
+                abort(reason)
             h.production_ready.set()
             h.playback_ready.set()
             if h is self.handle:
@@ -1038,10 +1095,20 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                     await self._emit_handle_progress(h, "old_provider_cancelled", reason=h.reason)
                     if self.handle is h and self._tts_session is session:
                         self._tts_session = None
+            if h.playback_transition is not None and self.player:
+                h.snapshot = await self.player.wait_replacement(h.playback_transition)
+                h.workspace.timings.update(h.playback_transition.events)
+                h.workspace.timings["local_playback_stopped"] = h.playback_transition.finished_at
+                await self._emit_handle_progress(h, "replacement_transition_completed",
+                    reason=h.playback_transition.reason,
+                    transition_ms=round((h.playback_transition.finished_at - h.playback_transition.started_at) * 1000, 2),
+                    transition_events=dict(h.playback_transition.events))
             if h.snapshot is None and self.player:
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
             delivery = self._delivery_resolvers[h.speech_id].resolve(
-                h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms)
+                h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms,
+                attenuated_range_ms=(h.playback_transition.attenuated_range_ms
+                                     if h.playback_transition is not None else None))
             delivery["termination"] = h.reason or "completed"
             if h.snapshot:
                 self.controller._add_playback_delivery_fields(delivery, h.snapshot)
@@ -1077,7 +1144,6 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                         played_ms=getattr(snapshot, "output_estimated_ms", None),
                         enqueued_ms=getattr(snapshot, "enqueued_ms", None), **diagnostic,
                     )
-            self.last_delivery = dict(delivery)
             if h.reason == "passive_quiet" and h.finished and h.envelope_validated:
                 heard = str(delivery.get("heard_text") or "")
                 self.runtime.defer_speech(h.speech_id, h.text[len(heard):], heard_text=heard)
@@ -1192,7 +1258,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             if h.revision_source_turn_id is not None:
                 record["revision_source_turn_id"] = h.revision_source_turn_id  # 最近修订来源轮次。
                 record["revision_request_id"] = h.revision_request_id  # 最近修订来源请求。
-            self.last_completed_speech = {
+            completed_speech = {
                 "speech_id": h.speech_id,
                 "conversation_id": h.identity[0],
                 "turn_id": h.turn_id,
@@ -1203,6 +1269,9 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 "termination": delivery.get("termination"),
                 "status": record["status"],
             }
+            if (self.last_completed_speech is None or h.workspace.generation >=
+                    self.last_completed_speech.get("output_generation", -1)):
+                self.last_completed_speech = completed_speech
             self.record_delivery(record)
             logger.info(
                 "episode.speech_final speech_id=%s conversation_id=%s request_id=%s turn_id=%s "
@@ -1228,7 +1297,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 self.handle = None
             self._handles_by_token.pop(h.workspace.token, None)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
-            if isinstance(source_timings, dict):
+            if isinstance(source_timings, dict) and h.workspace.generation == self.generation:
                 source_timings.update(h.workspace.timings)
             try:
                 await self.runtime.output_completed(record)
