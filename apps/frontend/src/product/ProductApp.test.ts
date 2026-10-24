@@ -136,12 +136,18 @@ describe('正式界面的真实控件交互', () => {
     expect(tasks).toHaveBeenCalledTimes(afterUnmount)
   })
 
-  it('声纹只保留四个滑块，保存只提交四项参数和运行开关', async () => {
+  it('声纹四个滑块默认收进高级区域，保存只提交四项参数和运行开关', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
     allowBusinessReady(value)
     const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: DEFAULT_SETTINGS.speaker } } as never)
     await flushPromises()
+    const advanced = wrapper.get('.speaker-advanced')
+    expect(advanced.element).toHaveProperty('open', false)
+    expect(advanced.get('summary').text()).toBe('高级')
+    advanced.element.setAttribute('open', '')
+    await advanced.trigger('toggle')
+    expect(advanced.element).toHaveProperty('open', true)
     const changed: Record<string,number> = {}
     for (const field of SPEAKER_FIELDS) {
       changed[field.key] = SPEAKER_CONTROL_DEFAULTS[field.key] + field.step
@@ -152,7 +158,8 @@ describe('正式界面的真实控件交互', () => {
     }
     expect(wrapper.findAll('input[type="range"]')).toHaveLength(4)
     expect(wrapper.findAll('input[type="number"]')).toHaveLength(0)
-    expect(wrapper.find('.speaker-advanced').exists()).toBe(false)
+    expect(advanced.findAll('input[type="range"]')).toHaveLength(4)
+    expect(advanced.text()).toContain('恢复四项默认值')
     await button(wrapper, '保存声纹参数').trigger('click')
     expect(save).toHaveBeenCalledWith(expect.objectContaining(changed))
     expect(Object.keys(save.mock.calls[0]![0] as object).sort()).toEqual([...Object.keys(changed), 'mode', 'owner_only_barge_in'].sort())
@@ -324,7 +331,7 @@ describe('正式界面的真实控件交互', () => {
     const saved = { ...value.settings.speaker, owner_only_barge_in: true }
     const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: saved } } as never)
     await flushPromises()
-    await wrapper.get('input[role="switch"]').setValue(true)
+    await wrapper.get('input[aria-label="仅主人可打断"]').setValue(true)
     await flushPromises()
     expect(save).toHaveBeenCalledTimes(1)
     expect(save).toHaveBeenCalledWith({ mode: saved.mode, confirm_threshold: saved.confirm_threshold, owner_only_barge_in: true })
@@ -341,25 +348,51 @@ describe('正式界面的真实控件交互', () => {
     vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({ available: true, templates: [] })
     vi.spyOn(productApi, 'saveSpeaker').mockRejectedValue(new Error('声纹工作进程启动失败'))
     await flushPromises()
-    await wrapper.get('input[role="switch"]').setValue(true)
+    await wrapper.get('input[aria-label="仅主人可打断"]').setValue(true)
     await flushPromises()
     expect(value.speakerForm.owner_only_barge_in).toBe(false)
     expect(value.settings.speaker.owner_only_barge_in).toBe(false)
     expect(value.lastError.value).toContain('声纹工作进程启动失败')
-    expect(wrapper.get('input[role="switch"]').element).toHaveProperty('checked', false)
+    expect(wrapper.get('input[aria-label="仅主人可打断"]').element).toHaveProperty('checked', false)
   })
 
-  it('声纹运行模式选择直接应用，无需再次点击页面底部保存', async () => {
+  it('声纹筛选开关直接保存开启与关闭，服务不可用时仍能关闭，保存失败恢复开关', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
     allowBusinessReady(value)
-    const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: { ...DEFAULT_SETTINGS.speaker, mode: 'observe' } } } as never)
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockImplementation(async submitted => ({
+      settings: { speaker: { ...DEFAULT_SETTINGS.speaker, ...submitted as typeof DEFAULT_SETTINGS.speaker } },
+    }) as never)
     await flushPromises()
-    await wrapper.get('select').setValue('observe')
+    const toggle = wrapper.get('input[aria-label="声纹筛选"]')
+    expect(wrapper.find('select').exists()).toBe(false)
+    expect(toggle.attributes('disabled')).toBeDefined()
+    value.speakerStatus.value = { service: 'DISABLED', profile: { available: true } }
+    await flushPromises()
+    expect(toggle.attributes('disabled')).toBeUndefined()
+    value.speakerForm.confirm_threshold = .85
+    await toggle.setValue(true)
     await flushPromises()
     expect(save).toHaveBeenCalledTimes(1)
-    expect(save.mock.calls[0]![0]).toMatchObject({ mode: 'observe', owner_only_barge_in: false })
-    expect(value.settings.speaker.mode).toBe('observe')
+    expect(save.mock.calls[0]![0]).toMatchObject({ mode: 'filter', owner_only_barge_in: false, confirm_threshold: .6 })
+    expect(value.settings.speaker.mode).toBe('filter')
+    expect(value.speakerForm.confirm_threshold).toBe(.85)
+    expect(toggle.element).toHaveProperty('checked', true)
+    expect(toggle.attributes('disabled')).toBeUndefined()
+    await toggle.setValue(false)
+    await flushPromises()
+    expect(save).toHaveBeenCalledTimes(2)
+    expect(save.mock.calls[1]![0]).toMatchObject({ mode: 'off', owner_only_barge_in: false })
+    expect(value.settings.speaker.mode).toBe('off')
+    expect(toggle.element).toHaveProperty('checked', false)
+    value.speakerStatus.value = { service: 'DISABLED', profile: { available: true } }
+    save.mockRejectedValueOnce(new Error('声纹工作进程启动失败'))
+    await flushPromises()
+    await toggle.setValue(true)
+    await flushPromises()
+    expect(value.speakerForm.mode).toBe('off')
+    expect(toggle.element).toHaveProperty('checked', false)
+    expect(value.lastError.value).toContain('声纹工作进程启动失败')
   })
 
   it('保存开关前的迟到声纹状态不能覆盖保存后的就绪结果', async () => {

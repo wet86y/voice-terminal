@@ -50,6 +50,11 @@ const sessionMetrics = computed(() => {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 });
 const recordingExpanded = ref(false); // recordingExpanded（录制面板）：收起时保留已完成片段。
+// speakerFilterEnabled（声纹筛选开关）：界面只提供开启筛选与关闭两种操作。
+const speakerFilterEnabled = computed({
+  get: () => speakerForm.mode === 'filter',
+  set: (enabled: boolean) => { speakerForm.mode = enabled ? 'filter' : 'off'; },
+});
 const admissionLabels: Record<string, string> = {
   collecting: '首段积累中', inferring: '首段核对中', held: '首段非主人，暂缓提交',
   relaxed: '本轮主人已确认，持续放行', unconfirmed: '身份未确认，保留全文放行', closed: '本轮已结束',
@@ -80,26 +85,22 @@ async function toggleRecording() {
   </div>
 
   <div class="settings-stack">
-    <label class="form-field"
-      ><span>运行模式</span
-      ><select v-model="speakerForm.mode" :disabled="saving" @change="saveSpeakerControls">
-        <option value="off">关闭</option>
-        <option value="observe">仅标记</option>
-        <option value="filter" :disabled="!speakerFilterAllowed">
-          拦截 · 首段核对后整轮放行
-        </option></select
-      ><small v-if="!speakerFilterAllowed"
-        >注册主人声纹且
-        Worker（工作进程）就绪后才能启用拦截。</small
-      ><small v-else
-        >先积累约1.2秒音频核对；达到当次阈值为主人，低于则暂缓。暂缓轮次连续三次达到正常主人阈值可恢复全部原文；无有效分数时保留全文降级，放行后异声只作标注。</small
-      ></label
+    <label class="switch-row"
+      ><div><strong>声纹筛选</strong><span v-if="!speakerFilterAllowed">注册主人声纹且工作进程就绪后才能启用筛选。</span><span v-else>先积累约1.2秒音频核对；达到当次阈值为主人，低于则暂缓。暂缓轮次连续三次达到正常主人阈值可恢复全部原文；无有效分数时保留全文降级，放行后异声只作标注。</span></div><input
+        v-model="speakerFilterEnabled"
+        type="checkbox"
+        role="switch"
+        aria-label="声纹筛选"
+        :disabled="saving || (!speakerFilterAllowed && !speakerFilterEnabled)"
+        @change="saveSpeakerControls"
+      /><i aria-hidden="true"></i></label
     >
     <label class="switch-row"
-      ><div><strong>仅主人可打断</strong><span>确认是主人后停止播放，其余情况保留播放；身份判断最多等待约 2.5 秒。关闭声纹模式时也可单独启用。</span></div><input
+      ><div><strong>仅主人可打断</strong><span>确认是主人后停止播放，其余情况保留播放；身份判断最多等待约 2.5 秒。关闭声纹筛选时也可单独启用。</span></div><input
         v-model="speakerForm.owner_only_barge_in"
         type="checkbox"
         role="switch"
+        aria-label="仅主人可打断"
         :disabled="saving || (!speakerHasProfile && !speakerForm.owner_only_barge_in)"
         @change="saveSpeakerControls"
       /><i aria-hidden="true"></i></label
@@ -131,20 +132,23 @@ async function toggleRecording() {
     {{ admissionLabels[current.admission_phase] || current.admission_phase }}。
     <template v-if="current.speaker_summary?.foreign_voice_suspected">本轮存在疑似外来声纹或识别波动，文字保持完整。</template>
   </p>
-  <section class="speaker-controls" aria-label="声纹参数">
-    <div class="speaker-thresholds">
-      <label v-for="field in SPEAKER_FIELDS" :key="field.key" class="form-field">
-        <span>{{ field.label }}<b>{{ Number(speakerForm[field.key]).toFixed(2) }}</b></span>
-        <input v-model.number="speakerForm[field.key]" type="range" :min="field.min" :max="field.max"
-          :step="field.step" :aria-label="field.label" />
-        <small>{{ field.hint }}</small>
-      </label>
-    </div>
-    <p class="instruction-hint">轮内阈值：{{ (speakerForm.confirm_threshold - speakerForm.intra_turn_relaxation).toFixed(2) }}；跨轮阈值：{{ (speakerForm.confirm_threshold - speakerForm.continuity_relaxation).toFixed(2) }}。两种放宽不叠加，保存时校验阈值不小于0。</p>
-    <p class="instruction-hint">临时声纹：{{ sessionMetrics.calibration_status === 'ready' ? '已建立' : sessionMetrics.calibration_status === 'collecting' ? '等待校准完成' : '尚未建立' }}；最近一次评分实际权重：{{ Number(sessionMetrics.effective_session_weight ?? 0).toFixed(2) }}。未建立时仅使用永久模板。</p>
-    <p v-if="controlsError" class="instruction-error" role="alert">{{ controlsError }}</p>
-    <button class="ghost-action" type="button" :disabled="saving" @click="restoreSpeakerDefaults">恢复四项默认值</button>
-  </section>
+  <details class="speaker-advanced">
+    <summary>高级</summary>
+    <section class="speaker-controls" aria-label="声纹参数">
+      <div class="speaker-thresholds">
+        <label v-for="field in SPEAKER_FIELDS" :key="field.key" class="form-field">
+          <span>{{ field.label }}<b>{{ Number(speakerForm[field.key]).toFixed(2) }}</b></span>
+          <input v-model.number="speakerForm[field.key]" type="range" :min="field.min" :max="field.max"
+            :step="field.step" :aria-label="field.label" />
+          <small>{{ field.hint }}</small>
+        </label>
+      </div>
+      <p class="instruction-hint">轮内阈值：{{ (speakerForm.confirm_threshold - speakerForm.intra_turn_relaxation).toFixed(2) }}；跨轮阈值：{{ (speakerForm.confirm_threshold - speakerForm.continuity_relaxation).toFixed(2) }}。两种放宽不叠加，保存时校验阈值不小于0。</p>
+      <p class="instruction-hint">临时声纹：{{ sessionMetrics.calibration_status === 'ready' ? '已建立' : sessionMetrics.calibration_status === 'collecting' ? '等待校准完成' : '尚未建立' }}；最近一次评分实际权重：{{ Number(sessionMetrics.effective_session_weight ?? 0).toFixed(2) }}。未建立时仅使用永久模板。</p>
+      <p v-if="controlsError" class="instruction-error" role="alert">{{ controlsError }}</p>
+      <button class="ghost-action" type="button" :disabled="saving" @click="restoreSpeakerDefaults">恢复四项默认值</button>
+    </section>
+  </details>
 
   <section class="speaker-enrollment-card" aria-labelledby="speaker-enrollment-title">
     <div class="speaker-card-heading">
