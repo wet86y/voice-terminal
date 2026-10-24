@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import UiDialog from '../../interface/UiDialog.vue'
 import { useProductContext } from '../product-context'
@@ -15,6 +15,9 @@ const search = ref('') // search（目标词与别名筛选）。
 const page = ref(0) // page（当前页，从零开始计数）。
 const pageSize = 20 // pageSize（每页热词数量）。
 const listScroll = ref<HTMLElement | null>(null) // listScroll（列表滚动容器）。
+const listContent = ref<HTMLElement | null>(null) // listContent（按实际词条高度测量的列表内容）。
+const listMaxHeight = ref<string>() // listMaxHeight（前五条词条的合计高度）。
+let listObserver: ResizeObserver | undefined // listObserver（词条尺寸变化监听器）。
 const filtered = computed(() => hotwordForm.entries.map((entry, index) => ({ entry, index }))
   .filter(({ entry }) => !search.value.trim() || [entry.word, ...entry.aliases].some(value => value.toLowerCase().includes(search.value.trim().toLowerCase()))))
 const pageCount = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize)))
@@ -41,10 +44,33 @@ const paginationItems = computed<PaginationItem[]>(() => {
   return items
 })
 function resetListScroll() { void nextTick(() => { if (listScroll.value) listScroll.value.scrollTop = 0 }) }
+function measureListHeight() {
+  const rows = listContent.value?.querySelectorAll<HTMLElement>('.hotword-row')
+  const last = rows?.[Math.min(rows.length, 5) - 1]
+  listMaxHeight.value = listContent.value && last
+    ? `min(70vh, ${last.getBoundingClientRect().bottom - listContent.value.getBoundingClientRect().top + (listScroll.value?.clientTop ?? 0)}px)`
+    : undefined
+}
+function observeListRows() {
+  listObserver?.disconnect()
+  if (listContent.value) {
+    listObserver?.observe(listContent.value)
+    listContent.value.querySelectorAll<HTMLElement>('.hotword-row').forEach((row, index) => {
+      if (index < 5) listObserver?.observe(row)
+    })
+  }
+  measureListHeight()
+}
+watch(visible, observeListRows, { deep: true, flush: 'post' })
 watch(search, () => { page.value = 0; resetListScroll() })
 watch(page, resetListScroll)
 watch(pageCount, count => { page.value = Math.min(page.value, count - 1) })
 onMounted(loadHotwords)
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined') listObserver = new ResizeObserver(measureListHeight)
+  observeListRows()
+})
+onBeforeUnmount(() => listObserver?.disconnect())
 function inputValue(event: Event) { return (event.target as HTMLInputElement).value }
 async function openJsonEditor() {
   jsonDialogOpen.value = true
@@ -90,7 +116,7 @@ function add() {
         <div><strong>启用热词</strong><span>总开关：控制主流式纠正和双路离线模型的原生热词增强。音色参考转写始终不使用热词。</span></div>
         <input v-model="hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i aria-hidden="true"></i>
       </label>
-      <label class="switch-row hotword-stream-option">
+      <label class="switch-row">
         <div><strong>流式热词修订</strong><span>只控制主流式文本的后置纠正；关闭后，已开启双路的离线模型仍可使用目标热词。</span></div>
         <input v-model="hotwordForm.stream_enabled" :disabled="!hotwordForm.enabled" type="checkbox" role="switch" @change="hotwordsChanged" /><i aria-hidden="true"></i>
       </label>
@@ -107,23 +133,30 @@ function add() {
           <button class="outline-button" :disabled="hotwordBusy || !hotwordLoaded" @click="openJsonEditor">导入词表</button>
         </div>
       </div>
-      <div ref="listScroll" class="hotword-list-scroll" tabindex="0" aria-label="当前页热词列表，滚动查看更多词条">
-        <div v-if="!filtered.length" class="hotword-empty" role="status">
-          <strong>{{ hotwordForm.entries.length ? '没有匹配的热词' : '还没有热词' }}</strong>
-          <p>{{ hotwordForm.entries.length ? '试试其他名称或别名。' : '点击“添加热词”逐条填写，或通过“导入词表”批量添加。' }}</p>
-        </div>
-        <div v-for="{ entry, index } in visible" :key="index" class="hotword-row">
-          <label class="form-field"><span>目标词 {{ index + 1 }}</span><input v-model="entry.word" maxlength="96" :aria-label="`目标词 ${index + 1}`" placeholder="希望输出的正确名称" @input="hotwordsChanged" /></label>
-          <div v-for="field in (['aliases', 'blacklist'] as const)" :key="field" class="form-field">
-            <span>{{ field === 'aliases' ? '别名（可选）' : '排除词（可选）' }}</span>
-            <div class="hotword-tags"><button v-for="(value, position) in entry[field]" :key="value" type="button" :aria-label="`移除${field === 'aliases' ? '别名' : '排除词'} ${value}`" @click="removeValue(entry, field, position)">{{ value }} ×</button></div>
-            <input :value="hotwordListValue(entry, field)" :aria-label="`${field === 'aliases' ? '读音或别名' : '邻近排除词'} ${index + 1}`" placeholder="多个值用分号分隔" @input="setHotwordList(entry, field, inputValue($event))" @paste="pasteValues($event, entry, field)" />
+      <div ref="listScroll" class="hotword-list-scroll" :style="{ maxHeight: listMaxHeight }" tabindex="0" aria-label="当前页热词列表，最多显示五条，滚动查看更多词条">
+        <div ref="listContent" class="hotword-list-content">
+          <div v-if="!filtered.length" class="hotword-empty" role="status">
+            <strong>{{ hotwordForm.entries.length ? '没有匹配的热词' : '还没有热词' }}</strong>
+            <p>{{ hotwordForm.entries.length ? '试试其他名称或别名。' : '点击“添加热词”逐条填写，或通过“导入词表”批量添加。' }}</p>
           </div>
-          <button class="ghost-action hotword-remove" :aria-label="`删除热词 ${index + 1}`" @click="hotwordForm.entries.splice(index, 1); hotwordsChanged()">删除</button>
+          <div v-for="{ entry, index } in visible" :key="index" class="hotword-row">
+            <label class="form-field"><span>目标词 {{ index + 1 }}</span><input v-model="entry.word" maxlength="96" :aria-label="`目标词 ${index + 1}`" placeholder="希望输出的正确名称" @input="hotwordsChanged" /></label>
+            <div v-for="field in (['aliases', 'blacklist'] as const)" :key="field" class="form-field">
+              <span>{{ field === 'aliases' ? '别名（可选）' : '排除词（可选）' }}</span>
+              <div class="hotword-tags"><button v-for="(value, position) in entry[field]" :key="value" type="button" :aria-label="`移除${field === 'aliases' ? '别名' : '排除词'} ${value}`" @click="removeValue(entry, field, position)">{{ value }} ×</button></div>
+              <input :value="hotwordListValue(entry, field)" :aria-label="`${field === 'aliases' ? '读音或别名' : '邻近排除词'} ${index + 1}`" placeholder="多个值用分号分隔" @input="setHotwordList(entry, field, inputValue($event))" @paste="pasteValues($event, entry, field)" />
+            </div>
+            <button class="ghost-action hotword-remove" :aria-label="`删除热词 ${index + 1}`" @click="hotwordForm.entries.splice(index, 1); hotwordsChanged()">删除</button>
+          </div>
         </div>
       </div>
-      <footer v-if="pageCount > 1" class="hotword-list-footer">
-        <nav class="hotword-pagination" aria-label="热词分页">
+      <footer class="hotword-list-footer">
+        <details class="hotword-list-guide">
+          <summary>填写说明</summary>
+          <p class="hotword-help">目标词填写希望输出的正确名称，别名和排除词为可选项。多个值可用英文分号、中文分号、顿号或换行分隔，斜杠与词内空格保留。</p>
+          <p class="hotword-help">别名和邻近排除词仅用于流式修订，离线模型只使用目标热词。</p>
+        </details>
+        <nav v-if="pageCount > 1" class="hotword-pagination" aria-label="热词分页">
           <button class="outline-button hotword-page-edge" :disabled="page === 0" @click="page = Math.max(0, page - 1)">上一页</button>
           <template v-for="item in paginationItems" :key="item.type === 'page' ? `page-${item.value}` : item.key">
             <button v-if="item.type === 'page'" class="hotword-page-number" :class="{ 'is-current': item.value === page + 1 }" :aria-current="item.value === page + 1 ? 'page' : undefined" @click="page = item.value - 1">{{ item.value }}</button>
@@ -132,11 +165,6 @@ function add() {
           <button class="outline-button hotword-page-edge" :disabled="page + 1 >= pageCount" @click="page = Math.min(pageCount - 1, page + 1)">下一页</button>
         </nav>
       </footer>
-      <details class="hotword-list-guide">
-        <summary>填写说明</summary>
-        <p class="hotword-help">目标词填写希望输出的正确名称，别名和排除词为可选项。多个值可用英文分号、中文分号、顿号或换行分隔，斜杠与词内空格保留。</p>
-        <p class="hotword-help">别名和邻近排除词仅用于流式修订，离线模型只使用目标热词。</p>
-      </details>
     </section>
     <details class="hotword-advanced"><summary>高级设置</summary><label class="form-field"><span>相似度门槛</span><input v-model.number="hotwordForm.threshold" type="number" min="0.5" max="1" step="0.01" @input="hotwordsChanged" /></label><p class="hotword-help">默认 0.85。提高门槛可减少近音匹配；这不是纠正准确率。</p></details>
     <footer class="hotword-save"><span role="status">{{ hotwordDirty ? '有未保存的修改' : '保存后从下一轮发言生效，无需重启' }}</span><button class="save-button" @click="saveHotwords">{{ hotwordSaving ? '正在构建并保存…' : '保存热词设置' }}</button></footer>
@@ -174,11 +202,10 @@ function add() {
 <style scoped>
 .hotword-settings-section{display:flex;flex-direction:column;gap:20px;min-width:0}
 .hotword-fields{display:flex;flex-direction:column;gap:24px;border:0;padding:0;margin:0;min-width:0}
-/* hotword-switches（热词开关组）：纵向留出间距，缩进流式子选项。 */
+/* hotword-switches（热词开关组）：卡片边缘对齐，纵向留出间距。 */
 .hotword-switches{display:grid;gap:12px;min-width:0}
 .hotword-switches .switch-row>div{min-width:0}
 .hotword-switches .switch-row>i{flex-shrink:0}
-.hotword-stream-option{margin-left:20px}
 .hotword-list-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;min-width:0}
 .hotword-list-heading h3{font-size:var(--font-section);font-weight:600}
 .hotword-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;min-width:0}
@@ -187,8 +214,9 @@ function add() {
 .hotword-count,.hotword-help,.hotword-save span{font-size:var(--font-caption);color:var(--muted)}
 .hotword-help{line-height:1.7}
 .hotword-list-window{display:grid;gap:16px;min-width:0;padding:20px;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:#ffffff02;container:hotword-list / inline-size}
-.hotword-list-scroll{max-height:min(70vh,690px);min-width:0;overflow-y:auto;overscroll-behavior-y:auto;border-top:1px solid var(--line)}
-.hotword-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:140px;padding:24px 16px;text-align:center}
+.hotword-list-scroll{max-height:70vh;min-width:0;overflow-y:auto;overscroll-behavior-y:auto;border-top:1px solid var(--line)}
+.hotword-list-content{position:relative;min-width:0}
+.hotword-empty{display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 12px;text-align:center}
 .hotword-empty strong{font-size:var(--font-body);font-weight:500;color:var(--text)}
 .hotword-empty p{max-width:360px;color:var(--muted);font-size:var(--font-caption);line-height:1.7}
 .hotword-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) auto;align-items:end;gap:8px 12px;padding:14px 0;border-bottom:1px solid var(--line)}
@@ -197,15 +225,16 @@ function add() {
 .hotword-row .form-field>span{margin-bottom:5px}
 .hotword-row .form-field input{height:34px;min-height:34px;padding:6px 9px;font-size:var(--font-body)}
 .hotword-remove{align-self:end;min-height:32px;padding:5px 8px}
-.hotword-list-footer{display:flex;align-items:center;justify-content:center;min-width:0;padding-top:12px;border-top:1px solid var(--line)}
-.hotword-pagination{display:flex;align-items:center;gap:4px;min-width:0;max-width:100%;overflow-x:auto;white-space:nowrap}
+.hotword-list-footer{display:grid;grid-template-columns:calc(var(--font-caption) * 6) minmax(0,1fr);align-items:start;column-gap:12px;min-width:0;padding-top:8px;border-top:1px solid var(--line)}
+.hotword-pagination{grid-column:2;grid-row:1;justify-self:end;display:flex;align-items:center;gap:4px;min-width:0;max-width:100%;overflow-x:auto;white-space:nowrap}
 .hotword-pagination .hotword-page-edge{min-height:30px;padding:4px 7px;font-size:var(--font-caption);white-space:nowrap}
 .hotword-page-number{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;min-width:30px;height:30px;padding:0 4px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted);font:inherit;font-size:var(--font-caption);cursor:pointer}
 .hotword-page-number:hover{border-color:var(--line-strong);color:var(--text)}
 .hotword-page-number.is-current{border-color:var(--accent);background:#ffffff0a;color:var(--accent);font-weight:600}
 .hotword-page-ellipsis{display:inline-flex;align-items:center;justify-content:center;flex:0 0 14px;color:var(--muted);font-size:var(--font-caption)}
 .hotword-count{white-space:nowrap}
-.hotword-list-guide summary{cursor:pointer;color:var(--muted);font-size:var(--font-caption)}
+.hotword-list-guide{grid-column:1 / -1;grid-row:1;min-width:0}
+.hotword-list-guide summary{width:max-content;cursor:pointer;color:var(--muted);font-size:var(--font-caption);line-height:16px;padding-block:7px}
 .hotword-list-guide .hotword-help{margin-top:8px}
 .hotword-advanced input{max-width:140px}
 .hotword-save{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:16px 0 0;border-top:1px solid var(--line)}
@@ -243,11 +272,9 @@ function add() {
 }
 @media(max-width:640px){
   .hotword-list-window{padding:16px}
-  .hotword-stream-option{margin-left:12px}
   .hotword-save{align-items:stretch}
   .hotword-save .save-button{width:100%}
   .hotword-json-guide{grid-template-columns:minmax(0,1fr)}
   .hotword-json-field textarea{height:42vh;min-height:220px}
-  .hotword-list-scroll{max-height:68vh}
 }
 </style>
