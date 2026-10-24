@@ -54,12 +54,13 @@ describe('HotwordSettings（热词编辑页）', () => {
     expect(controls.hotwordForm.entries).toHaveLength(2)
     expect(wrapper.text()).toContain('第 1 行格式无效')
     const save = vi.spyOn(productApi, 'saveHotwords')
-    vi.spyOn(productApi, 'previewHotwords').mockResolvedValue({ text: 'Claude。', raw_text: '克劳得。',
+    const preview = vi.spyOn(productApi, 'previewHotwords').mockResolvedValue({ text: 'Claude。', raw_text: '克劳得。',
       matches: [{ original: '克劳得', replacement: 'Claude', score: 1 }], elapsed_ms: 2, status: 'corrected' })
-    await wrapper.get('textarea').setValue('克劳得。')
-    await wrapper.get('.hotword-preview button').trigger('click')
-    await flushPromises()
-    expect(wrapper.get('.hotword-result').text()).toContain('Claude。')
+    // testHotwords（试测状态逻辑）：当前页面已改用完整词表编辑弹窗，不再渲染旧试测面板。
+    controls.hotwordTestText.value = '克劳得。'
+    await controls.testHotwords()
+    expect(preview).toHaveBeenCalledWith(controls.hotwordForm, '克劳得。')
+    expect(controls.hotwordPreview.value?.text).toBe('Claude。')
     expect(save).not.toHaveBeenCalled()
     wrapper.unmount()
   })
