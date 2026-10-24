@@ -63,4 +63,37 @@ describe('Boot page（共享启动与维护画面）', () => {
     expect((document.getElementById('retry') as HTMLButtonElement).hidden).toBe(false)
     expect((document.getElementById('reselect') as HTMLButtonElement).hidden).toBe(true)
   })
+
+  it('校验取消收尾完成后正常显示结果并允许重新校验', async () => {
+    const commands: string[] = []
+    openBoot(async command => {
+      commands.push(command!)
+      return { role: 'installer', operation: 'integrity', workspace_busy: false,
+        initialization: { phase: '校验已取消，必要收尾已完成', cancelled: true, can_cancel: false } }
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(document.getElementById('title')?.textContent).toBe('校验已取消')
+    expect(document.getElementById('message')?.classList.contains('is-error')).toBe(false)
+    expect(document.getElementById('progress')?.hidden).toBe(true)
+    expect((document.getElementById('cancel') as HTMLButtonElement).hidden).toBe(true)
+    expect((document.getElementById('exit') as HTMLButtonElement).disabled).toBe(false)
+    document.getElementById('retry')!.click()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(commands).toContain('desktop_initialize')
+  })
+
+  it('取消收尾期间允许登记退出请求', async () => {
+    const commands: string[] = []
+    openBoot(async command => {
+      commands.push(command!)
+      return { role: 'installer', operation: 'integrity', workspace_busy: true,
+        initialization: { phase: '正在取消，等待当前操作完成必要收尾', cancelling: true, can_cancel: false } }
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect((document.getElementById('exit') as HTMLButtonElement).disabled).toBe(false)
+    expect((document.getElementById('cancel') as HTMLButtonElement).hidden).toBe(true)
+    document.getElementById('exit')!.click()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(commands).toContain('exit_application')
+  })
 })
