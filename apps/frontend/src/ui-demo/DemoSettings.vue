@@ -17,7 +17,7 @@ import WakeTaskTabs from '../interface/WakeTaskTabs.vue'
 import type { LocalDownloadItem } from '../interface/local-components'
 import { useLocalComponentsDemo } from './useLocalComponentsDemo'
 import {
-  demoAmbientRecords, demoInstructions,
+  demoInstructions,
   demoSettings, demoSpeakerPrompts, demoSpeakerTemplates, demoWakeTasks,
   longIdentifier, longText, previewRows, primaryPersonaDocuments,
   type DemoWakeTask, type PreviewScene, type SettingsTab,
@@ -47,7 +47,6 @@ const selectedDemoResources = ref(new Set<string>()) // selectedDemoResources（
 const taskView = ref<'pending' | 'archived'>('pending') // taskView（当前演示任务分类）。
 const tasks = ref(previewRows(demoWakeTasks, props.scene))
 const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
-const ambient = computed(() => previewRows(demoAmbientRecords, props.scene))
 const instructionRows = computed(() => props.scene === 'empty' ? [] : instructions)
 const loading = computed(() => props.scene === 'loading')
 const integrityReady = ref(false) // integrityReady（演示中已准备对应版本的校验程序）。
@@ -244,7 +243,6 @@ function cancelTask(item: DemoWakeTask) {
           <div class="speaker-template-copy"><strong :title="props.scene === 'long' ? longIdentifier : item.label">{{ props.scene === 'long' ? longIdentifier : item.label }}</strong><time>{{ item.date }}</time></div><span class="speaker-template-state active">{{ item.status }}</span><div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" @click="feedback('声纹模板中心设置')">移出主中心</button><button class="outline-button danger-action speaker-compact-button" type="button" @click="feedback('声纹模板删除提示')">删除</button></div>
         </article></div><div v-else class="pool-empty">还没有声纹模板。</div>
       </section>
-      <section class="speaker-ambient-card"><div class="speaker-card-heading"><div><p class="section-label">AMBIENT CONTEXT（环境上下文）</p><h3>当前会话环境记录</h3></div><button class="ghost-action" type="button" @click="feedback('环境记录刷新提示')">刷新</button></div><div v-if="ambient.length" class="ambient-record-list"><article v-for="item in ambient" :key="item.id"><time>{{ item.time }}</time><p>{{ props.scene === 'long' ? longText : item.text }}</p><small>{{ item.status }}</small></article></div><div v-else class="pool-empty">暂无环境记录。</div></section>
       <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('声纹设置已保存')">{{ loading ? '正在保存…' : '保存声纹设置' }}</button></footer>
       <section class="hotword-settings-section">
         <SettingsPageHeader section="speaker" title="热词替换" description="专有名称、别名与识别文本纠正" compact />

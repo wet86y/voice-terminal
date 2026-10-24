@@ -143,8 +143,6 @@ export const productApi = {
   deleteSpeakerTemplate: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   setSpeakerTemplateCentroid: (id: string, include: boolean) => request<Record<string, unknown>>(`/api/v1/speaker/templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ include_in_centroid: include }) }),
   testSpeaker: (value: unknown) => request<Record<string, unknown>>('/api/v1/speaker/test', { method: 'POST', body: JSON.stringify(value) }),
-  ambientContext: (limit = 20) => request<Record<string, unknown>>(`/api/v1/ambient-context?limit=${limit}`),
-  clearAmbientContext: () => request<Record<string, unknown>>('/api/v1/ambient-context', { method: 'DELETE' }),
   registry: () => request<ProductSnapshot['models']>('/api/v1/models/registry'),
   fixedCredentials: () => request<import('./types').FixedModelCredentials>('/api/v1/models/credentials'),
   /** fixedProviderUsage（服务商账户用量）：密钥留在后端，只返回余额或订阅余量。 */

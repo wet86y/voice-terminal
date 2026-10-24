@@ -77,7 +77,7 @@ def test_unadmitted_continuous_activity_does_not_hold_or_drop_a_valid_reply(stat
         assert await controller._observe_activity(activity, frame) is activity
         await controller._new_turn(frame)
         controller.workspace.speaker_state = state
-        controller.workspace.speaker_decision = {"state": state, "route": "ambient"}
+        controller.workspace.speaker_decision = {"state": state, "route": "blocked"}
         # 连续三秒环境声：原始检测进入识别，输出事务仍可实际消费音频。
         for index in range(150):
             frame = AudioFrame(b"\x00\x00" * 320, index * 320, frame.captured_at + .02)

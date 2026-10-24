@@ -10,7 +10,7 @@
 
 | 组件 | 源码入口，相对于插件目录 | 负责内容 | 生命周期所有者 |
 | --- | --- | --- | --- |
-| `bridge`（桥接） | `src/bridge/plugin.ts` | 会话绑定、上下文合并与门禁、9 个根代理工具（含按需截屏）、回执、观察、工作区及模型设置 | 桥接插件上下文及绑定的根代理 |
+| `bridge`（桥接） | `src/bridge/plugin.ts` | 会话绑定、上下文合并与门禁、8 个根代理工具（含按需截屏）、回执、观察、工作区及模型设置 | 桥接插件上下文及绑定的根代理 |
 | `wake-tasks`（项目唤醒任务） | `src/wake-tasks/plugin.ts` | 8 个任务及语音事件工具、任务接口、持久化、旧项目任务迁移、定时投递 | 任务插件上下文及任务服务 |
 | `client`（浏览器界面） | `src/client/index.ts` | 设置页、消息渲染、语言资源和界面插槽 | 浏览器插件上下文及服务期间注册 |
 | `preset`（代理预设） | `preset/shadow-agent/agent.cordis.yml` | 官方工具、压缩、子代理及工作流的完整组合 | 官方代理预设注册器 |
@@ -43,7 +43,7 @@ graph LR
 | 激活与上下文 | `activation_id`（激活标识）、`context_revision`（上下文版本）；过期调用必须保持拒绝，不能用新激活替代旧请求水位 |
 | 实时运行轨迹 | `shadow.activity`（内部活动回调）的 `action_seq`（动作序号）在激活内递增，思考、工具和运行状态串行发送；`activity`（实时活动正文）只使用绑定根代理的公开实时流及工具事件，字段与拒收规则见 [桥接活动协议](../architecture/bridge-2.0-protocol.md) |
 
-9 个根代理工具为 `capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`read_ambient_context`（读取旁路文字）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）、`finish_shadow_no_action`（终态无需动作）。均只安装到已绑定的根代理，子代理不能通过伪造会话标识调用。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。
+8 个根代理工具为 `capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）、`finish_shadow_no_action`（终态无需动作）。均只安装到已绑定的根代理，子代理不能通过伪造会话标识调用。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。
 
 8 个任务工具为 `schedule_wake`（简易创建）、`cancel_wake`（取消）、`read_wake_reference`（按需读取冻结参考）、`publish_voice_event`（发布语音事件）、`wake_task_create`（创建）、`wake_task_list`（查询）、`wake_task_update`（更新）、`wake_task_delete`（删除）。保留完整任务标识、历史、删除确认、写入失败恢复及重启恢复。
 

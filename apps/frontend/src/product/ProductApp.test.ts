@@ -87,7 +87,6 @@ function allowBusinessReady(value: { voice: ReturnType<typeof useProductAdapter>
   } as never)
   vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
   vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
-  vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
   vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
   vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
   // 伪造已连接的测试适配器，避免对本机服务发起 WebSocket（网页套接字）请求。
@@ -177,6 +176,8 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.text()).toContain('本轮主人已确认，持续放行')
     expect(wrapper.text()).toContain('本轮存在疑似外来声纹或识别波动，文字保持完整')
     expect(wrapper.text()).toContain('约1.2秒音频核对')
+    expect(wrapper.text()).not.toContain('当前会话环境记录')
+    expect(wrapper.text()).not.toContain('全部清空')
     expect(wrapper.text()).not.toContain('初始阶段无条件放行')
   })
   it('声纹阈值只保存页面草稿，越过旧界限后保存按钮仍可用并提交放宽量', async () => {
@@ -324,7 +325,6 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
     allowBusinessReady(value)
     vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({ available: true, templates: [] })
-    vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
     vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({ registered: true, owner_only_barge_in_selected: true, owner_only_barge_in_ready: true,
       owner_only_barge_in_effective: false, owner_only_barge_in_reason: '已启用，等待播放期间验证回声保护' })
     value.speakerForm.confirm_threshold = 0.85
@@ -1253,7 +1253,6 @@ describe('正式界面的真实控件交互', () => {
     vi.spyOn(productApi, 'snapshot').mockReturnValue(response.promise)
     vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
     vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
-    vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
     vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
     vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
     const ready = { enabled:true, state:'ready' as const, version:'0.1.7', profile:'web' as const,
@@ -1279,7 +1278,6 @@ describe('正式界面的真实控件交互', () => {
     vi.spyOn(productApi, 'snapshot').mockReturnValue(response.promise)
     vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
     vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
-    vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
     vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
     vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
     vi.spyOn(productApi, 'scanModels').mockResolvedValue({ ...structuredClone(DEFAULT_REGISTRY),

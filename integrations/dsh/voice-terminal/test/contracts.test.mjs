@@ -14,7 +14,7 @@ test('工具输入范围、调用者身份与取消信号保留同一契约', as
   const agent = { id: 'root' }
   const binding = { handle: { agent }, state: 'active', activationId: 'activation', dshSessionId: 'dsh', voiceSessionId: 'voice', epoch: 1, revision: 0 }
   installRootTools({ tools: { register(tool) { tools.set(tool.name, tool) } } }, binding)
-  assert.deepEqual([...tools.keys()], ['get_latest_context', 'read_ambient_context', 'publish_progress', 'publish_voice_information', 'request_early_silence', 'request_user_input', 'return_shadow_result', 'finish_shadow_no_action'])
+  assert.deepEqual([...tools.keys()], ['get_latest_context', 'publish_progress', 'publish_voice_information', 'request_early_silence', 'request_user_input', 'return_shadow_result', 'finish_shadow_no_action'])
   const originalFetch = globalThis.fetch
   let calls = 0
   const controller = new AbortController()
@@ -26,7 +26,7 @@ test('工具输入范围、调用者身份与取消信号保留同一契约', as
   }
   try {
     for (const [name, args] of [
-      ['get_latest_context', { since_revision: -1 }], ['read_ambient_context', { limit: 51 }],
+      ['get_latest_context', { since_revision: -1 }],
       ['publish_progress', { text: ' ' }], ['publish_progress', { text: 'x'.repeat(513) }],
       ['publish_voice_information', { text: 'x'.repeat(2001) }],
       ['request_user_input', { question: '问题', options: Array(9).fill('选项') }],

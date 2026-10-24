@@ -87,7 +87,6 @@ beforeEach(() => {
   vi.spyOn(productApi, 'snapshot').mockResolvedValue(productSnapshot)
   vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
   vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
-  vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
   vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
   vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
 

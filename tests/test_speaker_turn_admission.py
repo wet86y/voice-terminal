@@ -12,7 +12,6 @@ from voice_terminal.config import SpeakerConfig
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.turn_workspace import AudioFrame, TurnWorkspace
 from voice_terminal.core.state import RuntimeState
-from voice_terminal.session.ambient import AmbientTranscriptStore
 from voice_terminal.speaker.rolling import RollingSpeakerSensor
 from voice_terminal.speaker.session import SessionSpeakerPolicy
 from voice_terminal.speaker.contracts import SpeakerState
@@ -323,12 +322,11 @@ async def test_cancelled_turn_does_not_publish_late_first_result():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("score,expected", [(.8, "完整句首和句尾"), (.1, "")])
-async def test_commit_routes_full_final_or_ambient_without_early_empty_settlement(score, expected):
+async def test_commit_admits_full_final_or_blocks_without_early_empty_settlement(score, expected):
     c, ws = first_controller(score)
     ws.final_text = ws.paraformer_final = "完整句首和句尾"
     c.speaker_mode = "filter"
     c.hotwords = None
-    c.ambient_store = AmbientTranscriptStore()
     c.episode_history = {}
     c._commit_input_workspace = AsyncMock()
     c._retire_committed_input = AsyncMock()
@@ -345,7 +343,8 @@ async def test_commit_routes_full_final_or_ambient_without_early_empty_settlemen
         assert c.episode.observe.call_args.kwargs["text"] == expected
     else:
         c._settle_committed_turn.assert_awaited_once_with("a", outcome="speaker_blocked")
-        assert c.ambient_store.records[0]["text"] == "完整句首和句尾"
+        assert ws.speaker_blocked
+        assert c.speaker_policy.turns["a"].text == "完整句首和句尾"
         c.episode.observe.assert_not_awaited()
 
 
@@ -360,7 +359,7 @@ async def test_first_scoring_failure_admits_full_text_once_and_commits_normally(
     else:
         c.speaker_client.embed_pcm.return_value = ("无效向量",)
     ws.final_text = ws.paraformer_final = "句首和句尾都完整"
-    c.speaker_mode, c.hotwords, c.ambient_store = "filter", None, AmbientTranscriptStore()
+    c.speaker_mode, c.hotwords = "filter", None
     c.episode_history = {}
     c._commit_input_workspace, c._retire_committed_input = AsyncMock(), AsyncMock()
     c._settle_committed_turn = AsyncMock()

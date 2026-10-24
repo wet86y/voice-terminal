@@ -75,7 +75,6 @@ beforeEach(() => {
   vi.spyOn(productApi, 'snapshot').mockResolvedValue({ settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY) } as never)
   vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
   vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
-  vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
   vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
   vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
   vi.spyOn(productApi, 'stopSpeakerCapture').mockResolvedValue({ stopped: true })

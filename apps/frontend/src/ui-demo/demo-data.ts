@@ -227,11 +227,6 @@ export const demoSpeakerTemplates = [
   { id: 'template-02', label: '安静环境', date: '2026-10-03 10:25', status: '已纳入主中心' },
 ]
 export const demoSpeakerPrompts = ['今天下午我会整理方案，请帮我保留一段连续的工作时间。', '需要确认的事情可以先列出来，我会逐项查看。', '先把当前安排记录下来，等我回来后再继续。']
-/** id（标识）、time（时间）、text（正文）、status（身份判断说明）。 */
-export const demoAmbientRecords = [
-  { id: 'ambient-01', time: '14:12', text: '窗外有一段远处的谈话声。', status: '非本人 · 环境记录' },
-  { id: 'ambient-02', time: '14:16', text: '稍后再确认这个安排。', status: '身份未知 · 环境记录' },
-]
 /** DemoWakeTask（展示任务）：各条目保留自己的重复规则与编辑内容。 */
 export interface DemoWakeTask {
   id: string // id（任务标识）。

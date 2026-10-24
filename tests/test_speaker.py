@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 from dataclasses import replace
 
-from voice_terminal.session.ambient import AmbientTranscriptStore
 from voice_terminal.speaker.contracts import SpeakerObservation, SpeakerState
 from voice_terminal.speaker.enrollment import (
     EnrollmentRejectedError,
@@ -90,7 +89,7 @@ class SpeakerStateTests(unittest.TestCase):
     def test_ambiguous_turn_never_confirms_on_its_own(self) -> None:
         # 低于主人阈值且没有连续主人证据，二分判断为非主人。
         self.assertEqual(self.machine.observe(observation(0.55)), SpeakerState.NON_OWNER_CONFIRMED)
-        self.assertEqual(self.machine.decision().route, "ambient")
+        self.assertEqual(self.machine.decision().route, "blocked")
 
     def test_continuity_requires_a_previous_owner_confirmation(self) -> None:
         self.machine.observe(observation(0.80))
@@ -109,7 +108,7 @@ class SpeakerStateTests(unittest.TestCase):
         self.machine.reset(turn_id="turn-2", generation=2)
         self.assertEqual(self.machine.observe(observation(0.10, turn_id="turn-2", generation=2)),
                          SpeakerState.NON_OWNER_CONFIRMED)
-        self.assertEqual(self.machine.decision().route, "ambient")
+        self.assertEqual(self.machine.decision().route, "blocked")
         # The rejection drops the owner trust, so the next ambiguous turn
         # cannot inherit continuity from the older confirmation.
         self.machine.reset(turn_id="turn-3", generation=3)
@@ -300,17 +299,6 @@ class SpeakerStorageTests(unittest.TestCase):
             store.delete_template(template_id)
             self.assertEqual(store.snapshot()["template_count"], 2)
             self.assertTrue(store.path.is_file())
-
-    def test_ambient_context_is_bounded_and_refinement_stays_session_local(self) -> None:
-        store = AmbientTranscriptStore(max_records=2, max_bytes=4096)
-        store.append({"turn_id": "one", "text": "环境一", "similarity": 0.1, "reason": "non-owner"})
-        store.append({"turn_id": "two", "text": "环境二", "similarity": 0.2, "reason": "non-owner"})
-        self.assertTrue(store.update_refined("one", "环境一精修"))
-        store.append({"turn_id": "three", "text": "环境三", "similarity": 0.3, "reason": "non-owner"})
-        snapshot = store.snapshot()
-        self.assertEqual(snapshot["total_count"], 2)
-        self.assertTrue(snapshot["session_scoped"])
-        self.assertEqual(snapshot["records"][0]["turn_id"], "two")
 
 
 class EnrollmentGateTests(unittest.TestCase):

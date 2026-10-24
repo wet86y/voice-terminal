@@ -19,9 +19,6 @@ const {
   cancelSpeakerEnrollment,
   deleteSpeakerTemplate,
   setSpeakerTemplateCentroid,
-  refreshAmbientContext,
-  clearAmbientContext,
-  formatTime,
   speakerRecordingSegment,
   speakerTestRecording,
   speakerRecordingSeconds,
@@ -29,7 +26,6 @@ const {
   speakerServiceLabel,
   speakerRollingSummary,
   speakerTemplates,
-  ambientRecords,
   speakerHasProfile,
   speakerNeedsReenrollment,
   speakerStaleReason,
@@ -203,49 +199,6 @@ async function toggleRecording() {
       </div>
     </details>
     <div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div>
-  </section>
-
-  <section class="speaker-ambient-card">
-    <div class="speaker-card-heading">
-      <div>
-        <p class="section-label">AMBIENT CONTEXT（环境上下文）</p>
-        <h3>当前会话环境记录</h3>
-        <p>
-          筛选模式拦截的非本人文本只保存在内存中，不跨会话、不保存音频，也不会自动进入主
-          Agent（代理）。
-        </p>
-      </div>
-      <div>
-        <button
-          class="ghost-action"
-          type="button"
-          @click="refreshAmbientContext"
-        >
-          刷新</button
-        ><button
-          class="danger-action"
-          type="button"
-          :disabled="!ambientRecords.length"
-          @click="clearAmbientContext"
-        >
-          全部清空
-        </button>
-      </div>
-    </div>
-    <div v-if="ambientRecords.length" class="ambient-record-list">
-      <article
-        v-for="record in ambientRecords"
-        :key="String(record.turn_id) + String(record.timestamp)"
-      >
-        <time>{{ formatTime(String(record.timestamp || "")) }}</time>
-        <p>{{ String(record.text || "") }}</p>
-        <small
-          >{{ speakerStateLabel(record.speaker_state) }} ·
-          {{ String(record.reason || "路由到环境记录") }}</small
-        >
-      </article>
-    </div>
-    <div v-else class="pool-empty">当前会话还没有被拦截的环境文本。</div>
   </section>
 
   <footer>
