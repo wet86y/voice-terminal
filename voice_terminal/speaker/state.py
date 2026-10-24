@@ -256,7 +256,7 @@ class SpeakerStateMachine:
             final_route = "main"
             final_reason = reason or "owner_continuity"
         elif state == SpeakerState.NON_OWNER_CONFIRMED:
-            final_route = "ambient"
+            final_route = "blocked"
             final_reason = reason or ("insufficient_speaker_evidence" if self._aggregate is None else "non_owner_confirmed")
         elif state == SpeakerState.UNAVAILABLE:
             final_route = "pending"

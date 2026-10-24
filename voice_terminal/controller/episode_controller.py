@@ -1097,10 +1097,6 @@ class EpisodeController(RealtimeController):
             await self._refresh_turn_speaker_summary(ws)
             if ws.token != token or self.workspace is not ws:
                 return True
-            if not turn.admitted and turn.text and self.ambient_store is not None:
-                self.ambient_store.append({"turn_id": ws.turn_id, "text": turn.text,
-                    "speaker_state": turn.state.value, "similarity": turn.scores.get("combined_score"),
-                    "reason": turn.reason, "refined_text": ws.refined_text})
             transcript_audit(ws.turn_id, "committed（实际提交全文）", ws.final_text, turn.text,
                              turn.text_revision, generation=ws.generation,
                              settings_revision=self.speaker_policy.settings_revision,
@@ -1354,8 +1350,6 @@ class EpisodeController(RealtimeController):
                              speaker_summary=dict(ws.speaker_summary))
         if ws.speaker_blocked and ws.speaker_summary:
             ws.raw_refined_text = incoming
-            if self.ambient_store is not None:
-                self.ambient_store.update_refined(ws.turn_id, incoming)
             return
         if (ws.speaker_mode == "filter" and not result.get("admission_checked")
                 and not ws.speaker_summary.get("admitted") and not self.speaker_policy.fully_admitted(ws.turn_id)):
@@ -1384,8 +1378,6 @@ class EpisodeController(RealtimeController):
             await self._publish(event("transcript.refined", ws.turn_id, output_generation=ws.generation,
                                       text=text, source=source, revision=revision, workspace=ws.snapshot()))
         if ws.speaker_blocked:
-            if self.ambient_store is not None:
-                self.ambient_store.update_refined(ws.turn_id, text)
             return
         updater = getattr(self.history, "update_input_refinement", None)
         if callable(updater):

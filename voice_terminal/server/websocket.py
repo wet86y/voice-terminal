@@ -51,12 +51,11 @@ from ..shadow_agent.component import ShadowAgentSession
 from ..shadow_agent.events import ShadowEventBuffer
 from ..shadow_agent.prompts import load_shadow_instructions
 from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
-from ..shadow_agent.tools import AmbientContextTools, ShadowToolExecutor
+from ..shadow_agent.tools import ShadowToolExecutor
 from ..shadow_agent.durable_mailbox import DurableVoiceMailbox
 from ..continuity import ContinuityManager
 from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
-from ..session.ambient import AmbientTranscriptStore
 from ..speaker.client import SpeakerWorkerClient
 from ..speaker.registry import SpeakerProfileStore
 from ..speaker.router import SpeakerRouter
@@ -207,7 +206,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
         profile_root = self.paths.speaker if self.paths.separated else config.persona.directory.resolve().parent / "speaker"
-        self.ambient_store = AmbientTranscriptStore()
         self.speaker_profile = SpeakerProfileStore(profile_root / config.speaker.model_id, model_id=config.speaker.model_id)
         self.speaker_router = SpeakerRouter(
             self.speaker_profile,
@@ -768,7 +766,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             speaker_mode=(self.config.speaker.mode if self.speaker_profile.available else "observe" if self.config.speaker.mode != "off" else "off"),
             speaker_config=self.config.speaker,
             owner_only_barge_in=self.config.speaker.owner_only_barge_in and self.speaker_profile.available,
-            ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
         self.configure_dsh_approvals()
@@ -798,7 +795,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                         self.state.set_service("web_search", "DISABLED")
                     files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
                     executor = ShadowToolExecutor(files, self.shadow_search_tools,
-                                                   AmbientContextTools(self.ambient_store),
                                                    soft_yield_ms=shadow_cfg.tools.soft_yield_ms,
                                                    on_status=self._on_shadow_tool_status)
                     provider = DeepSeekResponsesShadowProvider(
@@ -1798,9 +1794,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             # The ordered conversation starts over with the session; clients
             # adopt this snapshot instead of merging across the boundary.
             await self.publish_conversation_snapshot()
-            ambient_store = getattr(self, "ambient_store", None)
-            if ambient_store is not None:
-                ambient_store.clear()
             product_settings = getattr(self, "product_settings", None)
             if product_settings is not None:
                 shadow_user_profile = product_settings.read_persona().get("user", "")

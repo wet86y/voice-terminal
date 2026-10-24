@@ -13,7 +13,6 @@ from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.turn_workspace import TurnWorkspace
 from voice_terminal.core.state import RuntimeState
-from voice_terminal.session.ambient import AmbientTranscriptStore
 from voice_terminal.speaker.contracts import SpeakerObservation, SpeakerState
 from voice_terminal.speaker.router import SpeakerRouter
 from voice_terminal.config import SpeakerConfig
@@ -65,7 +64,6 @@ def make_controller(score, *, mode="filter", finished=True, connected=True):
         observe=AsyncMock(), discard_speaker_vetoed_input=Mock(), episode_id="conversation",
     )
     controller.episode_history = {}
-    controller.ambient_store = AmbientTranscriptStore()
     controller._publish = AsyncMock()
     controller._cancel_tts_prewarm = AsyncMock()
     controller._retire_committed_input = AsyncMock()
@@ -111,6 +109,20 @@ def test_refinement_cannot_bypass_unadmitted_input():
     async def run():
         c,ws=make_controller(None)
         await c._refinement_completed(ws,{"text":"尚未放行的精修"})
+        c.episode.observe.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_blocked_refinement_stays_out_of_conversation_without_environment_store():
+    async def run():
+        c, ws = make_controller(.2)
+        ws.speaker_blocked = True
+        ws.speaker_summary = {"admitted": False}
+        await c._refinement_completed(ws, {"text": "被拦截轮次的迟到精修"})
+        assert ws.raw_refined_text == "被拦截轮次的迟到精修"
+        assert not ws.refinement_available
+        assert not ws.transcript_updates
+        c._publish.assert_not_awaited()
         c.episode.observe.assert_not_awaited()
     asyncio.run(run())
 

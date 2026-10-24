@@ -110,6 +110,19 @@ class ProductApiTests(unittest.TestCase):
             assert (await self._request("POST", path, json=body, headers=headers)).status_code == 409
         asyncio.run(scenario())
 
+    def test_retired_environment_transcript_endpoints_are_unavailable(self) -> None:
+        """已下线的环境转写入口不再暴露记录或清空能力。"""
+        async def scenario():
+            for method, path in (
+                ("GET", "/api/v1/ambient-context"),
+                ("DELETE", "/api/v1/ambient-context"),
+                ("POST", "/api/internal/dsh-bridge/shadow.ambient.read"),
+            ):
+                with self.subTest(method=method, path=path):
+                    response = await self._request(method, path)
+                    self.assertEqual(response.status_code, 404)
+        asyncio.run(scenario())
+
     def test_speaker_capture_commit_and_reload_keep_three_templates_without_raw_audio(self) -> None:
         """声纹完整接口链路：替代硬件采样和推理，实际提交、存储并重新加载资料。"""
         from types import SimpleNamespace

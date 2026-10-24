@@ -154,7 +154,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const speakerStatus = ref<Record<string, unknown>>({})
   const speakerProfile = ref<Record<string, unknown>>({})
   const speakerTestResult = ref<Record<string, unknown> | null>(null)
-  const ambientContext = ref<Record<string, unknown>>({ records: [] })
   const speakerEnrollment = ref<{
     id: string
     segments: number[]
@@ -642,13 +641,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (!application.businessReady.value) return
     const revision = ++speakerStatusRevision
     try {
-      const [status, profile, ambient] = await Promise.all([
-        productApi.speakerStatus(), productApi.speakerProfile(), productApi.ambientContext(),
+      const [status, profile] = await Promise.all([
+        productApi.speakerStatus(), productApi.speakerProfile(),
       ])
       if (adapterDisposed) return
       if (revision === speakerStatusRevision) speakerStatus.value = status
       speakerProfile.value = profile
-      ambientContext.value = ambient
     } catch (error) {
       // The sidecar is optional; do not make the main product snapshot fail.
       if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
@@ -878,14 +876,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       speakerTestResult.value = result
       setNotice('现场声纹测试已完成。')
     } catch (error) { setError(error) }
-  }
-
-  async function refreshAmbientContext() {
-    try { ambientContext.value = await productApi.ambientContext() } catch (error) { setError(error) }
-  }
-
-  async function clearAmbientContext() {
-    try { ambientContext.value = await productApi.clearAmbientContext(); setNotice('环境记录已清空。') } catch (error) { setError(error) }
   }
 
   async function refreshRegistry() {
@@ -1624,7 +1614,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     speakerStatus,
     speakerProfile,
     speakerTestResult,
-    ambientContext,
     speakerEnrollment,
     providerForm,
     providerStep,
@@ -1682,8 +1671,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     captureSpeakerEnrollmentSegment,
     captureSpeakerTest,
     stopSpeakerCapture: productApi.stopSpeakerCapture,
-    refreshAmbientContext,
-    clearAmbientContext,
     scanModels,
     discoverProvider,
     verifyCustomModel,

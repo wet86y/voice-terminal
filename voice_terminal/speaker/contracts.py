@@ -57,7 +57,7 @@ class SpeakerDecision:
     speech_ms: int
     observation_count: int
     continuity_source: str | None
-    route: str
+    route: str  # route（准入路由）：main（主输入）、blocked（拦截）或 pending（待判）。
     reason: str
     degraded: bool = False
     anti_spoofing: str = "unavailable"

@@ -113,8 +113,8 @@ def _committed_controller():
 
     controller = object.__new__(EpisodeController)
     controller.state = SimpleNamespace(listening=True, current=SimpleNamespace(update=lambda **_kw: None))
-    controller.ambient_store = None
     controller.episode_history = {}
+    controller.speaker_policy = SimpleNamespace(turns={})  # speaker_policy（声纹策略）：此夹具未启用声纹筛选。
     controller.wake_enabled = True
     controller.wake_keyword = "七三"
     controller.wake_keywords = ("七三", "你好七三", "七三同学")

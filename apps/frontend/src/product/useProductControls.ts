@@ -152,7 +152,6 @@ export function useProductControls() {
     speakerStatus,
     speakerProfile,
     speakerTestResult,
-    ambientContext,
     speakerEnrollment,
     saveSpeaker,
     saveSpeakerControls,
@@ -166,8 +165,6 @@ export function useProductControls() {
     testSpeakerAudio,
     captureSpeakerEnrollmentSegment,
     captureSpeakerTest,
-    refreshAmbientContext,
-    clearAmbientContext,
   } = adapter;
   const computeModelRows = [
     {
@@ -1004,14 +1001,6 @@ export function useProductControls() {
         >)
       : [];
   });
-  const ambientRecords = computed(() => {
-    const records = ambientContext.value.records;
-    return Array.isArray(records)
-      ? (records.filter((item) => item && typeof item === "object") as Array<
-          Record<string, unknown>
-        >)
-      : [];
-  });
   const speakerHasProfile = computed(
     () =>
       speakerProfile.value.available === true ||
@@ -1751,8 +1740,6 @@ export function useProductControls() {
     cancelSpeakerEnrollment,
     deleteSpeakerTemplate,
     setSpeakerTemplateCentroid,
-    refreshAmbientContext,
-    clearAmbientContext,
     computeModelRows,
     formatComputeBytes,
     deviceLabel,
@@ -1809,7 +1796,6 @@ export function useProductControls() {
     speakerServiceLabel,
     speakerRollingSummary,
     speakerTemplates,
-    ambientRecords,
     speakerHasProfile,
     speakerNeedsReenrollment,
     speakerStaleReason,

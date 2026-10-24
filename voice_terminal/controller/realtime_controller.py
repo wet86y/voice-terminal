@@ -29,7 +29,6 @@ from ..speaker.session import SessionSpeakerPolicy
 from ..speaker.audit import audit as speaker_audit, transcript_audit
 from ..config import SpeakerConfig
 from ..speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
-from ..session.ambient import AmbientTranscriptStore
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +56,6 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         for legacy_key in ("speaker_wait_ms", "speaker_window_ms", "speaker_min_speech_ms",
                            "speaker_min_turn_speech_ms", "speaker_min_window_speech_ratio"):
             kwargs.pop(legacy_key, None)
-        self.ambient_store: AmbientTranscriptStore | None = kwargs.pop("ambient_store", None)
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)

@@ -2543,7 +2543,6 @@ time {
 }
 .speaker-status-card,
 .speaker-enrollment-card,
-.speaker-ambient-card,
 .compute-resource-card,
 .compute-model-card {
   border: 1px solid var(--line);
@@ -2662,8 +2661,7 @@ time {
   background: #efa0b108;
 }
 .speaker-segment-list,
-.speaker-template-list,
-.speaker-ambient-list {
+.speaker-template-list {
   display: grid;
   gap: 10px;
   margin-top: 18px;
@@ -2782,21 +2780,6 @@ time {
 }
 .speaker-template-state.active {
   color: var(--mint);
-}
-.speaker-ambient-row {
-  display: flex;
-  gap: 12px;
-  padding: 12px;
-  background: #ffffff02;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 10px;
-}
-.speaker-ambient-row small {
-  display: block;
-  font-size: 10px;
 }
 .speaker-template-actions {
   display: flex;

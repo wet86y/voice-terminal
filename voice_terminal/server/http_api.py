@@ -454,22 +454,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/api/internal/dsh-bridge/shadow.ambient.read")
-    async def dsh_shadow_ambient_read(request: Request) -> JSONResponse:
-        payload, _session = await dsh_callback_body(request)
-        limit = payload.get("limit")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
-            raise HTTPException(status_code=422, detail="invalid limit")
-        return JSONResponse(
-            {
-                "protocol_version": BRIDGE_PROTOCOL_VERSION,
-                "result": "accepted",
-                "source": "ambient_untrusted",
-                **runtime.ambient_store.snapshot(limit),
-            },
-            headers={"Cache-Control": "no-store"},
-        )
-
     def authorize_dsh_plugin(request: Request) -> None:
         remote = request.client.host if request.client is not None else None
         if not runtime.dsh.bridge_hub.authorize(request.headers.get("authorization"), remote):
@@ -1516,15 +1500,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 detail={"code": exc.code, "message": str(exc)}) from exc
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    @app.get("/api/v1/ambient-context")
-    async def get_ambient_context(limit: int = 20) -> dict[str, Any]:
-        return runtime.ambient_store.snapshot(limit)
-
-    @app.delete("/api/v1/ambient-context")
-    async def clear_ambient_context() -> dict[str, Any]:
-        runtime.ambient_store.clear()
-        return runtime.ambient_store.snapshot()
 
     @app.get("/api/v1/models/registry")
     async def get_model_registry() -> dict[str, Any]:
