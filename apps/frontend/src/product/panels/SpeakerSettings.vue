@@ -214,13 +214,19 @@ async function toggleRecording() {
       </div>
       <template #actions><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerEnrollment">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">保存声纹</button></template>
     </SpeakerRecordingFlow>
-    <div v-else-if="speakerTemplates.length" class="speaker-template-list">
-      <article v-for="template in speakerTemplates" :key="String(template.template_id)" class="speaker-template-row">
-        <div class="speaker-template-copy"><strong :title="String(template.label || '自定义')">{{ String(template.label || '自定义') }}</strong><time>{{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</time></div>
-        <span class="speaker-template-state" :class="{ active: template.include_in_centroid !== false }">{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span>
-        <div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="outline-button danger-action speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></div>
-      </article>
-    </div>
+    <details v-else-if="speakerTemplates.length" class="speaker-template-details">
+      <summary class="speaker-template-summary">
+        <span>已保存的语音段落</span>
+        <span class="speaker-template-count">共 {{ speakerTemplates.length }} 段</span>
+      </summary>
+      <div class="speaker-template-list">
+        <article v-for="template in speakerTemplates" :key="String(template.template_id)" class="speaker-template-row">
+          <div class="speaker-template-copy"><strong :title="String(template.label || '自定义')">{{ String(template.label || '自定义') }}</strong><time>{{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</time></div>
+          <span class="speaker-template-state" :class="{ active: template.include_in_centroid !== false }">{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span>
+          <div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="outline-button danger-action speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></div>
+        </article>
+      </div>
+    </details>
     <div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div>
   </section>
 
@@ -280,3 +286,47 @@ async function toggleRecording() {
     </button>
   </footer>
 </template>
+
+<style scoped>
+/* speaker-template-details（已保存段落折叠区）：默认收起，保留原生键盘展开操作。 */
+.speaker-template-details {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.speaker-template-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0 0;
+  list-style: none;
+  color: var(--text);
+  font-size: var(--font-body);
+  cursor: pointer;
+}
+.speaker-template-summary::-webkit-details-marker { display: none; }
+.speaker-template-summary::after {
+  content: '';
+  width: 7px;
+  height: 7px;
+  margin: 0 3px 4px 0;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  flex: none;
+}
+.speaker-template-details[open] > .speaker-template-summary::after {
+  margin-bottom: -4px;
+  transform: rotate(225deg);
+}
+.speaker-template-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+.speaker-template-count {
+  margin-left: auto;
+  color: var(--subtle);
+  font-size: var(--font-caption);
+  white-space: nowrap;
+}
+</style>
