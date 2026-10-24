@@ -424,7 +424,7 @@ async def test_business_commit_keeps_previously_admitted_refinement():
     ws._published_refinement = ("paraformer_offline", 1, "一")
     ws.transcript_updates = [{"kind": "asr_final", "text": "甲乙"},
                              {"kind": "refinement", "text": "一"}]
-    controller.speaker_policy = SimpleNamespace(pieces=[
+    controller.speaker_policy = SimpleNamespace(turns={}, settings_revision=0, pieces=[
         SimpleNamespace(turn_id="voice", status="admitted"),
         SimpleNamespace(turn_id="voice", status="rejected")],
         admitted_text=lambda _: "甲", fully_admitted=lambda _: False)
@@ -436,10 +436,13 @@ async def test_business_commit_keeps_previously_admitted_refinement():
     controller.episode_history = {}
     controller._commit_input_workspace = AsyncMock()
     controller._retire_committed_input = AsyncMock()
+    controller._publish = AsyncMock()
     assert await controller._input_committed(ws, ws.token)
     assert ws.final_text == "甲" and ws.refined_text == "一" and ws.refinement_available
     assert [row["text"] for row in ws.transcript_updates if row["kind"] == "refinement"] == ["一"]
     assert all(row["text"] != "甲乙" for row in ws.transcript_updates)
+    finals = [call.args[0] for call in controller._publish.call_args_list if call.args[0].type == "transcript.final"]
+    assert len(finals) == 1 and finals[0].payload["text"] == "甲"
 
 
 def test_ended_session_releases_workspace_even_with_pending_native_result():

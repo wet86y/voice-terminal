@@ -17,7 +17,7 @@ from ..session.contracts import DeliveryReport
 from ..session.conversation_log import USER_TURN, speech_kind
 from ..speaker.rolling import RollingSpeakerIdentity
 from ..speaker.contracts import SpeakerState
-from ..speaker.turn_admission import FIRST_AUDIO_MS
+from ..speaker.turn_admission import FIRST_AUDIO_MS, FIRST_DECISION_MAX_MS
 from ..speaker.audit import audit as speaker_audit, transcript_audit
 
 
@@ -214,36 +214,94 @@ class EpisodeController(RealtimeController):
                 self._schedule_segment_refinements(ws)
 
     async def _refresh_turn_speaker_summary(self, ws) -> None:
-        summary = self.speaker_policy.turn_summary(ws.turn_id)
-        if not summary or ws.speaker_summary == summary:
+        if self.workspace is not ws:
             return
+        turn = self.speaker_policy.turns.get(ws.turn_id)
+        if turn is not None and not turn.first_pending:
+            handle = getattr(ws, "_speaker_first_deadline_handle", None)
+            if handle is not None:
+                handle.cancel()
+                ws._speaker_first_deadline_handle = None
+        summary = self.speaker_policy.turn_summary(ws.turn_id)
+        if not summary:
+            return
+        unchanged = ws.speaker_summary == summary
         ws.speaker_summary, ws.admission_phase = summary, summary["admission_phase"]
+        self.state.current.update(admission_phase=ws.admission_phase, speaker_summary=summary)
+        if unchanged:
+            return  # 重试结束仍是相同待判状态，只同步本地阶段，不重复推送界面事件。
         inputs = getattr(self.episode, "inputs", {})
         if ws.turn_id in inputs:
             inputs[ws.turn_id]["speaker_summary"] = dict(summary)
-        self.state.current.update(admission_phase=ws.admission_phase, speaker_summary=summary)
         await self._publish(event("speaker.admission", ws.turn_id, admission_phase=ws.admission_phase,
                                   speaker_summary=summary, settings_revision=self.speaker_policy.settings_revision))
 
+    def _prime_speaker_turn_audio(self, ws, frame) -> None:
+        super()._prime_speaker_turn_audio(ws, frame)
+        self._arm_first_speaker_deadline(ws)
+
+    def _arm_first_speaker_deadline(self, ws) -> None:
+        """独立截止计时；没有新音频或推理在途也不能超过四秒后继续待判。"""
+        turn = self.speaker_policy.turns.get(ws.turn_id)
+        if turn is None or not turn.first_pending or getattr(ws, "_speaker_first_deadline_handle", None) is not None:
+            return
+        activation = self.speaker_policy.activation_id
+
+        def expire():
+            ws._speaker_first_deadline_handle = None
+            if (self.workspace is not ws or turn is not self.speaker_policy.turns.get(ws.turn_id)
+                    or activation != self.speaker_policy.activation_id or not turn.first_pending):
+                return
+            self._hold_first_speaker_unknown(ws, "first_identity_timeout")
+
+        delay = ws.started_at + FIRST_DECISION_MAX_MS / 1000 - time.monotonic()
+        # _speaker_first_deadline_handle（本轮首段身份截止计时器）不随续说或设置重算延期。
+        ws._speaker_first_deadline_handle = asyncio.get_running_loop().call_later(max(0, delay), expire)
+
+    def _hold_first_speaker_unknown(self, ws, reason: str) -> None:
+        """同步收紧准入，再异步发布一次状态；不生成空转写事件。"""
+        turn = self.speaker_policy.turns.get(ws.turn_id)
+        if turn is None or not turn.first_pending:
+            return
+        turn.hold_unknown(reason)
+        speaker_audit("admission_changed（未确认身份执行拦截）", turn_id=ws.turn_id,
+                      settings_revision=self.speaker_policy.settings_revision, **turn.summary())
+        self._track(asyncio.create_task(self._refresh_turn_speaker_summary(ws)))
+
     def _ensure_first_speaker_decision(self, ws, *, force=False, sequence=0):
-        """挂在现有心跳；短句闭段可提前启动，整个推理不阻塞采集。"""
+        """首窗1.2秒；未知时按新增音频增长重试，闭段或开口四秒时停止等待。"""
         turn = getattr(self.speaker_policy, "turns", {}).get(ws.turn_id)
         if turn is None or not turn.first_pending:
+            return None
+        self._arm_first_speaker_deadline(ws)
+        if force:
+            ws._speaker_first_final_requested = True  # 闭段要求；在途首窗之后仍可补查新增尾音。
+        remaining = ws.started_at + FIRST_DECISION_MAX_MS / 1000 - time.monotonic()
+        if remaining <= 0:
+            self._hold_first_speaker_unknown(ws, "first_identity_timeout")
             return None
         task = getattr(ws, "_speaker_first_task", None)
         if task is not None and not task.done():
             return task
         start = turn.start_sample
-        end = min(ws.audio.end_sample, start + FIRST_AUDIO_MS * 16)
+        limit_ms = FIRST_AUDIO_MS if turn.last_end < start and not force else FIRST_DECISION_MAX_MS
+        end = min(ws.audio.end_sample, start + limit_ms * 16)
         if not force and end-start < FIRST_AUDIO_MS*16:
             return None
+        revision = self.speaker_policy.settings_revision
+        attempt = (end, revision)  # 本次音频末端和设置版本；没有新证据不重复推理。
+        if attempt == getattr(ws, "_speaker_first_attempt", None):
+            if force:
+                self._hold_first_speaker_unknown(ws, "first_identity_unresolved_at_end")
+            return None
+        ws._speaker_first_attempt = attempt
         origin = ws.audio.start_sample
         pcm = (bytes(ws.audio.pcm[max(0, start-origin)*2:max(0, end-origin)*2:])
                if origin is not None and origin <= start else b"")
         activation = self.speaker_policy.activation_id
-        revision = self.speaker_policy.settings_revision
         sensor = self.speaker_sensor
         speech_ms = sensor.speech_ms(start, end) if sensor is not None else 0
+        new_speech_ms = sensor.speech_ms(max(start, turn.last_end), end) if sensor is not None else 0
         turn.phase = "inferring"
         ws.admission_phase = turn.phase
         self.state.current["admission_phase"] = turn.phase
@@ -258,32 +316,44 @@ class EpisodeController(RealtimeController):
             vector, quality = (), "insufficient_audio"
             try:
                 if pcm:
-                    vector = await self.speaker_client.embed_pcm(pcm)
+                    async with asyncio.timeout(max(0, ws.started_at + FIRST_DECISION_MAX_MS / 1000 - time.monotonic())):
+                        vector = await self.speaker_client.embed_pcm(pcm)
                     quality = "ready"
             except Exception as exc:
                 quality = getattr(exc, "quality", None) or "unavailable"
                 speaker_audit("first_inference_failed（首段推理异常）", turn_id=ws.turn_id,
                               settings_revision=revision, reason=f"{type(exc).__name__}: {str(exc)[:240]}")
             completed = time.monotonic()
+            ws.timings["speaker_inference_completed"] = completed
             if turn.closed or turn is not self.speaker_policy.turns.get(ws.turn_id) or activation != self.speaker_policy.activation_id:
                 speaker_audit("result_discarded（过期结果）", turn_id=ws.turn_id, reason="turn_closed_or_activation_changed")
                 return
+            if completed >= ws.started_at + FIRST_DECISION_MAX_MS / 1000:
+                self._hold_first_speaker_unknown(ws, "first_identity_timeout")
             if revision != self.speaker_policy.settings_revision:
-                turn.phase = "collecting"
+                if turn.first_pending:
+                    turn.phase = "collecting"
                 speaker_audit("result_discarded（过期设置结果）", turn_id=ws.turn_id,
                               settings_revision=revision, reason="settings_changed")
                 return
-            ws.timings["speaker_inference_completed"] = completed
+            if not turn.first_pending:
+                speaker_audit("result_discarded（首段等待结束后的结果）", turn_id=ws.turn_id,
+                              reason="first_decision_finished")
+                return
             elapsed = (completed-started)*1000
             if elapsed > 100:
                 self.speaker_policy.timeout_count += 1
                 speaker_audit("inference_late（软预算迟到仍消费）", turn_id=ws.turn_id, latency_ms=elapsed)
             self.speaker_policy.observe_turn(ws.turn_id, vector, start=start, end=end,
-                speech_ms=speech_ms, first=True, quality=quality, sequence=sequence, latency_ms=elapsed)
+                speech_ms=new_speech_ms, first=True, quality=quality, sequence=sequence, latency_ms=elapsed,
+                window_speech_ms=speech_ms, first_final=bool(getattr(ws, "_speaker_first_final_requested", False)
+                    and end >= min(ws.audio.end_sample, start + FIRST_DECISION_MAX_MS * 16)))
             if turn.admitted:
                 ws.timings.setdefault("speaker_admitted", completed)
             await self._refresh_turn_speaker_summary(ws)
             await self._flush_speaker_admissions()
+            if self.workspace is ws and not ws.committed:
+                await self._publish_partial_transcript(ws)
         task = asyncio.create_task(infer(), name=f"speaker-first-{ws.turn_id}")
         ws._speaker_first_task = task
         self._track(task)
@@ -436,6 +506,8 @@ class EpisodeController(RealtimeController):
                 else RollingSpeakerIdentity.UNKNOWN),
                 score=turn_admission.scores.get("combined_score"), reason=turn_admission.reason)
             await self._flush_speaker_admissions()
+            if self.workspace is ws and not ws.committed:
+                await self._publish_partial_transcript(ws)
         elif snapshot.embedding:
             identity_key = turn_id or f"barge-{barge_id}" if owner_candidate else turn_id or "idle"
             state = self.speaker_policy.observe(snapshot.embedding,
@@ -1081,7 +1153,7 @@ class EpisodeController(RealtimeController):
             await self._flush_speaker_admissions()
             if ws.token != token or self.workspace is not ws:
                 return True
-        if mode == "filter" and getattr(self, "hotwords", None) is not None:
+        if mode == "filter" and ws.final_text and getattr(self, "hotwords", None) is not None:
             ws.raw_final_text = ws.final_text
             correction = await self.hotwords.finalized(ws.final_text, ws.token)
             if ws.token != token or self.workspace is not ws:
@@ -1089,6 +1161,7 @@ class EpisodeController(RealtimeController):
             ws.final_text = correction["text"]
             ws.hotword_final = correction
             ws.segments = [{"text": ws.final_text, "raw_text": ws.raw_final_text, "hotword_matches": correction["matches"]}] if ws.final_text else []
+        if mode == "filter" and ws.final_text:
             self.state.current.update(final_text=ws.final_text)
             await self._detail("transcript.final", text=ws.final_text, raw_text=ws.raw_final_text, source="paraformer")
         ws.speaker_blocked = not bool(ws.final_text)
@@ -1497,6 +1570,10 @@ class EpisodeController(RealtimeController):
     async def _cancel_turn(self, *, reason="stopped", snapshot=None, record=True):
         if self.workspace is not None and hasattr(self, "speaker_policy"):
             ws = self.workspace
+            handle = getattr(ws, "_speaker_first_deadline_handle", None)
+            if handle is not None:
+                handle.cancel()
+                ws._speaker_first_deadline_handle = None
             hard_boundary = getattr(ws, "hard_closed", False) and reason == "interrupted" and ws.turn_id in self.speaker_policy.turns
             self.speaker_policy.close_turn(ws.turn_id, completed=reason == "completed" or hard_boundary, reason=reason)
         # Input cleanup never blocks/cancels the independently owned output.

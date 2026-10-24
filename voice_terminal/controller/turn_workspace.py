@@ -109,6 +109,8 @@ class TurnWorkspace:
     speaker_routing_finalized: bool = False  # speaker_routing_finalized（本段声纹路由已结算）。
     admission_phase: str = ""  # 本轮准入阶段，非拦截模式为空。
     speaker_summary: dict = field(default_factory=dict)  # 与原话分开的声纹语义摘要。
+    published_transcripts: dict[str, tuple] = field(default_factory=dict)  # 已发布正文及来源，用于显示事件去重。
+    published_partial_text: str = ""  # 最近已展示的原始部分转写，避免声纹心跳覆盖热词修订或重复刷新。
     # Capture the routing mode at turn start.  Product mode changes can then
     # take effect on the next speech segment without rewriting a turn that is
     # already being finalized.
@@ -148,16 +150,31 @@ class TurnWorkspace:
         self.speaker_degraded_reason = ""
         self.speaker_blocked = False
         self.speaker_routing_finalized = False
+        self._speaker_first_final_requested = False  # 同轮恢复讲话，撤销此前闭段的末次检查要求。
+        self.published_transcripts.clear()
+        self.published_partial_text = ""
+
+    @property
+    def transcript_visible(self) -> bool:
+        """原文保留在工作区；未通过声纹准入的正文不进入界面快照。"""
+        if self.speaker_mode != "filter":
+            return True
+        if self.speaker_summary:
+            return bool(self.speaker_summary.get("admitted"))
+        return (self.speaker_decision.get("route") == "main"
+                or (self.speaker_routing_finalized and not self.speaker_blocked))
 
     def snapshot(self) -> dict:
+        visible = self.transcript_visible
         return {
             "conversation_id": self.episode_id, "turn_id": self.turn_id, "output_generation": self.generation,
             "phase": self.phase,
             "committed": self.committed, "agent_phase": self.agent_phase,
-            "paraformer_final": self.paraformer_final, "refined_text": self.refined_text,
+            "paraformer_final": self.paraformer_final if visible else "",
+            "refined_text": self.refined_text if visible else "",
             "admission_phase": self.admission_phase, "speaker_summary": dict(self.speaker_summary),
-            "refinement_available": self.refinement_available,
-            "transcript_updates": [dict(item) for item in self.transcript_updates],
+            "refinement_available": self.refinement_available if visible else False,
+            "transcript_updates": [dict(item) for item in self.transcript_updates] if visible else [],
             "tts_prewarm_started": self.tts_prewarm_started,
             "tts_prewarm_status": self.tts_prewarm_status,
             "speaker_decision": dict(self.speaker_decision),
@@ -166,7 +183,7 @@ class TurnWorkspace:
             "speaker_degraded_reason": self.speaker_degraded_reason,
             "speaker_blocked": self.speaker_blocked,
             "speaker_mode": self.speaker_mode,
-            "segments": list(self.segments),
+            "segments": list(self.segments) if visible else [],
             "tools": list(self.tools), "audio_cues": list(self.audio_cues),
             "analysis": dict(self.analysis),
             "tts_segments": [dict(item) for item in self.tts_segments],

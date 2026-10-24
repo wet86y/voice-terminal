@@ -7,6 +7,7 @@ import math
 from .contracts import SpeakerState
 
 FIRST_AUDIO_MS = 1200  # 首段积累时长，复用三个400毫秒心跳时隙。
+FIRST_DECISION_MAX_MS = 4000  # 从实际开口起计算的首段身份等待上限，包含推理耗时。
 OWNER_RECOVERY_TICKS = 3  # 首段非主人后的连续明确主人结果次数。
 
 
@@ -21,7 +22,7 @@ class TurnAdmission:
     boundary_revision: int = 0  # 候选闭段版本，续说撤销时递增。
     boundary_at: float | None = None  # 最终成立候选所对应的实际语音终点。
     boundary_reason: str = ""  # SmartTurn或兜底结束原因。
-    phase: str = "collecting"  # 积累、推理、暂缓、放宽、未确认放行、结束。
+    phase: str = "collecting"  # 积累、推理、暂缓、放宽、结束。
     initial_identity: str = "unknown"  # 首段原始身份结论。
     admitted: bool = False  # 本轮获准后不可撤销。
     owner_confirmed: bool = False  # 本轮曾有明确主人证据。
@@ -50,7 +51,15 @@ class TurnAdmission:
             return SpeakerState.NON_OWNER_CONFIRMED
         return self.observation_state
 
-    def observe(self, scores: dict, config, *, end: int, first: bool = False) -> bool:
+    def hold_unknown(self, reason: str) -> None:
+        """身份仍未知，但普通输入按拦截分支处理，后续允许正常主人证据恢复。"""
+        if self.first_pending:
+            self.phase, self.reason = "held", reason
+            self.positive_ticks = self.negative_ticks = 0
+
+    def observe(self, scores: dict, config, *, end: int, first: bool = False,
+                first_final: bool = False) -> bool:
+        """first_final（闭段末次检查）为真时，不再等待未知结果的新增音频。"""
         if self.closed or (not first and end <= self.last_end):
             return False
         self.last_end = max(self.last_end, end)
@@ -72,8 +81,11 @@ class TurnAdmission:
                 self.observation_state = SpeakerState.NON_OWNER_CONFIRMED
                 self.phase, self.reason = "held", "first_non_owner_held"
             else:
-                self.admitted = True
-                self.phase, self.reason = "unconfirmed", "first_identity_uncertain"
+                self.phase, self.reason = "collecting", "first_identity_uncertain"
+                if end - self.start_sample >= FIRST_DECISION_MAX_MS * 16:
+                    self.hold_unknown("first_identity_timeout")
+                elif first_final:
+                    self.hold_unknown("first_identity_unresolved_at_end")
         elif valid:
             # 待恢复仍用正常阈值；已有主人证据后，放宽量实际参与当前身份观察。
             threshold = scores["threshold_used"]

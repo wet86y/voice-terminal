@@ -130,7 +130,7 @@ def test_unknown_or_timeout_preserves_original_qualification_without_renewing(sc
     previous_owner(p)
     turn = p.begin_turn("b", start_sample=32000, started_at=4)
     sample(p, "b", score, quality=quality)
-    assert turn.admitted and not turn.owner_confirmed
+    assert turn.first_pending and not turn.admitted and not turn.owner_confirmed
     finish(p, "b", 6)
     assert p.continuity.normal_end_at == 2 and not p.continuity.continuing
     assert not p.begin_turn("c", start_sample=64000, started_at=7.1).continuity_grant
