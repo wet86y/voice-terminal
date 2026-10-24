@@ -139,7 +139,7 @@ DSH 固定监听 `127.0.0.1:3081`。Voice Server 每次启动生成独立 Bridge
 只允许投递当前未退役主线。`publish_voice_event`（投递语音事件工具）通过桥接鉴权、事件标识去重和
 退役会话校验，但不要求预先建立 Voice activation（语音激活）或匹配上下文版本。
 
-Voice 模型仍只发送无正文的 `request_shadow({"request": true})`。Voice Terminal 是唯一权威上下文
+Voice 模型向后台仍只发送无正文的 `request_shadow({"request": true})`（固定后台唤醒）；本地 `continue_listening`（继续倾听）不发送到后台。Voice Terminal 是唯一权威上下文
 源；Bundle 先强制注入带来源、epoch、revision 的完整 snapshot/连续 update，再唤醒根 Agent。
 DSH 已经处于运行/推理状态时，后续 `request_shadow` 只同步 Voice 的最新权威上下文，不会创建第二个
 activation、打断模型或取消工具。下一个 `next-step` 安全点之前，连续 delta 会按 revision 合并为一条

@@ -172,7 +172,7 @@ async def test_acoustic_mailbox_is_consumed_without_shadow_and_emotion_never_wak
     await wait_for_calls(provider, 1)
     state = request_snapshot(provider.messages[-1])
     assert state["runtime"]["voice_emotion"] == "平静"
-    assert state["runtime"]["acoustic_events"] == [{"labels": ["Dog"], "start_ms": 0, "end_ms": 975}]
+    assert [row["payload"] for row in state["runtime"]["secondary_items"] if row["kind"] == "acoustic_observation"] == [{"labels": ["Dog"], "start_ms": 0, "end_ms": 975}]
     assert "progress" not in state.get("shadow", {})
     assert mailbox.snapshot() == []
     await _finish_blocking_request(runtime, provider)
@@ -464,7 +464,7 @@ async def test_normal_request_consumes_before_four_seconds_and_preserves_new_aud
     assert provider.calls == 0
     assert await runtime._start_dispatch({"USER_INPUT_FINALIZED"})
     await wait_for_calls(provider, 1)
-    assert request_snapshot(provider.messages[-1])["runtime"]["acoustic_events"][0]["labels"] == ["Dog"]
+    assert request_snapshot(provider.messages[-1])["runtime"]["secondary_items"][0]["payload"]["labels"] == ["Dog"]
     assert mailbox.snapshot() == []
     mailbox.append(["Bell"], 7680, 23280)
     await _finish_blocking_request(runtime, provider)

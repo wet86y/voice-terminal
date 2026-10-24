@@ -36,12 +36,12 @@ SPEECH_QUEUE_TASK = (
     "先根据本次用户表达判断自定义指令是否适用，适用时严格执行其完整内容；"
     "一般用户指令和某次触发效果只作用于原请求或任务，不因保留在历史里就限制后续判断。"
     "仍有效的明确持续要求按其范围保留，最新修正、撤销与恢复优先。\n"
-    "没有仍有效的暂缓或静默要求且没有活动队列时，按首次回答规则回应尚未回答的用户输入或仍必要的新信息；"
+    "没有仍有效的暂缓或静默要求且没有活动队列时，回应尚未回答的用户输入、仍必要的新信息，或按当前语境自然衔接对话；"
     "已有活动队列且计划已覆盖本次输入时，使用 wait（保持队列），让原播报继续。\n"
     "只有固定规则允许且确有实质理由时才修改队列。revision（尾巴修订）是在锁定边界后续写，"
     "speak.text（播报文本）只提交完整的新 editable_text（可改文本），直接接在 locked_text（锁定文本）后，"
     "保留旧尾巴所有仍有效的要点，不重新回答或重述锁定部分。"
-    "仅当确认已听内容严重错误且局部说明不足以纠正时，才 cancel（取消并替换）。\n"
+    "重点核对整轮末尾的修正与最终要求；锁定内容或回答前提与最新明确意图实质冲突时优先 cancel（取消并替换），不要求确认已听到严重错误。替换文本仅含必要更正及回答，不重复已传达的有效信息。\n"
     "用户主动追问且没有仍有效的暂缓或静默要求时依据已知事实回答，没有确认更新就如实说明。actions（后台动作列表）按路由独立判断。"
     "最终只输出 voice_decision_v06（语音决策结构）要求的 speak（语音决策）与 actions（动作列表）JSON（结构化输出）。"
 )
@@ -232,7 +232,8 @@ class LLMContextProjector:
         *, current: CurrentInput, speak_state: dict[str, Any],
         calendar_epoch: str | None = None, shadow: dict[str, Any] | None = None,
         tool_availability: dict[str, str] | None = None,
-        voice_emotion: str | None = None, acoustic_events: list[dict] | None = None,
+        voice_emotion: str | None = None, secondary_items: list[dict] | None = None,
+        listening_request: dict | None = None,
     ) -> str:
         """Create the only volatile model context block for one request."""
 
@@ -258,8 +259,10 @@ class LLMContextProjector:
             payload["runtime"]["calendar_epoch"] = calendar_epoch
         if voice_emotion:
             payload["runtime"]["voice_emotion"] = voice_emotion  # 语音情绪背景标签。
-        if acoustic_events:
-            payload["runtime"]["acoustic_events"] = acoustic_events  # 已冻结的待消费声学观察。
+        if secondary_items:
+            payload["runtime"]["secondary_items"] = secondary_items  # 本次冻结的通用二等条目。
+        if listening_request is not None:
+            payload["runtime"]["listening_request"] = dict(listening_request)  # 持续倾听余额及已注入状态。
         if shadow is not None:
             payload["shadow"] = {
                 "available": bool(shadow.get("available")),
@@ -272,16 +275,6 @@ class LLMContextProjector:
                     "text": str(information.get("text") or "")[:2000],
                     "source": str(information.get("source") or "agent"),
                 }
-            progress = shadow.get("progress")
-            if isinstance(progress, list):
-                values = [
-                    {"text": str(item["text"])[:2000 if item.get("source") == "observer" else 512], "source": item["source"]}
-                    for item in progress if isinstance(item, dict)
-                    and str(item.get("text") or "").strip()
-                    and item.get("source") in {"agent", "observer"}
-                ]
-                if values:
-                    payload["shadow"]["progress"] = values  # 进度列表，仅在本次请求尾部提供。
         if current.finalized:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:

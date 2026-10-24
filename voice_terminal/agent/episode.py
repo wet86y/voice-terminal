@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from collections import deque
 from contextlib import aclosing
 import json
@@ -23,6 +24,7 @@ from .prompts import (
     FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
 )
 from .options import AgentOptions
+from .listening import ListeningRequests
 from .context_audit import capture_context_snapshot, capture_request_outcome
 from .decision_envelope import (
     Action, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream,
@@ -178,6 +180,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.reasoning_mode = reasoning_mode  # reasoning_mode（运行模式）：后续请求使用的快速或深度选择。
         self.conversation = conversation
         self.ledger = ledger
+        self.listening = ListeningRequests(ledger.secondary_mailbox)
+        self._listening_by_identity: dict[tuple, dict] = {}  # 每次请求冻结的关注状态及作用域。
+        self._retry_listening_by_turn: dict[str, dict] = {}  # 原逻辑请求的关注快照。
         self.shadow_waker = shadow_waker
         self.on_final_system_check_settled = on_final_system_check_settled
         self.can_dispatch_final_silence = can_dispatch_final_silence
@@ -217,7 +222,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         }
         self._completed_speech_ids: set[str] = set()
         self.pending = set()
-        self._secondary_enqueued = 0  # 登记的实质进度变化数。
+        self._secondary_version_start = self.ledger.secondary_mailbox.version  # 本轮全来源登记计数起点。
         self._secondary_consumed_normal = 0  # 普通请求消费的来源数。
         self._secondary_consumed_check = 0  # 二等评估消费的来源数。
         self._secondary_cleared_final = 0  # 最终静默检查清理的来源数。
@@ -440,9 +445,11 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                   "scheduler": self.scheduler.snapshot(),
                   "secondary_mailbox": {  # 二等信箱诊断，不进入模型语义历史。
                       "pending_sources": sorted(self._secondary_pending),  # 待评估来源。
-                      "pending_count": len(self._secondary_pending),  # 待评估来源数。
-                      "latest_version": self.ledger._shadow_progress_version,  # 最新本地版本。
-                      "enqueued": self._secondary_enqueued,  # 已登记变化数。
+                      "pending_count": len(self._secondary_snapshot()),  # 待评估条目数。
+                      "latest_version": self.ledger.secondary_mailbox.version,  # 全部来源最新本地版本。
+                      "listening_request": {**self.listening.snapshot(), "injected": self.listening.injected,
+                                            "truncated": self.listening.truncated, "cleared": self.listening.cleared},
+                      "enqueued": self.ledger.secondary_mailbox.version - self._secondary_version_start,  # 全来源登记变化数。
                       "consumed_normal": self._secondary_consumed_normal,  # 普通请求消费数。
                       "consumed_check": self._secondary_consumed_check,  # 二等请求消费数。
                       "cleared_final": self._secondary_cleared_final,  # 最终静默清理数。
@@ -776,7 +783,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.state = "WAITING_EVENT"
         self.inputs.clear()
         self.ledger.clear_shadow_progress(reset_seen=True)
-        self._secondary_enqueued = 0
+        self._secondary_version_start = self.ledger.secondary_mailbox.version
         self._secondary_consumed_normal = 0
         self._secondary_consumed_check = 0
         self._secondary_cleared_final = 0
@@ -805,6 +812,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()
         self._retry_secondary_by_turn.clear()
+        self._retry_listening_by_turn.clear()
         self._retry_system_check = None
         self._heartbeat_generated = 0
         self._heartbeat_delivered = 0
@@ -973,13 +981,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         dispatch_epoch = context.get("user_speech_epoch")
         if dispatch_epoch is not None and int(dispatch_epoch) != self._user_speech_epoch:
             return "user_speech_started_after_dispatch"
-        progress_generation = context.get("shadow_progress_generation")
-        if progress_generation is not None and (
-            context.get("shadow_activation_id") != self.ledger.shadow_activation_id
-            or int(progress_generation) != self.ledger._shadow_progress_generation
-            or not self.ledger.shadow_active or not self.ledger.shadow_available
-        ):
-            return "shadow_activation_expired"  # 影子激活已结束或进度作用域已失效。
+        scopes = context.get("secondary_scopes", ())
+        if any(not self.ledger.secondary_mailbox.scope_valid(scope) for scope in scopes):
+            return "secondary_scope_expired"  # 只检查本次实际涉及的生产者作用域。
         return None
 
     def _system_check_is_stale(self, context) -> bool:
@@ -1178,6 +1182,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                                 if (source_turn or "") in self._retry_shadow_information_by_turn
                                 else None),
             secondary_context=self._retry_secondary_by_turn.get(source_turn or ""),
+            listening_context=deepcopy(self._listening_by_identity.get(identity)
+                                      or self._retry_listening_by_turn.get(source_turn or "")),
         )
         if getattr(self.provider, "transport", "chat_completions") == "responses":
             limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
@@ -1331,8 +1337,10 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
 
         self.invalidate_screen_capture()
         self.input_scope_closed = True
+        self.listening.close()
         self.ledger.clear_shadow_progress(reset_seen=True)
         self._retry_secondary_by_turn.clear()
+        # 原请求的无效倾听作用域保留至其结算，防止停止后才失败的旧请求借重试复活。
         self._discard_secondary_retry()
         self.recovery_queue.clear()
         if self.delay_task is not None and not self.delay_task.done():
@@ -1342,6 +1350,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         """Re-open dispatch for a session that starts listening again."""
 
         self.input_scope_closed = False
+        self.listening.open()
 
     async def _emit_turn_settled(self, identity, turn_id, outcome):
         """Tell the controller that a finalized turn ended without speech.
@@ -2103,6 +2112,11 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.agent_step_id = uuid4().hex
         self.state = "INVOKING"
         identity = self.identity()
+        if not recovery and "LLM_RETRY" not in kinds and prompt_kind != "final_silence":
+            self.listening.open()
+        self._listening_by_identity[identity] = {
+            "scope": self.listening.scope, "logical_id": identity[1],
+        }
         source_turn_id = (
             recovery_signal.source_turn_id if recovery_signal and recovery_signal.source_turn_id
             else self.last_turn_id
@@ -2139,9 +2153,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             dispatch_context["owner_scope"] = "system_check"
             dispatch_context["user_speech_epoch"] = self._user_speech_epoch
             dispatch_context["user_speaking_at_dispatch"] = self.user_speaking is True
-            if prompt_kind == "secondary_mailbox" and "acoustic_events" not in self._secondary_snapshot():
-                dispatch_context["shadow_activation_id"] = self.ledger.shadow_activation_id  # 进度所属激活。
-                dispatch_context["shadow_progress_generation"] = self.ledger._shadow_progress_generation  # 进度作用域代次。
+            if prompt_kind == "secondary_mailbox":
+                dispatch_context["secondary_scopes"] = sorted({
+                    row["scope"] for row in self._secondary_snapshot().values()})
             self._system_check_turn_ids.add(system_check_id)
             if prompt_kind == "final_silence":
                 self._final_system_checks[system_check_id] = dict(dispatch_context)
@@ -2249,6 +2263,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 system_check_id=system_check_id,
             )
             self._identity_turns.pop(identity, None)
+            self._listening_by_identity.pop(identity, None)
             if system_check_id:
                 self._system_check_turn_ids.discard(system_check_id)
                 self._final_system_checks.pop(system_check_id, None)
@@ -2261,6 +2276,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             return False
         if candidate is not None and self._meaningful_pending():
             self._identity_turns.pop(identity, None)
+            self._listening_by_identity.pop(identity, None)
             if system_check_id:
                 self._system_check_turn_ids.discard(system_check_id)
                 self._final_system_checks.pop(system_check_id, None)
@@ -2279,12 +2295,15 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             # 日志和界面回调会让出执行权，派发前必须再次确认讲话、信箱及最终期限。
             self._system_check_turn_ids.discard(system_check_id)
             self._identity_turns.pop(identity, None)
+            self._listening_by_identity.pop(identity, None)
             self.active_request_identity = None
             self.active_request_source_turn_id = None
             self.active_request_kinds = set()
             self.active_dispatch_context = None
             self.state = "WAITING_EVENT"
             return False
+        if prompt_kind == "final_silence":
+            self.listening.suspend()
         self.active_request = asyncio.create_task(
             self._step(identity, kinds, recovery=recovery,
                        recovery_signal=recovery_signal,
@@ -2313,6 +2332,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         signal.consumed = True
         if self._recovery_origin_prompt_kind(signal) == "secondary_mailbox" and self._system_check_is_stale(signal.dispatch_context):
             self._retry_secondary_by_turn.pop(signal.source_turn_id or "", None)
+            self._retry_listening_by_turn.pop(signal.source_turn_id or "", None)
             self._retry_shadow_information_by_turn.pop(signal.source_turn_id or "", None)
             self._system_check_turn_ids.discard(signal.system_check_id)
             await self.log("LLM_RECOVERY_SUPERSEDED", turn_id=signal.source_turn_id,
@@ -2483,12 +2503,12 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         if self.user_speaking is True:
             self._secondary_skipped_speaking += 1
             await self.log("SECONDARY_MAILBOX_SKIPPED", reason="user_speaking",
-                           window_index=current_window, pending_count=len(self._secondary_pending))
+                           window_index=current_window, pending_count=len(self._secondary_snapshot()))
             return
         if not self._dispatch_allowed():
             self._secondary_skipped_busy += 1
             await self.log("SECONDARY_MAILBOX_SKIPPED", reason=self._busy_reason(),
-                           window_index=current_window, pending_count=len(self._secondary_pending))
+                           window_index=current_window, pending_count=len(self._secondary_snapshot()))
             return
         secondary_candidate = self.scheduler.secondary_candidate(now=heartbeat_at)
         if secondary_candidate is not None and await self._start_dispatch(
@@ -2496,7 +2516,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         ):
             self._secondary_dispatched += 1
             await self.log("SECONDARY_MAILBOX_DISPATCHED", window_index=current_window,
-                           pending_count=len(self._secondary_pending),
+                           pending_count=len(self._secondary_snapshot()),
                            system_check_id=self.active_dispatch_context.get("system_check_id"))
 
     async def _settle_final_system_check(self, system_check_id: str) -> None:
@@ -2506,6 +2526,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._settled_final_system_checks.add(system_check_id)
         if int(context.get("generation") or 0) != self.scheduler.generation:
             return
+        self.listening.close()
         cleared = self.ledger.clear_shadow_progress()
         self._secondary_cleared_final += cleared
         if cleared:
@@ -2558,6 +2579,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 self._transport_retry_attempts_by_turn.pop(source_turn_id or "", None)
                 self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
                 self._retry_secondary_by_turn.pop(source_turn_id or "", None)
+                self._retry_listening_by_turn.pop(source_turn_id or "", None)
             elif recovery:
                 retry_snapshot = self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
                 discard_shadow_snapshot(
@@ -2646,6 +2668,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             ):
                 self._settle_screen_context(source_turn_id or "", step_outcome)
                 self._retry_secondary_by_turn.pop(source_turn_id or "", None)
+                self._retry_listening_by_turn.pop(source_turn_id or "", None)
                 if self._retry_system_check and self._retry_system_check.get("system_check_id") == system_check_id:
                     self._retry_system_check = None
             if settle_pending_silence:
@@ -2674,6 +2697,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             self.active_recovery = None
             self.active_dispatch_context = None
             self.last_llm_completed_at = time.monotonic()
+            self._listening_by_identity.pop(identity, None)
             if (system_check_id in self._system_check_turn_ids
                     and system_check_id not in self._system_check_output_turn_ids
                     and not secondary_retry_pending
@@ -3033,12 +3057,35 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             return
         shadow_actions = tuple(action for action in actions if action.name == "request_shadow")
         screen_actions = tuple(a for a in actions if a.name == "capture_screen")
-        invalid = tuple(action for action in actions if action.name not in {"request_shadow", "capture_screen"})
+        listening_actions = tuple(a for a in actions if a.name == "continue_listening")
+        invalid = tuple(action for action in actions if action.name not in {"request_shadow", "capture_screen", "continue_listening"})
         if invalid:
             raise ProtocolError("unsupported action: " + ", ".join(action.name for action in invalid))
+        if listening_actions:
+            advertised = {row.get("name") for row in self._session_action_definitions()}
+            if not self.tools_enabled or "continue_listening" not in advertised:
+                raise ProtocolError("continue_listening（持续倾听）当前不可用")
+            if len(listening_actions) != 1:
+                raise ProtocolError("continue_listening（持续倾听）每次决策最多一次")
+            arguments = listening_actions[0].arguments
+            if (set(arguments) != {"count"} or type(arguments["count"]) is not int
+                    or arguments["count"] not in (1, 2, 3)):
+                raise ProtocolError("continue_listening count（注入次数）必须为整数1、2或3")
+        # 所有动作参数先校验，再施加本地或后台副作用。
+        if shadow_actions:
+            for action in shadow_actions:
+                parse_shadow_wake(action.arguments)
+        if screen_actions and any(a.arguments != {"request": True} or type(a.arguments.get("request")) is not bool for a in screen_actions):
+            raise ProtocolError("截屏请求参数无效")
+        if listening_actions:
+            context = self._listening_by_identity.get(identity, {
+                "scope": self.listening.scope, "logical_id": identity[1]})
+            result = ({"accepted": 0, "reason": "input_scope_closed"} if self.input_scope_closed or self.closed
+                      else self.listening.request(listening_actions[0].arguments["count"],
+                           scope=context["scope"], logical_id=context["logical_id"]))
+            await self.log("LISTENING_REQUEST", identity=identity, turn_id=turn_id,
+                           requested_count=listening_actions[0].arguments["count"], **result)
         if screen_actions:
-            if any(a.arguments != {"request": True} or type(a.arguments.get("request")) is not bool for a in screen_actions):
-                raise ProtocolError("截屏请求参数无效")
             if self._screen_task is None or self._screen_task.done():
                 self._screen_task = asyncio.create_task(self._capture_screen_action(identity, turn_id), name="screen-capture")
                 self._track_background_tool(self._screen_task)
@@ -3063,10 +3110,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             await self.log("SHADOW_EVENT_DUPLICATE", event_id=event.event_id, event_kind=event.kind)
             return
         if self.ledger._shadow_progress_version != previous_version:
-            self._secondary_enqueued += 1
             await self.log("SECONDARY_MAILBOX_ENQUEUED", source=event.source,
                            version=self.ledger._shadow_progress_version,
-                           pending_count=len(self._secondary_pending))
+                           pending_count=len(self._secondary_snapshot()))
         await self.log("SHADOW_EVENT", event_id=event.event_id, event_kind=event.kind)
         if event.kind == "information":
             if self.ledger.shadow_information_snapshot() is not None:
@@ -3079,41 +3125,43 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
     @property
     def _secondary_pending(self) -> dict[str, int]:
         """待评估来源与 version（版本）的诊断视图；账本拥有唯一信箱状态。"""
-        return {source: state["version"] for source, state in self._secondary_snapshot().items()}
+        pending = {}
+        for state in self._secondary_snapshot().values():
+            pending[state["source"]] = max(pending.get(state["source"], 0), state["version"])
+        return pending
+
+    @property
+    def perception(self):
+        return getattr(self, "_perception", {})
+
+    @perception.setter
+    def perception(self, value):
+        self._perception = value
+        acoustic = value.get("acoustic")
+        if acoustic is not None:
+            acoustic.bind_mailbox(self.ledger.secondary_mailbox)
 
     def _secondary_snapshot(self) -> dict[str, dict]:
-        snapshot = self.ledger.shadow_progress_snapshot()
-        mailbox = getattr(self, "perception", {}).get("acoustic")
-        rows = mailbox.snapshot() if mailbox else []
-        if rows:
-            snapshot["acoustic_events"] = {"rows": rows, "version": rows[-1]["end_sample"]}
-        return snapshot
+        return self.ledger.secondary_mailbox.snapshot()
 
     def _valid_secondary(self, captured):
-        snapshot = self.ledger.valid_shadow_progress({key: row for key, row in (captured or {}).items() if key != "acoustic_events"})
-        mailbox = getattr(self, "perception", {}).get("acoustic")
-        rows = mailbox.valid((captured or {}).get("acoustic_events", {}).get("rows", [])) if mailbox else []
-        if rows:
-            snapshot["acoustic_events"] = {"rows": rows, "version": rows[-1]["end_sample"]}
-        return snapshot
+        return self.ledger.secondary_mailbox.valid(captured)
 
     def _acoustic_context(self, captured):
-        mailbox = getattr(self, "perception", {}).get("acoustic")
-        return mailbox.project((captured or {}).get("acoustic_events", {}).get("rows", [])) if mailbox else []
+        return [deepcopy(row["payload"]) for row in (captured or {}).values()
+                if row["kind"] == "acoustic_observation"]  # 旧内部读取适配，不参与信箱拼装。
 
     def _consume_secondary(self, captured: dict[str, dict], *, prompt_kind: str) -> list[str]:
-        consumed = self.ledger.consume_shadow_progress({key: row for key, row in captured.items() if key != "acoustic_events"})
-        mailbox = getattr(self, "perception", {}).get("acoustic")
-        if mailbox and "acoustic_events" in captured:
-            mailbox.consume(captured["acoustic_events"]["rows"])
-            consumed.append("acoustic_events")
+        consumed = self.ledger.secondary_mailbox.consume(captured)
+        if consumed and prompt_kind != "final_silence":
+            self.listening.refill()
         if prompt_kind == "final_silence":
             self._secondary_cleared_final += len(consumed)
         elif prompt_kind == "secondary_mailbox":
             self._secondary_consumed_check += len(consumed)
         else:
             self._secondary_consumed_normal += len(consumed)
-        return consumed
+        return [captured[key]["source"] for key in consumed]
 
     def _discard_secondary_retry(self) -> None:
         """丢弃已被新输入或生命周期边界替换的系统评估重试。"""
@@ -3124,6 +3172,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.pending.discard("LLM_RETRY")
         source = context.get("speech_turn_id") or ""
         self._retry_secondary_by_turn.pop(source, None)
+        self._retry_listening_by_turn.pop(source, None)
         self._retry_shadow_information_by_turn.pop(source, None)
         self._transport_retry_attempts_by_turn.pop(source, None)
         self._system_check_turn_ids.discard(context.get("system_check_id"))
@@ -3215,6 +3264,21 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         secondary_context = self._request_secondary_context(
             source_turn_id, kinds, recovery=recovery, recovery_signal=recovery_signal,
         )
+        if system_check and prompt_kind == "secondary_mailbox" and not recovery and "LLM_RETRY" not in kinds:
+            # 上下文冻结时重新登记实际来源，覆盖派发日志期间新到条目的作用域。
+            dispatch_context["secondary_scopes"] = sorted({row["scope"] for row in secondary_context.values()})
+        listening_context = self._listening_by_identity.get(identity)
+        if recovery and recovery_signal is not None and recovery_signal.listening_context is not None:
+            listening_context = deepcopy(recovery_signal.listening_context)
+        elif ("LLM_RETRY" in kinds and retry_key in self._retry_listening_by_turn
+              and not (set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"})):
+            listening_context = deepcopy(self._retry_listening_by_turn[retry_key])
+        if listening_context is None:
+            listening_context = {"scope": self.listening.scope, "logical_id": identity[1],
+                                 "state": self.listening.snapshot()}
+        elif "state" not in listening_context:
+            listening_context = {**listening_context, "state": self.listening.snapshot()}
+        self._listening_by_identity[identity] = listening_context
         if prompt_kind == "secondary_mailbox" and not secondary_context and not recovery:
             return "system_check_stale"
         if recovery and recovery_signal is not None and recovery_signal.shadow_information:
@@ -3233,6 +3297,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             current_turn_id=source_turn_id,
             shadow_information=shadow_information,
             secondary_context=secondary_context,
+            listening_context=listening_context["state"],
             reasoning_effort=reasoning_effort,
         )
         request_speak_snapshot = dict(self._last_model_speak_snapshot)
@@ -3300,6 +3365,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             )
         # 冻结与审计成功后才保存和确认版本；构建失败或旧版本确认不能丢失新状态。
         self._retry_secondary_by_turn[retry_key] = secondary_context
+        self._retry_listening_by_turn[retry_key] = deepcopy(listening_context)
         if shadow_information is not None:
             self._retry_shadow_information_by_turn[retry_key] = dict(shadow_information)
         consumed_secondary = self._consume_secondary(secondary_context, prompt_kind=prompt_kind)
@@ -3308,7 +3374,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                            turn_id=source_turn_id, prompt_kind=prompt_kind,
                            sources=consumed_secondary,
                            captured_version=max(state["version"] for state in secondary_context.values()),
-                           pending_count=len(self._secondary_pending))
+                           pending_count=len(self._secondary_snapshot()))
         audit_capture_ms = round((time.perf_counter() - audit_capture_started) * 1000, 2)
         self.request_count += 1
         self.request_started_at = time.monotonic()
@@ -3396,6 +3462,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             if stale_reported:
                 return
             stale_reported = True
+            reason = self._system_check_stale_reason(dispatch_context)
+            restored = (self.ledger.secondary_mailbox.restore(secondary_context)
+                        if reason == "secondary_scope_expired" else [])
             await self.log(
                 "SYSTEM_CHECK_STALE",
                 identity=identity,
@@ -3405,7 +3474,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 scheduler_generation=(dispatch_context.get("generation")
                                       if isinstance(dispatch_context, dict) else None),
                 current_scheduler_generation=self.scheduler.generation,
-                stale_reason=self._system_check_stale_reason(dispatch_context),
+                stale_reason=reason,
+                restored_secondary_count=len(restored),  # 归还仍有效的其他来源条目数。
                 system_check_user_speech_epoch=(dispatch_context.get("user_speech_epoch")
                                                 if isinstance(dispatch_context, dict) else None),
                 current_user_speech_epoch=self._user_speech_epoch,
@@ -3960,6 +4030,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             await self._settle_final_system_check(system_check_id)
 
     async def end(self, reason):
+        self.listening.close()
         perception = getattr(self, "perception", {})
         if perception:
             perception["scope"] += 1
@@ -3971,6 +4042,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         old = self.episode_id
         self.scheduler.disarm()
         self.ledger.clear_shadow_progress(reset_seen=True)
+        self.ledger.secondary_mailbox.clear()
         await self._stop_heartbeat_clock()
         self.recovery_queue.clear()
         self.active_dispatch_context = None
@@ -4012,6 +4084,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         if background:
             await asyncio.gather(*background, return_exceptions=True)
         self._background_tools.clear()
+        self._listening_by_identity.clear()
+        self._retry_listening_by_turn.clear()
         if old:
             self.registry.cancel_turn(old)
         self.pending.clear()
@@ -4049,6 +4123,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()
         self._retry_secondary_by_turn.clear()
+        self._retry_listening_by_turn.clear()
         self._retry_system_check = None
         self.deferred_recovery_feedback.clear()
         self.state = "IDLE"
@@ -4061,4 +4136,5 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._system_check_turn_ids.clear()
         self._system_check_output_turn_ids.clear()
         self._identity_turns.clear()
+        self._listening_by_identity.clear()
         self.input_finished_at.clear()

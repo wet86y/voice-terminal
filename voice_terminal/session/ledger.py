@@ -8,6 +8,7 @@ from html import escape
 from typing import Any
 from pathlib import Path
 from .storage import SessionJournal, StoredSequence, StoredSet
+from .secondary_mailbox import SecondaryMailbox
 from ..screen_capture import ScreenCaptureService
 
 from .contracts import DeliveryReport, ToolExchange
@@ -77,9 +78,10 @@ class SessionLedger:
         # activation_id（激活标识）和 context_revision（上下文修订号）只在进程内暂存。
         self.latest_shadow_information: dict[str, Any] | None = None
         self._shadow_information_version = 0
-        # 二等信箱：按 source（来源）保存当前 activation_id（激活标识）的最新进度。
-        # version（版本）和 scope_generation（作用域代次）仅在内存中比较消费，不写语义历史。
-        self._shadow_progress: dict[str, dict[str, Any]] = {}
+        # 来源开放的通用二等存储；后台适配层另持有去重与有效激活元数据。
+        self.secondary_mailbox = SecondaryMailbox()  # secondary_mailbox（唯一通用二等存储）。
+        self._shadow_scope = self.secondary_mailbox.new_scope()
+        self.secondary_mailbox.on_consume(self._ack_shadow_progress)
         self._shadow_progress_seen: dict[str, str] = {}
         self._shadow_progress_evaluated: dict[str, str] = {}  # 各来源已经冻结评估的最新正文，防止信息入口重复唤醒。
         self._shadow_information_seen: dict[str, str] = {}
@@ -269,6 +271,7 @@ class SessionLedger:
         self._shadow_frames.clear()
         self.latest_shadow_information = None
         self._shadow_information_version = 0
+        self.secondary_mailbox.clear()
         self.clear_shadow_progress(reset_seen=True)
         self.shadow_activation_id = None
         self.shadow_user_input_required = False
@@ -358,8 +361,8 @@ class SessionLedger:
 
     def clear_shadow_progress(self, *, reset_seen: bool = False) -> int:
         """清空待评估进度；推进作用域代次使旧请求快照无法确认新状态。"""
-        count = len(self._shadow_progress)
-        self._shadow_progress.clear()
+        count = self.secondary_mailbox.invalidate(self._shadow_scope)
+        self._shadow_scope = self.secondary_mailbox.new_scope()
         self._shadow_progress_evaluated.clear()
         self._shadow_progress_generation += 1
         if reset_seen:
@@ -379,6 +382,19 @@ class SessionLedger:
         """返回各有效来源尚未评估的最新进度，复制后供单次请求冻结。"""
         return self.valid_shadow_progress(self._shadow_progress)
 
+    @property
+    def _shadow_progress(self) -> dict[str, dict[str, Any]]:
+        """旧内部视图由通用存储即时派生，不拥有第二份待消费正文。"""
+        return {row["source"]: {**row["payload"], **row["metadata"], "source": row["source"],
+                               "version": row["version"], "id": row["id"]}
+                for row in self.secondary_mailbox.snapshot().values()
+                if row["scope"] == self._shadow_scope}
+
+    def _ack_shadow_progress(self, captured: dict[str, dict]) -> None:
+        for row in captured.values():
+            if row["scope"] == self._shadow_scope:
+                self._shadow_progress_evaluated[row["source"]] = self._progress_text_key(row["payload"]["text"])
+
     def valid_shadow_progress(self, captured: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """恢复或重试只能继续使用仍处于有效激活作用域的冻结进度。"""
         return {source: dict(state) for source, state in captured.items()
@@ -386,14 +402,12 @@ class SessionLedger:
 
     def consume_shadow_progress(self, captured: dict[str, dict[str, Any]]) -> list[str]:
         """仅确认捕获的同一 version（版本）；请求构建期间到达的新版本保留。"""
-        consumed = []
-        for source, state in captured.items():
-            if self._valid_progress_scope(state):
-                self._shadow_progress_evaluated[source] = self._progress_text_key(state["text"])
-            if self._shadow_progress.get(source) == state:
-                self._shadow_progress.pop(source)
-                consumed.append(source)
-        return consumed
+        rows = {state["id"]: {"id": state["id"], "version": state["version"],
+                "source": source, "kind": "shadow_progress", "scope": self._shadow_scope,
+                "payload": {"text": state["text"]}}
+                for source, state in self.valid_shadow_progress(captured).items()}
+        consumed = self.secondary_mailbox.consume(rows)
+        return [source for source, state in captured.items() if state.get("id") in consumed]
 
     @staticmethod
     def _progress_text_key(text: str) -> str:
@@ -741,12 +755,15 @@ class SessionLedger:
             self._shadow_progress_seen[event.source] = key
             # information（影子信息）已经通过普通入口提供的相同正文不能再触发二等评估。
             if key in self._shadow_information_seen.values():
-                self._shadow_progress.pop(event.source, None)
+                old = self._shadow_progress.get(event.source)
+                if old:
+                    self.secondary_mailbox.remove(old["id"])
                 return True
             self._shadow_progress_version += 1
-            self._shadow_progress[event.source] = {
-                **state, "version": self._shadow_progress_version,
-            }
+            self.secondary_mailbox.publish(source=event.source, kind="shadow_progress",
+                payload={"text": text},
+                metadata={key: state[key] for key in ("activation_id", "scope_generation")},
+                scope=self._shadow_scope, coalesce_key=event.source)
             return True
         if event.kind == "information":
             self._shadow_information_version += 1
@@ -762,7 +779,7 @@ class SessionLedger:
                 self._shadow_information_seen[event.source] = key
                 for source, state in tuple(self._shadow_progress.items()):
                     if self._progress_text_key(state["text"]) == key:
-                        self._shadow_progress.pop(source)
+                        self.secondary_mailbox.remove(state["id"])
                 if key in self._shadow_progress_evaluated.values():
                     # 同一激活中已随进度冻结评估的正文，不再从普通信息入口重复触发。
                     self.latest_shadow_information = None
