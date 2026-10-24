@@ -361,18 +361,12 @@ pub fn install(
         .stderr(Stdio::from(file));
     progress("正在通过 npm（包管理器）安装目标 DSH 与插件管理工具", 0, 0);
     let _transfer_slot=crate::download::acquire_slot(cancel,progress)?;
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     let job = crate::windows::Job::new()?;
     #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        if let Err(error) = job.assign(child.as_raw_handle()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    }
+    let mut child = job.spawn(&mut command)?;
+    #[cfg(not(windows))]
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
     loop {
         if cancel.load(Ordering::Acquire) {
             #[cfg(windows)]

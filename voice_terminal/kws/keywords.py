@@ -232,8 +232,9 @@ def generate_keywords_for(
     write_raw_keywords_multi(raw_path, entries)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     from ..paths import AppPaths
+    from ..process_host import interpreter_command
     paths = AppPaths.resolve()
-    python_cli = [sys.executable, "-X", "utf8", "-X", f"pycache_prefix={paths.cache / 'python'}", "-c", "from sherpa_onnx.cli import cli; cli()"] if paths.separated else None
+    python_cli = interpreter_command(sys.executable, "-X", "utf8", "-X", f"pycache_prefix={paths.cache / 'python'}", "-c", "from sherpa_onnx.cli import cli; cli()") if paths.separated else None
     cli = shutil.which("sherpa-onnx-cli")
     if cli is None:
         scripts_dir = Path(sys.executable).parent / "Scripts"

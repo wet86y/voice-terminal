@@ -1,5 +1,5 @@
 //! Voice runtime（语音运行环境）：共享依赖计划、可移动解释器、事务启用。
-use std::{fs, path::{Path,PathBuf}, process::{Command,ExitStatus,Stdio}, sync::{Arc,atomic::AtomicBool}, time::{Duration,Instant}};
+use std::{fs, path::{Path,PathBuf}, process::{ExitStatus,Stdio}, sync::{Arc,atomic::AtomicBool}, time::{Duration,Instant}};
 use serde_json::{Value,json};
 use crate::{LaunchContext,download::DownloadFile,resources::{self,Progress},workspace::{safe_path,atomic_json,file_hash,remove_owned}};
 // ENVIRONMENT_GROUPS（完整语音环境）：语音服务、各模型及轻量 VAD（语音活动检测）所需的六个必需依赖组。
@@ -148,19 +148,19 @@ pub fn system_candidates()->Vec<PathBuf>{
     candidates.sort();candidates.dedup();candidates
 }
 pub fn worker(context:&LaunchContext,python:&Path,operation:&str,args:&[String],cancel:&AtomicBool)->Result<Value,String>{
-    #[cfg(windows)] use std::os::windows::{process::CommandExt,io::AsRawHandle};
+    #[cfg(windows)] use std::os::windows::process::CommandExt;
     let output_path=safe_path(&context.install,&format!("tmp/process/worker-{}.json",crate::workspace::new_id()))?;
     fs::create_dir_all(output_path.parent().unwrap()).map_err(|e|e.to_string())?;
     let output=fs::File::create(&output_path).map_err(|e|e.to_string())?;
     let error_path=output_path.with_extension("stderr");
     let diagnostic=fs::File::create(&error_path).map_err(|e|e.to_string())?;
-    let mut command=Command::new(python);context.configure_command(&mut command);
+    let mut command=crate::process_host::python_command(python);context.configure_command(&mut command);
     command.args(["-I","-B","-X","utf8"]).arg(context.program.join("scripts/voice-environment-worker.py")).arg(operation).args(args)
         .stdin(Stdio::null()).stdout(output).stderr(diagnostic).current_dir(&context.program);
     #[cfg(windows)] command.creation_flags(0x08000000);
-    let mut child=command.spawn().map_err(|e|format!("解释器工作进程无法启动：{e}"))?;
     #[cfg(windows)] let job=crate::windows::Job::new()?;
-    #[cfg(windows)] job.assign(child.as_raw_handle())?;
+    #[cfg(windows)] let mut child=job.spawn(&mut command).map_err(|e|format!("解释器工作进程无法启动：{e}"))?;
+    #[cfg(not(windows))] let mut child=command.spawn().map_err(|e|format!("解释器工作进程无法启动：{e}"))?;
     // 完整语音依赖首次加载在测试机接近三分钟，单独放宽检查预算并继续响应取消。
     let timeout=if matches!(operation,"check"|"gpu"){600}else{180};
     let deadline=Instant::now()+Duration::from_secs(timeout);

@@ -12,6 +12,7 @@
 ## 架构
 
 - [系统架构与生命周期](architecture/architecture.md)
+- [项目进程管理与系统显示身份](architecture/process-management.md)
 - [兼容性组件与更新交接](architecture/compatibility-component.md)
 - [Bridge 2.0（第二版桥接协议）](architecture/bridge-2.0-protocol.md)
 - [能力就绪与能力级恢复](architecture/capability-readiness-and-recovery.md)
@@ -62,6 +63,7 @@
 - [启动与维护界面连续性验收](testing/startup-ui-continuity.md)
 - [当前已知问题](testing/known-issues.md)
 - [桌面现场验收](testing/desktop-acceptance.md)
+- [项目进程管理验收（2026-10-24）](testing/process-management-20261024.md)
 - [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)
 - [下载与首次启动修复验收](testing/download-startup-flow-20261010.md)
 - [国内镜像与原站回退验证](testing/download-sources-20261018.md)

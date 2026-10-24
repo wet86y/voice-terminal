@@ -23,6 +23,7 @@ pub mod compatibility; // compatibility（兼容性组件）：版本化规则�
 pub mod component_maintenance; // component_maintenance（组件校验交接）：分发器检查，本体组件列表修复。
 mod component_upgrade; // component_upgrade（组件兼容迁移）：由本体资源任务复用随包资源并处置旧版资料。
 pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
+pub mod process_host; // process_host（项目工作进程）：统一系统身份并复用现有解释器运行库。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -314,6 +315,9 @@ impl LaunchContext {
         }
         values.insert("PYTHONUTF8".into(), "1".into());
         values.insert("PYTHONNOUSERSITE".into(), "1".into());
+        if let Some(host) = process_host::current_host() {
+            values.insert("VOICE_PROCESS_HOST".into(), host.to_string_lossy().into_owned());
+        }
         values.insert("VOICE_RESOURCE_POLICY".into(),self.data.join("config/runtime-resources.json").to_string_lossy().into_owned());
         for (name, folder) in [("TEMP", "tmp/process"), ("TMP", "tmp/process"),
             ("HF_HOME", "cache/huggingface"), ("MODELSCOPE_CACHE", "cache/modelscope"),
@@ -762,7 +766,7 @@ pub mod windows {
             Ok(())
         }
     }
-    pub struct Job(HANDLE);
+    pub struct Job(HANDLE, std::sync::Mutex<Vec<crate::process_host::StartGate>>);
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
     impl Job {
@@ -784,7 +788,7 @@ pub mod windows {
                     CloseHandle(handle);
                     return Err(std::io::Error::last_os_error().to_string());
                 }
-                Ok(Self(handle))
+                Ok(Self(handle, std::sync::Mutex::new(Vec::new())))
             }
         }
         pub fn assign(&self, process: HANDLE) -> Result<(), String> {
@@ -793,6 +797,33 @@ pub mod windows {
             } else {
                 Ok(())
             }
+        }
+        /// spawn（受管创建）：先建立作业归属，再放行产品工作进程；失败时结束并等待直接子进程。
+        pub fn spawn(&self, command: &mut Command) -> Result<std::process::Child, String> {
+            let gate = crate::process_host::StartGate::prepare(command)?;
+            if gate.is_none() {
+                use std::os::windows::process::CommandExt;
+                use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+                // 此入口只用于后台辅助任务。第三方程序和外部解释器没有宿主门闩，改为挂起创建。
+                command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+            }
+            let mut child = command.spawn().map_err(|error| error.to_string())?;
+            use std::os::windows::io::AsRawHandle;
+            let result = self.assign(child.as_raw_handle()).and_then(|_| {
+                if let Some(gate) = &gate { gate.release()?; }
+                else { resume_suspended_child(child.id())?; }
+                Ok(())
+            });
+            if let Err(error) = result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            // 命名事件保持到所属作业关闭，避免父进程过早关闭句柄导致尚未启动的子进程无法打开门闩。
+            if let Some(gate) = gate {
+                self.1.lock().unwrap_or_else(|error| error.into_inner()).push(gate);
+            }
+            Ok(child)
         }
         pub fn terminate(&self) {
             unsafe {
@@ -805,6 +836,44 @@ pub mod windows {
             unsafe {
                 CloseHandle(self.0);
             }
+        }
+    }
+
+    /// resume_suspended_child（恢复初始线程）：仅处理本入口刚以挂起标志创建、尚未执行的直接子进程。
+    fn resume_suspended_child(pid: u32) -> Result<(), String> {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::{Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD},
+                Threading::{GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME}},
+        };
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE { return Err(std::io::Error::last_os_error().to_string()); }
+            let mut row: THREADENTRY32 = std::mem::zeroed();
+            row.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut found = None;
+            let mut ambiguous = false;
+            let mut more = Thread32First(snapshot, &mut row);
+            while more != 0 {
+                if row.th32OwnerProcessID == pid {
+                    if found.is_some() { ambiguous = true; break; }
+                    found = Some(row.th32ThreadID);
+                }
+                more = Thread32Next(snapshot, &mut row);
+            }
+            CloseHandle(snapshot);
+            if ambiguous { return Err("挂起工作进程初始线程不唯一，拒绝恢复未知线程。".into()); }
+            let thread_id = found.ok_or("无法定位挂起工作进程的初始线程。")?;
+            let thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, 0, thread_id);
+            if thread.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+            if GetProcessIdOfThread(thread) != pid {
+                CloseHandle(thread);
+                return Err("工作进程初始线程的归属已变化。".into());
+            }
+            let previous = ResumeThread(thread);
+            CloseHandle(thread);
+            if previous != 1 { return Err("工作进程初始线程的挂起状态异常。".into()); }
+            Ok(())
         }
     }
 
