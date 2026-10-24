@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -52,6 +53,60 @@ def live_controller(runtime):
     )
     runtime.controller = controller
     return controller
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["intra_turn_relaxation", "continuity_relaxation"])
+async def test_speaker_negative_derived_threshold_is_atomic_at_real_http_boundary(runtime, key):
+    store = runtime.product_settings
+    store.save_speaker({"mode": "off", "confirm_threshold": .6, "owner_only_barge_in": False})
+    previous, disk, config = store.settings_only()["speaker"], store.path.read_bytes(), runtime.config
+    response = await request(runtime, "speaker", {"mode": "off", "confirm_threshold": .1,
+        "owner_only_barge_in": False, "intra_turn_relaxation": 0, "continuity_relaxation": 0, key: .11})
+    assert response.status_code == 422 and "小于0" in response.text
+    assert runtime.config is config
+    assert store.settings_only()["speaker"] == previous and store.path.read_bytes() == disk
+
+
+@pytest.mark.asyncio
+async def test_speaker_new_limits_reach_real_runtime_and_reject_beyond_weight_limit(runtime):
+    response = await request(runtime, "speaker", {"mode": "off", "confirm_threshold": .3,
+        "owner_only_barge_in": False, "intra_turn_relaxation": .3, "continuity_relaxation": .2, "session_weight": .8})
+    assert response.status_code == 200, response.text
+    assert runtime.config.speaker.intra_turn_threshold == 0
+    assert runtime.config.speaker.continuity_threshold == pytest.approx(.1)
+    assert runtime.config.speaker.session_weight == .8
+    assert "non_owner_threshold" not in response.json()["settings"]["speaker"]
+    before = runtime.product_settings.path.read_bytes()
+    invalid = await request(runtime, "speaker", {"mode": "off", "confirm_threshold": .3,
+        "owner_only_barge_in": False, "session_weight": .81})
+    assert invalid.status_code == 422 and "临时声纹权重" in invalid.text
+    assert runtime.product_settings.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_speaker_apply_failure_restores_legacy_weight_and_internal_values(runtime):
+    store = runtime.product_settings
+    store.save_speaker({"mode": "off", "confirm_threshold": .6, "owner_only_barge_in": False, "context_max_ms": 6400})
+    data = json.loads(store.path.read_text(encoding="utf-8"))
+    data["speaker"]["session_weight"] = .9
+    store.path.write_text(json.dumps(data), encoding="utf-8")
+    runtime.product_settings = ProductSettingsStore(path=store.path, config=runtime.config)
+    runtime.config = runtime.product_settings.effective_config()
+    original_apply = runtime.set_speaker_settings
+    async def apply_then_fail(settings, *, restoring=False):
+        result = await original_apply(settings, restoring=restoring)
+        if not restoring:
+            raise RuntimeError("模拟运行参数应用失败")
+        return result
+    runtime.set_speaker_settings = apply_then_fail
+    with pytest.raises(RuntimeError, match="模拟运行参数应用失败"):
+        await request(runtime, "speaker", {"mode": "off", "confirm_threshold": .6,
+            "owner_only_barge_in": False, "session_weight": .8})
+    assert runtime.config.speaker.session_weight == .9
+    assert runtime.config.speaker.context_max_ms == 6400
+    assert runtime.product_settings.settings_only()["speaker"]["session_weight"] == .9
+    assert json.loads(store.path.read_text(encoding="utf-8"))["speaker"]["context_max_ms"] == 6400
 
 
 def test_dsh_approval_requires_host_auth_and_rejects_stale_requests(runtime, monkeypatch):

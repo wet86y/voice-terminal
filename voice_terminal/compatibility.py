@@ -88,7 +88,7 @@ def _valid_settings(defaults: dict, raw: object) -> dict:
     # 合并入口有兼容回退；落盘前还须严格检查，不能只相信“没有抛错”。
     if _settings_validation_warning(candidate):
         raise ValueError("合并后的产品设置未通过校验")
-    validate_tuning(candidate["speaker"], continuity=candidate["speaker"]["continuity_threshold"])
+    validate_tuning(candidate["speaker"])
     ScreenCaptureConfig(**candidate["screen_capture"])
     QuietHoursConfig(**candidate["quiet_hours"])
     AudioEnhancements.from_mapping(candidate["audio_enhancements"])

@@ -188,6 +188,11 @@ class AudioEnhancementsMixin:
         pieces = getattr(ws, "_refinement_speaker_pieces", [])
         segments = sorted((row for stream in streams for row in stream["segments"].values()
                            if row["text"] is not None), key=lambda row: row["start_sample"])
+        turn = getattr(self.speaker_policy, "turns", {}).get(ws.turn_id)
+        if turn is not None:
+            return (join_asr_segments([row["text"] for row in segments]), bool(segments)) if turn.admitted else ("", False)
+        if ws.speaker_summary:
+            return (join_asr_segments([row["text"] for row in segments]), bool(segments)) if ws.speaker_summary.get("admitted") else ("", False)
         admitted = []
         for segment in segments:
             overlapping = [piece for piece in pieces

@@ -84,11 +84,21 @@ def test_resume_increments_generation_before_router_reset_and_preroll():
     controller.analysis_health = {}
     controller.state = SimpleNamespace(current={})
     controller.barge_in_gate = SimpleNamespace(reset=Mock())
+    from voice_terminal.config import SpeakerConfig
+    from voice_terminal.speaker.session import SessionSpeakerPolicy
+    controller.speaker_config = SpeakerConfig()
+    controller.speaker_policy = SessionSpeakerPolicy(controller.speaker_config, lambda _vector: .8)
+    turn = controller.speaker_policy.begin_turn("resume", start_sample=320, generation=3, started_at=1)
+    controller.speaker_policy.observe_turn("resume", (1., 0.), start=320, end=19520, speech_ms=1200, first=True)
+    controller.speaker_policy.boundary("resume", at=2, reason="smart_turn")
 
     asyncio.run(RealtimeController._resume(controller, current))
 
     assert ws.generation == 4
     assert ws.speaker_mode == "filter"
+    assert controller.speaker_policy.turns["resume"] is turn and turn.start_sample == 320
+    assert turn.admitted and turn.boundary_at is None and turn.boundary_revision == 2
+    assert controller.speaker_policy.continuity.normal_end_at is None
     router_reset.assert_called_once_with(turn_id="resume", generation=4)
     submit.assert_not_called() # 不再产生第二条固定窗口声纹流。
     controller._detail.assert_awaited_once_with("turn.resumed")

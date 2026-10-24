@@ -186,6 +186,8 @@ class RuntimeState:
         for key in ("turn_id", "output_generation", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "refinement_available", "segments", "tools", "audio_cues", "analysis", "tts_segments", "speaker_decision"):
             self.current.pop(key, None)
         self.current.update(tts_prewarm_started=False, tts_prewarm_status="NOT_REQUESTED")
+        self.current.pop("admission_phase", None)
+        self.current.pop("speaker_summary", None)
         self.latency = {
             "complete": False,
             "values": {key: None for key in self.latency["values"]},

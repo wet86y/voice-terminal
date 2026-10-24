@@ -2,7 +2,7 @@
 import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 import SpeakerRecordingFlow from '../../interface/SpeakerRecordingFlow.vue';
-import { SPEAKER_FIELDS } from '../speaker-policy';
+import { SPEAKER_FIELDS, speakerControlsError } from '../speaker-policy';
 import { computed, ref, watch } from 'vue';
 const {
   current,
@@ -50,6 +50,12 @@ const sessionMetrics = computed(() => {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 });
 const recordingExpanded = ref(false); // recordingExpanded（录制面板）：收起时保留已完成片段。
+const admissionLabels: Record<string, string> = {
+  collecting: '首段积累中', inferring: '首段核对中', held: '首段非主人，暂缓提交',
+  relaxed: '本轮主人已确认，持续放行', unconfirmed: '身份未确认，保留全文放行', closed: '本轮已结束',
+  observing: '仅观察，普通输入不拦截',
+};
+const controlsError = computed(() => speakerControlsError(speakerForm)); // controlsError（四项草稿错误）。
 watch(speakerEnrollment, value => { if (!value) recordingExpanded.value = false; });
 async function toggleRecording() {
   if (recordingExpanded.value) { cancelActiveSpeakerCapture(); recordingExpanded.value = false; return; }
@@ -80,13 +86,13 @@ async function toggleRecording() {
         <option value="off">关闭</option>
         <option value="observe">仅标记</option>
         <option value="filter" :disabled="!speakerFilterAllowed">
-          拦截 · 仅确认主人时放行
+          拦截 · 首段核对后整轮放行
         </option></select
       ><small v-if="!speakerFilterAllowed"
         >注册主人声纹且
         Worker（工作进程）就绪后才能启用拦截。</small
       ><small v-else
-        >待确认正文暂存在内存，后续主人证据匹配时补入上下文；已放行正文保持有效。人工开始或唤醒成功后的初始阶段无条件放行并采集会话声纹。</small
+        >先积累约1.2秒音频核对；达到当次阈值为主人，低于则暂缓。暂缓轮次连续三次达到正常主人阈值可恢复全部原文；无有效分数时保留全文降级，放行后异声只作标注。</small
       ></label
     >
     <label class="switch-row"
@@ -121,59 +127,24 @@ async function toggleRecording() {
       }}</small>
     </div>
   </div>
-  <div class="info-callout" v-if="sessionMetrics.activation_id">
-    <p>会话临时声纹：{{ sessionMetrics.calibration_status === 'ready' ? '已固定，本会话有效' : sessionMetrics.calibration_status === 'collecting' ? '初始放行，正在采集' : '未启用' }}。
-      已采集人声 {{ sessionMetrics.calibration_speech_ms }} 毫秒；待确认增量 {{ sessionMetrics.pending_count }}；恢复 {{ sessionMetrics.recovered_count }}；超时 {{ sessionMetrics.timeout_count }}。
-      永久分数 {{ sessionMetrics.permanent_score ?? '—' }}，会话分数 {{ sessionMetrics.session_score ?? '—' }}，组合分数 {{ sessionMetrics.combined_score ?? '—' }}，实际阈值 {{ sessionMetrics.threshold_used ?? '—' }}。</p>
-  </div>
-  <details class="speaker-advanced">
-      <summary>高级设置 · 阈值基线</summary>
-      <p class="instruction-hint">手动开始和唤醒词激活均先放行并校准。临时质心固定到停止录制或进入静默；采集参数下次激活生效，判断参数下个心跳生效。</p>
-      <div class="speaker-thresholds">
-        <label v-for="field in SPEAKER_FIELDS" :key="field.key" class="form-field">
-          <span>{{ field.label }}</span>
-          <input v-model.number="speakerForm[field.key]" type="number" :min="field.min" :max="field.max" :step="field.step" :aria-label="field.label" />
-        </label>
-      </div>
-
-      <div class="speaker-thresholds">
-        <label class="form-field"
-          ><span
-            >主人确认阈值
-            <b>{{ Number(speakerForm.confirm_threshold).toFixed(2) }}</b></span
-          ><input
-            v-model.number="speakerForm.confirm_threshold"
-            type="range"
-            min="0.01"
-            max="1"
-            step="0.01"
-          /><small>达到主人阈值可确认身份；灰区暂存，持续低于非主人阈值才拦截。句内普通抖动不撤销放行。</small></label
-        ><label class="form-field"
-          ><span
-            >连续主人放宽量
-            <b>{{
-              Number(speakerForm.continuity_relaxation).toFixed(2)
-            }}</b></span
-          ><input
-            v-model.number="speakerForm.continuity_relaxation"
-            type="range"
-            min="0"
-            max="0.20"
-            step="0.01"
-          /><small
-            >向右增大放宽量，降低连续窗口阈值。当前连续阈值：{{ Math.max(0, Number(speakerForm.confirm_threshold) - Number(speakerForm.continuity_relaxation)).toFixed(2) }}。</small
-          ></label
-        ><button
-          class="ghost-action"
-          type="button"
-          @click="restoreSpeakerDefaults"
-        >
-          恢复默认（主人阈值 0.60 / 连续放宽 0.10）
-        </button>
-      </div>
-      <p class="instruction-hint">{{ String(speakerStatus.model_id || 'CAM++') }}（声纹模型）通过 {{ String(speakerStatus.runtime || 'FunASR / PyTorch（原生运行时）') }} 加载，实际设备 {{ String(speakerStatus.device || '尚未加载') }}。声纹在独立进程计算，超时沿用已有身份；待确认正文继续暂存，主人打断需要有效身份或初始临时授权。</p>
-      <p class="instruction-hint">阈值是当前测试基线，不代表安全等级；不提供 anti-spoofing（防伪与变声检测），不用于付款、删除或门锁等高风险操作的身份认证。</p>
-  </details>
+  <p v-if="current.admission_phase" class="instruction-hint" role="status">
+    {{ admissionLabels[current.admission_phase] || current.admission_phase }}。
+    <template v-if="current.speaker_summary?.foreign_voice_suspected">本轮存在疑似外来声纹或识别波动，文字保持完整。</template>
+  </p>
+  <section class="speaker-controls" aria-label="声纹参数">
+    <div class="speaker-thresholds">
+      <label v-for="field in SPEAKER_FIELDS" :key="field.key" class="form-field">
+        <span>{{ field.label }}<b>{{ Number(speakerForm[field.key]).toFixed(2) }}</b></span>
+        <input v-model.number="speakerForm[field.key]" type="range" :min="field.min" :max="field.max"
+          :step="field.step" :aria-label="field.label" />
+        <small>{{ field.hint }}</small>
+      </label>
+    </div>
+    <p class="instruction-hint">轮内阈值：{{ (speakerForm.confirm_threshold - speakerForm.intra_turn_relaxation).toFixed(2) }}；跨轮阈值：{{ (speakerForm.confirm_threshold - speakerForm.continuity_relaxation).toFixed(2) }}。两种放宽不叠加，保存时校验阈值不小于0。</p>
+    <p class="instruction-hint">临时声纹：{{ sessionMetrics.calibration_status === 'ready' ? '已建立' : sessionMetrics.calibration_status === 'collecting' ? '等待校准完成' : '尚未建立' }}；最近一次评分实际权重：{{ Number(sessionMetrics.effective_session_weight ?? 0).toFixed(2) }}。未建立时仅使用永久模板。</p>
+    <p v-if="controlsError" class="instruction-error" role="alert">{{ controlsError }}</p>
+    <button class="ghost-action" type="button" :disabled="saving" @click="restoreSpeakerDefaults">恢复四项默认值</button>
+  </section>
 
   <section class="speaker-enrollment-card" aria-labelledby="speaker-enrollment-title">
     <div class="speaker-card-heading">
@@ -282,7 +253,7 @@ async function toggleRecording() {
       "
       @click="saveSpeaker"
     >
-      {{ saving ? "正在保存…" : "保存声纹阈值" }}
+      {{ saving ? "正在保存…" : "保存声纹参数" }}
     </button>
   </footer>
 </template>

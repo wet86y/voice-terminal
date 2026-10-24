@@ -66,7 +66,7 @@ export function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     input_runtime: true, output_generation: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     refinement_available: false, tts_prewarm_started: false, tts_prewarm_status: 'NOT_REQUESTED',
-    segments: [], tools: [], audio_cues: [], analysis: {}, speaker_decision: {},
+    segments: [], tools: [], audio_cues: [], analysis: {}, speaker_decision: {}, admission_phase: '', speaker_summary: {},
   }
 }
 
@@ -83,7 +83,7 @@ export function createEmptyLatency(): LatencyValues {
     turn_total_ms: null,
     first_segment_ms: null, smart_turn_ms: null,
     sensevoice_refine_ms: null, commit_to_final_llm_ms: null,
-    asr_final_to_commit_ms: null, refine_duration_ms: null,
+    asr_final_to_commit_ms: null, refine_duration_ms: null, speaker_wait_ms: null, speaker_inference_ms: null,
     refine_to_redecision_ms: null, agent_request_to_speak_ms: null,
     tts_prewarm_requested_ms: null, tts_prewarm_ready_ms: null,
     tts_checkout_ms: null, tts_cold_start_ms: null,

@@ -1,4 +1,4 @@
-import { SPEAKER_DEFAULTS } from "./speaker-policy"
+import { SPEAKER_DEFAULTS, SPEAKER_FIELDS, speakerControlsError } from "./speaker-policy"
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import { useApplicationHost } from './application-host'
@@ -670,9 +670,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     await enqueue(async () => {
       saving.value = true
       try {
-        const submitted = { ...speakerForm, continuity_threshold: Math.max(0, speakerForm.confirm_threshold - speakerForm.continuity_relaxation) }
+        const error = speakerControlsError(speakerForm)
+        if (error) throw new Error(error)
+        // 只提交可见参数；隐藏值由服务端合并，避免旧页面草稿覆盖内部配置。
+        const submitted = { mode: speakerForm.mode, owner_only_barge_in: speakerForm.owner_only_barge_in,
+          confirm_threshold: speakerForm.confirm_threshold, intra_turn_relaxation: speakerForm.intra_turn_relaxation,
+          continuity_relaxation: speakerForm.continuity_relaxation, session_weight: speakerForm.session_weight }
         const result = await productApi.saveSpeaker(submitted)
-        const changed = speakerForm.confirm_threshold !== submitted.confirm_threshold || speakerForm.continuity_relaxation !== submitted.continuity_relaxation || speakerForm.mode !== submitted.mode || speakerForm.owner_only_barge_in !== submitted.owner_only_barge_in
+        const changed = SPEAKER_FIELDS.some(field => speakerForm[field.key] !== submitted[field.key])
+          || speakerForm.mode !== submitted.mode || speakerForm.owner_only_barge_in !== submitted.owner_only_barge_in
         updateSettingsFromResponse(settings, result)
         if (!changed) Object.assign(speakerForm, settings.speaker)
         await refreshSpeaker()
@@ -687,7 +693,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function saveSpeakerControls() {
     // 模式与开关直接保存；未保存的阈值草稿继续由底部按钮提交。
-    const submitted = { ...settings.speaker, mode: speakerForm.mode, owner_only_barge_in: speakerForm.owner_only_barge_in }
+    const submitted = { mode: speakerForm.mode, owner_only_barge_in: speakerForm.owner_only_barge_in,
+      confirm_threshold: settings.speaker.confirm_threshold }
     await enqueue(async () => {
       saving.value = true
       try {

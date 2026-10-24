@@ -277,6 +277,7 @@ class SessionLedger:
         self.shadow_user_input_required = False
         self.shadow_active = False
         self._shadow_current_turn_keys.clear()
+        self._speaker_shadow_summaries = {}
         self._storage_restoring = False
         self.persist_state()
 
@@ -548,10 +549,26 @@ class SessionLedger:
         # continue to update metadata, but never this frozen model text.
         self._freeze_input_history(entry)
         self.entries.append(entry)
+        if metadata.get("speaker_summary"):
+            self.entries.append(SessionLedgerEntry("speaker_annotation", dict(metadata["speaker_summary"]), {"turn_id": turn_id}))
         self._commit_shadow_input("user", "user_input", {
             "turn_id": turn_id, "transcript": value,
             "transcript_updates": metadata.get("transcript_updates", []),
+            "speaker_summary": dict(metadata.get("speaker_summary") or {}),
         })
+
+    def project_shadow_speaker_summary(self, turn_id: str, summary: dict) -> None:
+        """独立声纹参考帧；更新上下文但不生成后台唤醒。"""
+        if not turn_id or not summary:
+            return
+        previous = getattr(self, "_speaker_shadow_summaries", {})
+        if previous.get(turn_id) == summary:
+            return
+        previous[turn_id] = dict(summary)
+        if len(previous) > 64:
+            previous.pop(next(iter(previous)))
+        self._speaker_shadow_summaries = previous
+        self._commit_shadow_input("runtime", "speaker_annotation", {"turn_id": turn_id, "speaker_summary": dict(summary)})
 
     def has_input(self, turn_id: str) -> bool:
         """Whether this finalized turn is already represented in model history.
@@ -817,6 +834,9 @@ class SessionLedger:
                 messages.append(ContextFrame.make(
                     ContextLane.HISTORY, "user", self._render_input(entry),
                 ))
+            elif entry.kind == "speaker_annotation":
+                messages.append(ContextFrame.make(ContextLane.HISTORY, "system",
+                    "该轮声纹参考（不改写用户原话）：" + json.dumps(entry.content, ensure_ascii=False)))
             elif entry.kind == "speech":
                 model_content = entry.metadata.get("model_content")
                 if (

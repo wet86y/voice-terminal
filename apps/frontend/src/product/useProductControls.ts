@@ -1,4 +1,4 @@
-import { SPEAKER_DEFAULTS } from "./speaker-policy";
+import { SPEAKER_CONTROL_DEFAULTS } from "./speaker-policy";
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { onMounted } from "vue";
 import { useApplicationHost } from "./application-host";
@@ -982,7 +982,7 @@ export function useProductControls() {
     if (service === "READY") return "就绪";
     if (service === "STARTING") return "启动中";
     if (service === "DEGRADED")
-      return speakerForm.mode === "filter" ? "降级 · 输入已拦截" : "降级 · 不拦截输入";
+      return speakerForm.mode === "filter" ? "降级 · 身份未知时保留全文" : "降级 · 不拦截输入";
     if (service === "ERROR") return "错误";
     return service === "DISABLED" ? "已关闭" : "不可用";
   });
@@ -1165,11 +1165,9 @@ export function useProductControls() {
     // Mirrors config/default.yaml.  Changing the feature frontend moved the raw
     // cosine operating point, so these numbers are not comparable with any
     // threshold calibrated before that change.
-    Object.assign(speakerForm, SPEAKER_DEFAULTS);
-    speakerForm.confirm_threshold = 0.6;
+    Object.assign(speakerForm, SPEAKER_CONTROL_DEFAULTS);
     speakerForm.continuity_threshold = 0.5;
-    speakerForm.continuity_relaxation = 0.1;
-    setNotice("声纹阈值已恢复默认值（0.60 / 0.50），点击保存后应用。");
+    setNotice("四项参数已恢复默认：主人阈值0.60、两种放宽余量各0.10、临时声纹权重0.60，点击保存后应用。");
   }
   function mergeFloat32(chunks: Float32Array[]) {
     const length = chunks.reduce((total, chunk) => total + chunk.length, 0);

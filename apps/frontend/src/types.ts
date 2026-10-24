@@ -82,6 +82,8 @@ export interface PlaybackDiagnostics {
 
 export interface CurrentTurnSnapshot {
   speaker_session?: Record<string, unknown> // 激活会话声纹诊断，不含原始向量。
+  admission_phase?: string // admission_phase（本轮首段积累、暂缓或放行阶段）。
+  speaker_summary?: Record<string, unknown> // speaker_summary（声纹语义参考，与原话分开）。
 
   turn_id?: string | null
   input_runtime?: boolean
@@ -129,10 +131,14 @@ export interface CurrentTurnSnapshot {
     reason?: string
     degraded?: boolean
     anti_spoofing?: string
+    admission_phase?: string // 本轮准入阶段。
+    speaker_summary?: Record<string, unknown> // 本轮声纹摘要。
   }
 }
 
 export interface LatencyValues {
+  speaker_wait_ms?: number | null // speaker_wait_ms（从发言开始到身份放行，毫秒）。
+  speaker_inference_ms?: number | null // speaker_inference_ms（首段推理耗时，毫秒）。
   first_segment_ms?: number | null
   smart_turn_ms?: number | null
   sensevoice_refine_ms?: number | null

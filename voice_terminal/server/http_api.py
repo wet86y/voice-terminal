@@ -18,6 +18,7 @@ from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..application.ports import validate_endpoint_url
 from ..speaker.enrollment import EnrollmentRejectedError
 from ..speaker.enrollment_capture import EnrollmentCaptureError
+from ..speaker.audit import audit as speaker_audit, parameter_snapshot
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
 from ..model_registry.vault import CredentialVaultUnavailable
 from .product import (
@@ -251,6 +252,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
                 "continuity_relaxation": _speaker_relaxation(runtime.config.speaker),
+                "intra_turn_relaxation": runtime.config.speaker.intra_turn_relaxation,
                 "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             },
             "compute": {
@@ -1286,6 +1288,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             return await apply_speaker_settings(body)
 
     async def apply_speaker_settings(body: dict[str, Any]) -> dict[str, Any]:
+        speaker_audit("settings_submitted（设置提交）", submitted=parameter_snapshot(body))
         try:
             store = product_store_or_404()
             if getattr(runtime, "application_initializing", False) is True:
@@ -1294,6 +1297,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if enabling and not runtime.speaker_profile.available:
                     raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
                 value = await asyncio.to_thread(store.save_speaker, body)
+                speaker_audit("settings_saved（初始化期间保存）", saved=value, reason="initializing")
                 return {"settings": {"speaker": value}, **await apply_saved_product_settings(store, "声纹设置")}
             previous_speaker = store.settings_only().get("speaker", {
                 "mode": "off",
@@ -1309,6 +1313,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if not await runtime.ensure_speaker_worker():
                     raise HTTPException(status_code=422, detail="声纹 Worker（工作进程）不可用，暂时不能启用拦截或主人打断")
             value = await asyncio.to_thread(store.save_speaker, body)
+            speaker_audit("settings_saved（设置已保存）", saved=value)
             try:
                 async with runtime._session_lock:
                     applied = await runtime.set_speaker_settings(value)
@@ -1318,7 +1323,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 # Runtime availability is part of the filter-mode contract;
                 # restore the previous persisted mode when live application
                 # cannot complete.
-                await asyncio.to_thread(store.save_speaker, previous_speaker)
+                await asyncio.to_thread(store.restore_speaker, previous_speaker)
+                try:
+                    async with runtime._session_lock:
+                        await runtime.set_speaker_settings(previous_speaker, restoring=True)
+                except Exception as rollback_error:
+                    speaker_audit("runtime_rollback_failed（运行参数回滚失败）", reason=str(rollback_error)[:240])
+                speaker_audit("settings_rollback（设置回滚）", saved=previous_speaker, reason="runtime_apply_failed")
                 raise
             return {
                 "settings": {"speaker": value},

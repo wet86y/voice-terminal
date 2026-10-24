@@ -26,6 +26,7 @@ from ..speaker.client import SpeakerWorkerClient
 from ..speaker.contracts import SpeakerDecision, SpeakerObservation, SpeakerMode, SpeakerState
 from ..speaker.router import SpeakerRouter
 from ..speaker.session import SessionSpeakerPolicy
+from ..speaker.audit import audit as speaker_audit, transcript_audit
 from ..config import SpeakerConfig
 from ..speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 from ..session.ambient import AmbientTranscriptStore
@@ -52,11 +53,10 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._sub_sequences: dict[str, int] = {}
         self._sub_generations: dict[str,int] = {} # 识别流所属输入代次。
         self.owner_only_barge_in = bool(kwargs.pop("owner_only_barge_in", False))
-        self.speaker_wait_ms = int(kwargs.pop("speaker_wait_ms", 150))
-        self.speaker_window_ms = int(kwargs.pop("speaker_window_ms", 2000))
-        self.speaker_min_speech_ms = int(kwargs.pop("speaker_min_speech_ms", 700))
-        self.speaker_min_turn_speech_ms = int(kwargs.pop("speaker_min_turn_speech_ms", 2000))
-        self.speaker_min_window_speech_ratio = float(kwargs.pop("speaker_min_window_speech_ratio", 0.40))
+        # 旧调用方参数只作兼容消费；实际设置统一由speaker_config（声纹配置）提供。
+        for legacy_key in ("speaker_wait_ms", "speaker_window_ms", "speaker_min_speech_ms",
+                           "speaker_min_turn_speech_ms", "speaker_min_window_speech_ratio"):
+            kwargs.pop(legacy_key, None)
         self.ambient_store: AmbientTranscriptStore | None = kwargs.pop("ambient_store", None)
         super().__init__(**kwargs)
         self.options = options
@@ -140,13 +140,12 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             self.speaker_policy.tune(self.speaker_config)
         current = self.speaker_sensor
         if current is not None and current.embed_pcm == client.embed_pcm:
-            if current.confirm_threshold != self.speaker_config.confirm_threshold or current.non_owner_threshold != self.speaker_config.non_owner_threshold:
+            if current.confirm_threshold != self.speaker_config.confirm_threshold:
                 self._speaker_snapshot = None
                 self._speaker_snapshot_turn_id = None
                 self._speaker_snapshot_generation = None
                 self._speaker_snapshot_barge_id = None
             current.confirm_threshold = self.speaker_config.confirm_threshold
-            current.non_owner_threshold = self.speaker_config.non_owner_threshold
             current.window_samples = self.speaker_config.context_max_ms * 16
             current.buffer_samples = max(4000, self.speaker_config.context_max_ms) * 16
             return
@@ -156,7 +155,6 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             buffer_ms=max(4000, self.speaker_config.context_max_ms),
             min_voiced_ms=45, min_decision_voiced_ms=45,
             confirm_threshold=self.speaker_config.confirm_threshold,
-            non_owner_threshold=self.speaker_config.non_owner_threshold,
         )
         self._speaker_snapshot = None
         self._speaker_snapshot_turn_id = None
@@ -169,6 +167,9 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         if mode != "filter":
             return False
         self._ensure_speaker_policy()
+        turn = self.speaker_policy.turns.get(turn_id)
+        if turn is not None:
+            return not turn.admitted  # 校准宽限不能绕过新轮次的首段准入。
         if self.speaker_policy.grace():
             return False
         ws = self.workspace
@@ -204,6 +205,11 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         ws = self.workspace
         if ws is None or ws.turn_id != enriched.turn_id or ws.generation != enriched.generation:
             return
+        if ws.turn_id in getattr(getattr(self, "speaker_policy", None), "turns", {}):
+            speaker_audit("legacy_observation（旧回调仅供诊断）", turn_id=ws.turn_id,
+                          generation=ws.generation, quality=enriched.quality,
+                          reason="unified_turn_policy")
+            return  # 正式轮次的准入及阈值只有会话策略一个消费者。
         ws.speaker_observations.append(enriched.to_payload(include_embedding=False))
         if len(ws.speaker_observations) > 16:
             del ws.speaker_observations[:-8]
@@ -227,17 +233,24 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             return None
         state = self.speaker_policy.state(ws.turn_id, ws.generation)
         admitted = self.speaker_policy.admitted_text(ws.turn_id)
-        scores = self.speaker_policy.last_scores
+        turn = self.speaker_policy.turns.get(ws.turn_id)
+        scores = turn.scores if turn is not None else self.speaker_policy.last_scores
         decision = SpeakerDecision(turn_id=ws.turn_id, generation=ws.generation,
             user_id="owner" if state in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY} else None,
             state=state, similarity=scores.get("combined_score"), threshold_used=scores.get("threshold_used"),
-            speech_ms=0, observation_count=len(self.speaker_policy.evidence), continuity_source=None,
-            route="main" if mode != "filter" or admitted else "pending",
+            speech_ms=turn.speech_ms if turn is not None else 0,
+            observation_count=turn.observation_count if turn is not None else len(self.speaker_policy.evidence),
+            continuity_source=turn.continuity_grant.get("source_turn_id") if turn is not None else None,
+            route="main" if mode != "filter" or (turn.admitted if turn else admitted) else "pending",
             reason="streaming_admission" if admitted else "awaiting_speaker_evidence")
         ws.speaker_decision = decision.to_payload()
+        if turn:
+            ws.speaker_summary = turn.summary()
+            ws.admission_phase = turn.phase
+            ws.speaker_decision.update(admission_phase=turn.phase, speaker_summary=turn.summary())
         ws.speaker_state = state.value
-        self.state.current.update(speaker_decision=decision.to_payload(), speaker_session=self.speaker_policy.snapshot())
-        await self._publish(event("speaker.decision", ws.turn_id, decision=decision.to_payload()))
+        self.state.current.update(speaker_decision=dict(ws.speaker_decision), speaker_session=self.speaker_policy.snapshot())
+        await self._publish(event("speaker.decision", ws.turn_id, decision=dict(ws.speaker_decision)))
         return decision
 
     def _track(self, task: asyncio.Task | None) -> None:
@@ -409,6 +422,19 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         ws = self.workspace
         if ws is None:
             return
+        if type_.startswith("transcript.") and isinstance(payload.get("text"), str):
+            previous = getattr(ws, "_speaker_audit_texts", {})
+            text = payload["text"]
+            if previous.get(type_) != text:
+                revision = getattr(ws, "_speaker_audit_revision", 0)+1
+                transcript_audit(ws.turn_id, type_, text, previous.get(type_, ""), revision,
+                                 generation=ws.generation, settings_revision=self.speaker_policy.settings_revision,
+                                 speaker_summary=dict(ws.speaker_summary))
+                previous[type_] = text
+                ws._speaker_audit_texts, ws._speaker_audit_revision = previous, revision
+        elif type_ in {"turn.started", "turn.endpoint_candidate", "turn.committed", "turn.completed"}:
+            speaker_audit(type_+"（输入时间线）", turn_id=ws.turn_id, generation=ws.generation,
+                          timings=dict(ws.timings), speaker_summary=dict(ws.speaker_summary))
         self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
         await self._publish(event(type_, ws.turn_id, output_generation=ws.generation,
                                   workspace=ws.snapshot(), **payload))
@@ -671,6 +697,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                     if activity.speech_ended:
                         self._close_acoustic_segment(ws)
                 elif decision.confirmed or hard_boundary:
+                    if hard_boundary:
+                        ws.hard_closed = True  # 冻结等待期间越过最长时限，也属于不可撤销的轮次边界。
                     # Invalidate the old generation before publishing the
                     # interruption state so a concurrent LLM delta cannot
                     # enqueue stale TTS between the snapshot and cancellation.
@@ -728,7 +756,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self.conversation.begin_turn(turn_id)
         self.workspace = ws = TurnWorkspace(
             turn_id,
-            started_at=frame.captured_at,
+            started_at=frame.captured_at - max(0, frame.end_sample-self._speaker_turn_start_sample)/16000,
             speaker_mode=self.speaker_mode,
         )
         if self.speaker_router is not None:
@@ -772,8 +800,13 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=turn_id)
 
     def _prime_speaker_turn_audio(self, ws: TurnWorkspace, frame: AudioFrame) -> None:
-        """声纹仅由心跳单次推理，不再发送第二条固定窗口流。"""
-        return
+        """只登记逻辑轮次；首段音频由既有采集工作区保留。"""
+        if ws.speaker_mode != "off" or getattr(self, "owner_only_barge_in", False):
+            self._ensure_speaker_policy()
+            turn = self.speaker_policy.begin_turn(ws.turn_id,
+                start_sample=self._speaker_turn_start_sample if self._speaker_turn_start_sample is not None else frame.start_sample,
+                generation=ws.generation, started_at=ws.started_at, filtering=ws.speaker_mode == "filter")
+            ws.admission_phase = turn.phase
 
     def _new_sub(self, pcm: bytes) -> None:
         self._ensure_speaker_policy()
@@ -802,6 +835,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
 
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
+        self._ensure_speaker_policy()
+        self.speaker_policy.resume_turn(ws.turn_id)
         self._speaker_turn_start_sample = (
             self._speech_start_sample if self._speech_start_sample is not None else frame.start_sample
         )
@@ -845,6 +880,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._turn_cancel = asyncio.Event()
         self._active_input = True
         keep_timings = {"turn_started", "first_segment", "asr_first_text"}
+        keep_timings.update(k for k in ws.timings if k.startswith("speaker_"))
         keep_timings.update(k for k in ws.timings if k.startswith("tts_prewarm"))
         ws.timings = {k: v for k, v in ws.timings.items() if k in keep_timings}
         self._turn_timings[ws.turn_id] = ws.timings
@@ -905,8 +941,10 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             self._resume_started = frame.end_sample
         self._queue_asr(AudioChunk(self._sub_id, b"", is_final=True))
         ws.timings["endpoint_accepted"] = time.monotonic()
-        if "last_speech" not in ws.timings:
+        if "last_speech" not in ws.timings or (reason == "max_duration" and self._speech_start_sample is not None):
             ws.timings["last_speech"] = frame.captured_at
+        self._ensure_speaker_policy()
+        self.speaker_policy.boundary(ws.turn_id, at=ws.timings["last_speech"], reason=reason)
         await self._detail("turn.finalizing", reason=reason)
         await self._state_event(TerminalState.FINALIZING, listening=True, turn_id=ws.turn_id)
         self._completion_task = asyncio.create_task(self._complete(ws, token, self._sub_id, self._refine_task))
@@ -1006,8 +1044,10 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 end=origin+int(span.get("audio_end_sample", 0)),
                 text=str(span.get("text_delta", "")), bypass=ws.speaker_mode != "filter")
         flush = getattr(self, "_flush_speaker_admissions", None)
-        if callable(flush): await flush()
         self._sub_parts[sub_id] = text or self._sub_parts[sub_id]
+        if ws.speaker_mode == "filter" and ws.turn_id in self.speaker_policy.turns:
+            self.speaker_policy.set_turn_text(ws.turn_id, "".join(self._sub_parts.values()), generation=ws.generation)
+        if callable(flush): await flush()
         stream = self._enhancement_streams.get(sub_id)
         if stream is not None:
             stream["text"] = self._sub_parts[sub_id]
@@ -1084,6 +1124,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             "wake_detection_ms": None, "asr_first_text_ms": delta("asr_first_text", "start"),
             "speech_end_confirmation_ms": delta("endpoint_accepted", "last_speech"),
             "asr_final_to_commit_ms": delta("commit", "asr_final"),
+            "speaker_wait_ms": delta("speaker_admitted", "turn_started"),
+            "speaker_inference_ms": delta("speaker_inference_completed", "speaker_inference_started"),
             "llm_first_token_ms": delta("first_token", "llm_request"),
             "llm_request_to_first_tts_text_ms": delta("first_tts_text", "llm_request"),
             "tts_text_to_first_audio_ms": delta("first_audio", "first_tts_text"),
@@ -1196,6 +1238,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
     ) -> None:
         self._ensure_speaker_policy()
         ws = self.workspace
+        if ws is not None:
+            self.speaker_policy.close_turn(ws.turn_id, completed=reason == "completed", reason=reason)
         if record and ws is not None and reason != "interrupted" and ws.turn_id not in self._interrupted_turns:
             if snapshot is None and self.player:
                 snapshot = self._stop_playback_snapshot(ws.playback_key)

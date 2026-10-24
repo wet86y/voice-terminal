@@ -119,6 +119,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.6,
       continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.5,
       continuity_relaxation: typeof speaker.continuity_relaxation === 'number' ? speaker.continuity_relaxation : Math.max(0, Math.min(0.2, Number(speaker.confirm_threshold ?? 0.6) - Number(speaker.continuity_threshold ?? 0.5))),
+      intra_turn_relaxation: typeof speaker.intra_turn_relaxation === 'number' && Number.isFinite(speaker.intra_turn_relaxation) ? speaker.intra_turn_relaxation : Number((typeof speaker.continuity_relaxation === 'number' && Number.isFinite(speaker.continuity_relaxation) ? speaker.continuity_relaxation : Math.max(0, Math.min(0.2, Number(speaker.confirm_threshold ?? 0.6) - Number(speaker.continuity_threshold ?? 0.5)))).toFixed(4)),
       owner_only_barge_in: speaker.owner_only_barge_in === true,
     },
     compute: {

@@ -15,7 +15,7 @@ import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import SpeakerSettings from './panels/SpeakerSettings.vue'
-import { SPEAKER_DEFAULTS, SPEAKER_FIELDS } from './speaker-policy'
+import { SPEAKER_CONTROL_DEFAULTS, SPEAKER_FIELDS } from './speaker-policy'
 import { provideProductContext } from './product-context'
 import { useWorkspaceResources } from './useWorkspaceResources'
 import type { WorkbenchModel } from '../interface/workbench'
@@ -136,7 +136,7 @@ describe('正式界面的真实控件交互', () => {
     expect(tasks).toHaveBeenCalledTimes(afterUnmount)
   })
 
-  it('所有高级声纹控件可编辑并随同一次保存提交', async () => {
+  it('声纹只保留四个滑块，保存只提交四项参数和运行开关', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
     allowBusinessReady(value)
@@ -144,31 +144,109 @@ describe('正式界面的真实控件交互', () => {
     await flushPromises()
     const changed: Record<string,number> = {}
     for (const field of SPEAKER_FIELDS) {
-      changed[field.key] = SPEAKER_DEFAULTS[field.key] + field.step
-      await wrapper.get(`input[aria-label="${field.label}"]`).setValue(changed[field.key])
+      changed[field.key] = SPEAKER_CONTROL_DEFAULTS[field.key] + field.step
+      const input = wrapper.get(`input[aria-label="${field.label}"]`)
+      expect(input.attributes('min')).toBe(String(field.min))
+      expect(input.attributes('max')).toBe(String(field.max))
+      await input.setValue(changed[field.key])
     }
-    await button(wrapper, '保存声纹阈值').trigger('click')
+    expect(wrapper.findAll('input[type="range"]')).toHaveLength(4)
+    expect(wrapper.findAll('input[type="number"]')).toHaveLength(0)
+    expect(wrapper.find('.speaker-advanced').exists()).toBe(false)
+    await button(wrapper, '保存声纹参数').trigger('click')
     expect(save).toHaveBeenCalledWith(expect.objectContaining(changed))
+    expect(Object.keys(save.mock.calls[0]![0] as object).sort()).toEqual([...Object.keys(changed), 'mode', 'owner_only_barge_in'].sort())
+  })
+  it('声纹设置说明展示首段确认、整轮放行与异声提示', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({ available: true, templates: [] })
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({ registered: true, service: 'READY', worker_connected: true })
+    await flushPromises()
+    value.voice.current.admission_phase = 'relaxed'
+    value.voice.current.speaker_summary = { admitted: true, foreign_voice_suspected: true }
+    await flushPromises()
+    expect(wrapper.text()).toContain('本轮主人已确认，持续放行')
+    expect(wrapper.text()).toContain('本轮存在疑似外来声纹或识别波动，文字保持完整')
+    expect(wrapper.text()).toContain('约1.2秒音频核对')
+    expect(wrapper.text()).not.toContain('初始阶段无条件放行')
   })
   it('声纹阈值只保存页面草稿，越过旧界限后保存按钮仍可用并提交放宽量', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
     allowBusinessReady(value)
-    const save = vi.spyOn(productApi, 'saveSpeaker').mockImplementation(async submitted => ({ settings: { speaker: submitted } } as never))
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockImplementation(async submitted => {
+      const speaker = submitted as typeof DEFAULT_SETTINGS.speaker
+      return { settings: { speaker: { ...DEFAULT_SETTINGS.speaker, ...speaker,
+        continuity_threshold: speaker.confirm_threshold - (speaker.continuity_relaxation ?? .1) } } } as never
+    })
     await flushPromises()
     const sliders = wrapper.findAll('.speaker-thresholds input[type="range"]')
     await sliders[0]!.setValue('0.30')
-    await sliders[1]!.setValue('0.20')
+    await sliders[2]!.setValue('0.20')
     await flushPromises()
     expect(save).not.toHaveBeenCalled()
-    expect(button(wrapper, '保存声纹阈值').attributes('disabled')).toBeUndefined()
-    await button(wrapper, '保存声纹阈值').trigger('click')
+    expect(button(wrapper, '保存声纹参数').attributes('disabled')).toBeUndefined()
+    await button(wrapper, '保存声纹参数').trigger('click')
     await flushPromises()
     expect(save).toHaveBeenCalledOnce()
     expect(save.mock.calls[0]![0]).toMatchObject({ confirm_threshold: 0.30, continuity_relaxation: 0.20 })
-    expect((save.mock.calls[0]![0] as { continuity_threshold: number }).continuity_threshold).toBeCloseTo(0.10)
+    expect(save.mock.calls[0]![0]).not.toHaveProperty('continuity_threshold')
     expect(value.settings.speaker.confirm_threshold).toBe(0.30)
     expect(value.speakerForm.continuity_relaxation).toBe(0.20)
+  })
+
+  it('轮内与跨轮放宽分别保存，显示的阈值从同一基准派生且不叠减', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockImplementation(async submitted => {
+      const speaker = submitted as typeof DEFAULT_SETTINGS.speaker
+      return { settings: { speaker: { ...DEFAULT_SETTINGS.speaker, ...speaker,
+        continuity_threshold: speaker.confirm_threshold - (speaker.continuity_relaxation ?? .1) } } } as never
+    })
+    await flushPromises()
+    const sliders = wrapper.findAll('.speaker-thresholds input[type="range"]')
+    await sliders[0]!.setValue('0.70')
+    await sliders[2]!.setValue('0.05')
+    await wrapper.get('input[aria-label="会话内连续放宽余量"]').setValue('0.15')
+    expect(wrapper.text()).toContain('轮内阈值：0.55；跨轮阈值：0.65')
+    await button(wrapper, '保存声纹参数').trigger('click')
+    await flushPromises()
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ confirm_threshold: .7,
+      continuity_relaxation: .05, intra_turn_relaxation: .15 }))
+    expect(value.settings.speaker.intra_turn_relaxation).toBe(.15)
+    expect(value.settings.speaker.continuity_relaxation).toBe(.05)
+    expect(value.speakerForm.continuity_threshold).toBeCloseTo(.65)
+  })
+
+  it.each(['会话内连续放宽余量', '会话间连续放宽余量'])('负派生阈值在保存前阻止请求并保留%s草稿', async label => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    const save = vi.spyOn(productApi, 'saveSpeaker')
+    await flushPromises()
+    await wrapper.get('input[aria-label="主人确认阈值"]').setValue('0.10')
+    await wrapper.get(`input[aria-label="${label}"]`).setValue('0.20')
+    await button(wrapper, '保存声纹参数').trigger('click'); await flushPromises()
+    expect(save).not.toHaveBeenCalled()
+    expect(value.lastError.value).toContain('小于0')
+    expect(value.speakerForm.confirm_threshold).toBe(.1)
+    expect(value.settings.speaker.confirm_threshold).toBe(.6)
+    expect(wrapper.get('[role="alert"]').text()).toContain(label)
+  })
+
+  it('恢复默认只更新四项，隐藏参数与运行开关保持原值', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value); await flushPromises()
+    Object.assign(value.speakerForm, { mode: 'observe', owner_only_barge_in: true, context_max_ms: 6400,
+      pending_ttl_ms: 45000, calibration_similarity: .7, continuity_window_ms: 4000,
+      confirm_threshold: .7, intra_turn_relaxation: .3, continuity_relaxation: .2, session_weight: .8 })
+    await button(wrapper, '恢复四项默认值').trigger('click')
+    expect(value.speakerForm).toMatchObject({ ...SPEAKER_CONTROL_DEFAULTS, mode: 'observe', owner_only_barge_in: true,
+      context_max_ms: 6400, pending_ttl_ms: 45000, calibration_similarity: .7, continuity_window_ms: 4000 })
   })
 
   it('DSH（代理执行宿主）轨迹保留所有当前工具和输出，授权按钮携带原请求与运行序号', async () => {
@@ -249,7 +327,7 @@ describe('正式界面的真实控件交互', () => {
     await wrapper.get('input[role="switch"]').setValue(true)
     await flushPromises()
     expect(save).toHaveBeenCalledTimes(1)
-    expect(save).toHaveBeenCalledWith(saved)
+    expect(save).toHaveBeenCalledWith({ mode: saved.mode, confirm_threshold: saved.confirm_threshold, owner_only_barge_in: true })
     expect(value.settings.speaker.owner_only_barge_in).toBe(true)
     expect(value.speakerForm.confirm_threshold).toBe(0.85)
     expect(wrapper.get('.speaker-barge-status strong').text()).toBe('主人打断已启用')
