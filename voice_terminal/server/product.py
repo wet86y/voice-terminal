@@ -25,7 +25,7 @@ from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
-from ..speaker.settings import TUNING_DEFAULTS, validate_tuning
+from ..speaker.settings import TUNING_DEFAULTS, validate_controls, validate_tuning
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig, resolve_tts_sample_rate, validate_tts_inference_steps
 from ..custom_instructions import validate_entries
 from ..asr.hotwords import DEFAULT_HOTWORDS, validate_hotwords
@@ -321,11 +321,12 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     speaker["confirm_threshold"] = round(confirm, 4)
     speaker["continuity_relaxation"] = round(relaxation, 4)
     speaker["continuity_threshold"] = round(max(0.0, confirm - relaxation), 4)
+    if isinstance(raw_speaker, Mapping) and "intra_turn_relaxation" not in raw_speaker:
+        speaker["intra_turn_relaxation"] = round(relaxation, 4)
     try:
-        speaker.update(validate_tuning(speaker, continuity=speaker["continuity_threshold"]))
+        speaker.update(validate_tuning(speaker))
     except ValueError:
         speaker.update(TUNING_DEFAULTS)
-        speaker["non_owner_threshold"] = min(0.35, speaker["continuity_threshold"] - 0.01)
     return result
 
 
@@ -358,7 +359,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("shadow", ("experimental_context_gate_enabled",)),
         ("approvals", ("voice_confirmation_enabled", "continuous_enabled")),
         ("tts", ("backend", "local_model", "online_model", "online_voice_id", "local_optimization", "acoustic_continuation", "inference_steps_by_model", "active_voice_by_model")),
-        ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in")),
+        ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "intra_turn_relaxation", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
         if section is None:
@@ -421,8 +422,9 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "speaker" and field in {"confirm_threshold", "continuity_threshold"}:
                 invalid = invalid or not isinstance(candidate, (int, float)) or isinstance(candidate, bool) or not 0 <= float(candidate) <= 1
-            elif section_name == "speaker" and field == "continuity_relaxation":
-                invalid = invalid or type(candidate) not in {int, float} or not 0 <= float(candidate) <= 0.20
+            elif section_name == "speaker" and field in {"continuity_relaxation", "intra_turn_relaxation"}:
+                maximum = 0.30 if field == "intra_turn_relaxation" else 0.20
+                invalid = invalid or type(candidate) not in {int, float} or not 0 <= float(candidate) <= maximum
     speaker_section = value.get("speaker")
     if isinstance(speaker_section, Mapping):
         try:
@@ -571,7 +573,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
         continuity_relaxation=relaxation,
-        **validate_tuning(speaker, continuity=max(0.0, confirm_threshold-relaxation)),
+        **validate_tuning(speaker),
     )
     tts = settings.get("tts") if isinstance(settings.get("tts"), Mapping) else {}
     backend = tts.get("backend", config.tts.backend)
@@ -1143,10 +1145,12 @@ class ProductSettingsStore:
     @_settings_locked
     def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """原子保存声纹策略；兼容旧四字段请求，不清除新增参数。"""
-        base = {"mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in"}
+        # non_owner_threshold（已淘汰的独立非主人阈值）：接受旧客户端字段但不保存或使用。
+        base = {"mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in", "non_owner_threshold"}
         if set(payload) - (base | set(TUNING_DEFAULTS)) or not {"mode", "confirm_threshold", "owner_only_barge_in"} <= set(payload):
             raise ProductSettingsError("声纹设置字段无效或缺少模式、主人阈值、主人打断开关")
         candidate = {**self._settings["speaker"], **payload}
+        candidate.pop("non_owner_threshold", None)
         if candidate["mode"] not in {"off", "observe", "filter"} or type(candidate["owner_only_barge_in"]) is not bool:
             raise ProductSettingsError("声纹模式或主人打断开关无效")
         try:
@@ -1163,11 +1167,15 @@ class ProductSettingsStore:
             import math
             if type(confirm) not in {int, float} or type(relaxation) not in {int, float} or not math.isfinite(confirm) or not math.isfinite(relaxation) or not 0 <= confirm <= 1 or not 0 <= relaxation <= 0.20:
                 raise ValueError("主人阈值必须在0至1之间，连续放宽量必须在0至0.20之间")
+            # 按最终保存精度校验，防止先通过后因基准值舍入产生负阈值。
+            confirm, relaxation = round(confirm, 4), round(relaxation, 4)
+            tuning = validate_tuning(candidate)
+            if (confirm != self._settings["speaker"]["confirm_threshold"] or
+                    any(key in payload for key in ("intra_turn_relaxation", "continuity_relaxation", "continuity_threshold", "session_weight"))):
+                validate_controls({**candidate, **tuning, "confirm_threshold": confirm,
+                                   "continuity_relaxation": relaxation}, check_weight="session_weight" in payload)
+            # 仅切开关时可原样承接旧配置；新编辑已在上面拒绝负派生值。
             continuity = max(0.0, confirm - relaxation)
-            # 旧客户端未传反证参数时，将新增默认值约束到旧阈值下方。
-            if "non_owner_threshold" not in payload and candidate["non_owner_threshold"] >= continuity:
-                candidate["non_owner_threshold"] = continuity - 0.01
-            tuning = validate_tuning(candidate, continuity=continuity)
         except (TypeError, ValueError) as exc:
             raise ProductSettingsError(str(exc)) from exc
         saved = {"mode": candidate["mode"], "owner_only_barge_in": candidate["owner_only_barge_in"],
@@ -1176,6 +1184,14 @@ class ProductSettingsStore:
         self._settings["speaker"] = saved
         self._save_settings()
         return deepcopy(saved)
+
+    @_settings_locked
+    def restore_speaker(self, previous: Mapping[str, Any]) -> None:
+        """仅供运行应用失败时恢复刚才的可信快照，兼容历史权重及派生值。"""
+        restored = deepcopy(dict(previous))
+        restored.update(validate_tuning(restored))
+        self._settings["speaker"] = restored
+        self._save_settings()
 
     @_settings_locked
     def save_compute(self, payload: Mapping[str, Any], *,
@@ -1617,9 +1633,18 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
             "turn_id", "generation", "user_id", "state", "similarity",
             "threshold_used", "speech_ms", "observation_count",
             "continuity_source", "route", "reason", "degraded", "anti_spoofing",
+            "admission_phase", "speaker_summary",
         )
         if key in raw_speaker
     }
+    raw_summary = current.get("speaker_summary") or raw_speaker.get("speaker_summary")
+    safe_summary = ({key: raw_summary[key] for key in (
+        "admission_phase", "initial_identity", "admitted", "owner_confirmed", "observation_state", "recovered",
+        "continuity_source", "boundary_revision", "boundary_reason",
+        "foreign_voice_suspected", "reason", "closed", "interpretation") if key in raw_summary}
+        if isinstance(raw_summary, Mapping) else {})
+    if "speaker_summary" in safe_speaker:
+        safe_speaker["speaker_summary"] = safe_summary
     # The bootstrap rail renders the same server-ordered conversation the live
     # session publishes, so an offline page shows the identical history.
     raw_conversation = value.get("conversation") if isinstance(value.get("conversation"), Mapping) else {}
@@ -1662,6 +1687,8 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
                 "tts_text": _safe_display_text(current.get("tts_text"), limit=4000),
                 "tts_status": _safe_display_text(current.get("tts_status"), limit=120),
                 "speaker_decision": safe_speaker,
+                "admission_phase": _safe_display_text(current.get("admission_phase"), limit=80),
+                "speaker_summary": safe_summary,
             },
         },
     }

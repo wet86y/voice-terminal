@@ -17,6 +17,8 @@ from ..session.contracts import DeliveryReport
 from ..session.conversation_log import USER_TURN, speech_kind
 from ..speaker.rolling import RollingSpeakerIdentity
 from ..speaker.contracts import SpeakerState
+from ..speaker.turn_admission import FIRST_AUDIO_MS
+from ..speaker.audit import audit as speaker_audit, transcript_audit
 
 
 logger = logging.getLogger(__name__)
@@ -161,19 +163,30 @@ class EpisodeController(RealtimeController):
         return runtime
 
     def _speaker_admit_turn(self, turn_id: str) -> bool:
+        turn = self.speaker_policy.turns.get(turn_id)
+        if turn is not None:
+            return turn.admitted
         if self.speaker_mode != "filter": return True
         return bool(self.speaker_policy.admitted_text(turn_id))
 
     def _speaker_defer_turn(self, turn_id: str) -> bool:
+        turn = self.speaker_policy.turns.get(turn_id)
+        if turn is not None:
+            return not turn.admitted
         return self.speaker_mode == "filter" and not self.speaker_policy.admitted_text(turn_id)
 
     async def _flush_speaker_admissions(self) -> None:
         """一个事件批量恢复按原始顺序排列的获准轮次，正文修订只发布一次。"""
-        if self.speaker_mode != "filter": return
+        if self.speaker_mode != "filter" and not any(
+                turn.filtering and not turn.closed for turn in self.speaker_policy.turns.values()): return
         changes = []
         activation_id = self.speaker_policy.activation_id  # activation_id（准入恢复所属录音窗口）。
         for item in self.speaker_policy.admitted_turns():
+            turn = self.speaker_policy.turns.get(item["turn_id"])
+            if turn is not None and not turn.filtering:
+                continue
             if self._speaker_published.get(item["turn_id"]) == item["text"]: continue
+            previous_text = self._speaker_published.get(item["turn_id"], "")
             raw_text = item["text"]
             if getattr(self, "hotwords", None) is not None:
                 correction = await self.hotwords.finalized(item["text"], (item["turn_id"], item.get("generation", 0)))
@@ -183,6 +196,11 @@ class EpisodeController(RealtimeController):
                 if self.speaker_policy.admitted_text(item["turn_id"]) != raw_text:
                     continue
             self._speaker_published[item["turn_id"]] = raw_text
+            transcript_audit(item["turn_id"], "admitted（实际放行全文）", item["text"],
+                             previous_text, self.speaker_policy.turns[item["turn_id"]].text_revision
+                             if item["turn_id"] in self.speaker_policy.turns else 0,
+                             settings_revision=self.speaker_policy.settings_revision,
+                             speaker_summary=item.get("speaker_summary", {}))
             changes.append(item)
         if len(self._speaker_published) > 64:
             self._speaker_published = dict(list(self._speaker_published.items())[-64:])
@@ -194,6 +212,82 @@ class EpisodeController(RealtimeController):
             for ws in {id(value["workspace"]): value["workspace"]
                        for value in getattr(self, "_enhancement_streams", {}).values()}.values():
                 self._schedule_segment_refinements(ws)
+
+    async def _refresh_turn_speaker_summary(self, ws) -> None:
+        summary = self.speaker_policy.turn_summary(ws.turn_id)
+        if not summary or ws.speaker_summary == summary:
+            return
+        ws.speaker_summary, ws.admission_phase = summary, summary["admission_phase"]
+        inputs = getattr(self.episode, "inputs", {})
+        if ws.turn_id in inputs:
+            inputs[ws.turn_id]["speaker_summary"] = dict(summary)
+        self.state.current.update(admission_phase=ws.admission_phase, speaker_summary=summary)
+        await self._publish(event("speaker.admission", ws.turn_id, admission_phase=ws.admission_phase,
+                                  speaker_summary=summary, settings_revision=self.speaker_policy.settings_revision))
+
+    def _ensure_first_speaker_decision(self, ws, *, force=False, sequence=0):
+        """挂在现有心跳；短句闭段可提前启动，整个推理不阻塞采集。"""
+        turn = getattr(self.speaker_policy, "turns", {}).get(ws.turn_id)
+        if turn is None or not turn.first_pending:
+            return None
+        task = getattr(ws, "_speaker_first_task", None)
+        if task is not None and not task.done():
+            return task
+        start = turn.start_sample
+        end = min(ws.audio.end_sample, start + FIRST_AUDIO_MS * 16)
+        if not force and end-start < FIRST_AUDIO_MS*16:
+            return None
+        origin = ws.audio.start_sample
+        pcm = (bytes(ws.audio.pcm[max(0, start-origin)*2:max(0, end-origin)*2:])
+               if origin is not None and origin <= start else b"")
+        activation = self.speaker_policy.activation_id
+        revision = self.speaker_policy.settings_revision
+        sensor = self.speaker_sensor
+        speech_ms = sensor.speech_ms(start, end) if sensor is not None else 0
+        turn.phase = "inferring"
+        ws.admission_phase = turn.phase
+        self.state.current["admission_phase"] = turn.phase
+        ws.timings.setdefault("speaker_first_ready", time.monotonic())
+
+        async def infer():
+            started = time.monotonic()
+            ws.timings["speaker_inference_started"] = started
+            speaker_audit("first_inference_started（首段推理开始）", turn_id=ws.turn_id,
+                          generation=ws.generation, activation_id=activation, settings_revision=revision,
+                          sequence=sequence, start_sample=start, end_sample=end, speech_ms=speech_ms)
+            vector, quality = (), "insufficient_audio"
+            try:
+                if pcm:
+                    vector = await self.speaker_client.embed_pcm(pcm)
+                    quality = "ready"
+            except Exception as exc:
+                quality = getattr(exc, "quality", None) or "unavailable"
+                speaker_audit("first_inference_failed（首段推理异常）", turn_id=ws.turn_id,
+                              settings_revision=revision, reason=f"{type(exc).__name__}: {str(exc)[:240]}")
+            completed = time.monotonic()
+            if turn.closed or turn is not self.speaker_policy.turns.get(ws.turn_id) or activation != self.speaker_policy.activation_id:
+                speaker_audit("result_discarded（过期结果）", turn_id=ws.turn_id, reason="turn_closed_or_activation_changed")
+                return
+            if revision != self.speaker_policy.settings_revision:
+                turn.phase = "collecting"
+                speaker_audit("result_discarded（过期设置结果）", turn_id=ws.turn_id,
+                              settings_revision=revision, reason="settings_changed")
+                return
+            ws.timings["speaker_inference_completed"] = completed
+            elapsed = (completed-started)*1000
+            if elapsed > 100:
+                self.speaker_policy.timeout_count += 1
+                speaker_audit("inference_late（软预算迟到仍消费）", turn_id=ws.turn_id, latency_ms=elapsed)
+            self.speaker_policy.observe_turn(ws.turn_id, vector, start=start, end=end,
+                speech_ms=speech_ms, first=True, quality=quality, sequence=sequence, latency_ms=elapsed)
+            if turn.admitted:
+                ws.timings.setdefault("speaker_admitted", completed)
+            await self._refresh_turn_speaker_summary(ws)
+            await self._flush_speaker_admissions()
+        task = asyncio.create_task(infer(), name=f"speaker-first-{ws.turn_id}")
+        ws._speaker_first_task = task
+        self._track(task)
+        return task
 
     def _speaker_heartbeat_pulse(self, pulse) -> None:
         if self.speaker_sensor is None:
@@ -219,6 +313,11 @@ class EpisodeController(RealtimeController):
             return
         if generation != self.episode._heartbeat_episode_generation:
             return
+        ws = self.workspace
+        if ws is not None and ws.speaker_mode == "filter" and ws.turn_id in self.speaker_policy.turns:
+            if self.speaker_policy.turns[ws.turn_id].first_pending:
+                self._ensure_first_speaker_decision(ws, sequence=sequence)
+                return
         if self._speaker_analysis_task is not None and not self._speaker_analysis_task.done():
             self.speaker_policy.timeout_count += 1
             logger.warning("speaker.analysis_skipped sequence=%s reason=inference_in_progress", sequence)
@@ -299,7 +398,8 @@ class EpisodeController(RealtimeController):
         if activation_id != self.speaker_policy.activation_id or settings_revision != self.speaker_policy.settings_revision:
             return
         elapsed = (time.monotonic() - started) * 1000
-        if elapsed > 100 or snapshot.quality == "unavailable":
+        turn_admission = self.speaker_policy.turns.get(turn_id)
+        if (elapsed > 100 or snapshot.quality == "unavailable") and turn_admission is None:
             self.speaker_policy.timeout_count += 1
             logger.warning("speaker.heartbeat_timeout（声纹心跳超时） sequence=%s latency_ms=%.1f", sequence, elapsed)
             # 不修改本次原先判断；合格迟到证据留到下一心跳。
@@ -321,7 +421,22 @@ class EpisodeController(RealtimeController):
         elif self.workspace is not None or self._owner_barge_candidate_id is not None:
             logger.info("speaker.analysis_discarded sequence=%s reason=candidate_started", sequence)
             return
-        if snapshot.embedding:
+        if turn_admission is not None:
+            state = self.speaker_policy.observe_turn(turn_id, snapshot.embedding,
+                start=snapshot.analysis_start_sample, end=snapshot.analysis_end_sample,
+                speech_ms=sensor.speech_ms(max(snapshot.analysis_start_sample, turn_admission.last_end),
+                                          snapshot.analysis_end_sample), quality=snapshot.quality,
+                sequence=sequence, latency_ms=elapsed, window_speech_ms=snapshot.speech_ms)
+            if turn_admission.admitted:
+                ws.timings.setdefault("speaker_admitted", time.monotonic())
+            await self._refresh_turn_speaker_summary(ws)
+            snapshot = replace(snapshot, identity=(RollingSpeakerIdentity.OWNER if state in {
+                SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY}
+                else RollingSpeakerIdentity.NON_OWNER if state == SpeakerState.NON_OWNER_CONFIRMED
+                else RollingSpeakerIdentity.UNKNOWN),
+                score=turn_admission.scores.get("combined_score"), reason=turn_admission.reason)
+            await self._flush_speaker_admissions()
+        elif snapshot.embedding:
             identity_key = turn_id or f"barge-{barge_id}" if owner_candidate else turn_id or "idle"
             state = self.speaker_policy.observe(snapshot.embedding,
                 turn_id=identity_key, generation=turn_generation or 0,
@@ -335,6 +450,14 @@ class EpisodeController(RealtimeController):
         elif self._speaker_snapshot is not None:
             # 无新增证据和短静音不会撤销本句已确认身份。
             return
+        if turn_admission is None:
+            speaker_audit("rolling_observation（独立观察或打断）", turn_id=turn_id,
+                object_kind="barge" if owner_candidate else "idle" if turn_id is None else "input",
+                activation_id=activation_id, settings_revision=settings_revision, sequence=sequence,
+                start_sample=snapshot.analysis_start_sample, end_sample=snapshot.analysis_end_sample,
+                speech_ms=snapshot.speech_ms, new_speech_ms=snapshot.new_speech_ms,
+                quality=snapshot.quality, latency_ms=elapsed,
+                **self.speaker_policy.last_scores)
         self.state.current["speaker_session"] = self.speaker_policy.snapshot()
         previous_identity = getattr(getattr(self, "_speaker_snapshot", None), "identity", None)
         if previous_identity is not None and previous_identity != snapshot.identity and hasattr(self, "perception"):
@@ -480,6 +603,9 @@ class EpisodeController(RealtimeController):
         self.episode.scheduler.set_options(options)
 
     async def _agent_event(self, kind, payload):
+        if kind in {"speech.started", "speech.completed", "agent.turn_settled", "turn.latency"}:
+            speaker_audit(kind+"（输出时间线）", **{key: payload[key] for key in (
+                "turn_id", "speech_id", "request_id", "status", "latency", "delivery") if key in payload})
         # Only an authoritative Episode snapshot may replace the compact
         # current-state projection.  Late trace/output events deliberately
         # retain their own source identity and must remain history-only.
@@ -648,6 +774,9 @@ class EpisodeController(RealtimeController):
         if mode != "filter":
             return bool(activity.is_speech)
         self._ensure_speaker_policy()
+        turn = self.speaker_policy.turns.get(ws.turn_id) if ws is not None else None
+        if turn is not None:
+            return bool(activity.is_speech and turn.admitted)
         return bool(activity.is_speech and ws is not None and (
             self.speaker_policy.grace() or self.speaker_policy.state(ws.turn_id, ws.generation)
             in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY}))
@@ -759,6 +888,10 @@ class EpisodeController(RealtimeController):
                 getattr(self.barge_in_gate, "candidate_started_at", None) or frame.captured_at
             )
             self._owner_barge_output_key = handle.workspace.playback_key
+            self._ensure_speaker_policy()
+            self.speaker_policy.begin_candidate(self._owner_barge_candidate_id,
+                start_sample=self._owner_barge_start_sample,
+                started_at=frame.captured_at-max(0, frame.end_sample-self._owner_barge_start_sample)/16000)
             logger.info("speaker.barge_candidate_started candidate_id=%s speech_id=%s start_sample=%s",
                         self._owner_barge_candidate_id, handle.speech_id,
                         self._owner_barge_start_sample)
@@ -797,7 +930,7 @@ class EpisodeController(RealtimeController):
                           and self._barge_in_protected_available())
         if not authorized:
             return None
-        start_sample = self._owner_barge_start_sample or frame.start_sample
+        start_sample = self._owner_barge_start_sample if self._owner_barge_start_sample is not None else frame.start_sample
         self._recent = deque(
             AudioFrame(f.pcm[max(0, start_sample - f.start_sample) * 2:],
                        max(start_sample, f.start_sample), f.captured_at)
@@ -819,6 +952,7 @@ class EpisodeController(RealtimeController):
         await self._state_event(TerminalState.INTERRUPTING, listening=True, turn_id=handle.turn_id)
         await self.episode.speech_activity(True, interrupt_reason="user_interrupted")
         await self._cancel_turn(reason="interrupted", snapshot=playback)
+        self._speech_start_sample = start_sample
         await self._new_turn(frame)
         self._speaker_turn_start_sample = start_sample
         return None
@@ -900,13 +1034,29 @@ class EpisodeController(RealtimeController):
         return progress
 
     async def _input_committed(self, ws, token):
+        turn = getattr(self.speaker_policy, "turns", {}).get(ws.turn_id)
+        if turn is not None and ws.speaker_mode == "filter":
+            self.speaker_policy.set_turn_text(ws.turn_id, ws.final_text.strip(),
+                                             stage="asr_final（主识别定稿）", generation=ws.generation)
+            while turn.first_pending:
+                task = self._ensure_first_speaker_decision(ws, force=True)
+                if task is None:
+                    break
+                await asyncio.shield(task)
+                if ws.token != token or self.workspace is not ws:
+                    return True
+            pending = getattr(self, "_speaker_analysis_task", None)
+            if not turn.admitted and pending is not None and not pending.done():
+                await asyncio.shield(pending)
+                if ws.token != token or self.workspace is not ws:
+                    return True
         speaker_decision = await self._speaker_decision(ws)
         if ws.token != token or self.workspace is not ws:
             return True
         ws.speaker_routing_finalized = True
         mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
         if mode == "filter":
-            if any(p.turn_id == ws.turn_id and p.status == "pending" for p in self.speaker_policy.pieces):
+            if turn is None and any(p.turn_id == ws.turn_id and p.status == "pending" for p in self.speaker_policy.pieces):
                 if not hasattr(self, "_speaker_pending_audio"): self._speaker_pending_audio = {}
                 end = ws.audio.end_sample
                 start = max(ws.audio.start_sample or 0, end-self.speaker_config.context_max_ms*16)
@@ -917,10 +1067,11 @@ class EpisodeController(RealtimeController):
                         self._speaker_pending_audio.pop(next(iter(self._speaker_pending_audio)))
 
             ws.final_text = self.speaker_policy.admitted_text(ws.turn_id).strip()
-            ws.paraformer_final = ws.final_text
+            if turn is None:
+                ws.paraformer_final = ws.final_text
             ws.refinement_available = bool(ws.refined_text)
             ws.segments = [{"text": ws.final_text}] if ws.final_text else []
-            if not self.speaker_policy.fully_admitted(ws.turn_id):
+            if turn is None and not self.speaker_policy.fully_admitted(ws.turn_id):
                 ws.analysis = {}
                 ws.audio_cues = []
                 # 精修入口已逐音频片段准入；其他尾段待定不能删除已获准的精修证据。
@@ -928,6 +1079,8 @@ class EpisodeController(RealtimeController):
                                          if item.get("kind") == "refinement"]
             self.state.current.update(final_text=ws.final_text, partial_text="")
             await self._flush_speaker_admissions()
+            if ws.token != token or self.workspace is not ws:
+                return True
         if mode == "filter" and getattr(self, "hotwords", None) is not None:
             ws.raw_final_text = ws.final_text
             correction = await self.hotwords.finalized(ws.final_text, ws.token)
@@ -939,6 +1092,19 @@ class EpisodeController(RealtimeController):
             self.state.current.update(final_text=ws.final_text)
             await self._detail("transcript.final", text=ws.final_text, raw_text=ws.raw_final_text, source="paraformer")
         ws.speaker_blocked = not bool(ws.final_text)
+        if turn is not None:
+            ws.timings.setdefault("speaker_wait_finished", ws.timings.get("speaker_admitted", time.monotonic()))
+            await self._refresh_turn_speaker_summary(ws)
+            if ws.token != token or self.workspace is not ws:
+                return True
+            if not turn.admitted and turn.text and self.ambient_store is not None:
+                self.ambient_store.append({"turn_id": ws.turn_id, "text": turn.text,
+                    "speaker_state": turn.state.value, "similarity": turn.scores.get("combined_score"),
+                    "reason": turn.reason, "refined_text": ws.refined_text})
+            transcript_audit(ws.turn_id, "committed（实际提交全文）", ws.final_text, turn.text,
+                             turn.text_revision, generation=ws.generation,
+                             settings_revision=self.speaker_policy.settings_revision,
+                             speaker_summary=turn.summary(), raw_text=turn.text)
         if ws.final_text:
             if not any(item.get("kind") == "asr_final" for item in ws.transcript_updates):
                 ws.transcript_updates.append({
@@ -950,11 +1116,14 @@ class EpisodeController(RealtimeController):
                                        source="paraformer", source_revision=ws.generation,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
                                        analysis=dict(ws.analysis), speaker_decision=dict(ws.speaker_decision),
+                                        speaker_summary=dict(ws.speaker_summary),
                                        output_generation=ws.generation,
                                        raw_text=getattr(ws, "raw_final_text", "") or ws.final_text,
                                        hotword_matches=getattr(ws, "hotword_final", {}).get("matches", []),
                                        sentences=list(ws.segments),
                                        input_finished_at=ws.timings.get("commit"))
+            if ws.token != token or self.workspace is not ws:
+                return True
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
                 self.episode_history[ws.turn_id] = ws.episode_id
@@ -964,19 +1133,28 @@ class EpisodeController(RealtimeController):
                     "text": ws.refined_text,
                     "segments": list(ws.audio_cues),
                 })
+                if ws.token != token or self.workspace is not ws:
+                    return True
         # Finalized input is not a completed dialogue turn.  Retire only the
         # capture workspace so ASR resources are released while Agent/TTS and
         # late Paraformer（离线识别）refinement retain the same turn correlation.
         await self._commit_input_workspace(ws)
+        if ws.token != token or self.workspace is not ws:
+            return True
+        if turn is not None:
+            self.speaker_policy.close_turn(ws.turn_id, completed=True)
         if not ws.final_text:
-            await self._settle_committed_turn(ws.turn_id, outcome="empty_input")
+            await self._settle_committed_turn(ws.turn_id, outcome="speaker_blocked" if turn is not None and turn.text else "empty_input")
         await self._retire_committed_input(ws)
         return True
 
     async def _commit_input_workspace(self, ws):
         """Persist the primary transcript once, without publishing a terminal state."""
+        generation = getattr(ws, "generation", None)
 
         await self._ensure_workspace_episode(ws)
+        if getattr(ws, "generation", None) != generation:
+            return None
         if ws.turn_id in self._input_history_committed:
             return next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
         self.history.commit_input(ws.turn_id, ws.final_text, details={
@@ -987,6 +1165,7 @@ class EpisodeController(RealtimeController):
             "raw_refined_text": getattr(ws, "raw_refined_text", ""),
             "refinement_available": ws.refinement_available,
             "speaker_decision": dict(ws.speaker_decision),
+            "speaker_summary": dict(getattr(ws, "speaker_summary", {}) or {}),
             "transcript_updates": [dict(item) for item in ws.transcript_updates],
         })
         record = self.history.append_record({
@@ -1001,6 +1180,7 @@ class EpisodeController(RealtimeController):
                         "raw_refined_text": getattr(ws, "raw_refined_text", ""),
                         "refinement_available": ws.refinement_available,
                         "speaker_decision": dict(ws.speaker_decision),
+                         "speaker_summary": dict(getattr(ws, "speaker_summary", {}) or {}),
                         "transcript_updates": [dict(item) for item in ws.transcript_updates]},
         })
         self._input_history_committed.add(ws.turn_id)
@@ -1071,6 +1251,9 @@ class EpisodeController(RealtimeController):
         if ws is None:
             return
         self._settled_turns.add(turn_id)
+        ws.timings.setdefault("completed", time.monotonic())
+        speaker_audit("turn_settled（轮次最终结算）", turn_id=turn_id, outcome=outcome,
+                      speech_id=speech_id, timings=dict(ws.timings))
         record = next((item for item in self.history.records if item.turn_id == turn_id), None)
         # Formal speech owns its measured latency and emits it immediately
         # after speech.completed.  Control-only/empty-input paths have no
@@ -1090,6 +1273,9 @@ class EpisodeController(RealtimeController):
                 "asr_first_text_ms": elapsed("asr_first_text", "start"),
                 "speech_end_confirmation_ms": elapsed("endpoint_accepted", "last_speech"),
                 "asr_final_to_commit_ms": elapsed("commit", "asr_final"),
+                "speaker_wait_ms": elapsed("speaker_admitted" if "speaker_admitted" in timings
+                                           else "speaker_wait_finished", "turn_started"),
+                "speaker_inference_ms": elapsed("speaker_inference_completed", "speaker_inference_started"),
                 "llm_first_token_ms": elapsed("first_token", "llm_request"),
                 "llm_request_to_first_tts_text_ms": elapsed("first_tts_text", "llm_request"),
                 "tts_text_to_first_audio_ms": elapsed("first_audio", "first_tts_text"),
@@ -1160,7 +1346,19 @@ class EpisodeController(RealtimeController):
         """精修稿按原轮次和修订号投递，声学闭段不确认业务轮次。"""
         if getattr(ws, "_enhancement_invalidated", False):
             return
-        if ws.speaker_mode == "filter" and not result.get("admission_checked") and not self.speaker_policy.fully_admitted(ws.turn_id):
+        incoming = str(result.get("text") or "").strip()
+        if incoming:
+            transcript_audit(ws.turn_id, "refinement（精修全文）", incoming,
+                             ws.raw_refined_text, int(result.get("source_revision") or ws.generation+1),
+                             generation=ws.generation, source=result.get("source", "paraformer_offline"),
+                             speaker_summary=dict(ws.speaker_summary))
+        if ws.speaker_blocked and ws.speaker_summary:
+            ws.raw_refined_text = incoming
+            if self.ambient_store is not None:
+                self.ambient_store.update_refined(ws.turn_id, incoming)
+            return
+        if (ws.speaker_mode == "filter" and not result.get("admission_checked")
+                and not ws.speaker_summary.get("admitted") and not self.speaker_policy.fully_admitted(ws.turn_id)):
             return
         raw_text = str(result.get("text") or "").strip()
         if self.wake_enabled:
@@ -1305,6 +1503,10 @@ class EpisodeController(RealtimeController):
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)
 
     async def _cancel_turn(self, *, reason="stopped", snapshot=None, record=True):
+        if self.workspace is not None and hasattr(self, "speaker_policy"):
+            ws = self.workspace
+            hard_boundary = getattr(ws, "hard_closed", False) and reason == "interrupted" and ws.turn_id in self.speaker_policy.turns
+            self.speaker_policy.close_turn(ws.turn_id, completed=reason == "completed" or hard_boundary, reason=reason)
         # Input cleanup never blocks/cancels the independently owned output.
         ws = self.workspace
         if reason != "completed" and ws is not None:

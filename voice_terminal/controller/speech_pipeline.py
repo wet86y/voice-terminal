@@ -605,7 +605,11 @@ class SpeechPipeline:
                         return
                     audio_returned_bytes += len(pcm)
                     audio_signal.set()
-                    ws.timings.setdefault("first_audio", time.monotonic())
+                    if "first_audio" not in ws.timings:
+                        from ..speaker.audit import audit
+                        ws.timings["first_audio"] = time.monotonic()
+                        audit("synthesis_first_audio（合成首音频）", turn_id=ws.turn_id,
+                              generation=ws.generation, timings=dict(ws.timings))
                     ws.timings.setdefault("first_pcm", time.monotonic())
                     if self.player:
                         if getattr(active_session, "audio_rejected", False):

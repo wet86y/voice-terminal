@@ -1198,6 +1198,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 getattr(getattr(self.controller, "state", None), "latency", {}).get("values") or {}
             )
             settled_latency.update({
+                "speaker_wait_ms": elapsed("turn_started", "speaker_admitted"),
+                "speaker_inference_ms": elapsed("speaker_inference_started", "speaker_inference_completed"),
                 "wake_to_cue_first_pcm_ms": elapsed("wake_detected", "wake_cue_first_pcm"),  # 命中到提示音首帧。
                 "wake_to_llm_request_ms": elapsed("wake_detected", "llm_request"),  # 命中到模型请求。
                 "wake_to_asr_ready_ms": elapsed("wake_detected", "wake_asr_ready"),  # 命中到识别服务就绪。

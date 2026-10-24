@@ -28,6 +28,21 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('声纹阶段和异声摘要只更新状态，不裁剪转写或发送对话命令', () => {
+    const { terminal, socket } = openTerminal()
+    terminal.current.turn_id = 'a'
+    terminal.current.partial_text = '需要保留的完整句首和句尾'
+    socket.push('speaker.admission', 1, { admission_phase: 'relaxed',
+      speaker_summary: { admitted: true, foreign_voice_suspected: true } }, { turn_id: 'a' })
+    expect(terminal.current.admission_phase).toBe('relaxed')
+    expect(terminal.current.speaker_summary?.foreign_voice_suspected).toBe(true)
+    expect(terminal.current.partial_text).toBe('需要保留的完整句首和句尾')
+    const sent = socket.sent.length
+    socket.push('speaker.admission', 2, { admission_phase: 'held', speaker_summary: {} }, { turn_id: 'older' })
+    expect(terminal.current.admission_phase).toBe('relaxed')
+    expect(socket.sent).toHaveLength(sent)
+    terminal.dispose()
+  })
   it('悬浮窗明确停止输入保留当前播报，再次开始沿用原会话命令', () => {
     const { terminal, socket } = openTerminal()
     terminal.listening.value = true

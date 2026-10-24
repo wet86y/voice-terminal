@@ -805,6 +805,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (isRecord(snapshot.analysis)) current.analysis = snapshot.analysis as NonNullable<CurrentTurnSnapshot['analysis']>
     if (isRecord(snapshot.speaker_decision)) current.speaker_decision = snapshot.speaker_decision as NonNullable<CurrentTurnSnapshot['speaker_decision']>
     if (isRecord(snapshot.speaker_session)) current.speaker_session = snapshot.speaker_session
+    if (typeof snapshot.admission_phase === 'string') current.admission_phase = snapshot.admission_phase
+    if (isRecord(snapshot.speaker_summary)) current.speaker_summary = snapshot.speaker_summary
   }
 
   function applySpeakerDecision(payload: Record<string, unknown>, turnId: string | null) {
@@ -1207,6 +1209,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       case 'speaker.decision':
       case 'speaker.blocked':
         applySpeakerDecision(payload, message.turn_id ?? null)
+        break
+      case 'speaker.admission':
+        if (acceptsCurrentTurn(message.turn_id ?? null)) {
+          if (typeof payload.admission_phase === 'string') current.admission_phase = payload.admission_phase
+          if (isRecord(payload.speaker_summary)) current.speaker_summary = payload.speaker_summary
+        }
         break
       case 'input.completed':
         applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id ?? null)

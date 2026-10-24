@@ -171,6 +171,7 @@ class CurrentInput:
     # model-facing message, but lets the projector avoid duplicating a turn
     # that the controller has already committed to the ledger.
     turn_id: str = ""
+    speaker_summary: dict[str, Any] = field(default_factory=dict)  # 同轮声纹摘要，不拼入用户原话。
 
 
 class LLMContextProjector:
@@ -259,6 +260,8 @@ class LLMContextProjector:
             payload["runtime"]["calendar_epoch"] = calendar_epoch
         if voice_emotion:
             payload["runtime"]["voice_emotion"] = voice_emotion  # 语音情绪背景标签。
+        if current.speaker_summary:
+            payload["runtime"]["speaker_summary"] = current.speaker_summary
         if secondary_items:
             payload["runtime"]["secondary_items"] = secondary_items  # 本次冻结的通用二等条目。
         if listening_request is not None:

@@ -406,6 +406,7 @@ class SpeakerRuntimeMixin:
         logger.info("speaker.worker_stopped pid=%s", process.pid)
 
     def speaker_status(self) -> dict[str, Any]:
+        from ..speaker.audit import parameter_snapshot, parameter_effects
         profile = self.speaker_profile.snapshot()
         if not profile.get("available") and getattr(self.speaker_profile, "root", None) is not None and (self.speaker_profile.root.parent / "registry.json").is_file():
             profile.update(needs_reenrollment=True, stale_reason="speaker_model_changed", warning="旧声纹资料与当前 CAM++（声纹模型）不兼容，已停止使用；请重新录制主人声纹")
@@ -450,6 +451,8 @@ class SpeakerRuntimeMixin:
         rolling = getattr(controller, "_speaker_snapshot", None)
         return {
             "mode": self.config.speaker.mode,
+            "effective_settings": parameter_snapshot(self.config.speaker),
+            "parameter_effects": parameter_effects(),
             "effective_mode": getattr(controller, "speaker_mode", self.config.speaker.mode),
             "session": controller.speaker_policy.snapshot() if controller is not None and hasattr(controller, "speaker_policy") else {},
             "service": service,
@@ -553,7 +556,11 @@ class SpeakerRuntimeMixin:
         # PCM exists only in this in-memory session until commit/failure.
         self._speaker_enrollment[enrollment_id] = {
             "segments": {}, "created_at": time.monotonic(),
+            "config": self.config.speaker,  # 不可变配置快照，登记参数在下一次登记生效。
         }
+        from ..speaker.audit import audit, parameter_snapshot
+        audit("enrollment_started（登记参数快照）", enrollment_id=enrollment_id,
+              parameters=parameter_snapshot(self.config.speaker))
         return {
             "enrollment_id": enrollment_id,
             "required_segments": ENROLLMENT_REQUIRED_SEGMENTS,
@@ -827,7 +834,8 @@ class SpeakerRuntimeMixin:
             # Refuse an enrollment whose own segments disagree about the
             # speaker.  Storing a template that already fails this check is
             # how a profile ends up silently useless.
-            detail = check_segments(quality, embeddings, config=self.config.speaker)
+            enrollment_config = session.get("config", self.config.speaker)
+            detail = check_segments(quality, embeddings, config=enrollment_config)
             for index, item in enumerate(quality):
                 item["cosine_to_centroid"] = round(
                     WeSpeakerOnnxEngine.similarity(embeddings[index], centroid_of(embeddings)), 4

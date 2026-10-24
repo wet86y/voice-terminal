@@ -1,8 +1,8 @@
-/** 声纹高级设置：默认值与服务端一致，保存时由服务端原子校验。 */
+/** 声纹内部参数：保留旧设置，普通页面只提供四项调试控件。 */
 export const SPEAKER_DEFAULTS = {
+  "intra_turn_relaxation": 0.1,
   "continuity_window_ms": 5000,
   "continuity_max_ms": 10000,
-  "non_owner_threshold": 0.35,
   "non_owner_ticks": 3,
   "context_max_ms": 3200,
   "recovery_max_distance": 0.25,
@@ -20,22 +20,36 @@ export const SPEAKER_DEFAULTS = {
 }
 
 export type SpeakerTuning = Partial<Record<keyof typeof SPEAKER_DEFAULTS, number>>
+/** SPEAKER_CONTROL_DEFAULTS（四项可见参数默认值）：恢复默认只更新这些值。 */
+export const SPEAKER_CONTROL_DEFAULTS = {
+  confirm_threshold: 0.6,
+  intra_turn_relaxation: SPEAKER_DEFAULTS.intra_turn_relaxation,
+  continuity_relaxation: 0.1,
+  session_weight: SPEAKER_DEFAULTS.session_weight,
+}
+
 export const SPEAKER_FIELDS = [
-  { key: "continuity_window_ms", label: "连续主人进入时限（毫秒）", min: 0, max: 60000, step: 1 },
-  { key: "continuity_max_ms", label: "连续主人最长时限（毫秒）", min: 0, max: 120000, step: 1 },
-  { key: "non_owner_threshold", label: "持续非主人阈值", min: -1, max: 1, step: 0.01 },
-  { key: "non_owner_ticks", label: "非主人连续有效心跳次数", min: 1, max: 20, step: 1 },
-  { key: "context_max_ms", label: "分析上下文上限（毫秒）", min: 45, max: 16000, step: 1 },
-  { key: "recovery_max_distance", label: "跨轮恢复最大余弦距离", min: 0, max: 2, step: 0.01 },
-  { key: "pending_ttl_ms", label: "待确认文本保留时间（毫秒）", min: 400, max: 300000, step: 1 },
-  { key: "pending_max_turns", label: "待确认轮数上限", min: 1, max: 64, step: 1 },
-  { key: "calibration_speech_ms", label: "临时校准有效人声量（毫秒）", min: 45, max: 30000, step: 1 },
-  { key: "calibration_max_ms", label: "初始无条件放行最长时间（毫秒）", min: 400, max: 60000, step: 1 },
-  { key: "calibration_similarity", label: "临时样本一致性阈值", min: -1, max: 1, step: 0.01 },
-  { key: "session_weight", label: "临时会话声纹权重", min: 0, max: 1, step: 0.01 },
-  { key: "enrollment_min_segment_speech_ms", label: "永久注册单段最低人声（毫秒）", min: 45, max: 15000, step: 1 },
-  { key: "enrollment_min_total_speech_ms", label: "永久注册总人声要求（毫秒）", min: 45, max: 45000, step: 1 },
-  { key: "enrollment_min_speech_ratio", label: "永久注册最低人声比例", min: 0.01, max: 1, step: 0.01 },
-  { key: "enrollment_self_similarity_min", label: "永久注册声纹一致性阈值", min: -1, max: 1, step: 0.01 },
-  { key: "enrollment_max_clipped_ratio", label: "永久注册最大削波比例", min: 0, max: 1, step: 0.001 },
+  { key: "confirm_threshold", label: "主人确认阈值", min: 0, max: 1, step: 0.01,
+    hint: "正常首段确认与暂缓后的三次恢复使用此基准值。" },
+  { key: "intra_turn_relaxation", label: "会话内连续放宽余量", min: 0, max: 0.3, step: 0.01,
+    hint: "本轮确认主人后，从基准值减去此余量；已放行文字始终保留。" },
+  { key: "continuity_relaxation", label: "会话间连续放宽余量", min: 0, max: 0.2, step: 0.01,
+    hint: "下一轮开口时连续资格有效，则首段从基准值减去此余量。" },
+  { key: "session_weight", label: "临时声纹权重", min: 0, max: 0.8, step: 0.01,
+    hint: "临时声纹建立后参与混分；0仅使用永久模板，0.80表示临时声纹占80%。" },
 ] as const
+
+type SpeakerControls = Record<keyof typeof SPEAKER_CONTROL_DEFAULTS, number>
+/** speakerControlsError（四项草稿校验）：与后端保存规则一致，负阈值不夹紧。 */
+export function speakerControlsError(value: SpeakerControls): string {
+  for (const field of SPEAKER_FIELDS) {
+    const item = value[field.key]
+    if (!Number.isFinite(item) || item < field.min || item > field.max)
+      return `${field.label}必须在 ${field.min} 至 ${field.max} 之间`
+  }
+  if (value.intra_turn_relaxation > value.confirm_threshold)
+    return '会话内连续放宽余量不能大于主人确认阈值，否则放宽后的声纹阈值会小于0'
+  if (value.continuity_relaxation > value.confirm_threshold)
+    return '会话间连续放宽余量不能大于主人确认阈值，否则放宽后的声纹阈值会小于0'
+  return ''
+}

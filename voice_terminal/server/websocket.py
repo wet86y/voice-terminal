@@ -23,6 +23,7 @@ from ..config import AppConfig, LOCAL_TTS_PLAYER_RATES, local_tts_native_rate
 from ..paths import AppPaths
 from ..custom_instructions import shadow_projection
 from ..controller.episode_controller import EpisodeController
+from ..speaker.audit import audit as speaker_audit, parameter_snapshot, parameter_effects
 from ..dsh import (
     DshBridgeError,
     DshMappingStore,
@@ -767,11 +768,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             speaker_mode=(self.config.speaker.mode if self.speaker_profile.available else "observe" if self.config.speaker.mode != "off" else "off"),
             speaker_config=self.config.speaker,
             owner_only_barge_in=self.config.speaker.owner_only_barge_in and self.speaker_profile.available,
-            speaker_wait_ms=self.config.speaker.wait_ms,
-            speaker_window_ms=self.config.speaker.window_ms,
-            speaker_min_speech_ms=self.config.speaker.min_speech_ms,
-            speaker_min_turn_speech_ms=self.config.speaker.min_turn_speech_ms,
-            speaker_min_window_speech_ratio=self.config.speaker.min_window_speech_ratio,
             ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
@@ -2067,8 +2063,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             raise
         return value
 
-    async def set_speaker_settings(self, settings: Mapping[str, Any]) -> dict[str, Any]:
-        """Apply optional speaker mode/thresholds without restarting audio."""
+    async def set_speaker_settings(self, settings: Mapping[str, Any], *, restoring: bool = False) -> dict[str, Any]:
+        """即时应用声纹设置；restoring（恢复可信旧快照）仅用于运行失败回滚。"""
+        previous_speaker = self.config.speaker
         previous_mode = self.config.speaker.mode
         previous_owner_only = self.config.speaker.owner_only_barge_in
         mode = str(settings.get("mode") or "off")
@@ -2076,7 +2073,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         confirm = float(settings.get("confirm_threshold", self.config.speaker.confirm_threshold))
         continuity = float(settings.get("continuity_threshold", self.config.speaker.continuity_threshold))
         relaxation = float(settings.get("continuity_relaxation", min(0.20, max(0.0, confirm - continuity))))
-        from ..speaker.settings import validate_tuning
+        from ..speaker.settings import validate_controls, validate_tuning
+        tuning = validate_tuning({**vars(self.config.speaker), **settings})
+        controls = {**tuning, "confirm_threshold": confirm, "continuity_relaxation": relaxation}
+        # 同值应用可能来自旧保存设置；保留历史运行值，新编辑必须满足四项规则。
+        if not restoring and any(controls[key] != getattr(previous_speaker, key) for key in
+               ("confirm_threshold", "continuity_relaxation", "intra_turn_relaxation", "session_weight")):
+            validate_controls(controls, check_weight=tuning["session_weight"] != previous_speaker.session_weight)
         next_speaker = replace(
             self.config.speaker,
             mode=mode,
@@ -2084,7 +2087,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             confirm_threshold=confirm,
             continuity_threshold=continuity,
             continuity_relaxation=relaxation,
-            **validate_tuning({**vars(self.config.speaker), **settings}, continuity=max(0.0, confirm-relaxation)),
+            **tuning,
         )
         if mode == "filter" and previous_mode != "filter" and not self.speaker_profile.available:
             raise ValueError("未注册声纹前不能启用筛选模式")
@@ -2116,6 +2119,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 self.controller.barge_in_gate.reset()
                 self.controller._clear_owner_barge_candidate()
                 self.controller._owner_barge_expired = False
+            if next_speaker != previous_speaker:
+                self.controller._speaker_snapshot = None
+                self.controller._speaker_snapshot_barge_id = None
+                self.controller._clear_owner_barge_candidate()
             # ``ensure_speaker_worker`` may have replaced a degraded/stale
             # client while preparing filter mode. Always refresh the
             # controller reference for every enabled mode; otherwise a
@@ -2143,6 +2150,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 self.controller.speaker_policy.tune(next_speaker)
             self.controller.speaker_config = next_speaker
             self.controller.configure_speaker_runtime()
+        speaker_audit("runtime_settings_applied（运行参数回执）", effective=parameter_snapshot(next_speaker),
+                      settings_revision=getattr(getattr(self.controller, "speaker_policy", None), "settings_revision", None),
+                      effects=parameter_effects())
         await self.bus.publish(self.snapshot())
         status = self.speaker_status()
         return {
@@ -2150,7 +2160,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             "confirm_threshold": confirm,
             "continuity_threshold": next_speaker.continuity_threshold,
             "continuity_relaxation": relaxation,
+            "intra_turn_relaxation": next_speaker.intra_turn_relaxation,
+            "intra_turn_threshold": next_speaker.intra_turn_threshold,
             "owner_only_barge_in": owner_only,
+            "settings_revision": getattr(getattr(self.controller, "speaker_policy", None), "settings_revision", None),
+            "parameter_effects": parameter_effects(),
             "owner_only_barge_in_selected": status["owner_only_barge_in_selected"],
             "owner_only_barge_in_ready": status["owner_only_barge_in_ready"],  # 配置及组件就绪。
             "owner_only_barge_in_effective": status["owner_only_barge_in_effective"],

@@ -225,21 +225,21 @@ asr_worker:
 speaker:
   mode: off # 关闭、仅标记或主人筛选。
   owner_only_barge_in: false # 主人专属打断。
-  confirm_threshold: 0.60 # 主人确认原始余弦分数。
-  continuity_relaxation: 0.10 # 连续主人放宽量。
+  confirm_threshold: 0.60 # 主人确认原始余弦分数，界面可调0–1。
+  continuity_relaxation: 0.10 # 跨轮次连续主人放宽量，界面可调0–0.20，保存时不得大于基准值。
+  intra_turn_relaxation: 0.10 # 轮次内放宽量，界面可调0–0.30；独立减基准，不与跨轮量叠加，不得得到负阈值。
   model_id: campplus-zh-cn-common # CAM++ 官方中文通用模型。
   continuity_window_ms: 5000 # continuity_window_ms（连续主人进入时限（毫秒））。
   continuity_max_ms: 10000 # continuity_max_ms（连续主人最长宽容时间（毫秒））。
-  non_owner_threshold: 0.35 # non_owner_threshold（持续非主人阈值（余弦分数））。
   non_owner_ticks: 3 # non_owner_ticks（非主人连续有效心跳次数）。
   context_max_ms: 3200 # context_max_ms（增长式分析上下文上限（毫秒））。
   recovery_max_distance: 0.25 # recovery_max_distance（跨轮恢复最大余弦距离（0–2））。
   pending_ttl_ms: 30000 # pending_ttl_ms（待确认正文保留时间（毫秒））。
   pending_max_turns: 8 # pending_max_turns（待确认轮数上限）。
   calibration_speech_ms: 3200 # calibration_speech_ms（临时校准目标有效人声（毫秒））。
-  calibration_max_ms: 10000 # calibration_max_ms（激活后最长无条件放行时间（毫秒））。
+  calibration_max_ms: 10000 # calibration_max_ms（校准最长时间（毫秒），独立打断保留校准临时授权）。
   calibration_similarity: 0.65 # calibration_similarity（临时样本与候选质心最低余弦相似度）。
-  session_weight: 0.6 # session_weight（临时会话声纹权重（0–1））。
+  session_weight: 0.6 # session_weight（临时声纹权重，界面新保存范围0–0.80，旧值兼容读取）。
   enrollment_min_segment_speech_ms: 3000 # enrollment_min_segment_speech_ms（永久注册每段最低人声（毫秒））。
   enrollment_min_total_speech_ms: 15000 # enrollment_min_total_speech_ms（永久注册最低总人声（毫秒））。
   enrollment_min_speech_ratio: 0.5 # enrollment_min_speech_ratio（永久注册最低人声比例（0–1））。

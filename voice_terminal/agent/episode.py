@@ -495,6 +495,12 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 "turn_id": source_turn_id if turn_id is None else turn_id,
                 "at": time.time(), **payload}
         self.trace.append(item)
+        if kind in {"SCHEDULER_TICK", "TTS_PLAYBACK_COMPLETED", "USER_INPUT_FINALIZED",
+                    "USER_INPUT_REFINED", "USER_INPUT_RELEASED_BATCH"}:
+            from ..speaker.audit import audit
+            audit(kind+"（对话调度时间线）", turn_id=item["turn_id"], request_id=source[1],
+                  **{key: value for key, value in payload.items() if key in {
+                      "source", "source_revision", "input_finished_at", "speech_id", "count", "activation_id"}})
         # WebSocket debug logging deliberately avoids payloads, which made a
         # production incident impossible to attribute from server logs.  Log
         # the small, non-content control-plane subset needed to reconstruct
@@ -1689,6 +1695,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                         await self.observe("USER_SEGMENT_UPDATED", turn_id=item["turn_id"], text=item["text"],
                                            output_generation=item.get("generation", 0), source="speaker_recovery",
                                            raw_text=item.get("raw_text", item["text"]),
+                                            speaker_summary=dict(item.get("speaker_summary") or {}),
                                            hotword_matches=item.get("hotword_matches", []),
                                            occurred_at=item.get("occurred_at", time.time()))
             finally:
@@ -3010,6 +3017,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     raise ValueError(f"action not permitted: {action.name}")
                 parse_shadow_wake(action.arguments)
                 current = self.inputs.get(turn_id, {})
+                project_speaker = getattr(self.ledger, "project_shadow_speaker_summary", None)
+                if callable(project_speaker) and isinstance(current, dict):
+                    project_speaker(turn_id, dict(current.get("speaker_summary") or {}))
                 merge = getattr(self.ledger, "project_shadow_current_turn", None)
                 if callable(merge) and isinstance(current, dict):
                     merge(

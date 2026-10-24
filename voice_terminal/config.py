@@ -391,6 +391,7 @@ class SpeakerConfig:
     continuity_threshold: float = 0.50
     # continuity_relaxation（连续主人阈值放宽量）：旧绝对阈值仅用于兼容配置。
     continuity_relaxation: float | None = None
+    intra_turn_relaxation: float | None = None  # 轮内放宽量；旧配置缺失时保留此前轮内效果。
     window_ms: int = 3200
     step_ms: int = 400
     min_speech_ms: int = 45
@@ -400,7 +401,6 @@ class SpeakerConfig:
     model_id: str = "campplus-zh-cn-common"
     continuity_window_ms: int = 5000
     continuity_max_ms: int = 10000
-    non_owner_threshold: float = 0.35
     non_owner_ticks: int = 3
     context_max_ms: int = 3200
     recovery_max_distance: float = 0.25
@@ -428,10 +428,17 @@ class SpeakerConfig:
             object.__setattr__(self, "continuity_threshold", max(0.0, self.confirm_threshold - self.continuity_relaxation))
         if not 0.0 <= self.continuity_threshold <= self.confirm_threshold <= 1.0:
             raise ValueError("声纹阈值必须满足 0 ≤ 连续阈值 ≤ 主人阈值 ≤ 1")
+        if self.intra_turn_relaxation is None:
+            object.__setattr__(self, "intra_turn_relaxation", round(min(0.20, self.confirm_threshold-self.continuity_threshold), 10))
         from .speaker.settings import validate_tuning
-        validate_tuning(vars(self), continuity=self.continuity_threshold)
+        validate_tuning(vars(self))
         if self.window_ms < 45 or self.step_ms < 1 or self.min_speech_ms < 1:
             raise ValueError("声纹音频时长参数无效")
+
+    @property
+    def intra_turn_threshold(self) -> float:
+        """本轮判断阈值，直接从基准值派生，不叠减跨轮量。"""
+        return max(0.0, self.confirm_threshold-self.intra_turn_relaxation)
 
 
 
@@ -1098,6 +1105,7 @@ class AppConfig:
                 confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.60)),
                 continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.50)),
                 continuity_relaxation=(float(speaker["continuity_relaxation"]) if "continuity_relaxation" in speaker else None),
+                intra_turn_relaxation=(float(speaker["intra_turn_relaxation"]) if "intra_turn_relaxation" in speaker else None),
                 window_ms=int(_number(speaker.get("context_max_ms"), 3200)),
                 step_ms=400,
                 min_speech_ms=45,
@@ -1107,7 +1115,6 @@ class AppConfig:
                 model_id="campplus-zh-cn-common",
                 continuity_window_ms=int(_number(speaker.get("continuity_window_ms"), 5000)),
                 continuity_max_ms=int(_number(speaker.get("continuity_max_ms"), 10000)),
-                non_owner_threshold=float(_number(speaker.get("non_owner_threshold"), 0.35)),
                 non_owner_ticks=int(_number(speaker.get("non_owner_ticks"), 3)),
                 context_max_ms=int(_number(speaker.get("context_max_ms"), 3200)),
                 recovery_max_distance=float(_number(speaker.get("recovery_max_distance"), 0.25)),

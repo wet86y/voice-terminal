@@ -227,6 +227,7 @@ class AgentContextMixin:
                 if isinstance(item, dict)
             ),
             turn_id=model_turn_id,
+            speaker_summary=dict(current.get("speaker_summary") or {}),
         )
         # The ledger is the complete V0.6 history.  Native tool-call protocol
         # groups are intentionally never replayed to the provider.

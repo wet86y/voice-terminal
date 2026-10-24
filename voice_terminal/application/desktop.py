@@ -80,6 +80,8 @@ class DesktopControl:
             if isinstance(logger, logging.Logger):
                 handlers.update({id(handler): handler for handler in logger.handlers})
         try:
+            from ..logging_setup import flush_audit_logs
+            flush_audit_logs()
             for handler in handlers.values():
                 handler.acquire()
                 try:

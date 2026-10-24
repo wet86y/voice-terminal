@@ -78,7 +78,7 @@ class RollingSpeakerSensor:
     def __init__(self, embed_pcm, score_embedding, *, sample_rate=16000, buffer_ms=4000,
                  window_ms=3200, min_voiced_ms=45, min_decision_voiced_ms=45,
                  min_window_speech_ratio=0.0, confirm_threshold=0.60,
-                 non_owner_threshold=0.35, max_snapshot_age_ms=800):
+                 max_snapshot_age_ms=800):
         if sample_rate != 16000 or window_ms < 45 or buffer_ms < window_ms:
             raise ValueError("声纹上下文需至少45毫秒且不超过缓冲")
         self.embed_pcm, self.score_embedding = embed_pcm, score_embedding
@@ -88,7 +88,7 @@ class RollingSpeakerSensor:
         self.min_voiced_samples = sample_rate * 45 // 1000
         self.min_decision_voiced_samples = self.min_voiced_samples
         self.min_window_speech_ratio = 0.0
-        self.confirm_threshold, self.non_owner_threshold = confirm_threshold, non_owner_threshold
+        self.confirm_threshold = confirm_threshold
         self.max_snapshot_age_ms = max_snapshot_age_ms
         self._chunks = deque()
         self._latest_sample = None
@@ -109,6 +109,11 @@ class RollingSpeakerSensor:
         self._latest_sample = None
         self._last_analyzed_end = -1
         self._last_snapshot = None
+
+    def speech_ms(self, start: int, end: int) -> int:
+        """首段诊断复用VAD（语音活动检测）区间，不把整窗静音算成人声。"""
+        return sum(max(0, min(end, c.end_sample)-max(start, c.start_sample))
+                   for c in self._chunks if c.speech) * 1000 // self.sample_rate
 
     def submit_frame(self, pcm, *, start_sample, speech=None):
         if not pcm or len(pcm)%2 or type(start_sample) is not int or start_sample < 0:

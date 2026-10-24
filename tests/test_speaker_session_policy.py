@@ -114,9 +114,9 @@ def test_calibration_timeout_does_not_extend_on_duplicate_activation():
     assert not p.session_centroid
 
 
-def test_invalid_threshold_combination_and_nonfinite_values_rejected():
+def test_invalid_counter_and_nonfinite_values_rejected():
     with pytest.raises(ValueError):
-        SpeakerConfig(non_owner_threshold=0.55)
+        SpeakerConfig(non_owner_ticks=0)
     with pytest.raises(ValueError):
         SpeakerConfig(session_weight=float("nan"))
 

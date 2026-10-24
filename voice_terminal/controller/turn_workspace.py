@@ -107,6 +107,8 @@ class TurnWorkspace:
     speaker_degraded_reason: str = ""
     speaker_blocked: bool = False
     speaker_routing_finalized: bool = False  # speaker_routing_finalized（本段声纹路由已结算）。
+    admission_phase: str = ""  # 本轮准入阶段，非拦截模式为空。
+    speaker_summary: dict = field(default_factory=dict)  # 与原话分开的声纹语义摘要。
     # Capture the routing mode at turn start.  Product mode changes can then
     # take effect on the next speech segment without rewriting a turn that is
     # already being finalized.
@@ -153,6 +155,7 @@ class TurnWorkspace:
             "phase": self.phase,
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.refined_text,
+            "admission_phase": self.admission_phase, "speaker_summary": dict(self.speaker_summary),
             "refinement_available": self.refinement_available,
             "transcript_updates": [dict(item) for item in self.transcript_updates],
             "tts_prewarm_started": self.tts_prewarm_started,
