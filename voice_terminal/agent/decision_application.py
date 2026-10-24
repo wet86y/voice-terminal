@@ -22,9 +22,10 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
     snapshot = dict(raw_snapshot) if isinstance(raw_snapshot, dict) else {}
     snapshot["_output_busy"] = bool(getattr(self.output, "busy", False))
     queue_status = snapshot.get("queue_status", "empty") if isinstance(snapshot, dict) else "empty"
-    await self.log("SPEAK_STATE_CHANGED", identity=identity, turn_id=turn_id,
-                   state=decision.state, queue_status=queue_status,
-                   action_count=len(envelope.actions))
+    if decision.state != "cancel":
+        await self.log("SPEAK_STATE_CHANGED", identity=identity, turn_id=turn_id,
+                       state=decision.state, queue_status=queue_status,
+                       action_count=len(envelope.actions))
     if decision.state == "wait":
         self.current_action = "wait"
         await self.log("WAIT", identity=identity, turn_id=turn_id, reason="speak_wait")
@@ -57,7 +58,25 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
                                queue_status=queue_status)
                 self.current_action = "wait"
             else:
-                handle = await replace(identity, turn_id, emotion=decision.emotion)
+                admission = getattr(self, "_applying_speech_admission", None)
+                requested = admission.snapshot if admission is not None else snapshot
+                expected = requested.get("output_generation") if isinstance(requested, dict) else None
+                kwargs = {"emotion": decision.emotion}
+                if expected is not None:
+                    kwargs["expected_generation"] = expected
+                handle = await replace(identity, turn_id, **kwargs)
+                if handle is None:
+                    self.current_action = "wait"
+                    self.minor_protocol_feedback.append({
+                        "field": "speak.state", "applied": "rejected_output_generation_changed",
+                        "hint": "原取消目标已由其他播报接管；仅重新核对最新语音计划，不重发已处理后台动作。",
+                    })
+                    wake = getattr(self, "_wake", None)
+                    if callable(wake):
+                        wake("SPEECH_CANCEL_REASSESS", turn_id=turn_id)
+                    await self.log("SPEECH_CANCEL_REJECTED", identity=identity, turn_id=turn_id,
+                                   reason="output_generation_changed", expected_generation=expected)
+                    return
                 self._track_system_check_speech(handle, dispatch_context)
                 await handle.feed(decision.text)
                 await handle.finish()

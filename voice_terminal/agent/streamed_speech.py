@@ -48,7 +48,7 @@ async def queue_streamed_speech(runtime, state: StreamedSpeechAdmissionState,
                 "field": "speak.state",
                 "applied": "ignored_output_busy",
                 "hint": "输出仍忙碌：speak（新播报）不能追加或替换。确有实质不符或必要补充且尾巴可改时"
-                        "才用 revision（尾巴修订）；取消重讲必须满足末尾严格纠错条件，否则 wait（等待）。",
+                        "才用 revision（尾巴修订）；锁定前提实质失效时使用取消并替换，否则 wait（等待）。",
             })
             await runtime.log("SPEAK_BUSY_IGNORED", identity=state.identity,
                               turn_id=state.source_turn_id,

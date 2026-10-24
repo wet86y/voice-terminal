@@ -11,7 +11,8 @@ class SpeechFrontierMixin:
             continuation = self._continuation_snapshot()
             if continuation is not None:
                 return continuation
-            value = {"queue_status": "empty", "text_only_queue": True}
+            value = {"queue_status": "empty", "text_only_queue": True,
+                     "output_generation": getattr(self, "generation", 0)}
             self._add_delivered_frontier(value)
             return value
         if h.workspace.playback_started:
@@ -149,6 +150,10 @@ class SpeechFrontierMixin:
         bytes_per_second = player.sample_rate * player.channels * 2
         received = int(getattr(getattr(h, "tts_session", None), "received_bytes", 0) or 0)
         value["played_ms"] = int(current.get("output_estimated_ms") or 0)
+        resolver = self._delivery_resolvers.get(h.speech_id)
+        if resolver is not None:
+            value["delivery"] = {"speech_id": h.speech_id, **resolver.resolve(
+                current, h.text, overlap_start_ms=h.overlap_start_ms)}
         value["synthesized_ms"] = (
             int(received * 1000 / bytes_per_second) if bytes_per_second and received else 0
         )

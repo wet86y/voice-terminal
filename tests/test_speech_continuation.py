@@ -270,7 +270,9 @@ def test_settlement_stays_busy_and_rejected_request_is_never_replayed():
     asyncio.run(scenario())
 
 
-def test_cancel_with_text_replaces_busy_output_and_rejects_old_audio():
+def test_cancel_with_text_replaces_busy_output_and_rejects_old_audio(monkeypatch):
+    # 固定播放器时钟，避免机器负载决定本例是提前衔接还是旧音已自然到期。
+    monkeypatch.setattr("voice_terminal.audio.player.time", SimpleNamespace(monotonic=lambda: 100.0))
     async def scenario():
         harness = ContinuationHarness()
         runtime = _agent(harness)
@@ -282,7 +284,14 @@ def test_cancel_with_text_replaces_busy_output_and_rejects_old_audio():
             replacement = harness.output.handle
             await harness.wait_for_drain(replacement)
             harness.player.enqueue(first.workspace.playback_key, b"\x09\x00" * 80)
-            assert harness.render() == b"\x02\x00" * 80
+            # 替换现在保留有限旧音淡出，再淡入后继；迟到的旧0x09采样仍必须拒收。
+            rendered = harness.render() + harness.render()
+            samples = [int.from_bytes(rendered[i:i + 2], "little", signed=True)
+                       for i in range(0, len(rendered), 2)]
+            assert set(samples) <= {0, 1, 2}
+            assert samples[60:110] == [2] * 50
+            assert samples[110:] == [0] * 50
+            assert harness.player.progress(replacement.workspace.playback_key)["played_ms"] == 80
             await asyncio.wait_for(asyncio.shield(replacement.task), HANDOFF_TIMEOUT_SECONDS)
             assert first.reason == "replaced"
             assert harness.records[-1]["text"] == "我刚才听错了，改口。"
