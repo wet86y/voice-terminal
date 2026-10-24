@@ -1,8 +1,8 @@
 # Voice Terminal 架构与生命周期
 
-本文是当前组件边界和生命周期的唯一说明。模型可见字段见[上下文与工具规范](context-and-tools.md)；WebSocket 消息见[协议文档](websocket-protocol.md)；质量门槛见[运行与质量门槛](../testing/operations-and-quality.md)。
+本文是当前组件边界和生命周期的唯一说明。Windows（操作系统）进程映像、解释器宿主与音频会话身份见[项目进程管理](process-management.md)；模型可见字段见[上下文与工具规范](context-and-tools.md)；WebSocket 消息见[协议文档](websocket-protocol.md)；质量门槛见[运行与质量门槛](../testing/operations-and-quality.md)。
 
-Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运行环境）服务管理进程。应用宿主直接管理语音识别、分析和语音服务，委托语音服务管理 DSH（代理执行宿主）与声纹工作进程；每个进程只有一个直接生命周期所有者。关闭桌面窗口隐藏到托盘，明确退出应用回收整棵受管进程树。主产品与源码界面调试只支持桌面入口，独立样例由原生宿主管理其开发服务。启动反馈和进程状态契约见[独立应用启动与系统管理](../guides/application-lifecycle.md)，便携路径与数据边界见[桌面应用说明](../guides/desktop-application.md)。
+Tauri 2（桌面框架）拥有窗口、托盘、单实例和桌面进程。Python（后端运行环境）应用宿主仍是独立受管进程，但由 `VoiceTerminalDesktop.exe`（产品可执行文件）映像承载，并在该进程中加载所选解释器运行库；模型和语音服务等受管解释器进程也沿用同一入口，同时保留独立进程边界。应用宿主直接管理语音识别、分析和语音服务，委托语音服务管理 DSH（代理执行宿主）与声纹工作进程；每个进程只有一个直接生命周期所有者。关闭桌面窗口隐藏到托盘，明确退出应用回收整棵受管进程树。主产品与源码界面调试只支持桌面入口，独立样例由原生宿主管理其开发服务。启动反馈和进程状态契约见[独立应用启动与系统管理](../guides/application-lifecycle.md)，便携路径与数据边界见[桌面应用说明](../guides/desktop-application.md)。
 
 语音当前会话始终持久化到用户历史目录的 `archives/.journals/active-session.sqlite3`（当前会话数据库）；正式和源码布局共用
 `.local/data/history/`（唯一历史数据目录）。启动先恢复会话身份、日期基准、
@@ -18,11 +18,11 @@ Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运
 ```mermaid
 flowchart TD
     R[根启动入口：读取唯一便携配置，启动后退出] --> T[Tauri 桌面：窗口、托盘、单实例]
-    T --> A[Python 应用宿主：网页服务、管理接口、业务监督]
+    T --> A[VoiceTerminalDesktop.exe：独立 Python 应用宿主]
     T --> W[网页渲染进程：正式页面]
-    A --> B[语音识别工作进程]
-    A --> C[分析工作进程]
-    A --> D[语音服务]
+    A --> B[VoiceTerminalDesktop.exe：语音识别工作进程]
+    A --> C[VoiceTerminalDesktop.exe：分析工作进程]
+    A --> D[VoiceTerminalDesktop.exe：语音服务]
     D --> E[声纹工作进程]
     D --> F[DSH：代理执行宿主]
     W -.业务接口.-> A

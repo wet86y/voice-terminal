@@ -14,7 +14,7 @@ use environment_commands::{resource_install_plan,voice_environment_status,voice_
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
-    os::windows::{io::AsRawHandle, process::CommandExt},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -1185,7 +1185,7 @@ fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceSta
     } else {
         let context = state.context()
             .ok_or("产品服务缺少桌面启动上下文。")?;
-        command = Command::new(&context.python);
+        command = voice_desktop_common::process_host::python_command(&context.python);
         context.configure_command(&mut command);
         command
             .args(["-X", "utf8", "-X"])
@@ -1229,7 +1229,7 @@ fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceSta
     *state.error.lock().unwrap()=None;
     state.recovery.lock().unwrap().result=None;
     *state.dsh_origin.lock().unwrap()=None;
-    let mut child = command.spawn().map_err(|e| {
+    let mut child = job.spawn(&mut command).map_err(|e| {
         format!(
             "{} 启动失败：{e}",
             if state.mode == FrontendMode::UiPreview {
@@ -1239,11 +1239,6 @@ fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceSta
             }
         )
     })?;
-    if let Err(error) = job.assign(child.as_raw_handle()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("无法建立进程所有权：{error}"));
-    }
     let reader = BufReader::new(child.stdout.take().ok_or("缺少服务控制管道")?);
     let input = child.stdin.take().ok_or("缺少服务控制管道")?;
     *service_slot = Some(Service { child, input, job });
@@ -1686,6 +1681,13 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 fn main() {
+    if let Some(result) = voice_desktop_common::process_host::dispatch() {
+        let code = match result {
+            Ok(code) => code,
+            Err(message) => { eprintln!("{message}"); 1 }
+        };
+        std::process::exit(code);
+    }
     if let Some(result) = voice_desktop_common::windows::run_url_helper_if_requested() {
         if result.is_err() {
             std::process::exit(1);
@@ -1694,6 +1696,7 @@ fn main() {
     }
     #[cfg(feature="qualification")]
     if qualification::run_if_requested().is_some(){return;}
+    voice_desktop_common::process_host::set_identity();
     if let Err(message) = run() {
         if message.contains("WebView2") || message.contains("webview") || message.contains("网页引擎") {
             voice_desktop_common::webview::guide(&message);

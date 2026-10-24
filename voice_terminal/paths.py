@@ -180,10 +180,11 @@ def atomic_json(path: Path, value: dict) -> None:
 
 def python_command(executable: str, module: str, *arguments: str, root: Path | None = None) -> list[str]:
     """显式脚本入口兼容可嵌入解释器，不依赖被隔离的 PYTHONPATH（模块搜索环境变量）。"""
+    from .process_host import interpreter_command
     program = AppPaths.resolve(root).program_root
     entry = program / "scripts/backend-entry.py"
     if entry.is_file():
         paths = AppPaths.resolve(root)
         prefix = ["-X", f"pycache_prefix={paths.cache / 'python'}"] if paths.separated else []
-        return [executable, "-X", "utf8", *prefix, str(entry), module, *map(str, arguments)]
-    return [executable, "-m", module, *map(str, arguments)]
+        return interpreter_command(executable, "-X", "utf8", *prefix, str(entry), module, *map(str, arguments))
+    return interpreter_command(executable, "-m", module, *map(str, arguments))

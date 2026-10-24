@@ -1134,13 +1134,13 @@ fn verify_installer(context:&LaunchContext,path:&Path,cancel:&AtomicBool,progres
     let value=digest.finalize();if base64::engine::general_purpose::STANDARD.encode(value)!=artifact["sha512_base64"].as_str().unwrap_or(""){return Err("DSH 官方安装器摘要不匹配".into());}Ok(format!("{value:x}"))
 }
 fn run_seven(exe:&Path,source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),String>{
-    #[cfg(windows)] use std::os::windows::{process::CommandExt,io::AsRawHandle};
+    #[cfg(windows)] use std::os::windows::process::CommandExt;
     fs::create_dir_all(target).map_err(|e|e.to_string())?;let mut command=Command::new(exe);
     command.arg("x").arg(source).arg(format!("-o{}",target.display())).args(["-y","-bd"]).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)] command.creation_flags(0x08000000);
-    let mut child=command.spawn().map_err(|e|e.to_string())?;
     #[cfg(windows)] let job=crate::windows::Job::new()?;
-    #[cfg(windows)] job.assign(child.as_raw_handle())?;
+    #[cfg(windows)] let mut child=job.spawn(&mut command)?;
+    #[cfg(not(windows))] let mut child=command.spawn().map_err(|e|e.to_string())?;
     loop {if cancel.load(Ordering::Acquire){let _=child.kill();let _=child.wait();return Err("解包已取消".into());}
         if let Some(status)=child.try_wait().map_err(|e|e.to_string())? {if !status.success(){return Err("7-Zip（压缩工具）解包失败".into());}break;}
         std::thread::sleep(std::time::Duration::from_millis(80));}

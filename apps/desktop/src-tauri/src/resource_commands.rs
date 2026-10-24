@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdout, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
@@ -62,18 +62,13 @@ struct ControlledProcess {
 }
 
 impl ControlledProcess {
-    fn new(child: Child) -> Result<Self, String> {
+    fn spawn(command: &mut std::process::Command) -> Result<Self, String> {
         #[cfg(windows)] {
-            use std::os::windows::io::AsRawHandle;
             let job = voice_desktop_common::windows::Job::new()?;
-            if let Err(error) = job.assign(child.as_raw_handle() as _) {
-                let mut child = child;
-                let _ = child.kill();
-                return Err(error);
-            }
+            let child = job.spawn(command)?;
             Ok(Self { child, job })
         }
-        #[cfg(not(windows))] { Ok(Self { child }) }
+        #[cfg(not(windows))] { command.spawn().map(|child| Self { child }).map_err(|error| error.to_string()) }
     }
 
     fn kill(&mut self) {
@@ -681,7 +676,7 @@ impl ResourceManager {
         if !script.is_file() {
             return Err(ProcessError { message: "资源管理脚本缺失。".into(), installed: vec![], cancelled: false });
         }
-        let mut command = Command::new(&self.context.python);
+        let mut command = voice_desktop_common::process_host::python_command(&self.context.python);
         // -I（隔离模式）忽略 PYTHON* 环境变量；编码与缓存必须通过解释器参数明确指定。
         command.arg("-I").arg("-B").arg("-X").arg("utf8")
             .arg("-X").arg(format!("pycache_prefix={}",self.context.install.join("cache/python").display()))
@@ -700,16 +695,13 @@ impl ResourceManager {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = command.spawn().map_err(|_| ProcessError {
-            message: "无法启动固定 Python 资源管理器。".into(), installed: vec![], cancelled: false,
+        let mut child = ControlledProcess::spawn(&mut command).map_err(|_| ProcessError {
+            message: "无法建立受管资源进程。".into(), installed: vec![], cancelled: false,
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| ProcessError {
+        let stdout = child.child.stdout.take().ok_or_else(|| ProcessError {
             message: "资源管理器输出不可用。".into(), installed: vec![], cancelled: false,
         })?;
-        let mut child_stdin = child.stdin.take();
-        let child = ControlledProcess::new(child).map_err(|_| ProcessError {
-            message: "无法建立可控资源进程。".into(), installed: vec![], cancelled: false,
-        })?;
+        let mut child_stdin = child.child.stdin.take();
         let child = Arc::new(Mutex::new(child));
         if !job_id.is_empty() {
             self.attach_child(job_id, child.clone());

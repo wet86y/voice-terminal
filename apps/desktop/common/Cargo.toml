@@ -20,5 +20,5 @@ distribution = []
 qualification = ["distribution"]
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_Audio", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls_Dialogs", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Credentials"] }
