@@ -5,6 +5,8 @@ import { containPickerWheel } from "./picker-scroll";
 const props = defineProps<{
   modelValue: string; // modelValue（时间值）：沿用 HH:mm（时:分）格式。
   label: string; // label（控件名称）：区分开始时间和结束时间。
+  allow24?: boolean; // allow24（允许24:00）：仅供间隔时间使用，24点时分钟固定为00。
+  invalid?: boolean; // invalid（时间值无效）：供间隔设置显示字段校验状态。
   disabled?: boolean; // disabled（是否禁用）。
 }>();
 const emit = defineEmits<{
@@ -12,17 +14,17 @@ const emit = defineEmits<{
 }>();
 type TimePart = "hour" | "minute"; // TimePart（正在调整的时间部分）。
 
-function parseTime(value: string) {
+function parseTime(value: string, allow24 = false) {
   const match = value.trim().replace("：", ":").match(/^(\d{1,2}):(\d{1,2})$/);
   if (!match) return null;
   const hour = Number(match[1]), minute = Number(match[2]);
-  return hour <= 23 && minute <= 59 ? { hour, minute } : null;
+  return (hour <= 23 || (allow24 && hour === 24 && minute === 0)) && minute <= 59 ? { hour, minute } : null;
 }
 const pad = (value: number) => String(value).padStart(2, "0");
 const formatted = (time: { hour: number; minute: number }) => `${pad(time.hour)}:${pad(time.minute)}`;
-const current = computed(() => parseTime(props.modelValue) ?? { hour: 0, minute: 0 });
+const current = computed(() => parseTime(props.modelValue, props.allow24) ?? { hour: 0, minute: 0 });
 const normalized = computed(() => {
-  const time = parseTime(props.modelValue);
+  const time = parseTime(props.modelValue, props.allow24);
   return time ? formatted(time) : "";
 });
 const draft = ref(normalized.value); // draft（输入中的时间文字）。
@@ -35,10 +37,10 @@ const instanceId = useId(); // instanceId（每个时间控件的唯一标识）
 const panelId = `time-picker-${instanceId}`;
 const anchorName = `--time-picker-${instanceId}`; // anchorName（面板对应的输入框位置锚点）。
 const parts: TimePart[] = ["hour", "minute"];
-const options = {
-  hour: Array.from({ length: 24 }, (_, value) => value),
+const options = computed(() => ({
+  hour: Array.from({ length: props.allow24 ? 25 : 24 }, (_, value) => value),
   minute: Array.from({ length: 60 }, (_, value) => value),
-};
+}));
 
 watch(normalized, value => { if (!editing.value) draft.value = value; });
 watch(() => props.disabled, value => { if (value) closePanel(); });
@@ -49,12 +51,12 @@ function publish(time: { hour: number; minute: number }) {
 }
 function inputTime(event: Event) {
   draft.value = (event.target as HTMLInputElement).value;
-  const time = parseTime(draft.value);
+  const time = parseTime(draft.value, props.allow24);
   if (time && draft.value.length === 5) publish(time);
 }
 function commitEdit() {
   editing.value = false;
-  const time = parseTime(draft.value);
+  const time = parseTime(draft.value, props.allow24);
   if (time) publish(time);
   else draft.value = normalized.value;
 }
@@ -96,7 +98,9 @@ function closePanel(focusInput = false) {
 }
 async function choose(part: TimePart, value: number, focus = false) {
   if (props.disabled) return;
-  publish({ ...current.value, [part]: value });
+  if (part === "hour" && value === 24) publish({ hour: 24, minute: 0 });
+  else if (part === "minute" && current.value.hour === 24) return;
+  else publish({ ...current.value, [part]: value });
   await nextTick();
   if (focus) focusOption(part);
 }
@@ -111,9 +115,10 @@ async function fieldKeydown(event: KeyboardEvent) {
   } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
     event.preventDefault();
     const part: TimePart = (field.value?.selectionStart ?? 0) < 3 ? "hour" : "minute";
-    const time = parseTime(draft.value) ?? current.value;
+    const time = parseTime(draft.value, props.allow24) ?? current.value;
     const delta = (event.key === "ArrowUp" ? 1 : -1) * (part === "hour" ? 60 : 1);
-    const total = (time.hour * 60 + time.minute + delta + 1440) % 1440;
+    const rawTotal = time.hour * 60 + time.minute + delta;
+    const total = props.allow24 ? Math.max(0, Math.min(1440, rawTotal)) : (rawTotal + 1440) % 1440;
     publish({ hour: Math.floor(total / 60), minute: total % 60 });
     await nextTick();
     field.value?.setSelectionRange(part === "hour" ? 0 : 3, part === "hour" ? 2 : 5);
@@ -121,7 +126,7 @@ async function fieldKeydown(event: KeyboardEvent) {
 }
 function columnKeydown(event: KeyboardEvent, part: TimePart) {
   const value = Number((event.target as HTMLElement).dataset.value ?? current.value[part]);
-  const last = part === "hour" ? 23 : 59;
+  const last = part === "hour" ? (props.allow24 ? 24 : 23) : current.value.hour === 24 ? 0 : 59;
   if (event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "Home" || event.key === "End") {
     event.preventDefault();
     const next = event.key === "Home" ? 0 : event.key === "End" ? last : Math.max(0, Math.min(last, value + (event.key === "ArrowDown" ? 1 : -1)));
@@ -162,6 +167,7 @@ function columnKeydown(event: KeyboardEvent, part: TimePart) {
       aria-autocomplete="none"
       :aria-expanded="opened"
       :aria-controls="panelId"
+      :aria-invalid="invalid ? 'true' : undefined"
       :disabled="disabled"
       @focus="editing = true"
       @input="inputTime"
@@ -206,7 +212,7 @@ function columnKeydown(event: KeyboardEvent, part: TimePart) {
             :data-value="value"
             :aria-selected="current[part] === value"
             :tabindex="current[part] === value ? 0 : -1"
-            :disabled="disabled"
+            :disabled="disabled || (allow24 && part === 'minute' && current.hour === 24 && value !== 0)"
             @click="choose(part, value)"
           >{{ pad(value) }}</button>
         </div>

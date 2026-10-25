@@ -3013,11 +3013,25 @@ time {
 .wake-task-schedule.schedule-daily {
   grid-template-columns: minmax(120px, 180px) minmax(112px, 160px);
 }
-.wake-task-schedule.schedule-cron {
-  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+.wake-task-schedule.schedule-every {
+  grid-template-columns: minmax(120px, 180px) minmax(140px, 240px) 48px minmax(112px, 160px);
 }
 .wake-task-schedule > .form-field {
   min-width: 0;
+}
+.task-trigger-count-field input {
+  width: 100%;
+}
+.task-loop-field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.task-loop-field > span {
+  justify-content: flex-start;
+}
+.task-loop-field .instruction-toggle {
+  justify-content: flex-start;
 }
 .wake-task-schedule select {
   display: block;
@@ -3043,9 +3057,6 @@ time {
   padding: 6px 14px;
   border-radius: 9px;
 }
-.task-interval-field {
-  grid-column: 1 / -1;
-}
 /* 完整三列需要 644px；空间不足时三种规则统一把重复规则移到上一行。 */
 @container wake-task (max-width: 644px) {
   .wake-task-schedule.schedule-single,
@@ -3062,6 +3073,12 @@ time {
     width: 160px;
     max-width: 100%;
   }
+  .wake-task-schedule.schedule-every {
+    grid-template-columns: minmax(140px, 1fr) 48px minmax(100px, 130px);
+  }
+  .schedule-every .task-rule-field {
+    grid-column: 1 / -1;
+  }
 }
 @container wake-task (max-width: 380px) {
   .wake-task-summary > .pool-entry-actions {
@@ -3071,7 +3088,7 @@ time {
   .wake-task-schedule.schedule-weekly,
   .wake-task-schedule.schedule-single,
   .wake-task-schedule.schedule-daily,
-  .wake-task-schedule.schedule-cron {
+  .wake-task-schedule.schedule-every {
     grid-template-columns: minmax(0, 1fr);
   }
   .schedule-daily .task-time-field {

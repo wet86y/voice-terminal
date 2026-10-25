@@ -103,3 +103,86 @@ test('实际 DSH 规则投递一次性与重复任务，并在失败重试及重
     rmdirSync(temporary)
   }
 })
+
+test('有限间隔只在成功投递达到总次数后归档，并在重启后保留次数设置', async t => {
+  const start = Date.parse('2026-10-05T00:00:00.000Z')
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: start })
+  const originalFetch = globalThis.fetch
+  const originalWarn = console.warn
+  const calls = []
+  let service
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) })
+    if (calls.length === 1) return { ok: false, status: 503, json: async () => ({ detail: '暂时不可用' }) }
+    return { ok: true, status: 200, json: async () => ({ result: 'accepted', message_id: `finite-${calls.length}` }) }
+  }
+  console.warn = () => {}
+  try {
+    service = new TaskService()
+    const finite = await service.create({
+      title: '有限间隔', text: '检查两次', every_seconds: 60, loop: false, trigger_count: 2,
+    })
+    assert.equal(finite.when, new Date(start + 60_000).toISOString())
+    assert.equal(finite.loop, false)
+    assert.equal(finite.trigger_count, 2)
+    await assert.rejects(service.create({ title: '超长间隔', text: '不应保存', every_seconds: 86_460 }))
+    await assert.rejects(service.create({ title: '缺少次数', text: '不应保存', every_seconds: 60, loop: false }))
+
+    t.mock.timers.tick(60_000)
+    await service.chain
+    let row = service.list().find(item => item.task_id === finite.task_id)
+    assert.equal(calls[0]?.body.occurrence_id, `${finite.task_id}-1`)
+    assert.equal(row?.status, 'pending')
+    assert.equal(row?.occurrence, 1, '失败投递不能推进有限任务的触发次数')
+
+    t.mock.timers.tick(30_000)
+    await service.chain
+    row = service.list().find(item => item.task_id === finite.task_id)
+    assert.equal(calls[1]?.body.occurrence_id, calls[0]?.body.occurrence_id, '失败重试应沿用同一触发标识')
+    assert.equal(row?.status, 'pending')
+    assert.equal(row?.occurrence, 2)
+
+    await service.close()
+    service = new TaskService()
+    row = service.list().find(item => item.task_id === finite.task_id)
+    assert.equal(row?.status, 'pending')
+    assert.equal(row?.occurrence, 2)
+    assert.equal(row?.trigger_count, 2, '重启后应恢复有限触发次数与当前序号')
+
+    t.mock.timers.tick(30_000)
+    await service.chain
+    row = service.list().find(item => item.task_id === finite.task_id)
+    assert.equal(calls[2]?.body.occurrence_id, `${finite.task_id}-2`)
+    assert.equal(row?.status, 'archived')
+    assert.equal(row?.occurrence, 3)
+    const persisted = JSON.parse(readFileSync(store, 'utf8'))
+    assert.equal(persisted.schema_version, 1)
+    assert.equal(persisted.tasks[0].loop, false)
+    assert.equal(persisted.tasks[0].trigger_count, 2)
+
+    await service.close()
+    service = new TaskService()
+    row = service.list().find(item => item.task_id === finite.task_id)
+    assert.equal(row?.status, 'archived')
+    assert.equal(row?.trigger_count, 2)
+
+    const updatedFinite = await service.create({
+      title: '调整次数', text: '把次数调低', every_seconds: 60, loop: false, trigger_count: 5,
+    })
+    t.mock.timers.tick(60_000)
+    await service.chain
+    t.mock.timers.tick(60_000)
+    await service.chain
+    const updated = await service.update(updatedFinite.task_id, { trigger_count: 1 })
+    assert.equal(updated.occurrence, 3)
+    assert.equal(updated.status, 'archived', '新总次数低于已成功触发次数时应立即归档')
+  } finally {
+    if (service) await service.close()
+    globalThis.fetch = originalFetch
+    console.warn = originalWarn
+    for (const path of [store, native]) {
+      try { unlinkSync(path) } catch (error) { if (error?.code !== 'ENOENT') throw error }
+    }
+    rmdirSync(temporary)
+  }
+})

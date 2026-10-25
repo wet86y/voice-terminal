@@ -4,6 +4,7 @@ import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 import WakeTaskSchedule from '../../interface/WakeTaskSchedule.vue';
 import WakeTaskTabs from '../../interface/WakeTaskTabs.vue';
+import { validWakeTriggerCount, wakeIntervalSeconds } from '../../interface/wake-task-interval';
 const {
   saving,
   wakeTasks,
@@ -24,6 +25,19 @@ const pendingTasks = computed(() => wakeTasks.value.filter(task => task.status =
 const archivedTasks = computed(() => wakeTasks.value.filter(task => task.status !== 'pending'));
 const visibleTasks = computed(() => taskView.value === 'pending' ? pendingTasks.value : archivedTasks.value);
 function addTask() { taskView.value = 'pending'; addWakeTask(); }
+function intervalIsValid(hours: string, minutes: string) { return wakeIntervalSeconds(hours, minutes) !== null; }
+function countIsValid(count: string) { return validWakeTriggerCount(count); }
+function deliveredCount(task: { occurrence: number }) { return Math.max(0, task.occurrence - 1); }
+function formatRepeat(value: string) {
+  const match = /^(\d+)s$/u.exec(value);
+  if (!match) return value;
+  const seconds = Number(match[1]);
+  if (seconds % 60 !== 0) return `${seconds} 秒`;
+  const minutes = seconds / 60;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return hours && remainder ? `${hours} 小时 ${remainder} 分钟` : hours ? `${hours} 小时` : `${minutes} 分钟`;
+}
 </script>
 <template>
   <SettingsPageHeader section="wakes" />
@@ -38,10 +52,10 @@ function addTask() { taskView.value = 'pending'; addWakeTask(); }
     <section v-if="addingWakeTask" class="model-accordion-card wake-task-card wake-task-create" aria-label="添加定时任务">
       <h3>添加定时任务</h3>
       <div class="wake-task-editor">
-        <WakeTaskSchedule v-model:rule-kind="wakeTaskCreateDraft.ruleKind" v-model:when="wakeTaskCreateDraft.when" v-model:time="wakeTaskCreateDraft.time" v-model:weekdays="wakeTaskCreateDraft.weekdays" :disabled="saving" />
+        <WakeTaskSchedule v-model:rule-kind="wakeTaskCreateDraft.ruleKind" v-model:when="wakeTaskCreateDraft.when" v-model:time="wakeTaskCreateDraft.time" v-model:weekdays="wakeTaskCreateDraft.weekdays" v-model:interval-hours="wakeTaskCreateDraft.intervalHours" v-model:interval-minutes="wakeTaskCreateDraft.intervalMinutes" v-model:loop="wakeTaskCreateDraft.loop" v-model:trigger-count="wakeTaskCreateDraft.triggerCount" :disabled="saving" />
         <label class="form-field wake-task-text-field"><span>任务说明</span><textarea v-model="wakeTaskCreateDraft.text" maxlength="500" rows="2" aria-label="任务说明" placeholder="到时需要提醒或处理什么？" :disabled="saving"></textarea></label>
         <small>手动创建只保存任务说明，不冻结会话正文。</small>
-        <div class="wake-task-editor-actions"><button class="outline-button wake-task-button" type="button" :disabled="saving" @click="addingWakeTask = false">取消</button><button class="save-button compact-save" type="button" :disabled="saving || !wakeTaskCreateDraft.text.trim() || (wakeTaskCreateDraft.ruleKind === 'at' ? !wakeTaskCreateDraft.when : !wakeTaskCreateDraft.time) || (wakeTaskCreateDraft.ruleKind === 'weekly' && !wakeTaskCreateDraft.weekdays)" @click="createWakeTask">{{ saving ? '正在添加…' : '添加任务' }}</button></div>
+        <div class="wake-task-editor-actions"><button class="outline-button wake-task-button" type="button" :disabled="saving" @click="addingWakeTask = false">取消</button><button class="save-button compact-save" type="button" :disabled="saving || !wakeTaskCreateDraft.text.trim() || (wakeTaskCreateDraft.ruleKind === 'at' && !wakeTaskCreateDraft.when) || (['daily', 'weekly'].includes(wakeTaskCreateDraft.ruleKind) && !/^\d{2}:\d{2}(?::\d{2})?$/.test(wakeTaskCreateDraft.time)) || (wakeTaskCreateDraft.ruleKind === 'weekly' && !wakeTaskCreateDraft.weekdays) || (wakeTaskCreateDraft.ruleKind === 'every' && (!intervalIsValid(wakeTaskCreateDraft.intervalHours, wakeTaskCreateDraft.intervalMinutes) || (!wakeTaskCreateDraft.loop && !countIsValid(wakeTaskCreateDraft.triggerCount))))" @click="createWakeTask">{{ saving ? '正在添加…' : '添加任务' }}</button></div>
       </div>
     </section>
     <div v-if="visibleTasks.length" class="wake-task-list">
@@ -69,14 +83,16 @@ function addTask() { taskView.value = 'pending'; addWakeTask(); }
                   : task.rule_kind === "weekly"
                     ? "每周"
                     : task.rule_kind === "cron"
-                      ? "Cron（定时表达式）"
+                      ? "自定义规则"
                       : task.rule_kind === "every"
-                        ? "固定间隔"
+                        ? "间隔"
                         : "单次"
               }}
               · 下次：{{ task.when ? formatTime(task.when) : "—"
               }}<template v-if="task.repeat">
-                · 每 {{ task.repeat }} 重复</template
+                · 间隔 {{ formatRepeat(task.repeat) }}<template v-if="task.loop !== false">（循环）</template></template
+              ><template v-if="task.rule_kind === 'every' && task.loop === false">
+                · 共 {{ task.trigger_count }} 次（已触发 {{ Math.min(deliveredCount(task), task.trigger_count || 0) }} 次）</template
               ></small
             ><small
               >{{ task.creation_source === 'manual' ? '手动添加' : task.creation_source === 'agent' ? '代理创建' : '历史来源未知' }} · 参考上下文：{{ task.has_reference ? "已冻结，可按需读取" : "无"
@@ -84,10 +100,11 @@ function addTask() { taskView.value = 'pending'; addWakeTask(); }
                 · 最近触发：{{ formatTime(task.last_triggered_at) }}</template
               ></small
             >
+            <small v-if="task.status === 'pending' && task.rule_kind === 'cron'">该任务的自定义规则请通过 DSH（代理执行宿主）任务工具修改。</small>
           </div>
           <div class="pool-entry-actions">
             <button
-              v-if="task.status === 'pending'"
+              v-if="task.status === 'pending' && task.rule_kind !== 'cron'"
               class="outline-button wake-task-button"
               type="button"
               :aria-expanded="editingWakeTaskId === task.task_id"
@@ -110,10 +127,7 @@ function addTask() { taskView.value = 'pending'; addWakeTask(); }
           </div>
         </div>
         <div v-if="editingWakeTaskId === task.task_id" class="model-edit-panel wake-task-editor">
-          <WakeTaskSchedule v-model:rule-kind="wakeTaskDraft.ruleKind" v-model:when="wakeTaskDraft.when" v-model:time="wakeTaskDraft.ruleText" v-model:weekdays="wakeTaskDraft.weekdays" :disabled="saving" advanced>
-            <template #cron><label class="form-field"><span>定时表达式</span><input v-model="wakeTaskDraft.ruleText" type="text" :disabled="saving" /></label></template>
-            <template #interval><label class="form-field task-interval-field"><span>固定重复间隔</span><input v-model="wakeTaskDraft.repeat" placeholder="例如 1h（1 小时）、1d（1 天）" type="text" :disabled="saving" /></label></template>
-          </WakeTaskSchedule>
+          <WakeTaskSchedule v-model:rule-kind="wakeTaskDraft.ruleKind" v-model:when="wakeTaskDraft.when" v-model:time="wakeTaskDraft.ruleText" v-model:weekdays="wakeTaskDraft.weekdays" v-model:interval-hours="wakeTaskDraft.intervalHours" v-model:interval-minutes="wakeTaskDraft.intervalMinutes" v-model:loop="wakeTaskDraft.loop" v-model:trigger-count="wakeTaskDraft.triggerCount" :disabled="saving" />
           <label class="form-field wake-task-text-field"><span>任务说明</span><textarea v-model="wakeTaskDraft.text" maxlength="500" rows="2" :disabled="saving"></textarea></label>
           <div class="wake-task-editor-actions">
               <button
@@ -130,9 +144,10 @@ function addTask() { taskView.value = 'pending'; addWakeTask(); }
                   !wakeTaskDraft.text.trim() ||
                   (['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
                     ? !wakeTaskDraft.ruleText.trim()
-                    : !wakeTaskDraft.when) ||
-                  (wakeTaskDraft.ruleKind === 'weekly' && !wakeTaskDraft.weekdays) ||
-                  (wakeTaskDraft.ruleKind === 'every' && !wakeTaskDraft.repeat)
+                    : wakeTaskDraft.ruleKind === 'every'
+                      ? !intervalIsValid(wakeTaskDraft.intervalHours, wakeTaskDraft.intervalMinutes) || (!wakeTaskDraft.loop && !countIsValid(wakeTaskDraft.triggerCount))
+                      : !wakeTaskDraft.when) ||
+                  (wakeTaskDraft.ruleKind === 'weekly' && !wakeTaskDraft.weekdays)
                 "
                 @click="saveWakeTask"
               >

@@ -16,6 +16,8 @@ export type TaskInput = Record<string, unknown>
 const STORE_PATH = process.env.VOICE_DSH_TASKS_PATH ?? ''
 const LEGACY_PATH = process.env.VOICE_DSH_LEGACY_WAKE_PATH ?? ''
 const RETRY_MS = 30_000
+const MIN_EVERY_SECONDS = 60
+const MAX_EVERY_SECONDS = 24 * 60 * 60
 function taskTarget(value: unknown): Row['target'] {
   if (value === 'voice_llm' || value === 'shadow_agent' || value === 'both') return value
   throw new Error('target（任务目标）无效。')
@@ -27,7 +29,51 @@ type Row = {
   task_id: string; target: 'voice_llm' | 'shadow_agent' | 'both'; text: string; reference: string;
   record: ScheduleRecord; status: 'pending' | 'archived' | 'cancelled';
   created_at: string; updated_at: string; last_triggered_at: string | null;
+  /** loop（是否持续循环）：仅 every（间隔）规则使用；旧任务缺省为 true。 */
+  loop?: boolean
+  /** trigger_count（总触发次数）：包含第一次成功触发。 */
+  trigger_count?: number
   occurrence: number; retry_at?: number; history: Record<string, unknown>[];
+}
+
+type RecurrenceSettings = Pick<Row, 'loop' | 'trigger_count'>
+
+function validateEverySeconds(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)
+      || value < MIN_EVERY_SECONDS || value > MAX_EVERY_SECONDS || value % 60 !== 0) {
+    throw new Error('every_seconds（间隔秒数）必须是 60 至 86400 秒之间的整分钟数。')
+  }
+  return value
+}
+
+function validateTriggerCount(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error('trigger_count（总触发次数）必须是正整数。')
+  }
+  return value
+}
+
+function recurrenceSettings(args: TaskInput, isEvery: boolean, current?: Row): RecurrenceSettings {
+  if (!isEvery) {
+    if (args.loop !== undefined || args.trigger_count !== undefined) {
+      throw new Error('loop（是否循环）和 trigger_count（总触发次数）只适用于间隔规则。')
+    }
+    return {}
+  }
+  if (args.loop !== undefined && typeof args.loop !== 'boolean') {
+    throw new Error('loop（是否循环）必须是布尔值。')
+  }
+  const sameEvery = current?.record.kind === 'every'
+  const loop = args.loop ?? (sameEvery ? current?.loop ?? true : true)
+  if (loop) {
+    if (args.trigger_count !== undefined) throw new Error('循环任务不能同时设置 trigger_count（总触发次数）。')
+    return { loop: true }
+  }
+  const countValue = args.trigger_count !== undefined
+    ? args.trigger_count
+    : sameEvery ? current?.trigger_count : undefined
+  if (countValue === undefined) throw new Error('关闭循环时必须提供 trigger_count（总触发次数）。')
+  return { loop: false, trigger_count: validateTriggerCount(countValue) }
 }
 
 function readJson(path: string): Record<string, unknown> | undefined {
@@ -54,14 +100,37 @@ function decodeRow(value: unknown): Row {
       || (raw.status !== 'pending' && raw.status !== 'archived' && raw.status !== 'cancelled')) {
     throw new Error('DSH 任务存储行格式无效。')
   }
-  return { ...raw, task_id: raw.task_id, text: raw.text, reference: raw.reference,
+  const record = decodeScheduleRecord(raw.record)
+  const storedCount = raw.trigger_count === null ? undefined : raw.trigger_count
+  let loop: boolean | undefined
+  let triggerCount: number | undefined
+  if (record.kind === 'every') {
+    loop = raw.loop === undefined ? storedCount === undefined : raw.loop === true
+    if (raw.loop !== undefined && typeof raw.loop !== 'boolean') throw new Error('loop（是否循环）存储值无效。')
+    if (storedCount !== undefined) triggerCount = validateTriggerCount(storedCount)
+    if ((loop && triggerCount !== undefined) || (!loop && triggerCount === undefined)) {
+      throw new Error('间隔任务的循环与总触发次数存储值不一致。')
+    }
+  } else if (raw.loop !== undefined || storedCount !== undefined) {
+    throw new Error('非间隔任务不能保存循环或总触发次数。')
+  }
+  const decoded: Row = { ...raw, task_id: raw.task_id, text: raw.text, reference: raw.reference,
     target: taskTarget(raw.target), created_at: raw.created_at, updated_at: raw.updated_at,
     last_triggered_at: raw.last_triggered_at, occurrence: raw.occurrence, history: raw.history.map(jsonRecord),
-    status: raw.status, record: decodeScheduleRecord(raw.record),
+    status: raw.status, record,
     ...(raw.creation_source === 'manual' || raw.creation_source === 'agent' || raw.creation_source === 'unknown'
       ? { creation_source: raw.creation_source } : {}),
     ...(typeof raw.retry_at === 'number' ? { retry_at: raw.retry_at } : {}),
   }
+  if (record.kind === 'every') {
+    decoded.loop = loop ?? true
+    if (triggerCount === undefined) delete decoded.trigger_count
+    else decoded.trigger_count = triggerCount
+  } else {
+    delete decoded.loop
+    delete decoded.trigger_count
+  }
+  return decoded
 }
 
 function duration(value: string): number {
@@ -79,7 +148,7 @@ function recordFor(id: string, title: string, text: string, args: TaskInput, now
   switch (selectors[0]) {
     case 'after_seconds': return createAfterScheduleRecord(ScheduleId(id), text, Number(args.after_seconds), now, title)
     case 'at': return createAtScheduleRecord(ScheduleId(id), text, args.at as AtInput, now, title)
-    case 'every_seconds': return createEveryScheduleRecord(ScheduleId(id), text, Number(args.every_seconds), now, title)
+    case 'every_seconds': return createEveryScheduleRecord(ScheduleId(id), text, validateEverySeconds(args.every_seconds), now, title)
     case 'daily': return createDailyScheduleRecord(ScheduleId(id), text, args.daily as DailyInput, now, title)
     case 'weekly': return createWeeklyScheduleRecord(ScheduleId(id), text, args.weekly as WeeklyInput, now, title)
     default: return createCronScheduleRecord(ScheduleId(id), text, args.cron as CronInput, now, title)
@@ -94,7 +163,7 @@ function wakeRule(when: string, repeat: string | undefined): TaskInput {
   if (!Number.isFinite(due) || due <= now) throw new Error('when（触发时间）必须晚于当前时间。')
   if (repeat) {
     const seconds = duration(repeat)
-    if (seconds < 60) throw new Error('repeat（重复间隔）至少为 60 秒。')
+    validateEverySeconds(seconds)
     return { every_seconds: seconds, initial_at: new Date(due).toISOString() }
   }
   return { at: new Date(due).toISOString() }
@@ -181,6 +250,8 @@ export class TaskService {
     return {
       id: row.task_id, task_id: row.task_id, title: record.title, target: row.target,
       when: record.scheduledAt, repeat: record.kind === 'every' ? `${record.everySeconds}s` : null,
+      ...(record.kind === 'every' ? { loop: row.loop ?? true, trigger_count: row.trigger_count ?? null } : {}),
+      ...(record.kind === 'cron' ? { cron_input: { expression: record.expression, time_zone: record.timeZone } } : {}),
       rule_kind: record.kind, rule: record,
       text: row.text, status: row.status, created_at: row.created_at,
       updated_at: row.updated_at, last_triggered_at: row.last_triggered_at,
@@ -211,11 +282,12 @@ export class TaskService {
       if (initialAt) rule = { every_seconds: rule.every_seconds }
       const record = recordFor(id, title, text, rule, now)
       const finalRecord = initialAt ? decodeScheduleRecord({ ...record, scheduledAt: initialAt }) : record
+      const recurrence = recurrenceSettings(args, finalRecord.kind === 'every')
       const stamp = new Date(now).toISOString()
       const row: Row = { task_id: id, target, text,
         creation_source: args.creation_source === 'manual' ? 'manual' : 'agent',
         reference, record: finalRecord, status: 'pending', created_at: stamp, updated_at: stamp,
-        last_triggered_at: null, occurrence: 1, history: [] }
+        last_triggered_at: null, occurrence: 1, history: [], ...recurrence }
       this.rows.set(id, row)
       this.save(); this.arm()
       return this.view(row)
@@ -239,11 +311,21 @@ export class TaskService {
         if (initialAt) record = decodeScheduleRecord({ ...record, scheduledAt: initialAt })
       } else if (args.change) record = recordFor(id, title, text, args.change as TaskInput, now)
       else record = decodeScheduleRecord({ ...row.record, title, prompt: text })
-      row.record = record
-      row.text = text
       const target = taskTarget(args.target ?? row.target)
       if (!['voice_llm', 'shadow_agent', 'both'].includes(target)) throw new Error('target（任务目标）无效。')
+      const recurrence = recurrenceSettings(args, record.kind === 'every', row)
+      row.record = record
+      row.text = text
       row.target = target
+      if (record.kind === 'every') {
+        row.loop = recurrence.loop!
+        if (recurrence.trigger_count === undefined) delete row.trigger_count
+        else row.trigger_count = recurrence.trigger_count
+        if (row.loop === false && row.trigger_count! < row.occurrence) row.status = 'archived'
+      } else {
+        delete row.loop
+        delete row.trigger_count
+      }
       row.updated_at = new Date(now).toISOString()
       delete row.retry_at
       this.save(); this.arm()
@@ -309,7 +391,10 @@ export class TaskService {
           row.history = row.history.slice(-200)
           row.occurrence += 1
           delete row.retry_at
-          if (isRecurringScheduleRecord(row.record)) {
+          if (row.record.kind === 'every' && row.loop === false
+              && row.trigger_count !== undefined && row.occurrence > row.trigger_count) {
+            row.status = 'archived'
+          } else if (isRecurringScheduleRecord(row.record)) {
             const next = resolveRecurringOccurrence(row.record, Date.now()).nextScheduledAt
             row.status = next ? 'pending' : 'archived'
             if (next) row.record = decodeScheduleRecord({ ...row.record, scheduledAt: next })

@@ -24,6 +24,11 @@ writeFileSync(store, JSON.stringify({ schema_version: 1, tasks: [{
   task_id: historical.id, target: 'shadow_agent', text: historical.prompt, reference: '已有上下文',
   record: historical, status: 'archived', created_at: historical.scheduledAt, updated_at: historical.scheduledAt,
   last_triggered_at: null, occurrence: 2, history: [{ messageId: 'old-message' }],
+}, {
+  task_id: 'legacy-every', target: 'shadow_agent', text: '旧间隔任务', reference: '',
+  record: { id: 'legacy-every', kind: 'every', title: '旧间隔任务', prompt: '旧间隔任务', everySeconds: 60, scheduledAt: '2030-01-01T00:00:00.000Z' },
+  status: 'pending', created_at: '2026-09-26T15:13:25.574Z', updated_at: '2026-09-26T15:13:25.574Z',
+  last_triggered_at: null, occurrence: 1, history: [],
 }] }), 'utf8')
 const nativeContent = JSON.stringify({ tables: { tasks: {
   'native-task': { sessionId: 'ordinary-dsh-session', record: { ...historical, id: 'native-task', scheduledAt: '2030-01-01T00:00:00Z' },
@@ -49,6 +54,9 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
     assert.equal(service.reference('schedule-old').reference, '已有上下文')
     assert.equal(service.list().find(row => row.task_id === 'schedule-old').creation_source, 'unknown')
+    assert.equal(service.list().find(row => row.task_id === 'legacy-every').loop, true,
+      '没有新字段的旧间隔任务应继续循环')
+    assert.equal(service.list().find(row => row.task_id === 'legacy-every').trigger_count, null)
     const created = await service.create({ when: '1s', text: '请检查现在的状态' }, '创建时背景')
     assert.equal(created.has_reference, true)
     assert.equal(created.creation_source, 'agent')
@@ -60,6 +68,14 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     const cron = await service.create({ title: '工作日检查', prompt: '检查任务',
       cron: { expression: '0 9 * * 1-5', time_zone: 'Asia/Hong_Kong' } })
     assert.deepEqual([daily.rule_kind, weekly.rule_kind, cron.rule_kind], ['daily', 'weekly', 'cron'])
+    assert.deepEqual(cron.cron_input, { expression: '0 9 * * 1-5', time_zone: 'Asia/Hong_Kong' },
+      'Cron（定时规则）列表输出提供可直接复用的官方输入格式')
+    await assert.rejects(service.create({ title: '错误时间格式', prompt: '不能把时钟时间当 Cron 表达式',
+      cron: { expression: '02:55', time_zone: 'Asia/Hong_Kong' } }), /exactly five whitespace-separated fields/u,
+    'Cron（定时表达式）应拒绝 HH:mm（时:分）格式')
+    await assert.rejects(service.create({ title: '错误时区字段', prompt: '必须使用官方输入字段',
+      cron: { expression: '0 9 * * 1-5', timeZone: 'Asia/Hong_Kong' } }), /exactly expression and time_zone/u,
+    'Cron（定时表达式）应拒绝与官方接口不兼容的字段名')
     assert.equal(daily.creation_source, 'manual')
     assert.equal(daily.has_reference, false)
     await new Promise(resolve => setTimeout(resolve, 1300))
@@ -68,7 +84,7 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     assert.equal(service.list().find(row => row.task_id === created.task_id).status, 'archived')
     await service.close()
     service = new TaskService()
-    assert.equal(service.list().length, 5)
+    assert.equal(service.list().length, 6)
     assert.equal(service.list().find(row => row.task_id === daily.task_id).creation_source, 'manual')
     assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
     assert.equal(service.list().find(row => row.task_id === 'schedule-old').delivery_history[0].messageId, 'old-message')

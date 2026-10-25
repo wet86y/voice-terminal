@@ -84,7 +84,18 @@ export const productApi = {
     return await response.json() as { result: string }
   },
   /** createWakeTask（手动创建任务）：同源宿主校验桌面会话，内部凭据不进入前端。 */
-  createWakeTask: async (value: { text: string; at?: string; daily?: { time: string; time_zone: string }; weekly?: { time: string; time_zone: string; weekdays: number[] } }) => {
+  createWakeTask: async (value: {
+    text: string
+    at?: string
+    daily?: { time: string; time_zone: string }
+    weekly?: { time: string; time_zone: string; weekdays: number[] }
+    /** every_seconds（间隔秒数）：整分钟，范围为 60 至 86400。 */
+    every_seconds?: number
+    /** loop（是否持续循环）：关闭时必须提供 trigger_count（总触发次数）。 */
+    loop?: boolean
+    /** trigger_count（总触发次数）：包含第一次触发。 */
+    trigger_count?: number
+  }) => {
     const response = await fetch('/api/v1/application/wake-tasks', {
       method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value),
     })
