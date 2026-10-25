@@ -1117,6 +1117,49 @@ describe('正式界面的真实控件交互', () => {
     expect(value.wakeTaskCreateDraft.text).toBe('保留草稿')
     expect(value.lastError.value).toBe('创建失败')
   })
+  it('间隔任务创建和修改传递固定秒数、循环状态及总触发次数', async () => {
+    const { value } = liveAdapter()
+    allowBusinessReady(value)
+    const create = vi.spyOn(productApi, 'createWakeTask').mockResolvedValue({} as never)
+    value.addWakeTask()
+    Object.assign(value.wakeTaskCreateDraft, {
+      ruleKind: 'every', text: '有限检查', intervalHours: '1', intervalMinutes: '15',
+      loop: false, triggerCount: '3',
+    })
+    await value.createWakeTask()
+    expect(create).toHaveBeenCalledWith({ text: '有限检查', every_seconds: 4500, loop: false, trigger_count: 3 })
+
+    const update = vi.spyOn(productApi, 'updateWakeTask').mockResolvedValue({} as never)
+    value.editWakeTask({ task_id: 'finite-task', target: 'shadow_agent', status: 'pending',
+      when: '2026-10-12T18:00:00+08:00', text: '有限检查', repeat: '4500s',
+      rule_kind: 'every', loop: false, trigger_count: 3, occurrence: 2 } as never)
+    value.wakeTaskDraft.intervalHours = '0'
+    value.wakeTaskDraft.intervalMinutes = '30'
+    await value.saveWakeTask()
+    expect(update).toHaveBeenCalledWith('finite-task', expect.objectContaining({
+      change: { every_seconds: 1800 }, loop: false, trigger_count: 3,
+    }))
+    expect(update.mock.calls[0]?.[1]).not.toHaveProperty('reference')
+  })
+  it('手动间隔表单在间隔或有限次数无效时禁用保存', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(WakeTasksSettings) } })
+    allowBusinessReady(value)
+    value.addWakeTask()
+    expect(value.wakeTaskCreateDraft.intervalHours).toBe('1')
+    expect(value.wakeTaskCreateDraft.intervalMinutes).toBe('0')
+    expect(value.wakeTaskCreateDraft.loop).toBe(true)
+    expect(value.wakeTaskCreateDraft.triggerCount).toBe('1')
+    Object.assign(value.wakeTaskCreateDraft, { ruleKind: 'every', text: '检查', loop: false, triggerCount: '0' })
+    await flushPromises()
+    const save = wrapper.get('.wake-task-create .compact-save')
+    expect(save.attributes('disabled')).toBeDefined()
+    value.wakeTaskCreateDraft.intervalHours = '24'
+    value.wakeTaskCreateDraft.intervalMinutes = '0'
+    value.wakeTaskCreateDraft.triggerCount = '1'
+    await flushPromises()
+    expect(save.attributes('disabled')).toBeUndefined()
+  })
   it('三段服务端录音完成后立即允许保存，失败保留片段并可重试，成功显示已注册模板', async () => {
     vi.spyOn(productApi, 'startSpeakerEnrollment').mockResolvedValue({
       enrollment_id: 'complete-session', required_segments: 3,

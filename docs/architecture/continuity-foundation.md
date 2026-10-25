@@ -166,6 +166,8 @@ Plugins（插件）页面启用；启用后提供 `schedule_create/list/update/d
 
 项目任务存储位于 DSH home（DSH 用户数据目录）的 `storages/voice-terminal-wake-tasks.json`（项目任务文件）。插件迁移旧 Voice `wake-tasks.json`（旧语音任务文件）中的可转换项目任务，并保持已有项目任务和历史不变；它不导入官方 Schedule（会话定时任务），也不改写 DSH 的原生任务存储。安装及构建会保留用户已启用的官方 Automation Bundle（自动化功能包）。Voice Terminal（语音终端）的“唤醒任务”页只展示项目任务。
 
+间隔规则使用现有项目任务计时与投递流程，范围为 1 分钟至 24 小时并按整分钟设置。`loop`（是否持续循环）缺省时为持续循环；有限任务用 `trigger_count`（总触发次数）设定包含首次在内的成功投递次数。次数达到后任务归档；失败重试不消耗次数。新字段为可选存储成员，旧间隔任务仍按持续循环读取，`schema_version`（存储结构版本）保持不变。
+
 ## 安装
 
 停止当前 Voice Server（语音服务端）及其受管 DSH 进程后，运行 `scripts/setup-dsh.ps1`（DSH 安装脚本），然后按项目日常方式重新启动 Voice Server。安装脚本复用生产运行目录与唯一代理数据目录，构建统一插件并同步 Web profile（网页配置）；重要持久数据按唯一滚动备份规则保护；用户已启用的官方 Automation Bundle（自动化功能包）会保留。

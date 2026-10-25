@@ -19,6 +19,7 @@ import type {
   ProductSnapshot,
   WakeTask,
 } from './types'
+import { validWakeTriggerCount, wakeIntervalParts, wakeIntervalSeconds } from '../interface/wake-task-interval'
 import { isRecord } from '../record'
 import { desktopPort } from './desktop-port'
 import { modelComponentOwners } from './component-resources'
@@ -118,10 +119,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const editingWakeTaskId = ref('')
   const addingWakeTask = ref(false) // addingWakeTask（手动创建表单是否展开）。
   const wakeTaskCreateDraft = reactive({
-    ruleKind: 'at' as 'at' | 'daily' | 'weekly', // ruleKind（创建排期规则）。
+    ruleKind: 'at' as 'at' | 'daily' | 'weekly' | 'every', // ruleKind（创建排期规则）。
     when: '', // when（本地单次日期时间）。
     time: '', // time（每天或每周的时间）。
     weekdays: '', // weekdays（周一至周日的 1–7 集合）。
+    intervalHours: '1', // intervalHours（间隔小时数）。
+    intervalMinutes: '0', // intervalMinutes（间隔分钟数）。
+    loop: true, // loop（是否持续循环）：新间隔任务默认循环。
+    triggerCount: '1', // triggerCount（总触发次数）：包含第一次触发。
     timeZone: '', // timeZone（系统当前时区）。
     text: '', // text（任务说明），没有冻结参考。
   })
@@ -130,12 +135,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     target: 'voice_llm' as WakeTask['target'],
     /** when（时间）: 项目本地时间. */
     when: '',
-    /** repeat（间隔）: 固定循环间隔，空值表示一次性. */
-    repeat: '',
     ruleKind: 'at' as NonNullable<WakeTask['rule_kind']>,
     ruleText: '',
     timeZone: 'Asia/Hong_Kong',
     weekdays: '',
+    intervalHours: '1', // intervalHours（间隔小时数）。
+    intervalMinutes: '0', // intervalMinutes（间隔分钟数）。
+    loop: true, // loop（是否持续循环）。
+    triggerCount: '1', // triggerCount（总触发次数）：包含第一次触发。
     /** text（任务说明）: 触发时提供给 Agent 的方向. */
     text: '',
   })
@@ -495,7 +502,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       const pad = (value: number) => String(value).padStart(2, '0')
       wakeTaskDraft.when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
     } else wakeTaskDraft.when = ''
-    wakeTaskDraft.repeat = task.repeat || ''
+    const interval = wakeIntervalParts(task.repeat)
+    wakeTaskDraft.intervalHours = interval.hours
+    wakeTaskDraft.intervalMinutes = interval.minutes
+    wakeTaskDraft.loop = task.loop ?? true
+    wakeTaskDraft.triggerCount = String(task.trigger_count ?? 1)
     wakeTaskDraft.text = task.text
     wakeTaskDraft.ruleKind = task.rule_kind || (task.repeat ? 'every' : 'at')
     const rule = task.rule || {}
@@ -506,10 +517,20 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function saveWakeTask() {
     if (!editingWakeTaskId.value) return
+    const intervalSeconds = wakeTaskDraft.ruleKind === 'every'
+      ? wakeIntervalSeconds(wakeTaskDraft.intervalHours, wakeTaskDraft.intervalMinutes)
+      : null
+    if (wakeTaskDraft.ruleKind === 'every'
+        && (intervalSeconds === null || (!wakeTaskDraft.loop && !validWakeTriggerCount(wakeTaskDraft.triggerCount)))) {
+      setError(new Error('间隔须为 1 分钟至 24 小时；有限任务的触发次数须为正整数。'))
+      return
+    }
     saving.value = true
     try {
       const calendar = ['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
-      const change = wakeTaskDraft.ruleKind === 'daily'
+      const change = wakeTaskDraft.ruleKind === 'every'
+        ? { every_seconds: intervalSeconds! }
+        : wakeTaskDraft.ruleKind === 'daily'
         ? { daily: { time: scheduleTime(wakeTaskDraft.ruleText), time_zone: wakeTaskDraft.timeZone } }
         : wakeTaskDraft.ruleKind === 'weekly'
           ? { weekly: { time: scheduleTime(wakeTaskDraft.ruleText), time_zone: wakeTaskDraft.timeZone,
@@ -517,7 +538,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
           : { cron: { expression: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
       await productApi.updateWakeTask(editingWakeTaskId.value, {
         target: wakeTaskDraft.target, text: wakeTaskDraft.text,
-        ...(calendar ? { change } : { when: wakeTaskDraft.when, repeat: wakeTaskDraft.ruleKind === 'every' ? wakeTaskDraft.repeat : '' }),
+        ...(calendar || wakeTaskDraft.ruleKind === 'every'
+          ? { change }
+          : { when: wakeTaskDraft.when, repeat: '' }),
+        ...(wakeTaskDraft.ruleKind === 'every'
+          ? { loop: wakeTaskDraft.loop, ...(!wakeTaskDraft.loop ? { trigger_count: Number(wakeTaskDraft.triggerCount) } : {}) }
+          : {}),
       })
       editingWakeTaskId.value = ''
       await refreshWakeTasks()
@@ -534,7 +560,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const date = new Date(Date.now() + 3600000)
     const pad = (value: number) => String(value).padStart(2, '0')
     const when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
-    Object.assign(wakeTaskCreateDraft, { ruleKind: 'at', when, time: when.slice(11), weekdays: '', timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, text: '' })
+    Object.assign(wakeTaskCreateDraft, { ruleKind: 'at', when, time: when.slice(11), weekdays: '',
+      intervalHours: '1', intervalMinutes: '0', loop: true, triggerCount: '1',
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, text: '' })
     editingWakeTaskId.value = ''
     addingWakeTask.value = true
   }
@@ -544,8 +572,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const draft = { ...wakeTaskCreateDraft }
     const text = draft.text.trim()
     const weekdays = draft.weekdays.split(',').filter(Boolean).map(Number)
-    if (!text || text.length > 500 || (draft.ruleKind === 'weekly' && (!weekdays.length || weekdays.some(day => !Number.isInteger(day) || day < 1 || day > 7))) || (draft.ruleKind !== 'at' && !/^\d{2}:\d{2}(?::\d{2})?$/.test(draft.time))) {
-      setError(new Error('请填写有效的任务说明、触发时间与星期。'))
+    const intervalSeconds = draft.ruleKind === 'every' ? wakeIntervalSeconds(draft.intervalHours, draft.intervalMinutes) : null
+    if (!text || text.length > 500
+        || (draft.ruleKind === 'weekly' && (!weekdays.length || weekdays.some(day => !Number.isInteger(day) || day < 1 || day > 7)))
+        || (['daily', 'weekly'].includes(draft.ruleKind) && !/^\d{2}:\d{2}(?::\d{2})?$/.test(draft.time))
+        || (draft.ruleKind === 'every' && (intervalSeconds === null || (!draft.loop && !validWakeTriggerCount(draft.triggerCount))))) {
+      setError(new Error('请填写有效的任务说明、触发时间、星期或间隔次数。'))
       return
     }
     const date = new Date(draft.when)
@@ -558,7 +590,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       await productApi.createWakeTask({ text,
         ...(draft.ruleKind === 'at' ? { at: date.toISOString() }
           : draft.ruleKind === 'daily' ? { daily: { time: scheduleTime(draft.time), time_zone: draft.timeZone } }
-          : { weekly: { time: scheduleTime(draft.time), time_zone: draft.timeZone, weekdays } }),
+          : draft.ruleKind === 'weekly' ? { weekly: { time: scheduleTime(draft.time), time_zone: draft.timeZone, weekdays } }
+            : { every_seconds: intervalSeconds!, loop: draft.loop,
+              ...(!draft.loop ? { trigger_count: Number(draft.triggerCount) } : {}) }),
       })
       addingWakeTask.value = false
       await refreshWakeTasks()

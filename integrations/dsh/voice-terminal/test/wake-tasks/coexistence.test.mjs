@@ -189,6 +189,73 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
     assert.deepEqual(await callTool(first.ctx, first.agent, 'wake_task_list'), [],
       '项目启动不能把 native schedule（官方会话任务）导入链路任务存储')
 
+    const createToolSchema = first.ctx.tools.schemas(first.agent)
+      .find(schema => schema.name === 'wake_task_create')
+    assert.ok(createToolSchema, 'wake_task_create（创建任务）应暴露给 root Agent（根智能体）')
+    const parameters = createToolSchema.parameters.properties
+    assert.deepEqual(createToolSchema.parameters.required, ['title', 'prompt'],
+      'title（任务名称）和 prompt（任务内容）必须作为 DSH 工具必填参数暴露')
+    assert.equal(parameters.at.oneOf[0].type, 'string', 'at（单次时间）应允许带时区偏移的日期时间字符串')
+    assert.deepEqual(Object.keys(parameters.at.oneOf[1].properties).sort(), ['date', 'time', 'time_zone'])
+    assert.deepEqual(parameters.at.oneOf[1].required, ['date', 'time', 'time_zone'])
+    assert.equal(parameters.at.oneOf[1].additionalProperties, false,
+      'at（单次时间）的本地日期对象应只接受受支持字段')
+    assert.deepEqual(parameters.daily.required, ['time', 'time_zone'])
+    assert.equal(parameters.daily.additionalProperties, false,
+      'daily（每日规则）应完整暴露必填字段并拒绝其他字段')
+    assert.deepEqual(parameters.weekly.required, ['time', 'time_zone', 'weekdays'])
+    assert.equal(parameters.weekly.properties.weekdays.items.type, 'integer')
+    assert.equal(parameters.weekly.additionalProperties, false,
+      'weekly（每周规则）应完整暴露必填字段并拒绝其他字段')
+    assert.equal(parameters.every_seconds.type, 'integer')
+    for (const field of ['at', 'daily', 'weekly', 'every_seconds']) {
+      assert.match(parameters[field].description, /[\u4e00-\u9fff]/u,
+        `${field}（规则字段）应携带中文参数说明`)
+    }
+
+    const projectCron = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Workday check', prompt: 'Check the task',
+      cron: { expression: '0 9 * * 1-5', time_zone: 'Asia/Hong_Kong' },
+    })
+    assert.deepEqual(projectCron.cron_input, { expression: '0 9 * * 1-5', time_zone: 'Asia/Hong_Kong' },
+      'wake_task_create（创建任务）应接受并返回与 DSH 官方调度器相同的 Cron 输入格式')
+
+    const singleAt = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Single absolute time', prompt: 'Synthetic single absolute-time task',
+      at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    })
+    const dailyTask = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Daily task', prompt: 'Synthetic daily task',
+      daily: { time: '23:59:59', time_zone: 'Asia/Hong_Kong' },
+    })
+    const weeklyTask = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Weekly task', prompt: 'Synthetic weekly task',
+      weekly: { time: '23:59:59', time_zone: 'Asia/Hong_Kong', weekdays: [1, 3] },
+    })
+    assert.deepEqual([singleAt.rule_kind, dailyTask.rule_kind, weeklyTask.rule_kind], ['at', 'daily', 'weekly'],
+      'wake_task_create（创建任务）应通过 DSH 参数入口创建单次、每日与每周规则')
+
+    const incompatibleCronShape = await first.ctx.tools.execute({
+      callId: 'coexistence-wake-task-create-cron-wrong-time-zone-field',
+      signal: new AbortController().signal,
+      name: 'wake_task_create',
+      arguments: { title: '错误格式', prompt: '应拒绝不兼容字段',
+        cron: { expression: '0 9 * * 1-5', timeZone: 'Asia/Hong_Kong' } },
+      agent: first.agent,
+    })
+    assert.equal(incompatibleCronShape.isError, true,
+      'wake_task_create（创建任务）必须拒绝 native record（原生记录）格式的 timeZone 字段，要求输入格式 time_zone')
+    const incompatibleCronExpression = await first.ctx.tools.execute({
+      callId: 'coexistence-wake-task-create-cron-hhmm',
+      signal: new AbortController().signal,
+      name: 'wake_task_create',
+      arguments: { title: '错误表达式', prompt: '不能使用时钟时间',
+        cron: { expression: '02:55', time_zone: 'Asia/Hong_Kong' } },
+      agent: first.agent,
+    })
+    assert.equal(incompatibleCronExpression.isError, true,
+      'wake_task_create（创建任务）必须拒绝 HH:mm（时:分），只接受官方五字段 Cron 表达式')
+
     const nativeListed = await callTool(first.ctx, first.agent, 'schedule_list')
     assert.deepEqual(nativeListed.map(row => row.id), [nativeId], '官方 schedule_list（列出会话任务）只读官方存储')
     const projectOne = await callTool(first.ctx, first.agent, 'wake_task_create', {
@@ -197,6 +264,29 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
     const projectTwo = await callTool(first.ctx, first.agent, 'wake_task_create', {
       title: 'Project task two', prompt: 'Synthetic voice mainline task two', after_seconds: 3600,
     })
+    const finiteInterval = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Finite interval', prompt: 'Synthetic finite interval', every_seconds: 60,
+      loop: false, trigger_count: 2,
+    })
+    assert.equal(finiteInterval.rule_kind, 'every',
+      'wake_task_create（创建任务）应通过 DSH 参数入口创建间隔规则')
+    assert.equal(finiteInterval.loop, false)
+    assert.equal(finiteInterval.trigger_count, 2)
+    const finiteUpdate = await callTool(first.ctx, first.agent, 'wake_task_update', {
+      id: finiteInterval.id, trigger_count: 3,
+    })
+    assert.equal(finiteUpdate.trigger_count, 3, 'wake_task_update（修改任务）应更新有限触发次数')
+    const defaultLoop = await callTool(first.ctx, first.agent, 'wake_task_create', {
+      title: 'Default interval', prompt: 'Synthetic default interval', every_seconds: 60,
+    })
+    assert.equal(defaultLoop.loop, true, '省略 loop（是否循环）时应持续循环')
+    assert.equal(defaultLoop.trigger_count, null)
+    const shortcutInterval = await callTool(first.ctx, first.agent, 'schedule_wake', {
+      target: 'shadow_agent', when: '1h', repeat: '30m', loop: false,
+      trigger_count: 2, text: 'Synthetic shortcut interval',
+    })
+    assert.equal(shortcutInterval.loop, false)
+    assert.equal(shortcutInterval.trigger_count, 2, 'schedule_wake（快捷创建任务）应使用相同的间隔次数设置')
     const projectUpdated = await callTool(first.ctx, first.agent, 'wake_task_update', {
       id: projectOne.id, title: 'Project task one updated', prompt: 'Updated synthetic project content',
     })
@@ -205,7 +295,12 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
     const projectDeleted = await callTool(first.ctx, first.agent, 'wake_task_delete', { id: projectTwo.id })
     assert.equal(projectDeleted.status, 'cancelled', 'wake_task_delete（删除链路任务）按契约取消并保留历史记录')
     const projectListed = await callTool(first.ctx, first.agent, 'wake_task_list')
-    assert.deepEqual(new Set(projectListed.map(row => row.id)), new Set([projectOne.id, projectTwo.id]))
+    assert.deepEqual(new Set(projectListed.map(row => row.id)), new Set([
+      projectOne.id, projectTwo.id, projectCron.id, singleAt.id, dailyTask.id, weeklyTask.id,
+      finiteInterval.id, defaultLoop.id, shortcutInterval.id,
+    ]))
+    assert.equal(projectListed.find(row => row.id === finiteInterval.id).trigger_count, 3,
+      'wake_task_list（查询任务）应返回更新后的触发次数')
     assert.deepEqual((await callTool(first.ctx, first.agent, 'schedule_list')).map(row => row.id), [nativeId],
       '项目 CRUD（创建／读取／更新／删除）不能改写官方会话任务')
 
@@ -220,7 +315,9 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
     assert.equal(nativeRows.has(nativeId), false)
     assert.deepEqual(await callTool(first.ctx, first.agent, 'schedule_list'), [])
     assert.deepEqual(new Set((await callTool(first.ctx, first.agent, 'wake_task_list')).map(row => row.id)),
-      new Set([projectOne.id, projectTwo.id]), '官方 CRUD（创建／读取／更新／删除）不能改写项目任务')
+      new Set([projectOne.id, projectTwo.id, projectCron.id, singleAt.id, dailyTask.id, weeklyTask.id,
+        finiteInterval.id, defaultLoop.id, shortcutInterval.id]),
+      '官方 CRUD（创建／读取／更新／删除）不能改写项目任务')
 
     const nativeAcrossRestart = await callTool(first.ctx, first.agent, 'schedule_create', {
       title: 'Native restart reminder', prompt: 'Synthetic native task retained across restart', after_seconds: 3600,
@@ -241,12 +338,17 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
       [nativeAcrossRestart.id], '重启后的官方工具应从官方存储恢复会话任务')
     await second.mountProjectPlugin()
     const afterRestart = await callTool(second.ctx, second.agent, 'wake_task_list')
-    assert.deepEqual(new Set(afterRestart.map(row => row.id)), new Set([projectOne.id, projectTwo.id]),
+    assert.deepEqual(new Set(afterRestart.map(row => row.id)), new Set([
+      projectOne.id, projectTwo.id, projectCron.id, singleAt.id, dailyTask.id, weeklyTask.id,
+      finiteInterval.id, defaultLoop.id, shortcutInterval.id,
+    ]),
       '项目重启只恢复项目 tasks store（任务存储），不导入新增或既有官方任务')
     assert.ok(!afterRestart.some(row => row.id === nativeAcrossRestart.id))
     assert.equal((await callTool(second.ctx, second.agent, 'schedule_list')).some(row => row.id === nativeAcrossRestart.id), true)
     const persisted = JSON.parse(readFileSync(taskStore, 'utf8'))
-    assert.deepEqual(new Set(persisted.tasks.map(row => row.task_id)), new Set([projectOne.id, projectTwo.id]))
+    assert.deepEqual(new Set(persisted.tasks.map(row => row.task_id)),
+      new Set([projectOne.id, projectTwo.id, projectCron.id, singleAt.id, dailyTask.id, weeklyTask.id,
+        finiteInterval.id, defaultLoop.id, shortcutInterval.id]))
     assert.deepEqual(JSON.parse(readFileSync(nativeStore, 'utf8')).tables.tasks[nativeAcrossRestart.id].sessionId,
       'session-coexistence', '官方 fixture（测试样本）应保留原会话绑定')
   } finally {

@@ -31,8 +31,19 @@ def test_manual_create_requires_host_credential_and_fixes_business_fields(tmp_pa
                 headers = {'Authorization': 'Bearer test-host-secret'}
                 for extra in ({'target': 'both'}, {'creation_source': 'agent'}, {'reference': '伪造背景'}, {'daily': {}}):
                     assert (await client.post(route, headers=headers, json={**value, **extra})).status_code == 422
+                for invalid_interval in (
+                    {'every_seconds': 0},
+                    {'every_seconds': 86_460},
+                    {'every_seconds': 90},
+                    {'every_seconds': 60, 'loop': False},
+                    {'every_seconds': 60, 'loop': True, 'trigger_count': 2},
+                    {'every_seconds': 60, 'loop': False, 'trigger_count': 0},
+                ):
+                    result = await client.post(route, headers=headers, json={'text': '间隔任务', **invalid_interval})
+                    assert result.status_code == 422
                 for rule in ({'at': value['at']}, {'daily': {'time': '09:00:00', 'time_zone': 'Asia/Hong_Kong'}},
-                             {'weekly': {'time': '09:00:00', 'time_zone': 'Asia/Hong_Kong', 'weekdays': [1, 3]}}):
+                             {'weekly': {'time': '09:00:00', 'time_zone': 'Asia/Hong_Kong', 'weekdays': [1, 3]}},
+                             {'every_seconds': 3600, 'loop': False, 'trigger_count': 2}):
                     result = await client.post(route, headers=headers, json={'text': ' 检查真实任务 ', **rule})
                     assert result.status_code == 200
                     assert result.json()['creation_source'] == 'manual'

@@ -13,6 +13,74 @@ export const name = 'voice-terminal-wake-tasks'
 export const inject = ['agents', 'webServer']
 
 const MAX_REFERENCE_CHARS = 100_000
+const cronInputSchema = {
+  type: 'object' as const,
+  description: 'cron（Cron 定时规则）：与 DSH 官方 schedule_create（创建会话任务）相同的严格五字段 Vixie Cron 格式。',
+  properties: {
+    expression: {
+      type: 'string' as const,
+      required: true as const,
+      description: 'expression（五字段表达式）：格式为“分钟 小时 日期 月份 星期”；例如 0 9 * * 1-5 表示工作日 09:00。不接受 HH:mm、秒字段或扩展语法。',
+    },
+    time_zone: {
+      type: 'string' as const,
+      required: true as const,
+      description: 'time_zone（时区）：UTC 或 IANA 区域/地点，例如 Asia/Hong_Kong。',
+    },
+  },
+  additionalProperties: false as const,
+}
+
+const atInputSchema = {
+  description: 'at（单次绝对时点）：可传带 Z（协调世界时）或数字偏移的 RFC 3339 日期时间，也可传本地日期时间对象。',
+  oneOf: [
+    {
+      type: 'string' as const,
+      description: 'RFC 3339（日期时间格式），必须包含 Z 或时区偏移，例如 2026-10-26T09:00:00+08:00。',
+    },
+    {
+      type: 'object' as const,
+      additionalProperties: false as const,
+      description: '本地日期时间对象，date（日期）、time（时间）和 time_zone（时区）均必填。',
+      properties: {
+        date: { type: 'string' as const, required: true as const, description: 'date（日期）：YYYY-MM-DD（年-月-日）。' },
+        time: { type: 'string' as const, required: true as const, description: 'time（时间）：HH:mm:ss（时:分:秒），可带 1 至 3 位小数秒。' },
+        time_zone: { type: 'string' as const, required: true as const, description: 'time_zone（时区）：UTC 或 IANA 区域/地点，例如 Asia/Hong_Kong。' },
+      },
+    },
+  ] as const,
+} as const
+
+const dailyInputSchema = {
+  type: 'object' as const,
+  additionalProperties: false as const,
+  description: 'daily（每日规则）：每天在指定时区的本地时间触发。',
+  properties: {
+    time: { type: 'string' as const, required: true as const, description: 'time（时间）：HH:mm:ss（时:分:秒），可带 1 至 3 位小数秒。' },
+    time_zone: { type: 'string' as const, required: true as const, description: 'time_zone（时区）：UTC 或 IANA 区域/地点，例如 Asia/Hong_Kong。' },
+  },
+} as const
+
+const weeklyInputSchema = {
+  type: 'object' as const,
+  additionalProperties: false as const,
+  description: 'weekly（每周规则）：在指定星期和时区的本地时间触发。',
+  properties: {
+    time: { type: 'string' as const, required: true as const, description: 'time（时间）：HH:mm:ss（时:分:秒），可带 1 至 3 位小数秒。' },
+    time_zone: { type: 'string' as const, required: true as const, description: 'time_zone（时区）：UTC 或 IANA 区域/地点，例如 Asia/Hong_Kong。' },
+    weekdays: {
+      type: 'array' as const,
+      required: true as const,
+      description: 'weekdays（星期列表）：非空 ISO 星期数字；周一为 1，周日为 7，不得重复。',
+      items: { type: 'integer' as const },
+    },
+  },
+} as const
+
+const everySecondsSchema = {
+  type: 'integer' as const,
+  description: 'every_seconds（间隔秒数）：60 至 86400 秒的整分钟数，范围为 1 分钟至 24 小时。',
+} as const
 
 function responseToolOutput() {
   const nullableText = (description: string) => ({
@@ -20,6 +88,14 @@ function responseToolOutput() {
       { type: 'string' as const },
       { type: 'null' as const },
     ] as const,
+    description,
+  })
+  const nullableBoolean = (description: string) => ({
+    oneOf: [{ type: 'boolean' as const }, { type: 'null' as const }] as const,
+    description,
+  })
+  const nullableInteger = (description: string) => ({
+    oneOf: [{ type: 'integer' as const }, { type: 'null' as const }] as const,
     description,
   })
   return {
@@ -33,7 +109,9 @@ function responseToolOutput() {
           description: 'target（唤醒目标）：voice_llm、shadow_agent 或 both。',
         },
         when: nullableText('when（触发时间）：按项目本地时区表达的时间。'),
-        repeat: nullableText('repeat（重复间隔）：固定间隔；空值表示一次性任务。'),
+        repeat: nullableText('repeat（间隔）：按秒数字符串返回，范围为 60 至 86400 秒的整分钟间隔；空值表示非间隔任务。'),
+        loop: nullableBoolean('loop（是否持续循环）：true（是）持续循环，false（否）按 trigger_count（总触发次数）后归档；非间隔任务为空。'),
+        trigger_count: nullableInteger('trigger_count（总触发次数）：包含第一次成功触发；持续循环或非间隔任务为空。'),
         text: { type: 'string' as const, description: 'text（任务说明）：触发时传给目标 Agent 的方向。' },
         status: {
           type: 'string' as const,
@@ -46,6 +124,10 @@ function responseToolOutput() {
         occurrence: { type: 'integer' as const, description: 'occurrence（当前循环序号）。' },
         has_reference: { type: 'boolean' as const, description: 'has_reference（是否有冻结参考上下文）。' },
         reference: { type: 'string' as const, description: 'reference（创建任务时冻结的 DSH 上下文，只读）。' },
+        cron_input: {
+          ...cronInputSchema,
+          description: 'cron_input（Cron 规则的规范输入，可直接传给 wake_task_update（修改任务）的 cron 字段）。',
+        },
       },
       additionalProperties: true,
     },
@@ -99,7 +181,9 @@ function installAgentTools(agentCtx: Context, agent: Agent, service: TaskService
     parameters: {
       target: { type: 'string', enum: ['voice_llm', 'shadow_agent', 'both'], required: true, description: 'target（目标）：唤醒 voice_llm（语音大模型）、shadow_agent（影子代理）或 both（双方）。' },
       when: { type: 'string', required: true, description: 'when（时间）：延迟如 30m、2h，或项目本地时区的 ISO 日期时间。' },
-      repeat: { type: 'string', description: 'repeat（重复间隔）：可选固定间隔，如 1h、1d；省略表示一次性。' },
+      repeat: { type: 'string', description: 'repeat（重复间隔）：可选整分钟间隔，范围为 1 分钟至 24 小时；省略表示一次性。' },
+      loop: { type: 'boolean', description: 'loop（是否持续循环）：仅 repeat（重复间隔）有效，默认 true（是）；false（否）时必须提供 trigger_count（总触发次数）。' },
+      trigger_count: { type: 'integer', description: 'trigger_count（总触发次数）：正整数，包含第一次成功触发；关闭 loop（循环）时必填。' },
       text: { type: 'string', required: true, description: 'text（任务说明）：触发时传给目标 Agent 的简短方向。' },
     },
     output: responseToolOutput(),
@@ -163,16 +247,18 @@ function installAgentTools(agentCtx: Context, agent: Agent, service: TaskService
   })))
   dispose.push(agentCtx.tools.register(defineTool({
     name: 'wake_task_create',
-    description: '创建 Voice（语音）链路定时任务；任务到期后进入当前语音主线，不绑定创建它的 DSH 会话。仅提供一种时间规则。DSH 会话提醒请使用官方 schedule_create（创建会话任务）。',
+    description: '创建 Voice（语音）链路定时任务；任务到期后进入当前语音主线，不绑定创建它的 DSH 会话。必须且只能提供一种时间规则字段。DSH 会话提醒请使用官方 schedule_create（创建会话任务）。',
     parameters: {
       title: { type: 'string', required: true, description: 'title（任务名称）。' },
       prompt: { type: 'string', required: true, description: 'prompt（任务内容）。' },
-      after_seconds: { type: 'integer', description: 'after_seconds（延迟秒数）。' },
-      at: { oneOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }], description: 'at（带时区的绝对时点或本地时间对象）。' },
-      every_seconds: { type: 'integer', description: 'every_seconds（固定重复秒数）。' },
-      daily: { type: 'object', description: 'daily（每日时间与时区）。', additionalProperties: true },
-      weekly: { type: 'object', description: 'weekly（每周时间、时区和星期）。', additionalProperties: true },
-      cron: { type: 'object', description: 'cron（五字段定时表达式与时区）。', additionalProperties: true },
+      after_seconds: { type: 'integer', description: 'after_seconds（延迟秒数）：相对当前时间的一次性延迟，须为正整数。' },
+      at: atInputSchema,
+      every_seconds: everySecondsSchema,
+      loop: { type: 'boolean', description: 'loop（是否持续循环）：仅适用于 every_seconds（间隔秒数）；省略时默认为 true（持续循环）。' },
+      trigger_count: { type: 'integer', description: 'trigger_count（总触发次数）：正整数，包含第一次成功触发；loop（是否循环）为 false（否）时必填。' },
+      daily: dailyInputSchema,
+      weekly: weeklyInputSchema,
+      cron: cronInputSchema,
     },
     output: responseToolOutput(),
     async execute(args, exec) { ensureRoot(exec); return service.create(args, freezeCurrentContext(agent)) },
@@ -192,11 +278,13 @@ function installAgentTools(agentCtx: Context, agent: Agent, service: TaskService
       id: { type: 'string', required: true, description: 'id（任务标识）。' },
       title: { type: 'string', description: 'title（任务名称）。' },
       prompt: { type: 'string', description: 'prompt（任务内容）。' },
-      at: { oneOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }], description: 'at（带时区的绝对时点或本地时间对象）。' },
-      every_seconds: { type: 'integer', description: 'every_seconds（固定重复秒数）。' },
-      daily: { type: 'object', description: 'daily（每日规则）。', additionalProperties: true },
-      weekly: { type: 'object', description: 'weekly（每周规则）。', additionalProperties: true },
-      cron: { type: 'object', description: 'cron（定时表达式）。', additionalProperties: true },
+      at: atInputSchema,
+      every_seconds: everySecondsSchema,
+      loop: { type: 'boolean', description: 'loop（是否持续循环）：仅适用于 every_seconds（间隔秒数）；当前间隔任务省略时保留当前状态，其他规则改为间隔时默认为 true（持续循环）。' },
+      trigger_count: { type: 'integer', description: 'trigger_count（总触发次数）：正整数，包含第一次成功触发；关闭循环且没有已有次数时必填，可用它修改现有有限次数。' },
+      daily: dailyInputSchema,
+      weekly: weeklyInputSchema,
+      cron: cronInputSchema,
     },
     output: responseToolOutput(),
     async execute(args, exec) {
@@ -204,7 +292,9 @@ function installAgentTools(agentCtx: Context, agent: Agent, service: TaskService
       const change: Record<string, unknown> = {}
       for (const key of ['at', 'every_seconds', 'daily', 'weekly', 'cron'] as const) if (args[key] !== undefined) change[key] = args[key]
       return service.update(args.id, { title: args.title, prompt: args.prompt,
-        ...(Object.keys(change).length ? { change } : {}) })
+        ...(Object.keys(change).length ? { change } : {}),
+        ...(args.loop !== undefined ? { loop: args.loop } : {}),
+        ...(args.trigger_count !== undefined ? { trigger_count: args.trigger_count } : {}) })
     },
   })))
   dispose.push(agentCtx.tools.register(defineTool({

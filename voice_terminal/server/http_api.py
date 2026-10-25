@@ -548,14 +548,35 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=400, detail="请求必须为有效 JSON（结构化数据）。") from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="任务必须是对象。")
-        rules = [key for key in ("at", "daily", "weekly") if key in body]
-        if len(rules) != 1 or set(body) != {"text", rules[0]}:
-            raise HTTPException(status_code=422, detail="仅允许 text（任务说明）和一种单次、每天或每周规则。")
+        rules = [key for key in ("at", "daily", "weekly", "every_seconds") if key in body]
+        if len(rules) != 1:
+            raise HTTPException(status_code=422, detail="必须且只能提供一种单次、每日、每周或间隔规则。")
+        rule = rules[0]
+        allowed = {"text", rule}
+        if rule == "every_seconds":
+            allowed.update({"loop", "trigger_count"})
+        if set(body) - allowed or not {"text", rule}.issubset(body):
+            raise HTTPException(status_code=422, detail="手动任务只允许任务说明、一个时间规则及间隔任务的循环与次数字段。")
         text = body.get("text")
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 500:
             raise HTTPException(status_code=422, detail="任务说明须为 1 至 500 字。")
+        if rule == "every_seconds":
+            seconds = body.get("every_seconds")
+            loop = body.get("loop", True)
+            count = body.get("trigger_count")
+            if type(seconds) is not int or seconds < 60 or seconds > 86_400 or seconds % 60:
+                raise HTTPException(status_code=422, detail="every_seconds（间隔秒数）须为 60 至 86400 秒之间的整分钟数。")
+            if type(loop) is not bool:
+                raise HTTPException(status_code=422, detail="loop（是否循环）必须是布尔值。")
+            if loop and "trigger_count" in body:
+                raise HTTPException(status_code=422, detail="循环任务不能同时设置 trigger_count（总触发次数）。")
+            if not loop and (type(count) is not int or count < 1 or count > 9_007_199_254_740_991):
+                raise HTTPException(status_code=422, detail="关闭循环时 trigger_count（总触发次数）必须为正整数。")
+            if "trigger_count" in body and type(count) is not int:
+                raise HTTPException(status_code=422, detail="trigger_count（总触发次数）必须为整数。")
         return await dsh_task_api("POST", "tasks", {
-            "text": text.strip(), rules[0]: body[rules[0]],
+            "text": text.strip(), rule: body[rule],
+            **({key: body[key] for key in ("loop", "trigger_count") if key in body} if rule == "every_seconds" else {}),
             "target": "shadow_agent", "reference": "", "creation_source": "manual",
         })
 

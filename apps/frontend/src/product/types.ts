@@ -343,6 +343,10 @@ export interface WakeTask {
   when: string | null
   /** repeat（固定重复间隔）；null 表示一次性任务. */
   repeat: string | null
+  /** loop（是否持续循环）：仅间隔任务有效；历史间隔任务缺省为 true（持续循环）。 */
+  loop?: boolean
+  /** trigger_count（总触发次数）：包含第一次触发；循环任务为空。 */
+  trigger_count?: number | null
   /** rule_kind（规则类型）与 rule（原生调度规则）。 */
   rule_kind?: 'after' | 'at' | 'every' | 'daily' | 'weekly' | 'cron'
   rule?: Record<string, unknown>
