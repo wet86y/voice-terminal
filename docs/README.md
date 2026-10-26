@@ -109,6 +109,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.9 定时任务间隔、声纹拦截与进程管理](releases/v0.9.9.md)
 - [v0.9.8 持续倾听、声纹筛选与播报修订](releases/v0.9.8.md)
 - [v0.9.7 发行说明](releases/v0.9.7.md)
 - [v0.9.6 强制兼容处理与发布构建](releases/v0.9.6.md)
