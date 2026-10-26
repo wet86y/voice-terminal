@@ -65,6 +65,7 @@
 - [启动与维护界面连续性验收](testing/startup-ui-continuity.md)
 - [项目进程管理验收（2026-10-24）](testing/process-management-20261024.md)
 - [持续倾听与二等信箱验收（2026-10-24）](testing/secondary-listening-20261024.md)
+- [0.9.9 本机更新、分发与 GitHub 发行验收](testing/release-0.9.9-20261026.md)
 - [0.9.8 本机更新与公开发行验收](testing/release-0.9.8-20261024.md)
 - [0.9.7 本机更新与公开发行验收](testing/release-0.9.7-20261023.md)
 - [0.9.7 本机覆盖更新验收](testing/local-delivery-0.9.7-20261024.md)
