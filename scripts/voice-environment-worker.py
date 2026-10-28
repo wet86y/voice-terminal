@@ -19,6 +19,12 @@ import shutil
 import subprocess
 import zipfile
 
+# 私有环境检查同样可能在产品宿主中导入第三方框架；在导入依赖前启用后台进程策略。
+if __name__ == '__main__' and os.environ.get('VOICE_PROCESS_HOST'):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from voice_terminal.process_host import configure_background_subprocesses
+    configure_background_subprocesses()
+
 def emit(value):
     print(json.dumps(value,ensure_ascii=False),flush=True)
 
