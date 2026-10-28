@@ -96,6 +96,97 @@ def test_native_host_preserves_pipe_encoding_and_exit_code(native_host):
     assert result.stderr.strip() == "诊断中文"
 
 
+CONSOLE_PROBE_CODE = '''
+import ctypes, json, sys
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.GetConsoleWindow.restype = ctypes.c_void_p
+window = kernel.GetConsoleWindow()
+user = ctypes.WinDLL("user32", use_last_error=True)
+user.IsWindowVisible.argtypes = [ctypes.c_void_p]
+print(json.dumps({"console_handle": window, "visible": bool(user.IsWindowVisible(window))}), flush=True)
+print("后台诊断中文", file=sys.stderr, flush=True)
+sys.exit(7)
+'''
+
+
+@pytest.mark.parametrize("flags,positional", [(0, False), (0, True), (0x200, False)])
+def test_background_policy_hides_console_and_preserves_process_protocol(native_host, flags, positional):
+    root = Path(__file__).resolve().parents[1]
+    source = f'''
+import sys, subprocess, json
+sys.path.insert(0, {str(root)!r})
+from voice_terminal.process_host import configure_background_subprocesses
+configure_background_subprocesses()
+initialize = subprocess.Popen.__init__
+configure_background_subprocesses()
+assert subprocess.Popen.__init__ is initialize
+command = [sys.executable, "-I", "-B", "-X", "utf8", "-c", {CONSOLE_PROBE_CODE!r}]
+if {positional!r}:
+    child = subprocess.Popen(command, -1, None, None, subprocess.PIPE, subprocess.PIPE,
+        None, True, False, None, None, None, None, {flags}, text=True, encoding="utf-8")
+else:
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags={flags}, text=True, encoding="utf-8")
+output, error = child.communicate(timeout=10)
+print(json.dumps({{"result": json.loads(output), "error": error, "code": child.returncode}}, ensure_ascii=False))
+'''
+    result = subprocess.run([str(native_host), "--worker-host", sys.executable,
+        "-I", "-B", "-X", "utf8", "-c", source], capture_output=True, text=True,
+        encoding="utf-8", timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["result"] == {"console_handle": None, "visible": False}
+    assert value["code"] == 7
+    assert value["error"].strip() == "后台诊断中文"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅验证 Windows（操作系统）创建标志")
+def test_background_policy_preserves_explicit_console_requests():
+    root = Path(__file__).resolve().parents[1]
+    source = f'''
+import sys, subprocess
+sys.path.insert(0, {str(root)!r})
+seen = []
+def initialize(self, args, creationflags=0):
+    seen.append(creationflags)
+subprocess.Popen.__init__ = initialize
+from voice_terminal.process_host import configure_background_subprocesses
+configure_background_subprocesses()
+for flags in (subprocess.CREATE_NEW_CONSOLE, subprocess.DETACHED_PROCESS,
+              subprocess.CREATE_NEW_PROCESS_GROUP, subprocess.CREATE_NO_WINDOW):
+    subprocess.Popen(["unused"], creationflags=flags)
+assert seen == [subprocess.CREATE_NEW_CONSOLE, subprocess.DETACHED_PROCESS,
+    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW, subprocess.CREATE_NO_WINDOW], seen
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", source],
+        capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stderr
+
+
+def test_backend_entry_hides_dependency_subprocess_without_caller_flags(native_host, tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    # 模拟第三方模块在导入时创建控制台工具；调用方不主动安装策略或传递隐藏标志。
+    module = tmp_path / "background_console_probe.py"
+    module.write_text(
+        "import subprocess,sys\n"
+        f"result=subprocess.run([sys.executable,'-I','-B','-X','utf8','-c',{CONSOLE_PROBE_CODE!r}],"
+        "capture_output=True,text=True,encoding='utf-8')\n"
+        "print(result.stdout.strip())\n", encoding="utf-8")
+    source = f'''
+import sys, runpy
+sys.path.insert(0, {str(root)!r})
+import voice_terminal
+voice_terminal.__path__.append({str(tmp_path)!r})
+sys.argv = [{str(root / 'scripts/backend-entry.py')!r}, 'voice_terminal.background_console_probe']
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+    result = subprocess.run([str(native_host), "--worker-host", sys.executable,
+        "-I", "-B", "-X", "utf8", "-c", source], capture_output=True, text=True,
+        encoding="utf-8", timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"console_handle": None, "visible": False}
+
+
 def test_native_host_failure_returns_without_opening_a_window(native_host, tmp_path):
     result = subprocess.run([str(native_host), "--worker-host", str(tmp_path / "python.exe")],
         capture_output=True, text=True, encoding="utf-8", timeout=10)

@@ -13,6 +13,8 @@ if len(sys.argv) < 2 or not sys.argv[1].startswith(("voice_terminal.", "apps.ser
     raise SystemExit("需要指定受管后端模块")
 module = sys.argv.pop(1)
 sys.argv[0] = module
+from voice_terminal.process_host import configure_background_subprocesses
+configure_background_subprocesses()
 from voice_terminal.tensor_runtime import activate_tensor_runtime
 activate_tensor_runtime("cuda" if module == "voice_terminal.hardware_probe" else None)
 from voice_terminal.startup_logging import startup_event
