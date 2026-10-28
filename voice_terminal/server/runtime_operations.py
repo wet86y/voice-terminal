@@ -74,13 +74,15 @@ class RuntimeOperations:
 
     @asynccontextmanager
     async def run(self, target, label, *, phase="switching", pause=False, wait_output=False,
-                  on_release=None, ticket=None):
+                  on_release=None, ticket=None,
+                  publish_on_start=True):  # publish_on_start（是否先发布操作开始快照）。
         ticket = ticket or self.reserve(target, label, phase=phase, pause=pause)
         ticket.started = True
         operation = RuntimeOperation(self, ticket.key)
         failure = None
         try:
-            await self.publish()
+            if publish_on_start:
+                await self.publish()
             if ticket.pause:
                 await ticket.ready.wait()
                 if self.closed:

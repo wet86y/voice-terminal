@@ -1255,7 +1255,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     async def set_reasoning_mode(self, mode: str) -> bool:
         if mode not in {"fast", "deep"}:
             return False
-        async with runtime_operation(self, "reasoning_mode", "推理模式"):
+        async with runtime_operation(
+            self, "reasoning_mode", "推理模式",
+            publish_on_start=False,  # 跳过切换前的旧模式快照，避免前端选中态闪回。
+        ):
             async with self._session_lock:
                 self.reasoning_mode = mode
                 if self.controller is not None:
