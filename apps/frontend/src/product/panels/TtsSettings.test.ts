@@ -26,10 +26,10 @@ describe('音色设置只提供资源完整的本地模型', () => {
     return mount(defineComponent({ setup() { provideProductContext({ settings, setNotice: vi.fn() } as never); return () => h(TtsSettings) } }),
       { global: { stubs: { TtsVoiceLibrary: true } } })
   }
-  it('智能语音调节缺省开启，保存关闭后保持界面与配置一致', async () => {
+  it('语音调节缺省开启，保存关闭后保持界面与配置一致', async () => {
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({ settings: { tts: { speech_control_enabled: false } } } as never)
     const wrapper = render()
-    const control = wrapper.get('input[aria-label="智能语音调节"]')
+    const control = wrapper.get('input[aria-label="语音调节"]')
     expect((control.element as HTMLInputElement).checked).toBe(true)
     await control.setValue(false)
     await flushPromises()
@@ -38,11 +38,11 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect((control.element as HTMLInputElement).checked).toBe(false)
     wrapper.unmount()
   })
-  it('智能语音调节保存失败恢复原开关，显式关闭值不会被缺省值覆盖', async () => {
+  it('语音调节保存失败恢复原开关，显式关闭值不会被缺省值覆盖', async () => {
     settings.tts.speech_control_enabled = false
     vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('设置无法保存'))
     const wrapper = render()
-    const control = wrapper.get('input[aria-label="智能语音调节"]')
+    const control = wrapper.get('input[aria-label="语音调节"]')
     expect((control.element as HTMLInputElement).checked).toBe(false)
     await control.setValue(true)
     await flushPromises()
@@ -73,6 +73,8 @@ describe('音色设置只提供资源完整的本地模型', () => {
     } as never)
     const wrapper = render()
     expect(wrapper.find('.online-tts-settings').exists()).toBe(true)
+    expect(wrapper.get('.tts-target').find('.online-tts-settings').exists()).toBe(false)
+    expect(wrapper.get('.online-tts-settings').element.compareDocumentPosition(wrapper.get('.speech-control-row').element) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(wrapper.findAll('.online-model-choice').map(button => button.text())).toEqual(['Turbo低时延', 'HD高音质'])
     await wrapper.findAll('.online-model-choice')[0].trigger('click')
     await wrapper.find('.online-voice-row input').setValue('  my-clone  ')
@@ -123,6 +125,56 @@ describe('音色设置只提供资源完整的本地模型', () => {
     settings.tts.backend = 'voxcpm1'
     const wrapper = render()
     expect(wrapper.find('.online-tts-settings').exists()).toBe(false)
+    wrapper.unmount()
+  })
+  it('本地合成质量固定展示三个档位，保存当前模型且保留另一模型步数', async () => {
+    settings.tts.backend = 'voxcpm1'
+    settings.tts.local_model = 'voxcpm2'
+    settings.tts.inference_steps_by_model = { voxcpm1: 12, voxcpm2: 20 }
+    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
+    const wrapper = render()
+    const choices = wrapper.findAll('.tts-quality-options button')
+    expect(choices.map(button => button.text())).toEqual(['低', '中', '高'])
+    expect(choices[2].attributes('aria-pressed')).toBe('true')
+    expect(wrapper.find('.tts-quality summary').exists()).toBe(false)
+    const target = wrapper.get('.tts-target').element
+    const control = wrapper.get('.speech-control-row').element
+    const quality = wrapper.get('.tts-quality').element
+    const library = wrapper.get('tts-voice-library-stub').element
+    expect(target.compareDocumentPosition(library) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(library.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(control.compareDocumentPosition(quality) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    for (const [index, steps] of [10, 15, 20].entries()) {
+      await choices[index].trigger('click')
+      await flushPromises()
+      expect(save).toHaveBeenLastCalledWith({ inference_steps_by_model: { voxcpm1: 12, voxcpm2: steps } })
+      expect(settings.tts.inference_steps_by_model).toEqual({ voxcpm1: 12, voxcpm2: steps })
+      expect(choices[index].attributes('aria-pressed')).toBe('true')
+    }
+    wrapper.unmount()
+  })
+  it('保存合成质量期间禁用档位，失败后恢复原步数和选中状态', async () => {
+    settings.tts.backend = 'voxcpm1'
+    settings.tts.local_model = 'voxcpm2'
+    settings.tts.inference_steps_by_model = { voxcpm1: 10, voxcpm2: 15 }
+    let rejectSave!: (error: Error) => void // rejectSave（模拟保存失败）：验证在途状态与回滚。
+    vi.spyOn(productApi, 'saveTts').mockImplementation(() => new Promise((_resolve, reject) => { rejectSave = reject }))
+    const wrapper = render()
+    const choices = wrapper.findAll('.tts-quality-options button')
+    await choices[0].trigger('click')
+    expect(choices.every(button => (button.element as HTMLButtonElement).disabled)).toBe(true)
+    rejectSave(new Error('质量设置保存失败'))
+    await flushPromises()
+    expect(choices[1].attributes('aria-pressed')).toBe('true')
+    expect(choices.every(button => !(button.element as HTMLButtonElement).disabled)).toBe(true)
+    expect(settings.tts.inference_steps_by_model.voxcpm2).toBe(15)
+    expect(wrapper.text()).toContain('质量设置保存失败')
+    wrapper.unmount()
+  })
+  it('在线目标保留语音调节并隐藏本地合成质量', () => {
+    const wrapper = render()
+    expect(wrapper.find('.speech-control-row').exists()).toBe(true)
+    expect(wrapper.find('.tts-quality').exists()).toBe(false)
     wrapper.unmount()
   })
 })
