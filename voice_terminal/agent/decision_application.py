@@ -62,6 +62,10 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
                 requested = admission.snapshot if admission is not None else snapshot
                 expected = requested.get("output_generation") if isinstance(requested, dict) else None
                 kwargs = {"emotion": decision.emotion}
+                if decision.controls is not None and hasattr(self.output, "speech_control_epoch"):
+                    kwargs.update(controls=decision.controls,
+                                  control_epoch=requested.get("_speech_control_epoch"),
+                                  control_profile=requested.get("_speech_control_profile"))
                 if expected is not None:
                     kwargs["expected_generation"] = expected
                 handle = await replace(identity, turn_id, **kwargs)
@@ -95,7 +99,7 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
             identity, turn_id,
             admission.snapshot if admission is not None else snapshot,
             decision.text,
-            emotion=decision.emotion, dispatch_context=dispatch_context,
+            emotion=decision.emotion, controls=decision.controls, dispatch_context=dispatch_context,
         )
         self.current_action = "speak" if revised is not None else "wait"
     else:

@@ -1406,7 +1406,7 @@ fn start_service_for(app: tauri::AppHandle, state: Arc<Desktop>, kind:ServiceSta
 
 // create_window（统一窗口）：选定工作区后销毁临时窗口，将网页缓存切换到工作区。
 fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)->Result<WebviewWindow,String>{
-    let repair_handoff=management&&build_state.context().is_some_and(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).unwrap_or(false));
+    let repair_handoff=management&&build_state.context().is_some_and(|context|context.install.join("tmp/native-install.json").exists()||voice_desktop_common::component_maintenance::pending_repairs(&context).unwrap_or(false));
     let pending=build_state.mode==FrontendMode::Product&&build_state.context().is_none();
             let navigation_state = build_state.clone();
             let page_state = build_state.clone();
@@ -1586,7 +1586,7 @@ fn run() -> Result<(), String> {
                 *build_state.workspace_guard.lock().unwrap()=Some(voice_desktop_common::installation::WorkspaceGuard::acquire(&context.install).map_err(std::io::Error::other)?);
                 initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
             }
-            let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context)).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
+            let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).map(|pending|pending||context.install.join("tmp/native-install.json").exists())).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
             create_window(app.handle(),build_state.clone(),maintenance).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;

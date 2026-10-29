@@ -66,9 +66,10 @@ class MiniMaxEmotionUnsupported(MiniMaxTtsError):
 
 
 class MiniMaxTtsSession:
-    def __init__(self, client: "MiniMaxTtsClient", *, emotion: str | None = None) -> None:
+    def __init__(self, client: "MiniMaxTtsClient", *, emotion: str | None = None, controls=None) -> None:
         self.client = client
         self.emotion = emotion
+        self.controls = controls  # controls（本任务冻结的语音调节快照）。
         self.bidi = getattr(client, "transport", "websocket") == "websocket_bidi"
         self._socket: Any = None
         self._receiver: asyncio.Task[None] | None = None
@@ -112,6 +113,7 @@ class MiniMaxTtsSession:
         self._sentence_index = 0
         self._sentence_audio_base_ms = 0
         self._alignment_events: deque[dict[str, Any]] = deque(maxlen=512)
+        self.alignment_event_count = 0  # alignment_event_count（累计字幕事件数），不受环形缓存长度影响。
         self._cache_max_bytes = int(getattr(client, "audio_cache_max_bytes", 64 * 1024 * 1024))
         self.connection_id: int | None = None
         self._retry_attempts: dict[str, int] = {}
@@ -331,7 +333,9 @@ class MiniMaxTtsSession:
                         f"MiniMax Bidi 连接握手异常：期望 connected_success，收到 {connected_event or 'unknown'}"
                     )
                 logger.debug("minimax.connected_success connect_id=%s", connected.get("connect_id"))
-            await self._socket.send(json.dumps(self.client.start_payload(self.emotion), ensure_ascii=False))
+            payload = (self.client.start_payload(self.emotion, controls=self.controls) if self.controls is not None
+                       else self.client.start_payload(self.emotion))
+            await self._socket.send(json.dumps(payload, ensure_ascii=False))
             logger.debug("minimax.task_start_sent")
             while True:
                 message = await asyncio.wait_for(self._socket.recv(), self.client.timeout_seconds)
@@ -502,6 +506,7 @@ class MiniMaxTtsSession:
                         alignment["audio_base_ms"] = self._sentence_audio_base_ms
                         alignment["audio_returned_ms"] = self._received_audio_ms()
                         self._alignment_events.append(alignment)
+                        self.alignment_event_count += 1
                 data = parsed.get("data")
                 if (not self.bidi or self._generation_active) and not self._cancel_requested and not cancel_confirmation and isinstance(data, dict) and isinstance(data.get("audio"), str) and data["audio"]:
                     try:
@@ -790,6 +795,7 @@ class MiniMaxTtsSession:
         self._sentence_index = 0
         self._sentence_audio_base_ms = 0
         self._alignment_events.clear()
+        self.alignment_event_count = 0
         self._retry_attempts.clear()
         self._retry_deadlines.clear()
         self._sent_texts.clear()
@@ -892,6 +898,7 @@ class MiniMaxTtsSession:
 
 
 class MiniMaxTtsClient:
+    supports_speech_controls = True  # supports_speech_controls（统一语音调节接入）。
     def __init__(
         self,
         *,
@@ -967,6 +974,7 @@ class MiniMaxTtsClient:
         self.emotion_status = "requested" if self.emotion_enabled else "disabled"
         self.emotion_error: str | None = None
         self._active_emotion = self.default_emotion
+        self._active_controls = None
         self.timeout_seconds = timeout_ms / 1000
         # ``timeout_ms`` is kept as the connection/task-start timeout.  The
         # service documents a 120-second idle window after the last result;
@@ -1018,7 +1026,7 @@ class MiniMaxTtsClient:
                 if self._bidi_session is active:
                     self._bidi_session = None
                 await asyncio.sleep(0.25 * (2 ** attempt))
-                active = self.session(fresh=True)
+                active = self.session(fresh=True, controls=getattr(active, "controls", None))
         return active
 
     @property
@@ -1041,15 +1049,15 @@ class MiniMaxTtsClient:
         allowed = {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"}
         return value if isinstance(value, str) and value in allowed else "calm"
 
-    def start_payload(self, emotion: str | None = None) -> dict[str, Any]:
+    def start_payload(self, emotion: str | None = None, *, controls=None) -> dict[str, Any]:
         payload = {
             "event": "task_start",
             "model": self.model,
             "language_boost": "Chinese",
             "voice_setting": {
                 "voice_id": self.voice_id,
-                "speed": 1,
-                "vol": 1,
+                "speed": controls.speed if controls is not None else 1,
+                "vol": controls.volume if controls is not None else 1,
                 "pitch": 0,
             },
             "audio_setting": {
@@ -1060,7 +1068,9 @@ class MiniMaxTtsClient:
             },
         }
         selected = self.normalize_emotion(emotion or self._active_emotion)
-        if self.emotion_enabled:
+        if self.emotion_enabled and (controls is None or controls.guidance is not None):
+            if controls is not None:
+                selected = self.normalize_emotion(controls.guidance)
             payload["voice_setting"]["emotion"] = selected
         if self.transport == "websocket_bidi" or self.subtitle_enable:
             payload["subtitle_enable"] = bool(self.subtitle_enable)
@@ -1110,6 +1120,37 @@ class MiniMaxTtsClient:
         self._active_emotion = selected
         return selected
 
+    def invalidate_control_prewarm(self) -> None:
+        """同步摘除旧预热引用；异步清理仅持有摘除的对象，不能误关新预热。"""
+        candidates = []
+        if self._prewarm_session is not None:
+            candidates.append(self._prewarm_session)
+            self._prewarm_session = None
+            self._prewarm_turn_id = None
+        if self._bidi_session is not None and not self._bidi_session.generation_active:
+            candidates.append(self._bidi_session)
+            self._bidi_session = None
+        for session in set(candidates):
+            task = asyncio.create_task(session.close())
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        self._active_controls = None
+
+    async def prepare_speech_controls(self, controls, *, detach_active=False):
+        """完整参数组决定复用；旧代正在排空的连接由其原所有者收尾。"""
+        if self.emotion_status != "unsupported":
+            self.emotion_enabled = True  # 正式路径由总开关及显式引导控制，旧模式不再独立决定。
+        if controls == self._active_controls and not detach_active:
+            return
+        for attr in ("_prewarm_session", "_bidi_session"):
+            session = getattr(self, attr)
+            if session is not None and (detach_active or session.controls != controls):
+                setattr(self, attr, None)
+                if attr == "_prewarm_session":
+                    self._prewarm_turn_id = None
+                if not session.generation_active:
+                    await session.close()
+        self._active_controls = controls
+
     def disable_emotion_transport(self, error: str) -> None:
         """Make later Bidi sessions neutral after a server-side rejection."""
 
@@ -1124,7 +1165,7 @@ class MiniMaxTtsClient:
         return self._active_emotion if self.emotion_enabled else self.default_emotion
 
     def session(self, *, fresh: bool = False, turn_id: str | None = None,
-                speech_id: str | None = None) -> MiniMaxTtsSession:
+                speech_id: str | None = None, controls=None) -> MiniMaxTtsSession:
         # speech_id（语音事务标识）由本地后端用于日志关联；在线路径暂无对应记录口径。
         del speech_id
         if not self.api_key:
@@ -1135,12 +1176,13 @@ class MiniMaxTtsClient:
         # cancel/flush of the previous generation.  Do not publish this
         # isolated transaction as the reusable idle session.
         if fresh:
-            isolated = MiniMaxTtsSession(self, emotion=self._active_emotion)
+            isolated = MiniMaxTtsSession(self, emotion=self._active_emotion, controls=controls)
             isolated._isolated_transaction = True
             return isolated
         if self.transport == "websocket" and self.session_reuse:
             if (
                 self._prewarm_session is not None
+                and self._prewarm_session.controls == controls
                 and (self._prewarm_turn_id is None or self._prewarm_turn_id == turn_id)
             ):
                 return self._prewarm_session
@@ -1150,14 +1192,15 @@ class MiniMaxTtsClient:
                 or self._bidi_session.closed
                 or self._bidi_session._connection_dead
                 or self._bidi_session._error is not None
+                or self._bidi_session.controls != controls
                 or (self._bidi_session._started and self._bidi_session._socket is None)
             ):
-                self._bidi_session = MiniMaxTtsSession(self, emotion=self._active_emotion)
+                self._bidi_session = MiniMaxTtsSession(self, emotion=self._active_emotion, controls=controls)
             return self._bidi_session
-        return MiniMaxTtsSession(self, emotion=self._active_emotion)
+        return MiniMaxTtsSession(self, emotion=self._active_emotion, controls=controls)
 
     async def prewarm(self, emotion: str | None = None,
-                      turn_id: str | None = None) -> dict[str, Any]:
+                      turn_id: str | None = None, controls=None) -> dict[str, Any]:
         """Open an idle task_start session without sending any text.
 
         The returned session is deliberately only a checkout candidate.  It
@@ -1170,6 +1213,8 @@ class MiniMaxTtsClient:
             return {"status": "DISABLED", "reason": "session_prewarm_unavailable"}
         selected = self.normalize_emotion(emotion or self.default_emotion)
         selected = await self.prepare_emotion(selected)
+        if controls is not None:
+            await self.prepare_speech_controls(controls)
         if self.transport == "websocket":
             if self._prewarm_session is not None:
                 if self._prewarm_turn_id == turn_id and not self._prewarm_session.closed:
@@ -1179,13 +1224,13 @@ class MiniMaxTtsClient:
                     self._prewarm_session = None
                     self._prewarm_turn_id = None
                     await stale.close()
-                    session = MiniMaxTtsSession(self, emotion=selected)
+                    session = MiniMaxTtsSession(self, emotion=selected, controls=controls)
             else:
-                session = MiniMaxTtsSession(self, emotion=selected)
+                session = MiniMaxTtsSession(self, emotion=selected, controls=controls)
             self._prewarm_session = session
             self._prewarm_turn_id = turn_id
         else:
-            session = self.session(turn_id=turn_id)
+            session = self.session(turn_id=turn_id, controls=controls)
         # Emotion is part of task_start, so a concurrent Agent decision may
         # have selected a different voice between prepare_emotion() and
         # session().  Never label that connection as a calm warm candidate;
@@ -1250,7 +1295,11 @@ class MiniMaxTtsClient:
     def checkout_prewarm(self, session: MiniMaxTtsSession,
                          turn_id: str | None = None) -> bool:
         """Claim a ready warm session exactly once for real speech."""
+        session = getattr(session, "provider_session", session)
         retained = self._bidi_session if self.transport == "websocket_bidi" else self._prewarm_session
+        if session.controls != self._active_controls:
+            self.last_prewarm_checkout_reason = "controls_changed"
+            return False
         if session is not retained:
             self.last_prewarm_checkout_reason = "stale_generation"
             return False

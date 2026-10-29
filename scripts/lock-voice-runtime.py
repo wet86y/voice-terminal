@@ -17,7 +17,7 @@ OUT = ROOT / 'config/runtime/voice-runtime.lock.json'
 CACHE = ROOT / '.local/build/runtime-lock'
 GROUPS = {
     'voice-core': ['fastapi', 'uvicorn', 'httpx', 'pyyaml', 'numpy', 'psutil', 'websockets', 'keyring',
-                   'sounddevice', 'soundfile', 'webrtcvad-wheels', 'aec-audio-processing', 'pypinyin', 'dxcam', 'comtypes', 'pillow'],
+                   'sounddevice', 'soundfile', 'webrtcvad-wheels', 'aec-audio-processing', 'pypinyin', 'dxcam', 'comtypes', 'pillow', 'voice-audio-dsp'],
     'torch-cpu': ['torch', 'torchaudio', 'funasr'],
     'onnx-cpu': ['onnxruntime', 'transformers', 'librosa', 'kaldi-native-fbank'],
     'onnx-vad': ['funasr-onnx'],
@@ -35,6 +35,7 @@ def closure(roots):
         name=canonicalize_name(pending.pop())
         if name in seen: continue
         seen.add(name)
+        if name == 'voice-audio-dsp': continue  # 内置薄包装仅依赖Python（程序运行环境）标准库。
         distribution=metadata.distribution('onnxruntime-gpu' if name=='onnxruntime' else name)
         for text in distribution.requires or ():
             requirement=Requirement(text)
@@ -63,6 +64,20 @@ def bundled(distribution, name, version):
             'provenance': 'verified-development-manifest'}
 
 def resolve(name):
+    if name == 'voice-audio-dsp':
+        record_path = ROOT / '.local/build/speech-dsp/2.4.0/build.json'
+        if not record_path.is_file():
+            raise ValueError('请先运行 scripts/build-speech-dsp.py（构建锁定音频处理包）。')
+        build = json.loads(record_path.read_text('utf-8'))
+        row = dict(build['wheel'])
+        artifact = CACHE / row['file']
+        if (build['source_sha256'] != '3dda3c9ab1e287f15028c010a66ab7145fa855dfa62763538f341e70b4d10abd'
+                or Path(row['file']).name != row['file'] or not artifact.is_file()
+                or artifact.stat().st_size != row['size']
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != row['sha256']):
+            raise ValueError('内置语音音频处理包与锁定构建记录不匹配。')
+        row['groups'] = [group for group, items in resolved_groups.items() if name in items]
+        return row
     distribution=metadata.distribution('onnxruntime-gpu' if name=='onnxruntime' else name)
     version={'torch':'2.11.0+cpu','torchaudio':'2.11.0+cpu','onnxruntime':'1.24.3'}.get(name,distribution.version)
     if name in {'torch','torchaudio'}:
@@ -107,5 +122,14 @@ if __name__=='__main__':
             'groups':'按组件共享的依赖组；onnx-vad（轻量语音活动检测）为独立运行组','wheels':'固定版本的预编译包','name':'依赖名称','version':'锁定版本',
             'file':'固定文件名','url':'原始下载地址','size':'预期字节数','sha256':'SHA-256 文件摘要',
             'bundled':'随本体携带的小型预编译包','provenance':'构建来源','group':'所需共享依赖组'}}
+    # 旧安装只登记整锁摘要；保存旧包身份，让后续增量更新无需重装未变化依赖。
+    if OUT.is_file():
+        previous_bytes=OUT.read_bytes()
+        previous=json.loads(previous_bytes)
+        history_path=OUT.with_name('voice-runtime-history.json')
+        history=json.loads(history_path.read_text('utf-8')) if history_path.is_file() else {'schema':1,'locks':{},'fields':{'schema':'旧依赖锁身份格式','locks':'按旧完整锁摘要登记逐包内容身份'}}
+        history['locks'][hashlib.sha256(previous_bytes).hexdigest()]={row['name']:{key:row.get(key) for key in ('version','file','size','sha256')} for row in previous['wheels']}
+        history['fields'].update({'version':'旧锁定版本','file':'旧预编译包文件名','size':'旧包字节数','sha256':'旧包内容摘要'})
+        history_path.write_text(json.dumps(history,ensure_ascii=False,indent=2)+'\n','utf-8')
     OUT.write_text(json.dumps(record,ensure_ascii=False,indent=2)+'\n','utf-8')
     print(f'已锁定 {len(wheels)} 个预编译包；无需下载大型推理包。')

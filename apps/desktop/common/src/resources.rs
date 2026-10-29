@@ -17,6 +17,7 @@ pub struct PendingActivation {
     committed:bool, // committed（宿主恢复就绪后是否已提交）。
     finished:bool, // finished（备份/记录是否已完成清理）。
     companions:Vec<Value>, // companions（同事务资料）：模型清单、组件登记及已确认的旧声纹资料。
+    delta:Option<Vec<Value>>, // delta（文件增量）：空值继续使用旧版整目录事务。
 }
 impl PendingActivation {
     pub fn is_committed(&self)->bool{self.committed} // is_committed（资源替换是否已持久提交）。
@@ -459,7 +460,10 @@ pub(crate) fn maintenance_issues(context:&LaunchContext,full:bool,cancel:&Atomic
     let current=crate::runtime::current_for_upgrade(context)?;
     let verified=if full&&environment.is_dir(){Some(crate::workspace::verify_tree_with_progress(&environment,"manifest.json",cancel,progress))}else{None};
     check_cancel(cancel)?;
-    if let Some(Err(error))=verified{issue(crate::runtime::CPU_RESOURCE,format!("语音运行依赖完整性校验失败：{error}"),true);}
+    if let Some(Err(error))=verified{
+        if matches!(crate::component_recovery::classify(&error),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission|crate::component_recovery::Event::Space){return Err(format!("完整性校验暂时无法读取运行依赖，请处理占用、权限或空间问题后重试：{error}"));}
+        issue(crate::runtime::CPU_RESOURCE,format!("语音运行依赖完整性校验失败：{error}"),true);
+    }
     else if !current{issue(crate::runtime::CPU_RESOURCE,"语音运行依赖缺失或需要更新，请在系统组件中处理。".into(),false);}
     let runtime=crate::runtime::status(context)?;
     if runtime["components"].as_array().into_iter().flatten().any(|row|row["resource_id"]==crate::runtime::GPU_RESOURCE&&row["files_installed"]==true&&row["can_start"]!=true){
@@ -477,7 +481,10 @@ pub(crate) fn maintenance_issues(context:&LaunchContext,full:bool,cancel:&Atomic
             else{dsh_validate_with_progress(context,&root,true,cancel,progress)}
         }else{Ok(())};
         check_cancel(cancel)?;
-        if let Err(error)=valid{issue(id,format!("组件完整性校验失败：{error}"),true);}
+        if let Err(error)=valid{
+            if matches!(crate::component_recovery::classify(&error),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission|crate::component_recovery::Event::Space){return Err(format!("完整性校验暂时无法读取组件，请处理占用、权限或空间问题后重试：{error}"));}
+            issue(id,format!("组件完整性校验失败：{error}"),true);
+        }
         else if !current_for_upgrade(context,&item){issue(id,"组件缺失、版本或安装记录需要更新，请在组件列表中处理。".into(),false);}
     }
     Ok(issues)
@@ -695,19 +702,58 @@ fn refresh_target_binding(context:&LaunchContext,relative:&str,target:&Path)->Re
 // recover（事务恢复）：未提交替换回滚；只有明确写入 committed（已提交）后才保留新目录。
 pub fn recover(context:&LaunchContext)->Result<(),String>{
     let journal=context.install.join("tmp/native-install.json");if !journal.is_file(){return Ok(());}
-    let record=load(&journal)?;let relative=record["target"].as_str().ok_or("安装记录缺少目标")?;
+    let record=load(&journal)?;let stored=record["target"].as_str().ok_or("安装记录缺少目标")?;
+    let delta=if stored==crate::runtime_delta::JOURNAL_TARGET{Some(crate::runtime_delta::rows(&record["delta"]) ?)}else{None};
+    let relative=if delta.is_some(){"runtimes/python"}else{stored};
     if !(relative.starts_with("models/")||["runtimes/python","runtimes/dsh"].contains(&relative)){return Err("安装记录目标不在受管资源范围".into());}
     let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
     let committed=record["state"]=="committed";
     let companions=activation_companions(&record)?;
     if !committed {
-        if old.exists(){remove_owned(&target,&context.install)?;fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;fs::rename(&old,&target).map_err(|e|e.to_string())?;}
+        if let Some(rows)=&delta{crate::runtime_delta::rollback(&context.install,&target,&old,rows)?;}
+        else if old.exists(){remove_owned(&target,&context.install)?;fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;fs::rename(&old,&target).map_err(|e|e.to_string())?;}
         else if record["original"]==false{remove_owned(&target,&context.install)?;}
         restore_companions(context,&companions)?;
         if companions.is_empty()&&record["state"]=="swapped"{refresh_target_binding(context,relative,&target)?;}
     }else if companions.is_empty(){refresh_target_binding(context,relative,&target)?;}
     remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     remove_owned(&old,&context.install)?;fs::remove_file(journal).map_err(|e|e.to_string())?;Ok(())
+}
+
+pub struct ActivationFault { // ActivationFault（全面校验消费的事务故障），不接受任意恢复路径。
+    pub resource_id:Option<String>, // resource_id（可确定的受影响组件）。
+    pub reason:String, // reason（恢复失败的实际原因）。
+    journal_sha256:String, // journal_sha256（扫描期间不可变化的事务记录身份）。
+}
+/// recover_for_integrity（全面检查前尝试恢复）：故障转为校验输入，不能使全面扫描永久卡在同一恢复错误。
+pub(crate) fn recover_for_integrity(context:&LaunchContext)->Result<Option<ActivationFault>,String>{
+    let release=load(&context.installed_program().join("release.json"))?;
+    match recover(context){
+        Ok(())=>Ok(None),
+        Err(reason)=>{
+            // 安装器已经校验并换入的本体声明不应被失败组件事务中的旧声明覆盖。
+            atomic_json(&context.installed_program().join("release.json"),&release)?;
+            if matches!(crate::component_recovery::classify(&reason),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission|crate::component_recovery::Event::Space){return Err(format!("请解除占用、恢复权限或释放空间后重试完整性校验：{reason}"));}
+            let journal=safe_path(&context.install,"tmp/native-install.json")?;
+            let record=load(&journal).unwrap_or(Value::Null);let stored=record["target"].as_str().unwrap_or("");
+            let id=if ["runtimes/python",crate::runtime_delta::JOURNAL_TARGET].contains(&stored){Some(crate::runtime::CPU_RESOURCE.to_string())}
+                else if stored=="runtimes/dsh"{Some("dsh".into())}
+                else{specs(context)?.iter().find(|item|destination(context,item).is_ok_and(|path|path.strip_prefix(&context.install).is_ok_and(|path|path.to_string_lossy().replace('\\',"/")==stored))).and_then(|item|item["resource_id"].as_str().map(str::to_string))};
+            Ok(Some(ActivationFault{resource_id:id,reason,journal_sha256:file_hash(&journal)?}))
+        }
+    }
+}
+/// archive_failed_activation（校验结论落盘后保留故障证据）：移动固定事务路径，不删除备份，也不执行未知记录里的路径。
+pub(crate) fn archive_failed_activation(context:&LaunchContext,fault:&ActivationFault)->Result<(),String>{
+    let journal=safe_path(&context.install,"tmp/native-install.json")?;
+    if file_hash(&journal)?!=fault.journal_sha256{return Err("全面校验期间组件事务发生变化，请重新检查。".into());}
+    let archive=safe_path(&context.install,&format!("tmp/component-recovery/{}",fault.journal_sha256))?;
+    fs::create_dir_all(&archive).map_err(|e|e.to_string())?;
+    atomic_json(&archive.join("evidence.json"),&json!({"schema":1,"resource_id":fault.resource_id,"reason":fault.reason,"scan_scope":"all","fields":{"schema":"事务故障证据格式","resource_id":"已确认的受影响组件，未知时为空","reason":"无法自动恢复的原因","scan_scope":"已执行全部组件的完整性校验"}}))?;
+    for name in ["native-old","native-companions","native-install.json"]{
+        let source=safe_path(&context.install,&format!("tmp/{name}"))?;let target=safe_path(&archive,name)?;
+        if source.exists(){if target.exists(){return Err("事务故障证据保留目录冲突，原件和记录均保持。".into());}fs::rename(source,target).map_err(|e|e.to_string())?;}
+    }Ok(())
 }
 
 fn activation_companions(record:&Value)->Result<Vec<Value>,String>{
@@ -747,13 +793,14 @@ fn restore_companions(context:&LaunchContext,rows:&[Value])->Result<(),String>{
 }
 
 fn activation_record(transaction:&PendingActivation,state:&str)->Value{
-    json!({"target":transaction.relative,"state":state,"original":transaction.original,"companions":transaction.companions,
-        "fields":{"target":"受管组件相对路径","state":"组件启用阶段","original":"原组件是否存在","companions":"同事务回滚的登记及旧资料","path":"受控相对路径","copied":"登记文件复制保留；旧资料先移动保留"}})
+    json!({"target":if transaction.delta.is_some(){crate::runtime_delta::JOURNAL_TARGET}else{&transaction.relative},"state":state,"original":transaction.original,"companions":transaction.companions,"delta":transaction.delta,
+        "fields":{"target":"受管组件路径或依赖文件更新标识","state":"组件启用阶段","original":"原组件是否存在","companions":"同事务回滚的登记及旧资料","path":"受控相对路径","copied":"登记文件复制保留；旧资料先移动保留","delta":"仅变化文件的回滚集合；空值兼容旧版整目录事务","old_sha256":"旧文件内容摘要","old_size":"旧文件字节数","put":"写入新文件；否则仅卸载"}})
 }
 
 pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Result<PendingActivation,String>{
     let dsh_proof=if relative=="runtimes/dsh"{load(&stage.with_extension("verified.json")).ok().filter(|record|record["root"].as_str().is_some_and(|path|Path::new(path)==stage))}else{None};
     recover(context)?;let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
+    let delta=if relative=="runtimes/python"{crate::runtime_delta::read(context,stage)?}else{None};
     crate::verification::invalidate(&target);
     if old.exists(){return Err("上次资源备份尚未清理，无法开始新的激活。".into());}
     let mut companions=vec![];
@@ -765,7 +812,7 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     }
     remove_owned(&context.install.join("tmp/native-companions"),&context.install)?;
     let journal=context.install.join("tmp/native-install.json");let original=target.exists();
-    let mut transaction=PendingActivation{relative:relative.into(),target:target.clone(),old,journal,original,swapped:false,committed:false,finished:false,companions};
+    let mut transaction=PendingActivation{relative:relative.into(),target:target.clone(),old,journal,original,swapped:false,committed:false,finished:false,companions,delta};
     atomic_json(&transaction.journal,&activation_record(&transaction,"prepared"))?;
     let saved=(||{
         for row in transaction.companions.iter().filter(|row|row["copied"]==true&&row["original"]==true){
@@ -782,8 +829,10 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     })();
     if let Err(error)=saved{rollback_activation(context,&mut transaction)?;return Err(error);}
     if let Err(error)=crate::compatibility::invalidate(context){rollback_activation(context,&mut transaction)?;return Err(error);}
-    if original{if let Err(error)=fs::rename(&target,&transaction.old){rollback_activation(context,&mut transaction)?;return Err(error.to_string());}}
-    if let Err(error)=fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string()).and_then(|_|fs::rename(stage,&target).map_err(|e|e.to_string())){
+    if transaction.delta.is_none()&&original{if let Err(error)=fs::rename(&target,&transaction.old){rollback_activation(context,&mut transaction)?;return Err(error.to_string());}}
+    let swapped=if let Some(rows)=&transaction.delta{crate::runtime_delta::apply(&target,stage,&transaction.old,rows)}
+        else{fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string()).and_then(|_|fs::rename(stage,&target).map_err(|e|e.to_string()))};
+    if let Err(error)=swapped{
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
     }
@@ -803,6 +852,11 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
     }
+    // 服务已在宿主启用边界暂停；依赖只能在真实合并路径验证，失败逐文件恢复，绝不全量重建。
+    if transaction.delta.is_some(){if let Err(error)=crate::runtime::validate_activation(context){
+        let recovery=rollback_activation(context,&mut transaction);
+        return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧依赖失败：{rollback}")});
+    }}
     if let Err(error)=refresh_target_binding(context,relative,&target){
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
@@ -816,7 +870,8 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
 
 pub fn rollback_activation(context:&LaunchContext,transaction:&mut PendingActivation)->Result<(),String>{
     if transaction.finished||transaction.committed{return Err("已提交或清理完成的资源事务不能回滚。".into());}
-    if transaction.old.exists(){
+    if let Some(rows)=&transaction.delta{crate::runtime_delta::rollback(&context.install,&transaction.target,&transaction.old,rows)?;}
+    else if transaction.old.exists(){
         remove_owned(&transaction.target,&context.install)?;
         fs::create_dir_all(transaction.target.parent().unwrap()).map_err(|e|e.to_string())?;
         fs::rename(&transaction.old,&transaction.target).map_err(|e|e.to_string())?;

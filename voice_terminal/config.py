@@ -282,6 +282,7 @@ def validate_tts_inference_steps(value: Any, defaults: Mapping[str, int] | None 
 @dataclass(frozen=True)
 class TtsConfig:
     provider: str = "minimax"
+    speech_control_enabled: bool = True  # speech_control_enabled（智能语音调节总开关）。
     # backend（语音运行后端）；provider（模型元数据供应商）保留 MiniMax 兼容值。
     backend: str = "minimax"
     local_model: str = "voxcpm2"  # local_model（本地 TTS 模型）：audio.cpp（原生音频推理框架）中的 VoxCPM 选择。
@@ -1072,6 +1073,7 @@ class AppConfig:
                 cancel_timeout_ms=int(_number(tts.get("cancel_timeout_ms"), 2000)),
                 keepalive_seconds=int(_number(tts.get("keepalive_seconds"), 30)),
                 emotion_mode=_string(tts.get("emotion_mode"), "agent"),
+                speech_control_enabled=_bool(tts.get("speech_control_enabled"), True),
                 default_emotion=_string(tts.get("default_emotion"), "calm"),
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
                 session_reuse=_bool(tts.get("session_reuse"), True),

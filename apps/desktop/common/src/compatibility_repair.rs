@@ -85,7 +85,7 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
     let _guard=WorkspaceGuard::acquire(root)?;
     let _verification=crate::verification::VerificationSession::begin();
     let context=LaunchContext::portable(root)?;
-    resources::recover(&context)?;
+    let activation_fault=if full{resources::recover_for_integrity(&context)?}else{resources::recover(&context)?;None};
     rules(&context.program,false)?;
     let prior=read(&state_path(&context)?).unwrap_or(Value::Null);
     let mut reset=prior["enforcement"]["reset_devices"]==true;
@@ -97,13 +97,22 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
             progress("完整性维护：单轮核对现有环境、模型与代理组件",0,0);
             resources::prepare_maintenance_verification(&context,&cancel,progress)?;
         }
-        let issues=resources::maintenance_issues(&context,full,&cancel,progress)?;
+        let mut issues=resources::maintenance_issues(&context,full,&cancel,progress)?;
+        if let Some(fault)=&activation_fault{if let Some(id)=&fault.resource_id{
+            issues.retain(|row|row["resource_id"]!=*id);
+            issues.push(json!({"resource_id":id,"reason":format!("组件启用事务一致性无法恢复：{}",fault.reason),"content_failure":true,"consistency_failure":true,"dispatched":false}));
+        }}
         resources::check_cancel(&cancel)?;
         changing=true;
         checkpoint(&context,"verify_components",reset,None)?;
         repair_bootstrap_policy(&context)?;
         // 交接先落盘；清除后即使中断，正式程序仍知道哪些组件必须重新下载修复。
         crate::component_maintenance::save(&context,issues.clone(),full)?;
+        if let Some(fault)=&activation_fault{
+            // 扫描取消不动故障证据；进入维修后先保存交接，再解除旧事务门禁。
+            if cancel.load(std::sync::atomic::Ordering::Acquire){return Ok(());}
+            resources::archive_failed_activation(&context,fault)?;
+        }
         if full{for issue in issues.iter().filter(|row|row["content_failure"]==true){
             if cancel.load(std::sync::atomic::Ordering::Acquire){break;}
             let id=issue["resource_id"].as_str().ok_or("故障组件编号缺失")?;
@@ -144,6 +153,7 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
             progress("校验已取消，原有组件与维护状态已保留",0,0);
             Ok(MaintenanceOutcome::Cancelled)
         }
+        Err(error) if !changing&&matches!(crate::component_recovery::classify(&error),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission|crate::component_recovery::Event::Space)=>Err(error),
         Err(error)=>{checkpoint(&context,"repair_pending",reset,Some(&error))?;Err(error)}
         Ok(()) if cancel.load(std::sync::atomic::Ordering::Acquire)=>{
             progress("校验已取消，必要收尾已完成",0,0);
@@ -188,6 +198,24 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
         atomic_json(&path,&json!({"schema_version":rules(&context.program,false)?["settings_schema_max"],"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}}))?;
         atomic_json(&context.data.join("state/settings-validation.json"),&json!({"schema":1,"settings_schema":rules(&context.program,false)?["settings_schema_max"],"sha256":file_hash(&path)?}))
     }
+    #[test]fn failed_component_transaction_does_not_prevent_full_integrity_and_handoff(){
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let catalog=fixture.root.join("app/config/resources/catalog.json");
+        let mut value=read(&catalog).unwrap();
+        let other=fixture.root.join("models/unrelated");fs::create_dir_all(&other).unwrap();fs::write(other.join("model.bin"),b"bad!").unwrap();
+        value["resources"].as_array_mut().unwrap().push(json!({"resource_id":"unrelated-model","kind":"model","version":"1","destination":"unrelated","required":false,"files":[{"path":"model.bin","size_bytes":4,"sha256":"00".repeat(32)}]}));atomic_json(&catalog,&value).unwrap();
+        let journal=fixture.root.join("tmp/native-install.json");
+        let python=&fixture.context.python;let digest=file_hash(python).unwrap();
+        atomic_json(&journal,&json!({"target":crate::runtime_delta::JOURNAL_TARGET,"state":"swapped","original":true,"companions":[],"delta":[{"path":"python.exe","original":true,"put":true,"old_size":7,"old_sha256":digest}]})).unwrap();
+        fs::write(python,b"corrupt").unwrap();
+        assert!(resources::recover(&fixture.context).is_err());
+        let mut scanned=false;
+        maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase=="完整性维护：单轮核对现有环境、模型与代理组件"{scanned=true;}},true,|_,_,_|panic!("损坏环境不能运行设置工作进程")).unwrap();
+        assert!(scanned);assert!(!journal.exists());assert!(fixture.root.join("tmp/component-recovery").is_dir());
+        let handoff=crate::component_maintenance::load(&fixture.context).unwrap().unwrap();assert_eq!(handoff["scan_scope"],"all");
+        assert!(handoff["issues"].as_array().unwrap().iter().any(|row|row["resource_id"]==runtime::CPU_RESOURCE&&row["repair_action"]=="rebuild_component"));
+        assert!(handoff["issues"].as_array().unwrap().iter().any(|row|row["resource_id"]=="unrelated-model"));
+    }
     #[test]fn cancelled_readonly_integrity_preserves_startup_state_and_policy(){
         for trigger in ["完整性维护：单轮核对现有环境、模型与代理组件","批量校验组件文件内容","批量校验完成，复用结果并按需修复"]{
             let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
@@ -204,6 +232,18 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
             assert_eq!(fs::read(&policy).unwrap(),b"invalid-policy");assert_eq!(fs::read(&fixture.context.python).unwrap(),b"fixture");
             assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],true);
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn occupied_file_during_full_scan_preserves_previous_handoff_and_components(){
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},false,validate_settings).unwrap();
+        let handoff=fixture.context.data.join("state/component-maintenance.json");let before=fs::read(&handoff).unwrap();let state=fs::read(state_path(&fixture.context).unwrap()).unwrap();
+        let held=fs::OpenOptions::new().read(true).share_mode(0).open(&fixture.context.python).unwrap();
+        let error=maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},true,validate_settings).unwrap_err();
+        assert!(matches!(crate::component_recovery::classify(&error),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission));
+        assert_eq!(fs::read(&handoff).unwrap(),before);assert_eq!(fs::read(state_path(&fixture.context).unwrap()).unwrap(),state);drop(held);assert!(fixture.context.python.is_file());
     }
     #[test]fn cancelled_scan_preserves_existing_repair_and_does_not_create_new_state(){
         for pending in [false,true]{

@@ -20,6 +20,29 @@ async function expandCategory(wrapper: ReturnType<typeof mount>, category: strin
   if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
 }
 
+it('网络与占用仅给重试建议，内容恢复失败才进入既有全面校验', async () => {
+  const base=model();base.managedResourceJobs=[{id:'bad',resourceId:'voice-server',label:'语音依赖',state:'failed',phase:'未完成',canCancel:false,recovery:{event:'transfer',state:'retry_available',next_action:'retry',message:'检查网络后重试'}}]
+  const wrapper=mount(LocalComponents,{props:{model:base}})
+  expect(wrapper.text()).toContain('检查网络后重试')
+  expect(wrapper.find('[aria-label="组件恢复处理"]').text()).not.toContain('校验完整性')
+  await wrapper.setProps({model:{...base,integrityReady:true,managedResourceJobs:[{...base.managedResourceJobs[0]!,recovery:{event:'integrity',state:'integrity_required',next_action:'check_integrity',message:'局部修复未完成'}}]}})
+  const banner=wrapper.get('[aria-label="组件恢复处理"]')
+  expect(banner.text()).toContain('检查程序及全部组件')
+  await banner.get('button').trigger('click')
+  expect(wrapper.emitted('integrity')).toHaveLength(1)
+  wrapper.unmount()
+})
+
+it('后续已恢复的失败记录不再显示故障横幅或分类失败进度', () => {
+  const value=model()
+  value.managedResourceJobs=[{id:'old-failure',resourceId:'voice-server',label:'语音依赖',state:'failed',phase:'旧失败',canCancel:false,recovery:{event:'recovered',state:'resolved',next_action:'none',message:'该组件已恢复'}}]
+  const wrapper=mount(LocalComponents,{props:{model:value}})
+  expect(wrapper.find('[aria-label="组件恢复处理"]').exists()).toBe(false)
+  expect(wrapper.find('[data-job="category-voice-server"]').exists()).toBe(false)
+  expect(wrapper.text()).not.toContain('旧失败')
+  wrapper.unmount()
+})
+
 async function expandComponent(wrapper: ReturnType<typeof mount>, category: string, id: string) {
   await expandCategory(wrapper, category)
   const card = wrapper.get(`[data-component="${id}"]`)

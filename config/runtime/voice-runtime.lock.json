@@ -42,6 +42,7 @@
       "starlette",
       "typing-extensions",
       "uvicorn",
+      "voice-audio-dsp",
       "webrtcvad-wheels",
       "websockets"
     ],
@@ -1576,6 +1577,19 @@
       "groups": [
         "voice-core"
       ]
+    },
+    {
+      "name": "voice-audio-dsp",
+      "version": "0.1.0",
+      "file": "voice_audio_dsp-0.1.0-py3-none-win_amd64.whl",
+      "url": "",
+      "size": 643644,
+      "sha256": "5c0f24806b4bd69d28b353fa0d6808befb9fb2a57c829176d363abecf680875e",
+      "groups": [
+        "voice-core"
+      ],
+      "bundled": "tools/wheels/voice_audio_dsp-0.1.0-py3-none-win_amd64.whl",
+      "provenance": "verified-soundtouch-source-build"
     },
     {
       "file": "webrtcvad_wheels-2.0.14-cp312-cp312-win_amd64.whl",

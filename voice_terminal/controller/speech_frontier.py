@@ -204,7 +204,7 @@ class SpeechFrontierMixin:
 
     async def rewrite_unsent(self, identity, turn_id, *, speech_id, text,
                              expected_generation, expected_sent_chars, expected_text,
-                             expected_text_revision=0):
+                             expected_text_revision=0, controls=None, control_epoch=None, control_profile=None):
         """revision（尾巴修订）的原子确认：事务、版本、文本、提交边界必须全部匹配。
 
         None（未受理）表示确认边界失效，调用方不得降级为追加或新建事务。
@@ -240,6 +240,8 @@ class SpeechFrontierMixin:
             if dropped < 0:
                 return None
             h.text = baseline + text
+        if controls is not None:
+            self._set_handle_controls(h, controls, expected_epoch=control_epoch, expected_profile=control_profile)
         h.text_revision = getattr(h, "text_revision", 0) + 1
         h.revision_source_turn_id = turn_id  # revision_source_turn_id（最近修订来源轮次）。
         h.revision_request_id = identity[1]  # revision_request_id（最近修订来源请求）。

@@ -672,7 +672,7 @@ def test_passive_quiet_mid_stream_keeps_the_entire_unplayed_proposal():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","emotion":"calm","text":"完整'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"完整'}
                     yield {"type": "content", "text": '回答尾巴"},"actions":[]}'}
                     yield {"type": "finish", "reason": "stop"}
                 return stream()

@@ -293,6 +293,14 @@ pub fn launch(root:&Path)->Result<u32,String>{
 #[cfg(test)] mod tests{
     use super::*;
     #[test]
+    fn same_package_delivery_retains_matching_integrity_tool_and_rejects_wrong_package(){
+        let root=fixture();let payload=package("retained-build",false);run(&payload,&root).unwrap();
+        let folder=root.join("tmp/delivery");fs::create_dir_all(&folder).unwrap();let installer=folder.join("VoiceTerminalSetup.exe");fs::write(&installer,vec![1;1024*1024]).unwrap();let packed=folder.join("program.zip");fs::write(&packed,&payload).unwrap();
+        let mut receipt=json!({"role":"installer","version":package_version(&payload).unwrap(),"build":"retained-build","entry":"VoiceTerminalSetup.exe","size":1024*1024,"sha256":file_hash(&installer).unwrap(),"program_package_sha256":file_hash(&packed).unwrap()});atomic_json(&folder.join("delivery.json"),&receipt).unwrap();
+        crate::app_update::retain_local_delivery(&root,&installer,&packed).unwrap();assert!(crate::app_update::retained(&root,&package_version(&payload).unwrap(),"retained-build").unwrap().matches(&package_version(&payload).unwrap(),"retained-build"));
+        receipt["program_package_sha256"]=json!("00".repeat(32));atomic_json(&folder.join("delivery.json"),&receipt).unwrap();assert!(crate::app_update::retain_local_delivery(&root,&installer,&packed).is_err());fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn repair_checks_all_immutable_metadata_and_allows_only_workspace_bindings(){
         let root=fixture();let payload=package("repair-build",false);run(&payload,&root).unwrap();
         let path=root.join("app/release.json");let mut release=crate::resources::load(&path).unwrap();

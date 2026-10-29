@@ -26,6 +26,31 @@ describe('音色设置只提供资源完整的本地模型', () => {
     return mount(defineComponent({ setup() { provideProductContext({ settings, setNotice: vi.fn() } as never); return () => h(TtsSettings) } }),
       { global: { stubs: { TtsVoiceLibrary: true } } })
   }
+  it('智能语音调节缺省开启，保存关闭后保持界面与配置一致', async () => {
+    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({ settings: { tts: { speech_control_enabled: false } } } as never)
+    const wrapper = render()
+    const control = wrapper.get('input[aria-label="智能语音调节"]')
+    expect((control.element as HTMLInputElement).checked).toBe(true)
+    await control.setValue(false)
+    await flushPromises()
+    expect(save).toHaveBeenCalledWith({ speech_control_enabled: false })
+    expect(settings.tts.speech_control_enabled).toBe(false)
+    expect((control.element as HTMLInputElement).checked).toBe(false)
+    wrapper.unmount()
+  })
+  it('智能语音调节保存失败恢复原开关，显式关闭值不会被缺省值覆盖', async () => {
+    settings.tts.speech_control_enabled = false
+    vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('设置无法保存'))
+    const wrapper = render()
+    const control = wrapper.get('input[aria-label="智能语音调节"]')
+    expect((control.element as HTMLInputElement).checked).toBe(false)
+    await control.setValue(true)
+    await flushPromises()
+    expect(settings.tts.speech_control_enabled).toBe(false)
+    expect((control.element as HTMLInputElement).checked).toBe(false)
+    expect(wrapper.text()).toContain('设置无法保存')
+    wrapper.unmount()
+  })
   it('尚未加载但已具备运行条件的模型可以选择，缺失模型隐藏', () => {
     const wrapper = render()
     expect(wrapper.findAll('select option').map(item => item.attributes('value'))).toEqual(['minimax', 'voxcpm2'])

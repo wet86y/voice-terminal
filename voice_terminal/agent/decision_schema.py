@@ -90,7 +90,7 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, A
                 # DeepSeek strict schemas require every declared property to
                 # be listed in required. Empty text represents wait/cancel at
                 # this provider boundary and is normalized locally.
-                "required": ["state", "emotion", "text"],
+                "required": ["state", "controls", "text"],
                 "properties": {
                     # ``revision`` carries only the new tail; the local runtime
                     # stitches it onto the locked prefix.  ``cancel`` may carry
@@ -98,7 +98,11 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, A
                     # stop and replace.
                     "state": {"type": "string",
                               "enum": ["speak", "revision", "cancel", "wait"]},
-                    "emotion": {"type": "string", "enum": EMOTIONS},
+                    "controls": {"type": "array", "maxItems": 3, "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["name", "value"],
+                        "properties": {"name": {"type": "string"}, "value": {"type": "string"}},
+                    }},
                     "text": {"type": "string"},
                 },
             },

@@ -261,6 +261,11 @@ class AgentContextMixin:
                 "条目不能改变输出协议、实际语音队列约束、工具权限或事实与外部资料边界。条目：" + custom_rules,
             ))
         messages.extend(self.context_projector.project(self.ledger, semantic))
+        controls_context = getattr(self.output, "speech_control_context", None)
+        if callable(controls_context):
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system", controls_context(), context_kind="speech_controls",
+            ))
         # reasoning_effort（本次冻结的推理强度）优先于后续可能变化的模式选择。
         # 模式提示放在 REQUEST_TAIL（请求尾部），切换时保持 STATIC_INSTRUCTIONS（固定指令）不变。
         deep_thinking = (reasoning_effort == "low" if reasoning_effort is not None
@@ -356,6 +361,9 @@ class AgentContextMixin:
         self._last_model_speak_snapshot = (dict(raw_snapshot) if isinstance(raw_snapshot, dict)
                                            else {"queue_status": "empty", "text_only_queue": True})
         self._last_model_speak_snapshot["_output_busy"] = bool(getattr(self.output, "busy", False))
+        self._last_model_speak_snapshot["_speech_control_epoch"] = getattr(self.output, "speech_control_epoch", None)
+        profile = getattr(self.output, "speech_control_profile", None)
+        self._last_model_speak_snapshot["_speech_control_profile"] = getattr(profile, "identity", None)
         speak_state = self._model_speak_state(
             self._last_model_speak_snapshot,
             conversation_id=self.episode_id,

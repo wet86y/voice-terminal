@@ -6,6 +6,7 @@ export type ProductOnlineTtsModelId = 'speech-2.8-turbo' | 'speech-2.8-hd'
 export interface ProductTtsVoiceSelection { voice_id: string; revision: number } // 音色标识、不可变版本。
 /** ProductTtsSettings（语音配置）：后端、在线模型和音色、本地模型、推理步数及启用音色。 */
 export interface ProductTtsSettings {
+  speech_control_enabled?: boolean // speech_control_enabled（智能语音调节总开关），缺省开启。
   backend: 'minimax' | 'voxcpm1' // backend（后端）：voxcpm1 为本地兼容路由。
   online_model?: ProductOnlineTtsModelId // online_model（在线模型）：MiniMax Speech 2.8 Turbo 或 HD。
   online_voice_id?: string // online_voice_id（在线音色标识）：MiniMax 官方系统、克隆或生成音色 ID。

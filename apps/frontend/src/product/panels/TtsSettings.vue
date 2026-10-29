@@ -23,6 +23,7 @@ const selected = ref<Choice>(settings.tts.backend === 'minimax' ? 'minimax' : se
 const saving = ref(false)
 const savingOnline = ref(false)
 const previewingOnline = ref(false)
+const savingControls = ref(false) // savingControls（全局语音调节开关保存状态）。
 const onlineModelDraft = ref<ProductOnlineTtsModelId>(settings.tts.online_model ?? 'speech-2.8-hd')
 const onlineVoiceIdDraft = ref(settings.tts.online_voice_id ?? 'female-shaonv')
 let onlinePreviewOperationId: string | undefined
@@ -55,6 +56,21 @@ onBeforeUnmount(() => {
 })
 onMounted(() => { if (!props.demo) void live.refresh() })
 function refreshStatus() { if (!props.demo) void live.refresh() }
+async function setSpeechControl(enabled: boolean) {
+  const previous = settings.tts.speech_control_enabled ?? true
+  savingControls.value = true; error.value = ''
+  settings.tts.speech_control_enabled = enabled
+  try {
+    if (!props.demo) {
+      const result = await productApi.saveTts({ speech_control_enabled: enabled })
+      if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+    }
+    settings.tts.speech_control_enabled = enabled
+  } catch (failure) {
+    settings.tts.speech_control_enabled = previous
+    error.value = failure instanceof Error ? failure.message : '保存智能语音调节失败。'
+  } finally { savingControls.value = false }
+}
 function selectTarget(event: Event) {
   const choice = (event.target as HTMLSelectElement).value as Choice
   if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) return
@@ -145,6 +161,10 @@ async function openOfficialVoiceLibrary() {
 <template>
   <SettingsPageHeader section="tts" />
   <div class="tts-settings">
+    <section class="preference-card speech-control-card">
+      <div><strong>智能语音调节</strong><p class="instruction-hint">由大模型按当前语音模型的能力调节语气、语速和音量，适用于全部语音播放目标。</p></div>
+      <label class="voice-toggle"><input type="checkbox" role="switch" aria-label="智能语音调节" :checked="settings.tts.speech_control_enabled ?? true" :disabled="savingControls || saving || savingOnline" @change="setSpeechControl(($event.target as HTMLInputElement).checked)"><span aria-hidden="true"></span></label>
+    </section>
     <section class="tts-target preference-card"><label class="form-field"><span>语音播放目标</span><select :value="selectedReady ? selected : ''" @change="selectTarget"><option value="minimax">{{ names.minimax }}</option><option v-if="!selectedReady" value="" disabled>当前目标未就绪，请在组件设置补齐资源</option><option v-for="item in readyModels" :key="item.id" :value="item.id">{{ names[item.id] }}</option></select></label>
       <p class="instruction-hint" role="status">当前生效：{{ names[effective] }} · {{ saving ? '正在切换…' : states[status?.load_state || 'unloaded'] || '等待状态' }}<template v-if="status?.pending_selection"> · 等待当前事务结束后切换</template></p>
       <template v-if="selected === 'minimax'">
@@ -176,6 +196,9 @@ async function openOfficialVoiceLibrary() {
 </template>
 
 <style scoped>
+.speech-control-card { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--panel); }
+.speech-control-card .instruction-hint { margin: 6px 0 0; }
+.speech-control-card input { width: 20px; height: 20px; accent-color: var(--accent); }
 .tts-settings { display: grid; gap: 22px; }.tts-target { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--panel); }.tts-target .form-field { max-width: 520px; }.online-tts-settings{display:grid;gap:16px;max-width:760px;padding:16px;border:1px solid var(--line);border-radius:14px;background:#ffffff03}.online-model-field{display:grid;gap:8px;min-width:0;padding:0;border:0}.online-model-field legend{margin-bottom:8px;font-size:var(--font-caption);color:var(--text)}.online-model-choices{display:flex;gap:8px}.online-model-choice{display:flex;align-items:center;gap:8px;min-height:38px;padding:7px 14px;border:1px solid var(--line-strong);border-radius:10px;background:var(--panel-soft);color:var(--text);cursor:pointer}.online-model-choice[aria-pressed="true"]{border-color:var(--accent);background:#b2baff18;color:var(--accent)}.online-model-choice small{color:var(--muted)}.online-voice-row{display:grid;grid-template-columns:minmax(220px,1fr) auto;align-items:end;gap:12px}.online-voice-row .form-field{max-width:none}.online-voice-link{min-height:42px;white-space:nowrap}.online-tts-actions{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px}.online-tts-actions .instruction-hint{margin:0}.online-tts-buttons{display:flex;gap:8px}.online-tts-buttons .save-button{min-width:92px}.tts-quality { padding: 16px 20px; border-radius: 14px; border: 1px solid var(--line); color: var(--muted); }.tts-quality summary { cursor: pointer; }.tts-quality .form-field { margin-top: 16px; max-width: 320px; }
 @media(max-width:600px){.online-voice-row{grid-template-columns:minmax(0,1fr)}.online-voice-link{justify-self:start}.online-tts-actions{grid-template-columns:minmax(0,1fr)}.online-tts-buttons{justify-content:flex-end}}
 </style>

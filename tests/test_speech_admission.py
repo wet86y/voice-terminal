@@ -371,7 +371,7 @@ def test_streamed_speak_cannot_rewrite_existing_tail():
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
                     yield {"type": "content",
-                           "text": '{"speak":{"state":"speak","text":"已有改'}
+                           "text": '{"speak":{"state":"speak","controls":[],"text":"已有改'}
                     yield {"type": "content", "text": '正"},"actions":[]}'}
                     yield {"type": "finish", "reason": "stop"}
                 return stream()

@@ -27,7 +27,8 @@ def test_hotwords_and_required_punctuation_migrate_without_resetting_other_setti
         "enabled": False, "threshold": .91, "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}}), encoding="utf-8")
     assert repair(program, data)["ready"]
     settings = json.loads((data / "config/product-settings.json").read_text(encoding="utf-8"))
-    assert settings["schema_version"] == 17
+    assert settings["schema_version"] == 18
+    assert settings["tts"]["speech_control_enabled"] is True
     assert settings["hotwords"] == {"enabled": False, "stream_enabled": True, "threshold": .91,
                                       "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}
     assert yaml.safe_load(local.read_text(encoding="utf-8")) == {"asr": {"punctuation_device": "cpu", "chunk_size": [0, 8, 4]}}
@@ -49,7 +50,8 @@ def test_invalid_settings_are_repaired_persisted_and_original_is_archived(tmp_pa
     value = json.loads(settings.read_text(encoding="utf-8"))
     assert _settings_validation_warning(value) is None
     apply_settings_to_config(load_config(program / "config/default.yaml"), value)
-    assert value["schema_version"] == 17
+    assert value["schema_version"] == 18
+    assert value["tts"]["speech_control_enabled"] is True
     assert any(path.read_text(encoding="utf-8") == raw
                for path in (data / "archives").rglob("product-settings.json"))
     # 默认回退已经落盘；再执行不能再次归档，也不能恢复故障值。

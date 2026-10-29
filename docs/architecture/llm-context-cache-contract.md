@@ -7,6 +7,7 @@
 - `STATIC_INSTRUCTIONS`（固定指令）在 episode（会话）内保持稳定；人格和用户资料在新会话开始时载入，保存修订不会改写当前会话；自定义指令显式保存后更新后续请求快照并重新建立前缀摘要，已派发请求保留原副本；
 - `HISTORY` 只追加，不改写、不重排；
 - `REQUEST_TAIL` 只放当前请求动态信息；
+- `speech_controls`（当前合成能力及可选活动参数摘要）放入请求尾部；切换模型或“智能语音调节”开关不改固定前缀、历史及严格输出结构。活动参数仅在播放或有效续写窗口内非默认时简短提供，详见[语音调节](speech-controls.md)。
 - 深度模式提示随本次冻结的 `reasoning.effort`（推理强度）放入 `REQUEST_TAIL`（请求尾部）；暂停后切换模式不修改 `STATIC_INSTRUCTIONS`（固定指令）或 `HISTORY`（语义历史）；
 - 动态时间、可用性、revision、run ID、nonce、播放器和 provider 状态不能污染固定前缀；
 - provider 未返回 usage 时显示“不可观测”，不能解释成零命中；

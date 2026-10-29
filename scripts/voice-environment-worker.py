@@ -83,6 +83,17 @@ def reuse(lock, names, target):
         except Exception as error: rejected[item['name']]=str(error)
     return {'reused':reused,'rejected':rejected}
 
+def installed_relative(text):
+    """installed_relative（实际安装路径）：安装与卸载使用同一 .data（包附加文件）映射。"""
+    parts=Path(text).parts
+    if not parts: raise ValueError('预编译包路径为空')
+    if parts[0].endswith('.data'):
+        if len(parts)<3: raise ValueError('wheel（预编译包）数据路径无效')
+        if parts[1] not in {'purelib','platlib','data'}: return None
+        return '/'.join(parts[2:])
+    return text
+
+
 def install(wheels,site):
     records=[]
     for path in wheels:
@@ -90,11 +101,8 @@ def install(wheels,site):
             for item in archive.infolist():
                 text=item.filename
                 if item.is_dir(): continue
-                parts=Path(text).parts
-                if parts[0].endswith('.data'):
-                    if len(parts)<3: raise ValueError('wheel（预编译包）数据路径无效')
-                    if parts[1] not in {'purelib','platlib','data'}: continue
-                    text='/'.join(parts[2:])
+                text=installed_relative(text)
+                if text is None: continue
                 destination=safe(site,text)
                 if (item.external_attr>>16)&0o170000==0o120000: raise ValueError('预编译包包含链接')
                 destination.parent.mkdir(parents=True,exist_ok=True)
@@ -173,8 +181,29 @@ def defender_injected_module(path):
         return result.returncode==0
     except (OSError,subprocess.TimeoutExpired): return False
 
+def verified_product_host_files(image):
+    """仅认可当前真实产品宿主及其清单登记的三项 CRT（C++运行库）文件。"""
+    image=Path(image).resolve()
+    if image.name.casefold()!='voiceterminaldesktop.exe': return set()
+    try:
+        release=json.loads((image.parent/'release.json').read_text('utf-8'))
+        if not isinstance(release,dict) or release.get('role')!='product': return set()
+        rows={item['path']:item for item in release['files'] if isinstance(item,dict) and isinstance(item.get('path'),str)}
+        def matches(path):
+            row=rows.get(path.name)
+            return (row is not None and path.is_file() and path.stat().st_size==row.get('size')
+                    and hashlib.sha256(path.read_bytes()).hexdigest()==row.get('sha256'))
+        if not matches(image): return set()
+        allowed={image}
+        for name in ('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll'):
+            path=image.parent/name
+            if matches(path): allowed.add(path.resolve())
+        return allowed
+    except (OSError,ValueError,KeyError,TypeError): return set()
+
+
 def dynamic_library_closure():
-    """DLL closure（动态库闭包）：私有运行库、系统目录及已签名系统防护模块。"""
+    """DLL closure（动态库闭包）：私有库、系统库和精确核验的产品宿主文件。"""
     if os.name!='nt': return
     import ctypes
     from ctypes import wintypes
@@ -186,11 +215,14 @@ def dynamic_library_closure():
     process=kernel.GetCurrentProcess()
     if not psapi.EnumProcessModules(process,modules,ctypes.sizeof(modules),ctypes.byref(needed)): raise OSError('无法检查动态库来源')
     roots=[Path(sys.executable).parent.resolve(),Path(os.environ['SystemRoot']).resolve()]
+    image=ctypes.create_unicode_buffer(32768)
+    if not kernel.GetModuleFileNameW(None,image,len(image)):raise OSError('无法定位实际工作进程宿主')
+    host_files=verified_product_host_files(image.value)
     for module in list(modules)[:min(len(modules),needed.value//ctypes.sizeof(wintypes.HMODULE))]:
         text=ctypes.create_unicode_buffer(32768)
         if not kernel.GetModuleFileNameW(module,text,len(text)):raise OSError('无法定位运行动态库')
         path=Path(text.value).resolve()
-        if not any(path.is_relative_to(root) for root in roots) and not defender_injected_module(path):raise ValueError('运行依赖仍引用私有环境之外的动态库：'+path.name)
+        if path not in host_files and not any(path.is_relative_to(root) for root in roots) and not defender_injected_module(path):raise ValueError('运行依赖仍引用私有环境之外的动态库：'+path.name)
 
 def installed_version(name, lock=None, compatible_gpu=False):
     """installed_version（已安装版本）：复用现用环境时接受项目已验证的显卡组合。"""
@@ -221,17 +253,208 @@ def inventory(names, lock, compatible_gpu=False):
         except Exception as error: rejected[name]=str(error)[:300]
     return {'reused':reused,'rejected':rejected}
 
+
+def package_identity(row):
+    """package_identity（包内容身份）：地址、依赖组及排版变化不要求重新安装。"""
+    return {key: row.get(key) for key in ('version', 'file', 'size', 'sha256')}
+
+
+def delta_plan(root, lock, names, compatible_gpu=False, legacy=None, want_overlay=False, repair_local=False):
+    """delta_plan（增量计划）：从受管清单及旧安装记录恢复包所有权，不修改现用环境。"""
+    root = Path(root).resolve()
+    record = json.loads(safe(root, 'runtime.json').read_text('utf-8'))
+    manifest = json.loads(safe(root, 'manifest.json').read_text('utf-8'))
+    tracked = {row['path'].casefold(): row['path'] for row in manifest['files']}
+    tracked_rows = {row['path']: row for row in manifest['files']}
+    if record.get('schema') not in (1, 2):
+        raise ValueError('无法识别旧环境记录，保留现用环境，请先修复记录')
+    canonical = lambda text: text.lower().replace('_', '-').replace('.', '-')
+    legacy = legacy or {}
+    broken=set()
+    if repair_local:
+        for row in manifest['files']:
+            path=safe(root,row['path'])
+            try:
+                if not path.is_file() or path.stat().st_size!=row['size']:
+                    broken.add(row['path'])
+                else:
+                    with path.open('rb') as stream:
+                        if hashlib.file_digest(stream,'sha256').hexdigest()!=row['sha256']: broken.add(row['path'])
+            except FileNotFoundError: broken.add(row['path'])
+    unclaimed=set(broken)
+
+    def scope(relative, wanted, receipts, old_names, allow_gpu, historical):
+        site = safe(root, relative)
+        distributions = {}
+        recorded_entries = {}
+        owners = {}
+        paths = {}
+        for distribution in metadata.distributions(path=[str(site)]):
+            declared_name=distribution.metadata['Name']
+            if not declared_name: raise ValueError('旧环境存在缺少名称的发行元数据，保留原环境')
+            name = canonical(declared_name)
+            if name in distributions:
+                raise ValueError('旧环境存在重复包记录：' + name)
+            distributions[name] = distribution
+            raw_record=distribution.read_text('RECORD')
+            # importlib.metadata（发行元数据库）会过滤无法按原 RECORD 路径找到的项，
+            # .data（附加文件）已映射到实际位置时必须读取原记录，才能正确卸载。
+            entries=[row[0] for row in csv.reader(raw_record.splitlines()) if row] if raw_record else None
+            recorded_entries[name]=entries
+            owned = set()
+            for entry in entries or ():
+                text = str(entry).replace('\\', '/')
+                # 旧安装器没有释放环境外的命令脚本；不得把它们列入卸载。
+                if '..' in Path(text).parts or Path(text).is_absolute():
+                    continue
+                text=installed_relative(text)
+                if text is None: continue
+                path = safe(site, text).relative_to(root).as_posix()
+                if path.casefold() in tracked:
+                    path = tracked[path.casefold()]
+                    owned.add(path)
+                    owners.setdefault(path, set()).add(name)
+            # 标准发行元数据目录整体属于该发行包，包括旧安装器追加但未写回 RECORD（安装记录）的回执。
+            metadata_folders={Path(str(entry)).parts[0] for entry in entries or ()
+                              if Path(str(entry)).parts and Path(str(entry)).parts[0].endswith(('.dist-info','.egg-info'))}
+            for folder in metadata_folders:
+                prefix=safe(site,folder).relative_to(root).as_posix()+'/'
+                for path in tracked.values():
+                    if path.casefold().startswith(prefix.casefold()):
+                        owned.add(path)
+                        owners.setdefault(path,set()).add(name)
+            paths[name] = owned
+        desired = {row['name']: row for row in wanted}
+        changed, reused, identities = [], [], {}
+        for name, row in desired.items():
+            distribution = distributions.get(name)
+            if not allow_gpu and ((name in {'torch','torchaudio'} and distribution is not None and '+cu' in distribution.version and '+cpu' in row['version']) or
+                                  (name=='onnxruntime' and distribution is None and 'onnxruntime-gpu' in distributions)):
+                raise ValueError('不能以处理器依赖覆盖现用显卡包，需要完整性校验确认修复方向：'+name)
+            if distribution is None and name == 'onnxruntime' and allow_gpu:
+                distribution = distributions.get('onnxruntime-gpu')
+            actual = distribution.version if distribution else None
+            accepted = actual == row['version'] and (name != 'onnxruntime' or 'onnxruntime' in distributions)
+            accepted |= bool(allow_gpu and ((name in {'torch', 'torchaudio'} and actual == row['version'].replace('+cpu', '+cu128')) or
+                                          (name == 'onnxruntime' and 'onnxruntime-gpu' in distributions and actual == '1.24.4')))
+            identity = package_identity(row)
+            evidence = receipts.get(name, historical.get(name))
+            if accepted and evidence is None:
+                raise ValueError('旧依赖缺少可核对的内容身份，保留原环境，不能自动重装全部依赖：' + name)
+            # 历史兼容显卡包没有原 wheel（预编译包）摘要：明确登记已验证安装文件身份，不能冒充 CPU（中央处理器）包摘要。
+            variant = accepted and distribution is not None and (actual != row['version'] or canonical(distribution.metadata['Name']) != name)
+            installed_identity = None
+            if variant:
+                owned=paths[canonical(distribution.metadata['Name'])]
+                if not recorded_entries[canonical(distribution.metadata['Name'])] or not any(path.endswith('/RECORD') for path in owned):
+                    raise ValueError('历史兼容包缺少受清单覆盖的完整安装记录，不能迁移内容身份：' + name)
+                content=[tracked_rows[path] for path in sorted(owned)]
+                installed_identity={'contract':identity,'installed_version':actual,
+                                    'installed_files_sha256':hashlib.sha256(json.dumps(content,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+                                    'provenance':'verified-legacy-installed-files'}
+            artifact=legacy.get('artifacts',{}).get(name)
+            artifact_matches=variant and artifact is not None and artifact==evidence and artifact['version']==actual
+            matches = evidence == identity or artifact_matches or (installed_identity is not None and evidence == installed_identity)
+            if accepted and matches:
+                reused.append(name)
+            else:
+                changed.append(name)
+            identities[name] = installed_identity if variant else identity
+        for path in broken & owners.keys():
+            affected={('onnxruntime' if name=='onnxruntime-gpu' else name) for name in owners[path]}
+            if not affected<=desired.keys(): raise ValueError('损坏文件包含无法局部确认的共享所有者，需要完整性校验')
+            for name in affected:
+                if name not in changed: changed.append(name)
+                if name in reused: reused.remove(name)
+            unclaimed.discard(path)
+        removed = (set(old_names) | set(receipts)) - set(desired)
+        # 只卸载旧受管包。未登记的外来包及其它包共用的命名空间文件保持不变。
+        retiring = set(changed) | removed
+        if 'onnxruntime' in retiring and 'onnxruntime-gpu' in distributions:
+            retiring.add('onnxruntime-gpu')
+        for name in retiring & set(old_names):
+            if name not in distributions and not (name=='onnxruntime' and 'onnxruntime-gpu' in distributions):
+                raise ValueError('旧受管包缺少发行元数据，不能安全替换或卸载：' + name)
+        deletes = set()
+        if retiring and any(not entries for entries in recorded_entries.values()):
+            raise ValueError('安装记录不完整，无法确认共享文件所有权；保留原环境')
+        for name in retiring:
+            if name in distributions and not recorded_entries[name]:
+                raise ValueError('旧受管包缺少安装文件记录，不能安全卸载：' + name)
+            for path in paths.get(name, ()):
+                if owners[path] <= retiring:
+                    deletes.add(path)
+        # 删除已退役源码的派生字节码；避免旧缓存残留使后续完整性检查误报。
+        caches=set()
+        for path in deletes:
+            source=safe(root,path)
+            if source.suffix=='.py':
+                folder=source.parent/'__pycache__'
+                if reparse(folder): raise ValueError('字节码目录不能包含链接')
+                for cached in folder.glob(source.stem+'.*.pyc'):
+                    safe(root,cached.relative_to(root).as_posix())
+                    caches.add(cached.relative_to(root).as_posix())
+        deletes.update(caches)
+        return {'install': changed, 'reused': reused, 'removed': sorted(removed),
+                'delete': sorted(deletes), 'receipts': identities}
+
+    wanted = [row for row in lock['wheels'] if row['name'] in names]
+    main = scope('Lib/site-packages', wanted, record.get('package_receipts', {}), record.get('packages', legacy.get('main', {}).keys()), compatible_gpu, legacy.get('main', {}))
+    overlay = None
+    if want_overlay or record.get('gpu_profile') or record.get('compatible_gpu') or record.get('profile') == 'cu128':
+        base = lock.get('cpu_wheels', lock['wheels'])
+        overlay_names = {'torch', 'torchaudio'}
+        if any(safe(root, 'Lib/site-packages').glob('onnxruntime_gpu-*.dist-info')):
+            overlay_names.add('onnxruntime')
+        old_overlay = set(record.get('cpu_overlay_receipts', {}))
+        if not old_overlay:
+            old_overlay = {canonical(d.metadata['Name']) for d in metadata.distributions(path=[str(safe(root, 'Lib/cpu-packages'))])}
+        overlay = scope('Lib/cpu-packages', [r for r in base if r['name'] in overlay_names],
+                        record.get('cpu_overlay_receipts', {}), old_overlay, False, legacy.get('overlay', {}))
+    if unclaimed: raise ValueError('解释器或结构性文件损坏，无法安全局部重建，需要完整性校验：'+next(iter(sorted(unclaimed))))
+    return {'main': main, 'overlay': overlay}
+
+
+def legacy_identities(root, lock_path, gpu_path=None):
+    """legacy_identities（旧锁身份）：按完整旧锁摘要匹配随本体登记的历史包身份。"""
+    record = json.loads(safe(Path(root), 'runtime.json').read_text('utf-8'))
+    path = Path(lock_path)
+    history_path = path.with_name('voice-runtime-history.json')
+    history = json.loads(history_path.read_text('utf-8')) if history_path.is_file() else {'locks': {}}
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    current = json.loads(path.read_text('utf-8'))
+    identities = {row['name']: package_identity(row) for row in current['wheels']}
+    old = identities if record.get('lock_sha256') == digest else history['locks'].get(record.get('lock_sha256'), {})
+    result = {'main': dict(old), 'overlay': dict(old), 'artifacts':{}}
+    # 最早的离线环境只有 wheels（原始包回执），没有整锁摘要或 packages（包名列表）。
+    for artifact in record.get('wheels',[]):
+        filename=artifact.get('file','');parts=filename.split('-')
+        if Path(filename).name!=filename or not filename.endswith('.whl') or len(parts)<5:
+            raise ValueError('旧离线环境的包文件身份无效')
+        name=parts[0].lower().replace('_','-');name='onnxruntime' if name=='onnxruntime-gpu' else name
+        identity=package_identity({**artifact,'version':parts[1]})
+        if not isinstance(identity['sha256'],str) or len(identity['sha256'])!=64 or not isinstance(identity['size'],int):
+            raise ValueError('旧离线环境缺少完整包摘要或大小')
+        result['main'][name]=identity;result['artifacts'][name]=identity
+    if gpu_path and record.get('gpu_lock_sha256') == hashlib.sha256(Path(gpu_path).read_bytes()).hexdigest():
+        for row in json.loads(Path(gpu_path).read_text('utf-8'))['wheels']:
+            result['main'][row['name']] = package_identity(row)
+    return result
+
 def check(names, lock=None, compatible_gpu=False, tensor_device=None):
     errors={}
     modules={'fastapi':'fastapi','pyyaml':'yaml','pydantic':'pydantic','numpy':'numpy','psutil':'psutil',
              'httpx':'httpx','uvicorn':'uvicorn','sounddevice':'sounddevice','soundfile':'soundfile',
              'webrtcvad-wheels':'webrtcvad','aec-audio-processing':'aec_audio_processing',
-             'torch':'torch','torchaudio':'torchaudio','funasr':'funasr','onnxruntime':'onnxruntime','sherpa-onnx':'sherpa_onnx'}
+             'torch':'torch','torchaudio':'torchaudio','funasr':'funasr','onnxruntime':'onnxruntime','sherpa-onnx':'sherpa_onnx',
+             'voice-audio-dsp':'voice_audio_dsp'}
     for name in names:
         try:
             installed_version(name,lock,compatible_gpu)
             if name in modules:
                 module = importlib.import_module(modules[name])
+                if name=='voice-audio-dsp' and not module.available():
+                    raise ValueError('保音高音频处理动态库未就绪')
                 if name == 'torch' and module.tensor([1., 2.], device='cpu').sum().item() != 3.:
                     raise ValueError('张量运行库的 CPU（中央处理器）计算验证失败')
                 if tensor_device == 'cpu' and name == 'torch' and module.version.cuda is not None:
@@ -247,8 +470,9 @@ def check(names, lock=None, compatible_gpu=False, tensor_device=None):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','prune','check','gpu','tts-selection','compatibility-repair'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','delta-plan','install','prune','check','gpu','tts-selection','compatibility-repair'])
     parser.add_argument('--reset-devices', action='store_true') # reset_devices（重建环境后回退计算设备）。
+    parser.add_argument('--repair-local',action='store_true') # repair_local（只重建内容损坏的已登记依赖）。
     parser.add_argument('--data') # data（当前工作区数据目录）。
     parser.add_argument('--selection') # selection（显式选择的语音后端与模型）。
     parser.add_argument('--compatible-gpu',action='store_true') # compatible_gpu（允许复用项目已验证的显卡组合）。
@@ -277,6 +501,10 @@ def main():
     elif args.operation=='interpreter': result=interpreter()
     elif args.operation=='reuse': result=reuse(runtime_lock(args.lock,args.gpu_lock),names,Path(args.target))
     elif args.operation=='inventory': result=inventory(names,runtime_lock(args.lock,args.gpu_lock),args.compatible_gpu)
+    elif args.operation=='delta-plan':
+        effective=runtime_lock(args.lock,args.gpu_lock)
+        effective['cpu_wheels']=runtime_lock(args.lock)['wheels']
+        result=delta_plan(Path(args.target),effective,names,args.compatible_gpu,legacy_identities(args.target,args.lock,args.gpu_lock),bool(args.gpu_lock),args.repair_local)
     elif args.operation=='install': result=install([Path(path) for path in json.loads(args.wheels)],Path(args.target))
     elif args.operation=='prune': result=prune(Path(args.target),names)
     elif args.operation=='gpu':

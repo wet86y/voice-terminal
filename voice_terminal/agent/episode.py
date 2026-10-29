@@ -2880,7 +2880,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 value["delivery"] = {"heard_text": heard}
         return value
 
-    async def _apply_revision_tail(self, identity, turn_id, snapshot, tail, *, emotion,
+    async def _apply_revision_tail(self, identity, turn_id, snapshot, tail, *, emotion, controls=None,
                                    dispatch_context=None):
         """revision（尾巴修订）只修改请求快照仍匹配的活动事务，拒绝过期边界。"""
         proposal = str(tail or "")
@@ -2920,11 +2920,17 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             return "noop"
         rewrite = getattr(self.output, "rewrite_unsent", None)
         if reason is None and callable(rewrite):
+            control_kwargs = {}
+            if controls is not None and hasattr(self.output, "speech_control_epoch"):
+                control_kwargs = {"controls": controls,
+                                  "control_epoch": snapshot.get("_speech_control_epoch"),
+                                  "control_profile": snapshot.get("_speech_control_profile")}
             rewritten = await rewrite(
                 identity, turn_id, speech_id=speech_id, text=proposal,
                 expected_generation=snapshot.get("output_generation"),
                 expected_sent_chars=sent_chars, expected_text=active,
                 expected_text_revision=snapshot.get("text_revision", 0),
+                **control_kwargs,
             )
             if rewritten is not None:
                 await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
@@ -3450,7 +3456,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                                          "context_digest": request_context_digest,
                                          "conversation_id": identity[0], "request_id": identity[1]})
         parser = SpeechDecisionEnvelopeStream(
-            allow_empty_control_text=getattr(self.provider, "transport", "chat_completions") == "responses"
+            allow_empty_control_text=getattr(self.provider, "transport", "chat_completions") == "responses",
+            require_controls=True,
         )
         reasoning: list[str] = []
         content_chars = 0

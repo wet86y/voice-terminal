@@ -54,7 +54,8 @@ def test_scoped_voice_api_and_settings_projection(tmp_path):
             result = await client.put("/api/v1/product/settings/tts", json={"inference_steps_by_model": {"voxcpm1": 12, "voxcpm2": 22}})
             assert result.status_code == 200
             persisted = json.loads(store.path.read_text(encoding="utf-8"))
-            assert persisted["schema_version"] == 17
+            assert persisted["schema_version"] == 18
+            assert persisted["tts"]["speech_control_enabled"] is True
             assert "active_voice_by_model" not in persisted["tts"]
             target = runtime.voice_library.for_model("voxcpm2").put_import(_wav_bytes(), "target.wav")
             stale = {"name": "过期设计", "source": "design", "reference_asset_id": target["asset_id"],

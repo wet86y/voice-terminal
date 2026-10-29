@@ -141,6 +141,7 @@ class SpeechContinuationMixin:
                 if h.continuation_tail:
                     identity = h.continuation_identity or h.identity
                     successor = await self.begin(identity, h.turn_id, emotion=h.emotion_requested,
+                                                 controls=(),
                                                  kind=h.kind, _continuation_parent=h)
                     if successor is not None:
                         # 创建前的异步准备允许再次修订，接播必须消费最终版本。

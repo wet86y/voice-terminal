@@ -99,7 +99,7 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
   if (!resource) return undefined
   const jobs = props.resourceController?.resourceJobs.value.filter(job => job.resource_id === resourceId || resourceId === 'voice-runtime-cpu' && job.resource_id === 'voice-server') ?? []
   const active = jobs.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
-  const failed = jobs.some(job => job.state === 'failed')
+  const failed = jobs.at(-1)?.state === 'failed' && jobs.at(-1)?.recovery?.state !== 'resolved'
   return {
     id: resource.resource_id,
     label: resource.label,
@@ -110,7 +110,7 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
     ready: resource.can_start === true,
     installedVersion: resource.installed_version,
     targetVersion: resource.resource_id === 'voice-server' || resource.resource_id === 'dsh' ? undefined : resource.version,
-    error: resource.error || jobs.find(job => job.state === 'failed')?.error || undefined,
+    error: resource.error || (failed ? jobs.at(-1)?.error : undefined) || undefined,
     retryable: failed,
     busy: Boolean(active || props.resourceController?.startingResources.value.has(resourceId)
       || props.resourceController?.pendingDownloadPlan.value?.resource_id === resourceId),
@@ -409,6 +409,9 @@ const model = computed<LocalComponentsModel>(() => {
   // 总显存取自受管进程的去重计数，不把整卡占用当作应用占用。
   const gpu = hardware?.gpu
   return {
+    integrityReady: props.resourceController?.integrity.value.installer_ready === true,
+    integrityBusy: ['checking', 'downloading', 'handing_off'].includes(props.resourceController?.integrity.value.state ?? ''),
+    integrityMessage: props.resourceController?.integrity.value.error || props.resourceController?.integrity.value.phase || undefined,
     status: failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常', state: failed ? 'failed' : loading ? 'loading' : 'ready',
     sampledAt: snapshot?.sampled_at == null ? '—' : new Date(snapshot.sampled_at * 1000).toLocaleString('zh-CN', { hour12: false }),
     resources: [
@@ -425,6 +428,9 @@ const model = computed<LocalComponentsModel>(() => {
           : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
             : resource?.label || job.resource_id,
         state: job.state,
+        recovery: job.recovery,
+        attempt: job.attempt,
+        progressKind: job.progress_kind,
         phase: job.phase,
         completedBytes: job.completed_bytes,
         totalBytes: job.total_bytes,
@@ -494,5 +500,5 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
+  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()" />
 </template>

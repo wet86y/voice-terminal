@@ -62,9 +62,9 @@ def test_decision_schema_keeps_wire_shape_without_extra_control_actions():
 
 
 def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
-    assert "state、emotion、text 以及顶层 actions 始终必填" in PROMPT
-    assert "state=wait 时 text 必须为 \"\"" in PROMPT
-    assert "state=cancel 时 text 为空表示只停止，text 非空表示停止并替换" in PROMPT
+    assert "controls（参数补丁列表）" in PROMPT
+    assert 'state=wait时text必须为""' in PROMPT
+    assert "state=cancel时text为空表示只停止，非空表示停止并替换" in PROMPT
     examples = re.findall(r'\{"speak":\{[^{}\n]+\},"actions":\[\]\}', PROMPT)
     states = set()
     for example in examples:
@@ -128,7 +128,7 @@ def test_provider_schema_diagnostics_are_separate_from_local_contract():
         "json_syntax_valid": True,
         "provider_schema_valid": False,
         "provider_schema_error_code": "MISSING_REQUIRED",
-        "provider_schema_error_path": "$.speak.emotion",
+        "provider_schema_error_path": "$.speak.controls",
     }
 
     error = EnvelopeError("incomplete or invalid decision JSON")

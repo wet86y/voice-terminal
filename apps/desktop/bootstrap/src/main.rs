@@ -34,6 +34,11 @@ fn start()->Result<(),String>{
     let args:Vec<String>=std::env::args().skip(1).collect();
     if args==["--verify-package"]{return installation::verify_installed(std::env::current_exe().map_err(|e|e.to_string())?.parent().ok_or("入口缺少工作区")?);}
     if let Some(path)=value(&args,"--workspace-task"){return run_task(Path::new(path));}
+    if let Some(source)=value(&args,"--retain-installer"){
+        let root=Path::new(value(&args,"--target-root").ok_or("缺少校验程序目标工作区")?);
+        let package=Path::new(value(&args,"--program-package").ok_or("缺少同包交付的程序包")?);
+        return voice_desktop_common::app_update::retain_local_delivery(root,Path::new(source),package);
+    }
     // install-package（本地发布辅助模式）：与安装器共用本体事务及强制兼容处理。
     if let Some(package)=value(&args,"--install-package"){
         let root=Path::new(value(&args,"--target-root").ok_or("本地发布缺少目标工作区")?);
@@ -61,7 +66,7 @@ fn start()->Result<(),String>{
     command.current_dir(context.installed_program()).args(args).spawn().map_err(|e|format!("无法建立正式桌面窗口：{e}"))?;
     Ok(())
 }
-fn main(){if let Err(message)=start(){eprintln!("{message}");if std::env::args().any(|arg|arg=="--install-package"||arg=="--verify-package"){std::process::exit(1);}voice_desktop_common::windows::error(&message);std::process::exit(1);}}
+fn main(){if let Err(message)=start(){eprintln!("{message}");if std::env::args().any(|arg|arg=="--install-package"||arg=="--verify-package"||arg=="--retain-installer"){std::process::exit(1);}voice_desktop_common::windows::error(&message);std::process::exit(1);}}
 #[cfg(test)]mod tests{use super::*;
     #[test]fn debug_and_normal_use_same_installed_host(){let root=std::env::temp_dir().join(format!("voice-entry-{}",workspace::new_id()));std::fs::create_dir_all(root.join("app")).unwrap();std::fs::write(root.join("app/VoiceTerminalDesktop.exe"),b"formal").unwrap();let mut context=LaunchContext{channel:voice_desktop_common::LaunchChannel::Product,workspace_id:"test".into(),install:root.clone(),program:root.join("source"),data:root.join("data"),python:root.join("runtimes/python/python.exe"),models:None,webview2:None,dsh:None,node:None,dev:true,diagnostic:false};assert_eq!(desktop_executable(&context).unwrap(),root.join("app/VoiceTerminalDesktop.exe"));context.dev=false;context.program=root.join("app");assert_eq!(desktop_executable(&context).unwrap(),root.join("app/VoiceTerminalDesktop.exe"));std::fs::remove_dir_all(root).unwrap();}
 }
