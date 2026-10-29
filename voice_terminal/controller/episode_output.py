@@ -583,12 +583,10 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         else:
             h.tts_backend, h.tts_client = "minimax", self.tts
         base = (_continuation_parent.speech_controls if _continuation_parent is not None
-                else _control_base if _control_base is not None else DEFAULT_CONTROLS)
+                else _control_base if _control_base is not None else self.session_speech_controls)
         patch = controls
         if patch is None and emotion and self.speech_control_profile.guidance_kind == "enum":
             patch = ({"name": "guidance", "value": emotion},)
-        self._set_handle_controls(h, patch, base=base,
-                                  expected_epoch=control_epoch, expected_profile=control_profile)
         if _continuation_parent is not None:
             # 后继已注册才移交窗口；异步准备期间保留旧锚，取消仍能撤销接播。
             self._continuation_handle = None
@@ -656,6 +654,9 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                 h.reason = "failed"
                 h.task.cancel()  # 冻结音色失败时同样释放路由租约与待启动任务。
                 raise
+        # 音色冻结及准入确认后同步登记参数，先于可能等待网络的合成准备。
+        self._set_handle_controls(h, patch, base=base,
+                                  expected_epoch=control_epoch, expected_profile=control_profile)
         self._pending.append(h)
         try:
             await self._activate(h)  # 先合成，设备输出仍等待播放许可。
@@ -689,7 +690,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         # Late audio/progress from the old token will fail ``_valid`` even if
         # its socket has not finished its provider-side cancellation.
         predecessor = self.handle or self._continuation_handle
-        control_base = self._handle_controls(predecessor) if predecessor is not None else DEFAULT_CONTROLS
+        control_base = self._handle_controls(predecessor) if predecessor is not None else self.session_speech_controls
         self.generation += 1
         replacement_generation = self.generation
         old = self.handle
@@ -1378,6 +1379,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         self._playback_hold = False
         self._playback_release.set()
         self.cancel_all("stopped")
+        self.refresh_speech_controls("session_closed")
         if self.tasks:
             await asyncio.gather(*list(self.tasks), return_exceptions=True)
         if self._tts_session:

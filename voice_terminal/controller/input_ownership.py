@@ -285,7 +285,7 @@ class InputOwnershipMixin:
             return
         refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
         if callable(refresh):
-            refresh("kws_wake")
+            refresh("kws_wake", reset=False)
         self._activation_generation += 1
         generation = self._activation_generation
         source_id = f"wake-{uuid4().hex}"
@@ -362,7 +362,7 @@ class InputOwnershipMixin:
         if policy is not None: policy.activate("system")
         refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
         if callable(refresh):
-            refresh("listening_resumed")
+            refresh("listening_resumed", reset=False)
         self.state.input_owner = "asr"
         self.state.set_service("kws", "READY")
         self.state.set_service("asr", "RUNNING")
@@ -411,7 +411,7 @@ class InputOwnershipMixin:
         self.state.set_service("kws", "RUNNING")
         refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
         if callable(refresh):
-            refresh("kws_standby")
+            refresh("kws_standby", reset=False)
         self.state.set_service(
             "asr", "READY" if self.asr is not None and self.asr.connected else "ERROR",
         )

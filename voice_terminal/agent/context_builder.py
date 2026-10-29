@@ -370,6 +370,7 @@ class AgentContextMixin:
             turn_id=model_turn_id,
         )
         self._last_model_speak_state = dict(speak_state)
+        control_snapshot = getattr(self.output, "speech_control_snapshot", None)  # 本次会话参数快照读取器。
         messages.append(ContextFrame.make(
             ContextLane.REQUEST_TAIL, "system", self.context_projector.runtime_tail(
                 current=semantic, speak_state=speak_state,
@@ -379,6 +380,7 @@ class AgentContextMixin:
                 voice_emotion=getattr(self, "perception", {}).get("voice_emotion"),
                 secondary_items=self.ledger.secondary_mailbox.project(secondary_context or {}),
                 listening_request=(self.listening.snapshot() if listening_context is None else listening_context),
+                speech_controls=control_snapshot() if callable(control_snapshot) else None,
             ),
             context_kind="runtime_state",
         ))

@@ -16,7 +16,7 @@ VOICE_REQUEST_CONTEXT_TYPE = "voice_request_context"
 SPEECH_QUEUE_TASK_KIND = "speech_queue_task"  # 本次语音队列决策任务。
 OUTPUT_CONSTRAINT_KIND = "output_constraint"
 REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
-    "speech_controls",  # speech_controls（当前语音调节能力及必要的简短活动摘要）。
+    "speech_controls",  # speech_controls（当前语音调节能力说明）；参数事实在运行快照中独立提供。
     "minor_protocol_feedback",
     "immediate_recovery",
     "deferred_recovery",
@@ -236,6 +236,7 @@ class LLMContextProjector:
         tool_availability: dict[str, str] | None = None,
         voice_emotion: str | None = None, secondary_items: list[dict] | None = None,
         listening_request: dict | None = None,
+        speech_controls: dict[str, str | float] | None = None,
     ) -> str:
         """Create the only volatile model context block for one request."""
 
@@ -255,6 +256,9 @@ class LLMContextProjector:
             },
             "speech": speech,
         }
+        if speech_controls:
+            # speech_controls（当前会话有效语音参数）：仅含非默认值，播放空闲时也保留。
+            payload["runtime"]["speech_controls"] = dict(speech_controls)
         if tool_availability is not None:
             payload["tool_availability"] = dict(tool_availability)
         if calendar_epoch:

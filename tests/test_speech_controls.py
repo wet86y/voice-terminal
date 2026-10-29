@@ -219,7 +219,7 @@ def test_own_kws_resume_refresh_accepts_current_patch_without_reviving_stale_pat
                 output.refresh_speech_controls("settings_changed")
             async def resume():
                 previous = output.speech_control_epoch
-                output.refresh_speech_controls("listening_resumed")
+                output.refresh_speech_controls("listening_resumed", reset=False)
                 return previous, output.speech_control_epoch
             output.controller._on_model_speech_accepted = resume
             try:
@@ -306,7 +306,7 @@ def test_product_switch_defaults_persists_false_and_rejects_non_boolean(tmp_path
     asyncio.run(scenario())
 
 
-def test_queue_patch_continuation_summary_and_refresh_share_the_same_lifecycle():
+def test_queue_patch_continuation_and_session_controls_share_accepted_updates():
     from tests.test_speech_continuation import ContinuationHarness, SUFFIX_TEXT, _agent
     from tests.test_speech_continuation_window import complete
     async def scenario():
@@ -318,7 +318,7 @@ def test_queue_patch_continuation_summary_and_refresh_share_the_same_lifecycle()
             output = harness.output
             output._set_handle_controls(first, [{"name": "speed", "value": "0.8"}], base=DEFAULT_CONTROLS)
             await complete(harness, first)
-            assert "当前播报调节：语速=0.8" in output.speech_control_context()
+            assert output.speech_control_snapshot() == {"speed": .8}
             snapshot = dict(output.speak_snapshot)
             changed = await runtime._apply_revision_tail(harness.identity, harness.turn_id, snapshot,
                                                          SUFFIX_TEXT, emotion="calm",
@@ -327,16 +327,270 @@ def test_queue_patch_continuation_summary_and_refresh_share_the_same_lifecycle()
             successor = await harness.wait_for_drain()
             assert successor.speech_controls == SpeechControls(None, .8, .6)
             old_epoch = output.speech_control_epoch
-            output.refresh_speech_controls("kws_standby")
+            output.refresh_speech_controls("kws_standby", reset=False)
             assert output.speech_control_epoch == old_epoch + 1
-            assert successor.speech_controls.is_default
-            assert "当前播报调节" not in output.speech_control_context()
+            assert successor.speech_controls == SpeechControls(None, .8, .6)
+            assert output.speech_control_snapshot() == {"speed": .8, "volume": .6}
             output._set_handle_controls(successor, [{"name": "volume", "value": "1.4"}], expected_epoch=old_epoch)
-            assert successor.speech_controls.is_default
+            assert successor.speech_controls == SpeechControls(None, .8, .6)
+            assert output.speech_control_snapshot() == {"speed": .8, "volume": .6}
             harness.tts.speech_control_enabled = False
             output.refresh_speech_controls("settings_changed")
+            assert successor.speech_controls.is_default
+            assert output.speech_control_snapshot() == {}
             assert "guidance" not in output.speech_control_context()
             assert "speed" not in output.speech_control_context()
         finally:
             await harness.close()
+    asyncio.run(scenario())
+
+
+async def _controlled_reply(harness, controls):
+    """用真实输出准入、合成队列及播放器创建带参数的独立回应。"""
+    handle = await harness.output.begin(harness.identity, harness.turn_id, controls=controls)
+    await handle.feed("测试回复。")
+    await handle.finish()
+    await harness.wait_for_drain(handle)
+    return handle
+
+
+def test_session_controls_survive_idle_turns_partial_updates_and_default_resets():
+    from tests.test_speech_continuation import ContinuationHarness
+    from tests.test_speech_continuation_window import complete, expire
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        original = SpeechControls("happy", 1.1, .8)
+        replies = [
+            ([{"name": "guidance", "value": "happy"}, {"name": "speed", "value": "1.1"},
+              {"name": "volume", "value": "0.8"}], original),
+            ([], original),
+            ([{"name": "volume", "value": "0.6"}], SpeechControls("happy", 1.1, .6)),
+            ([{"name": "guidance", "value": "default"}, {"name": "speed", "value": "default"}],
+             SpeechControls(volume=.6)),
+            ([{"name": "volume", "value": "default"}], DEFAULT_CONTROLS),
+        ]
+        try:
+            first = None
+            for index, (patch, expected) in enumerate(replies):
+                harness.turn_id = f"turn-{index}"
+                handle = await _controlled_reply(harness, patch)
+                first = first or handle
+                assert handle.speech_controls == expected
+                assert harness.output.session_speech_controls == expected
+                await complete(harness, handle)
+                expire(handle)
+                assert harness.output.speak_snapshot["queue_status"] == "empty"
+                assert harness.output.speech_control_snapshot() == expected.non_defaults()
+            # 后续调整不回写已合成或已播放事务的参数快照。
+            assert first.speech_controls == original
+        finally:
+            await harness.close()
+        assert harness.output.session_speech_controls.is_default
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["listening_started", "kws_wake", "listening_resumed", "kws_standby"])
+def test_listening_boundary_keeps_session_values_and_expires_old_patches(reason):
+    from tests.test_speech_continuation import ContinuationHarness
+    from tests.test_speech_continuation_window import complete, expire
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        output = harness.output
+        try:
+            first = await _controlled_reply(harness, [{"name": "speed", "value": "1.1"}])
+            await complete(harness, first)
+            expire(first)
+            epoch = output.speech_control_epoch
+            profile = output.speech_control_profile.identity
+            output.refresh_speech_controls(reason, reset=False)
+            assert output.speech_control_epoch == epoch + 1
+            # 旧请求正文仍可按原准入播放，但不能跨监听边界更改参数。
+            second = await output.begin(harness.identity, "next-turn", controls=[{"name": "speed", "value": "0.8"}],
+                                        control_epoch=epoch, control_profile=profile)
+            assert second.speech_controls == SpeechControls(speed=1.1)
+            assert output.speech_control_snapshot() == {"speed": 1.1}
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["model", "voice", "switch"])
+def test_capability_refresh_clears_session_and_rejects_old_request(change):
+    from tests.test_speech_continuation import ContinuationHarness
+    from tests.test_speech_continuation_window import complete, expire
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        output = harness.output
+        try:
+            first = await _controlled_reply(harness, [{"name": "speed", "value": "1.1"}])
+            await complete(harness, first)
+            expire(first)
+            epoch, profile = output.speech_control_epoch, output.speech_control_profile.identity
+            if change == "model":
+                harness.tts.model = "speech-2.8-turbo"
+            elif change == "voice":
+                harness.tts.voice_id = "other-voice"
+            else:
+                harness.tts.speech_control_enabled = False
+            output.refresh_speech_controls("settings_changed" if change == "switch" else "model_changed")
+            second = await output.begin(harness.identity, "next-turn", controls=[{"name": "speed", "value": "0.8"}],
+                                        control_epoch=epoch, control_profile=profile)
+            assert second.speech_controls.is_default
+            assert output.session_speech_controls.is_default
+            assert output.speech_control_snapshot() == {}
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_rejected_updates_wait_and_stop_do_not_overwrite_session_controls():
+    from voice_terminal.agent.decision_envelope import DecisionEnvelope, SpeechDecision
+    from tests.test_speech_continuation import ContinuationHarness, SUFFIX_TEXT, _agent
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        runtime = _agent(harness)
+        output = harness.output
+        patch = ({"name": "speed", "value": "0.8"},)
+        try:
+            first = await _controlled_reply(harness, [{"name": "speed", "value": "1.1"}])
+            assert await output.begin(harness.identity, "busy-turn", controls=patch) is None
+            snapshot = dict(output.speak_snapshot)
+            rejected = await runtime._apply_revision_tail(harness.identity, harness.turn_id,
+                                                         {**snapshot, "text_revision": -1}, SUFFIX_TEXT,
+                                                         emotion="calm", controls=patch)
+            assert rejected is None
+            output._set_handle_controls(first, [*patch, {"name": "volume", "value": "invalid"}])
+            assert first.speech_controls == SpeechControls(speed=1.1)
+            output._set_handle_controls(first, patch, expected_profile="old-capability")
+            assert first.speech_controls == SpeechControls(speed=1.1)
+            for state in ("wait", "cancel"):
+                await runtime._apply_decision_v06(harness.identity, harness.turn_id,
+                                                 DecisionEnvelope(SpeechDecision(state, "calm", "", patch), ()))
+                assert output.speech_control_snapshot() == {"speed": 1.1}
+            await asyncio.gather(first.task, return_exceptions=True)
+            assert output.handle is None
+            # 空闲时的非空取消替换也从本会话保持值开始，仅更新指定项。
+            replacement = await output.replace_current(harness.identity, "replacement-turn", controls=[
+                {"name": "volume", "value": "0.6"},
+            ])
+            assert replacement.speech_controls == SpeechControls(None, 1.1, .6)
+            assert output.speech_control_snapshot() == {"speed": 1.1, "volume": .6}
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_session_end_clears_retained_values_before_next_conversation():
+    from tests.test_speech_continuation import ContinuationHarness, _agent
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        runtime = _agent(harness)
+        runtime.registry.cancel_turn = lambda _turn: None
+        try:
+            await _controlled_reply(harness, [{"name": "speed", "value": "1.1"}])
+            await runtime.end("reset")
+            assert runtime.episode_id is None
+            assert harness.output.session_speech_controls.is_default
+            assert harness.output.speech_control_snapshot() == {}
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_stage", ["voice_snapshot", "synthesis"])
+def test_new_reply_commits_controls_only_after_voice_snapshot_admission(failure_stage):
+    from tests.test_speech_continuation import ContinuationHarness
+    from tests.test_speech_continuation_window import complete, expire
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.model = "speech-2.8-hd"
+        output = harness.output
+        try:
+            first = await _controlled_reply(harness, [{"name": "speed", "value": "1.1"}])
+            await complete(harness, first)
+            expire(first)
+            if failure_stage == "voice_snapshot":
+                harness.tts.resolve_voice = lambda: None
+                def fail_voice(**_kwargs):
+                    raise RuntimeError("音色快照不可用")
+                harness.tts.session = fail_voice
+                expected = {"speed": 1.1}
+            else:
+                harness.tts.prepare_speech_controls = AsyncMock(side_effect=RuntimeError("合成准备暂时失败"))
+                # 已受理参数不随网络合成故障撤销，后续回应继续沿用用户的调整意图。
+                expected = {"speed": 1.1, "volume": .6}
+            with pytest.raises(RuntimeError):
+                await output.begin(harness.identity, "next-turn", controls=[{"name": "volume", "value": "0.6"}])
+            assert output.speech_control_snapshot() == expected
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_every_request_projects_full_session_parameters_in_tail_without_changing_cache_prefix():
+    from tests.test_context_cache_contract import _request_packet
+    from tests.test_speech_continuation import ContinuationHarness, _agent
+    from tests.test_speech_continuation_window import complete, expire
+    from voice_terminal.session.context_frames import ContextFrame, ContextLane
+
+    async def scenario():
+        harness = ContinuationHarness()
+        harness.tts.local_model = "voxcpm2"
+        runtime = _agent(harness)
+        output = harness.output
+        description = "轻柔、亲近，略带笑意，语气平缓且自然，清晰表达，句尾轻收，停顿舒缓但不要刻意拖长。"
+
+        def request(kind, **kwargs):
+            messages = runtime.messages({kind}, **kwargs)
+            runtime._guard_context_contract(messages)
+            prefix = [frame for frame in messages if ContextFrame.lane_of(frame) != ContextLane.REQUEST_TAIL]
+            return _request_packet(messages), prefix
+
+        try:
+            before, prefix = request("USER_INPUT_FINALIZED")
+            assert "speech_controls" not in before["runtime"]
+            first = await _controlled_reply(harness, [{"name": "guidance", "value": description},
+                                                       {"name": "volume", "value": "0.8"}])
+            expected = {"guidance": description, "volume": .8}
+            during, during_prefix = request("USER_SEGMENT_UPDATED")
+            assert during["runtime"]["speech_controls"] == expected
+            assert during_prefix == prefix
+            assert "speed" not in during["runtime"]["speech_controls"]
+            await complete(harness, first)
+            expire(first)
+            for kind, prompt_kind in (("USER_INPUT_FINALIZED", "normal"), ("TOOL_COMPLETED", "normal"),
+                                      ("SYSTEM_CHECK", "secondary_mailbox"), ("SYSTEM_CHECK", "final_silence"),
+                                      ("SYSTEM_CHECK", "kws_wake")):
+                packet, current_prefix = request(kind, prompt_kind=prompt_kind)
+                assert packet["speech"]["state"] == "empty"
+                assert packet["runtime"]["speech_controls"] == expected
+                assert current_prefix == prefix
+            # 已冻结的请求快照不因后续恢复默认而被改写。
+            await output.begin(harness.identity, "reset-turn", controls=[
+                {"name": "guidance", "value": "default"}, {"name": "volume", "value": "default"},
+            ])
+            after, after_prefix = request("USER_INPUT_FINALIZED")
+            assert "speech_controls" not in after["runtime"]
+            assert after_prefix == prefix
+            assert during["runtime"]["speech_controls"] == expected
+        finally:
+            await harness.close()
+
     asyncio.run(scenario())
