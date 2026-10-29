@@ -4048,6 +4048,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
 
     async def end(self, reason):
         self.listening.close()
+        refresh_controls = getattr(self.output, "refresh_speech_controls", None)
+        if callable(refresh_controls):
+            refresh_controls("session_ended")
         perception = getattr(self, "perception", {})
         if perception:
             perception["scope"] += 1

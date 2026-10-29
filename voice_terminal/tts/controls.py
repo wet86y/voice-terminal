@@ -26,16 +26,10 @@ class SpeechControls:
     def is_default(self) -> bool:
         return self == DEFAULT_CONTROLS
 
-    def summary(self) -> str:
-        parts = []
-        if self.guidance:
-            text = " ".join(self.guidance.split())
-            parts.append("语气=" + text[:32] + ("…" if len(text) > 32 else ""))
-        if self.speed != 1:
-            parts.append(f"语速={self.speed:g}")
-        if self.volume != 1:
-            parts.append(f"音量={self.volume:g}")
-        return "；".join(parts)
+    def non_defaults(self) -> dict[str, str | float]:
+        """只投影非默认项；guidance（语气引导）保留完整规范化描述。"""
+        return {name: getattr(self, name) for name in CONTROL_NAMES
+                if getattr(self, name) != getattr(DEFAULT_CONTROLS, name)}
 
 
 DEFAULT_CONTROLS = SpeechControls()
@@ -96,10 +90,17 @@ class SpeechControlProfile:
         if "volume" in self.names:
             lines.append("volume（相对音量）接受0.6至1.4的数值字符串，1为默认；无调整需求时不要改变音量。"
                          + ("采用服务端原生处理。" if self.native_volume else "采用客户端增益处理。"))
-        lines.append("只输出需要改变的项；[]表示沿用当前队列参数，value（参数值）写default可恢复该项默认。"
-                     "用户要求调整时，根据上下文维护后续对话的统一、连贯，避免无理由反复变化。"
-                     "对话间是否再次调整由你判断；没有活动参数摘要时按默认理解。"
-                     "描述中的节奏和响度不要与独立数值要求冲突。仅能使用本次列出的参数。")
+        lines.append("语音参数在本会话内持续生效，播放结束、用户换轮、待机唤醒或恢复监听不会自动恢复默认。"
+                     "以本次runtime.speech_controls（当前会话有效语音参数）为参数事实；"
+                     "其中省略的受支持参数为默认值，整个字段缺省表示全部为默认值；不要从历史口头承诺反推当前数值。"
+                     "只输出需要改变的项；[]表示沿用本会话当前参数，value（参数值）写default可恢复该项默认。"
+                     "用户认可效果或要求保持时输出[]即可，无需重复提交。"
+                     "用户没有新要求、表达场景也没有明显变化时，保持语气、语速和音量统一、连贯，"
+                     "不为每次新回答反复改写同一语气描述。用户明确的持续要求优先；临时表达场景结束后，"
+                     "结合上下文通过补丁恢复或调整。描述中的节奏和响度不要与独立数值要求冲突。"
+                     "参数只随已受理的新播报、尾巴修订或非空取消替换生效；wait（等待）或只停止时不提交调整。"
+                     "仍遵守语音队列约束，不得仅为改变风格而修订或取消重说；已提交音频保留原参数快照，"
+                     "更新从后续合成边界生效。仅能使用本次列出的参数。")
         return "\n".join(lines)
 
 

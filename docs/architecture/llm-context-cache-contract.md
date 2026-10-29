@@ -69,6 +69,8 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 
 第2版将状态直接放入原生 JSON（结构化数据），不再使用 `entries.content`（条目正文字符串）嵌套另一层 JSON。`runtime`（本轮运行信息）、`speech`（当前语音事务）、`shadow`（后台状态）与 `tool_availability`（工具可用性）相互独立。恢复反馈和强制调度提示保持单独的动态系统消息，不得在最终输出约束之后追加消息。深度模式提示使用内部 `context_kind=reasoning_mode`（上下文类型为本次推理模式），与冻结的接口强度一致；快速和唤醒确认请求不携带该提示。
 
+`runtime.speech_controls`（当前会话有效语音参数）只包含当前能力允许的非默认值：`guidance`（完整语气引导）、`speed`（语速倍率数值）及 `volume`（相对音量倍率数值）。播放和空闲状态的每次请求均可携带，全部默认或调节关闭时省略整个字段。该字段表示后续合成沿用的已受理参数，已生成音频继续保留自身快照；它不表示音频是否已经传达。参数及能力说明仅在请求尾部提供，不改写固定前缀、历史或输出结构；会话内继承和刷新边界见[语音调节说明](speech-controls.md)。
+
 原始正文不能被摘要或重新解释。预算处理仅可截短过长的当前未提交输入；完整历史、当前锁定文本、可改尾巴和必要状态作为整体保留。固定字段说明不随可选动态字段的出现而改变，模式切换也只改变请求尾部。修改固定指令后的首批请求需建立新的缓存前缀；后续请求仍可复用稳定指令与追加历史，实际命中率以服务端用量为准。
 
 ### 当前语音事务投影
@@ -131,6 +133,7 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 | 最近一次传达前沿 `delivery`（仅 `state=empty`） | Speech runtime | REQUEST_TAIL | 否 | delivery/order |
 | revision（尾巴修订）拒绝的轻度反馈 | Agent runtime | REQUEST_TAIL | 否 | placement/final-position |
 | 时间、工具可用性、恢复反馈 | Runtime | REQUEST_TAIL | 否 | placement/final-position |
+| `runtime.speech_controls`（当前会话有效语音参数） | EpisodeSpeechOutput（会话语音输出管理器） | REQUEST_TAIL（请求尾部） | 否，仅当前会话内存保持 | 播放及空闲投影／默认省略／完整描述／继承与刷新／固定前缀与输出结构稳定 |
 | 最终 JSON 输出约束 | Agent runtime | REQUEST_TAIL 尾部 | 否 | schema/final-position |
 
 ## 不可违反的规则
