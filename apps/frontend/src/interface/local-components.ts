@@ -148,6 +148,8 @@ export interface LocalDownloadItem {
 
 /** ManagedResourceJob（资源任务进度）：前端从桌面事件投影出的展示信息。 */
 export interface ManagedResourceJob {
+  /** recovery（统一组件恢复结果与下一步）。 */
+  recovery?: import('./component-recovery').ComponentRecovery | null
   /** id（任务标识）、resourceId（当前资源或批量导入）及 label（任务名称）。 */
   id: string
   resourceId: string
@@ -173,6 +175,10 @@ export interface ManagedResourceJob {
 
 /** LocalComponentsModel（本地组件页面数据）：统一呈现总量、硬件与组件。 */
 export interface LocalComponentsModel {
+  /** integrityReady（全面校验程序就绪）、integrityBusy（维护程序准备或交接中）与 integrityMessage（维护进度或错误）。 */
+  integrityReady?: boolean
+  integrityBusy?: boolean
+  integrityMessage?: string
   /** ttsSelection（启动前播放目标）：只提供已就绪的本地选项，value（当前选择）可以尚未就绪。 */
   ttsSelection?: { value: 'minimax' | 'voxcpm1' | 'voxcpm2'; options: Array<{ value: string; label: string }>; saving: boolean; error?: string }
   /** status（整体状态）、state（状态类别）与 sampledAt（采样时间）。 */

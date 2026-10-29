@@ -16,6 +16,7 @@ VOICE_REQUEST_CONTEXT_TYPE = "voice_request_context"
 SPEECH_QUEUE_TASK_KIND = "speech_queue_task"  # 本次语音队列决策任务。
 OUTPUT_CONSTRAINT_KIND = "output_constraint"
 REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
+    "speech_controls",  # speech_controls（当前语音调节能力及必要的简短活动摘要）。
     "minor_protocol_feedback",
     "immediate_recovery",
     "deferred_recovery",

@@ -199,6 +199,21 @@ pub fn retain_local_installer(root:&Path,source:&Path,version:&str,build:&str)->
     save_retained(root,&record)
 }
 
+/// retain_local_delivery（本机同包交付）：校验器必须与现用本体、统一包和交付回执均匹配。
+pub fn retain_local_delivery(root:&Path,source:&Path,package:&Path)->Result<(),String>{
+    crate::installation::ensure_idle(root)?;let _guard=crate::installation::WorkspaceGuard::acquire(root)?;
+    let delivery=crate::resources::load(&source.parent().ok_or("校验程序目录无效")?.join("delivery.json"))?;
+    let release=crate::resources::load(&root.join("app/release.json"))?;
+    let bytes=fs::read(package).map_err(|e|e.to_string())?;
+    let version=crate::installation::package_version(&bytes)?;let build=crate::installation::package_build(&bytes)?;
+    if delivery["role"]!="installer"||delivery["version"]!=version||delivery["build"]!=build||release["build"]!=build
+        ||source.file_name().and_then(|name|name.to_str())!=delivery["entry"].as_str()
+        ||delivery["program_package_sha256"]!=crate::workspace::file_hash(package)?
+        ||Some(fs::metadata(source).map_err(|e|e.to_string())?.len())!=delivery["size"].as_u64()
+        ||delivery["sha256"]!=crate::workspace::file_hash(source)?{return Err("本机校验程序与现用本体或同包交付摘要不一致。".into());}
+    retain_local_installer(root,source,&version,&build)
+}
+
 #[cfg(windows)]
 fn replace_file(source:&Path,destination:&Path)->Result<(),String>{
     use std::os::windows::ffi::OsStrExt;

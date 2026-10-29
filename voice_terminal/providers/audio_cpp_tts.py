@@ -28,6 +28,8 @@ from ..log_budget import (
     unprotect_log_files,
 )
 from ..tts.scheduling import TtsSegmentReceipt
+from ..tts.controls import DEFAULT_CONTROLS
+from ..audio.speech_controls import PcmControlProcessor
 from ..tts.capabilities import TtsCapabilities
 from ..tts.voices import ResolvedLocalTtsVoice, VoiceLibrary
 from ..gpu_performance import GpuPerformanceMode
@@ -856,6 +858,7 @@ class AudioCppTtsServer:
 
 
 class AudioCppTtsClient:
+    supports_speech_controls = True  # supports_speech_controls（接入统一语音调节层）。
     """把 VoxCPM SSE（服务器推送事件流）映射为现有 TTS 会话接口。"""
 
     transport = "http_sse"
@@ -973,7 +976,7 @@ class AudioCppTtsClient:
         return emotion if emotion in {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"} else "calm"
 
     async def prepare_emotion(self, emotion: str | None, *, detach_active: bool = False) -> str:
-        """prepare_emotion（旧情绪兼容接口）：正式播报固定沿用参考语气。"""
+        """prepare_emotion（旧情绪兼容接口）：风格控制由正式参数快照路径处理。"""
         del detach_active
         self._active_emotion = "calm"
         return self._active_emotion
@@ -1168,6 +1171,11 @@ class AudioCppTtsSession:
         self.audio_rejected = False  # audio_rejected（本事务已经判废，不再接收后续正文）。
         self.request_metrics: list[dict[str, float | int | str | bool | None]] = []
         self.received_bytes = 0
+        self.source_received_bytes = 0  # source_received_bytes（变速前累计字节）。
+        self.speech_control_reader = None  # speech_control_reader（下次新合成参数读取器）。
+        self._request_controls = None
+        self._audio_control = None
+        self.audio_transform_spans = []  # audio_transform_spans（精确的合成段输入/输出边界）。
         self.completed_segments = 0
         self.completed_sentences = 0
         self.generation_finished = False
@@ -1316,6 +1324,12 @@ class AudioCppTtsSession:
             # 再建立新上下文；缺失前文时原生使用正式参考独立合成。
             await self._send_text_once(text)
 
+    @property
+    def buffered_source_bytes(self) -> int:
+        """buffered_source_bytes（处理器持有的源字节），不计入播放时钟。"""
+        processor = self._audio_control
+        return processor.buffered_input_frames * 2 if processor is not None else 0
+
     async def _send_text_once(self, text: str) -> None:
         if not self._started:
             raise self._reject("state", "VoxCPM 会话尚未启动")
@@ -1332,6 +1346,13 @@ class AudioCppTtsSession:
         chunk_count = 0
         max_chunk_gap_ms = 0.0
         native_timing: dict[str, float] = {}  # 原生完成事件中的有限数值计时。
+        self._request_controls = (self.speech_control_reader() if callable(self.speech_control_reader)
+                                  and not self._is_preview and not self._is_prewarm else DEFAULT_CONTROLS)
+        self._audio_control_source_start = self.source_received_bytes // 2
+        self._audio_control_output_start = self.received_bytes // 2
+        self._audio_control = PcmControlProcessor(self.client.sample_rate,
+                                                 speed=self._request_controls.speed,
+                                                 volume=self._request_controls.volume)
         body = {
             "model": self.model_id,
             "input": self._request_text(text),
@@ -1471,9 +1492,7 @@ class AudioCppTtsSession:
                                         f"本地语音生成异常：音频超过正文时长预算（{budget_ms} 毫秒），已停止播报。")
                                 output_pcm = self._resampler.push(pcm) if self._resampler is not None else pcm
                                 if output_pcm:
-                                    output_for_request += len(output_pcm)
-                                    self.received_bytes += len(output_pcm)
-                                    await self._queue_pcm(output_pcm)
+                                    output_for_request += await self._queue_pcm(output_pcm)
                         elif event_type == "speech.audio.done":
                             timing = event.get("timing")
                             if isinstance(timing, dict):
@@ -1498,9 +1517,8 @@ class AudioCppTtsSession:
             if self._resampler is not None:
                 tail = self._resampler.finish()
                 if tail:
-                    output_for_request += len(tail)
-                    self.received_bytes += len(tail)
-                    await self._queue_pcm(tail)
+                    output_for_request += await self._queue_pcm(tail)
+            output_for_request += await self._finish_audio_control()
             receipt = TtsSegmentReceipt(
                 index=self.completed_segments,
                 text_chars=len(text),
@@ -1632,6 +1650,10 @@ class AudioCppTtsSession:
         finally:
             self._active_response = None
             self._send_task = None
+            if self._audio_control is not None:
+                self._audio_control.close()
+                self._audio_control = None
+            self._request_controls = None
 
     async def _preview_lines(self, response: httpx.Response) -> AsyncIterator[str]:
         """把任务接口的完整 WAV（波形音频）接入既有回执、取消与音频收集流程。"""
@@ -1679,7 +1701,6 @@ class AudioCppTtsSession:
         if self._resampler is not None:
             tail = self._resampler.finish()
             if tail:
-                self.received_bytes += len(tail)
                 await self._queue_pcm(tail)
         self._segment_available.set()
         await self._audio.put(_QUEUE_END)
@@ -1720,6 +1741,8 @@ class AudioCppTtsSession:
     async def cancel(self, *, timeout_seconds: float | None = None) -> bool:
         del timeout_seconds
         self._cancelled = True
+        if self._audio_control is not None:
+            self._audio_control.close()
         response = self._active_response
         if response is not None:
             with contextlib.suppress(Exception):
@@ -1755,7 +1778,30 @@ class AudioCppTtsSession:
                 self._buffered_bytes -= len(item)
                 yield item
 
-    async def _queue_pcm(self, pcm: bytes) -> None:
+    async def _queue_pcm(self, pcm: bytes) -> int:
+        self.source_received_bytes += len(pcm)
+        processor = self._audio_control
+        if processor is not None:
+            if processor.speed != 1:
+                pcm = await asyncio.to_thread(processor.push, pcm)
+            else:
+                pcm = processor.push(pcm)
+        if self._cancelled or not pcm:
+            return 0
+        return await self._queue_output_pcm(pcm)
+
+    async def _finish_audio_control(self) -> int:
+        processor = self._audio_control
+        if processor is None:
+            return 0
+        tail = await asyncio.to_thread(processor.finish) if processor.speed != 1 else processor.finish()
+        self.audio_transform_spans.append(processor.span(
+            input_start=self._audio_control_source_start, output_start=self._audio_control_output_start,
+        ))
+        self._audio_control = None
+        return await self._queue_output_pcm(tail) if tail and not self._cancelled else 0
+
+    async def _queue_output_pcm(self, pcm: bytes) -> int:
         if self.first_audio_ready_at is None:
             self.first_audio_ready_at = time.monotonic()
         callback = getattr(self, "first_audio_callback", None)
@@ -1768,7 +1814,9 @@ class AudioCppTtsSession:
             )
             raise AudioCppTtsError("提前合成音频暂存超过 32 MiB（二进制兆字节）")
         self._buffered_bytes += len(pcm)
+        self.received_bytes += len(pcm)
         await self._audio.put(pcm)
+        return len(pcm)
 
     async def _release_context(self) -> None:
         needs_handoff = ((self._cancelled or self.audio_rejected) and self._native_request_submitted
@@ -1829,8 +1877,14 @@ class AudioCppTtsSession:
     def _control_instructions(self) -> list[str]:
         """control_instructions（逐请求控制提示）；只适用于 VoxCPM2。"""
         voice = self.voice_snapshot
-        if voice is None or voice.model != "voxcpm2" or not self._is_preview:
+        if voice is None or voice.model != "voxcpm2":
             return []
+        if not self._is_preview:
+            controls = self._request_controls
+            if controls is None and callable(self.speech_control_reader):
+                controls = self.speech_control_reader()
+            guidance = getattr(controls, "guidance", None)
+            return [guidance.replace("(", "（").replace(")", "）")] if guidance else []
         instructions: list[str] = []
         if voice.style_description.strip():
             instructions.append(voice.style_description.strip())

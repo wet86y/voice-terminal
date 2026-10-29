@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 class TtsBackendRouter:
     def __init__(self, *, remote: Any | None, local: Any | None = None,
-                 backend: str = "minimax") -> None:
+                 backend: str = "minimax", speech_control_enabled: bool = True) -> None:
         if backend not in {"minimax", "voxcpm1"}:
             raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
         if backend == "voxcpm1" and local is None:
@@ -19,6 +19,7 @@ class TtsBackendRouter:
         self.remote = remote
         self.local = local
         self.backend = backend
+        self.speech_control_enabled = speech_control_enabled
         self._local_leases = 0
         self._local_ready = backend == "voxcpm1"
         self._switch_lock = asyncio.Lock()
@@ -150,6 +151,9 @@ class TtsBackendRouter:
             prewarm = getattr(client, "prewarm", None)
             if not callable(prewarm):
                 return {"status": "DISABLED", "reason": "unsupported"}
+            if callable(getattr(client, "prepare_speech_controls", None)):
+                from .controls import DEFAULT_CONTROLS
+                return await prewarm(turn_id=turn_id, controls=DEFAULT_CONTROLS)
             return await prewarm(turn_id=turn_id)
         finally:
             if local_backend:

@@ -969,16 +969,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         store = product_store_or_404()
         if not body or set(body) - {
             "backend", "local_model", "online_model", "online_voice_id",
-            "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+            "local_optimization", "acoustic_continuation", "speech_control_enabled", "inference_steps_by_model",
         }:
             raise HTTPException(
                 status_code=422,
                 detail="TTS 设置包含不支持的字段。",
             )
         optimization = {field: body.get(field, getattr(runtime.config.tts, field))
-                        for field in ("local_optimization", "acoustic_continuation")}
+                        for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled")}
         if any(not isinstance(value, bool) for value in optimization.values()):
-            raise HTTPException(status_code=422, detail="本地优化与声学续接开关必须为布尔值。")
+            raise HTTPException(status_code=422, detail="智能语音调节、本地优化与声学续接开关必须为布尔值。")
         from ..config import validate_tts_inference_steps
         try:
             optimization["inference_steps_by_model"] = validate_tts_inference_steps(
@@ -1019,13 +1019,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if getattr(runtime, "_pending_tts_update", None) is not None:
                     runtime._pending_tts_update.update(optimization)
                 runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization))
+                if runtime.tts is not None:
+                    runtime.tts.speech_control_enabled = optimization["speech_control_enabled"]
+                output = getattr(runtime.controller, "output", None)
+                if "speech_control_enabled" in body and callable(getattr(output, "refresh_speech_controls", None)):
+                    output.refresh_speech_controls("settings_changed")
                 local_client = getattr(runtime.tts, "local", None)
                 if local_client is not None:
                     for key, value in optimization.items():
                         setattr(local_client, key, value)
                     local_client._warmed = False
                 await runtime.bus.publish(runtime.snapshot())
-                return {"settings": {"tts": saved}, "effective_from": "next_answer", "pending": False,
+                return {"settings": {"tts": saved}, "effective_from": "next_synthesis" if "speech_control_enabled" in body else "next_answer", "pending": False,
                         "message": "合成设置已热更新，下一回答使用新参数。", "tts": runtime.local_tts_status_payload()}
         if not prepared:
             if runtime.application_initializing:
@@ -1083,6 +1088,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 await runtime.switch_tts_selection(backend, local_model)
                 saved = store.save_tts_local_model({"backend": backend, "local_model": local_model,
                                                     **optimization, **online_settings})
+                runtime.tts.speech_control_enabled = optimization["speech_control_enabled"]
+                output = getattr(runtime.controller, "output", None)
+                if callable(getattr(output, "refresh_speech_controls", None)):
+                    output.refresh_speech_controls("model_changed")
                 runtime.config = replace(
                     runtime.config,
                     tts=replace(runtime.config.tts, backend=backend, local_model=local_model,

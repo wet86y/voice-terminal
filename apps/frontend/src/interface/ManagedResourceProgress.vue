@@ -41,6 +41,7 @@ function formatBytes(value: number | null | undefined) {
       <small v-else>请稍候…</small>
     </div>
     <p v-if="job.error" class="managed-job-error" role="alert">{{ job.error }}</p>
+    <p v-if="job.recovery?.message" class="managed-job-phase" role="status">{{ job.recovery.message }}</p>
   </section>
 </template>
 

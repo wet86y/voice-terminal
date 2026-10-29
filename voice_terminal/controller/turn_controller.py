@@ -151,6 +151,9 @@ class InputController:
             self.vad.reset()
             self.state.set_service("audio", "RUNNING")
             self.state.input_owner = "asr"
+            refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
+            if callable(refresh):
+                refresh("listening_started")
             self.state.set_service("kws", "READY" if self.wake_enabled else "DISABLED")
             self.state.set_service("asr", "RUNNING")
             self._listen_task = asyncio.create_task(self._listen_loop(), name="voice-input-loop")

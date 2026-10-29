@@ -22,6 +22,15 @@ $Helper=Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTermin
 $InstallArguments=@('--install-package',$Package,'--target-root',$InstallRoot)
 Invoke-DesktopStage '安装已有程序包与组件状态检查' {Invoke-DesktopInstallProcess -Executable $Helper -Arguments $InstallArguments}
 if ((Get-Sha256File -LiteralPath $Package) -ne $PackageHash) {throw '安装期间程序包发生变化，拒绝将本轮标记为同包交付。'}
+# 同包交付已构建相同版本的维护程序时一并保留；普通本体发布不为此下载或构建组件。
+$LocalDeliveryPath=Join-Path $DesktopRepo '.local/releases/installer/delivery.json'
+if (Test-Path -LiteralPath $LocalDeliveryPath -PathType Leaf) {
+  $LocalDelivery=Get-Content -LiteralPath $LocalDeliveryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($LocalDelivery.program_package_sha256 -eq $PackageHash) {
+    $LocalInstaller=Join-Path $DesktopRepo '.local/releases/installer/VoiceTerminalSetup.exe'
+    Invoke-DesktopStage '保留同构建的完整性校验程序' {Invoke-DesktopInstallProcess -Executable $Helper -Arguments @('--retain-installer',$LocalInstaller,'--target-root',$InstallRoot,'--program-package',$Package) -LogName 'desktop-maintenance-retain-latest.log'}
+  }
+}
 if ($BuildDemo -and $InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminalUIDemo.exe') -Destination (Join-Path $InstallRoot 'VoiceTerminalUIDemo.exe') -Force
 }

@@ -283,6 +283,9 @@ class InputOwnershipMixin:
                 self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
             )
             return
+        refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
+        if callable(refresh):
+            refresh("kws_wake")
         self._activation_generation += 1
         generation = self._activation_generation
         source_id = f"wake-{uuid4().hex}"
@@ -357,6 +360,9 @@ class InputOwnershipMixin:
         await self._reset_owner_boundary()
         policy = getattr(self, "speaker_policy", None)
         if policy is not None: policy.activate("system")
+        refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
+        if callable(refresh):
+            refresh("listening_resumed")
         self.state.input_owner = "asr"
         self.state.set_service("kws", "READY")
         self.state.set_service("asr", "RUNNING")
@@ -403,6 +409,9 @@ class InputOwnershipMixin:
             return False
         self.state.input_owner = "kws"
         self.state.set_service("kws", "RUNNING")
+        refresh = getattr(getattr(self, "output", None), "refresh_speech_controls", None)
+        if callable(refresh):
+            refresh("kws_standby")
         self.state.set_service(
             "asr", "READY" if self.asr is not None and self.asr.connected else "ERROR",
         )

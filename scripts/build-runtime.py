@@ -147,6 +147,14 @@ def main():
         raise FileExistsError("运行环境输出目录已经存在，请先检查并回收旧候选暂存。")
     wheels = args.wheelhouse.resolve() / (args.profile + "-onnx-cuda" if onnx_profile == "cuda" else args.profile)
     wheels.mkdir(parents=True, exist_ok=True)
+    runtime_lock = json.loads((ROOT / 'config/runtime/voice-runtime.lock.json').read_text('utf-8'))
+    for bundled_row in runtime_lock['wheels']:
+        if bundled_row.get('provenance') != 'verified-soundtouch-source-build':
+            continue
+        internal = ROOT / '.local/build/runtime-lock' / bundled_row['file']
+        if not internal.is_file() or digest(internal) != bundled_row['sha256']:
+            raise ValueError('缺少锁定的语音处理预编译包，请先运行 scripts/build-speech-dsp.py。')
+        shutil.copy2(internal, wheels / bundled_row['file'])
     cache = ROOT / ".local/build/runtime/downloads"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / "python-3.12.10-embed-amd64.zip"

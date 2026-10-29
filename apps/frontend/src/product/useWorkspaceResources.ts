@@ -116,7 +116,7 @@ export function useWorkspaceResources() {
         for (const job of jobs) {
           const known = resourceJobs.value.some(current => current.job_id === job.job_id)
           // 只恢复活动任务；已知任务则接收完成/失败快照，补救丢失的终态事件。
-          if (!known && TERMINAL_JOB_STATES.has(job.state)) continue
+          if (!known && TERMINAL_JOB_STATES.has(job.state) && !(job.state === 'failed' && job.recovery?.next_action !== 'none' && job.recovery?.next_action)) continue
           if ((receivedEvents.get(job.job_id) ?? 0) > startedAt && (job.created_at === undefined || job.revision === undefined)) continue
           upsertResourceJob(job)
         }
@@ -308,6 +308,11 @@ export function useWorkspaceResources() {
     if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     try { integrity.value = await port.checkIntegrity() }
     catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error), installer_ready: false } }
+  }
+  async function requestIntegrity() {
+    // 组件故障入口复用现有全面校验；不传入组件编号，不从错误事件自动启动维护。
+    if (integrity.value.installer_ready) await checkIntegrity()
+    else await downloadIntegrity()
   }
   async function cancelAppUpdate() {
     const target = integrity.value.can_cancel ? integrity : appUpdate
@@ -503,6 +508,7 @@ export function useWorkspaceResources() {
     integrity,
     downloadIntegrity,
     checkIntegrity,
+    requestIntegrity,
     openProjectRepository,
     checkAppUpdate,
     downloadAppUpdate,

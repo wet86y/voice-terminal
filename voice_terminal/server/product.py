@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 17
+PRODUCT_SETTINGS_SCHEMA_VERSION = 18
 PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
@@ -120,6 +120,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": config.tts.backend, "local_model": config.tts.local_model,
+                "speech_control_enabled": config.tts.speech_control_enabled,
                 "online_model": (config.tts.model if config.tts.model in PRODUCT_MINIMAX_TTS_MODELS else "speech-2.8-hd"),
                 "online_voice_id": config.tts.voice_id,
                 "local_optimization": True, "acoustic_continuation": config.tts.acoustic_continuation,
@@ -180,7 +181,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
-    for field in ("local_optimization", "acoustic_continuation"):
+    for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled"):
         if not isinstance(result["tts"].get(field), bool):
             result["tts"][field] = defaults["tts"][field]
     try:
@@ -358,7 +359,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("approvals", ("voice_confirmation_enabled", "continuous_enabled")),
-        ("tts", ("backend", "local_model", "online_model", "online_voice_id", "local_optimization", "acoustic_continuation", "inference_steps_by_model", "active_voice_by_model")),
+        ("tts", ("backend", "local_model", "online_model", "online_voice_id", "local_optimization", "acoustic_continuation", "speech_control_enabled", "inference_steps_by_model", "active_voice_by_model")),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "intra_turn_relaxation", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
@@ -597,6 +598,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         provider="minimax",
         local_model=str(local_model),
         local_optimization=tts.get("local_optimization", config.tts.local_optimization),
+        speech_control_enabled=tts.get("speech_control_enabled", config.tts.speech_control_enabled),
         acoustic_continuation=tts.get("acoustic_continuation", config.tts.acoustic_continuation),
         inference_steps_by_model=tts.get("inference_steps_by_model", config.tts.inference_steps_by_model),
 
@@ -732,20 +734,22 @@ class ProductSettingsStore:
         """在运行切换成功后保存 backend（语音后端）及 local_model（本地模型）。"""
         if not payload or set(payload) - {
             "backend", "local_model", "online_model", "online_voice_id",
-            "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+            "local_optimization", "acoustic_continuation", "speech_control_enabled", "inference_steps_by_model",
         }:
             raise ProductSettingsError(
                 "TTS 设置字段无效：仅接受 backend（语音后端）、online_model（在线模型）、"
-                "online_voice_id（在线音色标识）、local_model（本地语音合成模型）及本地合成参数。"
+                "online_voice_id（在线音色标识）、local_model（本地语音合成模型）、speech_control_enabled（智能语音调节开关）及本地合成参数。"
             )
         model = payload.get("local_model", self._settings["tts"]["local_model"])
         if not isinstance(model, str) or model not in {"voxcpm1", "voxcpm2"}:
             raise ProductSettingsError(
                 "local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。"
             )
-        for field in ("local_optimization", "acoustic_continuation"):
+        for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled"):
             if field in payload and not isinstance(payload[field], bool):
-                raise ProductSettingsError(f"{field}（本地优化开关）必须为布尔值。")
+                label = {"local_optimization": "本地优化开关", "acoustic_continuation": "声学续接开关",
+                         "speech_control_enabled": "智能语音调节开关"}[field]
+                raise ProductSettingsError(f"{field}（{label}）必须为布尔值。")
         previous = deepcopy(self._settings["tts"])
         try:
             steps = validate_tts_inference_steps(

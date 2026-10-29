@@ -197,7 +197,8 @@ tts:
   audio_cache_max_bytes: 67108864
   cancel_timeout_ms: 2000
   keepalive_seconds: 30
-  emotion_mode: agent
+  speech_control_enabled: true # 智能语音调节总开关；正式播报的三项控制统一经兼容层。
+  emotion_mode: agent # 旧情绪字段，仅保留配置兼容。
   default_emotion: calm
   emotion_transport: voice_setting
   session_reuse: true

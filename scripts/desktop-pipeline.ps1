@@ -59,9 +59,10 @@ function ConvertTo-DesktopNativeArgument {
   return '"'+$Escaped+'"'
 }
 function Invoke-DesktopInstallProcess {
-  param([string]$Executable,[string[]]$Arguments)
+  param([string]$Executable,[string[]]$Arguments,[string]$LogName='desktop-install-latest.log') # LogName（独立维护步骤日志文件名）。
   $Directory=Join-Path (Get-ProjectRoot) '.local/cache/logs';[IO.Directory]::CreateDirectory($Directory) | Out-Null
-  $Log=[IO.StreamWriter]::new((Join-Path $Directory 'desktop-install-latest.log'),$false,[Text.UTF8Encoding]::new($false))
+  if ([IO.Path]::GetFileName($LogName) -ne $LogName) {throw '安装步骤日志必须使用固定文件名。'}
+  $Log=[IO.StreamWriter]::new((Join-Path $Directory $LogName),$false,[Text.UTF8Encoding]::new($false))
   $Info=[Diagnostics.ProcessStartInfo]::new();$Info.FileName=$Executable;$Info.Arguments=(($Arguments | ForEach-Object {ConvertTo-DesktopNativeArgument $_}) -join ' ')
   $Info.UseShellExecute=$false;$Info.CreateNoWindow=$true;$Info.RedirectStandardOutput=$true;$Info.RedirectStandardError=$true
   $Info.StandardOutputEncoding=[Text.Encoding]::UTF8;$Info.StandardErrorEncoding=[Text.Encoding]::UTF8
@@ -80,7 +81,7 @@ function Invoke-DesktopInstallProcess {
           else {Write-Host $Line;$Log.WriteLine(('{0:o} {1}' -f [DateTime]::UtcNow,$Line));$Log.Flush();$LastNotice=[DateTime]::UtcNow;$Pending[$Index]=$Readers[$Index].ReadLineAsync()}
         }
       }
-      if (([DateTime]::UtcNow-$LastNotice).TotalSeconds -ge 20) {Write-Host ('安装与兼容处理仍在运行，已用时 {0:N0} 秒；详细进度见 .local/cache/logs/desktop-install-latest.log' -f $Elapsed.Elapsed.TotalSeconds);$LastNotice=[DateTime]::UtcNow}
+      if (([DateTime]::UtcNow-$LastNotice).TotalSeconds -ge 20) {Write-Host ('安装与兼容处理仍在运行，已用时 {0:N0} 秒；详细进度见 .local/cache/logs/{1}' -f $Elapsed.Elapsed.TotalSeconds,$LogName);$LastNotice=[DateTime]::UtcNow}
       Start-Sleep -Milliseconds 100
     }
     $Process.WaitForExit()

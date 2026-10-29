@@ -1,5 +1,6 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
 import type { AppUpdateStatus } from '../interface/app-update'
+import type { ComponentRecovery } from '../interface/component-recovery'
 export type { AppUpdateStatus } from '../interface/app-update'
 import type { FixedModelCredentialUpdate, FixedModelCredentials } from './types'
 import type { FloatingSessionAction, FloatingWindowModel, FloatingWindowProjection } from './floating-window'
@@ -54,6 +55,8 @@ export interface ResourceStatus {
 
 /** ResourceJob（资源任务）：下载、导入及取消状态的桌面事件负载。 */
 export interface ResourceJob {
+  /** recovery（组件共用恢复结果）：普通传输／占用错误与内容一致性异常分别引导。 */
+  recovery?: ComponentRecovery | null
   /** created_at（本次任务创建时间，毫秒）与 revision（状态修订号）：拒绝迟到的快照和旧重试事件。 */
   created_at?: number
   revision?: number

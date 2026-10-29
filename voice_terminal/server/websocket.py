@@ -595,7 +595,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             self.state.set_service("tts", "STARTING")
             await asyncio.to_thread(self._select_available_tts)
             remote_tts, local_tts = self._build_tts_clients()
-            self.tts = TtsBackendRouter(remote=remote_tts, local=local_tts, backend=self.config.tts.backend)
+            self.tts = TtsBackendRouter(remote=remote_tts, local=local_tts, backend=self.config.tts.backend,
+                                        speech_control_enabled=self.config.tts.speech_control_enabled)
             self.state.current.update(
                 tts_transport=getattr(self.tts, "transport", "websocket"),
                 tts_scheduling=getattr(self.tts, "effective_scheduling", "auto"),
@@ -1119,7 +1120,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             remote, local = self._build_tts_clients()
             if backend == "minimax" and remote is None:
                 raise RuntimeError("在线 MiniMax TTS（文本转语音）凭据尚未配置，已保留原语音选择。")
-            candidate = TtsBackendRouter(remote=remote, local=local, backend=backend)
+            candidate = TtsBackendRouter(remote=remote, local=local, backend=backend,
+                                         speech_control_enabled=self.config.tts.speech_control_enabled)
             await candidate.ensure_ready()
             warmup = (await candidate.prewarm()
                       if backend == "minimax" or self._active_voice_snapshot(local_model) is not None
@@ -1140,6 +1142,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 await candidate.shutdown()
             raise
         self.tts = candidate
+        output = getattr(self.controller, "output", None)
+        if callable(getattr(output, "refresh_speech_controls", None)):
+            output.refresh_speech_controls("model_changed")
         if self.controller is not None:
             self.controller.tts = candidate
             # output（发声事务执行器）保存独立路由引用，下一笔播报必须同步切换。

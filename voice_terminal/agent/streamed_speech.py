@@ -92,8 +92,12 @@ async def queue_streamed_speech(runtime, state: StreamedSpeechAdmissionState,
                                   baseline_source=guard["source"] if guard else "empty_text",
                                   reason="completed_same_turn_identical")
             return True
-        handle = await runtime.output.begin(state.identity, state.source_turn_id,
-                                            emotion=decision.emotion)
+        kwargs = {"emotion": decision.emotion}
+        if decision.controls is not None and hasattr(runtime.output, "speech_control_epoch"):
+            kwargs.update(controls=decision.controls,
+                          control_epoch=state.snapshot.get("_speech_control_epoch"),
+                          control_profile=state.snapshot.get("_speech_control_profile"))
+        handle = await runtime.output.begin(state.identity, state.source_turn_id, **kwargs)
         # begin（创建）在异步准备后再次确认空闲，防止并发请求同时通过。
         if handle is None:
             state.rejected = True

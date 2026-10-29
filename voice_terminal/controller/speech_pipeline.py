@@ -235,6 +235,9 @@ class SpeechPipeline:
         async def start_tts_session(active_session):
             # MiniMax can retry a connection handshake before accepting text;
             # other providers keep their existing single-start behavior.
+            if getattr(active_session, "managed_controls", False):
+                await active_session.start()
+                return active_session
             retry_start = getattr(tts_client, "start_session_with_retry", None)
             if callable(retry_start):
                 return await retry_start(active_session)

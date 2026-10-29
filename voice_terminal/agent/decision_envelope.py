@@ -31,6 +31,7 @@ class SpeechDecision:
     state: str
     emotion: str = "calm"
     text: str = ""
+    controls: tuple[Any, ...] | None = None  # controls（参数补丁）；None仅表示旧情绪协议。
 
 
 @dataclass(frozen=True)
@@ -408,13 +409,82 @@ class SpeechDecisionEnvelopeStream:
     envelope and its actions.
     """
 
-    def __init__(self, *, limit: int = 32768, allow_empty_control_text: bool = False) -> None:
+    def __init__(self, *, limit: int = 32768, allow_empty_control_text: bool = False,
+                 require_controls: bool = False) -> None:
         self.raw = ""
         self.limit = limit
         self.allow_empty_control_text = allow_empty_control_text
         self.state: str | None = None
         self._emitted_length = 0
         self.emotion_normalizations: list[dict[str, str]] = []
+        self.require_controls = require_controls
+        self._frozen_controls = None
+
+    def _speak_members(self) -> tuple[dict[str, Any], str | None]:
+        """按对象边界读取字段；描述中的text/state字样不能伪造播报字段。"""
+        decoder = json.JSONDecoder()
+        raw = self.raw
+
+        def whitespace(pos):
+            while pos < len(raw) and raw[pos].isspace():
+                pos += 1
+            return pos
+
+        pos = whitespace(0)
+        if pos >= len(raw) or raw[pos] != "{":
+            return {}, None
+        pos += 1
+        while True:
+            pos = whitespace(pos)
+            try:
+                key, end = decoder.raw_decode(raw, pos)
+            except (ValueError, json.JSONDecodeError):
+                return {}, None
+            pos = whitespace(end)
+            if not isinstance(key, str) or pos >= len(raw) or raw[pos] != ":":
+                return {}, None
+            pos = whitespace(pos + 1)
+            if key == "speak":
+                break
+            try:
+                _, pos = decoder.raw_decode(raw, pos)
+            except (ValueError, json.JSONDecodeError):
+                return {}, None
+            pos = whitespace(pos)
+            if pos >= len(raw) or raw[pos] != ",":
+                return {}, None
+            pos += 1
+        if pos >= len(raw) or raw[pos] != "{":
+            return {}, None
+        pos += 1
+        members: dict[str, Any] = {}
+        while True:
+            pos = whitespace(pos)
+            if pos >= len(raw) or raw[pos] == "}":
+                return members, None
+            try:
+                key, pos = decoder.raw_decode(raw, pos)
+            except (ValueError, json.JSONDecodeError):
+                return members, None
+            pos = whitespace(pos)
+            if not isinstance(key, str) or pos >= len(raw) or raw[pos] != ":":
+                return members, None
+            pos = whitespace(pos + 1)
+            try:
+                value, end = decoder.raw_decode(raw, pos)
+            except (ValueError, json.JSONDecodeError):
+                partial = self._quoted_value('"text":' + raw[pos:], "text", allow_partial=True) if key == "text" else None
+                return members, partial
+            members[key] = value
+            pos = whitespace(end)
+            if pos >= len(raw) or raw[pos] != ",":
+                return members, None
+            pos += 1
+
+    @staticmethod
+    def _control_tuple(value: Any) -> tuple[Any, ...]:
+        # 形状错误由可选参数层反馈；合法正文不因此被丢弃。
+        return tuple(value) if isinstance(value, list) else ({"invalid_controls": value},)  # invalid_controls（无效容器）。
 
     @staticmethod
     def _quoted_value(raw: str, key: str, *, allow_partial: bool = False) -> str | None:
@@ -512,12 +582,13 @@ class SpeechDecisionEnvelopeStream:
         self.raw += delta
         if len(self.raw) > self.limit:
             raise EnvelopeError("decision envelope too large")
-        state = self._quoted_value(self.raw, "state")
+        members, partial_text = self._speak_members()
+        state = members.get("state")
         if state is not None:
             if state not in SPEAK_STATES:
                 raise EnvelopeError("invalid speak state")
             self.state = state
-        stream_emotion = self._quoted_value(self.raw, "emotion")
+        stream_emotion = members.get("emotion")
         # Empty emotion has an unambiguous neutral compatibility repair, but
         # finish() remains strict and rejects it unless the compatibility
         # parser rewrites the complete envelope.
@@ -525,7 +596,16 @@ class SpeechDecisionEnvelopeStream:
             self._emotion(stream_emotion)
         if self.state != "speak":
             return ""
-        text = self._quoted_value(self.raw, "text", allow_partial=True)
+        if "controls" not in members and self.require_controls:
+            return ""
+        if "controls" in members:
+            current_controls = json.dumps(members["controls"], sort_keys=True, ensure_ascii=False)
+            if self._frozen_controls is not None and current_controls != self._frozen_controls:
+                raise EnvelopeError("speak controls changed after text admission")
+            self._frozen_controls = current_controls
+        text = members.get("text", partial_text)
+        if text is not None and not isinstance(text, str):
+            raise EnvelopeError("speak text must be a string")
         if text is None or len(text) <= self._emitted_length:
             return ""
         value = text[self._emitted_length:]
@@ -543,14 +623,18 @@ class SpeechDecisionEnvelopeStream:
         state = self.state
         if state is None:
             return None
-        raw_emotion = self._quoted_value(self.raw, "emotion")
+        members, partial_text = self._speak_members()
+        if "controls" not in members and self.require_controls:
+            return None
+        controls = self._control_tuple(members["controls"]) if "controls" in members else None
+        raw_emotion = members.get("emotion")
         emotion = "calm" if raw_emotion == "" else self._emotion(raw_emotion) or "calm"
         if state != "speak":
-            return SpeechDecision(state, emotion, "")
-        text = self._quoted_value(self.raw, "text", allow_partial=True)
+            return SpeechDecision(state, emotion, "", controls)
+        text = members.get("text", partial_text)
         if not isinstance(text, str) or not text.strip():
             return None
-        return SpeechDecision(state, emotion, text)
+        return SpeechDecision(state, emotion, text, controls)
 
     @staticmethod
     def _action(value: Any) -> Action:
@@ -569,8 +653,11 @@ class SpeechDecisionEnvelopeStream:
         if not isinstance(value, dict) or set(value) != {"speak", "actions"}:
             raise EnvelopeError("decision envelope must contain exactly speak and actions")
         speak = value.get("speak")
-        if not isinstance(speak, dict) or set(speak) - {"state", "emotion", "text"}:
+        if not isinstance(speak, dict) or set(speak) - {"state", "emotion", "controls", "text"}:
             raise EnvelopeError("invalid speak object")
+        # 旧 emotion（情绪）只供存量输出归一化；新输出必须携带稳定参数容器。
+        if self.require_controls and "controls" not in speak and "emotion" not in speak:
+            raise EnvelopeError("missing speak controls")
         state = speak.get("state")
         if state not in SPEAK_STATES:
             raise EnvelopeError("invalid or missing speak state")
@@ -594,4 +681,5 @@ class SpeechDecisionEnvelopeStream:
         actions = value.get("actions")
         if not isinstance(actions, list) or len(actions) > 8:
             raise EnvelopeError("actions must be an array with at most eight entries")
-        return DecisionEnvelope(SpeechDecision(state, emotion, text), tuple(self._action(item) for item in actions))
+        controls = self._control_tuple(speak["controls"]) if "controls" in speak else None
+        return DecisionEnvelope(SpeechDecision(state, emotion, text, controls), tuple(self._action(item) for item in actions))

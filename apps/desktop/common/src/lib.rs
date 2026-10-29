@@ -14,6 +14,7 @@ pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志�
 pub mod workspace;
 pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
+mod runtime_delta; // runtime_delta（依赖文件增量）：保持未变化文件，支持卸载与崩溃回滚。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
 pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
 pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
@@ -21,6 +22,7 @@ pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新�
 pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
 pub mod compatibility; // compatibility（兼容性组件）：版本化规则、安装迁移与即时组件盘点。
 pub mod component_maintenance; // component_maintenance（组件校验交接）：分发器检查，本体组件列表修复。
+pub mod component_recovery; // component_recovery（组件共用恢复）：分类重试、局部重建和全面校验导流。
 mod component_upgrade; // component_upgrade（组件兼容迁移）：由本体资源任务复用随包资源并处置旧版资料。
 pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
 pub mod process_host; // process_host（项目工作进程）：统一系统身份并复用现有解释器运行库。

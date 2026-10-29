@@ -31,6 +31,7 @@ const emit = defineEmits<{
   resourceImportAll: []
   openResourceSource: [id: string]
   cancelResource: [jobId: string]
+  integrity: [] // integrity（进入已有全面完整性校验）。
   /** device（修改运行位置草稿）与 save（保存运行位置）。 */
   device: [id: string, value: string]
   save: [id: string]
@@ -54,6 +55,14 @@ const latestJobs = computed(() => {
   }
   return jobs
 })
+const failedRecoveryJobs = computed(() => [...latestJobs.value.values()].filter(job => job.state === 'failed' && job.recovery && job.recovery.state !== 'resolved'))
+const needsIntegrity = computed(() => failedRecoveryJobs.value.some(job => job.recovery?.next_action === 'check_integrity'))
+function retryRecovery(job: ManagedResourceJob) {
+  if (job.resourceId === 'required-batch') emit('resourceDownloadRequired')
+  else if (job.resourceId === 'batch') emit('resourceImportAll')
+  else if (/^(im-|env-import)/.test(job.id)) emit('resourceImport', job.resourceId)
+  else emit('resourceDownload', job.resourceId)
+}
 const componentCards = computed(() => props.model.rows.flatMap(expandRuntimeDependencies).map(row => {
   const job = rowJobs(row).find(jobIsActive)
   const enhancementResource = row.enhancement?.resource ? rowResource(row, row.enhancement.resource) : undefined
@@ -75,7 +84,7 @@ const categories = computed(() => categoryDefinitions.map(definition => {
   }
 }))
 function visibleJob(job: ManagedResourceJob | undefined) {
-  return job && !['complete', 'completed'].includes(job.state) ? job : undefined
+  return job && job.recovery?.state !== 'resolved' && !['complete', 'completed'].includes(job.state) ? job : undefined
 }
 function jobIsActive(job?: ManagedResourceJob) {
   return Boolean(job && !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
@@ -412,7 +421,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
   const ids = categoryResourceIds(rows)
   const jobs = [...new Map([...ids].flatMap(id => {
     const job = resourceJob(id)
-    return job && (jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state)) ? [job] : []
+    return job && job.recovery?.state !== 'resolved' && (jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state)) ? [job] : []
   }).map(job => [job.id, job])).values()]
   const active = jobs.filter(jobIsActive)
   const failed = jobs.filter(job => job.state === 'failed')
@@ -466,6 +475,15 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
     <p v-if="model.resourceError" class="local-error" role="alert">{{ model.resourceError }}</p>
     <p v-for="error in model.errors" :key="error.id" class="local-error" role="alert" :data-error-source="error.id">{{ error.message }}</p>
     <p v-if="model.resourceEventError" class="local-error" role="status">{{ model.resourceEventError }}</p>
+    <section v-if="failedRecoveryJobs.length" class="panel component-recovery" aria-label="组件恢复处理">
+      <div v-for="job in failedRecoveryJobs" :key="job.id">
+        <p role="status">{{ job.label }}：{{ job.recovery?.message }}</p>
+        <button v-if="job.recovery?.next_action === 'retry' && model.resourceActionsAvailable" class="outline-button" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="retryRecovery(job)">{{ /^(im-|env-import)/.test(job.id) || job.resourceId === 'batch' ? '重新导入' : '重试此任务' }}</button>
+      </div>
+      <p v-if="needsIntegrity">完整性校验会检查程序及全部组件，由校验结果确定修复对象和范围。</p>
+      <p v-if="needsIntegrity && model.integrityMessage" role="status">{{ model.integrityMessage }}</p>
+      <button v-if="needsIntegrity && model.resourceActionsAvailable" class="outline-button" type="button" :disabled="model.integrityBusy || model.resourceTasksBusy" @click="emit('integrity')">{{ model.integrityBusy ? '正在准备全面校验…' : model.integrityReady ? '校验完整性' : '准备校验程序' }}</button>
+    </section>
     <div class="local-list-heading local-managed-heading">
       <div><h3>组件分类</h3></div>
       <div class="local-heading-actions">

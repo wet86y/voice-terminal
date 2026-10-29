@@ -1248,7 +1248,7 @@ def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
             def stream_events(self, _messages, *, json_mode=False):
                 seen["json_mode"] = json_mode
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"好的"},"actions":[]}' }
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"好的"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
         class Registry:
@@ -1286,7 +1286,7 @@ def test_runtime_keeps_queued_speak_and_ignores_bad_actions():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"先到'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"先到'}
                     await asyncio.sleep(0)
                     yield {"type": "content", "text": '的回答"},"actions":[{"name":"bad"}]}' }
                     yield {"type": "finish", "reason": "stop"}
@@ -1350,7 +1350,7 @@ def test_runtime_keeps_queued_speak_on_truncated_envelope():
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
                     yield {"type": "content", "text": (
-                        '{"speak":{"state":"speak","emotion":"calm","text":"保留这段语音"},'
+                        '{"speak":{"state":"speak","controls":[],"text":"保留这段语音"},'
                         '"actions":[]'
                     )}
                     yield {"type": "finish", "reason": "stop"}
@@ -1499,7 +1499,7 @@ def test_streamed_prefix_divergence_is_ignored_while_busy():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已有改'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"已有改'}
                     yield {"type": "content", "text": '正"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
@@ -1631,7 +1631,7 @@ def test_active_previous_turn_also_blocks_new_speak():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"上一轮正在播放。'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"上一轮正在播放。'}
                     yield {"type": "content", "text": '这是当前轮的新回答。"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
@@ -1686,7 +1686,7 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"能听到，你说吧，我在。'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"能听到，你说吧，我在。'}
                     yield {"type": "content", "text": '我自己起名字的话，就叫小听吧。"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
@@ -1763,7 +1763,7 @@ def test_streamed_same_turn_completed_prefix_uses_only_suffix_for_refinement():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已经播出的回答。'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"已经播出的回答。'}
                     yield {"type": "content", "text": '补充的新事实。"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
@@ -1890,7 +1890,7 @@ def test_exact_previous_completed_text_remains_a_valid_explicit_replay():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"请再说一遍。"},"actions":[]}' }
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"请再说一遍。"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
 
@@ -1937,7 +1937,7 @@ def test_streamed_full_text_cannot_append_to_active_speech():
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已有播报'}
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"已有播报'}
                     yield {"type": "content", "text": '，新增句子"},"actions":[]}' }
                     yield {"type": "finish", "reason": "stop"}
                 return stream()

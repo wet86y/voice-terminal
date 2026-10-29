@@ -31,8 +31,14 @@ pub fn install_manager(app:&tauri::AppHandle,state:Arc<Desktop>,context:&LaunchC
         }
         Ok(running)
     });
-    voice_desktop_common::resources::recover(context)?;
-    app.manage(Arc::new(ResourceManager::new(context.clone(),app.clone(),control)?));
+    let recovered=voice_desktop_common::resources::recover(context);
+    let manager=Arc::new(ResourceManager::new(context.clone(),app.clone(),control)?);
+    if let Err(error)=&recovered{
+        manager.record_recovery_failure(error)?;
+        *state.error.lock().map_err(|_|"启动错误状态不可用")?=Some(error.clone());
+        state.startup_skipped.store(true,Ordering::Release);
+    }
+    app.manage(manager);
     // 页面真正加载后才登记就绪，迁移不能把窗口创建之前的阶段视为启动成功。
     Ok(())
 }

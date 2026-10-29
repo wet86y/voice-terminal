@@ -590,15 +590,20 @@ class EpisodeController(RealtimeController):
         # an LLM/TTS scheduling failure must not close the protected input path.
         return True
 
-    async def _on_model_speech_accepted(self) -> None:
+    async def _on_model_speech_accepted(self) -> tuple[int, int] | None:
         if callable(self.on_user_activity):
             self.on_user_activity()
+        output = getattr(self, "output", None)
+        previous_epoch = getattr(output, "speech_control_epoch", 0)
         if await self.activate_asr_for_model_speech():
+            control_transition = (previous_epoch, getattr(output, "speech_control_epoch", 0))
             # A model-initiated speech (scheduled/DSH wake task) moved the
             # microphone from KWS standby to ASR.  Arm the same silence window
             # a wake word arms, so ownership returns to KWS only after the
             # configured final silence has really elapsed.
             await self.episode.arm_silence_window()
+            return control_transition
+        return None
 
     async def _final_system_check_settled(self, context: dict) -> None:
         scheduler_generation = context.get("generation")

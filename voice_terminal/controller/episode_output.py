@@ -10,6 +10,8 @@ from .speech_pipeline import SpeechPipeline
 from .speech_frontier import SpeechFrontierMixin
 from .speech_inference import SpeechInferenceBoundary
 from .speech_continuation import SpeechContinuationMixin
+from .speech_controls import SpeechControlMixin
+from ..tts.controls import DEFAULT_CONTROLS
 from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
@@ -41,6 +43,8 @@ class SpeechHandle:
         self.speech_id = uuid4().hex
         self.emotion_requested = emotion
         self.emotion_applied = emotion
+        self.speech_controls = DEFAULT_CONTROLS
+        self.speech_control_epoch = getattr(owner, "speech_control_epoch", 0)
         self.kind = kind
         self.queue = asyncio.Queue(maxsize=32)
         self.output_generation = owner.generation
@@ -147,7 +151,7 @@ class SpeechHandle:
             yield value
 
 
-class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPipeline):
+class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFrontierMixin, SpeechPipeline):
     """Generation-owned output transactions sharing the audio pipeline.
 
     A superseded transaction is locally stopped synchronously, while its
@@ -192,6 +196,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         self._delivery_frontier_generation = -1
         self.inference_boundary = SpeechInferenceBoundary(self)  # inference_boundary（模型推理提交边界）。
         self._init_continuation()
+        self._init_speech_controls()
 
     @property
     def active(self):
@@ -392,6 +397,16 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             raise RuntimeError("所选 TTS provider 不可用。")
         # turn_id / speech_id（轮次与语音事务标识）随会话进入 provider，供日志串联。
         correlation = {"turn_id": ws.turn_id, "speech_id": getattr(h, "speech_id", None)}
+        if h is not None and callable(getattr(client, "prepare_speech_controls", None)):
+            from ..tts.controlled_session import ControlledTtsSession
+            def factory(values, isolated):
+                return client.session(fresh=isolated, controls=values, **correlation)
+            session = ControlledTtsSession(client, factory(self._handle_controls(h), fresh),
+                                           lambda: self._handle_controls(h), factory)
+            h.tts_session = session
+            if h is self.handle:
+                self._tts_session = session
+            return session
         try:
             if h is not None and getattr(h, "tts_voice_snapshot", None) is not None:
                 session = client.session(voice_snapshot=h.tts_voice_snapshot,
@@ -408,6 +423,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 except TypeError:
                     session = client.session()
         if h is not None:
+            if getattr(client, "supports_speech_controls", False):
+                session.speech_control_reader = lambda: self._handle_controls(h)
             h.tts_session = session
         if h is self.handle:
             self._tts_session = session  # compatibility for controller prewarm state
@@ -509,6 +526,7 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
+                    controls=None, control_epoch=None, control_profile=None, _control_base=None,
                     _generation_advanced=False, _fresh_session=False, _continuation_parent=None,
                     _replacement_transition=None, _expected_generation=None):
         if _expected_generation is not None and self.generation != _expected_generation:
@@ -524,7 +542,14 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             return None
         on_model_speech = getattr(self.controller, "_on_model_speech_accepted", None)
         if callable(on_model_speech) and not getattr(self.runtime, "should_defer_speech", lambda: False)():
-            await on_model_speech()
+            transition = await on_model_speech()
+            # 本次受理主动播报自身恢复监听时，允许其补丁通过自身触发的刷新；
+            # 其他并发刷新或先前已过期的请求仍必须被代次检查拒绝。
+            if (isinstance(transition, tuple) and len(transition) == 2
+                    and control_epoch == transition[0]
+                    and transition[1] == transition[0] + 1
+                    and self.speech_control_epoch == transition[1]):
+                control_epoch = transition[1]
         # 异步准备后再次确认；检查与注册之间没有让出事件循环。
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during preparation")
@@ -557,6 +582,13 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 h.tts_backend, h.tts_client = self.tts.bind(backend=_continuation_parent.tts_backend)
         else:
             h.tts_backend, h.tts_client = "minimax", self.tts
+        base = (_continuation_parent.speech_controls if _continuation_parent is not None
+                else _control_base if _control_base is not None else DEFAULT_CONTROLS)
+        patch = controls
+        if patch is None and emotion and self.speech_control_profile.guidance_kind == "enum":
+            patch = ({"name": "guidance", "value": emotion},)
+        self._set_handle_controls(h, patch, base=base,
+                                  expected_epoch=control_epoch, expected_profile=control_profile)
         if _continuation_parent is not None:
             # 后继已注册才移交窗口；异步准备期间保留旧锚，取消仍能撤销接播。
             self._continuation_handle = None
@@ -613,6 +645,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
                 else:
                     h.tts_session = h.tts_client.session(turn_id=turn_id, speech_id=h.speech_id)
                 h.tts_session_prepared = True
+                if getattr(h.tts_client, "supports_speech_controls", False):
+                    h.tts_session.speech_control_reader = lambda: self._handle_controls(h)
                 h.tts_voice_snapshot = getattr(h.tts_session, "voice_snapshot", None)
                 h.tts_inference_steps = getattr(h.tts_session, "_inference_steps", None)
                 library = getattr(h.tts_client, "voice_library", None)
@@ -636,7 +670,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             raise
         return h
 
-    async def replace_current(self, identity, turn_id, *, emotion="calm", expected_generation=None):
+    async def replace_current(self, identity, turn_id, *, emotion="calm", expected_generation=None,
+                              controls=None, control_epoch=None, control_profile=None):
         """Replace all output based on the current decision in one tool call.
 
         expected_generation（请求快照输出代次）不匹配时拒绝，锁定边界推进不影响取消。
@@ -653,6 +688,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         # Advance the transaction generation before closing the old PCM gate.
         # Late audio/progress from the old token will fail ``_valid`` even if
         # its socket has not finished its provider-side cancellation.
+        predecessor = self.handle or self._continuation_handle
+        control_base = self._handle_controls(predecessor) if predecessor is not None else DEFAULT_CONTROLS
         self.generation += 1
         replacement_generation = self.generation
         old = self.handle
@@ -684,6 +721,8 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             await self._emit_handle_progress(old_candidate, "replacement_detected",
                                              reason="replaced", new_generation=self.generation)
         handle = await self.begin(identity, turn_id, emotion=emotion, kind="formal",
+                                  controls=controls, control_epoch=control_epoch,
+                                  control_profile=control_profile, _control_base=control_base,
                                   _generation_advanced=True, _fresh_session=True,
                                   _replacement_transition=replacement[0] if replacement else None,
                                   _expected_generation=replacement_generation)
@@ -722,7 +761,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
         self.handle = h
         self.state.clear_current()
         prepare = getattr(h.tts_client, "prepare_emotion", None)
-        if prepare is not None:
+        prepare_controls = getattr(h.tts_client, "prepare_speech_controls", None)
+        if callable(prepare_controls):
+            await prepare_controls(self._handle_controls(h), detach_active=h.force_fresh_tts_session)
+        if prepare is not None and not getattr(h.tts_client, "supports_speech_controls", False):
             try:
                 h.emotion_applied = await prepare(
                     h.emotion_requested,
