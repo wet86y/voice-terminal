@@ -121,9 +121,15 @@ class AppPaths:
             runtime = self.install_root / selected['dsh']
             from .distribution import safe_path
             values.update(VOICE_MODEL_DIR=str(self.install_root / selected['models']), VOICE_DSH_RUNTIME=str(runtime))
-            if (runtime / 'runtime.json').is_file():
-                metadata = json.loads((runtime / 'runtime.json').read_text(encoding='utf-8-sig'))
-                if relative := metadata.get('node') or metadata.get('executable'):
+            # 组件登记不影响管理进程环境；具体故障由组件校验报告，登记路径仍核对边界。
+            metadata_path = safe_path(runtime, 'runtime.json')
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding='utf-8-sig'))
+            except (OSError, UnicodeError, ValueError):
+                metadata = None
+            if isinstance(metadata, dict):
+                relative = metadata.get('node') or metadata.get('executable')
+                if isinstance(relative, str) and relative:
                     values['VOICE_NODE_EXECUTABLE'] = str(safe_path(runtime, relative))
         if self.data_root:
             values.update(VOICE_DATA_DIR=str(self.data_root), VOICE_RESOURCE_POLICY=str(self.config / "runtime-resources.json"),

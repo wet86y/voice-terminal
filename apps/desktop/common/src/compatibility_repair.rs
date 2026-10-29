@@ -198,6 +198,54 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
         atomic_json(&path,&json!({"schema_version":rules(&context.program,false)?["settings_schema_max"],"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}}))?;
         atomic_json(&context.data.join("state/settings-validation.json"),&json!({"schema":1,"settings_schema":rules(&context.program,false)?["settings_schema_max"],"sha256":file_hash(&path)?}))
     }
+    // dsh_registration（微型代理组件）：不运行宿主，只保留可核验的登记与内容。
+    fn dsh_registration(root:&Path)->std::path::PathBuf{
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{
+            "resource_id":"dsh","kind":"dsh","title":"代理宿主","destination":"runtimes/dsh","version":"1","required":true
+        }]})).unwrap();
+        let directory=root.join("runtimes/dsh");fs::create_dir_all(&directory).unwrap();
+        atomic_json(&directory.join("runtime.json"),&json!({"source_kind":"official_desktop","executable":"host.exe","version":"1"})).unwrap();
+        fs::write(directory.join("host.exe"),b"not executed").unwrap();
+        atomic_json(&directory.join("manifest.json"),&resources::manifest(&directory,"dsh","fixture").unwrap()).unwrap();
+        directory
+    }
+    #[test]fn damaged_dsh_registration_allows_management_and_integrity_handoff(){
+        for full in [false,true]{for damaged in [None,Some(b"".as_slice()),Some(b"{".as_slice()),Some(b"\xff".as_slice())]{
+            let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+            let directory=dsh_registration(&fixture.root);let registration=directory.join("runtime.json");
+            if let Some(bytes)=damaged{fs::write(&registration,bytes).unwrap();}else{fs::remove_file(&registration).unwrap();}
+            let user=fixture.context.data.join("tts/keep.wav");fs::create_dir_all(user.parent().unwrap()).unwrap();fs::write(&user,b"user voice").unwrap();
+            let context=LaunchContext::from_executable(&fixture.root.join("VoiceTerminal.exe"),&[]).unwrap();
+            assert!(context.node.is_none());assert!(context.refreshed_components().unwrap().node.is_none());
+            let rows=resources::inventory(&context).unwrap();
+            let dsh=rows.iter().find(|row|row["resource_id"]=="dsh").unwrap();
+            assert_eq!(dsh["can_start"],false);assert!(dsh["error"].is_string());
+            assert_eq!(resources::startup_readiness(&context).unwrap()["ready"],false);
+            assert_eq!(maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},full,validate_settings).unwrap(),MaintenanceOutcome::Complete);
+            let handoff=crate::component_maintenance::load(&context).unwrap().unwrap();
+            let issue=handoff["issues"].as_array().unwrap().iter().find(|row|row["resource_id"]=="dsh").unwrap();
+            assert_eq!(issue["content_failure"],full);assert_eq!(issue["dispatched"],false);
+            assert_eq!(directory.exists(),!full);assert_eq!(fs::read(&user).unwrap(),b"user voice");
+        }}
+    }
+    #[test]
+    #[cfg(windows)]
+    fn unreadable_dsh_registration_keeps_components_and_prior_handoff(){
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
+        let directory=dsh_registration(&fixture.root);let registration=directory.join("runtime.json");
+        let bytes=fs::read(&registration).unwrap();
+        let handoff=fixture.context.data.join("state/component-maintenance.json");
+        let before=fs::read(&handoff).ok();
+        let held=fs::OpenOptions::new().read(true).share_mode(0).open(&registration).unwrap();
+        let context=LaunchContext::portable(&fixture.root).unwrap();assert!(context.node.is_none());
+        let rows=resources::inventory(&context).unwrap();
+        assert_eq!(rows.iter().find(|row|row["resource_id"]=="dsh").unwrap()["can_start"],false);
+        let error=maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},true,validate_settings).unwrap_err();
+        assert!(matches!(crate::component_recovery::classify(&error),crate::component_recovery::Event::FileBusy|crate::component_recovery::Event::Permission));
+        assert_eq!(fs::read(&handoff).ok(),before);assert!(directory.join("host.exe").is_file());
+        drop(held);assert_eq!(fs::read(&registration).unwrap(),bytes);
+    }
     #[test]fn failed_component_transaction_does_not_prevent_full_integrity_and_handoff(){
         let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
         let catalog=fixture.root.join("app/config/resources/catalog.json");

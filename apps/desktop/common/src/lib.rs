@@ -182,11 +182,13 @@ impl LaunchContext {
         let python = workspace::safe_path(&install, &selection.python)?;
         let models = Some(install.join(&selection.models));
         let webview2 = None; // 所有正式实例统一使用系统 Evergreen（自动更新网页引擎）。
-        let runtime = install.join(selection.dsh.as_ref().unwrap());
-        let node = if runtime.join("runtime.json").is_file() {
-            let metadata: serde_json::Value = read_json(&runtime.join("runtime.json"))?;
+        let runtime = workspace::safe_path(&install,selection.dsh.as_ref().unwrap())?;
+        let metadata_path = workspace::safe_path(&runtime,"runtime.json")?;
+        // node（宿主入口候选）不决定组件就绪；登记读取或解析异常由组件盘点与完整性维修报告。
+        // 路径安全检查仍须成功，不能因允许损坏登记而读取目录联接之外的文件。
+        let node = read_json::<serde_json::Value>(&metadata_path).ok().and_then(|metadata| {
             if metadata["source_kind"]=="npm_package" { dsh::target(&program).ok().and_then(|spec|dsh::discover(&spec,false).ok().map(|v|v.0)) } else {metadata["node"].as_str().or(metadata["executable"].as_str()).and_then(|relative| component(&runtime, relative).ok())}
-        } else { None };
+        });
         let identity: serde_json::Value = read_json(&install.join("portable.json"))?;
         let context = Self {
             channel: LaunchChannel::current(),

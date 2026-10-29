@@ -76,7 +76,6 @@ pydantic-core==2.27.2
 pygments==2.21.0
 pynndescent==0.6.0
 pypinyin==0.55.0
-pystray==0.19.5
 python-dotenv==1.2.3
 pywin32-ctypes==0.2.3
 pyyaml==6.0.3

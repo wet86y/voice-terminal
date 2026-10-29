@@ -40,6 +40,18 @@ const { TaskService } = await import(
   new URL('../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/wake-tasks/task-service.js', import.meta.url).href,
 )
 
+// blockStore（存储故障注入）：阻止原子换入，原文件与恢复操作均留在测试目录。
+function blockStore() {
+  renameSync(store, `${store}.backup`)
+  mkdirSync(store)
+  return () => { rmdirSync(store); renameSync(`${store}.backup`, store) }
+}
+async function withBlockedStore(work) {
+  const restore = blockStore()
+  try { await work() }
+  finally { restore() }
+}
+
 test('preserves project history, keeps native tasks separate, and delivers to the current voice mainline', async () => {
   const calls = []
   const originalFetch = globalThis.fetch
@@ -94,13 +106,11 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     await assert.rejects(service.removeArchive(daily.task_id), /先取消/u)
     assert.equal(service.list().find(row => row.task_id === daily.task_id).status, 'pending')
     const beforeFailure = readFileSync(store, 'utf8')
-    renameSync(store, `${store}.backup`)
-    mkdirSync(store) // 用目录模拟持久化失败；不能先报成功或丢失内存中的任务。
-    try {
+    await withBlockedStore(async () => {
       await assert.rejects(service.removeArchive('schedule-old'))
       assert.equal(service.list().find(row => row.task_id === 'schedule-old').status, 'archived')
       assert.equal(readFileSync(`${store}.backup`, 'utf8'), beforeFailure)
-    } finally { rmdirSync(store); renameSync(`${store}.backup`, store) }
+    })
     writeFileSync(legacy, JSON.stringify({ tasks: { 'legacy-cancelled': {
       text: '旧存储取消任务', scheduled_at: 1700000000, status: 'cancelled',
     } } }), 'utf8')
@@ -130,3 +140,195 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     rmdirSync(temporary)
   }
 })
+
+for (const operation of ['create', 'update', 'cancel']) {
+  test(`任务${operation}（创建／修改／取消）写盘失败时保留原任务及计时，后续保存不混入失败操作`, async () => {
+    mkdirSync(temporary, { recursive: true })
+    const originalFetch = globalThis.fetch
+    const calls = []
+    globalThis.fetch = async (_url, options) => {
+      calls.push(JSON.parse(options.body))
+      return { ok: true, json: async () => ({ result: 'accepted' }) }
+    }
+    let service
+    try {
+      service = new TaskService()
+      const original = await service.create({ when: '1s', text: '原任务正文' }, '冻结参考')
+      const before = structuredClone(service.list())
+      const stored = readFileSync(store, 'utf8')
+      await withBlockedStore(async () => {
+        await assert.rejects(operation === 'create'
+          ? service.create({ when: '1s', text: '失败创建的任务' })
+          : operation === 'update'
+            ? service.update(original.task_id, { text: '失败修改的正文', when: '30m' })
+            : service.cancel(original.task_id))
+        assert.deepEqual(service.list(), before)
+        assert.equal(readFileSync(`${store}.backup`, 'utf8'), stored)
+        assert.equal(service.reference(original.task_id).reference, '冻结参考')
+      })
+      const later = await service.create({ when: '30m', text: '后续正常保存' })
+      assert.deepEqual(JSON.parse(readFileSync(store, 'utf8')).tasks.filter(row => row.task_id !== later.task_id),
+        JSON.parse(stored).tasks)
+      await new Promise(resolve => setTimeout(resolve, 1300))
+      assert.deepEqual(calls.map(row => row.text), ['原任务正文'])
+      assert.equal(service.list().find(row => row.task_id === original.task_id).status, 'archived')
+      await service.close()
+      service = new TaskService()
+      assert.equal(service.list().length, 2)
+      assert.equal(service.list().find(row => row.task_id === original.task_id).status, 'archived')
+    } finally {
+      if (service) await service.close()
+      globalThis.fetch = originalFetch
+      unlinkSync(store)
+      rmdirSync(temporary)
+    }
+  })
+}
+
+test('投递成功但结算写盘失败时保留同次触发，重启重试沿用幂等标识', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-05T00:00:00Z') })
+  mkdirSync(temporary, { recursive: true })
+  const originalFetch = globalThis.fetch
+  const calls = []
+  let restore
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body)
+    calls.push(body)
+    if (calls.length === 1) restore = blockStore()
+    return { ok: true, json: async () => ({ result: calls.length === 1 ? 'accepted' : 'duplicate', message_id: body.occurrence_id }) }
+  }
+  let service
+  try {
+    service = new TaskService()
+    const original = await service.create({ when: '1s', text: '投递结算测试' })
+    const before = structuredClone(service.list())
+    t.mock.timers.tick(1000)
+    await service.chain
+    assert.equal(calls.length, 1)
+    assert.deepEqual(service.list(), before)
+    await assert.rejects(service.update(original.task_id, { text: '未结算前不能改写投递内容' }))
+    await assert.rejects(service.cancel(original.task_id))
+    assert.deepEqual(service.list(), before)
+    const stored = JSON.parse(readFileSync(`${store}.backup`, 'utf8')).tasks[0]
+    assert.equal(stored.delivery_pending, true)
+    assert.equal(stored.occurrence, 1)
+    assert.equal(stored.text, '投递结算测试')
+    await service.close()
+    restore(); restore = undefined
+    service = new TaskService()
+    t.mock.timers.tick(0)
+    await service.chain
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].occurrence_id, calls[1].occurrence_id)
+    const completed = service.list().find(row => row.task_id === original.task_id)
+    assert.equal(completed.status, 'archived')
+    assert.equal(completed.occurrence, 2)
+    assert.equal(completed.delivery_history.length, 1)
+    assert.equal(JSON.parse(readFileSync(store, 'utf8')).tasks[0].status, 'archived')
+    assert.equal('delivery_pending' in JSON.parse(readFileSync(store, 'utf8')).tasks[0], false)
+  } finally {
+    if (service) await service.close()
+    if (restore) restore()
+    globalThis.fetch = originalFetch
+    unlinkSync(store)
+    rmdirSync(temporary)
+  }
+})
+
+for (const repeated of [false, true]) {
+  test(`${repeated ? '重复' : '单次'}任务结算恢复后再接受用户变更，已确认投递不在进程内重发`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-05T00:00:00Z') })
+    mkdirSync(temporary, { recursive: true })
+    const originalFetch = globalThis.fetch
+    const calls = []
+    let restore
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body)
+      calls.push(body)
+      if (calls.length === 1) restore = blockStore()
+      return { ok: true, json: async () => ({ result: 'accepted', message_id: body.occurrence_id }) }
+    }
+    let service
+    try {
+      service = new TaskService()
+      const original = await service.create({ when: '1s', text: '原投递内容',
+        ...(repeated ? { repeat: '1m', loop: false, trigger_count: 2 } : {}) })
+      const before = structuredClone(service.list())
+      t.mock.timers.tick(1000)
+      await service.chain
+      assert.deepEqual(service.list(), before)
+      restore(); restore = undefined
+      await service.create({ when: '30m', text: '恢复写盘后的独立任务' })
+      let row = service.list().find(item => item.task_id === original.task_id)
+      assert.equal(calls.length, 1)
+      assert.equal(row.occurrence, 2)
+      assert.equal(row.status, repeated ? 'pending' : 'archived')
+      assert.equal(row.delivery_history.length, 1)
+      assert.equal(row.delivery_history[0].prompt, '原投递内容')
+      assert.equal(JSON.parse(readFileSync(store, 'utf8')).tasks[0].delivery_pending, undefined)
+      if (repeated) {
+        await service.update(original.task_id, { text: '下一次投递内容' })
+        t.mock.timers.tick(60_000)
+        await service.chain
+        row = service.list().find(item => item.task_id === original.task_id)
+        assert.equal(row.status, 'archived')
+        assert.deepEqual(row.delivery_history.map(item => item.prompt), ['原投递内容', '下一次投递内容'])
+        assert.deepEqual(calls.map(item => item.occurrence_id), [`${original.task_id}-1`, `${original.task_id}-2`])
+      }
+    } finally {
+      if (service) await service.close()
+      if (restore) restore()
+      globalThis.fetch = originalFetch
+      unlinkSync(store)
+      rmdirSync(temporary)
+    }
+  })
+}
+
+for (const cancel of [false, true]) {
+  test(`回执丢失后${cancel ? '取消会停止后续重试' : '重启仍固定原投递内容和标识'}，不把未投递的新正文写入历史`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-05T00:00:00Z') })
+    mkdirSync(temporary, { recursive: true })
+    const originalFetch = globalThis.fetch
+    const calls = []
+    const receiver = new Map() // receiver（持久接收方替身）：接受后即使回执丢失，也按原触发标识去重。
+    globalThis.fetch = async (_url, options) => {
+      const body = JSON.parse(options.body)
+      calls.push(body)
+      if (!receiver.has(body.occurrence_id)) {
+        receiver.set(body.occurrence_id, body)
+        throw new TypeError('接收成功后连接中断，客户端未收到回执')
+      }
+      return { ok: true, json: async () => ({ result: 'duplicate', message_id: body.occurrence_id }) }
+    }
+    let service
+    try {
+      service = new TaskService()
+      const original = await service.create({ when: '1s', text: '接收方实际收到的正文' })
+      t.mock.timers.tick(1000)
+      await service.chain
+      assert.equal(JSON.parse(readFileSync(store, 'utf8')).tasks[0].delivery_pending, true)
+      await assert.rejects(service.update(original.task_id, { text: '不能冒用旧标识的新正文' }), /投递结果尚未确认/u)
+      if (cancel) await service.cancel(original.task_id)
+      await service.close()
+      service = new TaskService()
+      if (!cancel) await assert.rejects(service.update(original.task_id, { text: '重启后也不能改写' }), /投递结果尚未确认/u)
+      t.mock.timers.tick(30_000)
+      await service.chain
+      const row = service.list().find(item => item.task_id === original.task_id)
+      assert.equal(row.status, cancel ? 'cancelled' : 'archived')
+      assert.equal(calls.length, cancel ? 1 : 2)
+      assert.equal(receiver.size, 1)
+      if (!cancel) {
+        assert.deepEqual(calls[0], calls[1])
+        assert.equal(row.delivery_history[0].prompt, calls[0].text)
+        assert.equal(row.delivery_history.length, 1)
+      }
+    } finally {
+      if (service) await service.close()
+      globalThis.fetch = originalFetch
+      unlinkSync(store)
+      rmdirSync(temporary)
+    }
+  })
+}
