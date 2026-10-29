@@ -18,6 +18,59 @@ from types import SimpleNamespace
 import zipfile
 
 
+@pytest.mark.parametrize('registration', [None, b'', b'{', b'\xff', b'[]', b'null', b'{"node":10}'])
+def test_environment_keeps_management_paths_when_dsh_registration_is_unusable(tmp_path, registration):
+    from voice_terminal.local_layout import default_portable
+
+    atomic_json(tmp_path / 'portable.json', default_portable())
+    metadata = tmp_path / 'runtimes/dsh/runtime.json'
+    if registration is not None:
+        metadata.parent.mkdir(parents=True)
+        metadata.write_bytes(registration)
+    paths = AppPaths(tmp_path / 'app', tmp_path, tmp_path / 'data')
+    environment = paths.environment()
+    assert 'VOICE_NODE_EXECUTABLE' not in environment
+    assert environment['VOICE_DSH_RUNTIME'] == str(tmp_path / 'runtimes/dsh')
+    assert environment['VOICE_DATA_DIR'] == str(tmp_path / 'data')
+    if registration is not None:
+        assert metadata.read_bytes() == registration
+    else:
+        assert not metadata.exists()
+
+
+@pytest.mark.parametrize('registration', [None, b'', b'{', b'\xff', b'[]', b'null', b'{"node":10}'])
+def test_local_context_can_reach_native_management_with_unusable_dsh_registration(tmp_path, registration):
+    import shutil
+    from voice_terminal.local_layout import default_portable
+
+    powershell = shutil.which('powershell.exe')
+    if not powershell:
+        pytest.skip('此开发入口回归需要 Windows PowerShell（命令环境）。')
+    atomic_json(tmp_path / 'portable.json', default_portable())
+    metadata = tmp_path / 'runtimes/dsh/runtime.json'
+    if registration is not None:
+        metadata.parent.mkdir(parents=True)
+        metadata.write_bytes(registration)
+    script = Path(__file__).resolve().parents[1] / 'scripts/local-context.ps1'
+    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+    command = ("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
+               f". {quote(script)}; Get-LocalContext -Root {quote(tmp_path)} | ConvertTo-Json -Compress")
+    result = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-Command', command],
+                            capture_output=True, text=True, encoding='utf-8', timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['Dsh'] == str(tmp_path / 'runtimes/dsh')
+
+
+def test_environment_does_not_accept_an_escaping_dsh_executable(tmp_path):
+    from voice_terminal.local_layout import default_portable
+
+    atomic_json(tmp_path / 'portable.json', default_portable())
+    atomic_json(tmp_path / 'runtimes/dsh/runtime.json', {'node': '../outside.exe'})
+    paths = AppPaths(tmp_path / 'app', tmp_path, tmp_path / 'data')
+    with pytest.raises(ValueError, match='不安全'):
+        paths.environment()
+
+
 def test_paths_independent_of_working_directory(tmp_path, monkeypatch):
     program = tmp_path / "中文 程序"
     (program / "config/persona").mkdir(parents=True)

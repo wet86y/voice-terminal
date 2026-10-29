@@ -9,7 +9,7 @@ import stat
 
 from .paths import atomic_json
 
-PERSISTENT = ("config", "persona", "speaker", "history", "dsh", "workspace", "imports", "state", ".env.local")
+PERSISTENT = ("config", "persona", "speaker", "history", "tts", "dsh", "workspace", "imports", "state", ".env.local")
 EXCLUDED = {"node_modules", "cache", "logs", "__pycache__", ".git", ".pnpm-store"}
 
 

@@ -201,6 +201,37 @@ def test_backup_restores_important_data_without_dependencies_or_cache(tmp_path):
     assert not (root / 'tmp/user-backup.old').exists()
 
 
+def test_backup_restores_both_local_voice_libraries(tmp_path):
+    from tests.test_tts_voices import _create_voice
+    from voice_terminal.local_files import backup_user_data
+    from voice_terminal.tts.voices import ModelVoiceLibraries
+    import shutil
+
+    root = tmp_path / '音色备份'
+    libraries = ModelVoiceLibraries(root / 'data/tts')
+    expected = {}
+    for model in ('voxcpm1', 'voxcpm2'):
+        library = libraries.for_model(model)
+        asset, voice = _create_voice(library, text=f'{model}的参考转写。')
+        selection = {'voice_id': voice['id'], 'revision': voice['revision']}
+        library.activate(selection)
+        expected[model] = (selection, library.asset_bytes(asset['asset_id']))
+
+    for _ in range(2):
+        backup = backup_user_data(root)
+        paths = {row['path'] for row in backup['files']}
+        assert all(f'tts/{model}/voices/index.json' in paths for model in expected)
+        restored = tmp_path / '恢复工作区'
+        shutil.copytree(root / 'backups/user-data', restored, dirs_exist_ok=True)
+        recovered = ModelVoiceLibraries(restored / 'tts')
+        for model, (selection, audio) in expected.items():
+            library = recovered.for_model(model)
+            assert library.active_selection == selection
+            snapshot = library.resolve(model, selection)
+            assert snapshot.reference_text == f'{model}的参考转写。'
+            assert snapshot.reference_path.read_bytes() == audio
+
+
 def test_native_cache_records_lock_changes_without_deleting_channel_outputs(tmp_path, monkeypatch):
     module = script('prepare-build-cache')
     monkeypatch.setattr(module, 'ROOT', tmp_path)

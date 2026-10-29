@@ -21,9 +21,13 @@ function Get-LocalContext {
   foreach ($Key in $Fixed.Keys) { if ($Selection.$Key -ne $Fixed[$Key]) { throw "固定路径字段不符：$Key（组件位置）" } }
   $Runtime = Join-Path $Root $Selection.dsh
   $Node = ''
+  $Metadata = $null # Metadata（可选宿主登记）：损坏时仍允许启动原生组件管理与维修。
   $MetadataPath = Join-Path $Runtime 'runtime.json'
   if (Test-Path -LiteralPath $MetadataPath -PathType Leaf) {
-    $Metadata = Get-Content -LiteralPath $MetadataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    try { $Metadata = Get-Content -LiteralPath $MetadataPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { Write-Verbose '宿主登记暂不可读，具体问题交由正式程序组件检查。' }
+  }
+  if ($Metadata) {
     # node（Node.js 解释器字段）仅属于源码闭包；官方 Electron（桌面框架）运行包只有 executable（应用入口）。
     if ($Metadata.node -is [string] -and $Metadata.node) {
       $NodeCandidate = [IO.Path]::GetFullPath((Join-Path $Runtime $Metadata.node))

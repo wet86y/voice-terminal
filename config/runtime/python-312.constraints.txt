@@ -78,7 +78,6 @@ pydantic_core==2.27.2
 Pygments==2.21.0
 pynndescent==0.6.0
 pypinyin==0.55.0
-pystray==0.19.5
 pytest-asyncio==0.24.0
 pytest==8.3.4
 python-dotenv==1.2.3

@@ -34,6 +34,8 @@ type Row = {
   /** trigger_count（总触发次数）：包含第一次成功触发。 */
   trigger_count?: number
   occurrence: number; retry_at?: number; history: Record<string, unknown>[];
+  /** delivery_pending（投递结果待确认）：发送前持久化，重试与重启期间固定当前触发内容。 */
+  delivery_pending?: boolean
 }
 
 type RecurrenceSettings = Pick<Row, 'loop' | 'trigger_count'>
@@ -96,6 +98,7 @@ function decodeRow(value: unknown): Row {
       || typeof raw.created_at !== 'string' || typeof raw.updated_at !== 'string'
       || (raw.last_triggered_at !== null && typeof raw.last_triggered_at !== 'string')
       || typeof raw.occurrence !== 'number' || !Number.isSafeInteger(raw.occurrence) || raw.occurrence < 1
+      || (raw.delivery_pending !== undefined && typeof raw.delivery_pending !== 'boolean')
       || !Array.isArray(raw.history)
       || (raw.status !== 'pending' && raw.status !== 'archived' && raw.status !== 'cancelled')) {
     throw new Error('DSH 任务存储行格式无效。')
@@ -176,6 +179,8 @@ export class TaskService {
   private chain: Promise<unknown> = Promise.resolve()
   private closed = false
   private readonly deliveryController = new AbortController()
+  private retryAt = new Map<string, number>() // retryAt（瞬时重试截止）：不改写已提交的任务快照。
+  private settlements = new Map<string, Row>() // settlements（已获投递回执的待保存结算）：写盘前冻结正文和触发序号。
 
   constructor() {
     if (!STORE_PATH) throw new Error('DSH 任务存储路径缺失。')
@@ -191,7 +196,7 @@ export class TaskService {
       }
     }
     const migrated = this.importLegacy()
-    if (migrated) this.save()
+    if (migrated) this.commitState(this.rows)
     this.arm()
   }
 
@@ -227,22 +232,46 @@ export class TaskService {
     return changed
   }
 
-  private save(): void {
+  /** commitState（提交候选状态）：磁盘原子换入成功后才替换生效状态。 */
+  private commitState(rows: Map<string, Row>, deletedIds = this.deletedIds): void {
     mkdirSync(dirname(STORE_PATH), { recursive: true })
     const temporary = `${STORE_PATH}.${randomUUID()}.tmp`
     try {
-      writeFileSync(temporary, JSON.stringify({ schema_version: 1, tasks: [...this.rows.values()], deleted_task_ids: [...this.deletedIds] }, null, 2), 'utf8')
+      writeFileSync(temporary, JSON.stringify({ schema_version: 1, tasks: [...rows.values()], deleted_task_ids: [...deletedIds] }, null, 2), 'utf8')
       renameSync(temporary, STORE_PATH)
     } catch (error) {
       try { unlinkSync(temporary) } catch { /* temporary（临时存储）可能尚未创建。 */ }
       throw error
     }
+    for (const id of this.retryAt.keys()) {
+      if (rows.get(id) !== this.rows.get(id)) this.retryAt.delete(id)
+    }
+    this.rows = rows
+    this.deletedIds = deletedIds
+  }
+
+  /** flushSettlements（补交已确认回执）：失败时保留原任务和待保存结算。 */
+  private flushSettlements(): void {
+    if (!this.settlements.size) return
+    const rows = new Map(this.rows)
+    for (const [id, row] of this.settlements) rows.set(id, row)
+    this.commitState(rows)
+    this.settlements.clear()
   }
 
   private serialized<T>(work: () => Promise<T> | T): Promise<T> {
     const next = this.chain.then(work, work)
     this.chain = next.catch(() => undefined)
     return next
+  }
+
+  /** change（串行用户变更）：先保存已接受的投递，避免新正文复用旧触发的回执。 */
+  private change<T>(work: () => T): Promise<T> {
+    return this.serialized(() => {
+      this.flushSettlements()
+      try { return work() }
+      finally { this.arm() }
+    })
   }
 
   view(row: Row) {
@@ -269,7 +298,7 @@ export class TaskService {
   }
 
   create(args: TaskInput, reference = '') {
-    return this.serialized(() => {
+    return this.change(() => {
       const id = `schedule-${randomUUID()}`
       const now = Date.now()
       const text = String(args.text ?? args.prompt ?? '').trim()
@@ -288,16 +317,17 @@ export class TaskService {
         creation_source: args.creation_source === 'manual' ? 'manual' : 'agent',
         reference, record: finalRecord, status: 'pending', created_at: stamp, updated_at: stamp,
         last_triggered_at: null, occurrence: 1, history: [], ...recurrence }
-      this.rows.set(id, row)
-      this.save(); this.arm()
+      this.commitState(new Map(this.rows).set(id, row))
       return this.view(row)
     })
   }
 
   update(id: string, args: TaskInput) {
-    return this.serialized(() => {
-      const row = this.rows.get(id)
-      if (!row || row.status !== 'pending') throw new Error('待执行任务不存在。')
+    return this.change(() => {
+      const current = this.rows.get(id)
+      if (!current || current.status !== 'pending') throw new Error('待执行任务不存在。')
+      if (current.delivery_pending) throw new Error('本次投递结果尚未确认，暂不能修改任务；可等待确认，或取消后新建任务。')
+      const row = { ...current }
       const now = Date.now()
       const text = String(args.text ?? args.prompt ?? row.text).trim()
       const title = String(args.title ?? row.record.title).trim()
@@ -328,38 +358,38 @@ export class TaskService {
       }
       row.updated_at = new Date(now).toISOString()
       delete row.retry_at
-      this.save(); this.arm()
+      this.commitState(new Map(this.rows).set(id, row))
       return this.view(row)
     })
   }
 
   cancel(id: string) {
-    return this.serialized(() => {
+    return this.change(() => {
       const row = this.rows.get(id)
       if (!row) throw new Error('任务不存在。')
-      row.status = 'cancelled'; row.updated_at = new Date().toISOString()
-      this.save(); this.arm()
-      return this.view(row)
+      const updated: Row = { ...row, status: 'cancelled', updated_at: new Date().toISOString() }
+      delete updated.delivery_pending
+      this.commitState(new Map(this.rows).set(id, updated))
+      return this.view(updated)
     })
   }
 
   removeArchive(id: string): Promise<{ task_id: string; deleted: true }> {
-    return this.serialized(() => {
+    return this.change(() => {
       const row = this.rows.get(id)
       if (row?.status === 'pending') throw new Error('待执行任务请先取消，再删除归档记录。')
       if (!row && this.deletedIds.has(id)) return { task_id: id, deleted: true }
       if (!row) throw new Error('任务不存在。')
-      this.rows.delete(id)
-      this.deletedIds.add(id)
-      try { this.save() }
-      catch (error) {
-        this.rows.set(id, row)
-        this.deletedIds.delete(id)
-        throw error
-      }
-      this.arm()
+      const rows = new Map(this.rows)
+      rows.delete(id)
+      this.commitState(rows, new Set(this.deletedIds).add(id))
       return { task_id: id, deleted: true }
     })
+  }
+
+  /** deadline（允许触发时刻）：同时遵守历史重试登记和当前进程的退避。 */
+  private deadline(row: Row): number {
+    return Math.max(Date.parse(row.record.scheduledAt), row.retry_at ?? 0, this.retryAt.get(row.task_id) ?? 0)
   }
 
   private arm(): void {
@@ -367,7 +397,7 @@ export class TaskService {
     if (this.closed) return
     const now = Date.now()
     const due = [...this.rows.values()].filter(row => row.status === 'pending')
-      .map(row => Math.max(Date.parse(row.record.scheduledAt), row.retry_at ?? 0))
+      .map(row => this.deadline(row))
       .reduce((minimum, value) => Math.min(minimum, value), Infinity)
     if (Number.isFinite(due)) this.timer = setTimeout(() => void this.drive(), Math.min(Math.max(0, due - now), 30_000))
   }
@@ -376,33 +406,39 @@ export class TaskService {
     await this.serialized(async () => {
       if (this.closed) return
       const now = Date.now()
-      for (const row of this.rows.values()) {
+      for (let row of [...this.rows.values()]) {
         if (this.closed) break
-        if (row.status !== 'pending' || Math.max(Date.parse(row.record.scheduledAt), row.retry_at ?? 0) > now) continue
+        if (this.rows.get(row.task_id) !== row || row.status !== 'pending' || this.deadline(row) > now) continue
         const occurrenceId = `${row.task_id}-${row.occurrence}`
         try {
-          const receipt = await voiceApi('/api/internal/dsh-bridge/mainline.deliver', 'POST', {
-            task_id: row.task_id, occurrence_id: occurrenceId, text: row.text, target: row.target,
-          }, this.deliveryController.signal)
-          const deliveredAt = new Date().toISOString()
-          row.last_triggered_at = deliveredAt
-          row.history.push({ scheduledAt: row.record.scheduledAt, deliveredAt,
-            messageId: receipt.message_id ?? occurrenceId, dshSessionId: receipt.dsh_session_id, prompt: row.text })
-          row.history = row.history.slice(-200)
-          row.occurrence += 1
-          delete row.retry_at
-          if (row.record.kind === 'every' && row.loop === false
-              && row.trigger_count !== undefined && row.occurrence > row.trigger_count) {
-            row.status = 'archived'
-          } else if (isRecurringScheduleRecord(row.record)) {
-            const next = resolveRecurringOccurrence(row.record, Date.now()).nextScheduledAt
-            row.status = next ? 'pending' : 'archived'
-            if (next) row.record = decodeScheduleRecord({ ...row.record, scheduledAt: next })
-          } else row.status = 'archived'
-          row.updated_at = deliveredAt
-          this.save()
+          if (!row.delivery_pending) {
+            row = { ...row, delivery_pending: true }
+            this.commitState(new Map(this.rows).set(row.task_id, row))
+          }
+          if (!this.settlements.has(row.task_id)) {
+            const receipt = await voiceApi('/api/internal/dsh-bridge/mainline.deliver', 'POST', {
+              task_id: row.task_id, occurrence_id: occurrenceId, text: row.text, target: row.target,
+            }, this.deliveryController.signal)
+            const deliveredAt = new Date().toISOString()
+            const updated: Row = { ...row, last_triggered_at: deliveredAt, updated_at: deliveredAt,
+              history: [...row.history, { scheduledAt: row.record.scheduledAt, deliveredAt,
+                messageId: receipt.message_id ?? occurrenceId, dshSessionId: receipt.dsh_session_id, prompt: row.text }].slice(-200),
+              occurrence: row.occurrence + 1 }
+            delete updated.retry_at
+            delete updated.delivery_pending
+            if (updated.record.kind === 'every' && updated.loop === false
+                && updated.trigger_count !== undefined && updated.occurrence > updated.trigger_count) {
+              updated.status = 'archived'
+            } else if (isRecurringScheduleRecord(updated.record)) {
+              const next = resolveRecurringOccurrence(updated.record, Date.now()).nextScheduledAt
+              updated.status = next ? 'pending' : 'archived'
+              if (next) updated.record = decodeScheduleRecord({ ...updated.record, scheduledAt: next })
+            } else updated.status = 'archived'
+            this.settlements.set(row.task_id, updated)
+          }
+          this.flushSettlements()
         } catch (error) {
-          row.retry_at = Date.now() + RETRY_MS
+          this.retryAt.set(row.task_id, Date.now() + RETRY_MS)
           console.warn('[voice-terminal-wake-tasks] delivery retry', row.task_id, String(error))
         }
       }
