@@ -1264,11 +1264,15 @@ fn validate_dsh_activation_state(row:&Value,target_version:&str)->Result<(),Stri
 }
 fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
     check_cancel(cancel)?;
-    let metadata=load(&safe_path(source,"runtime.json")?)?;let digest=file_hash(&safe_path(source,"manifest.json")?)?;let item=spec(context,"dsh")?;
+    let metadata=load(&safe_path(source,"runtime.json")?)?;
+    // 清单绑定与构建身份使用同一份字节，避免重复读取大清单及两次读取间的内容不一致。
+    let manifest_bytes=fs::read(safe_path(source,"manifest.json")?).map_err(|e|e.to_string())?;
+    let digest=format!("{:x}",Sha256::digest(&manifest_bytes));let item=spec(context,"dsh")?;
     if metadata["source_kind"]=="npm_package" {
         crate::dsh::inspect(&context.installed_program(),source)?;
         if source==context.install.join("runtimes/dsh"){
-            let release=load(&context.installed_program().join("release.json"))?;let manifest=load(&source.join("manifest.json"))?;
+            let release=load(&context.installed_program().join("release.json"))?;
+            let manifest:Value=serde_json::from_slice(manifest_bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&manifest_bytes)).map_err(|e|e.to_string())?;
             if !release["components"].as_array().is_some_and(|rows|rows.iter().any(|row|row["kind"]=="dsh"&&row["path"]=="runtimes/dsh"&&row["build"]==manifest["build"]&&row["manifest_sha256"]==digest)){
                 return Err("DSH（代理宿主）安装清单绑定不一致，请修复组件。".into());
             }
@@ -1750,6 +1754,33 @@ mod download_tests {
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
+    #[test]
+    fn dsh_manifest_binding_keeps_exact_bytes_and_accepts_bom(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-dsh-manifest-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        atomic_json(&root.join("app/config/default.yaml"),&json!({})).unwrap();
+        fs::create_dir_all(root.join("app/scripts")).unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        atomic_json(&root.join("app/config/dsh/runtime.lock.json"),&serde_json::from_str::<Value>(include_str!("../../../../config/dsh/runtime.lock.json")).unwrap()).unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{"resource_id":"dsh","kind":"dsh","origin":"npm_package","destination":"runtimes/dsh"}]})).unwrap();
+        let installed=root.join("runtimes/dsh");
+        atomic_json(&installed.join("runtime.json"),&json!({"schema":3,"source_kind":"npm_package","adapter":"npm_cli_v1","version":"old","package_name":"fixture-dsh","modules":"node_modules","package_manager":"pnpm@9.0.0",
+            "entry":"entry.js","cli_entry":"entry.js","schedule":"entry.js","pnpm_entry":"entry.js","required_files":[]})).unwrap();
+        atomic_json(&installed.join("package.json"),&json!({})).unwrap();fs::write(installed.join("entry.js"),b"fixture").unwrap();
+        atomic_json(&installed.join("node_modules/fixture-dsh/package.json"),&json!({"name":"fixture-dsh","version":"old"})).unwrap();
+        atomic_json(&installed.join("node_modules/pnpm/package.json"),&json!({"name":"pnpm","version":"9.0.0"})).unwrap();
+        let path=installed.join("manifest.json");fs::write(&path,b"\xef\xbb\xbf{\"build\":\"bound\",\"files\":[]}").unwrap();
+        let mut release=json!({"components":[{"kind":"dsh","path":"runtimes/dsh","build":"bound","manifest_sha256":file_hash(&path).unwrap()}]});
+        atomic_json(&root.join("app/release.json"),&release).unwrap();let context=LaunchContext::portable(&root).unwrap();
+        assert!(inspect_dsh_installed(&context,&installed,false).is_ok());
+        fs::write(&path,b"{\"build\":\"bound\", \"files\":[]}").unwrap();
+        assert!(inspect_dsh_installed(&context,&installed,false).unwrap_err().contains("绑定不一致"));
+        release["components"][0]["manifest_sha256"]=json!(file_hash(&path).unwrap());release["components"][0]["build"]=json!("other");
+        atomic_json(&root.join("app/release.json"),&release).unwrap();
+        assert!(inspect_dsh_installed(&context,&installed,false).unwrap_err().contains("绑定不一致"));
+        fs::write(&path,b"invalid json").unwrap();release["components"][0]["manifest_sha256"]=json!(file_hash(&path).unwrap());
+        atomic_json(&root.join("app/release.json"),&release).unwrap();assert!(inspect_dsh_installed(&context,&installed,false).is_err());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
     #[test]
     fn dsh_reuse_is_lightweight_and_explicit_integrity_detects_corruption() {
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();

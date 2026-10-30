@@ -179,7 +179,8 @@ pub fn retain_local_installer(root:&Path,source:&Path,version:&str,build:&str)->
         })();
         if let Err(error)=copy_result{let _=fs::remove_file(&temporary);return Err(error);}
     }
-    if fs::metadata(&destination).map_err(|error|error.to_string())?.len()!=size||crate::workspace::file_hash(&destination)?!=sha256{
+    // 同目录原子改名沿用临时文件已完成的内容核验；原位保留时源文件也已核验。
+    if fs::metadata(&destination).map_err(|error|error.to_string())?.len()!=size{
         return Err("已保存的当前校验分发器摘要不匹配。".into());
     }
     let manifest=AppUpdateManifest{
@@ -208,7 +209,7 @@ pub fn retain_local_delivery(root:&Path,source:&Path,package:&Path)->Result<(),S
     let version=crate::installation::package_version(&bytes)?;let build=crate::installation::package_build(&bytes)?;
     if delivery["role"]!="installer"||delivery["version"]!=version||delivery["build"]!=build||release["build"]!=build
         ||source.file_name().and_then(|name|name.to_str())!=delivery["entry"].as_str()
-        ||delivery["program_package_sha256"]!=crate::workspace::file_hash(package)?
+        ||delivery["program_package_sha256"]!={use sha2::{Digest,Sha256};format!("{:x}",Sha256::digest(&bytes))}
         ||Some(fs::metadata(source).map_err(|e|e.to_string())?.len())!=delivery["size"].as_u64()
         ||delivery["sha256"]!=crate::workspace::file_hash(source)?{return Err("本机校验程序与现用本体或同包交付摘要不一致。".into());}
     retain_local_installer(root,source,&version,&build)
@@ -256,6 +257,25 @@ mod tests {
         let mut value = manifest(); value.asset = "other.exe".into(); assert!(value.validate().is_err());
         let mut value = manifest(); value.sha256 = "not-a-digest".into(); assert!(value.validate().is_err());
         let mut value = manifest(); value.fields.insert("size".into(), "asset bytes".into()); assert!(value.validate().is_err());
+    }
+    #[test]
+    fn retained_installer_copy_and_in_place_refresh_keep_verified_identity(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("retained-installer-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let source=root.join("source.exe");fs::write(&source,vec![0x41;1024*1024]).unwrap();
+        retain_local_installer(&root,&source,"0.10.0","fixture-build").unwrap();
+        let target=installer_path(&root).unwrap();let record=retained(&root,"0.10.0","fixture-build").unwrap();
+        assert_eq!(record.manifest.sha256,crate::workspace::file_hash(&target).unwrap());
+        assert_eq!(fs::read(&target).unwrap(),fs::read(&source).unwrap());
+        fs::write(&target,vec![0x42;1024*1024]).unwrap();
+        retain_local_installer(&root,&target,"0.10.0","fixture-build").unwrap();
+        let updated=retained(&root,"0.10.0","fixture-build").unwrap();
+        assert_ne!(updated.manifest.sha256,record.manifest.sha256);
+        assert_eq!(updated.manifest.sha256,crate::workspace::file_hash(&target).unwrap());
+        fs::write(&source,b"invalid small installer").unwrap();
+        assert!(retain_local_installer(&root,&source,"0.10.0","fixture-build").is_err());
+        assert_eq!(crate::workspace::file_hash(&target).unwrap(),updated.manifest.sha256);
+        crate::workspace::remove_owned(&root,&owner).unwrap();
     }
     #[test]
     fn integrity_uses_exact_release_and_requires_the_same_build(){

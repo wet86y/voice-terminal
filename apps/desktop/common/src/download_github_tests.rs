@@ -233,13 +233,16 @@ fn upstream_nodes_choose_current_faster_origin_or_mirror_and_cache_verified_succ
 #[test]
 fn upstream_nodes_fall_back_after_bad_digest_without_publishing_or_caching_bad_source(){
     let mirror=Fixture::sized(Behavior::Ranges,99,GITHUB_PARALLEL_THRESHOLD as usize);let direct=Fixture::new(Behavior::Ranges);
-    let file=direct.file();let target=temporary_target("节点摘要回退");fs::write(&target,b"previous cache").unwrap();
-    let policy=route_policy(&file,&mirror,&direct,false);let mut phases=vec![];
-    download_github_with_policy(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{
-        if phase.contains("尝试下一来源"){assert_eq!(fs::read(&target).unwrap(),b"previous cache");}
+    let file=direct.file();let target=temporary_target("节点摘要回退");let previous=vec![0x41;file.size as usize];fs::write(&target,&previous).unwrap();
+    let policy=route_policy(&file,&mirror,&direct,false);let mut phases=vec![];let mut cache_checks=0;
+    download_github_with_policy(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,done,_|{
+        if phase=="校验现有下载缓存"&&done==0{cache_checks+=1;}
+        assert!(!phase.starts_with("校验现有下载缓存 · 来源："),"同一坏缓存不能在来源回退中反复核验");
+        if phase.contains("尝试下一来源"){assert_eq!(fs::read(&target).unwrap(),previous);}
         phases.push(phase.to_owned());
     },&policy.to_string()).unwrap();
     let sources=phases.iter().filter(|phase|phase.starts_with("下载来源：")).collect::<Vec<_>>();
+    assert_eq!(cache_checks,2); // 开始进度与摘要读取起点各报告一次，仅有一轮旧缓存核验。
     assert!(sources[0].contains("mirror-test"));assert!(sources[1].contains("原站"));
     assert_eq!(crate::workspace::file_hash(&target).unwrap(),file.sha256);
     let cache:serde_json::Value=serde_json::from_slice(&fs::read(node_cache_path(&policy)).unwrap()).unwrap();assert_eq!(cache["lastSuccess"],"github-direct");

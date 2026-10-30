@@ -54,6 +54,81 @@ def test_inputs_changed_during_build_are_not_registered(tmp_path, state):
     assert not state.run(tmp_path, 'check', 'product')
 
 
+def test_inventory_hashes_overlapping_inputs_once(tmp_path, monkeypatch):
+    module = load_script('desktop-build-state')
+    folder = tmp_path / 'source'; folder.mkdir()
+    nested = folder / 'nested'; nested.mkdir()
+    (folder / 'one').write_bytes(b'one'); (nested / 'two').write_bytes(b'two')
+    expected = module.inventory(tmp_path, ['source'])
+    calls = []
+    original = module.digest
+    def counted(path):
+        calls.append(path.relative_to(tmp_path).as_posix())
+        return original(path)
+    monkeypatch.setattr(module, 'digest', counted)
+    assert module.inventory(tmp_path, ['source', 'source/nested', 'source/one', 'source']) == expected
+    assert sorted(calls) == ['source/nested/two', 'source/one']
+
+
+def test_package_check_reads_archive_once_and_still_rejects_same_size_corruption(tmp_path, state, monkeypatch):
+    directory = tmp_path / '.local/build/program-package'; directory.mkdir(parents=True)
+    archive = directory / 'program.zip'; archive.write_bytes(b'package')
+    info = directory / 'package-info.json'
+    info.write_text(json.dumps({'size': 7, 'sha256': state.digest(archive), 'build': 'fixture'}))
+    (tmp_path / 'source').write_text('source')
+    monkeypatch.setattr(state, 'paths_for', lambda *_: (['source'], [
+        '.local/build/program-package/program.zip', '.local/build/program-package/package-info.json']))
+    state.run(tmp_path, 'begin', 'package'); state.run(tmp_path, 'record', 'package')
+    calls = []
+    original = state.digest
+    def counted(path):
+        if path == archive: calls.append(path)
+        return original(path)
+    monkeypatch.setattr(state, 'digest', counted)
+    assert state.run(tmp_path, 'check', 'package', build='fixture')
+    assert len(calls) == 1
+    timestamp = archive.stat().st_mtime_ns
+    archive.write_bytes(b'corrupt'); os.utime(archive, ns=(timestamp, timestamp))
+    assert not state.run(tmp_path, 'check', 'package')
+    with pytest.raises(ValueError, match='大小或摘要不符'):
+        state.verify_package(tmp_path)
+    archive.write_bytes(b'package')
+    info.write_text(json.dumps({'size': 8, 'sha256': original(archive), 'build': 'fixture'}))
+    # 错误元数据即使被登记进产物快照，也不能代替包自身的大小约束。
+    state.run(tmp_path, 'begin', 'package'); state.run(tmp_path, 'record', 'package')
+    assert not state.run(tmp_path, 'check', 'package')
+    calls.clear()
+    with pytest.raises(ValueError, match='大小或摘要不符'):
+        state.verify_package(tmp_path)
+    assert not calls
+
+
+def test_installer_reuses_only_the_current_input_archive_digest(tmp_path, monkeypatch):
+    module = load_script('desktop-build-state')
+    archive = tmp_path / '.local/build/program-package/program.zip'; archive.parent.mkdir(parents=True)
+    archive.write_bytes(b'package')
+    monkeypatch.setattr(module.subprocess, 'check_output', lambda *_, **__: 'fixture compiler')
+    monkeypatch.setenv('VOICE_PROGRAM_PACKAGE', str(archive))
+    calls = []
+    original = module.digest
+    def counted(path):
+        calls.append(path)
+        return original(path)
+    monkeypatch.setattr(module, 'digest', counted)
+    inputs, _, _ = module.inputs_for(tmp_path, 'installer', 'release', 'installer', False, '')
+    assert calls.count(archive) == 1
+    assert json.loads(inputs['<tools>'])['embedded_package'] == original(archive)
+    external = tmp_path.parent / (tmp_path.name + '-external.zip')
+    try:
+        external.write_bytes(b'external package')
+        monkeypatch.setenv('VOICE_PROGRAM_PACKAGE', str(external)); calls.clear()
+        inputs, _, _ = module.inputs_for(tmp_path, 'installer', 'release', 'installer', False, '')
+        assert calls.count(archive) == calls.count(external) == 1
+        assert json.loads(inputs['<tools>'])['embedded_package'] == original(external)
+    finally:
+        external.unlink(missing_ok=True)
+
+
 def test_archive_reuses_identical_bytes_across_timestamp_changes(tmp_path):
     module = load_script('assemble-program-package')
     stage = tmp_path / 'payload'; stage.mkdir()
@@ -128,7 +203,7 @@ def pipeline_root(tmp_path):
         """), encoding='utf-8')
     common = scripts / 'desktop-pipeline.ps1'
     with common.open('a', encoding='utf-8') as file:
-        file.write("\nfunction Invoke-DesktopInstallProcess {param($Executable,$Arguments);Add-Content (Join-Path (Get-ProjectRoot) '.local/counts.txt') 'install'}\n")
+        file.write("\nfunction Invoke-DesktopInstallProcess {param($Executable,$Arguments);$kind=if($Arguments[0] -eq '--retain-installer'){'retain'}elseif($Arguments[0] -eq '--install-package'){'install'}else{throw '未知维护操作'};Add-Content (Join-Path (Get-ProjectRoot) '.local/counts.txt') $kind}\n")
     # 停机检查仍执行真实脚本入口，但夹具没有用户进程或数据。
     voice = root / 'voice_terminal'; voice.mkdir()
     (voice / '__init__.py').write_text('')
@@ -142,12 +217,15 @@ def test_combined_delivery_assembles_once_and_skip_build_never_repackages(pipeli
     assert first.returncode == 0, first.stdout + first.stderr
     counts = (root / '.local/counts.txt').read_text('utf-8-sig').splitlines()
     assert counts.count('plugin') == counts.count('package') == counts.count('installer') == counts.count('install') == 1
+    assert counts.count('retain') == 1
     package = root / '.local/build/program-package/program.zip'
     content, timestamp = package.read_bytes(), package.stat().st_mtime_ns
     second = ps(root, "& ./scripts/publish-desktop.ps1 -SkipBuild")
     assert second.returncode == 0, second.stdout + second.stderr
     assert package.read_bytes() == content and package.stat().st_mtime_ns == timestamp
-    assert (root / '.local/counts.txt').read_text('utf-8-sig').splitlines().count('package') == 1
+    counts = (root / '.local/counts.txt').read_text('utf-8-sig').splitlines()
+    assert counts.count('package') == 1
+    assert counts.count('install') == counts.count('retain') == 2
     (root / 'voice_terminal/distribution.py').write_text('def require_stopped(*args): pass\n# changed input\n')
     rejected = ps(root, "& ./scripts/publish-desktop.ps1 -SkipBuild")
     assert rejected.returncode != 0

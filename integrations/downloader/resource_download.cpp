@@ -64,9 +64,10 @@ static void promote_download(const std::filesystem::path& part, const std::files
     }
 }
 
-extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t size,
+// download_resource（传输实现）：check_cache（旧缓存核验开关）不影响新下载文件的摘要验证。
+static int download_resource(const char* url, const wchar_t* target, std::uint64_t size,
     const char* expected, int sha512, int accelerate, std::uint64_t probe_limit, Progress progress, void* context, CancelCheck cancel_check, const void* cancel_context,
-    char* error, std::size_t error_size) noexcept {
+    char* error, std::size_t error_size, bool check_cache) noexcept {
     try {
         using namespace desktop_update_kit;
         auto cancelled = [&](std::uint64_t current, int phase = 1, const char* detail = nullptr) {
@@ -101,7 +102,7 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         if (!size || !expected || !*expected) throw std::runtime_error("资源缺少可信大小或摘要");
         std::filesystem::path output(target), part(output.wstring() + L".part"), checkpoint(output.wstring() + L".part.identity");
         std::filesystem::create_directories(output.parent_path());
-        if (std::filesystem::exists(output) && std::filesystem::file_size(output) == size && hash_file(output, sha512 != 0, [&](auto done) { cancelled(done, 4); }) == expected) {
+        if (check_cache && std::filesystem::exists(output) && std::filesystem::file_size(output) == size && hash_file(output, sha512 != 0, [&](auto done) { cancelled(done, 4); }) == expected) {
             cancelled(size, 8); cancelled(size, 3); return 0;
         }
         const std::string identity = std::to_string(size) + ":" + (sha512 ? "sha512:" : "sha256:") + expected;
@@ -198,7 +199,21 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
     }
 }
 
-// vt_fetch_manifest（读取应用更新清单）：固定 HTTPS（加密传输）地址、响应大小和超时。
+extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t size,
+    const char* expected, int sha512, int accelerate, std::uint64_t probe_limit, Progress progress, void* context,
+    CancelCheck cancel_check, const void* cancel_context, char* error, std::size_t error_size) noexcept {
+    return download_resource(url,target,size,expected,sha512,accelerate,probe_limit,progress,context,
+        cancel_check,cancel_context,error,error_size,true);
+}
+
+// download_after_cache_check（本次缓存预检后的传输）：只跳过旧缓存复查，新下载仍完整核验后启用。
+int voice_resource_download::download_after_cache_check(const char* url, const wchar_t* target, std::uint64_t size,
+    const char* expected, int sha512, Progress progress, void* context, CancelCheck cancel_check,
+    const void* cancel_context, char* error, std::size_t error_size) noexcept {
+    return download_resource(url,target,size,expected,sha512,1,0,progress,context,
+        cancel_check,cancel_context,error,error_size,false);
+}
+
 extern "C" int vt_resource_cached(const wchar_t* target, std::uint64_t size, const char* expected, int sha512,
     ResourceProgress progress, void* context, ResourceCancel cancel_check, const void* cancel_context, char* error, std::size_t error_size) noexcept {
     try {
