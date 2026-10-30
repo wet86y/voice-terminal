@@ -58,8 +58,8 @@ fn cpu_overlay_digest(context:&LaunchContext,runtime:&Path)->Result<String,Strin
 }
 /// validate_activation（增量原位校验）：失败交由同一资源事务恢复，禁止自动全量重建。
 pub(crate) fn validate_activation(context:&LaunchContext)->Result<(),String>{
-    crate::workspace::verify_tree_with_progress(&context.install.join("runtimes/python"),"manifest.json",&AtomicBool::new(false),&mut|_,_,_|{})
-        .map_err(|error|format!("增量合并后文件校验失败，恢复原环境：{error}"))?;
+    // 增量候选及待替换原件已经由 runtime_delta::read（变更文件检查）验证；
+    // 同盘换入不再次遍历、读取整个环境，完整内容扫描保留在主动完整性维护中。
     let record=resources::load(&context.install.join("runtimes/python/runtime.json"))?;let gpu=managed_gpu(&record);let names=requested(&effective_lock(context,gpu)?,"all")?;
     let mut args=vec!["--names".into(),serde_json::to_string(&names).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
     if gpu{args.extend(["--gpu-lock".into(),gpu_lock_path(context).to_string_lossy().into_owned()]);}
@@ -327,22 +327,26 @@ pub fn repair_with_activation(context:&LaunchContext,group:&str,cancel:Arc<Atomi
 }
 fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool,repair:bool,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     resources::check_cancel(&cancel)?;progress("检查现有语音环境登记",0,0);
-    let old=context.install.join("runtimes/python");
-    let existing=resources::load(&old.join("runtime.json")).unwrap_or(Value::Null);
+    let old=safe_path(&context.install,"runtimes/python")?;
+    safe_path(&old,"python.exe")?;
+    let existing=resources::load(&safe_path(&old,"runtime.json")?).unwrap_or(Value::Null);
     let gpu=gpu_requested(group)||managed_gpu(&existing);
     let lock=effective_lock(context,gpu)?;let requested=requested(&lock,"all")?;
-    let compatible_gpu=allow_reuse&&(existing["compatible_gpu"]==true||(existing["schema"]==1&&existing["profile"]=="cu128")||registered_gpu_environment(context,&old));
-    let reusable_environment=if allow_reuse&&context.python.is_file(){
-        let result=crate::workspace::verify_tree_with_progress(&old,"manifest.json",&cancel,&mut|phase,done,total|
-            progress(&format!("校验现有语音环境：{phase}"),done,total));
-        // 取消不能被当成完整性失败并继续下载，也不能把显卡环境改装成处理器环境。
+    let compatible_gpu=allow_reuse&&(existing["compatible_gpu"]==true||(existing["schema"]==1&&existing["profile"]=="cu128"));
+    if allow_reuse&&context.python.is_file(){
+        let ids=if has_gpu(&existing)||gpu_requested(group){vec![CPU_RESOURCE,GPU_RESOURCE]}else{vec![CPU_RESOURCE]};
+        if repair||!crate::component_maintenance::reuse_allowed(context,&ids)?{
+            return Err("现用运行依赖需要完整性校验确定修复范围；原环境和故障记录保持不变，不自动扫描整个环境。".into());
+        }
         resources::check_cancel(&cancel)?;
-        if compatible_gpu&&!repair{if let Err(error)=&result{return Err(format!("现用显卡运行环境完整性校验失败：{error} 原环境保持不变。"));}}
-        result.is_ok()
-    }else{false};
-    if reusable_environment||(repair&&context.python.is_file()) {return update::configure(context,&existing,gpu,compatible_gpu,repair,cancel,progress,enable);}
-    // 已安装环境损坏必须显式维修；普通更新不能因复用失败静默切入全量安装。
-    if allow_reuse&&context.python.is_file(){return Err("现用运行环境完整性检查失败，原环境保持不变；请通过组件完整性维修处理。".into());}
+        if current_for_upgrade(context)?&&(!gpu_requested(group)||gpu_current(context,&existing)){
+            progress("复用已登记语音环境",1,1);resources::check_cancel(&cancel)?;
+            return Ok(installed_resources(managed_gpu(&existing)));
+        }
+        // 普通更新只规划变化包；旧登记无效或变更文件异常直接报错，不能转成整环境重装。
+        let compatible_gpu=compatible_gpu||allow_reuse&&registered_gpu_environment(context,&old);
+        return update::configure(context,&existing,gpu,compatible_gpu,false,cancel,progress,enable);
+    }
     let mut check_args=vec!["--names".into(),serde_json::to_string(&requested).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
     if gpu{check_args.extend(["--gpu-lock".into(),gpu_lock_path(context).to_string_lossy().into_owned()]);}
     if compatible_gpu{check_args.push("--compatible-gpu".into());}
@@ -521,6 +525,44 @@ mod tests {
         let lock_path=root.join("app/config/runtime/voice-runtime.lock.json");
         let mut changed=fs::read(&lock_path).unwrap();changed.push(b'\n');fs::write(&lock_path,changed).unwrap();
         assert!(!current_for_upgrade(&context).unwrap());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn ready_configuration_reuses_registration_without_scanning_or_activation(){
+        let (owner,root,context)=runtime_workspace();let runtime=root.join("runtimes/python");
+        atomic_json(&runtime.join("manifest.json"),&resources::manifest(&runtime,"python","fixture").unwrap()).unwrap();
+        let before=file_hash(&runtime.join("runtime.json")).unwrap();let manifest_before=file_hash(&runtime.join("manifest.json")).unwrap();
+        // 同大小内容变化与清单外文件交给手动完整性检查；就绪复用不能借机扫描文件树。
+        fs::write(runtime.join("python.exe"),b"changed").unwrap();fs::write(runtime.join("unrelated.dll"),b"unrelated").unwrap();
+        let mut activated=false;let mut phases=vec![];
+        assert_eq!(configure_with_activation(&context,"torch-cpu",Arc::new(AtomicBool::new(false)),&mut|phase,_,_|phases.push(phase.to_owned()),&mut|_,_|{activated=true;Ok(())}).unwrap(),installed_resources(false));
+        assert!(!activated);assert!(!phases.iter().any(|phase|phase.contains("校验组件文件内容")||phase.contains("扫描")));
+        assert_eq!(file_hash(&runtime.join("runtime.json")).unwrap(),before);assert_eq!(file_hash(&runtime.join("manifest.json")).unwrap(),manifest_before);
+        assert!(!root.join("tmp/voice-environment/stage").exists());
+        fs::remove_file(runtime.join("unrelated.dll")).unwrap();
+        assert!(crate::workspace::verify_tree(&runtime,"manifest.json").is_err());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn known_runtime_fault_and_automatic_repair_never_become_lightweight_success(){
+        let (owner,root,context)=runtime_workspace();let runtime=root.join("runtimes/python");
+        atomic_json(&runtime.join("manifest.json"),&resources::manifest(&runtime,"python","fixture").unwrap()).unwrap();
+        atomic_json(&root.join("app/release.json"),&json!({"build":"fixture"})).unwrap();
+        let path=root.join("data/state/component-maintenance.json");
+        atomic_json(&path,&json!({"schema":1,"workspace_id":context.workspace_id,"build":"fixture","issues":[
+            {"resource_id":CPU_RESOURCE,"reason":"完整检查已确认损坏","content_failure":true,"dispatched":false}]})).unwrap();
+        let original=file_hash(&path).unwrap();let mut activated=false;
+        let error=configure_with_activation(&context,"cpu",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_,_|{activated=true;Ok(())}).unwrap_err();
+        assert!(error.contains("需要完整性校验"));assert!(!activated);assert_eq!(file_hash(&path).unwrap(),original);
+        let mut record=resources::load(&path).unwrap();record["issues"][0]["resource_id"]=json!(GPU_RESOURCE);atomic_json(&path,&record).unwrap();
+        assert_eq!(configure_with_activation(&context,"cpu",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_,_|{activated=true;Ok(())}).unwrap(),installed_resources(false));
+        crate::component_maintenance::resolved(&context,&[CPU_RESOURCE.into()]).unwrap();
+        assert!(!crate::component_maintenance::reuse_allowed(&context,&[GPU_RESOURCE]).unwrap());assert!(!activated);
+        fs::remove_file(&path).unwrap();
+        let error=repair_with_activation(&context,"cpu",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_,_|{activated=true;Ok(())}).unwrap_err();
+        assert!(error.contains("需要完整性校验"));assert!(!activated);assert!(!root.join("cache/dependencies").exists());
         crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
@@ -714,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_existing_environment_validation_never_downloads_or_activates(){
+    fn cancel_existing_environment_preparation_never_downloads_or_activates(){
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-runtime-cancel-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();
         fs::create_dir_all(root.join("app/config/runtime")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
@@ -726,7 +768,7 @@ mod tests {
         let original=file_hash(&runtime.join("manifest.json")).unwrap();let stage=root.join("tmp/voice-environment/stage");fs::create_dir_all(&stage).unwrap();fs::write(stage.join("sentinel.bin"),b"prior candidate").unwrap();
         let context=LaunchContext::portable(&root).unwrap();let cancel=Arc::new(AtomicBool::new(false));let mut activated=false;
         let error=configure_with_activation(&context,"all",cancel.clone(),&mut|phase,_,_|{
-            if phase=="校验现有语音环境：校验组件文件内容"{cancel.store(true,std::sync::atomic::Ordering::Release);}
+            if phase=="检查现有语音环境登记"{cancel.store(true,std::sync::atomic::Ordering::Release);}
         },&mut|_,_|{activated=true;Ok(())}).unwrap_err();
         assert!(error.contains("取消"));assert!(!activated);assert_eq!(file_hash(&runtime.join("manifest.json")).unwrap(),original);
         assert_eq!(fs::read(stage.join("sentinel.bin")).unwrap(),b"prior candidate");assert!(!root.join("cache/dependencies").exists());

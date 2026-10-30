@@ -91,17 +91,6 @@ struct ProcessError {
     cancelled: bool,
 }
 
-#[derive(Clone,PartialEq,Eq)]
-struct PreparedEnvironment {
-    manifest_sha256:String, // manifest_sha256（已完整验证的环境清单摘要）。
-    fingerprint:String, // fingerprint（全部文件的路径、大小及修改时间指纹）。
-}
-impl PreparedEnvironment{
-    fn read(root:&Path)->Result<Self,String>{
-        Ok(Self{manifest_sha256:voice_desktop_common::workspace::file_hash(&root.join("manifest.json"))?,fingerprint:voice_desktop_common::runtime::fingerprint(root)?})
-    }
-}
-
 /// ResourceManager（资源管理器）：owns resource jobs and talks only to fixed local tools.
 pub struct ResourceManager {
     context: LaunchContext,
@@ -118,7 +107,6 @@ pub struct ResourceManager {
     batch_active: AtomicBool, // batch_active（一键维护中）：整批结束后才恢复服务。
     accepting_jobs: AtomicBool, // accepting_jobs（接受新任务）：迁移排空前原子关闭，防止排空后再写旧工作区。
     validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
-    prepared_environment:Mutex<Option<PreparedEnvironment>>, // prepared_environment（本次任务已验证的共享环境）：启动仍做全量摘要复核。
 }
 
 impl ResourceManager {
@@ -153,7 +141,6 @@ impl ResourceManager {
             batch_active: AtomicBool::new(false),
             accepting_jobs: AtomicBool::new(true),
             validation_failures:Mutex::new(HashMap::new()),
-            prepared_environment:Mutex::new(None),
         };
         manager.persist_jobs()?;
         Ok(manager)
@@ -626,7 +613,7 @@ impl ResourceManager {
             if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
             else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
         };
-        // dependency_group（依赖组）模型先校验并配置完整运行环境，再下载自身模型文件。
+        // dependency_group（依赖组）模型先核对共享环境登记，仅有依赖变更时配置增量，再下载模型文件。
         let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
             .map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let item=voice_desktop_common::resources::spec(&self.context,resource_id)
@@ -863,7 +850,6 @@ impl ResourceManager {
         match voice_desktop_common::resources::commit_activation(&self.context,&mut transaction){
             Ok(())=>{
                 clear_resume_intent_if_resumed(&self.resume_pending,resumed);
-                if relative=="runtimes/python"{*self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=None;}
                 self.publish_installed(job_id,relative);
                 Ok(())
             },
@@ -894,30 +880,14 @@ impl ResourceManager {
         }
     }
 
-    fn current_environment_identity(&self)->Result<PreparedEnvironment,String>{
-        let root=self.context.install.join("runtimes/python");
-        PreparedEnvironment::read(&root)
-    }
     fn prepare_environment(&self,job_id:&str,group:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
         voice_desktop_common::resources::check_cancel(&cancel)?;
-        let state=voice_desktop_common::runtime::status(&self.context)?;
-        let gpu_ready=state["components"].as_array().is_some_and(|rows|rows.iter().any(|row|row["resource_id"]==voice_desktop_common::runtime::GPU_RESOURCE&&row["can_start"]==true));
-        let ready=state["full_ready"]==true&&(!voice_desktop_common::runtime::gpu_requested(group)||gpu_ready);
-        let verified=self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?.clone();
-        if ready&&verified.is_some(){
-            progress("核对本次已验证共享环境是否变化",0,0);
-            let current=self.current_environment_identity();voice_desktop_common::resources::check_cancel(&cancel)?;
-            if current.as_ref().ok()==verified.as_ref(){
-                progress("复用本次已验证完整语音环境",1,1);return Ok(vec!["voice-server".into()]);
-            }
-            *self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=None;
-        }
+        // 共享环境统一由运行依赖入口按登记和已知故障判断复用，不为进程内缓存遍历文件树。
         let repairing=self.jobs.lock().map_err(|_|"资源任务状态不可用")?.get(job_id).is_some_and(|job|job.snapshot.attempt>1&&job.snapshot.recovery.as_ref().is_some_and(|state|state["state"]=="repairing"));
         let result=if repairing{voice_desktop_common::runtime::repair_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}
             else{voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}?;
         voice_desktop_common::compatibility::finish_deferred_settings(&self.context,&cancel)?;
         voice_desktop_common::resources::check_cancel(&cancel)?;
-        *self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=Some(self.current_environment_identity()?);
         Ok(result)
     }
 
@@ -1461,16 +1431,6 @@ mod service_tests {
         jobs.get_mut("dl-required").unwrap().snapshot.resource_id="model".into();jobs.get_mut("dl-required").unwrap().snapshot.state="running".into();
         assert!(validate_batch_admission(&jobs,"required-batch",None).is_err());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn prepared_environment_identity_rejects_changed_manifest_and_file_collection(){
-        let root=std::env::temp_dir().join(format!("voice-environment-reuse-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("python.exe"),b"fixture").unwrap();voice_desktop_common::workspace::atomic_json(&root.join("manifest.json"),&json!({"files":[]})).unwrap();
-        let original=PreparedEnvironment::read(&root).unwrap();assert!(PreparedEnvironment::read(&root).unwrap()==original);
-        voice_desktop_common::workspace::atomic_json(&root.join("manifest.json"),&json!({"files":[],"build":"changed"})).unwrap();assert!(PreparedEnvironment::read(&root).unwrap()!=original);
-        let current=PreparedEnvironment::read(&root).unwrap();fs::write(root.join("changed.dll"),b"new file").unwrap();assert!(PreparedEnvironment::read(&root).unwrap()!=current);
-        fs::remove_file(root.join("manifest.json")).unwrap();assert!(PreparedEnvironment::read(&root).is_err());fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
