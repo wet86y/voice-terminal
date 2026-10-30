@@ -102,12 +102,21 @@ pub fn dispatched(context:&LaunchContext,id:&str)->Result<(),String>{
     atomic_json(&safe_path(&context.data,RECORD)?,&record)
 }
 
-/// resolved（启用成功后清除）：轻量盘点或任务结束本身不能撤销完整校验失败。
+/// reuse_allowed（轻量复用准入）：已有内容或事务故障必须实际修复，不能由元数据快检撤销。
+pub fn reuse_allowed(context:&LaunchContext,ids:&[&str])->Result<bool,String>{
+    let Some(record)=load(context)?else{return Ok(true)};
+    Ok(!record["issues"].as_array().unwrap().iter().any(|issue|
+        (issue["content_failure"]==true||issue["consistency_failure"]==true)
+        &&issue["resource_id"].as_str().is_some_and(|id|ids.contains(&id))))
+}
+
+/// resolved（启用成功后清除）：调用者必须已完成真实修复或通过复用准入，轻量盘点不能撤销已知故障。
 pub fn resolved(context:&LaunchContext,ids:&[String])->Result<(),String>{
     let _guard=RECORD_LOCK.lock().map_err(|_|"组件校验记录锁不可用。")?;
     let Some(mut record)=load(context)?else{return Ok(())};
     record["issues"].as_array_mut().unwrap().retain(|issue|!ids.iter().any(|id|issue["resource_id"]==*id));
-    if let Some(rows)=record["migrations"].as_array_mut(){rows.retain(|row|!ids.iter().any(|id|row["resource_id"]==*id));}
+    // 旧交接允许省略 migrations（离线迁移清单）；读取可选字段不能补写成无效的 null（空值）。
+    if let Some(rows)=record.get_mut("migrations").and_then(Value::as_array_mut){rows.retain(|row|!ids.iter().any(|id|row["resource_id"]==*id));}
     atomic_json(&safe_path(&context.data,RECORD)?,&record)
 }
 

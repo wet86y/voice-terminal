@@ -6,7 +6,7 @@ use crate::{LaunchContext,resources,workspace::{safe_path,atomic_json,file_hash,
 pub const DESCRIPTOR:&str=".runtime-delta.json"; // DESCRIPTOR（稀疏候选说明），不进入正式环境。
 pub const JOURNAL_TARGET:&str="runtime-file-update"; // JOURNAL_TARGET（新事务标识）：旧程序遇到它会安全拒绝，不会按整目录回滚。
 
-/// prepare（生成增量清单）：仅计算新文件摘要，沿用已经完整验证的未变化文件记录。
+/// prepare（生成增量清单）：仅计算新文件摘要，沿用既有安装清单的未变化文件记录。
 pub fn prepare(context:&LaunchContext,stage:&Path,deletes:&[String],cancel:&AtomicBool,progress:&mut resources::Progress)->Result<(),String>{
     prepare_inner(context,stage,deletes,false,cancel,progress)
 }
@@ -163,6 +163,22 @@ mod tests{
         let(owner,context)=fixture();let stage=context.install.join("tmp/stage");fs::create_dir_all(&stage).unwrap();
         prepare(&context,&stage,&[],&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();fs::write(context.install.join("runtimes/python/manifest.json"),b"changed").unwrap();
         assert!(read(&context,&stage).unwrap_err().contains("已变化"));crate::workspace::remove_owned(&context.install,&owner).unwrap();
+    }
+    #[test]
+    fn update_checks_changed_files_without_revalidating_unrelated_content(){
+        let(owner,context)=fixture();let root=context.install.join("runtimes/python");let stage=context.install.join("tmp/stage");fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("change.dll"),b"new").unwrap();
+        prepare(&context,&stage,&["change.dll".into()],&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+        fs::write(root.join("keep.dll"),b"tampered!").unwrap();
+        assert!(read(&context,&stage).is_ok());
+        fs::write(stage.join("change.dll"),b"bad").unwrap();assert!(read(&context,&stage).unwrap_err().contains("增量文件摘要不符"));
+        fs::write(stage.join("change.dll"),b"new").unwrap();
+        fs::write(root.join("change.dll"),b"bad").unwrap();assert!(read(&context,&stage).unwrap_err().contains("待变更旧文件已变化"));
+        fs::write(root.join("change.dll"),b"old").unwrap();let changes=read(&context,&stage).unwrap().unwrap();
+        let backup=context.install.join("tmp/backup");apply(&root,&stage,&backup,&changes).unwrap();
+        assert_eq!(fs::read(root.join("keep.dll")).unwrap(),b"tampered!");assert!(crate::workspace::verify_tree(&root,"manifest.json").is_err());
+        rollback(&context.install,&root,&backup,&changes).unwrap();assert_eq!(fs::read(root.join("change.dll")).unwrap(),b"old");
+        crate::workspace::remove_owned(&context.install,&owner).unwrap();
     }
     #[test]
     fn missing_or_corrupt_backup_keeps_recovery_journal_and_never_accepts_new_content(){
