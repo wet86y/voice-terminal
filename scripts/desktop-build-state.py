@@ -26,6 +26,7 @@ def digest(path: Path) -> str:
 def inventory(root: Path, paths: list[str]) -> dict[str, str]:
     result = {}
     content = []
+    visited = set()  # visited（本轮已收集路径）：重叠输入只计算一次摘要。
     parents_checked = set()
     last_notice = time.monotonic()
     def collect(path: Path, info=None):
@@ -38,6 +39,9 @@ def inventory(root: Path, paths: list[str]) -> dict[str, str]:
             return
         if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
             raise ValueError(f'构建输入或产物不能是目录联接或符号链接：{name}')
+        if name in visited:
+            return
+        visited.add(name)
         if stat.S_ISREG(info.st_mode):
             content.append((name, path))
             result[name] = '<file>'
@@ -125,7 +129,7 @@ def paths_for(stage: str, optimization='release', components='desktop,bootstrap'
     raise ValueError('未知构建阶段')
 
 
-def tool_identity(root: Path, stage: str) -> dict:
+def tool_identity(root: Path, stage: str, checked_inputs=None) -> dict:
     result = {'python': sys.version, 'state_script': digest(Path(__file__))}
     if stage in {'frontend', 'plugin'}:
         result['node'] = subprocess.check_output(['node', '--version'], text=True).strip()
@@ -138,7 +142,13 @@ def tool_identity(root: Path, stage: str) -> dict:
             package = Path(os.environ['VOICE_PROGRAM_PACKAGE'])
             if package.is_symlink() or package.is_junction():
                 raise ValueError('安装器程序包不能是链接')
-            result['embedded_package'] = digest(package)
+            # checked_inputs（本轮内容盘点）：只复用同一次检查的摘要，不跨构建阶段缓存。
+            try:
+                relative = package.absolute().relative_to(root.absolute()).as_posix()
+            except ValueError:
+                relative = None
+            checked = (checked_inputs or {}).get(relative)
+            result['embedded_package'] = checked if checked and not checked.startswith('<') else digest(package)
     return result
 
 
@@ -162,7 +172,7 @@ def inputs_for(root, stage, optimization, components, qualification, build):
             sources += ['.local/build/dsh/source/' + name for name in listed.decode('utf-8').split('\0')
                         if name and not any(part in IGNORED for part in Path(name).parts)]
     inputs = inventory(root, sources)
-    inputs['<tools>'] = json.dumps(tool_identity(root, stage), sort_keys=True)
+    inputs['<tools>'] = json.dumps(tool_identity(root, stage, inputs), sort_keys=True)
     inputs['<options>'] = json.dumps([optimization, components, qualification])
     fingerprint = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
     return inputs, fingerprint, outputs
@@ -175,11 +185,16 @@ def write_state(path: Path, value):
     pending.replace(path)
 
 
-def verify_package(root: Path):
+def verify_package(root: Path, checked_outputs=None):
     directory = root / '.local/build/program-package'
     info = json.loads((directory / 'package-info.json').read_text('utf-8-sig'))
     archive = directory / 'program.zip'
-    if archive.stat().st_size != info['size'] or digest(archive) != info['sha256']:
+    if archive.stat().st_size != info['size']:
+        raise ValueError('已有程序包大小或摘要不符，拒绝安装或构建安装器')
+    # checked_outputs（本次刚核验的产物）：独立调用仍完整核验，不使用历史构建记录代替读取。
+    checked = (checked_outputs or {}).get('.local/build/program-package/program.zip')
+    actual = checked if checked and not checked.startswith('<') else digest(archive)
+    if actual != info['sha256']:
         raise ValueError('已有程序包大小或摘要不符，拒绝安装或构建安装器')
     return info
 
@@ -213,11 +228,12 @@ def run(root, operation, stage, optimization='release', components='desktop,boot
                        if inputs.get(name) != recorded['inputs'].get(name)]
             print('需要更新：输入内容变化，' + '、'.join(changed[:5]))
             return False
-        if recorded['outputs'] != inventory(root, outputs):
+        checked_outputs = inventory(root, outputs)
+        if recorded['outputs'] != checked_outputs:
             print('需要更新：构建产物缺失或内容变化')
             return False
         if stage == 'package':
-            info = verify_package(root)
+            info = verify_package(root, checked_outputs)
             if build and info['build'] != build:
                 print('需要更新：指定构建编号与已有包不同')
                 return False

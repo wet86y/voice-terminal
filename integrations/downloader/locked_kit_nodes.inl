@@ -162,7 +162,8 @@ extern "C" int vt_download_github(const char* origin, const wchar_t* target, std
             status("下载来源：" + label);
             SourceTransport source(policy); const auto url = source.actual_url(expand_node(node, origin));
             ForwardProgress forward{progress, context, label};
-            const int result = vt_download(url.c_str(), target, size, expected, sha512, 1, 0, forward_progress, &forward, cancel, cancel_context, error, error_size);
+            const int result = download_after_cache_check(url.c_str(), target, size, expected, sha512,
+                forward_progress, &forward, cancel, cancel_context, error, error_size);
             if (result == 0) {
                 NodeCacheGuard guard(policy.options);
                 if (guard) save_cache(policy.options, policy.release.nodes, node.id);
