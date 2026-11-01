@@ -84,7 +84,7 @@ fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) ->
 }
 
 pub fn ready(status: &Value) -> bool {
-    status["providers"]["deepseek"]["configured"] == true
+    status["providers"][if status["inference_backend"]=="minimax" {"minimax"} else {"deepseek"}]["configured"] == true
         && if status["tts_backend"] == "voxcpm1" {status["local_tts_ready"] == true} else {status["providers"]["minimax"]["configured"] == true}
 }
 
@@ -123,6 +123,14 @@ pub fn configured_tts_selection(data:&Path)->Value{
         }
     }selection
 }
+/// configured_inference（启动时推理选择）：旧设置默认 DeepSeek（深度求索）。
+pub fn configured_inference(data:&Path)->Value{
+    let backend=fs::read(data.join("config/product-settings.json")).ok()
+        .and_then(|bytes|serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)).ok())
+        .filter(|value|value["schema_version"].as_u64().is_some_and(|version|version>=19))
+        .is_some_and(|value|value["inference"]["backend"]=="minimax");
+    json!({"backend":if backend{"minimax"}else{"deepseek"}})
+}
 fn configured_tts_backend(data:&Path)->&'static str{if configured_tts_selection(data)["backend"]=="voxcpm1"{"voxcpm1"}else{"minimax"}}
 
 fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
@@ -131,6 +139,8 @@ fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
 
 pub fn status(data: &Path) -> Result<Value,String> {
     let mut result = snapshot(&registry(&data.join("config/model-registry.json"))?, &native_environment(data)?, &SystemVault)?;
+    result["inference_backend"] = configured_inference(data)["backend"].clone();
+    result["fields"]["inference_backend"] = json!("启动时主语音推理后端");
     result["tts_backend"] = json!(configured_tts_backend(data));
     result["tts_local_model"] = configured_tts_selection(data)["local_model"].clone();
     result["fields"]["tts_local_model"] = json!("持久化选择的本地语音模型");
@@ -316,6 +326,14 @@ mod tests {
         crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"minimax"}})).unwrap();
         assert_eq!(configured_tts_backend(&root),"minimax");
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn selected_inference_provider_alone_controls_startup_gate() {
+        let status=json!({"inference_backend":"minimax","tts_backend":"minimax","providers":{"deepseek":{"configured":false},"minimax":{"configured":true}}});
+        assert!(ready(&status));
+        let status=json!({"inference_backend":"deepseek","tts_backend":"voxcpm1","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        assert!(ready(&status));
+        let status=json!({"inference_backend":"minimax","tts_backend":"voxcpm1","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        assert!(!ready(&status));
     }
     #[test]
     #[cfg(windows)]

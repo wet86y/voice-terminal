@@ -75,10 +75,12 @@ class AgentContextMixin:
             rows.append({
                 "name": name,
                 "description": item.get("description", ""),
-                # Full types, enums and length constraints are already in the
-                # strict provider Schema. Repeating them in instructions
-                # wastes attention without adding a new decision fact.
-                "parameters": [key for key, value in properties.items() if isinstance(value, dict)],
+                # 提示显式携带合同；MiniMax 的结构字段不能代替动作说明。
+                "parameters": item.get("parameters", {}),
+                "example": {"name": name, "arguments": {
+                    key: value.get("const", (value.get("enum") or [True if value.get("type") == "boolean" else 1 if value.get("type") == "integer" else "示例"])[0])
+                    for key, value in properties.items() if key in params.get("required", [])
+                }},
             })
         return rows
 
@@ -330,6 +332,7 @@ class AgentContextMixin:
                 "code": recovery_signal.code,
                 "source_request_id": recovery_signal.source_request_id,
                 "origin_prompt_kind": origin_prompt_kind,
+                "contract_error": recovery_signal.contract_feedback,
                 "instruction": self._recovery_instruction(
                     recovery_signal.code, origin_prompt_kind=origin_prompt_kind,
                 ),
@@ -350,6 +353,7 @@ class AgentContextMixin:
                     "code": deferred.code,
                     "source_request_id": deferred.source_request_id,
                     "origin_prompt_kind": origin_prompt_kind,
+                    "contract_error": deferred.contract_feedback,
                     "instruction": self._recovery_instruction(
                         deferred.code, deferred=True, origin_prompt_kind=origin_prompt_kind,
                     ),
@@ -443,6 +447,8 @@ class AgentContextMixin:
     def _normalize_schema_envelope(self, envelope: DecisionEnvelope) -> DecisionEnvelope:
         """Remove strict-schema filler fields without weakening local validation."""
 
+        if not getattr(self, "legacy_merged_schema", False):
+            return envelope
         definitions = self._session_action_definitions()
         allowed: dict[str, set[str]] = {}
         for definition in definitions:

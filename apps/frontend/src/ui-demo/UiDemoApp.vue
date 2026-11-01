@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { demoInferenceBackend } from "./inference-demo"
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import AppFrame from "../interface/AppFrame.vue";
 import SettingsFrame from "../interface/SettingsFrame.vue";
@@ -223,11 +224,12 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
   modeDisabled: replayMode.value || Boolean(sessionOperation.value),
   canReset: !replayMode.value && !voiceSession.active.value && effectiveRuntimeState.value === "standby",
   mode: reasoningMode.value,
+  modeVisible: demoInferenceBackend.value !== 'minimax',
   latency: replayMode.value ? voiceShadowReplayDemo.latency : voiceSession.active.value
     ? voiceSession.latencyMs.value === null ? '—' : `${voiceSession.latencyMs.value} ms`
     : currentRuntime.value.latency,
   latencyPending: !replayMode.value && voiceSession.latencyPending.value,
-  voiceModel: "DeepSeek Flash",
+  voiceModel: demoInferenceBackend.value === 'minimax' ? 'MiniMax M3.1 Flash' : 'DeepSeek Flash',
   shadowModel: replayMode.value ? '历史活动回放' : "代理宿主管理",
   conversation: conversationModel.value,
   partial: effectiveRuntimeState.value === "listening" ? "我想整理一下今天的安排…" : "",

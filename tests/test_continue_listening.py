@@ -379,11 +379,15 @@ async def test_final_dispatch_suspends_refill_and_settlement_clears_plan():
 
 
 @pytest.mark.asyncio
-async def test_merged_schema_strips_fillers_for_each_action():
+async def test_legacy_merged_entry_strips_known_fillers_but_rejects_unknown_fields():
     runtime = runtime_for()
     runtime.registry = VoiceShadowRegistry(available=True)
     schema = runtime._decision_schema()
-    assert schema["properties"]["actions"]["items"]["properties"]["arguments"]["properties"]["count"]["type"] == "integer"
+    branches = schema["properties"]["actions"]["items"]["anyOf"]
+    listening = next(branch for branch in branches if branch["properties"]["name"]["enum"] == ["continue_listening"])
+    assert listening["properties"]["arguments"]["properties"]["count"]["type"] == "integer"
+    assert "request" not in listening["properties"]["arguments"]["properties"]
+    runtime.legacy_merged_schema = True  # 只有明确旧格式入口才清理历史填充。
     envelope = DecisionEnvelope(SpeechDecision("wait", "calm", ""),
                                 (Action("continue_listening", {"request": True, "count": 2}),))
     normalized = runtime._normalize_schema_envelope(envelope)
@@ -396,7 +400,7 @@ async def test_merged_schema_strips_fillers_for_each_action():
     assert normalized.actions[0].arguments == {"request": True}
     unknown = runtime._normalize_schema_envelope(DecisionEnvelope(
         SpeechDecision("wait", "calm", ""), (Action("continue_listening", {"count": 1, "duration": 10}),)))
-    with pytest.raises(ProtocolError, match="count"):
+    with pytest.raises(ProtocolError, match="duration"):
         await runtime._dispatch_actions_v06((runtime.episode_id, "unknown"), "turn-a", unknown)
 
 

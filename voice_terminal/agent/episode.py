@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from collections import deque
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 import json
 import inspect
 import logging
@@ -27,7 +27,7 @@ from .options import AgentOptions
 from .listening import ListeningRequests
 from .context_audit import capture_context_snapshot, capture_request_outcome
 from .decision_envelope import (
-    Action, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream,
+    Action, ActionContractError, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream,
     envelope_error_diagnostics, json_structure_fingerprint,
     parse_compatible_decision_envelope, provider_schema_diagnostics,
 )
@@ -1146,7 +1146,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 pass
 
     async def _queue_recovery(self, code, message, *, identity=None, turn_id=None,
-                              delivery_feedback=None):
+                              delivery_feedback=None, contract_feedback=None):
         """Queue one immediate, model-correctable protocol recovery.
 
         This method is intentionally the only bypass of the ordinary 400 ms
@@ -1155,6 +1155,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         bounded scheduler may also surface it on a later forced window.
         Exhaustion itself never schedules an unbounded provider loop.
         """
+        if self.input_scope_closed:
+            return None  # 停止倾听后不再派发恢复，也不能留下无法消费的切换等待项。
         source_turn = turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id)
         active_context = self.active_dispatch_context
         is_active_identity = identity is None or identity == self.active_request_identity
@@ -1178,6 +1180,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         )
         signal = RecoverySignal(
             code=str(code), message=str(message)[:500],
+            contract_feedback=contract_feedback,
             source_request_id=identity[1] if identity else self.agent_step_id,
             source_turn_id=source_turn,
             delivery_feedback=delivery_feedback if isinstance(delivery_feedback, dict) else None,
@@ -1348,6 +1351,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._retry_secondary_by_turn.clear()
         # 原请求的无效倾听作用域保留至其结算，防止停止后才失败的旧请求借重试复活。
         self._discard_secondary_retry()
+        self.pending.discard("LLM_RETRY")
         self.recovery_queue.clear()
         if self.delay_task is not None and not self.delay_task.done():
             self.delay_task.cancel()
@@ -2063,9 +2067,22 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         return "not_allowed"
 
     async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None):
+        # 派发准备包含异步日志，需在首次让出前预留，避免切换误判为空闲。
+        self._dispatch_starting = True
+        try:
+            return await self._start_dispatch_inner(kinds, recovery_signal=recovery_signal, candidate=candidate)
+        finally:
+            self._dispatch_starting = False
+
+    async def _start_dispatch_inner(self, kinds, *, recovery_signal=None, candidate=None):
         """Create one request task without ever waiting for its result."""
 
         recovery = recovery_signal is not None
+        if getattr(self, "inference_switch_pending", False) and not recovery:
+            if "LLM_RETRY" not in kinds:
+                return False
+            kinds = {"LLM_RETRY"}  # 切换等待期间只完成已开始逻辑请求的恢复。
+            candidate = None
         dispatch_kind = "normal"
         prompt_kind = "normal"
         dispatch_context = None
@@ -2109,6 +2126,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 }
                 dispatch_kind = "scheduled_wake"
 
+        if getattr(self, "inference_switch_pending", False) and not recovery and "LLM_RETRY" not in kinds:
+            return False
         if not self._dispatch_allowed(respect_backoff=not recovery):
             return False
         # A system check is only valid while the ordinary mailbox is empty.
@@ -2128,6 +2147,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             recovery_signal.source_turn_id if recovery_signal and recovery_signal.source_turn_id
             else self.last_turn_id
         )
+        if getattr(self, "inference_switch_pending", False) and "LLM_RETRY" in kinds:
+            source_turn_id = getattr(self, "_transport_retry_source_turn_id", None) or source_turn_id
         if (
             not recovery and candidate is None
             and {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}.intersection(kinds)
@@ -2187,6 +2208,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if prompt_kind == "kws_wake":
             reasoning_effort = "none"
+        from ..inference import MODEL_CAPABILITIES
+        reasoning_effort = MODEL_CAPABILITIES.get(getattr(self.provider, "model", ""), {}).get("forced_effort") or reasoning_effort
         self._identity_turns[identity] = source_turn_id
         self.active_request_identity = identity
         self.active_request_source_turn_id = source_turn_id
@@ -2333,6 +2356,13 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         return True
 
     async def _start_recovery(self):
+        self._recovery_starting = True  # 恢复队列出队至活动请求建立之间也属于原逻辑请求。
+        try:
+            return await self._start_recovery_inner()
+        finally:
+            self._recovery_starting = False
+
+    async def _start_recovery_inner(self):
         if not self.recovery_queue or not self._dispatch_allowed(respect_backoff=False):
             return False
         signal = self.recovery_queue.popleft()
@@ -2472,7 +2502,11 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                         self.pending.clear()
                         self._pending_since = None
                         return
-            self.pending.clear()
+            if getattr(self, "inference_switch_pending", False):
+                kinds = set(kinds) & {"LLM_RETRY"}
+                self.pending.difference_update(kinds)
+            else:
+                self.pending.clear()
             if not await self._start_dispatch(kinds):
                 self.pending.update(kinds)
             return
@@ -2612,7 +2646,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 system_check_id and isinstance(dispatch_context, dict)
                 and failed_prompt_kind in {"final_silence", "kws_wake"}
             )
-            retryable = bool(getattr(exc, "retryable", False)) and not terminal_system_check
+            retryable = bool(getattr(exc, "retryable", False)) and not terminal_system_check and not self.input_scope_closed
             await self.log(
                 "AGENT_ERROR", error=str(exc)[:300],
                 error_layer=getattr(exc, "error_layer", "runtime"),
@@ -2651,6 +2685,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     self.backoff_until = time.monotonic() + wait_seconds
                     await self.log("LLM_BACKOFF", seconds=wait_seconds, step=self.backoff_step)
                     self.pending.add("LLM_RETRY")
+                    self._transport_retry_source_turn_id = retry_key  # 重试源轮次，切换等待不能借新输入启动普通请求。
                     if system_check_id and failed_prompt_kind == "secondary_mailbox":
                         self._retry_system_check = dict(dispatch_context)
                     if self.queue.empty():
@@ -3076,23 +3111,37 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         listening_actions = tuple(a for a in actions if a.name == "continue_listening")
         invalid = tuple(action for action in actions if action.name not in {"request_shadow", "capture_screen", "continue_listening"})
         if invalid:
-            raise ProtocolError("unsupported action: " + ", ".join(action.name for action in invalid))
+            raise ActionContractError("unsupported action: " + ", ".join(action.name for action in invalid))
+        from .decision_envelope import _validate_schema_subset
+        definitions = {item["name"]: item["parameters"] for item in self._session_action_definitions()}
+        for index, action in enumerate(actions):
+            path = f"$.actions[{index}]"
+            if action.name not in definitions:
+                raise ActionContractError("动作当前不可用", path=path + ".name", code="ACTION_UNAVAILABLE")
+            valid, code, field = _validate_schema_subset(action.arguments, definitions[action.name], path + ".arguments")
+            if not valid:
+                raise ActionContractError(f"{action.name}（动作）参数不符合定义：{field}（字段路径），{code}（错误码）", path=field or path, code=code or "INVALID_ARGUMENT")
         if listening_actions:
             advertised = {row.get("name") for row in self._session_action_definitions()}
             if not self.tools_enabled or "continue_listening" not in advertised:
-                raise ProtocolError("continue_listening（持续倾听）当前不可用")
+                raise ActionContractError("continue_listening（持续倾听）当前不可用")
             if len(listening_actions) != 1:
-                raise ProtocolError("continue_listening（持续倾听）每次决策最多一次")
+                raise ActionContractError("continue_listening（持续倾听）每次决策最多一次")
             arguments = listening_actions[0].arguments
             if (set(arguments) != {"count"} or type(arguments["count"]) is not int
                     or arguments["count"] not in (1, 2, 3)):
-                raise ProtocolError("continue_listening count（注入次数）必须为整数1、2或3")
+                raise ActionContractError("continue_listening count（注入次数）必须为整数1、2或3")
         # 所有动作参数先校验，再施加本地或后台副作用。
+        if len(shadow_actions) > 1:
+            raise ActionContractError("request_shadow（后台请求）每份决策最多一次", code="TOO_MANY_BACKGROUND_REQUESTS")
         if shadow_actions:
             for action in shadow_actions:
-                parse_shadow_wake(action.arguments)
+                try:
+                    parse_shadow_wake(action.arguments)
+                except ValueError as exc:
+                    raise ActionContractError(str(exc), path="$.actions.arguments.request") from exc
         if screen_actions and any(a.arguments != {"request": True} or type(a.arguments.get("request")) is not bool for a in screen_actions):
-            raise ProtocolError("截屏请求参数无效")
+            raise ActionContractError("capture_screen（截屏）request（请求信号）必须为 true（真值）", path="$.actions.arguments.request")
         if listening_actions:
             context = self._listening_by_identity.get(identity, {
                 "scope": self.listening.scope, "logical_id": identity[1]})
@@ -3234,6 +3283,13 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
 
     async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None,
                     reasoning_effort=None, dispatch_context=None):
+        scope = getattr(self.provider, "credential_scope", nullcontext)
+        with scope():
+            return await self._step_scoped(identity, kinds, recovery=recovery, recovery_signal=recovery_signal,
+                reasoning_effort=reasoning_effort, dispatch_context=dispatch_context)
+
+    async def _step_scoped(self, identity, kinds, *, recovery=False, recovery_signal=None,
+                           reasoning_effort=None, dispatch_context=None):
         """有效请求才冻结语音提交；输出应用及所有退出路径均释放边界。"""
         if kinds != {"DEFERRED_OUTPUT"} and (self.closed or not self.episode_id):
             return
@@ -3705,7 +3761,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 content_chars=content_chars,
                 reasoning_effort=reasoning_effort or "none",
                 local_contract_valid=True,
-                action_adapter_valid=(True if not envelope.actions else None),
+                action_adapter_valid=True,
                 **schema_diagnostics,
             )
             await self.log(
@@ -3718,7 +3774,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 action_count=len(envelope.actions),
                 content_chars=content_chars,
                 local_contract_valid=True,
-                action_adapter_valid=(True if not envelope.actions else None),
+                action_adapter_valid=True,
                 **schema_diagnostics,
             )
             await self.emit("speak.preview", {
@@ -3761,7 +3817,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 return "system_check_stale"
             recovery_code = (
                 "LLM_EMPTY_OUTPUT" if not parser.raw.strip()
-                else "TOOL_PROTOCOL_ERROR" if any(marker in error_text for marker in ("action", "tool"))
+                else "TOOL_PROTOCOL_ERROR" if isinstance(exc, ActionContractError) or any(marker in error_text for marker in ("action", "tool"))
                 else "SPEAK_ENVELOPE_INVALID"
             )
             # The streamed ``speak`` prefix is deliberately validated apart
@@ -3777,7 +3833,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     speak_prefix = parser.speak_prefix()
                 except (EnvelopeError, ValueError, json.JSONDecodeError):
                     speak_prefix = None
-            if speak_prefix is not None and speak_prefix.state == "speak" and speak_prefix.text.strip():
+            if not isinstance(exc, ActionContractError) and speak_prefix is not None and speak_prefix.state == "speak" and speak_prefix.text.strip():
                 try:
                     await finish_streamed_speech()
                 except Exception:
@@ -3847,7 +3903,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 workspace = getattr(admission.speech_handle, "workspace", None)
                 if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
                     workspace.timings["partial_speech_protocol_error"] = True
-            if admission.speech_handle is not None:
+            if admission.speech_handle is not None and not isinstance(exc, ActionContractError):
                 # A legal prefix can start speaking before a later JSON error.
                 # Stop that provisional generation; the superseded output is
                 # intentionally never resumed.
@@ -3855,7 +3911,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 if callable(cancel):
                     cancel(getattr(admission.speech_handle, "speech_id", None), "cancelled")
             queued = await self._queue_recovery(recovery_code, error_text,
-                                                identity=identity, turn_id=source_turn_id)
+                                                identity=identity, turn_id=source_turn_id,
+                                                contract_feedback=({"type": "action_contract", "code": exc.code, "path": exc.path}
+                                                    if isinstance(exc, ActionContractError) else None))
             outcome = "recovery_queued" if queued is not None else "recovery_exhausted"
             record_audit_outcome(
                 "invalid_envelope",

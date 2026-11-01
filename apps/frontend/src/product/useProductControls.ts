@@ -1590,9 +1590,10 @@ export function useProductControls() {
         || applicationSnapshot.value?.startup_complete === false,
       canReset: connected.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
+      modeVisible: voice.inference.value?.reasoning_mode_selectable !== false,
       latency: formatResponseLatency(latencyMs.value),
       latencyPending: latencyRunning.value,
-      voiceModel: modelTitle(activeModels.value.voice),
+      voiceModel: voice.inference.value?.model || "正在读取主语音模型",
       shadowModel:
         shadow.value.backend === "dsh"
           ? "代理宿主管理"

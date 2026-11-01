@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import ResourceInstallDialog from './ResourceInstallDialog.vue';
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import LocalComponents from '../../interface/LocalComponents.vue'
 import { formatComponentMemory, type FixedProviderId, type LocalComponentCategory, type LocalComponentRow, type LocalComponentsModel, type LocalDownloadItem, type LocalProviderSettings, type ManagedResourceRow } from '../../interface/local-components'
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
@@ -13,7 +13,7 @@ import { useLocalTtsStatus } from '../useLocalTtsStatus'
 import { operationPhaseLabel, type RuntimeOperation } from '../../runtime/runtime-operations'
 
 const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources>; operations?: RuntimeOperation[] }>()
-const { settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
+const { voice, settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
 const refreshing = ref(false)
@@ -37,6 +37,19 @@ function enhancement(key: EnhancementKey, label: string) {
       } catch (failure) { enhancementError.value = failure instanceof Error ? failure.message : String(failure) }
       finally { enhancementBusy.value = false }
     } }
+}
+const inferenceDraft = ref<FixedProviderId>(settings.inference?.backend ?? 'deepseek') // inferenceDraft（后端草稿）。
+const inferenceSaving = ref(false) // inferenceSaving（请求边界切换进行中）。
+const inferenceError = ref('') // inferenceError（切换失败原因）。
+watch(() => settings.inference?.backend, value => { if (value) inferenceDraft.value = value })
+async function saveInference() {
+  if (inferenceSaving.value) return
+  inferenceSaving.value = true; inferenceError.value = ''
+  try {
+    const result = await productApi.saveInference(inferenceDraft.value)
+    settings.inference = { backend: result.backend }
+  } catch (failure) { inferenceError.value = failure instanceof Error ? failure.message : String(failure) }
+  finally { inferenceSaving.value = false }
 }
 const providerLoading = ref(true) // providerLoading（正在读取在线服务配置状态）。
 const providerSaving = ref(false) // providerSaving（正在保存在线服务密钥）。
@@ -369,13 +382,16 @@ const rows = computed<LocalComponentRow[]>(() => {
   })
   const startupLoading = application.snapshot.value?.startup_complete === false
   components.push({
-    id: 'deepseek', name: 'DeepSeek 在线 API（推理接口）', category: 'inference',
-    state: startupLoading || providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
-    status: startupLoading ? '启动中' : providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
-    available: providerConfigured.value.deepseek, busy: startupLoading || providerLoading.value,
+    id: 'deepseek', name: '主语音推理（在线接口）', category: 'inference',
+    state: startupLoading || providerLoading.value ? 'loading' : providerConfigured.value[inferenceDraft.value] ? 'ready' : 'failed',
+    status: startupLoading ? '启动中' : providerLoading.value ? '读取配置中' : providerConfigured.value[inferenceDraft.value] ? '已配置' : '待配置',
+    available: providerConfigured.value[inferenceDraft.value], busy: startupLoading || providerLoading.value,
     runtime: '', location: '在线服务',
-    description: startupLoading ? '正在加载组件' : '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
-    facts: [], provider: providerSettings('deepseek'),
+    description: startupLoading ? '正在加载组件' : '选择主语音模型并填写对应密钥；MiniMax 与在线语音合成共用同一密钥。',
+    facts: [{ label: '实际模型', value: voice.inference.value?.model || '正在读取' }], provider: providerSettings(inferenceDraft.value),
+      inference: { value: inferenceDraft.value, current: voice.inference.value?.model || '正在读取', pending: voice.inference.value?.pending_backend, disabled: inferenceSaving.value, change: value => { inferenceDraft.value = value }, save: saveInference },
+      error: inferenceError.value || undefined,
+      note: voice.inference.value?.dsh_sync_pending ? 'MiniMax 后台凭据同步待处理，将自动重试。' : undefined,
   })
   // 能力行：模型行未覆盖的能力（音频、合成、主模型等）单独呈现，并可只恢复该能力。
   const coveredCapabilities = new Set(['asr', 'kws', 'speaker', 'tts'])

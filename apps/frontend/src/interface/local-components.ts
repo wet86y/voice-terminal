@@ -25,6 +25,15 @@ export interface LocalProviderSettings {
 
 /** LocalComponentRow（组件条目）：展示层只接收指标与选项，不直接调用业务。 */
 export interface LocalComponentRow {
+  /** inference（推理选择）：实际模型与表单草稿分开保存。 */
+  inference?: {
+    value: FixedProviderId // value（草稿供应方）。
+    current: string // current（实际模型或启动选择）。
+    pending?: string | null // pending（等待切换的模型）。
+    disabled?: boolean // disabled（正在保存）。
+    change: (value: FixedProviderId) => void // change（修改草稿）。
+    save: () => Promise<void> // save（保存后端选择）。
+  }
   /** enhancement（增强能力开关）：详情中直接保存；busy（切换中）时锁定。 */
   enhancement?: {
     label: string // label（开关中文名称）。

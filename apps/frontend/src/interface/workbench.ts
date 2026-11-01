@@ -10,6 +10,7 @@ export interface WorkbenchModel {
   action: string; // action（语音会话操作文案）。
   disabled?: boolean;
   modeDisabled?: boolean; // modeDisabled（离线时禁止切换运行模式，仍可重试连接）。
+  modeVisible?: boolean; // modeVisible（实际模型是否支持选择运行模式）。
   canReset?: boolean;
   sessionOperation?: SessionOperation | null; // sessionOperation（正在整理上下文或清除会话）。
   mode: ReasoningMode; // mode（下一轮使用的运行模式，仅快速或深度）。

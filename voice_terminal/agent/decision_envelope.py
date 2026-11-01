@@ -26,6 +26,18 @@ class EnvelopeError(ValueError):
     """A model response that can be corrected by the recovery lane."""
 
 
+class ProtocolError(ValueError):
+    """可通过有界恢复纠正的模型协议错误；旧入口继续使用同一类型。"""
+
+
+class ActionContractError(EnvelopeError, ProtocolError):
+    """动作合同错误：以字段定位生成恢复反馈，不依赖错误文案。"""
+    def __init__(self, message: str, *, path: str = "$.actions", code: str = "INVALID_ARGUMENT"):
+        super().__init__(message)
+        self.path = path  # path（动作错误字段路径）。
+        self.code = code  # code（稳定错误码）。
+
+
 @dataclass(frozen=True)
 class SpeechDecision:
     state: str
@@ -79,11 +91,18 @@ def _validate_schema_subset(value: Any, schema: Any, path: str = "$") -> tuple[b
 
     if not isinstance(schema, dict):
         return True, None, None
+    for keyword in ("anyOf", "oneOf"):
+        if keyword in schema:
+            matched = sum(_validate_schema_subset(value, branch, path)[0] for branch in schema[keyword])
+            if matched < 1 or (keyword == "oneOf" and matched != 1):
+                return False, "BRANCH_MISMATCH", path
+    if "const" in schema and (type(value) is not type(schema["const"]) or value != schema["const"]):
+        return False, "CONST_MISMATCH", path
     expected = schema.get("type")
     if isinstance(expected, str) and not _schema_type_matches(value, expected):
         return False, "TYPE_MISMATCH", path
     enum = schema.get("enum")
-    if isinstance(enum, list) and value not in enum:
+    if isinstance(enum, list) and not any(type(value) is type(item) and value == item for item in enum):
         return False, "ENUM_MISMATCH", path
     if isinstance(value, dict):
         properties = schema.get("properties")
@@ -111,6 +130,11 @@ def _validate_schema_subset(value: Any, schema: Any, path: str = "$") -> tuple[b
             valid, code, child_path = _validate_schema_subset(child, item_schema, f"{path}[{index}]")
             if not valid:
                 return valid, code, child_path
+    if isinstance(value, str):
+        if isinstance(schema.get("minLength"), int) and len(value) < schema["minLength"]:
+            return False, "MIN_LENGTH", path
+        if isinstance(schema.get("maxLength"), int) and len(value) > schema["maxLength"]:
+            return False, "MAX_LENGTH", path
     return True, None, None
 
 
@@ -161,8 +185,11 @@ def envelope_error_diagnostics(raw: str, error: Exception, schema: Any) -> dict[
                 else ("JSON_MALFORMED", "container_malformed")
             )
         result.update(error_layer="json_syntax", error_code=code, content_class=content_class)
-    elif any(marker in message for marker in ("action", "tool")):
+    elif isinstance(error, ActionContractError) or any(marker in message for marker in ("action", "tool")):
         result.update(error_layer="action_contract", error_code="INVALID_ACTION", content_class="valid_json")
+        if isinstance(error, ActionContractError):
+            result["error_path"] = error.path
+            result["error_code"] = error.code
     elif result.get("provider_schema_valid") is False:
         result.update(
             error_layer="provider_schema",
@@ -676,7 +703,7 @@ class SpeechDecisionEnvelopeStream:
         # ``cancel`` has two legitimate shapes: empty text stops output
         # immediately, non-empty text stops and replaces.  ``wait`` stays
         # text-free because the provider boundary normalizes it that way.
-        if state == "wait" and has_text and (text.strip() or not self.allow_empty_control_text):
+        if state == "wait" and has_text and (text.strip()):
             raise EnvelopeError("cancel/wait cannot contain text")
         actions = value.get("actions")
         if not isinstance(actions, list) or len(actions) > 8:

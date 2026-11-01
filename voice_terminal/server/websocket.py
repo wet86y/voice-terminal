@@ -81,7 +81,10 @@ async def _no_session_lock():
     yield
 
 
-class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntimeMixin):
+from ..inference import InferenceRuntimeMixin
+
+
+class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntimeMixin):
     """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None,
                  speaker_worker_config_path: Path | None = None,
@@ -92,6 +95,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             config.dsh,
             callback_origin=f"http://127.0.0.1:{config.server.port}",
         )
+        self.dsh.on_ready = self.sync_minimax_dsh
         self.product_settings = product_settings
         from ..asr.hotwords import HotwordService
         self.hotwords = HotwordService()  # hotwords（共享依赖、分通道的热词服务）。
@@ -232,7 +236,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if self.product_settings is not None:
             self.product_settings._tts_voice_selections = self._active_voices_by_model
         self.build_info: dict[str, Any] = {}
-        self.reasoning_mode = config.llm.reasoning_mode
+        self._deepseek_reasoning_mode = config.llm.reasoning_mode
+        self.reasoning_mode = "deep" if config.llm.model == "MiniMax-M3.1-Flash" else config.llm.reasoning_mode
         self._credential_overrides: dict[str, str] = {}
         self.state.wake_always_on = bool(config.wake.enabled)
         self.state.set_service(
@@ -893,6 +898,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             # a real ledger keep the legacy snapshot shape.
             value.payload["conversation"] = conversation_snapshot()
         value.payload["reasoning_mode"] = self.reasoning_mode
+        value.payload["inference"] = self.inference_snapshot()
         value.payload["shadow"] = self._shadow_product_snapshot()
         return value
 
@@ -1258,6 +1264,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self._pending_product_settings = dict(settings)
 
     async def set_reasoning_mode(self, mode: str) -> bool:
+        if self.config.llm.model == "MiniMax-M3.1-Flash":
+            return False
         if mode not in {"fast", "deep"}:
             return False
         async with runtime_operation(

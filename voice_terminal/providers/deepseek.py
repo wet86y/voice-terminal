@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
@@ -54,7 +56,7 @@ class DeepSeekHttpError(DeepSeekError):
             "PROVIDER_5XX" if 500 <= self.status_code < 600 else "HTTP_ERROR"
         )
         self.body_preview = _safe_error_body(str(body))[:500]
-        super().__init__(f"DeepSeek HTTP {self.status_code}: {self.body_preview}")
+        super().__init__(f"推理接口 HTTP {self.status_code}: {self.body_preview}")
 
 
 class DeepSeekImageReferenceError(DeepSeekHttpError):
@@ -79,7 +81,7 @@ class DeepSeekTransportError(DeepSeekError):
             "connect": "TRANSPORT_CONNECT",
         }.get(kind, "TRANSPORT_FAILURE")
         super().__init__(
-            f"DeepSeek transport failure: {kind}; received_content={self.received_content}"
+            f"推理接口传输失败: {kind}; received_content（已收到内容）={self.received_content}"
         )
 
 
@@ -120,11 +122,12 @@ class DeepSeekClient:
         protocol_recovery_limit: int = 1,
         transport_retry_limit: int = 2,
     ) -> None:
-        if provider not in {"deepseek", "opencode_go", "openai_compatible"}:
+        if provider not in {"deepseek", "minimax", "opencode_go", "openai_compatible"}:
             raise ValueError("provider must be deepseek, opencode_go, or openai_compatible")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        self._request_key = ContextVar("inference_request_key", default=None)  # 单请求凭据冻结，不记录正文。
         self.provider = provider
         self.api_key_env = api_key_env
         self.session_id = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
@@ -151,7 +154,9 @@ class DeepSeekClient:
         self.transport_retry_limit = max(0, transport_retry_limit)
         self.supports_decision_schema = True
         from urllib.parse import urlsplit
-        self.supports_images = self.model == "deepseek-flash" and urlsplit(self.base_url).hostname == "api.deepseek.com"  # supports_images（已验证图像协议）。
+        from ..inference import MODEL_CAPABILITIES
+        self.capabilities = MODEL_CAPABILITIES.get(self.model, {})
+        self.supports_images = bool(self.capabilities.get("images")) and (provider == "minimax" or urlsplit(self.base_url).hostname == "api.deepseek.com")
         self._client = None
 
     def set_session_id(self, session_id: str | None) -> None:
@@ -163,7 +168,7 @@ class DeepSeekClient:
         return _canonical_reasoning_effort(value, default=self.reasoning_effort) in self.allowed_reasoning
 
     def _request_headers(self, *, streaming: bool = False) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {"Authorization": f"Bearer {self._request_key.get() or self.api_key}"}
         if self.user_agent:
             headers["User-Agent"] = self.user_agent
         if self.session_id:
@@ -174,6 +179,15 @@ class DeepSeekClient:
                 "Accept": "text/event-stream",
             })
         return headers
+
+    @contextmanager
+    def credential_scope(self):
+        """credential_scope（请求认证作用域）：图片上传及响应流共用请求开始时的密钥。"""
+        token = self._request_key.set(self.api_key)
+        try:
+            yield
+        finally:
+            self._request_key.reset(token)
 
     async def _http_client(self):
         if self._client is None:
@@ -197,8 +211,13 @@ class DeepSeekClient:
         import copy
         import hashlib
         import time
-        if not self.supports_images:
+        if not self.supports_images or self.capabilities.get("images") == "inline":
             return messages
+        scope = self.image_transport_snapshot()["scope"]
+        if getattr(self, "_image_scope", scope) != scope:
+            self._image_sources = {}
+            self._image_locks = {}
+        self._image_scope = scope
         if not hasattr(self, "_image_sources"):
             self._image_sources = {}  # 图片摘要到稳定传输来源；不进入聊天编码存储。
             self._image_locks = {}
@@ -245,7 +264,7 @@ class DeepSeekClient:
     def image_transport_snapshot(self):
         """image_transport_snapshot（图片传输检查点）：保存引用和有效期，不保存凭据或编码。"""
         import hashlib
-        return {"scope": hashlib.sha256(f"{self.base_url}\0{self.api_key}".encode()).hexdigest(),
+        return {"scope": hashlib.sha256(f"{self.base_url}\0{self._request_key.get() or self.api_key}".encode()).hexdigest(),
                 "sources": {key: dict(value) for key, value in getattr(self, "_image_sources", {}).items()}}
 
     def restore_image_transport(self, snapshot):
@@ -379,14 +398,10 @@ class DeepSeekClient:
                 "content": responses_content(content)
                 if isinstance(content, list) else [{"type": "input_text", "text": content}],
             })
-        compatibility = (
-            "Provider schema compatibility: every declared property is required. "
-            "For wait set speak.text to the empty string; for cancel an empty text "
-            "stops output and a non-empty text stops and replaces it; for revision "
-            "write only the new tail. "
-            "For action arguments, set fields irrelevant to that action to empty/neutral values; "
-            "the local runtime will retain only that action's declared fields."
-        )
+        compatibility = ('输出一个完整 JSON（结构化决策）：speak（语音决策）与 actions（动作列表）。'
+            'wait（等待）时 text（文本）必须为空字符串。动作包装为 {"name":"动作名称","arguments":{自身参数}}；'
+            '可包含多个不同动作，request_shadow（后台请求）每份输出最多一次。每个动作只填写自身参数，禁止跨工具占位。'
+            '\nJSON Schema（结构定义）：\n' + json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
         return {
             "model": model,
             "instructions": "\n\n".join([*instructions, compatibility]),
@@ -419,6 +434,8 @@ class DeepSeekClient:
         schema_name: str = "voice_decision_v06",
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[dict]:
+        # 所有入口统一执行能力策略，包括静默、唤醒和恢复请求。
+        reasoning_effort = self.capabilities.get("forced_effort") or reasoning_effort
         if not self.api_key:
             raise DeepSeekError(f"未配置 {self.api_key_env}")
         try:
@@ -526,7 +543,9 @@ class DeepSeekClient:
                 if not finished:
                     raise DeepSeekError("LLM stream disconnected before completion")
             logger.info("deepseek.request_done deltas=%d response_chars=%d", delta_count, response_chars)
-        except DeepSeekError:
+        except DeepSeekError as exc:
+            exc.provider = self.provider  # provider（错误所属供应方），不改变重试预算。
+            exc.args = (f"{self.provider}（推理供应方）：{exc}",)
             raise
         except Exception as exc:
             logger.exception("deepseek.request_failed")
@@ -544,6 +563,7 @@ class DeepSeekClient:
         reasoning_effort: str,
         cancel_event: Any = None,
     ) -> AsyncIterator[dict]:
+        logger.info("inference.request provider（供应方）=%s model（模型）=%s", self.provider, self.model)
         headers = self._request_headers(streaming=True)
         payload = self._responses_payload(
             messages, model=self.model, schema=schema, schema_name=schema_name,
@@ -720,14 +740,19 @@ class DeepSeekClient:
                     "stream_disconnected", reason="missing_terminal_event",
                     stream_metrics=stream_metrics,
                 )
-        except DeepSeekError:
+        except DeepSeekError as exc:
+            exc.provider = self.provider
+            exc.args = (f"{self.provider}（推理供应方）：{exc}",)
             raise
         except Exception as exc:
             logger.exception("deepseek.responses_failed")
             kind = "timeout" if "timeout" in type(exc).__name__.casefold() else (
                 "connect" if "connect" in type(exc).__name__.casefold() else "transport"
             )
-            raise DeepSeekTransportError(kind, received_content=bool(streamed_parts)) from exc
+            error = DeepSeekTransportError(kind, received_content=bool(streamed_parts))
+            error.provider = self.provider
+            error.args = (f"{self.provider}（推理供应方）：{error}",)
+            raise error from exc
 
     async def check(self) -> None:
         if not self.api_key:

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inference-selection-save"
+description = "Enables the inference_selection_save command without any pre-configured scope."
+commands.allow = ["inference_selection_save"]
+
+[[permission]]
+identifier = "deny-inference-selection-save"
+description = "Denies the inference_selection_save command without any pre-configured scope."
+commands.deny = ["inference_selection_save"]

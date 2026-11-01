@@ -11,6 +11,16 @@ import WorkspaceSettings from '../product/panels/WorkspaceSettings.vue'
 import { useWorkspaceResources } from '../product/useWorkspaceResources'
 import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type DesktopCredentialsPort, type DesktopWorkspacePort, type ResourceStatus } from '../product/desktop-port'
 
+const inferenceDraft = ref<'deepseek' | 'minimax'>('deepseek') // inferenceDraft（启动后端草稿）。
+const inferenceSaving = ref(false) // inferenceSaving（正在保存）。
+const inferenceError = ref('') // inferenceError（保存失败说明）。
+async function saveInference() {
+  if (!port.saveInferenceSelection || inferenceSaving.value) return
+  inferenceSaving.value = true; inferenceError.value = ''
+  try { await port.saveInferenceSelection({ backend: inferenceDraft.value }); await credentials.refresh() }
+  catch (failure) { inferenceError.value = failure instanceof Error ? failure.message : String(failure) }
+  finally { inferenceSaving.value = false }
+}
 const section = ref('compute')
 const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopWorkspacePort
@@ -58,6 +68,7 @@ function enhancement(resource: string): LocalComponentRow['enhancement'] {
     } }
 }
 const credentials = useStartupCredentials(port, () => resources.refreshInventory())
+watch(credentials.inferenceBackend, value => { inferenceDraft.value = value }, { immediate: true })
 watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), item => {
   credentials.setLocalTtsReady(item ? item.selected_local_ready === true : null)
 }, { immediate: true })
@@ -190,15 +201,17 @@ const model = computed<LocalComponentsModel>(() => {
     description: 'MiniMax 在线语音服务；API 密钥在详情中配置。启动程序后可查询套餐或账户用量。',
     facts: [], provider: credentials.providerSettings('minimax'),
   }
-  const deepseekReady = credentials.configured.value.deepseek
+  const deepseekReady = credentials.configured.value[inferenceDraft.value]
   const deepseekRow: LocalComponentRow = {
-    id: 'deepseek', name: 'DeepSeek 在线 API（推理接口）', category: 'inference',
+    id: 'deepseek', name: '主语音推理（在线接口）', category: 'inference',
     state: credentials.loading.value ? 'loading' : deepseekReady ? 'ready' : 'failed',
     status: credentials.loading.value ? '读取配置中' : deepseekReady ? '已配置' : '待配置',
     available: deepseekReady, busy: credentials.loading.value,
     runtime: '',
-    description: '配置 DeepSeek 接口密钥并查询账户余额。密钥保存在本机系统凭据库，不会返回页面。',
-    facts: [], provider: credentials.providerSettings('deepseek'),
+    description: '选择主语音模型并配置对应密钥。MiniMax 与在线语音合成共用一次填写的密钥。',
+    facts: [{ label: '启动模型', value: credentials.inferenceBackend.value === 'minimax' ? 'MiniMax M3.1 Flash' : 'DeepSeek Flash' }], provider: credentials.providerSettings(inferenceDraft.value),
+      inference: { value: inferenceDraft.value, current: credentials.inferenceBackend.value === 'minimax' ? 'MiniMax M3.1 Flash' : 'DeepSeek Flash', disabled: inferenceSaving.value, change: value => { inferenceDraft.value = value }, save: saveInference },
+      error: inferenceError.value || undefined,
   }
   const voiceServer = findResource('voice-server')
   const voiceRow: LocalComponentRow = voiceServer ? resourceRow(voiceServer, 'voice-server') : {
@@ -265,8 +278,8 @@ async function startProgram() {
   }
   if (!credentials.ready.value) {
     credentials.error.value = credentials.localTts.value
-      ? '请在“推理执行”分类的 DeepSeek 详情中填写接口密钥。'
-      : '请配置 DeepSeek 接口密钥，并准备本地 TTS 模型或配置 MiniMax 在线 API。'
+      ? '请在“推理执行”分类的主语音推理详情中填写所选供应方密钥。'
+      : `请配置 ${credentials.inferenceBackend.value === 'minimax' ? 'MiniMax' : 'DeepSeek'} 接口密钥，并准备本地 TTS 模型或配置 MiniMax 在线 API。`
     section.value = 'compute'
     return
   }
@@ -307,7 +320,7 @@ function exportLogs() {
       <article class="settings-panel panel">
         <template v-if="section === 'compute' || section === 'system'">
           <div class="management-start">
-            <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置 DeepSeek 与 TTS。' : componentBlockMessage }}</p>
+            <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置所选推理服务与语音合成。' : componentBlockMessage }}</p>
             <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
           </div>
           <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @tts-selection="saveTtsChoice" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />

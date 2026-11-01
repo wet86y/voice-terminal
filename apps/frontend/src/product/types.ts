@@ -1,3 +1,4 @@
+import type { InferenceBackend, InferenceSnapshot } from '../types'
 import type { ProductTtsSettings } from '../interface/tts-voice-types'
 export * from '../interface/tts-voice-types'
 import type { SpeakerTuning } from "./speaker-policy"
@@ -134,7 +135,9 @@ export interface ProductComputeStatus {
     'service' | 'device' | 'runtime' | 'resource_status' | 'resource_footprint' | 'load_error'>>>
 }
 
+export type { InferenceBackend, InferenceSnapshot } from '../types'
 export interface ProductRuntimeSnapshot {
+  inference?: InferenceSnapshot // inference（实际推理状态）。
   /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不包含待传达正文。 */
   quiet_hours?: { passive_quiet: boolean; user_interaction: boolean; within_quiet_hours: boolean }
   state: TerminalState
@@ -174,6 +177,7 @@ export interface ScreenCaptureSettings {
   app_overrides: Array<{ executable: string; mode: 'auto' | 'cursor' | 'center' }> // app_overrides（文件名与中心模式规则）。
 }
 export interface ProductSettingsSnapshot {
+  inference?: { backend: InferenceBackend } // inference（已保存的推理选择）。
   /** audio_enhancements（音频增强）：三个独立开关，兼容旧快照省略。 */
   audio_enhancements?: { dual_pass: boolean; emotion: boolean; acoustic_events: boolean }
   screen_capture?: ScreenCaptureSettings // screen_capture（兼容旧版本可省略）。
@@ -236,6 +240,7 @@ export interface ProductProvider {
 
 /** FixedModelCredentials（固定供应商密钥状态）：前端只接收是否已配置。 */
 export interface FixedModelCredentials {
+  inference_backend?: InferenceBackend // inference_backend（启动时推理后端）。
   tts_local_model?: 'voxcpm1' | 'voxcpm2' // tts_local_model（持久化本地语音模型）。
   tts_backend?: 'minimax' | 'voxcpm1' // tts_backend（启动时语音后端）。
   local_tts_ready?: boolean // local_tts_ready（至少一款本地模型及运行程序就绪）。
@@ -248,7 +253,7 @@ export interface FixedModelCredentials {
 export interface FixedModelCredentialUpdate {
   /** deepseek_api_key（DeepSeek 推理服务接口密钥）：留空或省略时保留已有密钥。 */
   deepseek_api_key?: string
-  /** minimax_api_key（MiniMax 语音合成服务接口密钥）：留空或省略时保留已有密钥。 */
+  /** minimax_api_key（MiniMax 推理与语音合成共享接口密钥）：留空或省略时保留已有密钥。 */
   minimax_api_key?: string
 }
 

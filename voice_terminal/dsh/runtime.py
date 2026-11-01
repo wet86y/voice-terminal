@@ -206,6 +206,9 @@ class DshRuntimeManager:
                 raise RuntimeError("DSH Bridge 协议版本不匹配。")
             self._state = "ready"
             self._message = ""
+            callback = getattr(self, "on_ready", None)
+            if callback is not None:
+                await callback()
             logger.info("DSH Web ready at %s", self.status().ui_origin)
         except asyncio.CancelledError:
             raise
@@ -217,6 +220,10 @@ class DshRuntimeManager:
 
     async def close(self) -> None:
         self._closing = True
+        sync_task = getattr(self, "_credential_sync_task", None)
+        if sync_task is not None:
+            sync_task.cancel()
+            await asyncio.gather(sync_task, return_exceptions=True)
         task = self._start_task
         if task is not None and not task.done():
             task.cancel()

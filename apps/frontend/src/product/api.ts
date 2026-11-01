@@ -102,6 +102,7 @@ export const productApi = {
     if (!response.ok) throw await readError(response)
     return await response.json() as WakeTask
   },
+  saveInference: (backend: import('./types').InferenceBackend) => request<import('./types').InferenceSnapshot>('/api/v1/settings/inference', { method: 'PUT', body: JSON.stringify({ backend }) }), // saveInference（在请求边界保存并切换主语音推理）。
   snapshot: () => request<ProductSnapshot>('/api/v1/product/snapshot'),
   dshStatus: () => request<DshRuntimeStatus>('/api/v1/dsh/status'),
   launchDsh: () => request<{ url: string }>('/api/v1/dsh/ui-launch', { method: 'POST', body: '{}' }),

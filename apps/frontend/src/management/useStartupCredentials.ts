@@ -5,6 +5,7 @@ import type { FixedProviderId, LocalProviderSettings } from '../interface/local-
 
 /** useStartupCredentials（启动前接口设置）：密钥草稿只保存在组件表单内存。 */
 export function useStartupCredentials(port: DesktopCredentialsPort, afterSave?: () => Promise<void>) {
+  const inferenceBackend = ref<'deepseek' | 'minimax'>('deepseek') // inferenceBackend（启动推理后端）。
   const configured = ref({ deepseek: false, minimax: false }) // configured（两家在线服务是否已配置）。
   const loading = ref(true) // loading（正在读取凭据状态）。
   const saving = ref(false) // saving（正在保存单个服务密钥）。
@@ -16,9 +17,10 @@ export function useStartupCredentials(port: DesktopCredentialsPort, afterSave?: 
   const localTtsSnapshot = ref(false) // localTtsSnapshot（凭据接口返回的本地 TTS 就绪状态）。
   const localTtsOverride = ref<boolean | null>(null) // localTtsOverride（资源清单更新后优先使用的就绪状态）。
   const localTts = computed(() => localTtsOverride.value ?? localTtsSnapshot.value)
-  const ready = computed(() => !disabled.value && configured.value.deepseek && (ttsBackend.value === 'voxcpm1' ? localTts.value : configured.value.minimax))
+  const ready = computed(() => !disabled.value && configured.value[inferenceBackend.value] && (ttsBackend.value === 'voxcpm1' ? localTts.value : configured.value.minimax))
 
   function update(result: FixedModelCredentials) {
+    inferenceBackend.value = result.inference_backend === 'minimax' ? 'minimax' : 'deepseek'
     ttsBackend.value = result.tts_backend === 'voxcpm1' ? 'voxcpm1' : 'minimax'
     ttsLocalModel.value = result.tts_local_model === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2'
     localTtsSnapshot.value = result.local_tts_ready === true
@@ -64,5 +66,5 @@ export function useStartupCredentials(port: DesktopCredentialsPort, afterSave?: 
 
   function setLocalTtsReady(value: boolean | null) { localTtsOverride.value = value }
 
-  return { configured, ttsBackend, ttsLocalModel, refresh, loading, saving, disabled, ready, localTts, error, notice, saveProvider, providerSettings, setLocalTtsReady }
+  return { inferenceBackend, configured, ttsBackend, ttsLocalModel, refresh, loading, saving, disabled, ready, localTts, error, notice, saveProvider, providerSettings, setLocalTtsReady }
 }

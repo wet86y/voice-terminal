@@ -67,3 +67,19 @@ pub async fn tts_selection_save(window:WebviewWindow,desktop:State<'_,Arc<Deskto
         Ok(credentials::configured_tts_selection(&context.data))
     }).await.map_err(|_|"语音目标保存失败。".to_string())?
 }
+
+/// inference_selection_save（启动前推理选择）：复用权威设置入口，服务启动后交由在线接口处理。
+#[tauri::command]
+pub async fn inference_selection_save(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,request:Value)->Result<Value,String>{
+    allowed(&window,&desktop)?;let desktop=desktop.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        let _guard=desktop.credentials_guard.lock().map_err(|_|"推理配置锁不可用。")?;
+        if desktop.service.lock().map_err(|_|"服务状态锁不可用。")?.is_some(){return Err("程序已启动，请在组件详情中切换。".into());}
+        if desktop.workspace_busy.load(std::sync::atomic::Ordering::Acquire){return Err("正在切换工作区，请稍后保存。".into());}
+        if !request.is_object()||request.as_object().unwrap().len()!=1||!matches!(request["backend"].as_str(),Some("deepseek"|"minimax")){return Err("backend（推理后端）必须为 deepseek 或 minimax。".into());}
+        let context=desktop.context().ok_or("请先选择工作区。")?;
+        if !context.python.is_file(){return Err("请先准备 CPU（中央处理器）基础运行依赖，再保存推理选择。".into());}
+        voice_desktop_common::runtime::worker(&context,&context.python,"inference-selection",&["--program".into(),context.program.to_string_lossy().into_owned(),"--data".into(),context.data.to_string_lossy().into_owned(),"--selection".into(),request.to_string()],&std::sync::atomic::AtomicBool::new(false))?;
+        Ok(credentials::configured_inference(&context.data))
+    }).await.map_err(|_|"推理选择保存失败。".to_string())?
+}

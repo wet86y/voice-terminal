@@ -2,12 +2,8 @@
 from __future__ import annotations
 from hashlib import sha256
 
-from .decision_envelope import DecisionEnvelope
+from .decision_envelope import DecisionEnvelope, ProtocolError
 from .streamed_speech import StreamedSpeechAdmissionState, queue_streamed_speech
-
-
-class ProtocolError(ValueError):
-    """A model-controlled tool/protocol error eligible for immediate recovery."""
 
 
 async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope,

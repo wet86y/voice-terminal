@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "revision": 5,
-  "settings_schema_max": 18,
+  "revision": 6,
+  "settings_schema_max": 19,
   "upgrade_handlers": ["speaker", "tts_audiocpp"],
   "settings_rules": [],
   "fields": {

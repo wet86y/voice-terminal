@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { LocalProviderSettings } from './local-components'
 
 /** UsageRow（用量摘要项）：label（中文显示名称）与 value（服务端实际数值）。 */
@@ -191,26 +191,31 @@ const notice = computed(() => {
   return ''
 })
 
+let queryGeneration = 0 // queryGeneration（查询代次）：旧供应方和旧密钥的回包不得覆盖当前显示。
 async function checkUsage() {
   if (!props.model.usage || checking.value || !configured.value) return
+  const generation = ++queryGeneration
+  const query = props.model.usage
   checking.value = true
   error.value = ''
-  try { result.value = await props.model.usage() }
+  try { const response = await query(); if (generation === queryGeneration) result.value = response }
   catch (failure) {
+    if (generation !== queryGeneration) return
     result.value = null
     error.value = failure instanceof Error ? failure.message : '账户用量读取失败。'
-  } finally { checking.value = false }
+  } finally { if (generation === queryGeneration) checking.value = false }
 }
-
-watch(() => props.model.configured, value => {
-  configured.value = value
-  if (value && props.model.usage && !result.value && !checking.value) void checkUsage()
-})
-onMounted(() => { if (props.model.usage && configured.value) void checkUsage() })
-watch(() => props.refreshKey, () => {
-  result.value = null
+function resetUsage() {
+  ++queryGeneration
+  configured.value = props.model.configured
+  result.value = null; error.value = ''; checking.value = false
   if (props.model.usage && configured.value) void checkUsage()
-})
+}
+// 分别比较原始值；父组件重建配置对象或更新运行状态不属于余额刷新事件。
+watch([() => props.model.provider, () => props.model.configured, () => props.refreshKey], resetUsage)
+onMounted(resetUsage)
+onBeforeUnmount(() => { ++queryGeneration })
+
 </script>
 
 <template>

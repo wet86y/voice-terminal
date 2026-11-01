@@ -1,4 +1,5 @@
 import { record } from '../shared/json-record.js'
+import { syncMiniMax, MINIMAX_BOOTSTRAP_VERSION } from './minimax.js'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { restoreVoiceContextFrames } from './image-history.js'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -34,6 +35,19 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
       let releaseContext: (() => void) | undefined
       try {
         const body = await readBody(req, config.maxBodyBytes)
+        if (path === 'host.minimax.sync') {
+          if (Object.keys(body).some(key => !['api_key', 'initialize'].includes(key))
+            || typeof body.api_key !== 'string' || !body.api_key.trim() || body.api_key.length > 4096
+            || typeof body.initialize !== 'boolean') { json(res, 422, result('conflict')); return }
+          try {
+            await syncMiniMax(ctx, body.api_key, body.initialize)
+            json(res, 200, result('accepted', { bootstrap_version: MINIMAX_BOOTSTRAP_VERSION }))
+          } catch {
+            // 凭据或供应方配置错误可能携带秘密，不返回原始异常。
+            json(res, 503, result('conflict', { message: 'MiniMax 同步待重试' }))
+          }
+          return
+        }
         assertEnvelope(body)
         const existing = bindings.get(body.dsh_session_id)
         const prior = existing?.requests.get(body.request_id)
