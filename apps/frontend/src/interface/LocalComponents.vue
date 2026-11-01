@@ -349,7 +349,7 @@ function rowJobs(row: LocalComponentRow) {
 function rowActionResources(row: LocalComponentRow) {
   if (row.runtimeDependencies?.length) return []
   const resources = [row.resource, ...(row.resourceChoices ?? [])].filter((resource): resource is ManagedResourceRow => Boolean(resource))
-  return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable)
+  return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable || resource.resetAvailable)
 }
 function componentDetailsActionAvailable(row: LocalComponentRow) {
   if (expandedComponents.value.has(row.id) || row.runtimeDependencies?.length) return true
@@ -552,11 +552,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <div v-if="row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
                   <div v-for="resource in selectedResources(row)" :key="resource.id" class="local-inline-resource-action">
                     <span class="local-inline-resource-status"><strong>{{ resource.label }}</strong><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></span>
-                    <ManagedResourceActions v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)" :resource="resource" :download-label="resourceActionLabel(resource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
+                    <ManagedResourceActions v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)" :resource="resource" :download-label="resourceActionLabel(resource)" :reset-blocked="model.resourceTasksBusy" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                   </div>
                 </div>
                 <div v-if="!row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
-                  <ManagedResourceActions v-for="resource in rowActionResources(row)" :key="resource.id" :resource="resource" :download-label="resourceActionLabel(resource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
+                  <ManagedResourceActions v-for="resource in rowActionResources(row)" :key="resource.id" :resource="resource" :download-label="resourceActionLabel(resource)" :reset-blocked="model.resourceTasksBusy" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                 </div>
                 <button v-if="componentDetailsActionAvailable(row)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
                   {{ expandedComponents.has(row.id) ? '收起' : '详情' }}
@@ -580,7 +580,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                       <button v-if="jobIsActive(resourceJob(dependency.id))" class="outline-button" type="button" :disabled="!resourceJob(dependency.id)?.canCancel" @click="emit('cancelResource', resourceJob(dependency.id)!.id)">取消任务</button>
                       <template v-else-if="runtimeNeedsAction(dependency)">
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：${resourceActionLabel(dependency)}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceDownload', dependency.id)">{{ dependency.busy ? '处理中…' : resourceActionLabel(dependency) }}</button>
-                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：导入`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceImport', dependency.id)">导入</button>
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：${dependency.resetAvailable ? '重置' : '导入'}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row) || dependency.resetAvailable && model.resourceTasksBusy" @click="emit('resourceImport', dependency.id)">{{ dependency.resetAvailable ? '重置' : '导入' }}</button>
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', dependency.id)">跳转</button>
                       </template>
                     </div>
@@ -609,7 +609,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <dl v-if="detailFacts(row).length" class="local-detail-facts"><div v-for="fact in detailFacts(row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
                 <section v-if="row.enhancement && enhancementResource && !enhancementReady(enhancementResource, enhancementJob)" class="switch-row component-enhancement-toggle component-enhancement-install" :data-enhancement-resource="enhancementResource.id" :aria-label="row.enhancement.label" :aria-busy="model.resourceLoading || enhancementResource.busy || jobIsActive(enhancementJob)">
                   <div class="component-enhancement-copy"><strong>{{ row.enhancement.label }}</strong><small aria-live="polite">{{ jobIsActive(enhancementJob) ? '正在准备离线 ASR（语音识别）模型' : enhancementResourceStatus(enhancementResource) }} · 可选组件，不阻塞流式识别</small></div>
-                  <ManagedResourceActions v-if="model.resourceActionsAvailable && !jobIsActive(enhancementJob)" :resource="enhancementResource" :download-label="resourceActionLabel(enhancementResource)" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
+                  <ManagedResourceActions v-if="model.resourceActionsAvailable && !jobIsActive(enhancementJob)" :resource="enhancementResource" :download-label="resourceActionLabel(enhancementResource)" :reset-blocked="model.resourceTasksBusy" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
                   <small v-else-if="!model.resourceActionsAvailable" class="local-detail-note">请在桌面组件管理中准备离线模型。</small>
                   <div v-if="enhancementJob" class="component-enhancement-progress">
                     <ManagedResourceProgress :job="enhancementJob" :label="enhancementResource.label" />

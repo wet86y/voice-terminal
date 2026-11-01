@@ -4,6 +4,7 @@ import type { ManagedResourceRow } from './local-components'
 defineProps<{
   resource: ManagedResourceRow // resource（受管资源）：操作始终发送该资源编号。
   downloadLabel: string // downloadLabel（下载或更新文案）：包含失败后的重试状态。
+  resetBlocked?: boolean // resetBlocked（其他组件任务运行时禁止重置）。
   loading?: boolean // loading（组件清单检查中）：暂时禁用安装操作。
 }>()
 const emit = defineEmits<{
@@ -16,7 +17,7 @@ const emit = defineEmits<{
 <template>
   <div class="local-inline-resource-action managed-resource-buttons">
     <button class="outline-button" type="button" :aria-label="`${resource.label}：${downloadLabel}`" :disabled="resource.busy || loading" @click="emit('download', resource.id)">{{ resource.busy ? '处理中…' : downloadLabel }}</button>
-    <button class="outline-button" type="button" :aria-label="`${resource.label}：导入`" :disabled="resource.busy || loading" @click="emit('import', resource.id)">导入</button>
+    <button class="outline-button" type="button" :aria-label="`${resource.label}：${resource.resetAvailable ? '重置' : '导入'}`" :disabled="resource.busy || loading || resource.resetAvailable && resetBlocked" @click="emit('import', resource.id)">{{ resource.resetAvailable ? '重置' : '导入' }}</button>
     <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="loading" @click="emit('source', resource.id)">跳转</button>
   </div>
 </template>

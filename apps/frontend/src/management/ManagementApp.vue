@@ -126,6 +126,7 @@ function toManagedResource(item: ResourceStatus): ManagedResourceRow {
     required: item.required !== false,
     ready: item.can_start === true,
     installedVersion: item.installed_version,
+    resetAvailable: item.reset_available,
     targetVersion: modelResourceIds.has(item.resource_id) ? item.version : undefined,
     error: item.error || failedJob?.error || undefined,
     retryable: Boolean(failedJob),
@@ -257,6 +258,7 @@ const model = computed<LocalComponentsModel>(() => {
         label: job.resource_id === 'batch' ? '批量资源导入'
           : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
             : resource?.label || '资源任务',
+        recovery: job.recovery,
         state: job.state, phase: job.phase, progressKind: job.progress_kind, attempt: job.attempt, parentJobId: job.parent_job_id, completedBytes: job.completed_bytes,
         totalBytes: job.total_bytes, downloadCompletedBytes: job.download_completed_bytes,
         downloadTotalBytes: job.download_total_bytes, verificationCompletedBytes: job.verification_completed_bytes,

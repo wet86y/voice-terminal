@@ -56,6 +56,7 @@ export function useWorkspaceResources() {
   const startingResources = ref(new Set<string>())
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
+  const pendingResetPlan = ref<{ resource_id: string; paths: string[]; token: string; message: string } | null>(null) // pendingResetPlan（一次删除范围确认）。
   const pendingDownloadPlan = ref<ResourceInstallPlan | null>(null)
   const pendingDownloadBundlePlan = ref<ResourceDownloadBundlePlan | null>(null) // pendingDownloadBundlePlan（分类下载确认草稿）。
   const preparingDownloadBundle = ref(false) // preparingDownloadBundle（正在并行读取分类资源计划）。
@@ -423,7 +424,24 @@ export function useWorkspaceResources() {
       .map(plan => startResourceJob(plan.resource_id, 'download')))
   }
 
+  async function confirmReset() {
+    const plan = pendingResetPlan.value
+    if (!plan) return
+    pendingResetPlan.value = null
+    try {
+      const result = await port.resetResource(plan.resource_id, plan.token)
+      upsertResourceJob({ job_id: result.job_id, resource_id: plan.resource_id, state: 'queued', phase: '准备重置组件', can_cancel: false })
+      void refreshJobSnapshots()
+      schedulePoll(ACTIVE_REFRESH_MS)
+    } catch (error) { resourceError.value = String(error) }
+  }
   async function importResource(resourceId?: string) {
+    const rows = resources.value.flatMap(row => [row, ...(row.runtime_components ?? [])])
+    if (resourceId && rows.find(row => row.resource_id === resourceId)?.reset_available) {
+      try { pendingResetPlan.value = await port.resourceResetPlan(resourceId) }
+      catch (error) { resourceError.value = String(error) }
+      return
+    }
     await startResourceJob(resourceId ?? 'batch', 'import', resourceId)
   }
 
@@ -522,6 +540,8 @@ export function useWorkspaceResources() {
     migrateWorkspace,
     downloadResource,
     downloadRequiredResources: () => startResourceJob('required-batch', 'required'),
+    pendingResetPlan,
+    confirmReset,
     pendingDownloadPlan,
     confirmDownload,
     pendingDownloadBundlePlan,

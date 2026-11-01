@@ -371,3 +371,27 @@ def test_defender_injection_requires_trusted_location_and_valid_signature(tmp_pa
         assert not worker.defender_injected_module(tmp_path/'external/MpOAV.dll')
         assert not worker.defender_injected_module(module.with_name('unknown.dll'))
         verify.assert_called_once()
+
+
+@pytest.mark.parametrize('field', ['cpu_overlay_receipts', 'package_receipts', 'packages'])
+def test_null_runtime_collections_preserve_legacy_identity(tmp_path, field):
+    root, lock, old = _delta_runtime(tmp_path, [('small', '1', {'small/a.py': b'keep'})])
+    record = json.loads((root / 'runtime.json').read_text())
+    record[field] = None
+    (root / 'runtime.json').write_text(json.dumps(record))
+    lock['cpu_wheels'] = [{'name': n, 'version': '1', 'file': n + '.whl', 'size': 1, 'sha256': n}
+                          for n in ['torch', 'torchaudio']]
+    plan = worker.delta_plan(root, lock, ['small'], legacy=old, want_overlay=True)
+    assert plan['main']['reused'] == ['small']
+    assert set(plan['overlay']['install']) == {'torch', 'torchaudio'}
+
+
+@pytest.mark.parametrize('field,value', [('cpu_overlay_receipts', []), ('package_receipts', {'small': None}), ('packages', [None])])
+def test_malformed_runtime_collections_fail_without_modifying_files(tmp_path, field, value):
+    root, lock, old = _delta_runtime(tmp_path, [('small', '1', {'small/a.py': b'keep'})])
+    record = json.loads((root / 'runtime.json').read_text()); record[field] = value
+    (root / 'runtime.json').write_text(json.dumps(record))
+    before = (root / 'Lib/site-packages/small/a.py').read_bytes()
+    with pytest.raises(ValueError, match='格式无效'):
+        worker.delta_plan(root, lock, ['small'], legacy=old)
+    assert (root / 'Lib/site-packages/small/a.py').read_bytes() == before

@@ -63,6 +63,16 @@ function confirmBundle() {
 }
 </script>
 <template>
+  <div v-if="controller.pendingResetPlan?.value" class="install-plan-backdrop">
+    <section role="dialog" aria-modal="true" aria-labelledby="reset-plan-title" class="install-plan panel">
+      <h2 id="reset-plan-title">重置组件</h2>
+      <p>{{ controller.pendingResetPlan.value.message }}</p>
+      <p>确认后将完全删除以下组件文件与缓存，开始删除后不可取消。完成后请自行选择下载或导入。</p>
+      <ul><li v-for="path in controller.pendingResetPlan.value.paths" :key="path">{{ path }}</li></ul>
+      <button class="outline-button" @click="controller.pendingResetPlan.value = null">取消</button>
+      <button class="outline-button" @click="controller.confirmReset()">确认重置</button>
+    </section>
+  </div>
   <div v-if="controller.pendingDownloadPlan.value" class="install-plan-backdrop">
     <section role="dialog" aria-modal="true" aria-labelledby="install-plan-title" class="install-plan panel">
       <h2 id="install-plan-title">{{ updatePending ? '准备更新' : '准备下载' }} {{ controller.pendingDownloadPlan.value.title }}</h2>

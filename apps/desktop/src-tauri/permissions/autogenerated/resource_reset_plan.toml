@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-reset-plan"
+description = "Enables the resource_reset_plan command without any pre-configured scope."
+commands.allow = ["resource_reset_plan"]
+
+[[permission]]
+identifier = "deny-resource-reset-plan"
+description = "Denies the resource_reset_plan command without any pre-configured scope."
+commands.deny = ["resource_reset_plan"]

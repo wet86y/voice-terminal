@@ -23,9 +23,9 @@ pub fn classify(message:&str)->Event{
     Event::Unknown
 }
 pub fn automatic(event:Event,attempt:u32)->bool{
-    attempt<3&&matches!(event,Event::Transfer|Event::FileBusy|Event::Content|Event::Unknown)
+    attempt<3&&matches!(event,Event::Transfer|Event::FileBusy|Event::Content)
 }
-pub fn local_rebuild(event:Event)->bool{matches!(event,Event::Content|Event::Unknown)}
+pub fn local_rebuild(event:Event)->bool{matches!(event,Event::Content)}
 pub fn guidance(event:Event,repairing:bool)->Value{
     let (kind,state,action,message)=if repairing{match event{
         Event::Transfer=>("transfer","retrying","none","正在重试传输，继续复用已校验文件和下载进度。"),
@@ -60,5 +60,6 @@ pub fn interrupted()->Value{
         assert_eq!(guidance(classify("增量依赖实际加载失败"),false)["next_action"],"check_integrity");
         assert!(!automatic(classify("旧依赖备份损坏，保留事务恢复记录"),1));
         assert_eq!(guidance(Event::Unknown,false)["next_action"],"retry");
+        assert!(!automatic(Event::Unknown,1));assert!(!local_rebuild(Event::Unknown));
     }
 }
