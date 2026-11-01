@@ -158,8 +158,12 @@ export interface ProductRuntimeSnapshot {
 export interface CustomInstruction {
   /** id（稳定标识）。 */
   id: string
+  /** name（可选显示名称，留空时显示触发语义，不参与模型执行）。 */
+  name?: string
   /** trigger（自然语言触发语义）。 */
   trigger: string
+  /** keywords（选填的系统内部发音检索词，每项 2–4 个汉字）。 */
+  keywords?: string[]
   /** target（执行位置）。 */
   target: 'voice' | 'shadow'
   /** instruction（执行目标）。 */

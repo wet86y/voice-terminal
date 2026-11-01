@@ -340,18 +340,29 @@ export function useProductControls() {
   ];
   const emptyInstruction = (): CustomInstruction => ({
     id: "",
+    name: "",
     trigger: "",
+    keywords: [],
     target: "voice",
     instruction: "",
     enabled: true,
   });
   const instructionDraft = reactive<CustomInstruction>(emptyInstruction());
   const instructionFormError = ref("");
+  const instructionExpanded = reactive<Record<string, boolean>>({}); // instructionExpanded（每条指令独立展开状态）。
   function addInstructionRow() {
-    customInstructions.value.push({ ...emptyInstruction(), id: crypto.randomUUID() });
+    const row = { ...emptyInstruction(), id: crypto.randomUUID() };
+    customInstructions.value.push(row);
+    instructionExpanded[row.id] = true;
+  }
+  async function saveInstructionRow(id: string) {
+    if (await adapter.saveInstructionEntry(id)) instructionExpanded[id] = false;
+  }
+  async function deleteInstructionRow(id: string) {
+    if (await adapter.deleteInstructionEntry(id)) delete instructionExpanded[id];
   }
   function editInstruction(item: CustomInstruction) {
-    Object.assign(instructionDraft, item);
+    Object.assign(instructionDraft, item, { name: item.name ?? '', keywords: [...(item.keywords ?? [])] });
     instructionFormError.value = "";
   }
   function clearInstructionDraft() {
@@ -370,11 +381,16 @@ export function useProductControls() {
         "触发语义最多 200 字，执行目标最多 2000 字。";
       return false;
     }
+    if ((instructionDraft.keywords ?? []).some(word => !/^[\u3400-\u4dbf\u4e00-\u9fff]{2,4}$/u.test(word.trim()))) {
+      instructionFormError.value = "每个触发关键词须为 2～4 个汉字。";
+      return false;
+    }
     const item = {
       ...instructionDraft,
       id: instructionDraft.id || crypto.randomUUID(),
       trigger,
       instruction,
+      keywords: [...new Set((instructionDraft.keywords ?? []).map(word => word.trim()))],
     };
     const index = customInstructions.value.findIndex(
       (row) => row.id === item.id,
@@ -388,6 +404,12 @@ export function useProductControls() {
     instructionFormError.value = "";
     if (customInstructions.value.some(item => !item.trigger.trim() || !item.instruction.trim())) {
       instructionFormError.value = "请填写每条指令的触发语义和执行目标。";
+      return;
+    }
+    if (customInstructions.value.some(item => (item.keywords ?? []).some(
+      word => !/^[\u3400-\u4dbf\u4e00-\u9fff]{2,4}$/u.test(word.trim()),
+    ))) {
+      instructionFormError.value = "每个触发关键词须为 2～4 个汉字。";
       return;
     }
     if (
@@ -1758,6 +1780,12 @@ export function useProductControls() {
     personaItems,
     instructionDraft,
     instructionFormError,
+    instructionExpanded,
+    instructionBusy: adapter.instructionBusy,
+    instructionErrors: adapter.instructionErrors,
+    saveInstructionRow,
+    deleteInstructionRow,
+    toggleInstructionEntry: adapter.toggleInstructionEntry,
     editInstruction,
     clearInstructionDraft,
     stageInstruction,

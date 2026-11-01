@@ -416,4 +416,6 @@ class ProductSettingsRuntimeMixin:
             if episode is not None:
                 episode.refresh_custom_instructions(self._instruction_snapshot)
             self._persist_voice_identity()
+            # 先同步已保存语义，再准备增强索引；等待方取消时也不遗留旧语义。
+            await self.instruction_matcher.configure(self._instruction_snapshot)
             await self.bus.publish(self.snapshot())

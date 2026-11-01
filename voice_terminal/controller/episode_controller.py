@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 class EpisodeController(RealtimeController):
     def __init__(self, *, agent_options, persona_config=None,
-                 custom_instructions_provider=None,
+                 custom_instructions_provider=None, instruction_matcher=None,
                  continuity_document_provider=None, on_user_activity=None,
                  on_silence_anchor=None, **kwargs):
         self.quiet_policy = kwargs.pop("quiet_policy", None)
@@ -36,6 +36,7 @@ class EpisodeController(RealtimeController):
         self.agent_options = agent_options
         self.persona_config = persona_config
         self.custom_instructions_provider = custom_instructions_provider
+        self.instruction_matcher = instruction_matcher  # 会话共享的音素候选检索服务。
         self.continuity_document_provider = continuity_document_provider
         self.on_user_activity = on_user_activity
         self.on_silence_anchor = on_silence_anchor
@@ -146,6 +147,7 @@ class EpisodeController(RealtimeController):
                                        shadow_waker=self.shadow_waker,
                                        reasoning_mode=mode, persona_config=self.persona_config,
                                        custom_instructions_provider=self.custom_instructions_provider,
+                                       instruction_matcher=self.instruction_matcher,
                                        defer_silence_until_output=self.wake_always_on,
                                        on_final_system_check_settled=self._final_system_check_settled,
                                        can_dispatch_final_silence=self._final_silence_dispatch_ready,

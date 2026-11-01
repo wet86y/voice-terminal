@@ -153,6 +153,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const noticeVisible = ref(false)
   const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('personality')
   const customInstructions = ref<CustomInstruction[]>([])
+  const instructionBusy = ref<string[]>([]) // instructionBusy（正在保存、启停或删除的条目标识）。
+  const instructionErrors = ref<Record<string, string>>({}) // instructionErrors（条目独立错误）。
+  let instructionRevision = 0 // instructionRevision（指令写入代次，拒绝迟到的旧设置快照）。
+  let instructionWrites = 0 // instructionWrites（包含排队中的指令写入数量）。
   const silenceSeconds = ref(30)
   const quietHoursForm = reactive({ enabled: false, start: '23:00', end: '07:00' })
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
@@ -271,7 +275,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function applySnapshot(value: ProductSnapshot, requestedRegistryRevision: number, requestedDshRevision: number,
-    requestedAudioEnhancementRevision: number) {
+    requestedAudioEnhancementRevision: number, requestedInstructionRevision: number) {
     // 重连快照更新服务端基线，正在编辑的表单仍由根层持有。
     const known = snapshot.value !== null
     const differs = (draft: unknown, saved: unknown) => JSON.stringify(draft) !== JSON.stringify(saved)
@@ -322,10 +326,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
     Object.assign(settings.tts, nextSettings.tts)
     Object.assign(settings.persona, nextSettings.persona)
-    const hasPendingInstructionEdits = JSON.stringify(customInstructions.value) !== JSON.stringify(settings.custom_instructions)
-    settings.custom_instructions = nextSettings.custom_instructions.map(item => ({ ...item }))
-    if (!hasPendingInstructionEdits) {
-      customInstructions.value = nextSettings.custom_instructions.map(item => ({ ...item }))
+    if (requestedInstructionRevision === instructionRevision && instructionWrites === 0) {
+      const hasPendingInstructionEdits = JSON.stringify(customInstructions.value) !== JSON.stringify(settings.custom_instructions)
+      settings.custom_instructions = nextSettings.custom_instructions.map(item => ({ ...item }))
+      if (!hasPendingInstructionEdits) {
+        customInstructions.value = nextSettings.custom_instructions.map(item => ({ ...item }))
+      }
     }
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
@@ -368,9 +374,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const requestedRegistryRevision = registryRevision
     const requestedDshRevision = dshRevision
     const requestedAudioEnhancementRevision = audioEnhancementRevision
+    const requestedInstructionRevision = instructionRevision
     snapshotRequest = productApi.snapshot().then(async value => {
       if (adapterDisposed) return
-      applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision)
+      applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision, requestedInstructionRevision)
       await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
       lastError.value = ''
     }).catch(setError).finally(() => {
@@ -1258,20 +1265,74 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   async function saveCustomInstructions() {
     await enqueue(async () => {
       saving.value = true
+      instructionRevision++; instructionWrites++
       try {
-        const submitted = customInstructions.value.map(item => ({ ...item }))
+        const draftSnapshot = JSON.stringify(customInstructions.value) // draftSnapshot（提交前草稿，独立于字段规范化）。
+        const submitted = customInstructions.value.map(item => ({ ...item,
+          keywords: [...new Set((item.keywords ?? []).map(word => word.trim()))],
+        }))
         const result = await productApi.saveCustomInstructions({ custom_instructions: submitted })
-        const changed = JSON.stringify(customInstructions.value) !== JSON.stringify(submitted)
+        const changed = JSON.stringify(customInstructions.value) !== draftSnapshot
         updateSettingsFromResponse(settings, result)
         if (!changed) customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
         setNotice(result.message || '自定义指令已保存，后续模型请求立即使用新内容。')
       } catch (error) {
         setError(error)
       } finally {
+        instructionRevision++; instructionWrites--
         saving.value = false
       }
     })
   }
+
+  async function persistInstruction(id: string, operation: 'save' | 'toggle' | 'delete', enabled?: boolean): Promise<boolean> {
+    if (instructionBusy.value.includes(id)) return false
+    const draft = customInstructions.value.find(item => item.id === id)
+    if (!draft) return false
+    const draftSnapshot = JSON.stringify(draft) // 保存期间只合并本条目，保留其它条目的草稿。
+    const submitted: CustomInstruction = { ...draft, name: (draft.name ?? '').trim(), trigger: draft.trigger.trim(),
+      instruction: draft.instruction.trim(), keywords: [...new Set((draft.keywords ?? []).map(word => word.trim()))] }
+    const error = !submitted.trigger || !submitted.instruction ? '请填写触发语义和执行目标。'
+      : submitted.trigger.length > 200 || submitted.instruction.length > 2000 ? '触发语义最多 200 字，执行目标最多 2000 字。'
+      : submitted.name!.length > 80 || submitted.name!.includes('\0') ? '指令名称最多 80 字。'
+      : submitted.keywords!.some(word => !/^[\u3400-\u4dbf\u4e00-\u9fff]{2,4}$/u.test(word)) ? '每个触发关键词须为 2～4 个汉字。' : ''
+    if (operation === 'save' && error) { instructionErrors.value[id] = error; return false }
+    delete instructionErrors.value[id]
+    instructionBusy.value = [...instructionBusy.value, id]
+    instructionRevision++; instructionWrites++
+    try {
+      return await enqueue(async () => {
+        const saved = settings.custom_instructions.map(item => ({ ...item, keywords: [...(item.keywords ?? [])] }))
+        const previous = saved.find(item => item.id === id)
+        if (operation === 'toggle' && !previous) return false
+        if (operation !== 'delete' || previous) {
+          const entry = operation === 'toggle' ? { ...previous!, enabled: enabled! } : submitted
+          const next = operation === 'delete' ? saved.filter(item => item.id !== id)
+            : previous ? saved.map(item => item.id === id ? entry : item) : [...saved, entry]
+          const result = await productApi.saveCustomInstructions({ custom_instructions: next })
+          updateSettingsFromResponse(settings, result)
+        }
+        const current = customInstructions.value.find(item => item.id === id)
+        const stored = settings.custom_instructions.find(item => item.id === id)
+        if (operation === 'delete') customInstructions.value = customInstructions.value.filter(item => item.id !== id)
+        else if (current && stored) {
+          if (operation === 'toggle') current.enabled = stored.enabled
+          else if (JSON.stringify(current) === draftSnapshot) Object.assign(current, stored, { keywords: [...(stored.keywords ?? [])] })
+        }
+        setNotice(operation === 'delete' ? '指令已删除。' : operation === 'toggle' ? '指令启用状态已保存。' : '指令已保存，后续模型请求立即使用新内容。')
+        return true
+      })
+    } catch (error) {
+      instructionErrors.value[id] = error instanceof Error ? error.message : '指令保存失败，请重试。'
+      return false
+    } finally {
+      instructionRevision++; instructionWrites--
+      instructionBusy.value = instructionBusy.value.filter(key => key !== id)
+    }
+  }
+  const saveInstructionEntry = (id: string) => persistInstruction(id, 'save') // 保存单条指令。
+  const toggleInstructionEntry = (id: string, enabled: boolean) => persistInstruction(id, 'toggle', enabled)
+  const deleteInstructionEntry = (id: string) => persistInstruction(id, 'delete')
 
   async function scanModels() {
     await enqueue(async () => {
@@ -1645,6 +1706,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     personaDocument,
     personaDocuments,
     customInstructions,
+    instructionBusy,
+    instructionErrors,
+    saveInstructionEntry,
+    toggleInstructionEntry,
+    deleteInstructionEntry,
     speakerForm,
     speakerStatus,
     speakerProfile,

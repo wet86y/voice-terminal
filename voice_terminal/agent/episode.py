@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import aclosing, nullcontext
 import json
 import inspect
@@ -156,7 +156,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
                  options=None, tools_enabled=True, reasoning_mode="deep", persona_config=None,
-                 custom_instructions_provider=None,
+                 custom_instructions_provider=None, instruction_matcher=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  can_dispatch_final_silence=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
@@ -201,6 +201,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.persona_documents = PersonaDocuments()
         self.custom_instructions_provider = custom_instructions_provider
         self.custom_instructions = []
+        self.instruction_matcher = instruction_matcher  # 指令检索：只返回内部条目标识。
+        self._instruction_candidates_by_turn = OrderedDict()  # 原逻辑请求的冻结模型投影，最多 64 轮。
         self.scheduler = AgentDecisionScheduler(self.options)
         self.episode_id = None
         self.agent_step_id = None
@@ -788,6 +790,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.episode_id = self.conversation.conversation_id
         self.state = "WAITING_EVENT"
         self.inputs.clear()
+        self._instruction_candidates_by_turn.clear()
         self.ledger.clear_shadow_progress(reset_seen=True)
         self._secondary_version_start = self.ledger.secondary_mailbox.version
         self._secondary_consumed_normal = 0
@@ -3312,6 +3315,45 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 reasoning_effort=reasoning_effort, dispatch_context=dispatch_context,
             )
 
+    async def _request_instruction_candidates(self, turn_id, kinds, *, prompt_kind="normal", recovery=False):
+        """冻结本次候选投影：重试复用，系统调度不重放历史触发。"""
+        if prompt_kind != "normal":
+            return ""
+        key = turn_id or ""
+        user_update = bool({
+            "USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED", "USER_INPUT_RELEASED_BATCH",
+        }.intersection(kinds))
+        if recovery or ("LLM_RETRY" in kinds and not user_update):
+            return self._instruction_candidates_by_turn.get(key, "")
+        if self.instruction_matcher is None or not user_update:
+            # 普通后台结果评估不是上次用户请求，后续重试也不沿用旧提醒。
+            self._instruction_candidates_by_turn.pop(key, None)
+            return ""
+        from ..custom_instructions import voice_projection
+        current = self.inputs.get(key, {})
+        entries = deepcopy(self.custom_instructions)
+        configured_for = getattr(self.instruction_matcher, "configured_for", None)
+        if callable(configured_for) and not configured_for(entries):
+            self._instruction_candidates_by_turn.pop(key, None)
+            return ""
+        texts = tuple(dict.fromkeys(
+            str(text).strip() for text in (
+                current.get("text"), current.get("refined_text"),
+                *(item.get("text") for item in current.get("transcript_updates", []) if isinstance(item, dict)),
+            ) if text and str(text).strip()
+        ))
+        identifiers = await self.instruction_matcher.match(key, texts)
+        if (self.closed or self.inputs.get(key, {}) is not current
+                or entries != self.custom_instructions):
+            return ""
+        selected = {identifier for identifier in identifiers}
+        projection = voice_projection([item for item in entries if item["id"] in selected])
+        self._instruction_candidates_by_turn[key] = projection
+        self._instruction_candidates_by_turn.move_to_end(key)
+        while len(self._instruction_candidates_by_turn) > 64:
+            self._instruction_candidates_by_turn.popitem(last=False)
+        return projection
+
     async def _step_with_speech_boundary(self, identity, kinds, *, recovery=False,
                                        recovery_signal=None, reasoning_effort=None,
                                        dispatch_context=None):
@@ -3361,6 +3403,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             shadow_information = self.ledger.shadow_information_snapshot()
         self._prepare_screen_context(retry_key, kinds, recovery)
         self._claim_screen_context(retry_key)
+        instruction_candidates = await self._request_instruction_candidates(
+            source_turn_id, kinds, prompt_kind=prompt_kind, recovery=recovery,
+        )
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,
@@ -3371,6 +3416,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             secondary_context=secondary_context,
             listening_context=listening_context["state"],
             reasoning_effort=reasoning_effort,
+            instruction_candidates=instruction_candidates,
         )
         request_speak_snapshot = dict(self._last_model_speak_snapshot)
         request_speak_context = dict(self._last_model_speak_state)
@@ -4105,6 +4151,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             await self._settle_final_system_check(system_check_id)
 
     async def end(self, reason):
+        self._instruction_candidates_by_turn.clear()
         self.listening.close()
         refresh_controls = getattr(self.output, "refresh_speech_controls", None)
         if callable(refresh_controls):

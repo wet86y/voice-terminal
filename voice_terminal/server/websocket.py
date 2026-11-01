@@ -99,6 +99,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self.product_settings = product_settings
         from ..asr.hotwords import HotwordService
         self.hotwords = HotwordService()  # hotwords（共享依赖、分通道的热词服务）。
+        from ..instruction_matching import InstructionMatcher
+        self.instruction_matcher = InstructionMatcher()  # 指令候选检索，与转写纠错独立。
         self._instruction_snapshot = (
             product_settings.settings_only().get("custom_instructions", [])
             if product_settings is not None else []
@@ -726,12 +728,14 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         if self.product_settings is not None:
             await self.hotwords.configure(lambda: self.product_settings.settings_only().get("hotwords", self.hotwords.bank.settings))
+        await self.instruction_matcher.configure(self._instruction_snapshot)
         self.controller = EpisodeController(
             audio_enhancements=self.config.audio_enhancements,
             hotwords=self.hotwords,
             options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self._episode_persona_config(),
             custom_instructions_provider=lambda: self._instruction_snapshot,
+            instruction_matcher=self.instruction_matcher,
             continuity_document_provider=lambda: self.continuity.document,
             on_user_activity=self._on_voice_activity,
             on_silence_anchor=self._on_voice_silence_anchor,
@@ -1814,6 +1818,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if product_settings is not None:
                 shadow_user_profile = product_settings.read_persona().get("user", "")
                 self._instruction_snapshot = product_settings.settings_only().get("custom_instructions", [])
+                await self.instruction_matcher.configure(self._instruction_snapshot)
             else:
                 config = getattr(self, "config", None)
                 persona = getattr(config, "persona", None)
@@ -1955,6 +1960,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         """Stop project-owned timers when the Voice Server process exits."""
 
         self.hotwords.close()
+        self.instruction_matcher.close()
 
         if self._quiet_clock_task is not None:
             self._quiet_clock_task.cancel()

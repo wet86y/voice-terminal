@@ -1503,13 +1503,116 @@ describe('正式界面的真实控件交互', () => {
 
     const instructions = deferred<Awaited<ReturnType<typeof productApi.saveCustomInstructions>>>()
     vi.spyOn(productApi, 'saveCustomInstructions').mockReturnValue(instructions.promise)
-    value.customInstructions.value = [{ id: 'instruction-1', trigger: '查资料', target: 'shadow', instruction: '原指令', enabled: true }]
+    value.customInstructions.value = [{ id: 'instruction-1', trigger: '查资料', keywords: ['静默'], target: 'shadow', instruction: '原指令', enabled: true }]
     const instructionSave = value.saveCustomInstructions(); await flushPromises()
     value.customInstructions.value[0].instruction = '新草稿'
+    value.customInstructions.value[0].keywords!.push('退下')
     instructions.resolve({ settings: { custom_instructions: [{ id: 'instruction-1', trigger: '查资料', target: 'shadow', instruction: '原指令', enabled: true }] } } as never)
     await instructionSave
     expect(value.settings.custom_instructions[0].instruction).toBe('原指令')
     expect(value.customInstructions.value[0].instruction).toBe('新草稿')
+    expect(value.customInstructions.value[0].keywords).toEqual(['静默', '退下'])
+    expect(vi.mocked(productApi.saveCustomInstructions).mock.calls[0][0]).toMatchObject({
+      custom_instructions: [{ keywords: ['静默'] }],
+    })
+  })
+  it('关键词选填，非法词阻止保存，多词去重后提交并采用保存回执', async () => {
+    const { value } = liveControls()
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => ({ settings: body }) as never)
+    value.customInstructions.value = [{ id: 'quiet', trigger: '要求静默', target: 'shadow', instruction: '提前静默', enabled: true, keywords: ['静'] }]
+    await value.saveInstructionSettings()
+    expect(save).not.toHaveBeenCalled()
+    expect(value.instructionFormError.value).toContain('2～4 个汉字')
+    value.customInstructions.value[0].keywords = ['静默', '退下', '静默']
+    await value.saveInstructionSettings()
+    expect(save).toHaveBeenLastCalledWith({ custom_instructions: [{ id: 'quiet', trigger: '要求静默', target: 'shadow', instruction: '提前静默', enabled: true, keywords: ['静默', '退下'] }] })
+    expect(value.customInstructions.value[0].keywords).toEqual(['静默', '退下'])
+    value.customInstructions.value[0].keywords = []
+    await value.saveInstructionSettings()
+    expect(value.settings.custom_instructions[0].keywords).toEqual([])
+  })
+  it('独立保存、启停和删除仅提交目标条目，不提交其它草稿', async () => {
+    const { value } = liveAdapter()
+    const first = { id: 'first', name: '', trigger: '要求静默', target: 'shadow' as const, instruction: '提前静默', enabled: true, keywords: ['静默'] }
+    const second = { ...first, id: 'second', trigger: '要求等待', instruction: '保持等待', keywords: ['等待'] }
+    value.settings.custom_instructions = structuredClone([first, second])
+    value.customInstructions.value = structuredClone([first, second])
+    value.customInstructions.value[0].name = ' 静默模式 '
+    value.customInstructions.value[1].trigger = '' // 不合法的其它草稿不阻止本条保存。
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+    expect(await value.saveInstructionEntry('first')).toBe(true)
+    expect(save.mock.calls[0][0]).toMatchObject({ custom_instructions: [{ ...first, name: '静默模式' }, second] })
+    expect(value.customInstructions.value[1].trigger).toBe('')
+    value.customInstructions.value[0].instruction = '尚未保存的目标'
+    expect(await value.toggleInstructionEntry('first', false)).toBe(true)
+    expect(save.mock.calls[1][0]).toMatchObject({ custom_instructions: [{ instruction: '提前静默', enabled: false }, second] })
+    expect(value.customInstructions.value[0].instruction).toBe('尚未保存的目标')
+    expect(await value.deleteInstructionEntry('first')).toBe(true)
+    expect(save.mock.calls[2][0]).toEqual({ custom_instructions: [second] })
+    expect(value.customInstructions.value.map(item => item.id)).toEqual(['second'])
+    expect(value.customInstructions.value[0].trigger).toBe('')
+  })
+  it('多条保存串行合并最新回执，失败保留草稿并显示条目错误', async () => {
+    const { value } = liveAdapter()
+    const first = { id: 'first', name: '', trigger: '要求静默', target: 'shadow' as const, instruction: '提前静默', enabled: true, keywords: [] }
+    const second = { ...first, id: 'second' }
+    value.settings.custom_instructions = structuredClone([first, second])
+    value.customInstructions.value = structuredClone([first, second])
+    value.customInstructions.value[0].name = '第一条'
+    value.customInstructions.value[1].name = '第二条'
+    const response = deferred<Awaited<ReturnType<typeof productApi.saveCustomInstructions>>>()
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockReturnValueOnce(response.promise)
+      .mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+    const a = value.saveInstructionEntry('first'); const b = value.saveInstructionEntry('second')
+    await flushPromises()
+    expect(save).toHaveBeenCalledTimes(1)
+    response.resolve({ settings: structuredClone(save.mock.calls[0][0]) } as never)
+    expect(await a).toBe(true); expect(await b).toBe(true)
+    expect(value.settings.custom_instructions.map(item => item.name)).toEqual(['第一条', '第二条'])
+    save.mockRejectedValueOnce(new Error('保存失败'))
+    expect(await value.toggleInstructionEntry('first', false)).toBe(false)
+    expect(value.customInstructions.value[0].enabled).toBe(true)
+    expect(value.instructionErrors.value.first).toBe('保存失败')
+    expect(value.instructionBusy.value).toEqual([])
+  })
+  it('迟到的旧读取不能回滚保存回执或污染下一条保存基线', async () => {
+    application.businessReady.value = true
+    const response = deferred<Awaited<ReturnType<typeof productApi.snapshot>>>()
+    vi.spyOn(productApi, 'snapshot').mockReturnValue(response.promise)
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+    vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+    const value = await adapter()
+    const first = { id: 'first', name: '', trigger: '要求静默', target: 'shadow' as const, instruction: '提前静默', enabled: true, keywords: [] }
+    const second = { ...first, id: 'second' }
+    value.settings.custom_instructions = structuredClone([first, second])
+    value.customInstructions.value = structuredClone([first, second])
+    const reading = value.loadSnapshot()
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+    value.customInstructions.value[0].name = '新名称'
+    expect(await value.saveInstructionEntry('first')).toBe(true)
+    response.resolve({ settings: { ...structuredClone(DEFAULT_SETTINGS), custom_instructions: [first, second] }, models: structuredClone(DEFAULT_REGISTRY) } as never)
+    await reading
+    expect(value.settings.custom_instructions[0].name).toBe('新名称')
+    expect(value.customInstructions.value[0].name).toBe('新名称')
+    value.customInstructions.value[1].name = '另一条'
+    await value.saveInstructionEntry('second')
+    expect(save.mock.calls[1][0]).toMatchObject({ custom_instructions: [{ name: '新名称' }, { name: '另一条' }] })
+  })
+  it('新建指令展开，保存校验只针对本条，取消新建不发送请求', async () => {
+    const { value } = liveControls()
+    const save = vi.spyOn(productApi, 'saveCustomInstructions')
+    value.addInstructionRow()
+    const row = value.customInstructions.value[0]
+    expect(value.instructionExpanded[row.id]).toBe(true)
+    await value.saveInstructionRow(row.id)
+    expect(value.instructionErrors.value[row.id]).toContain('触发语义')
+    expect(save).not.toHaveBeenCalled()
+    await value.deleteInstructionRow(row.id)
+    expect(value.customInstructions.value).toEqual([])
+    expect(value.instructionExpanded[row.id]).toBeUndefined()
+    expect(save).not.toHaveBeenCalled()
   })
   it('模型确认在实际应用完成前保持可见，失败后可重试', async () => {
     const response = deferred<Awaited<ReturnType<typeof productApi.applyAssignments>>>()

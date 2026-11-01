@@ -36,6 +36,18 @@ const documents = reactive(Object.fromEntries(primaryPersonaDocuments.map(item =
 const activeDocument = ref('personality')
 const currentDocument = computed(() => primaryPersonaDocuments.find(item => item.id === activeDocument.value) || primaryPersonaDocuments[0])
 const instructions = reactive(structuredClone(demoInstructions))
+const instructionExpanded = reactive<Record<string, boolean>>({}) // 每条演示指令独立展开。
+function addInstruction() {
+  const id = `instruction-${Date.now()}`
+  instructions.push({ id, name: '', trigger: '', keywords: [], target: 'voice', instruction: '', enabled: true })
+  instructionExpanded[id] = true
+}
+function saveInstruction(id: string) { instructionExpanded[id] = false; feedback('指令已保存') }
+function removeInstruction(id: string) {
+  const index = instructions.findIndex(item => item.id === id)
+  if (index >= 0) instructions.splice(index, 1)
+  delete instructionExpanded[id]
+}
 const recordingPreview = ref(false) // recordingPreview（声纹录制面板是否展开）。
 const speakerSegments = ref([0]) // speakerSegments（已完成的演示片段），初始保留一个示例。
 const speakerRecording = ref<number | null>(null) // speakerRecording（当前录制的演示片段）。
@@ -209,9 +221,9 @@ function cancelTask(item: DemoWakeTask) {
         <label class="document-editor"><span :title="`${currentDocument.path}（展示文档路径）`">{{ currentDocument.path }}（展示文档路径）</span><textarea v-model="documents[currentDocument.id]" :aria-label="`${currentDocument.label}文档内容`" spellcheck="false"></textarea></label>
       </div>
       <section class="preview-section">
-        <div class="section-row"><h3>自定义语音指令</h3><button class="ghost-action" type="button" @click="feedback('添加指令入口')">添加指令</button></div>
+        <div class="section-row"><h3>自定义语音指令</h3><button class="ghost-action" type="button" @click="addInstruction">添加指令</button></div>
         <div v-if="!instructionRows.length" class="pool-empty">还没有自定义指令。</div>
-        <InstructionEditorRow v-for="item in instructionRows" :key="item.id" :row="item" :disabled="loading" />
+        <div class="instruction-demo-list"><InstructionEditorRow v-for="item in instructionRows" :key="item.id" v-model:expanded="instructionExpanded[item.id]" :row="item" :disabled="loading" removable @save="saveInstruction(item.id)" @toggle="item.enabled = $event" @remove="removeInstruction(item.id)" /></div>
       </section>
       <section class="preview-section approval-settings-section" aria-label="授权确认">
         <div class="section-row"><h3>授权确认</h3></div>
@@ -219,7 +231,7 @@ function cancelTask(item: DemoWakeTask) {
         <label class="switch-row"><div><strong>连续提权</strong><span>先语音确认第一条授权，再自动同意后续请求。进入关键词静默或手动停止录音后结束。</span></div><input v-model="form.continuousApprovalEnabled" type="checkbox" role="switch" :disabled="loading || !form.voiceConfirmationEnabled" @change="feedback('连续提权设置已保存')"><i></i></label>
       </section>
       <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="form.experimentalContextGateEnabled" type="checkbox" role="switch"><i></i></label>
-      <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('人格与指令已保存')">{{ loading ? '正在保存…' : '保存人格与指令' }}</button></footer>
+      <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('人格资料已保存')">{{ loading ? '正在保存…' : '保存人格资料' }}</button></footer>
     </template>
 
     <template v-else-if="tab === 'speaker'">
@@ -313,6 +325,7 @@ function cancelTask(item: DemoWakeTask) {
 
 <style scoped>
 .hotword-settings-section{display:flex;flex-direction:column;gap:20px;min-width:0}
+.instruction-demo-list{display:grid;gap:12px}
 </style>
 
 <style scoped>
