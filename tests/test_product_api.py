@@ -79,6 +79,22 @@ class ProductApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_inference_endpoint_validates_shape_switches_and_reports_actual_model(self) -> None:
+        async def scenario():
+            self.runtime._credential_overrides.update({"MINIMAX_API_KEY": "synthetic-mini", "DEEPSEEK_API_KEY": "synthetic-deep"})
+            for invalid in ({}, {"backend": []}, {"backend": "unknown"}, {"backend": "minimax", "model": "custom"}):
+                response = await self._request("PUT", "/api/v1/settings/inference", json=invalid)
+                assert response.status_code == 422
+            response = await self._request("PUT", "/api/v1/settings/inference", json={"backend": "minimax"})
+            assert response.status_code == 200
+            assert response.json()["model"] == "MiniMax-M3.1-Flash"
+            snapshot = (await self._request("GET", "/api/v1/product/snapshot")).json()
+            assert snapshot["settings"]["inference"]["backend"] == "minimax"
+            assert snapshot["runtime"]["inference"]["backend"] == "minimax"
+            assert snapshot["runtime"]["inference"]["reasoning_mode_selectable"] is False
+            await self.runtime.llm.close()
+        asyncio.run(scenario())
+
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         transport = httpx.ASGITransport(app=self.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

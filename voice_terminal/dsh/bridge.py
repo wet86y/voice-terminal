@@ -282,6 +282,13 @@ class DshBridgeClient:
     async def health(self) -> dict[str, Any]:
         return await self._request("GET", "health", None)
 
+    async def sync_minimax(self, api_key: str, *, initialize: bool) -> dict[str, Any]:
+        """sync_minimax（共享凭据同步）：仅通过已认证的本机桥接传递，不返回密钥。"""
+        result = await self._request("POST", "host.minimax.sync", {"api_key": api_key, "initialize": initialize})
+        if result.get("result") != "accepted" or result.get("bootstrap_version") != 1:
+            raise DshBridgeError("MiniMax 配置同步未确认，稍后重试")
+        return result
+
     async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = str(payload.get("request_id") or uuid.uuid4())
         body = {

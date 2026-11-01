@@ -222,7 +222,7 @@ class LlmConfig:
     transport_retry_limit: int = 2
 
     def __post_init__(self) -> None:
-        if self.provider not in {"deepseek", "opencode_go", "openai_compatible"}:
+        if self.provider not in {"deepseek", "minimax", "opencode_go", "openai_compatible"}:
             raise ValueError("llm.provider must be deepseek, opencode_go, or openai_compatible")
         if self.transport not in {"chat_completions", "responses"}:
             raise ValueError("llm.transport must be chat_completions or responses")

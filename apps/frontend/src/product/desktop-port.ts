@@ -237,6 +237,7 @@ export interface DesktopEnvironmentPort {
 
 /** DesktopCredentialsPort（原生接口密钥设置）：不需要 Python（后端运行环境）。 */
 export interface DesktopCredentialsPort {
+  saveInferenceSelection?(request: { backend: import('./types').InferenceBackend }): Promise<{ backend: import('./types').InferenceBackend }> // saveInferenceSelection（启动前保存推理后端）。
   /** fixedCredentials（读取配置状态）：只返回是否已配置，不返回密钥正文。 */
   fixedCredentials(): Promise<FixedModelCredentials>
   /** saveFixedCredentials（保存固定服务密钥）：空白保留已有值，系统凭据库保存正文。 */
@@ -274,6 +275,7 @@ export function desktopPort(): DesktopPort {
     resourceInstallPlan: resourceId => call('resource_install_plan', { resource_id: resourceId }),
     downloadResource: resourceId => call<{ job_id: string }>('resource_download', { resource_id: resourceId }),
     downloadRequiredResources: () => call<{ job_id: string }>('resource_download_required'),
+    saveInferenceSelection: request => call('inference_selection_save', { request }),
     ttsSelectionStatus: () => call<TtsSelection>('tts_selection_status'),
     saveTtsSelection: request => call<TtsSelection>('tts_selection_save', { request }),
     audioEnhancements: request => call('audio_enhancements_settings', { request: request ?? null }),

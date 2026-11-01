@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 18
+PRODUCT_SETTINGS_SCHEMA_VERSION = 19
 PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
@@ -96,6 +96,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
     compute_devices["paraformer"] = paraformer_mode
     return {
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
+        "inference": {"backend": "deepseek"},  # 旧设置默认保持 DeepSeek（深度求索）。
         "audio_enhancements": config.audio_enhancements.snapshot(),
         "screen_capture": config.screen_capture.snapshot(),
         "quiet_hours": config.quiet_hours.snapshot(),
@@ -177,10 +178,12 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
             result["hotwords"] = validate_hotwords(value["hotwords"])
         except ValueError:
             result["hotwords"] = deepcopy(DEFAULT_HOTWORDS)
-    for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours", "approvals"):
+    for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours", "approvals", "inference"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
+    if not isinstance(result["inference"]["backend"], str) or result["inference"]["backend"] not in {"deepseek", "minimax"}:
+        result["inference"]["backend"] = defaults["inference"]["backend"]
     for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled"):
         if not isinstance(result["tts"].get(field), bool):
             result["tts"][field] = defaults["tts"][field]
@@ -355,6 +358,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     ):
         invalid = True
     for section_name, fields in (
+        ("inference", ("backend",)),
         ("wake", ("enabled", "keyword", "keyword_label", "keywords", "sensitivity")),
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
@@ -372,7 +376,9 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             if field not in section:
                 continue
             candidate = section[field]
-            if section_name == "approvals":
+            if section_name == "inference":
+                invalid = invalid or not isinstance(candidate, str) or candidate not in {"deepseek", "minimax"}
+            elif section_name == "approvals":
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "wake" and field == "enabled":
                 invalid = invalid or type(candidate) is not bool
@@ -500,6 +506,9 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     """Return a config overlay without changing the YAML or secret source."""
 
     from ..kws.keywords import canonical_labels, normalize_keyword_list
+    from ..inference import inference_config
+    if isinstance(settings.get("inference"), Mapping):
+        config = replace(config, llm=inference_config(config.llm, settings["inference"]["backend"]))
 
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
@@ -699,6 +708,19 @@ class ProductSettingsStore:
         if selections:
             result["tts"]["active_voice_by_model"] = selections()
         return result
+
+    @_settings_locked
+    def save_inference(self, payload: Mapping[str, Any]) -> dict:
+        if set(payload) != {"backend"} or not isinstance(payload["backend"], str) or payload["backend"] not in {"deepseek", "minimax"}:
+            raise ProductSettingsError("backend（推理后端）必须为 deepseek 或 minimax。")
+        previous = self._settings["inference"]
+        self._settings["inference"] = dict(payload)
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["inference"] = previous
+            raise
+        return dict(payload)
 
     @_settings_locked
     def save_audio_enhancements(self, payload: Mapping[str, Any]) -> dict:
@@ -1675,6 +1697,7 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
         "can_start": bool(value.get("can_start")),
         "wake_always_on": bool(value.get("wake_always_on")),
         "input_owner": value.get("input_owner"),
+        "inference": value.get("inference", {}),
         "reasoning_mode": value.get("reasoning_mode", "deep"),  # reasoning_mode（运行模式）：缺省为深度。
         "quiet_hours": {key: bool((value.get("quiet_hours") or {}).get(key))
                         for key in ("passive_quiet", "user_interaction", "within_quiet_hours")},

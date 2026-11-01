@@ -1558,10 +1558,25 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.put("/api/v1/models/credentials")
     async def save_fixed_model_credentials(body: dict[str, Any]) -> dict[str, Any]:
         try:
-            return await registry_or_404().save_fixed_credentials(body)
+            registry = registry_or_404()
+            result = await registry.save_fixed_credentials(body)
+            await runtime.refresh_provider_credentials(registry)
+            pending = getattr(runtime, "_minimax_dsh_sync_pending", False)
+            await runtime.bus.publish(runtime.snapshot())
+            return {**result, "dsh_sync_pending": pending,
+                    "message": "接口密钥已保存，后续请求使用新密钥。" + ("后台凭据同步待处理，将自动重试。" if pending else "")}
         except Exception as exc:
             registry_error(exc)
             raise AssertionError("unreachable")
+
+    @app.put("/api/v1/settings/inference")
+    async def save_inference(body: dict[str, Any]) -> dict[str, Any]:
+        if set(body) != {"backend"} or not isinstance(body.get("backend"), str) or body.get("backend") not in {"deepseek", "minimax"}:
+            raise HTTPException(status_code=422, detail="只允许 backend（推理后端）：deepseek 或 minimax。")
+        try:
+            return await runtime.switch_inference(body["backend"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/models/scan")
     async def scan_models() -> dict[str, Any]:

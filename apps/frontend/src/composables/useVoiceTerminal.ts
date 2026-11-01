@@ -79,6 +79,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const wakeAlwaysOn = ref(false)
   const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
   const quietHours = reactive({ passive_quiet: false, user_interaction: false, within_quiet_hours: false })
+  const inference = ref<import('../product/types').InferenceSnapshot | null>(null) // inference（服务端实际模型状态）。
   const reasoningMode = ref<ReasoningMode>('deep') // reasoningMode（运行模式）：默认深度，仍可切换快速。
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
@@ -865,6 +866,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (payload.input_owner === 'none' || payload.input_owner === 'kws' || payload.input_owner === 'asr') {
       inputOwner.value = payload.input_owner
     }
+    if (isRecord(payload.inference) && ['deepseek', 'minimax'].includes(String(payload.inference.backend))) inference.value = payload.inference as unknown as import('../product/types').InferenceSnapshot
     if (payload.reasoning_mode === 'fast' || payload.reasoning_mode === 'deep') reasoningMode.value = payload.reasoning_mode
     applyServices(payload.services)
     const hasCurrentTurnId = isRecord(payload.current)
@@ -1390,6 +1392,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     wakeAlwaysOn,
     inputOwner,
     quietHours,
+    inference,
     reasoningMode,
     currentTurnId,
     current,

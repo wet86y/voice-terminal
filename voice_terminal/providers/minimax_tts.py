@@ -1120,6 +1120,16 @@ class MiniMaxTtsClient:
         self._active_emotion = selected
         return selected
 
+    def update_api_key(self, api_key: str) -> None:
+        """update_api_key（更新共享密钥）：在途代继续，后续代重新建立认证连接。"""
+        if api_key == self.api_key:
+            return
+        self.api_key = api_key
+        self.invalidate_control_prewarm()
+        active = self._bidi_session
+        if active is not None and active.generation_active:
+            self._bidi_session = None  # 原连接仍由其正在执行的合成事务持有。
+
     def invalidate_control_prewarm(self) -> None:
         """同步摘除旧预热引用；异步清理仅持有摘除的对象，不能误关新预热。"""
         candidates = []

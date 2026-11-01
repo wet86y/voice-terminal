@@ -1,9 +1,11 @@
+import { demoInferenceBackend as inferenceBackend } from './inference-demo'
 import { computed, onBeforeUnmount, reactive, ref, watch, type Ref } from 'vue'
 import { formatComponentMemory, type LocalComponentCategory, type LocalComponentRow, type LocalComponentsModel, type ManagedResourceRow } from '../interface/local-components'
 import { demoComputeModels, demoSystemComponents, longIdentifier, previewRows, type PreviewScene } from './demo-data'
 
 /** useLocalComponentsDemo（本地组件样例）：状态、重试与保存均在展示内存中完成。 */
 export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (message: string) => void) {
+  const inferenceDraft = ref<'deepseek' | 'minimax'>(inferenceBackend.value) // inferenceDraft（演示后端草稿）。
   const selectedDevices = reactive<Record<string, string>>({})
   const savedDevices = reactive<Record<string, string>>({})
   const recovered = reactive(new Set<string>())
@@ -124,10 +126,11 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       sharedResource: resourceSamples.find(row => row.id === 'tts-audiocpp-runtime'),
     }
     const deepseek: LocalComponentRow = {
-      id: 'deepseek', name: 'DeepSeek 在线 API（推理接口）', category: 'inference',
+      id: 'deepseek', name: '主语音推理（在线接口）', category: 'inference',
       state: 'ready', status: '已配置', available: true, runtime: '在线 API（推理接口）',
-      description: '配置 DeepSeek 接口密钥并查询账户余额。演示界面不会连接服务或读取真实密钥。',
-      facts: [], provider: providerSettings('deepseek'),
+      description: '选择主语音推理后端；MiniMax 与在线合成共用密钥。演示界面不会读取真实密钥。',
+      facts: [{ label: '实际模型', value: inferenceBackend.value === 'minimax' ? 'MiniMax M3.1 Flash' : 'DeepSeek Flash' }], provider: providerSettings(inferenceDraft.value),
+      inference: { value: inferenceDraft.value, current: inferenceBackend.value === 'minimax' ? 'MiniMax M3.1 Flash' : 'DeepSeek Flash', change: value => { inferenceDraft.value = value }, save: async () => { inferenceBackend.value = inferenceDraft.value; feedback('演示后端已切换') } },
     }
     return [...componentRows, punctuation, tts, deepseek, hotwords]
   })

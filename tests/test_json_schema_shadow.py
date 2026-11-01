@@ -55,10 +55,10 @@ def test_decision_schema_keeps_wire_shape_without_extra_control_actions():
     }])
     assert schema["required"] == ["speak", "actions"]
     assert schema["additionalProperties"] is False
-    item = schema["properties"]["actions"]["items"]
+    item = schema["properties"]["actions"]["items"]["anyOf"][0]
     assert item["required"] == ["name", "arguments"]
     assert item["properties"]["name"]["enum"] == ["web_search"]
-    assert item["properties"]["arguments"]["properties"] == {"query": {"type": "string"}}
+    assert item["properties"]["arguments"]["properties"] == {"query": {"type": "string", "minLength": 1}}
 
 
 def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
@@ -138,20 +138,16 @@ def test_provider_schema_diagnostics_are_separate_from_local_contract():
     assert prose["content_class"] == "prose"
 
 
-def test_responses_control_text_compatibility_is_explicit_not_global():
+def test_wait_empty_text_has_the_same_contract_in_both_transports():
     raw = '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}'
-    strict_chat = SpeechDecisionEnvelopeStream()
-    strict_chat.feed(raw)
-    try:
-        strict_chat.finish()
-    except ValueError as exc:
-        assert "cannot contain text" in str(exc)
-    else:
-        raise AssertionError("the frozen Chat contract must still reject wait.text")
-
-    responses = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
-    responses.feed(raw)
-    assert responses.finish().speak == SpeechDecision("wait", "calm", "")
+    for responses_mode in (False, True):
+        parser = SpeechDecisionEnvelopeStream(allow_empty_control_text=responses_mode)
+        parser.feed(raw)
+        assert parser.finish().speak == SpeechDecision("wait", "calm", "")
+        invalid = SpeechDecisionEnvelopeStream(allow_empty_control_text=responses_mode)
+        invalid.feed(raw.replace('"text":""', '"text":"不得播报"'))
+        with pytest.raises(EnvelopeError, match="cannot contain text"):
+            invalid.finish()
 
 
 def test_stream_parser_detects_only_definitive_non_json_prefixes_after_ten_chars():
@@ -444,7 +440,8 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
         reasoning_effort="none", max_output_tokens=512,
     )
     assert payload["instructions"].startswith("rules\n\n")
-    assert "For wait set speak.text to the empty string" in payload["instructions"]
+    assert "wait（等待）时 text（文本）必须为空字符串" in payload["instructions"]
+    assert json.dumps(schema, ensure_ascii=False, separators=(",", ":")) in payload["instructions"]
     assert payload["reasoning"] == {"effort": "none"}
     assert payload["text"]["format"]["strict"] is True
     assert payload["text"]["format"]["schema"] == schema
@@ -1027,6 +1024,9 @@ def test_shadow_chain_validates_without_touching_output_or_ledger():
 def test_secondary_mailbox_shadow_actions_follow_normal_dispatch_rules():
     async def scenario():
         runtime = _runtime(SimpleNamespace())
+        from voice_terminal.agent.shadow_registry import VoiceShadowRegistry
+        runtime.registry = VoiceShadowRegistry(available=True)
+        runtime._frozen_action_definitions = None
         shadow_wakes = []
         runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
         envelope = DecisionEnvelope(

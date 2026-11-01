@@ -470,7 +470,7 @@ def check(names, lock=None, compatible_gpu=False, tensor_device=None):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','delta-plan','install','prune','check','gpu','tts-selection','compatibility-repair'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','delta-plan','install','prune','check','gpu','tts-selection','inference-selection','compatibility-repair'])
     parser.add_argument('--reset-devices', action='store_true') # reset_devices（重建环境后回退计算设备）。
     parser.add_argument('--repair-local',action='store_true') # repair_local（只重建内容损坏的已登记依赖）。
     parser.add_argument('--data') # data（当前工作区数据目录）。
@@ -489,7 +489,7 @@ def main():
         sys.path.insert(0,args.program)
         from voice_terminal.compatibility import repair
         result=repair(Path(args.program),Path(args.data),reset_devices=args.reset_devices)
-    elif args.operation=='tts-selection':
+    elif args.operation in {'tts-selection', 'inference-selection'}:
         sys.path.insert(0,args.program)
         from voice_terminal.config import load_config
         from voice_terminal.server.product import ProductSettingsStore
@@ -497,7 +497,7 @@ def main():
         local=data/'config/local.yaml'
         config=load_config(Path(args.program)/'config/default.yaml',local if local.is_file() else None)
         store=ProductSettingsStore(path=data/'config/product-settings.json',config=config)
-        result=store.save_tts_local_model(json.loads(args.selection))
+        result=(store.save_inference(json.loads(args.selection)) if args.operation == 'inference-selection' else store.save_tts_local_model(json.loads(args.selection)))
     elif args.operation=='interpreter': result=interpreter()
     elif args.operation=='reuse': result=reuse(runtime_lock(args.lock,args.gpu_lock),names,Path(args.target))
     elif args.operation=='inventory': result=inventory(names,runtime_lock(args.lock,args.gpu_lock),args.compatible_gpu)

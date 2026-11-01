@@ -215,7 +215,7 @@ onBeforeUnmount(() => {
         </button>
       </footer>
     </aside>
-    <section ref="voiceColumn" class="system-column panel" :class="{ 'session-active': sessionActive }" :data-voice-state="model.state" aria-labelledby="voice-panel-title">
+    <section ref="voiceColumn" class="system-column panel" :class="{ 'session-active': sessionActive, 'fixed-inference': model.modeVisible === false }" :data-voice-state="model.state" aria-labelledby="voice-panel-title">
       <header class="voice-heading">
         <div class="voice-heading-row">
           <h2 id="voice-panel-title" class="panel-kicker">语音助手</h2>
@@ -265,7 +265,7 @@ onBeforeUnmount(() => {
             <small v-if="model.latencyPending && !sessionActive">等待开始播报</small>
           </div>
           <Transition name="voice-mode">
-            <section v-if="!sessionActive" class="mode-picker" title="切换模式后将在下一轮对话生效">
+            <section v-if="!sessionActive && model.modeVisible !== false" class="mode-picker" title="切换模式后将在下一轮对话生效">
               <div class="section-row"><span>运行模式</span></div>
               <div class="mode-options">
                 <button

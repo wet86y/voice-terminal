@@ -11,6 +11,7 @@ const saveError = ref('') // saveError（保存密钥时的错误）。
 const notice = ref('') // notice（保存结果说明）。
 const name = computed(() => props.model.provider === 'deepseek' ? 'DeepSeek' : 'MiniMax')
 watch(() => props.model.configured, value => { configured.value = value })
+watch(() => props.model.provider, () => { draft.value = ''; saveError.value = ''; notice.value = ''; configured.value = props.model.configured })
 
 async function save() {
   if (saving.value || props.model.disabled || !draft.value.trim()) return
@@ -40,7 +41,7 @@ async function save() {
         <label class="form-field"><span>{{ name }} API Key（接口密钥）</span><input v-model="draft" type="password" autocomplete="new-password" spellcheck="false" :disabled="model.disabled || saving" :placeholder="configured ? '已配置，填写可更新' : '填写接口密钥'" /></label>
         <button class="save-button" type="button" :disabled="model.disabled || saving || !draft.trim()" @click="save">{{ saving ? '正在保存…' : '保存密钥' }}</button>
       </div>
-      <small class="provider-settings-hint">留空保留已有密钥；{{ model.provider === 'deepseek' ? '保存后供推理服务使用。' : '保存后可作为语音合成的在线方式。' }}</small>
+      <small class="provider-settings-hint">留空保留已有密钥；{{ model.provider === 'deepseek' ? '保存后供推理服务使用。' : '与主语音推理、在线语音合成共用；任一处保存即可。' }}</small>
       <p v-if="notice" class="provider-settings-message notice" role="status">{{ notice }}</p>
       <p v-if="saveError" class="provider-settings-message error" role="alert">{{ saveError }}</p>
     </div>

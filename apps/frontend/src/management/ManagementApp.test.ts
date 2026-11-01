@@ -14,6 +14,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   let wrapper: VueWrapper | undefined
   let inventory: ResourceStatus[]
   let jobs: ResourceJob[]
+  let inferenceBackend: 'deepseek' | 'minimax' // inferenceBackend（启动时选定供应方）。
   let configured: { deepseek: boolean; minimax: boolean } // configured（固定接口配置状态）。
   let resourceEvent: ((event: { payload: ResourceJob }) => void) | undefined
   const start = vi.fn()
@@ -40,6 +41,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   beforeEach(() => {
     inventory = [row('voice-server', 'Voice Server（语音服务）'), row('paraformer-streaming', 'Paraformer（流式识别）'), row('emotion2vec-plus-base', 'emotion2vec+ base（情绪背景）')]
     jobs = []
+    inferenceBackend = "deepseek"
     configured = { deepseek: true, minimax: true }
     saveCredentials.mockReset().mockImplementation(async (request: { deepseek_api_key: string; minimax_api_key: string }) => {
       configured = { deepseek: configured.deepseek || Boolean(request.deepseek_api_key?.trim()), minimax: configured.minimax || Boolean(request.minimax_api_key?.trim()) }
@@ -65,7 +67,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
       resourceInstallPlan: resourcePlan,
       downloadResource: download,
       startVoiceService: start,
-      fixedCredentials: async () => ({ providers: { deepseek: { configured: configured.deepseek }, minimax: { configured: configured.minimax } }, vault_available: true }),
+      saveInferenceSelection: async (request: { backend: "deepseek" | "minimax" }) => { inferenceBackend = request.backend; return { backend: inferenceBackend } },
+      fixedCredentials: async () => ({ inference_backend: inferenceBackend, providers: { deepseek: { configured: configured.deepseek }, minimax: { configured: configured.minimax } }, vault_available: true }),
       saveFixedCredentials: saveCredentials,
       listen: async (name: string, handler: typeof resourceEvent) => {
         if (name === desktop.RESOURCE_PROGRESS_EVENT) resourceEvent = handler
@@ -84,6 +87,22 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     await wrapper.get('button[aria-label="返回工作台"]').trigger('click')
     expect(wrapper.text()).toContain('全部组件完备后再启动')
+    expect(start).not.toHaveBeenCalled()
+  })
+
+  it('仅有 MiniMax 密钥时，启动前选择 MiniMax 即可通过推理与在线合成门禁', async () => {
+    inventory = inventory.map(item => ({ ...item, can_start: true, files_installed: true, runtime_ready: true }))
+    configured = { deepseek: false, minimax: true }
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    const provider = await expandComponent('deepseek', 'inference')
+    await provider.get('select[id="inference-deepseek"]').setValue('minimax')
+    expect(provider.get('.provider-settings-detail').attributes('data-provider')).toBe('minimax')
+    expect(inferenceBackend).toBe('deepseek')
+    await provider.get('.local-device-editor button').trigger('click'); await flushPromises()
+    expect(inferenceBackend).toBe('minimax')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
     expect(start).not.toHaveBeenCalled()
   })
 
@@ -588,7 +607,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     const provider = await expandComponent('deepseek', 'inference')
     const input = provider.get<HTMLInputElement>('.provider-key-settings input')
     await input.setValue('test-draft-key')
-    await provider.get('.save-button').trigger('click')
+    await provider.get('.provider-key-settings .save-button').trigger('click')
     await flushPromises()
     expect(wrapper.get('[data-error-source="audio-enhancements"]').text()).toContain('音频增强设置暂不可用')
     expect(wrapper.get('[data-error-source="credentials"]').text()).toContain('系统凭据存储不可用')

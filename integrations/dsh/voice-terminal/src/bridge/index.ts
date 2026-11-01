@@ -13,7 +13,7 @@ import { registerVoiceImageSummaryGuard } from './images.js'
 import type { Binding, Config } from './contracts.js'
 export type { Config } from './contracts.js'
 export const name = BRIDGE_NAME
-export const inject = ['webServer', 'agents', 'sessions', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'llm', 'attachments', 'sessionTitle', 'settings', 'workspaceRegistry', 'loader', 'approval', 'jobs']
+export const inject = ['webServer', 'agents', 'sessions', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'llm', 'attachments', 'sessionTitle', 'settings', 'credentials', 'workspaceRegistry', 'loader', 'approval', 'jobs']
 
 export function apply(ctx: Context, config: Config): void {
   if (!TOKEN) throw new Error('VOICE_DSH_BRIDGE_TOKEN is required')

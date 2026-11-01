@@ -42,7 +42,7 @@ const providerUsageRevision = ref(0) // providerUsageRevision（密钥更新后�
 const categoryDefinitions: Array<{ id: LocalComponentCategory; title: string; description: string }> = [
   { id: 'speech', title: '语音识别', description: '语音活动检测、转写、轮次判断与流式标点' },
   { id: 'tts', title: '语音合成', description: '本地 VoxCPM 模型或 MiniMax 在线 API（程序接口）' },
-  { id: 'inference', title: '推理执行', description: 'DeepSeek 在线推理服务与 DSH 执行组件' },
+  { id: 'inference', title: '推理执行', description: '主语音在线推理与 DSH（后台执行宿主）组件' },
   { id: 'extensions', title: '拓展组件', description: '唤醒词、声纹、情绪背景、声学事件与热词修订' },
   { id: 'voice-server', title: 'Voice Server（语音服务）', description: '独立管理桌面语音运行环境' },
 ]
@@ -536,7 +536,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
               <div class="local-component-summary">
                 <div class="local-component-body">
                   <div class="local-component-identity" :class="{ 'has-provider-usage': Boolean(row.provider) }">
-                    <div class="local-component-name"><h4 :title="row.name">{{ row.name }}</h4><small v-if="row.category === 'voice-server' && row.resource?.required === false">可选运行依赖，不阻塞基础语音服务</small></div>
+                    <div class="local-component-name"><h4 :title="row.name">{{ row.name }}</h4><small v-if="row.inference">{{ row.inference.current }}<template v-if="row.inference.pending"> · 待切换：{{ row.inference.pending }}</template></small><small v-if="row.category === 'voice-server' && row.resource?.required === false">可选运行依赖，不阻塞基础语音服务</small></div>
                     <div class="local-component-state-group">
                       <FixedProviderUsage v-if="row.provider" class="local-component-provider-usage" :model="row.provider" :refresh-key="providerUsageRevision" />
                       <span class="local-state" :class="job ? jobState(job) : rowState(row)"><i aria-hidden="true"></i>{{ job ? jobStateLabel(job) : rowStatus(row) }}</span>
@@ -597,7 +597,12 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   <dl v-if="resourceRuntimeFacts(row.sharedResource).length" class="local-resource-versions"><div v-for="fact in resourceRuntimeFacts(row.sharedResource)" :key="fact.label"><dt>{{ fact.label }}</dt><dd :title="fact.value">{{ fact.value }}</dd></div></dl>
                   <p v-if="row.sharedResource.error && !rowHasActiveJob(row)" class="local-error" role="status">{{ row.sharedResource.error }}</p>
                 </section>
-                <FixedProviderSettings v-if="row.provider" :model="row.provider" @saved="refreshProviderUsage" />
+                <div v-if="row.inference" class="local-device-editor">
+                  <label :for="`inference-${row.id}`"><span>后端模型</span><select :id="`inference-${row.id}`" :value="row.inference.value" :disabled="row.inference.disabled" @change="row.inference.change(($event.target as HTMLSelectElement).value as 'deepseek' | 'minimax')"><option value="deepseek">DeepSeek Flash</option><option value="minimax">MiniMax M3.1 Flash</option></select></label>
+                  <button class="save-button" type="button" :disabled="row.inference.disabled" @click="row.inference.save()">{{ row.inference.disabled ? '等待切换' : '保存' }}</button>
+                  <small>当前{{ row.inference.current }}<template v-if="row.inference.pending"> · 待切换：{{ row.inference.pending }}</template></small>
+                </div>
+                <FixedProviderSettings v-if="row.provider" :key="row.provider.provider" :model="row.provider" @saved="refreshProviderUsage" />
                 <p v-if="!job && row.resource && needsResource(row) && !row.resource.error" class="local-resource-hint" role="status">{{ row.resource.required === false ? '可选组件；缺失或待更新不阻塞启动。' : '资源缺失或需要更新，可通过分类卡片中的下载操作处理。' }}</p>
                 <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
                 <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>

@@ -1015,6 +1015,9 @@ time {
 .voice-controls > .mode-picker {
   grid-area: mode;
 }
+.fixed-inference:not(.session-active) .voice-controls {
+  grid-template-areas: 'action' 'reset' 'latency';
+}
 .session-active .voice-controls {
   grid-template-columns: minmax(0, 1fr) 104px;
   grid-template-areas: 'action latency';

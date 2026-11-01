@@ -1,3 +1,14 @@
+/** InferenceBackend（主语音推理供应方标识）。 */
+export type InferenceBackend = 'deepseek' | 'minimax'
+/** InferenceSnapshot（实际使用的模型及请求边界切换进度）。 */
+export interface InferenceSnapshot {
+  dsh_sync_pending?: boolean // dsh_sync_pending（后台共享凭据待同步）。
+  backend: InferenceBackend // backend（已生效后端）。
+  model: string // model（已生效模型标识）。
+  pending_backend: InferenceBackend | null // pending_backend（等待当前逻辑请求结束的后端）。
+  reasoning_effort: string // reasoning_effort（有效思考强度）。
+  reasoning_mode_selectable: boolean // reasoning_mode_selectable（能否选择运行模式）。
+}
 export const TERMINAL_STATES = [
   'STARTING',
   'IDLE',
@@ -224,6 +235,7 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  inference?: InferenceSnapshot // inference（当前实际模型及切换状态）。
   runtime_operations?: import('./runtime/runtime-operations').RuntimeOperation[] // 运行操作快照。
   input_paused?: boolean // input_paused（维护操作暂时停听）。
   listening_requested?: boolean // listening_requested（维护结束后的监听意图）。
