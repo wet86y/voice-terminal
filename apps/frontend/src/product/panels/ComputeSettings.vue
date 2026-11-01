@@ -122,6 +122,7 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
     required: resource.required !== false,
     ready: resource.can_start === true,
     installedVersion: resource.installed_version,
+    resetAvailable: resource.reset_available,
     targetVersion: resource.resource_id === 'voice-server' || resource.resource_id === 'dsh' ? undefined : resource.version,
     error: resource.error || (failed ? jobs.at(-1)?.error : undefined) || undefined,
     retryable: failed,

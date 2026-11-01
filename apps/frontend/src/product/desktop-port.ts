@@ -23,6 +23,8 @@ export interface WorkspaceChoice {
 
 /** ResourceStatus（独立资源状态）：与运行进程及内存采样分开。 */
 export interface ResourceStatus {
+  reset_available?: boolean // reset_available（维护异常允许手动重置）。
+  reset_reason?: string | null // reset_reason（中文重置原因）。
   /** runtime_components（语音服务下的三个运行依赖卡片），parent_resource_id（所属组件编号）。 */
   runtime_components?: ResourceStatus[]
   parent_resource_id?: string
@@ -55,6 +57,9 @@ export interface ResourceStatus {
 
 /** ResourceJob（资源任务）：下载、导入及取消状态的桌面事件负载。 */
 export interface ResourceJob {
+  operation?: 'install' | 'reset' // operation（安装或用户确认的重置）。
+  first_error?: string | null // first_error（本轮首次错误）。
+  failure_resource_id?: string | null // failure_resource_id（实际失败的依赖组件）。
   /** recovery（组件共用恢复结果）：普通传输／占用错误与内容一致性异常分别引导。 */
   recovery?: ComponentRecovery | null
   /** created_at（本次任务创建时间，毫秒）与 revision（状态修订号）：拒绝迟到的快照和旧重试事件。 */
@@ -166,6 +171,8 @@ export interface DesktopWorkspacePort {
   saveTtsSelection?(request: TtsSelection): Promise<TtsSelection> // saveTtsSelection（仅保存，不启动）。
   audioEnhancements?(request?: Record<string, boolean>): Promise<{ dual_pass: boolean; emotion: boolean; acoustic_events: boolean }> // audioEnhancements（启动前读取或保存音频增强）。
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
+  resourceResetPlan(resourceId: string): Promise<{ resource_id: string; paths: string[]; token: string; message: string }> // resourceResetPlan（读取重置确认范围）。
+  resetResource(resourceId: string, token: string): Promise<{ job_id: string }> // resetResource（确认并删除受管组件）。
   importResource(resourceId?: string): Promise<{ job_id: string }>
   /** resource_open_source（打开上游）：由原生宿主打开资源来源页面。 */
   openResourceSource(resourceId: string): Promise<void>
@@ -279,6 +286,8 @@ export function desktopPort(): DesktopPort {
     ttsSelectionStatus: () => call<TtsSelection>('tts_selection_status'),
     saveTtsSelection: request => call<TtsSelection>('tts_selection_save', { request }),
     audioEnhancements: request => call('audio_enhancements_settings', { request: request ?? null }),
+    resourceResetPlan: resourceId => call('resource_reset_plan', { resource_id: resourceId }),
+    resetResource: (resourceId, token) => call('resource_reset', { resource_id: resourceId, token }),
     importResource: resourceId => call<{ job_id: string }>('resource_import', resourceId === undefined ? undefined : { resource_id: resourceId }),
     openResourceSource: resourceId => call('resource_open_source', { resource_id: resourceId }),
     cancelResource: jobId => call('resource_cancel', { job_id: jobId }),

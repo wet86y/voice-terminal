@@ -326,6 +326,18 @@ pub fn repair_with_activation(context:&LaunchContext,group:&str,cancel:Arc<Atomi
     configure_inner(context,group,cancel,progress,true,true,enable)
 }
 fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool,repair:bool,enable:&mut resources::Activation)->Result<Vec<String>,String>{
+    // report（本轮报告）：即使规划尚未生成，也替换上一次成功记录。
+    let report_path=context.install.join("cache/reports/runtime-update-latest.json");
+    let mut report=json!({"state":"preparing","group":group,"fields":{"state":"本轮运行环境操作状态","group":"请求的依赖组","error":"本轮最终错误"}});
+    let _=atomic_json(&report_path,&report);
+    let result=configure_inner_reported(context,group,cancel.clone(),progress,allow_reuse,repair,enable);
+    if let Ok(value)=resources::load(&report_path){report=value;}
+    report["state"]=json!(if result.is_ok(){"complete"}else if cancel.load(std::sync::atomic::Ordering::Acquire){"cancelled"}else{"failed"});
+    if let Err(error)=&result{report["error"]=json!(error);}
+    if let Err(error)=atomic_json(&report_path,&report){eprintln!("运行环境诊断写入失败：{error}");}
+    result
+}
+fn configure_inner_reported(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool,repair:bool,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     resources::check_cancel(&cancel)?;progress("检查现有语音环境登记",0,0);
     let old=safe_path(&context.install,"runtimes/python")?;
     safe_path(&old,"python.exe")?;
@@ -492,6 +504,15 @@ mod tests {
         let context=LaunchContext::portable(&root).unwrap();(owner,root,context)
     }
 
+    #[test]
+    fn planning_failure_replaces_stale_success_report_without_downloading(){
+        let(owner,root,context)=runtime_workspace();
+        let report=root.join("cache/reports/runtime-update-latest.json");atomic_json(&report,&json!({"state":"complete","main":{"install":["old"]}})).unwrap();
+        atomic_json(&root.join("app/config/runtime/voice-gpu.lock.json"),&json!({"schema":1,"profile":"invalid","wheels":[]})).unwrap();
+        assert!(configure_with_activation(&context,"gpu",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_,_|panic!("规划失败不能启用组件")).is_err());
+        let result=resources::load(&report).unwrap();assert_eq!(result["state"],"failed");assert!(result["error"].as_str().unwrap().contains("显卡依赖锁"));assert!(result.get("main").is_none());assert!(!root.join("cache/dependencies").exists());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
     #[test]
     fn dependency_cards_require_only_cpu_and_missing_optional_locks_do_not_block_cpu(){
         let (owner,root,context)=runtime_workspace();

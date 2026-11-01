@@ -503,3 +503,16 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     wrapper.unmount()
   })
 })
+
+it('组件维护异常将导入替换为重置，清除资格后恢复导入', async () => {
+  const base = model(); base.rows[0]!.resource!.resetAvailable = true
+  const wrapper = mount(LocalComponents, { props: { model: base } })
+  await expandCategory(wrapper, 'voice-server')
+  const reset = wrapper.get('button[aria-label="Voice Server（语音服务）：重置"]')
+  await reset.trigger('click')
+  expect(wrapper.emitted('resourceImport')?.[0]).toEqual(['voice-server'])
+  const cleared = model(); cleared.rows[0]!.resource!.state = 'missing'
+  await wrapper.setProps({ model: cleared })
+  expect(wrapper.find('button[aria-label="Voice Server（语音服务）：导入"]').exists()).toBe(true)
+  wrapper.unmount()
+})

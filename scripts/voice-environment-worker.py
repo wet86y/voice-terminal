@@ -282,6 +282,21 @@ def delta_plan(root, lock, names, compatible_gpu=False, legacy=None, want_overla
                         if hashlib.file_digest(stream,'sha256').hexdigest()!=row['sha256']: broken.add(row['path'])
             except FileNotFoundError: broken.add(row['path'])
     unclaimed=set(broken)
+    # collection（登记集合）：旧记录的缺字段及空值等同未登记，错误类型明确拒绝。
+    def collection(name, expected, fallback):
+        value = record.get(name)
+        if value is None:
+            return fallback
+        if not isinstance(value, expected):
+            raise ValueError('运行环境登记字段格式无效：' + name)
+        if expected is dict and any(not isinstance(key, str) or not isinstance(item, dict) for key, item in value.items()):
+            raise ValueError('运行环境依赖回执格式无效：' + name)
+        if expected is list and any(not isinstance(item, str) for item in value):
+            raise ValueError('运行环境包清单格式无效：' + name)
+        return value
+    main_receipts = collection('package_receipts', dict, {})
+    overlay_receipts = collection('cpu_overlay_receipts', dict, {})
+    old_packages = collection('packages', list, list(legacy.get('main', {})))
 
     def scope(relative, wanted, receipts, old_names, allow_gpu, historical):
         site = safe(root, relative)
@@ -399,18 +414,18 @@ def delta_plan(root, lock, names, compatible_gpu=False, legacy=None, want_overla
                 'delete': sorted(deletes), 'receipts': identities}
 
     wanted = [row for row in lock['wheels'] if row['name'] in names]
-    main = scope('Lib/site-packages', wanted, record.get('package_receipts', {}), record.get('packages', legacy.get('main', {}).keys()), compatible_gpu, legacy.get('main', {}))
+    main = scope('Lib/site-packages', wanted, main_receipts, old_packages, compatible_gpu, legacy.get('main', {}))
     overlay = None
     if want_overlay or record.get('gpu_profile') or record.get('compatible_gpu') or record.get('profile') == 'cu128':
         base = lock.get('cpu_wheels', lock['wheels'])
         overlay_names = {'torch', 'torchaudio'}
         if any(safe(root, 'Lib/site-packages').glob('onnxruntime_gpu-*.dist-info')):
             overlay_names.add('onnxruntime')
-        old_overlay = set(record.get('cpu_overlay_receipts', {}))
+        old_overlay = set(overlay_receipts)
         if not old_overlay:
             old_overlay = {canonical(d.metadata['Name']) for d in metadata.distributions(path=[str(safe(root, 'Lib/cpu-packages'))])}
         overlay = scope('Lib/cpu-packages', [r for r in base if r['name'] in overlay_names],
-                        record.get('cpu_overlay_receipts', {}), old_overlay, False, legacy.get('overlay', {}))
+                        overlay_receipts, old_overlay, False, legacy.get('overlay', {}))
     if unclaimed: raise ValueError('解释器或结构性文件损坏，无法安全局部重建，需要完整性校验：'+next(iter(sorted(unclaimed))))
     return {'main': main, 'overlay': overlay}
 
@@ -523,4 +538,4 @@ def main():
 
 if __name__=='__main__':
     try: main()
-    except Exception as error: emit({'ok':False,'error':str(error)[:500]});sys.exit(1)
+    except Exception as error: emit({'ok':False,'error':f'{type(error).__name__}: {error}'[:500]});sys.exit(1)

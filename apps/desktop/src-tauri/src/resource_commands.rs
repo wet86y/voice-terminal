@@ -40,6 +40,8 @@ struct JobSnapshot {
     download_total_bytes: Option<u64>, // download_total_bytes（资源下载总字节）。
     verification_completed_bytes: Option<u64>, // verification_completed_bytes（摘要校验已处理字节）。
     verification_total_bytes: Option<u64>, // verification_total_bytes（摘要校验总字节）。
+    failure_resource_id: Option<String>, // failure_resource_id（本轮实际失败的依赖组件）。
+    first_error: Option<String>, // first_error（本轮首次错误，自动恢复不能覆盖）。
     error: Option<String>, // error（安全错误说明）。
     can_cancel: bool, // can_cancel（当前是否可取消）。
     installed_resources: Vec<String>, // installed_resources（本次安装资源编号）。
@@ -104,6 +106,7 @@ pub struct ResourceManager {
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
     tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
+    resetting: AtomicBool, // resetting（重置独占准入）。
     batch_active: AtomicBool, // batch_active（一键维护中）：整批结束后才恢复服务。
     accepting_jobs: AtomicBool, // accepting_jobs（接受新任务）：迁移排空前原子关闭，防止排空后再写旧工作区。
     validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
@@ -138,10 +141,12 @@ impl ResourceManager {
             tts_runtime: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
             resume_pending: Mutex::new(false),
+            resetting: AtomicBool::new(false),
             batch_active: AtomicBool::new(false),
             accepting_jobs: AtomicBool::new(true),
             validation_failures:Mutex::new(HashMap::new()),
         };
+        for job in manager.snapshots(){if job["state"]=="failed"&&job["recovery"]["state"]!="resolved"{if let (Some(id),Some(reason))=(job["failure_resource_id"].as_str().or_else(||job["resource_id"].as_str()),job["error"].as_str()){voice_desktop_common::component_reset::fault(&manager.context,id,reason)?;}}}
         manager.persist_jobs()?;
         Ok(manager)
     }
@@ -149,6 +154,8 @@ impl ResourceManager {
     /// Inventory（资源清单）：normalize the Python resource result for the frontend.
     pub fn inventory(&self) -> Result<Vec<Value>, String> {
         voice_desktop_common::compatibility::inventory_with(&self.context, |rows| {
+        if let Some(record)=voice_desktop_common::component_maintenance::load(&self.context)?{for issue in record["issues"].as_array().into_iter().flatten(){if issue["content_failure"]==true{if let (Some(id),Some(reason))=(issue["resource_id"].as_str(),issue["reason"].as_str()){voice_desktop_common::component_reset::fault(&self.context,id,reason)?;}}}}
+        voice_desktop_common::component_reset::apply(&self.context,rows)?;
         let failures=self.validation_failures.lock().map_err(|_|"组件校验状态不可用。")?;
         for row in rows.iter_mut(){if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
             row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
@@ -169,19 +176,43 @@ impl ResourceManager {
     }
 
     pub fn context(&self)->LaunchContext {self.context.clone()}
+    fn reset_resource(self:&Arc<Self>,resource_id:String,token:String)->Result<Value,String>{
+        let plan=voice_desktop_common::component_reset::plan(&self.context,&resource_id)?;
+        if plan["token"]!=token&&voice_desktop_common::component_reset::pending(&self.context)?.is_none(){return Err("重置范围已变化，请重新确认。".into());}
+        {let jobs=self.jobs.lock().map_err(|_|"任务状态不可用")?;if jobs.values().any(|j|!terminal(&j.snapshot.state))||self.resetting.swap(true,Ordering::AcqRel){return Err("请等待当前组件任务完成。".into());}}
+        let job_id=format!("reset-{resource_id}");
+        let result=self.start_job(job_id.clone(),resource_id.clone(),"准备重置组件".into(),false,move|manager,id|{
+            let result=(||{
+                let mut lease=manager.pause_service()?;
+                manager.remember_service_was_running(lease.was_running())?;
+                lease.keep_stopped();
+                let removed=voice_desktop_common::component_reset::execute(&manager.context,&resource_id,&token,&mut|phase,done,total|manager.set_phase(&id,phase,false,done,if total==0{None}else{Some(total)}))?;
+                if let Ok(mut failures)=manager.validation_failures.lock(){for resource in &removed{failures.remove(resource);}}
+                let old=manager.snapshots();for job in old{if job["job_id"]!=id&&removed.iter().any(|r|job["resource_id"]==*r){if let Some(key)=job["job_id"].as_str(){manager.update_job(key,|row|row.recovery=Some(json!({"event":"reset","state":"resolved","next_action":"none","message":"组件已重置，等待下载或导入。"})));}}}
+                if removed.len()==1{manager.maybe_resume_service(&mut lease)?;}
+                Ok(vec![])
+            })();
+            manager.resetting.store(false,Ordering::Release);
+            result.map_err(|message|JobError::Failed{message,installed:vec![]})
+        });
+        if result.is_err(){self.resetting.store(false,Ordering::Release);}result?;Ok(json!({"job_id":job_id}))
+    }
+
     pub fn record_recovery_failure(&self,reason:&str)->Result<(),String>{
         use voice_desktop_common::component_recovery::{self,Event};
+        if let Err(error)=voice_desktop_common::component_reset::transaction_fault(&self.context,reason){eprintln!("组件事务重置资格未能保存：{error}");}
         let event=component_recovery::classify(reason);let routine=matches!(event,Event::FileBusy|Event::Space|Event::Permission);
-        let mut recovery=component_recovery::guidance(if routine{event}else{Event::Consistency},false);
+        let mut recovery=component_recovery::guidance(event,false);
         if routine{recovery["next_action"]=json!("restart");recovery["message"]=json!(format!("{} 处理后请重新打开程序，启动时将自动恢复本次事务。",recovery["message"].as_str().unwrap_or("请解决当前问题。")));}
-        let snapshot=JobSnapshot{job_id:"component-recovery".into(),resource_id:"maintenance".into(),state:"failed".into(),phase:if routine{"组件事务等待占用或环境问题解除"}else{"组件事务需要全面完整性校验"}.into(),progress_kind:"waiting".into(),attempt:1,parent_job_id:None,
-            completed_bytes:0,total_bytes:None,download_completed_bytes:None,download_total_bytes:None,verification_completed_bytes:None,verification_total_bytes:None,error:Some(reason.into()),can_cancel:false,installed_resources:vec![],import_preview:None,created_at:unix_millis(),revision:1,
+        let snapshot=JobSnapshot{job_id:"component-recovery".into(),resource_id:"maintenance".into(),state:"failed".into(),phase:if routine{"组件事务等待占用或环境问题解除"}else if event==Event::Unknown{"组件事务恢复失败，可重试或重置已确认组件"}else{"组件事务需要全面完整性校验"}.into(),progress_kind:"waiting".into(),attempt:1,parent_job_id:None,
+            completed_bytes:0,total_bytes:None,download_completed_bytes:None,download_total_bytes:None,verification_completed_bytes:None,verification_total_bytes:None,failure_resource_id:None,first_error:Some(reason.into()),error:Some(reason.into()),can_cancel:false,installed_resources:vec![],import_preview:None,created_at:unix_millis(),revision:1,
             recovery:Some(recovery)};
         self.jobs.lock().map_err(|_|"资源任务状态不可用")?.insert(snapshot.job_id.clone(),JobControl{snapshot,cancel:Arc::new(AtomicBool::new(false)),child:None,last_event:Instant::now(),last_persist:Instant::now()});
         self.persist_jobs()
     }
     /// resume_maintenance（承接主动完整性维修）：管理页挂载后复用既有资源任务。
     pub fn resume_maintenance(self:&Arc<Self>)->Result<(),String>{
+        if let Some(pending)=voice_desktop_common::component_reset::pending(&self.context)?{return self.reset_resource(pending["resource_id"].as_str().ok_or("重置记录缺少组件编号")?.into(),pending["token"].as_str().unwrap_or("").into()).map(|_|());}
         let targets=voice_desktop_common::component_maintenance::pending_requests(&self.context)?;
         if targets.is_empty(){return Ok(());}
         self.start_job("repair-components".into(),"required-batch".into(),"修复完整性校验发现的组件问题".into(),true,move|manager,parent|{
@@ -418,7 +449,7 @@ impl ResourceManager {
         let mut installed=vec![];
         for attempt in 1..=3{
             if self.cancelled(id){return Err(JobError::Cancelled);}
-            self.update_job(id,|row|{row.attempt=attempt;row.can_cancel=true;row.progress_kind="waiting".into();row.completed_bytes=0;row.total_bytes=None;
+            self.update_job(id,|row|{row.attempt=attempt;row.failure_resource_id=None;row.can_cancel=true;row.progress_kind="waiting".into();row.completed_bytes=0;row.total_bytes=None;
                 row.download_completed_bytes=None;row.download_total_bytes=None;row.verification_completed_bytes=None;row.verification_total_bytes=None;});
             let recovered=if attempt>1&&self.context.install.join("tmp/native-install.json").exists(){self.recover_pending_transaction()}else{Ok(())};
             let outcome=recovered.map_err(|message|JobError::Failed{message,installed:vec![]}).and_then(|_|voice_desktop_common::download::with_attempt(Some(attempt),&mut operation));
@@ -426,6 +457,7 @@ impl ResourceManager {
                 Ok(mut result)=>{installed.append(&mut result);installed.sort();installed.dedup();return Ok(installed);},
                 Err(JobError::Failed{message,installed:partial})=>{
                     installed.extend(partial);
+                    self.update_job(id,|row|{if row.first_error.is_none(){row.first_error=Some(message.clone());}});
                     let event=voice_desktop_common::component_recovery::classify(&message);
                     if !voice_desktop_common::component_recovery::automatic(event,attempt){return Err(JobError::Failed{message,installed});}
                     let guidance=voice_desktop_common::component_recovery::guidance(event,true);
@@ -615,7 +647,7 @@ impl ResourceManager {
         };
         // dependency_group（依赖组）模型先核对共享环境登记，仅有依赖变更时配置增量，再下载模型文件。
         let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
-            .map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:vec![]}})?;
         let item=voice_desktop_common::resources::spec(&self.context,resource_id)
             .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
         if let Some(shared)=item["runtime_resource"].as_str().filter(|_| !matches!(resource_id,"tts-voxcpm1"|"tts-voxcpm2")){
@@ -643,7 +675,7 @@ impl ResourceManager {
         };
         if let Some(id)=resource_id.as_deref(){
             let dependencies=self.configure_resource_dependencies(job_id,id,self.cancel_signal(job_id)?,&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+                .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:installed.clone()}})?;
             installed.extend(dependencies);
         }
         for source in sources {
@@ -884,11 +916,23 @@ impl ResourceManager {
         voice_desktop_common::resources::check_cancel(&cancel)?;
         // 共享环境统一由运行依赖入口按登记和已知故障判断复用，不为进程内缓存遍历文件树。
         let repairing=self.jobs.lock().map_err(|_|"资源任务状态不可用")?.get(job_id).is_some_and(|job|job.snapshot.attempt>1&&job.snapshot.recovery.as_ref().is_some_and(|state|state["state"]=="repairing"));
+        let outcome=(||{
         let result=if repairing{voice_desktop_common::runtime::repair_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}
             else{voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}?;
         voice_desktop_common::compatibility::finish_deferred_settings(&self.context,&cancel)?;
         voice_desktop_common::resources::check_cancel(&cancel)?;
-        Ok(result)
+        Ok::<Vec<String>,String>(result)
+        })();
+        let report_path=self.context.install.join("cache/reports/runtime-update-latest.json");
+        if let Ok(mut report)=voice_desktop_common::resources::load(&report_path){
+            report["job_id"]=json!(job_id);
+            report["fields"]["job_id"]=json!("创建本轮运行环境操作的资源任务编号");
+            report["fields"]["phase"]=json!("任务最后到达的阶段");
+            if let Some(row)=self.jobs.lock().ok().and_then(|jobs|jobs.get(job_id).map(|job|job.snapshot.clone())){report["phase"]=json!(row.phase);}
+            if let Err(error)=&outcome{report["state"]=json!(if cancel.load(Ordering::Acquire){"cancelled"}else{"failed"});report["error"]=json!(error);}
+            if let Err(error)=voice_desktop_common::workspace::atomic_json(&report_path,&report){eprintln!("运行环境任务报告写入失败：{error}");}
+        }
+        outcome
     }
 
     fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
@@ -899,12 +943,14 @@ impl ResourceManager {
     // start_child_job（任务准入）：在同一状态锁内预留批量任务，并只放行所属子任务。
     fn start_child_job<F>(self:&Arc<Self>,job_id:String,resource_id:String,phase:String,can_cancel:bool,parent:Option<String>,worker:F)->Result<(),String>
     where F:FnOnce(Arc<ResourceManager>,String)->Result<Vec<String>,JobError>+Send+'static{
-        if self.context.install.join("tmp/native-install.json").exists(){
+        if !job_id.starts_with("reset-")&&voice_desktop_common::component_reset::pending(&self.context)?.is_some(){return Err("已确认的组件重置尚未完成，请先继续重置。".into());}
+        if !job_id.starts_with("reset-")&&self.context.install.join("tmp/native-install.json").exists(){
             if self.has_active_jobs(){return Err("组件正在完成启用，请稍候再试。".into());}
             if let Err(error)=self.recover_pending_transaction(){let _=self.record_recovery_failure(&error);return Err(error);}
         }
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
+            if self.resetting.load(Ordering::Acquire)&&!job_id.starts_with("reset-"){return Err("组件正在重置，请等待完成。".into());}
             if !self.accepting_jobs.load(Ordering::Acquire){return Err("工作区正在迁移、更新或退出，不能启动新的资源任务。".into());}
             if jobs.get(&job_id).is_some_and(|job| !terminal(&job.snapshot.state)) {
                 if jobs[&job_id].snapshot.parent_job_id!=parent{return Err("此组件由其他资源任务处理中，请等待完成。".into());}
@@ -918,7 +964,12 @@ impl ResourceManager {
             let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
                 completed_bytes: 0, total_bytes: None, download_completed_bytes:None,download_total_bytes:None,
                 verification_completed_bytes:None,verification_total_bytes:None,error: None, can_cancel, installed_resources: vec![],
-                import_preview: None, created_at, revision: 1, progress_kind:"waiting".into(),attempt:1,parent_job_id:parent,recovery:None };
+                import_preview: None, created_at, revision: 1, failure_resource_id:None,first_error:None, progress_kind:"waiting".into(),attempt:1,parent_job_id:parent,recovery:None };
+            // previous_run（旧任务历史）：同一组件手动重试前保留终态及首轮错误。
+            if let Some(previous)=jobs.get(&job_id).filter(|job|terminal(&job.snapshot.state)){
+                let mut historical=previous.snapshot.clone();historical.job_id=format!("history-{}-{}",job_id,historical.created_at);
+                jobs.insert(historical.job_id.clone(),JobControl{snapshot:historical,cancel:Arc::new(AtomicBool::new(false)),child:None,last_event:Instant::now(),last_persist:Instant::now()});
+            }
             jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
             if let Err(error)=self.persist_locked(&jobs){jobs.remove(&job_id);return Err(error);}
@@ -928,7 +979,7 @@ impl ResourceManager {
         let manager = Arc::clone(self);
         let thread_id = job_id.clone();
         thread::Builder::new().name(format!("resource-{thread_id}")).spawn(move || {
-            manager.set_phase(&thread_id, "正在运行资源任务", true, 0, None);
+            manager.set_phase(&thread_id, "正在运行资源任务", !thread_id.starts_with("reset-"), 0, None);
             let outcome = if manager.cancelled(&thread_id) { Err(JobError::Cancelled) }
                 else { std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(Arc::clone(&manager), thread_id.clone())))
                     .unwrap_or_else(|_| Err(JobError::Failed { message: "资源任务异常退出；未输出敏感诊断信息。".into(), installed: vec![] })) };
@@ -945,20 +996,23 @@ impl ResourceManager {
     }
 
     fn finish_job(&self, job_id: &str, result: Result<Vec<String>, JobError>) {
+        if job_id.starts_with("reset-"){self.resetting.store(false,Ordering::Release);}
         let maintenance_completed=job_id=="repair-components"&&result.is_ok();
         if job_id=="dl-required"||job_id=="repair-components"{self.batch_active.store(false,Ordering::Release);}
         let (state, phase, error, installed) = match result {
-            Ok(installed) => ("complete", "资源处理完成", None, installed),
+            Ok(installed) => ("complete", if job_id.starts_with("reset-"){ "重置完成，等待下载或导入" }else{"资源处理完成"}, None, installed),
             Err(JobError::Cancelled) => ("cancelled", "任务已取消；临时下载可供重试", None, vec![]),
             Err(JobError::Failed { message, installed }) => ("failed", "资源处理失败", Some(message), installed),
         };
         if let Ok(mut failures)=self.validation_failures.lock(){for id in &installed{failures.remove(id);}}
         if !installed.is_empty(){if let Err(error)=voice_desktop_common::component_maintenance::resolved(&self.context,&installed){eprintln!("组件校验交接收尾失败：{error}");}}
+        if let Some(id)=self.jobs.lock().ok().and_then(|jobs|jobs.get(job_id).map(|job|job.snapshot.failure_resource_id.clone().unwrap_or_else(||job.snapshot.resource_id.clone()))){if let Some(reason)=error.as_deref(){if let Err(e)=voice_desktop_common::component_reset::fault(&self.context,&id,reason){eprintln!("重置资格保存失败：{e}");}}}
+        if !installed.is_empty(){if let Err(e)=voice_desktop_common::component_reset::clear(&self.context,&installed){eprintln!("重置资格清除失败：{e}");}}
         let operation_error=error.clone();
         let recovered_resources=installed.clone();
         let guidance=error.as_deref().map(|message|voice_desktop_common::component_recovery::guidance(voice_desktop_common::component_recovery::classify(message),false));
         self.update_job(job_id, |snapshot| {
-            snapshot.state = state.into(); snapshot.phase = phase.into(); snapshot.error = error;
+            snapshot.state = state.into(); snapshot.phase = phase.into(); if snapshot.first_error.is_none(){snapshot.first_error=error.clone();} snapshot.error = error;
             snapshot.can_cancel = false; for id in installed{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}}snapshot.import_preview=None;
             snapshot.recovery=guidance;
         });
@@ -1094,7 +1148,7 @@ impl ResourceManager {
                 completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0), total_bytes: value["total_bytes"].as_u64(),
                 download_completed_bytes:value["download_completed_bytes"].as_u64(),download_total_bytes:value["download_total_bytes"].as_u64(),
                 verification_completed_bytes:value["verification_completed_bytes"].as_u64(),verification_total_bytes:value["verification_total_bytes"].as_u64(),
-                error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1),
+                failure_resource_id:value["failure_resource_id"].as_str().map(str::to_owned),first_error:value["first_error"].as_str().map(str::to_owned),error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1),
                 progress_kind:value["progress_kind"].as_str().unwrap_or("waiting").into(),attempt:value["attempt"].as_u64().unwrap_or(1) as u32,parent_job_id:value["parent_job_id"].as_str().map(str::to_owned),recovery };
             jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
@@ -1218,7 +1272,7 @@ fn response_result(record: Value) -> Result<Value, ProcessError> {
 }
 
 fn event_value(snapshot: &JobSnapshot) -> Value {
-    json!({
+    let mut value=json!({
         "job_id": snapshot.job_id,
         "resource_id": snapshot.resource_id,
         "state": snapshot.state,
@@ -1240,7 +1294,14 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "revision": snapshot.revision,
         "import_preview": snapshot.import_preview,
         "fields":{"progress_kind":"当前进度类型，下载与校验分别计数","attempt":"当前自动恢复轮次","recovery":"故障类别、自动恢复结果和明确下一步","parent_job_id":"所属一键任务编号","created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"其他阶段已处理字节数","total_bytes":"其他阶段总字节数","download_completed_bytes":"资源下载已完成字节数","download_total_bytes":"资源下载总字节数","verification_completed_bytes":"本地摘要校验已处理字节数","verification_total_bytes":"本地摘要校验总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
-    })
+    });
+    value["operation"]=json!(if snapshot.job_id.starts_with("reset-")||snapshot.job_id.starts_with("history-reset-"){"reset"}else{"install"});
+    value["first_error"]=json!(snapshot.first_error);
+    value["failure_resource_id"]=json!(snapshot.failure_resource_id);
+    value["fields"]["failure_resource_id"]=json!("本轮实际失败的组件，依赖故障不能归给请求模型");
+    value["fields"]["first_error"]=json!("本轮任务首次错误，自动恢复不能覆盖");
+    value["fields"]["operation"]=json!("组件安装或用户确认的重置");
+    value
 }
 
 fn terminal(state: &str) -> bool { matches!(state, "complete" | "completed" | "failed" | "cancelled" | "canceled") }
@@ -1524,4 +1585,15 @@ mod service_tests {
         let mut progress=|_:&str,_,_|{};
         assert!(acquire_environment_lock(&environment,&AtomicBool::new(false),&mut progress).is_ok());
     }
+}
+
+/// resource_reset_plan（读取组件重置范围）：不接受任意文件路径。
+#[tauri::command(rename_all="snake_case")]
+pub fn resource_reset_plan(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
+ command_allowed(&window,&desktop)?;voice_desktop_common::component_reset::plan(&manager.context,&resource_id)
+}
+/// resource_reset（确认删除组件）：原生任务负责安全收尾。
+#[tauri::command(rename_all="snake_case")]
+pub fn resource_reset(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,resource_id:String,token:String)->Result<Value,String>{
+ command_allowed(&window,&desktop)?;manager.inner().reset_resource(resource_id,token)
 }

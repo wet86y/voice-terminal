@@ -745,11 +745,14 @@ pub(crate) fn recover_for_integrity(context:&LaunchContext)->Result<Option<Activ
 }
 /// archive_failed_activation（校验结论落盘后保留故障证据）：移动固定事务路径，不删除备份，也不执行未知记录里的路径。
 pub(crate) fn archive_failed_activation(context:&LaunchContext,fault:&ActivationFault)->Result<(),String>{
+    archive_failed_activation_for(context,fault,"integrity")
+}
+pub(crate) fn archive_failed_activation_for(context:&LaunchContext,fault:&ActivationFault,operation:&str)->Result<(),String>{
     let journal=safe_path(&context.install,"tmp/native-install.json")?;
     if file_hash(&journal)?!=fault.journal_sha256{return Err("全面校验期间组件事务发生变化，请重新检查。".into());}
     let archive=safe_path(&context.install,&format!("tmp/component-recovery/{}",fault.journal_sha256))?;
     fs::create_dir_all(&archive).map_err(|e|e.to_string())?;
-    atomic_json(&archive.join("evidence.json"),&json!({"schema":1,"resource_id":fault.resource_id,"reason":fault.reason,"scan_scope":"all","fields":{"schema":"事务故障证据格式","resource_id":"已确认的受影响组件，未知时为空","reason":"无法自动恢复的原因","scan_scope":"已执行全部组件的完整性校验"}}))?;
+    atomic_json(&archive.join("evidence.json"),&json!({"schema":1,"resource_id":fault.resource_id,"reason":fault.reason,"operation":operation,"scan_scope":if operation=="integrity"{Some("all")}else{None},"fields":{"schema":"事务故障证据格式","resource_id":"已确认的受影响组件，未知时为空","reason":"无法自动恢复的原因","operation":"完整性维护或用户确认的重置","scan_scope":"完整性维护为全部，用户重置不声明扫描范围"}}))?;
     for name in ["native-old","native-companions","native-install.json"]{
         let source=safe_path(&context.install,&format!("tmp/{name}"))?;let target=safe_path(&archive,name)?;
         if source.exists(){if target.exists(){return Err("事务故障证据保留目录冲突，原件和记录均保持。".into());}fs::rename(source,target).map_err(|e|e.to_string())?;}

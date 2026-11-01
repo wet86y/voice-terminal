@@ -52,7 +52,7 @@ pub(super) fn configure(context:&LaunchContext,existing:&Value,gpu:bool,compatib
     record["compatible_gpu"]=json!(compatible_gpu);record["groups"]=json!(ENVIRONMENT_GROUPS);record["packages"]=json!(names);
     record["lock_sha256"]=json!(file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?);
     record["gpu_profile"]=if gpu{json!("cu128")}else{Value::Null};record["gpu_lock_sha256"]=if gpu{json!(file_hash(&gpu_lock_path(context))?)}else{Value::Null};
-    record["package_receipts"]=plan["main"]["receipts"].clone();record["cpu_overlay_receipts"]=plan["overlay"]["receipts"].clone();
+    record["package_receipts"]=plan["main"]["receipts"].clone();record["cpu_overlay_receipts"]=plan["overlay"]["receipts"].as_object().map(|rows|json!(rows)).unwrap_or_else(||json!({}));
     // 旧字段继续保存整锁摘要，供旧版程序读取；新字段独立判断处理器包内容。
     record["cpu_overlay_lock_sha256"]=if plan["overlay"].is_object(){record["lock_sha256"].clone()}else{Value::Null};
     record["cpu_overlay_content_sha256"]=if plan["overlay"].is_object(){json!(cpu_overlay_digest(context,&root)?)}else{Value::Null};

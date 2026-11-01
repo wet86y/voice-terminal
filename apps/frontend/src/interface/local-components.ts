@@ -115,6 +115,7 @@ export interface LocalComponentRow {
 
 /** ManagedResourceRow（受管独立资源）：文件安装状态与进程健康分开呈现。 */
 export interface ManagedResourceRow {
+  resetAvailable?: boolean // resetAvailable（维护异常允许重置）。
   /** id（固定资源编号）、label（显示名称）与状态中文文案。 */
   id: string
   label: string

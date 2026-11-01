@@ -80,3 +80,19 @@ describe('ResourceInstallDialog（资源安装确认）模型与共享依赖入�
     wrapper.unmount()
   })
 })
+
+it('重置先展示一次删除范围确认，取消不执行删除', async () => {
+  const model = controller({ resource_id: 'dsh', title: '代理宿主', model_bytes: 0 })
+  model.pendingDownloadPlan.value = null
+  model.pendingResetPlan = ref({ resource_id: 'dsh', paths: ['runtimes/dsh', 'cache/npm'], token: 'test', message: '用户代理资料保留' })
+  model.confirmReset = vi.fn()
+  const wrapper = mount(ResourceInstallDialog, { props: { controller: model } })
+  expect(wrapper.get('[aria-labelledby="reset-plan-title"]').text()).toContain('cache/npm')
+  expect(wrapper.text()).toContain('用户代理资料保留')
+  const buttons = wrapper.findAll('button')
+  await buttons.find(button => button.text() === '确认重置')!.trigger('click')
+  expect(model.confirmReset).toHaveBeenCalledOnce()
+  await buttons.find(button => button.text() === '取消')!.trigger('click')
+  expect(model.pendingResetPlan.value).toBeNull()
+  wrapper.unmount()
+})
