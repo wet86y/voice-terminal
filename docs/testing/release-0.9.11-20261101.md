@@ -1,0 +1,39 @@
+# 0.9.11 GitHub（代码托管平台）公开发行验收（2026-11-01）
+
+## 对照范围
+
+上次公开发行是 2026-10-30 的 `v0.9.10`，标签指向源码 `76dda488cb68ef43fcf92833f5ecb2fc4423b84c`。本次公开版以 `2422ea634fe9849de2cb6070be156ad351e9607a` 为源，包含两轮更新链路重复校验优化、主语音双后端与协议修复、共享 MiniMax 密钥、后台模型配置同步，以及余额刷新和模型名称显示修正。此前仅进入本机 0.9.10 程序的用户可感知变化均并入[v0.9.11 更新说明](../releases/v0.9.11.md)。
+
+## 发行结果
+
+| 项目 | 已核验结果 |
+| --- | --- |
+| GitHub 标签 | `v0.9.11`，指向 `2422ea634fe9849de2cb6070be156ad351e9607a` |
+| 远程主分支 | 发行时 `main` 与发行标签指向同一提交；发行后仅追加本机交付记录，标签继续绑定构建提交 |
+| 发行地址 | <https://github.com/wet86y/voice-terminal/releases/tag/v0.9.11> |
+| 正式程序构建 | `0.9.11 / product-99a4345067625a3b` |
+| 统一程序包 | 377 个固定本体文件，105,065,539 字节 |
+| 程序包 SHA-256（内容摘要） | `e59705d94d57cb50331534cbe8d15a04127c44ebbeb2a3e4a43b011a41fce3e3` |
+| 分发安装器 | `VoiceTerminalSetup.exe`，115,219,968 字节 |
+| 安装器 SHA-256（内容摘要） | `e9c13dc14f053e79611bdb21bc2c76f0f263b92be651ca812ca080971d866a4a` |
+| 发布与回下载核验 | 2026-11-01 12:02（香港时间）完成；标签、最新发行入口、说明正文及四项资产完整摘要匹配 |
+| 本机安装状态 | 本轮未覆盖本机程序；本机仍运行 `0.9.10 / product-2bedabd3c2a44362` |
+
+## 发布资产
+
+| 文件 | 字节数 | SHA-256（内容摘要） |
+| --- | ---: | --- |
+| `VoiceTerminalSetup.exe` | 115,219,968 | `e9c13dc14f053e79611bdb21bc2c76f0f263b92be651ca812ca080971d866a4a` |
+| `delivery.json` | 893 | `ddc50f20c14fb44e74cbdbffe46569b949e09aff7fc9537b53b5673ab68f7e95` |
+| `update.json` | 2,021 | `42e2fbf6fcc7b3b18fa1e6ae0c789952f0505cc04f5d1965e96de35d93d8f59e` |
+| `SHA256SUMS.txt` | 247 | `c620d6eacd5fe4fc7c8bb212c6302ce44728e4a87bba46448d8e3d01af8752ff` |
+
+`update.json`（应用更新清单）中的中文发行说明从版本文档生成。公开资产逐项回下载后，字节数与本机文件摘要完全匹配。
+
+## 构建与验证
+
+通过 `npm run github:release`（构建并发布公开发行）完成。前端类型检查和正式构建、桌面程序与启动管理器原生优化构建、统一程序包组装、安装器原生优化构建、GitHub 上传及回下载核验全部成功；流水线总用时 375.9 秒。桌面宿主构建有 5 条未使用代码警告，构建成功。
+
+发布前功能验证记录：后端协议与调度 232 项通过、1 项跳过；推理切换专项 14 项通过；产品设置与接口 74 项通过；余额和显示相关前端回归 67 项通过；后台执行宿主完整回归 79 项通过；前端类型检查、正式构建及演示布局检查通过。结果详见[双后端实现与验证入口](../development/inference-backends.md)和[本机显示修正记录](local-delivery-0.9.10-20261101.md)。
+
+本机核验记录位于 `.local/cache/reports/release-public-latest.json`（公开回下载逐项结果）及 `.local/cache/reports/desktop-pipeline-latest.json`（发行构建阶段结果）；程序包和安装器信息分别见 `.local/build/program-package/package-info.json` 与 `.local/releases/installer/delivery.json`。
