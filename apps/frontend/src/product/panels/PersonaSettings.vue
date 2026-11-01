@@ -3,8 +3,9 @@ import { useProductContext } from '../product-context';
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 import InstructionEditorRow from '../../interface/InstructionEditorRow.vue';
 const { saving, settings, activePersona, personaDocuments, customInstructions, saveShadowGate,
-  savePersona, saveApprovalSettings, personaItems, instructionFormError, addInstructionRow, saveInstructionSettings,
-  removeInstruction, currentDocument } = useProductContext();
+  savePersona, saveApprovalSettings, personaItems, addInstructionRow, instructionExpanded,
+  instructionBusy, instructionErrors, saveInstructionRow, deleteInstructionRow,
+  toggleInstructionEntry, currentDocument } = useProductContext();
 </script>
 <template>
   <SettingsPageHeader section="persona" />
@@ -17,11 +18,11 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
   <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存人格与用户资料' }}</button></footer>
   <section class="preview-section instruction-section" aria-label="自定义指令">
     <div class="section-row"><h3>自定义语音指令</h3><button class="ghost-action" type="button" :disabled="saving" @click="addInstructionRow">添加指令</button></div>
-    <p class="instruction-hint">语音模型按整句话的意思判断；Shadow（影子代理）独立阅读用户原话。配置不会增加模型的工具权限。</p>
+    <p class="instruction-hint">点击名称展开编辑，每条指令单独保存。</p>
     <div v-if="!customInstructions.length" class="pool-empty">还没有自定义指令。</div>
-    <InstructionEditorRow v-for="item in customInstructions" :key="item.id" :row="item" :disabled="saving" removable @remove="removeInstruction(item.id)" />
-    <p v-if="instructionFormError" class="instruction-error" role="alert">{{ instructionFormError }}</p>
-    <footer class="instruction-save-actions"><small class="instruction-hint">增删改与启停在保存后持久化，当前会话的后续模型请求立即使用新内容。</small><button class="save-button" type="button" :disabled="saving" @click="saveInstructionSettings">{{ saving ? '正在保存…' : '保存自定义指令' }}</button></footer>
+    <div class="instruction-list">
+      <InstructionEditorRow v-for="item in customInstructions" :key="item.id" v-model:expanded="instructionExpanded[item.id]" :row="item" :disabled="saving || instructionBusy.includes(item.id)" :saved="settings.custom_instructions.some(saved => saved.id === item.id)" :error="instructionErrors[item.id]" removable @save="saveInstructionRow(item.id)" @toggle="toggleInstructionEntry(item.id, $event)" @remove="deleteInstructionRow(item.id)" />
+    </div>
   </section>
   <section class="preview-section approval-settings-section" aria-label="授权确认">
     <div class="section-row"><h3>授权确认</h3></div>
@@ -31,6 +32,5 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
   <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" role="switch" :disabled="saving" @change="saveShadowGate" /><i></i></label>
 </template>
 <style scoped>
-.instruction-save-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding-top:18px;border-top:1px solid var(--line)}
-.instruction-save-actions small{flex:1;min-width:140px}
+.instruction-list{display:grid;gap:12px}
 </style>

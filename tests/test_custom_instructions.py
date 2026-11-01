@@ -69,9 +69,15 @@ def test_voice_static_context_does_not_expose_shadow_goal(tmp_path):
         def begin_turn(self, _episode_id):
             return None
 
+        def cancel_turn(self, _episode_id):
+            return None
+
     class Output:
         status = "IDLE"
         speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+        def cancel_all(self, _reason):
+            return None
 
     async def emit(*_args):
         return None
@@ -92,5 +98,6 @@ def test_voice_static_context_does_not_expose_shadow_goal(tmp_path):
         assert "查询用户所问的资料并核实" not in static
         if runtime._tokenizer_prewarm_task is not None:
             await runtime._tokenizer_prewarm_task
+        await runtime.end("test_complete")
 
     asyncio.run(scenario())

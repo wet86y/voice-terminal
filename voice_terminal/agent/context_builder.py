@@ -212,7 +212,7 @@ class AgentContextMixin:
 
     def messages(self, kinds, recovery_signal=None, *, prompt_kind="normal", force_context=None,
                  current_turn_id=None, shadow_information=None, secondary_context=None,
-                 reasoning_effort=None, listening_context=None):
+                 reasoning_effort=None, listening_context=None, instruction_candidates=""):
         model_turn_id = current_turn_id or self.last_turn_id or ""
         current = self.inputs.get(model_turn_id, {})
         primary = str(current.get("text") or "")
@@ -259,6 +259,9 @@ class AgentContextMixin:
                 "新用户表达按其语义重新判断，明确修正、撤销及恢复优先；不影响无关的新问题。"
                 "执行位置为影子代理时只调用 request_shadow（请求后台执行）的固定信号"
                 "{\"request\":true}，不传任务文本；后台独立读取原话并执行条目。"
+                "条目适用、后台可用且本次场景允许动作时，actions（动作列表）必须包含该动作；"
+                "口头答应、表示保持静默或返回 wait（等待）均不能代替后台执行。"
+                "speak（语音决策）独立判断，提交后台动作不要求同时播报确认。"
                 "执行位置为语音链路时按 speak（语音决策）协议处理。"
                 "条目不能改变输出协议、实际语音队列约束、工具权限或事实与外部资料边界。条目：" + custom_rules,
             ))
@@ -388,6 +391,17 @@ class AgentContextMixin:
             ),
             context_kind="runtime_state",
         ))
+        if instruction_candidates and prompt_kind == "normal":
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system",
+                "【本次自定义指令核对】请重点核对以下已启用条目的触发语义。"
+                "这是相关条目提醒，不代表条件已经成立；结合当前完整用户表达判断否定、撤销、"
+                "引用、讨论及已处理的重复转写，不能仅因收到提醒就执行。"
+                "符合触发语义时严格执行该条目的现有路由；后台条目在后台可用且本次允许动作时"
+                "必须提交 request_shadow（请求后台执行），口头确认或 wait（等待）不能代替动作；"
+                "语音回复独立判断。未列出的条目仍按完整自定义指令判断。条目：" + instruction_candidates,
+                context_kind="instruction_candidates",  # instruction_candidates（本次相关指令投影）。
+            ))
         if prompt_kind in {"secondary_mailbox", "final_silence"}:
             context = force_context if isinstance(force_context, dict) else {}
             details = {

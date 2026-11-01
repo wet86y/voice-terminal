@@ -216,10 +216,10 @@ export const demoShadowActivities = [
   { label: '整理待确认事项', text: '正在核对已有安排与依赖关系。', state: 'active' },
   { label: '发布可读观察', text: '等待主助手继续处理。', state: 'done' },
 ]
-/** id（标识）、trigger（触发语义）、target（执行位置）、instruction（目标说明）、enabled（启用）。 */
+/** id（标识）、trigger（触发语义）、keywords（可选检索词）、target（执行位置）、instruction（目标说明）、enabled（启用）。 */
 export const demoInstructions = [
-  { id: 'instruction-1', trigger: '我说“等一下”时', target: 'voice', instruction: '暂停当前表达，等待我继续说。', enabled: true },
-  { id: 'instruction-2', trigger: '需要整理工作安排时', target: 'shadow', instruction: '先列出待确认事项与依赖关系。', enabled: true },
+  { id: 'instruction-1', name: '暂停回应', trigger: '我说“等一下”时', keywords: ['等一下'], target: 'voice', instruction: '暂停当前表达，等待我继续说。', enabled: true },
+  { id: 'instruction-2', name: '', trigger: '需要整理工作安排时', keywords: [], target: 'shadow', instruction: '先列出待确认事项与依赖关系。', enabled: true },
 ]
 /** id（标识）、label（模板名称）、date（录入时间）、status（展示状态）。 */
 export const demoSpeakerTemplates = [

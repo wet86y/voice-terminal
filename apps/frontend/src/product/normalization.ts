@@ -112,7 +112,10 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     shadow: {
       experimental_context_gate_enabled: shadow.experimental_context_gate_enabled === true,
     },
-    custom_instructions: customInstructions.map(item => ({ ...item })),
+    custom_instructions: customInstructions.map(item => ({ ...item,
+      name: typeof item.name === 'string' ? item.name : '',
+      keywords: Array.isArray(item.keywords) ? [...item.keywords] : [],
+    })),
     approvals: { voice_confirmation_enabled: approvals.voice_confirmation_enabled === true, continuous_enabled: approvals.continuous_enabled === true },
     speaker: {
       ...Object.fromEntries(Object.entries(SPEAKER_DEFAULTS).map(([key, fallback]) => [key, typeof speaker[key] === "number" && Number.isFinite(speaker[key]) ? speaker[key] : fallback])),
