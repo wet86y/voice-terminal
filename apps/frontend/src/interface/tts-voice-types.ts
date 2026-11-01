@@ -2,6 +2,11 @@
 export type ProductLocalTtsModelId = 'voxcpm1' | 'voxcpm2'
 /** ProductOnlineTtsModelId（在线语音模型标识）：MiniMax Speech 2.8 Turbo（低时延）或 HD（高音质）。 */
 export type ProductOnlineTtsModelId = 'speech-2.8-turbo' | 'speech-2.8-hd'
+/** ProductMinimaxVoiceName（MiniMax 在线音色查询结果）：名称由服务端实时读取。 */
+export interface ProductMinimaxVoiceName {
+  voice_id: string // voice_id（音色标识）。
+  voice_name: string | null // voice_name（MiniMax 在线返回的音色名称，无名称时为空）。
+}
 /** ProductTtsVoiceSelection（已启用音色版本）。 */
 export interface ProductTtsVoiceSelection { voice_id: string; revision: number } // 音色标识、不可变版本。
 /** ProductTtsSettings（语音配置）：后端、在线模型和音色、本地模型、推理步数及启用音色。 */

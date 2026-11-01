@@ -37,17 +37,24 @@ const selectedReady = computed(() => selected.value === 'minimax' || readyModels
 const model = computed(() => selected.value === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2')
 const steps = reactive({ voxcpm1: 10, voxcpm2: 20, ...settings.tts.inference_steps_by_model })
 const effective = computed(() => status.value?.backend === 'voxcpm1' ? status.value.local_model : 'minimax')
-const unavailable = computed(() => saving.value || !!status.value?.pending_selection || (selected.value !== 'minimax' && (effective.value !== selected.value || status.value?.load_state !== 'ready')))
+const unavailable = computed(() => saving.value || !!status.value?.pending_selection)
+const targetSaveDisabled = computed(() => saving.value || !!status.value?.pending_selection || !selectedReady.value ||
+  (selected.value === effective.value && (selected.value === 'minimax' || status.value?.load_state === 'ready')))
 const names: Record<Choice, string> = { minimax: '在线 API（网络语音接口）', voxcpm1: 'VoxCPM1（第一代本地模型）', voxcpm2: 'VoxCPM2（第二代本地模型）' }
 const states: Record<string, string> = { disabled: '在线模式', unloaded: '尚未加载', loading: '正在加载', ready: '已就绪', error: '加载失败' }
 watch(() => [settings.tts.online_model, settings.tts.online_voice_id] as const, ([modelId, voiceId]) => {
   if (modelId === 'speech-2.8-turbo' || modelId === 'speech-2.8-hd') onlineModelDraft.value = modelId
   if (typeof voiceId === 'string') onlineVoiceIdDraft.value = voiceId
 }, { immediate: true })
+let previousEffective: Choice = effective.value
 watch(() => status.value, value => {
-  if (value && !value.pending_selection && !saving.value) {
+  if (!value) return
+  const nextEffective: Choice = value.backend === 'minimax' ? 'minimax' : value.local_model
+  const draftFollowedPreviousEffective = selected.value === previousEffective
+  previousEffective = nextEffective
+  if (!value.pending_selection) {
     settings.tts.backend = value.backend; settings.tts.local_model = value.local_model
-    if (value.load_state !== 'loading') selected.value = value.backend === 'minimax' ? 'minimax' : value.local_model
+    if (!saving.value && draftFollowedPreviousEffective) selected.value = nextEffective
   }
 })
 onBeforeUnmount(() => {
@@ -74,10 +81,13 @@ function selectTarget(event: Event) {
   const choice = (event.target as HTMLSelectElement).value as Choice
   if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) return
   selected.value = choice
-  void choose()
+  error.value = ''
 }
-async function choose() {
-  const choice = selected.value; const generation = ++selectionGeneration; saving.value = true; error.value = ''
+async function applyTarget(choice: Choice) {
+  if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) {
+    throw new Error('所选本地语音模型尚未具备运行条件。')
+  }
+  const generation = ++selectionGeneration; saving.value = true; error.value = ''
   try {
     if (props.demo) {
       demoStatus.backend = choice === 'minimax' ? 'minimax' : 'voxcpm1'
@@ -93,10 +103,18 @@ async function choose() {
   } catch (failure) {
     if (generation !== selectionGeneration) return
     error.value = failure instanceof Error ? failure.message : '语音目标切换失败。'
-    await live.refresh(true)
-    if (generation !== selectionGeneration) return
-    selected.value = effective.value
+    if (!props.demo) await live.refresh(true)
+    throw failure
   } finally { if (generation === selectionGeneration) saving.value = false }
+}
+async function saveTarget() {
+  try { await applyTarget(selected.value) } catch { /* error（界面错误）：已在 applyTarget 中展示。 */ }
+}
+async function ensureTargetSupport(target: ProductLocalTtsModelId) {
+  if (props.demo) return
+  const current = status.value
+  if (current?.backend === 'voxcpm1' && current.local_model === target && current.load_state === 'ready') return
+  await applyTarget(target)
 }
 async function setQuality(value: number) {
   if (savingQuality.value || steps[model.value] === value) return
@@ -168,13 +186,18 @@ async function openOfficialVoiceLibrary() {
 <template>
   <SettingsPageHeader section="tts" />
   <div class="tts-settings">
-    <section class="tts-target preference-card"><label class="form-field"><span>语音播放目标</span><select :value="selectedReady ? selected : ''" @change="selectTarget"><option value="minimax">{{ names.minimax }}</option><option v-if="!selectedReady" value="" disabled>当前目标未就绪，请在组件设置补齐资源</option><option v-for="item in readyModels" :key="item.id" :value="item.id">{{ names[item.id] }}</option></select></label>
+    <section class="tts-target preference-card">
+      <div class="tts-target-row">
+        <label class="form-field"><span>语音播放目标</span><select :value="selectedReady ? selected : ''" :disabled="saving || !!status?.pending_selection" @change="selectTarget"><option value="minimax">{{ names.minimax }}</option><option v-if="!selectedReady" value="" disabled>当前目标未就绪，请在组件设置补齐资源</option><option v-for="item in readyModels" :key="item.id" :value="item.id">{{ names[item.id] }}</option></select></label>
+        <button class="save-button tts-target-save" type="button" aria-label="保存播放目标" :disabled="targetSaveDisabled" @click="saveTarget">{{ saving ? '正在切换…' : '保存播放目标' }}</button>
+      </div>
       <p class="instruction-hint" role="status">当前生效：{{ names[effective] }} · {{ saving ? '正在切换…' : states[status?.load_state || 'unloaded'] || '等待状态' }}<template v-if="status?.pending_selection"> · 等待当前事务结束后切换</template></p>
+      <p v-if="selected !== effective" class="instruction-hint">当前仅切换设置展示；保存播放目标后才会切换实际语音后端。</p>
       <p v-if="selected === 'minimax'" class="instruction-hint">在线接口密钥与账号用量可在“组件设置 → 语音合成”中管理。</p>
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
     <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :disabled="saving" :demo="demo" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
-    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="model" :steps="steps[model]" :unavailable="unavailable" :demo="demo" @changed="refreshStatus" />
+    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="model" :steps="steps[model]" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" />
     <TtsSynthesisPreferences
       :speech-control-enabled="settings.tts.speech_control_enabled ?? true"
       :speech-disabled="savingControls || saving || savingOnline || savingQuality"
@@ -193,5 +216,7 @@ async function openOfficialVoiceLibrary() {
 <style scoped>
 .tts-settings { display: grid; gap: 22px; }
 .tts-target { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--panel); }
-.tts-target .form-field { max-width: 520px; }
+.tts-target-row { display: grid; grid-template-columns: minmax(0,520px) auto; align-items: end; gap: 12px; }
+.tts-target-save { min-height: 42px; white-space: nowrap; }
+@media(max-width:600px) { .tts-target-row { grid-template-columns: minmax(0,1fr); } .tts-target-save { justify-self: end; } }
 </style>

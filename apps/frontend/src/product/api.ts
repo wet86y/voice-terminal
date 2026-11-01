@@ -5,7 +5,7 @@ import type {
   ProductMutationResult,
   ProductComputeDeviceSwitch,
   ProductSnapshot,
-  WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
+  WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductMinimaxVoiceName, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
 
 export class ProductApiError extends Error implements ProductApiErrorShape {
@@ -126,6 +126,8 @@ export const productApi = {
   saveAudioEnhancements: (value: Record<string, boolean>) => request<{ settings: NonNullable<import('./types').ProductSettingsSnapshot['audio_enhancements']>; message: string }>('/api/v1/product/settings/audio-enhancements', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */
   saveTts: (value: Partial<ProductTtsSettings>) => request<ProductMutationResult>('/api/v1/product/settings/tts', jsonBody(value)),
+  /** minimaxVoiceName（查询 MiniMax 在线音色名称）：密钥仅由 Voice Server 使用。 */
+  minimaxVoiceName: (voice_id: string) => request<ProductMinimaxVoiceName>('/api/v1/tts/minimax/voice-name', { method: 'POST', body: JSON.stringify({ voice_id }) }),
   ttsVoices: (model: ProductLocalTtsModelId) => request<{ voices: ProductTtsVoice[] }>(`/api/v1/tts/voices/${model}`),
   createTtsVoice: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${model}`, { ...jsonBody(voice), method: 'POST' }),
   updateTtsVoice: (model: ProductLocalTtsModelId, id: string, voice: Partial<ProductTtsVoice>, revision: number) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${model}/${id}`, jsonBody({ ...voice, expected_revision: revision })),

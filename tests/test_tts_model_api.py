@@ -110,6 +110,44 @@ def test_minimax_voice_lookup_accepts_future_voice_categories(monkeypatch):
     assert seen["body"] == {"voice_type": "all"}
 
 
+def test_minimax_voice_name_api_returns_live_name_or_null(tmp_path, monkeypatch):
+    async def scenario():
+        payload = {"system_voice": [
+            {"voice_id": "dynamic-system", "voice_name": "在线取得的名称"},
+            {"voice_id": "clone-without-name"},
+        ]}
+        client_type = httpx.AsyncClient
+        requests = []
+
+        def handler(request):
+            requests.append((str(request.url), json.loads(request.content)))
+            return httpx.Response(200, json=payload)
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(
+            transport=httpx.MockTransport(handler), **kwargs,
+        ))
+        config = AppConfig()
+        store = ProductSettingsStore(path=tmp_path / "data/config/product-settings.json", config=config)
+        runtime = SessionRuntime(config, product_settings=store, runtime_data_dir=tmp_path / "data")
+        runtime._api_key = lambda _: "test-secret"
+        async with client_type(
+            transport=httpx.ASGITransport(app=create_app(runtime, product_settings=store)),
+            base_url="http://test",
+        ) as client:
+            named = await client.post("/api/v1/tts/minimax/voice-name", json={"voice_id": " dynamic-system "})
+            unnamed = await client.post("/api/v1/tts/minimax/voice-name", json={"voice_id": "clone-without-name"})
+        assert named.status_code == 200
+        assert named.json() == {"voice_id": "dynamic-system", "voice_name": "在线取得的名称"}
+        assert unnamed.status_code == 200
+        assert unnamed.json() == {"voice_id": "clone-without-name", "voice_name": None}
+        assert requests == [
+            ("https://api.minimaxi.com/v1/get_voice", {"voice_type": "all"}),
+            ("https://api.minimaxi.com/v1/get_voice", {"voice_type": "all"}),
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_minimax_voice_lookup_rejects_unknown_id_and_api_errors(monkeypatch):
     from fastapi import HTTPException
     from voice_terminal.server.http_api import _validate_minimax_voice_id
