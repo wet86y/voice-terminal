@@ -4,7 +4,14 @@ import ReferenceAudioPlayer from './ReferenceAudioPlayer.vue'
 import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE, type VoiceDraft } from './useTtsVoiceState'
 import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, TtsVoicePort } from './tts-voice-types'
 
-const props = withDefaults(defineProps<{ model: ProductLocalTtsModelId; steps: number; unavailable?: boolean; demo?: boolean; port?: TtsVoicePort }>(), { unavailable: false, demo: false })
+const props = withDefaults(defineProps<{
+  model: ProductLocalTtsModelId
+  steps: number
+  unavailable?: boolean // unavailable（目标切换或事务进行期间暂不可操作）。
+  demo?: boolean // demo（仅演示界面）。
+  port?: TtsVoicePort // port（音色库业务接口）。
+  ensureSupport?: (model: ProductLocalTtsModelId) => Promise<void> // ensureSupport（试听前确保对应本地模型就绪）。
+}>(), { unavailable: false, demo: false })
 const productApi = props.port! // port（业务接口）：演示模式仅使用模拟数据。
 const emit = defineEmits<{ changed: [] }>()
 const state = useTtsVoiceState()
@@ -135,6 +142,8 @@ async function preview(draft: VoiceDraft) {
       draft.targetTranscript = draft.text
       draft.signature = prepared; draft.notice = '试音演示完成。'; return
     }
+    await props.ensureSupport?.(model)
+    if (draft.generation !== generation) return
     const result = await monitor(draft, () => productApi.startTtsPreview(model, voice, draft.text), generation)
     if (draft.generation === generation && signature(draft, model) === prepared && result.result?.voice) {
       draft.candidate = result.result.voice; draft.targetTranscript = result.result.voice.reference_text || ''; draft.signature = prepared; draft.notice = '试音完成，请核对目标样音转写后保存。'
@@ -221,7 +230,7 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
     <p v-if="!drafts.length" class="instruction-hint">尚无音色。可以添加参考音频，或使用二代模型设计音色。</p>
     <article v-for="draft in drafts" :key="draft.key" class="voice-card" :class="{ enabled: stored(draft)?.enabled }">
       <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="音色名称（可选）" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
-        <div class="voice-actions"><button type="button" :disabled="!draft.id || unavailable || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
+        <div class="voice-actions"><button type="button" :disabled="!draft.id || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
           <label class="voice-toggle"><input type="checkbox" role="switch" :aria-label="`启用 ${draft.name || '音色'}`" :checked="stored(draft)?.enabled" :disabled="!draft.id || globalBusy || (stored(draft)?.is_default && stored(draft)?.enabled)" @change="toggle(draft, ($event.target as HTMLInputElement).checked)"><span aria-hidden="true"></span></label>
         </div></header>
       <div v-if="draft.expanded" :id="`voice-editor-${draft.key}`" class="voice-editor">

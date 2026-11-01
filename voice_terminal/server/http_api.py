@@ -77,8 +77,26 @@ def _minimax_voice_ids(payload: Any) -> set[str]:
     return found
 
 
-async def _validate_minimax_voice_id(runtime: Any, voice_id: str) -> None:
-    """Validate arbitrary official MiniMax voice_id（音色标识），不固定音色目录。"""
+def _minimax_voice_name(payload: Any, voice_id: str) -> tuple[bool, str | None]:
+    """Find voice_name（音色名称）for one voice_id（音色标识），without a fixed catalog."""
+    if isinstance(payload, Mapping):
+        if isinstance(payload.get("voice_id"), str) and payload["voice_id"].strip() == voice_id:
+            name = payload.get("voice_name")
+            return True, name.strip() if isinstance(name, str) and name.strip() else None
+        for value in payload.values():
+            found, name = _minimax_voice_name(value, voice_id)
+            if found:
+                return found, name
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            found, name = _minimax_voice_name(value, voice_id)
+            if found:
+                return found, name
+    return False, None
+
+
+async def _minimax_voice_catalog(runtime: Any) -> Mapping[str, Any]:
+    """Fetch MiniMax's live voice catalog, keeping api_key（接口密钥）server-side."""
     tts_config = runtime.config.tts
     api_key = runtime._api_key(tts_config.api_key_env)
     if not api_key:
@@ -110,6 +128,12 @@ async def _validate_minimax_voice_id(runtime: Any, voice_id: str) -> None:
         status_code = base_resp.get("status_code")
         if status_code not in (None, 0, "0"):
             raise HTTPException(status_code=502, detail="MiniMax 音色查询接口返回业务错误。")
+    return payload
+
+
+async def _validate_minimax_voice_id(runtime: Any, voice_id: str) -> None:
+    """Validate arbitrary official MiniMax voice_id（音色标识），不固定音色目录。"""
+    payload = await _minimax_voice_catalog(runtime)
     if voice_id not in _minimax_voice_ids(payload):
         raise HTTPException(status_code=422, detail="该音色 ID 未出现在 MiniMax 官方音色查询结果中。")
 
@@ -832,6 +856,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         library = tts_voice_library_or_503(model)
         return {"voices": library.list_voices({model: library.active_selection}),
                 "active_voice": library.active_selection, "model": model}
+
+    @app.post("/api/v1/tts/minimax/voice-name")
+    async def get_minimax_voice_name(body: dict[str, Any]):
+        if set(body) != {"voice_id"}:
+            raise HTTPException(status_code=422, detail="音色查询仅接受 voice_id（音色标识）。")
+        voice_id = body.get("voice_id")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            raise HTTPException(status_code=422, detail="voice_id（音色标识）不能为空。")
+        voice_id = voice_id.strip()
+        payload = await _minimax_voice_catalog(runtime)
+        found, voice_name = _minimax_voice_name(payload, voice_id)
+        return {"voice_id": voice_id, "voice_name": voice_name if found else None}
 
     @app.post("/api/v1/tts/voices/{model}")
     async def create_tts_voice(model: str, body: dict[str, Any]):

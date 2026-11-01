@@ -163,6 +163,19 @@ describe('正式界面的真实控件交互', () => {
     expect(save).toHaveBeenCalledWith(expect.objectContaining(changed))
     expect(Object.keys(save.mock.calls[0]![0] as object).sort()).toEqual([...Object.keys(changed), 'mode', 'owner_only_barge_in'].sort())
   })
+  it('声纹页移除旧 CAM++ 升级提示但保留当前状态和设置', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    vi.mocked(productApi.speakerProfile).mockResolvedValue({
+      stale: true, stale_reason: 'speaker_model_changed', templates: [],
+    } as never)
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('需要注册CAM++声纹')
+    expect(wrapper.find('.info-callout').exists()).toBe(false)
+    expect(wrapper.text()).toContain('声纹筛选')
+    wrapper.unmount()
+  })
   it('声纹设置说明展示首段确认、整轮放行与异声提示', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })

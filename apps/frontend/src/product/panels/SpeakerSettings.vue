@@ -27,8 +27,6 @@ const {
   speakerRollingSummary,
   speakerTemplates,
   speakerHasProfile,
-  speakerNeedsReenrollment,
-  speakerStaleReason,
   speakerFilterAllowed,
   speakerEnrollmentComplete,
   speakerStateLabel,
@@ -68,17 +66,6 @@ async function toggleRecording() {
   <SettingsPageHeader section="speaker" />
   <p class="instruction-hint" role="status">{{ speakerServiceLabel }} · {{ speakerHasProfile ? '已注册主人声纹' : '尚未注册声纹' }} · {{ speakerStatus.worker_connected === true ? '工作进程已连接' : '工作进程未连接' }}<template v-if="speakerRollingSummary"> · {{ speakerRollingSummary }}</template></p>
   <p v-if="speakerStatus.last_error" class="instruction-error" role="alert">最近错误：{{ String(speakerStatus.last_error) }}</p>
-
-  <div v-if="speakerNeedsReenrollment" class="info-callout">
-    <span>!</span>
-    <p>
-      <strong>需要注册CAM++声纹。</strong
-      >{{
-        speakerStaleReason
-      }}
-      此版本使用CAM++，升级会移除旧WeSpeaker模型与档案。缺少有效CAM++档案时以观察状态运行，录制三段后恢复已保存的筛选及主人打断偏好。
-    </p>
-  </div>
 
   <div class="settings-stack">
     <label class="switch-row"

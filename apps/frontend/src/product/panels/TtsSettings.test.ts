@@ -22,9 +22,9 @@ describe('音色设置只提供资源完整的本地模型', () => {
         { id: 'voxcpm2', name: '第二代', available: true, loaded: false, native_sample_rate: 48000 },
       ] }), loading: ref(false), error: ref(''), refresh: vi.fn() }
   })
-  function render() {
+  function render(stubs: Record<string, unknown> = {}) {
     return mount(defineComponent({ setup() { provideProductContext({ settings, setNotice: vi.fn() } as never); return () => h(TtsSettings) } }),
-      { global: { stubs: { TtsVoiceLibrary: true } } })
+      { global: { stubs: { TtsVoiceLibrary: true, ...stubs } } })
   }
   it('语音调节缺省开启，保存关闭后保持界面与配置一致', async () => {
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({ settings: { tts: { speech_control_enabled: false } } } as never)
@@ -57,6 +57,51 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(settings.tts.backend).toBe('minimax')
     wrapper.unmount()
   })
+  it('切换播放目标只改变设置草稿，显式保存后才提交后端选择', async () => {
+    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({
+      settings: { tts: { backend: 'voxcpm1', local_model: 'voxcpm2' } },
+    } as never)
+    const wrapper = render()
+    await wrapper.get('.tts-target select').setValue('voxcpm2')
+    expect(save).not.toHaveBeenCalled()
+    expect(wrapper.find('tts-voice-library-stub').exists()).toBe(true)
+    expect(wrapper.get('.tts-target').text()).toContain('当前生效：在线 API（网络语音接口）')
+    expect(wrapper.get('button[aria-label="保存播放目标"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('button[aria-label="保存播放目标"]').trigger('click')
+    await flushPromises()
+    expect(save).toHaveBeenCalledOnce()
+    expect(save).toHaveBeenCalledWith({ backend: 'voxcpm1', local_model: 'voxcpm2' })
+    wrapper.unmount()
+  })
+  it('播放目标切换失败时保留原后端和未保存草稿', async () => {
+    vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('模型切换失败'))
+    const wrapper = render()
+    await wrapper.get('.tts-target select').setValue('voxcpm2')
+    await wrapper.get('button[aria-label="保存播放目标"]').trigger('click')
+    await flushPromises()
+    expect((wrapper.get('.tts-target select').element as HTMLSelectElement).value).toBe('voxcpm2')
+    expect(settings.tts.backend).toBe('minimax')
+    expect(wrapper.text()).toContain('模型切换失败')
+    wrapper.unmount()
+  })
+  it('本地音色生成试听自动切换到草稿模型后继续', async () => {
+    let ensureSupport!: (model: 'voxcpm1' | 'voxcpm2') => Promise<void>
+    const LibraryStub = defineComponent({
+      name: 'TtsVoiceLibrary',
+      props: { ensureSupport: { type: Function, required: true } },
+      setup(props) {
+        ensureSupport = props.ensureSupport as (model: 'voxcpm1' | 'voxcpm2') => Promise<void>
+        return () => h('div', { class: 'tts-voice-library-stub' })
+      },
+    })
+    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
+    const wrapper = render({ TtsVoiceLibrary: LibraryStub })
+    await wrapper.get('.tts-target select').setValue('voxcpm2')
+    await ensureSupport('voxcpm2')
+    expect(save).toHaveBeenCalledWith({ backend: 'voxcpm1', local_model: 'voxcpm2' })
+    expect(wrapper.text()).not.toContain('确认切换')
+    wrapper.unmount()
+  })
   it('隐藏失效选择不改写保存的后端或模型', () => {
     settings.tts.backend = 'voxcpm1'
     const wrapper = render()
@@ -84,6 +129,47 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(settings.tts.online_model).toBe('speech-2.8-turbo')
     expect(settings.tts.online_voice_id).toBe('my-clone')
     wrapper.unmount()
+  })
+  it('MiniMax 音色名随输入在线查询，未匹配或查询失败统一显示音色错误', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let resolveSlow!: (result: { voice_id: string; voice_name: string | null }) => void
+    const lookup = vi.spyOn(productApi, 'minimaxVoiceName').mockImplementation(async voiceId => {
+      if (voiceId === 'known-voice') return { voice_id: voiceId, voice_name: '在线名称' }
+      if (voiceId === 'failed-voice') throw new Error('在线接口暂不可用')
+      if (voiceId === 'slow-voice') return await new Promise(resolve => { resolveSlow = resolve })
+      if (voiceId === 'latest-voice') return { voice_id: voiceId, voice_name: '最新名称' }
+      return { voice_id: voiceId, voice_name: null }
+    })
+    const wrapper = render()
+    try {
+      const input = wrapper.get('.online-voice-row input')
+      await input.setValue('known-voice')
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+      expect(lookup).toHaveBeenCalledWith('known-voice')
+      expect(wrapper.get('.online-voice-name strong').text()).toBe('在线名称')
+      await input.setValue('unknown-voice')
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+      expect(wrapper.get('.online-voice-name strong').text()).toBe('音色错误')
+      await input.setValue('failed-voice')
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+      expect(wrapper.get('.online-voice-name strong').text()).toBe('音色错误')
+      await input.setValue('slow-voice')
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+      await input.setValue('latest-voice')
+      await vi.advanceTimersByTimeAsync(300)
+      await flushPromises()
+      expect(wrapper.get('.online-voice-name strong').text()).toBe('最新名称')
+      resolveSlow({ voice_id: 'slow-voice', voice_name: '过期名称' })
+      await flushPromises()
+      expect(wrapper.get('.online-voice-name strong').text()).toBe('最新名称')
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
   })
   it('试音按钮位于保存左侧，并用当前模型与音色 ID 发起默认试听', async () => {
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
