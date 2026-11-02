@@ -91,7 +91,7 @@
 - [0.9.1 构建、升级与发布验证](testing/release-0.9.1-20261018.md)
 - [0.9.1 应用更新交接与重新发行验收](testing/app-update-handoff-20261018.md)
 - [0.9.2 一代 TTS 播放失败调查与修复验证](testing/tts-v1-playback-investigation-20261018.md)
-- [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
+- [DSH 0.2.1-rc.5 本机升级实施记录](testing/dsh-rc5-upgrade-20261102.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [音频增强替换验收记录](testing/audio-enhancements-20261020.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)

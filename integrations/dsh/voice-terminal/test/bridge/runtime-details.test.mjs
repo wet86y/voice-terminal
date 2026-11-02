@@ -7,6 +7,7 @@ function fixture(t) {
   const listeners = new Map(), received = [], reads = []
   const root = { id: 'root', session: { id: 'root', header: {} } }
   const child = { id: 'child', session: { id: 'child', header: { parentSession: 'root' } } }
+  const secondChild = { id: 'child-2', session: { id: 'child-2', header: { parentSession: 'root' } } }
   const unrelated = { id: 'other', session: { id: 'other', header: {} } }
   const binding = {
     voiceSessionId: 'voice', dshSessionId: 'root', epoch: 1, revision: 2,
@@ -18,7 +19,7 @@ function fixture(t) {
   let chunks = []
   const ctx = {
     on(name, listener) { listeners.set(name, listener) },
-    agents: { list: () => [root, child, unrelated], isOwnedBy: (id, parent) => id === 'child' && parent === root },
+    agents: { list: () => [root, child, secondChild, unrelated], isOwnedBy: (id, parent) => ['child', 'child-2'].includes(id) && parent === root },
     jobs: {
       events: { subscribe(_options, callback) { receiveJob = callback; return () => {} } },
       readAt(id, offset, owner) {
@@ -32,7 +33,7 @@ function fixture(t) {
   t.after(async () => { dispose(); stopRuntimeActivity(binding); await binding.actionQueue })
   const stream = (agent, frame) => listeners.get('agent/assistant-stream')({ agent, frame })
   const approval = (agent, extra = {}) => listeners.get('approval/request')({ agent, toolName: 'bash', callId: 'call', reason: '需要执行命令', ...extra }, () => Promise.resolve('fallback'))
-  return { binding, root, child, unrelated, stream, approval, receiveJob: event => receiveJob(event), received, reads,
+  return { binding, root, child, secondChild, unrelated, stream, approval, receiveJob: event => receiveJob(event), received, reads,
     chunks: value => { chunks = value }, event: (agent, type, data) => listeners.get('session/event')(agent.session, { type, data }) }
 }
 
@@ -50,6 +51,39 @@ test('所属子代理的正文与思考完成后结算，迟到尝试与无关�
   assert.deepEqual(f.received.map(item => item.activity.phase), ['delta', 'delta', 'completed', 'completed'])
   assert.equal(JSON.stringify(f.received).includes('子代理结果'), true)
   assert.equal(JSON.stringify(f.received).includes('乱序'), false)
+})
+
+test('不同子代理的签名过滤状态隔离，流结束后未闭合内容丢弃', async t => {
+  const f = fixture(t)
+  f.stream(f.child, { type: 'start', revision: 1, attemptId: 'a' })
+  f.stream(f.child, { type: 'chunk', revision: 2, attemptId: 'a', chunk: { type: 'reasoning-delta', index: 0, text: '<sig' } })
+  f.stream(f.secondChild, { type: 'start', revision: 1, attemptId: 'b' })
+  f.stream(f.secondChild, { type: 'chunk', revision: 2, attemptId: 'b', chunk: { type: 'reasoning-delta', index: 0, text: '独立子代理思考' } })
+  f.stream(f.child, { type: 'chunk', revision: 3, attemptId: 'a', chunk: { type: 'reasoning-delta', index: 0, text: 'nature>隐藏签名</signature>子代理正文' } })
+  f.stream(f.child, { type: 'end', revision: 4, attemptId: 'a' })
+  f.stream(f.secondChild, { type: 'end', revision: 3, attemptId: 'b' })
+  f.stream(f.child, { type: 'start', revision: 5, attemptId: 'c' })
+  f.stream(f.child, { type: 'chunk', revision: 6, attemptId: 'c', chunk: { type: 'reasoning-delta', index: 0, text: '<signature>未闭合的签名' } })
+  f.stream(f.child, { type: 'end', revision: 7, attemptId: 'c' })
+  await f.binding.actionQueue
+  const deltas = f.received.filter(value => value.activity?.delta).map(value => value.activity.delta)
+  assert.deepEqual(deltas, ['独立子代理思考', '子代理正文'])
+  assert.equal(JSON.stringify(f.received).includes('隐藏签名'), false)
+  assert.equal(JSON.stringify(f.received).includes('未闭合的签名'), false)
+})
+
+test('子代理激活切换重新建立思考过滤状态', async t => {
+  const f = fixture(t)
+  f.stream(f.child, { type: 'start', revision: 1, attemptId: 'a' })
+  f.stream(f.child, { type: 'chunk', revision: 2, attemptId: 'a', chunk: { type: 'reasoning-delta', index: 0, text: '<sig' } })
+  f.binding.activationId = 'run-b'
+  f.stream(f.child, { type: 'start', revision: 3, attemptId: 'b' })
+  f.stream(f.child, { type: 'chunk', revision: 4, attemptId: 'b', chunk: { type: 'reasoning-delta', index: 0, text: '新激活思考' } })
+  f.stream(f.child, { type: 'end', revision: 5, attemptId: 'b' })
+  await f.binding.actionQueue
+  const deltas = f.received.filter(value => value.activity?.delta).map(value => value.activity.delta)
+  assert.deepEqual(deltas, ['新激活思考'])
+  assert.ok(f.received.every(value => value.activation_id === 'run-b'))
 })
 
 test('子代理工具的参数和结果可展开且脱敏，参数缓存随结果清理', async t => {

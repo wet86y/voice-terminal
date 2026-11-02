@@ -12,8 +12,8 @@ from voice_terminal.distribution import digest, manifest, verify, verify_install
 from voice_terminal.paths import atomic_json
 
 ROOT = Path(__file__).resolve().parents[1]
-DSH_VERSION = '0.2.1-rc.2'  # DSH（代理宿主）版本。
-DSH_COMMIT = '687f282e8625c6b8d11ff58211a90524be2e4317'  # commit（源码提交号）。
+DSH_VERSION = '0.2.1-rc.5'  # DSH（代理宿主）版本。
+DSH_COMMIT = 'b830ec950faba0a46dda564be3e2d854afed94f1'  # commit（源码提交号）。
 
 
 @pytest.fixture
