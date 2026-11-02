@@ -1,4 +1,5 @@
 import { record } from '../shared/json-record.js'
+import { LeadingSignatureFilter } from '../shared/signature-filter.js'
 import type { Context } from '../shared/services.js'
 import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 /** Event component（事件组件）：观察已提交事件并投影根 Agent 的实时思考与工具动作。 */
@@ -66,6 +67,7 @@ function flushThinking(binding: Binding): void {
   const delta = binding.pendingThinkingDelta
   binding.pendingThinkingDelta = ''
   if (!delta || !binding.currentThinkingItemId || !binding.currentThinkingActivationId) return
+  binding.currentThinkingVisible = true
   const characters = Array.from(delta)
   for (let offset = 0; offset < characters.length; offset += THINKING_DELTA_LIMIT) {
     sendRuntimeActivity(binding, binding.currentThinkingActivationId, {
@@ -79,19 +81,25 @@ function clearCurrentThinking(binding: Binding): void {
   if (binding.currentThinkingAttemptId) finishThinking(binding, binding.currentThinkingAttemptId)
   else flushThinking(binding)
   binding.currentThinkingItemId = undefined
+  binding.currentThinkingFilter = undefined
+  binding.currentThinkingVisible = undefined
   binding.currentThinkingAttemptId = undefined
   binding.currentThinkingActivationId = undefined
 }
 
 function finishThinking(binding: Binding, attemptId: string): void {
   if (binding.currentThinkingAttemptId === attemptId) {
+    const trailing = binding.currentThinkingFilter?.finish() ?? ''
+    if (trailing) binding.pendingThinkingDelta += redactSensitive(trailing)
     flushThinking(binding)
-    if (binding.currentThinkingItemId && binding.currentThinkingActivationId) {
+    if (binding.currentThinkingItemId && binding.currentThinkingActivationId && binding.currentThinkingVisible) {
       sendRuntimeActivity(binding, binding.currentThinkingActivationId, {
         stream: 'thinking', phase: 'completed', item_id: binding.currentThinkingItemId,
       })
     }
     binding.currentThinkingItemId = undefined
+    binding.currentThinkingFilter = undefined
+    binding.currentThinkingVisible = undefined
     binding.currentThinkingAttemptId = undefined
     binding.currentThinkingActivationId = undefined
   }
@@ -109,6 +117,8 @@ export function stopRuntimeActivity(binding: Binding): void {
   binding.thinkingTimer = undefined
   binding.pendingThinkingDelta = ''
   binding.currentThinkingItemId = undefined
+  binding.currentThinkingFilter = undefined
+  binding.currentThinkingVisible = undefined
   binding.currentThinkingAttemptId = undefined
   binding.currentThinkingActivationId = undefined
 }
@@ -127,8 +137,8 @@ function onAssistantStream(binding: Binding, frame: AssistantStreamFrame): void 
   if (binding.currentThinkingAttemptId !== String(frame.attemptId)
     || binding.currentThinkingActivationId !== activationId) return
   if (frame.type === 'chunk' && frame.chunk?.type === 'reasoning-delta') {
-    const text = typeof frame.chunk.text === 'string' ? redactSensitive(frame.chunk.text) : ''
-    if (!text) return
+    const rawText = typeof frame.chunk.text === 'string' ? frame.chunk.text : ''
+    if (!rawText) return
     const attemptId = String(frame.attemptId)
     const itemId = `thinking-${attemptId}-${frame.chunk.index}`.slice(0, 160)
     if (binding.currentThinkingItemId !== itemId
@@ -137,7 +147,11 @@ function onAssistantStream(binding: Binding, frame: AssistantStreamFrame): void 
       binding.currentThinkingItemId = itemId
       binding.currentThinkingAttemptId = attemptId
       binding.currentThinkingActivationId = activationId
+      binding.currentThinkingFilter = new LeadingSignatureFilter()
+      binding.currentThinkingVisible = false
     }
+    const text = redactSensitive(binding.currentThinkingFilter?.push(rawText) ?? '')
+    if (!text) return
     binding.pendingThinkingDelta += text
     if (binding.pendingThinkingDelta.length >= THINKING_DELTA_LIMIT) flushThinking(binding)
     else if (!binding.thinkingTimer) {

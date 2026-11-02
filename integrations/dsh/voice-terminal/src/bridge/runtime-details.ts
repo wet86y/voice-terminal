@@ -7,6 +7,7 @@ import type { Context } from '../shared/services.js'
 import type { Binding } from './contracts.js'
 import { record } from '../shared/json-record.js'
 import { redactSensitive } from '../shared/protocol.js'
+import { LeadingSignatureFilter } from '../shared/signature-filter.js'
 import { sendRuntimeActivity } from './events.js'
 
 /** ownedBinding（运行归属）：逐层验证实时所有权，排除其他独立会话和会话分叉。 */
@@ -61,13 +62,25 @@ export function registerExtendedActivity(ctx: Context, bindings: Map<string, Bin
   })
 
   // StreamState（流状态）：各代理独立校验修订、尝试和激活，拒收迟到帧。
-  const streams = new WeakMap<Agent, { revision: number; attemptId: string; activationId: string; items: Map<string, 'thinking' | 'output'> }>()
+  type StreamItem = { stream: 'thinking' | 'output'; filter?: LeadingSignatureFilter; visible: boolean }
+  type StreamState = { revision: number; attemptId: string; activationId: string; items: Map<string, StreamItem> }
+  const streams = new WeakMap<Agent, StreamState>()
   const finishStream = (agent: Agent, binding: Binding) => {
     const state = streams.get(agent)
     if (!state) return
-    for (const [itemId, stream] of state.items) {
-      if (stream === 'thinking') sendRuntimeActivity(binding, state.activationId, { stream, phase: 'completed', item_id: itemId })
-      else sendRuntimeActivity(binding, state.activationId, { stream, phase: 'completed', item_id: itemId, tool_name: binding.handle?.agent === agent ? 'DSH 回复' : '子代理回复', tool_status: 'completed' })
+    for (const [itemId, item] of state.items) {
+      if (item.stream === 'thinking') {
+        const trailing = display(item.filter?.finish() ?? '')
+        if (trailing) {
+          item.visible = true
+          for (let offset = 0; offset < trailing.length; offset += 1800) {
+            sendRuntimeActivity(binding, state.activationId, { stream: 'thinking', phase: 'delta', item_id: itemId, delta: trailing.slice(offset, offset + 1800) })
+          }
+        }
+        if (item.visible) sendRuntimeActivity(binding, state.activationId, { stream: 'thinking', phase: 'completed', item_id: itemId })
+      } else {
+        sendRuntimeActivity(binding, state.activationId, { stream: 'output', phase: 'completed', item_id: itemId, tool_name: binding.handle?.agent === agent ? 'DSH 回复' : '子代理回复', tool_status: 'completed' })
+      }
     }
     state.items.clear()
     state.attemptId = ''
@@ -91,9 +104,18 @@ export function registerExtendedActivity(ctx: Context, bindings: Map<string, Bin
     if (chunk.type !== 'text-delta' && chunk.type !== 'reasoning-delta') return
     const child = binding.handle?.agent !== agent
     if (!child && chunk.type === 'reasoning-delta') return
-    const text = display(chunk.text)
     const itemId = `${chunk.type === 'reasoning-delta' ? 'child-thinking' : 'message'}-${agent.id}-${frame.attemptId}-${chunk.index}`.slice(0, 160)
-    previous.items.set(itemId, chunk.type === 'reasoning-delta' ? 'thinking' : 'output')
+    let item = previous.items.get(itemId)
+    if (!item) {
+      item = { stream: chunk.type === 'reasoning-delta' ? 'thinking' : 'output', visible: false }
+      if (chunk.type === 'reasoning-delta') item.filter = new LeadingSignatureFilter()
+      previous.items.set(itemId, item)
+    }
+    const rawText = typeof chunk.text === 'string' ? chunk.text : JSON.stringify(chunk.text ?? {})
+    const text = chunk.type === 'reasoning-delta'
+      ? display(item.filter?.push(rawText) ?? '')
+      : display(rawText)
+    if (text) item.visible = true
     for (let offset = 0; offset < text.length; offset += 1800) {
       if (chunk.type === 'reasoning-delta') sendRuntimeActivity(binding, previous.activationId, { stream: 'thinking', phase: 'delta', item_id: itemId, delta: text.slice(offset, offset + 1800) })
       else sendRuntimeActivity(binding, previous.activationId, { stream: 'output', phase: 'delta', item_id: itemId, tool_name: child ? '子代理回复' : 'DSH 回复', tool_status: 'running', delta: text.slice(offset, offset + 1800) })

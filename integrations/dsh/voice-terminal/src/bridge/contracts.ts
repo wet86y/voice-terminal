@@ -4,6 +4,7 @@ import type { Volatile } from '@deepseek-ai/cordis'
 import type { Json } from '../shared/protocol.js'
 import type { CallbackScope } from '../shared/callback.js'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { LeadingSignatureFilter } from '../shared/signature-filter.js'
 export interface Config {
   /** HTTP route prefix（HTTP 路由前缀）. */
   readonly routePrefix: string
@@ -93,6 +94,10 @@ export interface Binding {
   assistantStreamRevision: number
   /** currentThinkingItemId（当前思考项）：将同一思考块的增量合并。 */
   currentThinkingItemId?: string | undefined
+  /** currentThinkingFilter（当前思考过滤器）：仅属于此根代理思考项，跨分片过滤前置签名块。 */
+  currentThinkingFilter?: LeadingSignatureFilter | undefined
+  /** currentThinkingVisible（当前思考可见标记）：隐藏签名块时不发送空的完成事件。 */
+  currentThinkingVisible?: boolean | undefined
   /** currentThinkingAttemptId（当前推理尝试）：用于结束当前思考项。 */
   currentThinkingAttemptId?: string | undefined
   /** currentThinkingActivationId（当前思考激活）：迟到刷新仍绑定原运行。 */

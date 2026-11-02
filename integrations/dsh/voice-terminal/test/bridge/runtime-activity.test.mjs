@@ -113,6 +113,50 @@ test('根代理思考保留空白并累加，新块与工具按同一动作序�
   assert.equal(JSON.stringify(rows).includes('助手'), false)
 })
 
+test('根代理过滤跨分片前置签名块、清理换行并继续脱敏正文', async t => {
+  const f = fixture(t)
+  f.start()
+  f.delta('<sig')
+  f.delta('nature>内部签名内容</sign')
+  f.delta('ature>\r')
+  f.delta('\n\n正文 password=private-test-key')
+  f.end()
+  await f.binding.actionQueue
+  const deltas = f.callbacks().filter(value => value.activity?.delta).map(value => value.activity.delta)
+  assert.deepEqual(deltas, ['正文 password=[REDACTED]'])
+  assert.equal(JSON.stringify(f.callbacks()).includes('内部签名内容'), false)
+  assert.equal(JSON.stringify(f.callbacks()).includes('private-test-key'), false)
+})
+
+test('根代理保留普通前缀和正文中间标记，未闭合前置签名不会泄漏', async t => {
+  const f = fixture(t)
+  f.start()
+  f.delta('普通文本 <signature>正文标记</signature> 保留')
+  f.end()
+  f.start('attempt-b')
+  f.delta('<signature>未闭合的内部内容')
+  f.end('attempt-b')
+  await f.binding.actionQueue
+  const deltas = f.callbacks().filter(value => value.activity?.delta).map(value => value.activity.delta)
+  assert.deepEqual(deltas, ['普通文本 <signature>正文标记</signature> 保留'])
+  assert.equal(JSON.stringify(f.callbacks()).includes('未闭合的内部内容'), false)
+})
+
+test('取消清理旧过滤状态，后续激活从新的普通正文开始', async t => {
+  const f = fixture(t)
+  f.start()
+  f.delta('<sig')
+  stopRuntimeActivity(f.binding)
+  f.binding.activationId = 'activation-b'
+  f.start('attempt-b')
+  f.delta('新激活正文', 0, 'attempt-b')
+  f.end('attempt-b')
+  await f.binding.actionQueue
+  const rows = f.callbacks().filter(value => value.activity?.delta)
+  assert.deepEqual(rows.map(value => value.activity.delta), ['新激活正文'])
+  assert.ok(rows.every(value => value.activation_id === 'activation-b'))
+})
+
 test('旧修订帧和旧尝试结束不能刷新或替换新思考块', async t => {
   const f = fixture(t)
   f.start(); f.delta('旧思考')

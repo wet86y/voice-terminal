@@ -1465,13 +1465,13 @@ mod download_tests {
 
     #[test]
     fn dsh_activation_requires_exact_version_clear_update_flag_and_start_readiness(){
-        let ready=json!({"installed_version":"0.2.1-rc.2","update_available":false,"can_start":true});
-        assert!(validate_dsh_activation_state(&ready,"0.2.1-rc.2").is_ok());
+        let ready=json!({"installed_version":"0.2.1-rc.5","update_available":false,"can_start":true});
+        assert!(validate_dsh_activation_state(&ready,"0.2.1-rc.5").is_ok());
         for changed in [
-            json!({"installed_version":"0.2.0-rc.2","update_available":false,"can_start":true}),
-            json!({"installed_version":"0.2.1-rc.2","update_available":true,"can_start":true}),
-            json!({"installed_version":"0.2.1-rc.2","update_available":false,"can_start":false}),
-        ] {assert!(validate_dsh_activation_state(&changed,"0.2.1-rc.2").is_err());}
+            json!({"installed_version":"0.2.1-rc.2","update_available":false,"can_start":true}),
+            json!({"installed_version":"0.2.1-rc.5","update_available":true,"can_start":true}),
+            json!({"installed_version":"0.2.1-rc.5","update_available":false,"can_start":false}),
+        ] {assert!(validate_dsh_activation_state(&changed,"0.2.1-rc.5").is_err());}
     }
 
     #[test]
@@ -1856,13 +1856,13 @@ mod download_tests {
         atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","legacy").unwrap()).unwrap();
         let digest=file_hash(&installed.join("manifest.json")).unwrap();
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{
-            "resource_id":"dsh","title":"代理宿主","kind":"dsh","version":"0.2.1-rc.2","destination":"runtimes/dsh",
+            "resource_id":"dsh","title":"代理宿主","kind":"dsh","version":"0.2.1-rc.5","destination":"runtimes/dsh",
             "source":{"transfer":{"artifact":{"sha512_base64":base64::engine::general_purpose::STANDARD.encode([0u8;64])}}},
             "legacy_export":{"supported":true,"manifest_sha256":digest},"files":[]
         }]})).unwrap();
         let context=LaunchContext::portable(&root).unwrap();let rows=inventory(&context).unwrap();let row=rows.iter().find(|row|row["resource_id"]=="dsh").unwrap();
         assert_eq!(row["installation_state"],"installed");assert_eq!(row["files_installed"],true);
-        assert_eq!(row["installed_version"],"0.1.0");assert_eq!(row["version"],"0.2.1-rc.2");
+        assert_eq!(row["installed_version"],"0.1.0");assert_eq!(row["version"],"0.2.1-rc.5");
         assert_eq!(row["update_available"],true);assert_eq!(row["can_start"],false);
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
