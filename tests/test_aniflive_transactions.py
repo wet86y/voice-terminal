@@ -10,16 +10,17 @@ from tests.test_model_resource_updates import workspace
 
 
 @pytest.mark.parametrize('state', ['prepared', 'committed'])
-def test_dependency_swap_recovers_both_versions_without_mixing(tmp_path, state):
-    for folder in ('packages', 'export-packages'):
+@pytest.mark.parametrize('folders', [('packages', 'export-packages'), ('source',)])
+def test_dependency_swap_recovers_both_versions_without_mixing(tmp_path, state, folders):
+    for folder in folders:
         for name, content in ((folder, b'new'), ('.' + folder + '-old-1', b'old'), ('.' + folder + '-stage-1', b'candidate')):
             (tmp_path / name).mkdir()
             (tmp_path / name / 'version').write_bytes(content)
     rows = [{'target': folder, 'stage': '.' + folder + '-stage-1', 'backup': '.' + folder + '-old-1', 'original': True}
-            for folder in ('packages', 'export-packages')]
+            for folder in folders]
     (tmp_path / 'dependency-transaction.json').write_text(json.dumps({'schema': 1, 'state': state, 'items': rows}), encoding='utf-8')
     recover_dependencies(tmp_path)
-    for folder in ('packages', 'export-packages'):
+    for folder in folders:
         assert (tmp_path / folder / 'version').read_bytes() == (b'old' if state == 'prepared' else b'new')
     assert not list(tmp_path.glob('.*')) and not (tmp_path / 'dependency-transaction.json').exists()
 

@@ -2,6 +2,8 @@
 import json
 import ast
 import os
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 import zipfile
 
@@ -11,9 +13,12 @@ from voice_terminal.tts import aniflive_native as native
 
 
 def archive_fixture(tmp_path, monkeypatch):
+    # 此夹具只验证归档事务；阶段拆分另用完整固定源码执行验证。
+    from voice_terminal.tts import aniflive_export
+    monkeypatch.setattr(aniflive_export, 'stage_export_source', lambda text: text)
     archive = tmp_path / "source.zip"
     files = {
-        "minimal_inference/export_onnx.py": "ssl_model = ssl_model.to(device)\ndef export():\n    torch.set_num_threads(4)\n",
+        "minimal_inference/export_onnx.py": "ssl_model = ssl_model.to(device)\ndef export():\n    torch.set_num_threads(4)\n" + native.GPT_ENCODER_VALIDATION + '\n',
         "minimal_inference/GPT_SoVITS/text/korean.py": "dictionary_path = mecab_ko_dic.dictionary_path.as_posix()\n",
         "src/aniflive_tts/service.py": "if int(properties.total_memory) < 8 * 1024 * 1024 * 1024:\n    pass\n",
         "src/aniflive_tts/backend/trt_builder.py": "if not parser.parse_from_file(str(source)):\n    pass\n",
@@ -31,6 +36,32 @@ def archive_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(native, "patch_source", patch_and_pin)
     local = tmp_path / "local"
     return archive, local
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_encoder_validation_threads_restore_original_budget(monkeypatch, fail):
+    state = {'threads': 4, 'calls': []}
+    def set_threads(value):
+        state['threads'] = value
+        state['calls'].append(value)
+    monkeypatch.setattr(native, 'os', SimpleNamespace(name='nt'))
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(
+        get_num_threads=lambda: state['threads'], set_num_threads=set_threads))
+    try:
+        with native.gpt_encoder_validation_threads():
+            assert state['threads'] == 24
+            if fail:
+                raise RuntimeError('模拟官方数值校验失败')
+    except RuntimeError:
+        assert fail
+    assert state == {'threads': 4, 'calls': [24, 4]}
+
+
+def test_non_windows_encoder_validation_preserves_resource_policy(monkeypatch):
+    monkeypatch.setattr(native, 'os', SimpleNamespace(name='posix'))
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace())
+    with native.gpt_encoder_validation_threads():
+        pass  # 非 Windows（操作系统）不访问或改变张量库线程。
 
 
 @pytest.mark.parametrize("windows", [False, True])
@@ -61,6 +92,33 @@ def test_wrong_archive_does_not_change_existing_files(tmp_path):
     with pytest.raises(ValueError, match="摘要"):
         native.prepare_source(archive, local)
     assert not local.exists()
+
+
+@pytest.mark.parametrize('activation_fails', [False, True])
+def test_known_source_upgrade_checks_prior_and_restores_if_activation_fails(tmp_path, monkeypatch, activation_fails):
+    archive, local = archive_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(native, 'PATCH_REVISION', 3)
+    prior = native.prepare_source(archive, local)
+    hashes = {r['path']:r['after_sha256'] for r in prior['files']}
+    monkeypatch.setattr(native, 'PREVIOUS_PATCHED_SHA256', {3:hashes})
+    monkeypatch.setattr(native, 'PATCH_REVISION', 5)
+    target = local/'runtimes/aniflive-tts/source'
+    calls = []
+    def activate():
+        calls.append(True)
+        assert json.loads((target/'windows-source-receipt.json').read_text())['patch_revision'] == 3
+        if activation_fails:
+            raise RuntimeError('模拟暂停失败')
+    if activation_fails:
+        with pytest.raises(RuntimeError, match='暂停失败'):
+            native.prepare_source(archive, local, allow_upgrade=True, before_activate=activate)
+        assert json.loads((target/'windows-source-receipt.json').read_text()) == prior
+    else:
+        result = native.prepare_source(archive, local, allow_upgrade=True, before_activate=activate)
+        assert result['patch_revision'] == 5
+        assert native.prepare_source(archive, local) == result
+    assert calls == [True]
+    assert not (target.parent/'dependency-transaction.json').exists()
 
 
 def test_unknown_source_structure_never_activates(tmp_path, monkeypatch):

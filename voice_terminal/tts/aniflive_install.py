@@ -123,11 +123,13 @@ class AnifLiveInstallTask:
 
     def prepare_source(self):
         emit('核对固定官方源码与兼容补丁')
+        from .aniflive_transactions import recover_dependencies
+        recover_dependencies(self.runtime)
         cache = self.local / 'cache/aniflive-tts-v1.5.0-beta-source.zip'
         row = {'url': f'https://github.com/Hiruynk/AnifLive-TTS/archive/{UPSTREAM_COMMIT}.zip',
                'size': 32876798, 'sha256': ARCHIVE_SHA256}
         artifact(row, cache, local=self.local, program=self.program)
-        return prepare_source(cache, self.local)
+        return prepare_source(cache, self.local, allow_upgrade=True, before_activate=self.acquire_gpu)
 
     def prepare_dependencies(self):
         unresolved = [r['name'] for r in self.lock['wheels'] if r.get('needs_build') or r.get('resolution_error')]

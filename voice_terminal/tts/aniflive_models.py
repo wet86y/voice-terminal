@@ -15,23 +15,48 @@ BUILD_ADAPTER_FILES = (
     'voice_terminal/tts/aniflive_worker.py', 'voice_terminal/tts/aniflive_build_diagnostics.py',
     'scripts/run-aniflive.py', 'voice_terminal/tts/aniflive_aliases.py',
     'voice_terminal/tts/aniflive_shared.py', 'voice_terminal/tts/aniflive_service.py',
+    'voice_terminal/tts/aniflive_export.py',
 )  # BUILD_ADAPTER_FILES（构建与私有接口桥接的完整源码身份）。
 
 
 def validate_build_identity(identity, program: Path):
-    """检查当前补丁、依赖锁与桥接实现；旧构建必须重新通过组件转换。"""
+    """检查完整构建身份；只允许明确审阅过的导出改动兼容旧引擎。"""
     source = identity.get('source', {})
     if (identity.get('dependency_lock') != digest(program / 'config/runtime/aniflive-runtime.lock.json')
             or identity.get('shared_lock') != digest(program / 'config/runtime/aniflive-shared-assets.lock.json')
-            or source.get('upstream_commit') != UPSTREAM_COMMIT or source.get('patch_revision') != PATCH_REVISION
-            or {row['path']: row['after_sha256'] for row in source.get('files', [])} != PATCHED_SHA256):
+            or source.get('upstream_commit') != UPSTREAM_COMMIT):
         raise ValueError('模型构建的补丁或依赖身份已变化，请在组件列表重新转换。')
     adapters = identity.get('adapter')
     required = set(BUILD_ADAPTER_FILES)
+    if reviewed_export_compatibility(identity, program):
+        return
+    if (source.get('patch_revision') != PATCH_REVISION
+            or {row['path']: row['after_sha256'] for row in source.get('files', [])} != PATCHED_SHA256):
+        raise ValueError('模型构建的补丁身份已变化，且未经过运行兼容审阅，请在组件列表重新转换。')
     if not isinstance(adapters, dict) or set(adapters) != required:
         raise ValueError('模型缺少完整桥接实现身份，请重新转换。')
     if any(digest(contained(program, program / name)) != expected for name, expected in adapters.items()):
         raise ValueError('模型桥接实现身份已变化，请在组件列表重新转换。')
+
+
+def reviewed_export_compatibility(identity, program: Path) -> bool:
+    """收据仍保持真实旧身份，不将旧引擎改写成新补丁构建。"""
+    path = program/'config/runtime/aniflive-build-compatibility.json'
+    if not path.is_file():
+        return False
+    rules = json.loads(path.read_text(encoding='utf-8'))
+    if rules.get('schema') != 1 or not isinstance(rules.get('profiles'), list):
+        return False
+    for profile in rules['profiles']:
+        if (not isinstance(profile, dict) or profile.get('source') != identity.get('source')
+                or profile.get('adapter') != identity.get('adapter')):
+            continue
+        runtime = profile.get('runtime_adapter')
+        if not isinstance(runtime, dict) or set(runtime) != set(BUILD_ADAPTER_FILES):
+            continue
+        if all(digest(contained(program, program/name)) == expected for name, expected in runtime.items()):
+            return True
+    return False
 
 
 def validate_model_id(value):

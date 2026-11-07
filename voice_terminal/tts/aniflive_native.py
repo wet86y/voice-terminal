@@ -14,14 +14,17 @@ import zipfile
 
 UPSTREAM_COMMIT = "9bc349d3a71362b3bfdccbc630983809800954fd"
 ARCHIVE_SHA256 = "67929fedc70df998a6006028b6385743611c5d5a78a5ede3b6713f64435eada2"
-PATCH_REVISION = 3  # PATCH_REVISION（本机兼容补丁修订）。
+PATCH_REVISION = 5  # PATCH_REVISION（本机兼容补丁修订）。
 PATCHED_SHA256 = {
     "scripts/setup_shared_assets.py": "13c89086b7a499b0be3d408f476032832c7961e5840fbd3c9764ee98a430dc84",
-    "minimal_inference/export_onnx.py": "f554f3f3cc36c24650a31dde5fb4313179340fd1024653b8ae10ba32e764c4a8",
+    "minimal_inference/export_onnx.py": "da5f9bc8dff89c38ec2a297b6754736d529a2a9fb401456efcb39ff4dc7b9bbf",
     "minimal_inference/GPT_SoVITS/text/korean.py": "07b5f540a6664b028bfcdabaed1c0a064d0e3a2d2fc61d9f87d1a111bb974fe7",
     "src/aniflive_tts/service.py": "ba3ed25c5eac40522af6986450e2e4f03407bfa531770517edd6ecf3d56be29e",
     "src/aniflive_tts/backend/trt_builder.py": "70f8b41a9f71dc0311cadcc3bc48a4a5fcb9da2951ef2e2a63cd490e3f1d7753",
 }  # PATCHED_SHA256（本修订的固定补丁结果摘要）。
+PREVIOUS_PATCHED_SHA256 = {3: {**PATCHED_SHA256, 'minimal_inference/export_onnx.py':
+    'f554f3f3cc36c24650a31dde5fb4313179340fd1024653b8ae10ba32e764c4a8'}}
+# PREVIOUS_PATCHED_SHA256（允许事务升级的已审阅旧补丁完整结果摘要）。
 
 
 def digest(path: Path) -> str:
@@ -54,6 +57,37 @@ def nominal_vram_supported(total_bytes: int, *, windows: bool) -> bool:
     return type(total_bytes) is int and total_bytes >= 8 * 1024**3 - (16 * 1024**2 if windows else 0)
 
 
+@contextmanager
+def gpt_encoder_validation_threads():
+    """仅 Windows（操作系统）编码器参考校验复用已成功现场的 24 线程。"""
+    if os.name != 'nt':
+        yield
+        return
+    import torch
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(24)
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+GPT_ENCODER_VALIDATION = '''    if validator:
+        for probe_seed in GPT_VALIDATION_SEEDS:
+            if not validator.validate_model(
+                model_name="GPTEncoder",
+                onnx_path=f"{output_dir}/gpt_encoder.onnx",
+                pytorch_model=gpt_enc,
+                dummy_inputs=gpt_validation_inputs(probe_seed),
+                output_names=["topk_values", "topk_indices", "k_cache", "v_cache", "x_len", "y_len", "logits"],
+                rtol=1e-3,
+                atol=1e-5,
+                case_id=f"seed-{probe_seed}",
+            ):
+                raise RuntimeError("GPT encoder PyTorch to ONNX validation failed")'''
+# GPT_ENCODER_VALIDATION（固定上游编码器校验区块）；不修改容差与失败处理。
+
+
 def patch_source(source: Path) -> dict:
     """固定归档在隔离候选内应用补丁；调用者负责最终启用。"""
     records = []
@@ -77,6 +111,13 @@ def patch_source(source: Path) -> dict:
     replace("minimal_inference/export_onnx.py", "torch.set_num_threads(4)",
             "from voice_terminal.resources import model_thread_budget\n"
             "    torch.set_num_threads(model_thread_budget())  # 使用项目资源策略，不固定测试线程数。")
+    replace("minimal_inference/export_onnx.py", GPT_ENCODER_VALIDATION,
+            '    from voice_terminal.tts.aniflive_native import gpt_encoder_validation_threads\n'
+            '    with gpt_encoder_validation_threads():\n' +
+            '\n'.join('    ' + line for line in GPT_ENCODER_VALIDATION.splitlines()))
+    from .aniflive_export import stage_export_source
+    exporter = (source / 'minimal_inference/export_onnx.py').read_text(encoding='utf-8')
+    replace('minimal_inference/export_onnx.py', exporter, stage_export_source(exporter))
     replace("minimal_inference/GPT_SoVITS/text/korean.py",
             'dictionary_path = mecab_ko_dic.dictionary_path.as_posix()',
             'dictionary_path = getattr(mecab_ko_dic, "dictionary_path", None)\n'
@@ -105,7 +146,7 @@ def patch_source(source: Path) -> dict:
                        "before_sha256": "修改前摘要", "after_sha256": "修改后摘要"}}
 
 
-def prepare_source(archive: Path, local: Path) -> dict:
+def prepare_source(archive: Path, local: Path, *, allow_upgrade=False, before_activate=None) -> dict:
     """校验固定归档并准备首次源码；不覆盖现用运行资源。"""
     local = contained(local, local)
     archive = Path(archive)
@@ -116,7 +157,9 @@ def prepare_source(archive: Path, local: Path) -> dict:
     target = contained(local, local / "runtimes/aniflive-tts/source")
     if target.exists():
         receipt = json.loads((target / "windows-source-receipt.json").read_text(encoding="utf-8"))
-        if receipt.get("upstream_commit") != UPSTREAM_COMMIT or receipt.get("patch_revision") != PATCH_REVISION:
+        revision = receipt.get('patch_revision')
+        upgrading = allow_upgrade and revision == 3 and PATCH_REVISION == 5
+        if receipt.get("upstream_commit") != UPSTREAM_COMMIT or (revision != PATCH_REVISION and not upgrading):
             raise ValueError("现用源码需要通过组件更新事务升级。")
         if receipt.get("archive_sha256") != ARCHIVE_SHA256 or not isinstance(receipt.get("inventory"), dict):
             raise ValueError("现用源码缺少可信归档与完整文件登记。")
@@ -124,7 +167,7 @@ def prepare_source(archive: Path, local: Path) -> dict:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as bundle:
             expected_inventory = {row.filename.split("/", 1)[1]: hashlib.sha256(bundle.read(row)).hexdigest()
                                   for row in bundle.infolist() if not row.is_dir()}
-        expected_inventory.update(PATCHED_SHA256)
+        expected_inventory.update(PREVIOUS_PATCHED_SHA256[revision] if upgrading else PATCHED_SHA256)
         if inventory != expected_inventory:
             raise ValueError("现用源码登记与固定官方归档或补丁身份不匹配。")
         actual = {p.relative_to(target).as_posix() for p in target.rglob("*")
@@ -138,6 +181,8 @@ def prepare_source(archive: Path, local: Path) -> dict:
         for row in receipt["files"]:
             if digest(contained(target, target / row["path"])) != row["after_sha256"]:
                 raise ValueError("已准备源码的兼容补丁内容损坏。")
+        if upgrading:
+            return _upgrade_source(archive, local, before_activate)
         return receipt
     task_root = contained(local, local / "tmp/aniflive-source")
     task_root.mkdir(parents=True, exist_ok=True)
@@ -171,6 +216,38 @@ def prepare_source(archive: Path, local: Path) -> dict:
     finally:
         if candidate.exists():
             shutil.rmtree(contained(task_root, candidate))
+
+
+def _upgrade_source(archive: Path, local: Path, before_activate) -> dict:
+    """已完整确权的旧源码经可恢复事务更新；依赖和用户资料不移动。"""
+    from .aniflive_transactions import recover_dependencies
+    from ..paths import atomic_json
+    runtime = local/'runtimes/aniflive-tts'
+    scratch_root = local/'tmp/aniflive-source'
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix='upgrade-', dir=scratch_root))
+    try:
+        receipt = prepare_source(archive, scratch)
+        # 再次按固定归档与结果摘要验证，不信任刚生成的自报收据。
+        prepare_source(archive, scratch)
+        if before_activate is not None:
+            before_activate()
+        stage = runtime/('.source-stage-'+scratch.name)
+        backup = runtime/('.source-old-'+scratch.name)
+        os.rename(scratch/'runtimes/aniflive-tts/source', stage)
+        row = {'target':'source','stage':stage.name,'backup':backup.name,'original':True}
+        journal = runtime/'dependency-transaction.json'
+        try:
+            atomic_json(journal, {'schema':1,'state':'prepared','items':[row]})
+            os.rename(runtime/'source', backup)
+            os.rename(stage, runtime/'source')
+            atomic_json(journal, {'schema':1,'state':'committed','items':[row]})
+        finally:
+            recover_dependencies(runtime)
+        return receipt
+    finally:
+        if scratch.exists():
+            shutil.rmtree(contained(scratch_root, scratch))
 
 
 def verify_external_data(source: Path) -> None:
