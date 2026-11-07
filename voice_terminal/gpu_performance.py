@@ -103,7 +103,7 @@ _GRAPHICS_PROCESS_APIS = (
 # 外部 Python 进程（例如另一份模型脚本、notebook）误判成自己人。自建进程一律
 # 通过进程树祖先关系判定，见 ``GpuPerformanceMode._own_pids``。
 OWN_PROCESS_MARKERS = (
-    "audiocpp_server", "voice-server", "llama-server",
+    "voice-server", "llama-server",
     "voice-terminal", "electron", "dsh",
 )
 

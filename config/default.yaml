@@ -172,13 +172,16 @@ llm:
   transport_retry_limit: 2
 
 tts:
-  # backend（语音后端）：当前产品固定使用 MiniMax API（在线语音接口）；兼容路由层保留本地扩展位。
+  # backend（语音后端）：minimax（MiniMax 在线接口）或 aniflive（本地引擎）。
   backend: minimax
+  local_model: minimax-female-shaonv-zh # local_model（本地默认登记编号）。
+  aniflive_chunk_optimization: true # 后续使用48个语义标记。
+  aniflive_first_audio_wait_ms: 0 # 首块实际到达后的等待毫秒。
   provider: minimax
   # gpu_max_performance（本地合成请求显卡优先最大性能）：本地 TTS 就绪时用 NVML 把本进程的
   # PowerMizer 模式设为“优先最大性能”，免管理员权限、按进程生效、进程退出自动还原；
   # 无 NVIDIA 驱动或接口不可用时自动跳过，不影响合成。
-  gpu_max_performance: true
+  gpu_max_performance: false
   base_url: https://api.minimaxi.com
   websocket_path: /ws/v1/t2a_v2
   transport: websocket

@@ -17,66 +17,77 @@ from voice_terminal.tts.router import TtsBackendRouter
 from voice_terminal.audio.player import PcmPlayer
 
 
+@pytest.fixture(autouse=True)
+def registered_model_fixtures(tmp_path):
+    import hashlib
+    entries = {}
+    for index, model in enumerate(("minimax-female-shaonv-zh", "tangyuge-v2pp-d78cf598")):
+        revision = str(index + 1) * 24
+        folder = tmp_path / "models/aniflive-tts/packages" / model / revision
+        folder.mkdir(parents=True)
+        (folder / "fixture.engine").write_bytes(b"test-engine")
+        (folder / "manifest.json").write_text(json.dumps({"format": "aniflive-tts-model-package", "model_id": model}), encoding="utf-8")
+        (folder / "checksums.json").write_text('{}', encoding='utf-8')
+        from tests.aniflive_fixtures import build_identity
+        identity = {**build_identity(), "fixture": model}
+        (folder / "application-receipt.json").write_text(json.dumps({"identity": identity,
+            "validation": {"enqueue_verified": True, "engine_count": 9}, "streaming_verified": True,
+            "files": [{"path": p.name, "size": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                      for p in (folder / 'fixture.engine', folder / 'manifest.json')]}), encoding="utf-8")
+        entries[model] = {"name": model, "current_revision": revision,
+            "versions": {revision: {"state": "validated", "identity": identity}}}
+    path = tmp_path / "data/config/aniflive-models.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schema": 1, "models": entries}), encoding="utf-8")
+
+
 def test_scoped_voice_api_and_settings_projection(tmp_path):
     async def scenario():
         config = AppConfig()
         store = ProductSettingsStore(path=tmp_path / "data/config/product-settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=store, runtime_data_dir=tmp_path / "data")
-        for library in runtime.voice_library.libraries.values():
-            library.register_default(_wav_bytes(), "默认素材准确转写。")
+        library = runtime.voice_library.for_model("aniflive")
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, product_settings=store)), base_url="http://test") as client:
-            one = (await client.get("/api/v1/tts/voices/voxcpm1")).json()
-            two = (await client.get("/api/v1/tts/voices/voxcpm2")).json()
-            assert one["active_voice"] != two["active_voice"]
-            default = one["active_voice"]["voice_id"]
-            assert (await client.delete(f"/api/v1/tts/voices/voxcpm1/{default}")).status_code == 409
-            asset = (await client.post("/api/v1/tts/assets/voxcpm1/import?filename=test.wav", content=_wav_bytes())).json()["asset"]
-            audio_url = f"/api/v1/tts/assets/voxcpm1/{asset['asset_id']}/audio"
-            audio = await client.get(audio_url)
-            assert audio.status_code == 200
-            assert audio.headers["content-type"] == "audio/wav"
-            assert audio.content == runtime.voice_library.for_model("voxcpm1").asset_bytes(asset["asset_id"])
-            missing = await client.get("/api/v1/tts/assets/voxcpm1/nonexistent/audio")
-            assert missing.status_code == 404
-            payload = {"name": "自定义", "source": "import", "reference_asset_id": asset["asset_id"], "reference_text": "准确转写。"}
-            foreign = await client.post("/api/v1/tts/voices/voxcpm2", json={**payload, "model": "voxcpm1"})
-            assert foreign.status_code == 422
-            created = (await client.post("/api/v1/tts/voices/voxcpm1", json=payload)).json()["voice"]
+            assert (await client.get("/api/v1/tts/voices/voxcpm1")).status_code == 422
+            assert (await client.get("/api/v1/tts/voices/voxcpm2")).status_code == 422
+            asset = (await client.post("/api/v1/tts/assets/aniflive/import?filename=test.wav", content=_wav_bytes())).json()["asset"]
+            audio = await client.get(f"/api/v1/tts/assets/aniflive/{asset['asset_id']}/audio")
+            assert audio.status_code == 200 and audio.headers["content-type"] == "audio/wav"
+            payload = {"name": "自定义", "source": "import", "reference_asset_id": asset["asset_id"],
+                       "reference_text": "准确转写。", "reference_language": "zh"}
+            created = (await client.post("/api/v1/tts/voices/aniflive", json=payload)).json()["voice"]
             selected = {"voice_id": created["id"], "revision": 1}
-            assert (await client.put("/api/v1/tts/voices/voxcpm2/selection", json={"selection": selected})).status_code == 422
-            assert (await client.put("/api/v1/tts/voices/voxcpm1/selection", json={"selection": selected})).status_code == 200
-            path = "/api/v1/tts/voices/voxcpm1/" + created["id"]
+            assert (await client.put("/api/v1/tts/voices/aniflive/selection", json={"selection": selected})).status_code == 200
+            path = "/api/v1/tts/voices/aniflive/" + created["id"]
             assert (await client.put(path, json={**payload, "name": "新版", "expected_revision": 1})).status_code == 200
             assert (await client.put(path, json={**payload, "expected_revision": 1})).status_code == 409
-            assert store.settings_only()["tts"]["active_voice_by_model"]["voxcpm1"]["revision"] == 2
+            assert library.active_selection["revision"] == 2
             assert (await client.delete(path)).status_code == 200
-            assert store.settings_only()["tts"]["active_voice_by_model"]["voxcpm1"]["voice_id"] == default
-            result = await client.put("/api/v1/product/settings/tts", json={"inference_steps_by_model": {"voxcpm1": 12, "voxcpm2": 22}})
-            assert result.status_code == 200
+            assert library.active_selection is None
+            assert (await client.put("/api/v1/product/settings/tts", json={"inference_steps_by_model": {"tangyuge-v2pp-d78cf598": 22}})).status_code == 422
+            response = await client.put("/api/v1/product/settings/tts", json={"aniflive_first_audio_wait_ms": 137})
+            assert response.status_code == 200, response.text
             persisted = json.loads(store.path.read_text(encoding="utf-8"))
-            assert persisted["schema_version"] == 18
-            assert persisted["tts"]["speech_control_enabled"] is True
+            assert persisted["schema_version"] == 20 and persisted["tts"]["aniflive_first_audio_wait_ms"] == 137
+            assert persisted["tts"]["backend"] == "minimax"
             assert "active_voice_by_model" not in persisted["tts"]
-            target = runtime.voice_library.for_model("voxcpm2").put_import(_wav_bytes(), "target.wav")
-            stale = {"name": "过期设计", "source": "design", "reference_asset_id": target["asset_id"],
-                     "reference_text": "生成正文。", "design_text": "生成正文。", "design_description": "温柔女声", "inference_steps": 20}
-            runtime.voice_library.for_model("voxcpm2").mark_design(target["asset_id"], stale)
-            assert (await client.post("/api/v1/tts/voices/voxcpm2", json=stale)).status_code == 422
-            # 样音独立使用30步，调整正式步数仍可保存并单独校对目标转写。
-            candidate = {**stale, "name": "独立样音", "inference_steps": 30,
-                         "generation_recipe": "voxcpm2-full-decode-v2"}
-            runtime.voice_library.for_model("voxcpm2").mark_design(target["asset_id"], candidate)
-            assert (await client.put("/api/v1/product/settings/tts", json={"inference_steps_by_model": {"voxcpm2": 13}})).status_code == 200
-            created = await client.post("/api/v1/tts/voices/voxcpm2", json=candidate)
-            assert created.status_code == 200, created.text
-            saved = created.json()["voice"]
-            correction = {**saved, "reference_text": "生成时实际说出的正文。", "expected_revision": 1}
-            updated = await client.put("/api/v1/tts/voices/voxcpm2/" + saved["id"], json=correction)
-            assert updated.status_code == 200, updated.text
-            assert updated.json()["voice"]["reference_asset_id"] == target["asset_id"]
-            assert updated.json()["voice"]["reference_text"] == "生成时实际说出的正文。"
-            assert runtime.config.tts.inference_steps_by_model["voxcpm2"] == 13
+            assert (await client.post("/api/v1/tts/voices/aniflive", json={**payload, "source": "design"})).status_code == 422
     asyncio.run(scenario())
+
+
+def test_startup_selection_persists_exact_registered_revision(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    model = 'tangyuge-v2pp-d78cf598'
+    result = subprocess.run([sys.executable, '-I', '-B', '-X', 'utf8', str(root / 'scripts/voice-environment-worker.py'),
+        'tts-selection', '--program', str(root), '--data', str(tmp_path / 'data'), '--selection',
+        json.dumps({'backend': 'aniflive', 'local_model': model})], capture_output=True, text=True, encoding='utf-8', timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    stored = json.loads((tmp_path / 'data/config/product-settings.json').read_text(encoding='utf-8'))
+    assert stored['schema_version'] == 20 and stored['tts']['local_model_revision'] == '2' * 24
+    assert stored['tts']['backend'] == 'aniflive' and stored['tts']['local_model'] == model
 
 
 def test_minimax_voice_lookup_accepts_future_voice_categories(monkeypatch):
@@ -254,7 +265,7 @@ def test_online_tts_settings_validate_apply_and_persist(tmp_path, monkeypatch):
         runtime.state.set_service("tts", "READY")
         switched = []
 
-        async def switch(backend, local_model):
+        async def switch(backend, local_model, **options):
             switched.append((backend, local_model, runtime.config.tts.model, runtime.config.tts.voice_id))
             runtime.tts.backend = backend
             runtime.config = replace(runtime.config, tts=replace(
@@ -270,7 +281,7 @@ def test_online_tts_settings_validate_apply_and_persist(tmp_path, monkeypatch):
             })
         assert response.status_code == 200, response.text
         assert validate.await_args.args[1] == "my-clone"
-        assert switched == [("minimax", "voxcpm2", "speech-2.8-turbo", "my-clone")]
+        assert switched == [("minimax", "minimax-female-shaonv-zh", "speech-2.8-turbo", "my-clone")]
         assert runtime.config.tts.model == "speech-2.8-turbo"
         assert runtime.config.tts.voice_id == "my-clone"
         assert store.settings_only()["tts"]["online_model"] == "speech-2.8-turbo"
@@ -295,7 +306,7 @@ def test_online_tts_client_switch_failure_rolls_back_runtime_and_settings(tmp_pa
         runtime.state.set_service("tts", "READY")
         switch_calls = []
 
-        async def switch(backend, local_model):
+        async def switch(backend, local_model, **options):
             switch_calls.append((backend, local_model))
             if len(switch_calls) == 1:
                 raise RuntimeError("模拟客户端重建失败")
@@ -312,7 +323,7 @@ def test_online_tts_client_switch_failure_rolls_back_runtime_and_settings(tmp_pa
                 "online_model": "speech-2.8-turbo", "online_voice_id": "candidate-clone",
             })
         assert response.status_code == 503
-        assert switch_calls == [("minimax", "voxcpm2"), ("minimax", "voxcpm2")]
+        assert switch_calls == [("minimax", "minimax-female-shaonv-zh"), ("minimax", "minimax-female-shaonv-zh")]
         assert runtime.config.tts.model == config.tts.model
         assert runtime.config.tts.voice_id == config.tts.voice_id
         assert store.settings_only()["tts"]["online_model"] == "speech-2.8-hd"
@@ -346,11 +357,11 @@ def test_online_tts_voice_validation_failure_does_not_save_or_apply(tmp_path, mo
 def test_asset_file_missing_returns_not_found(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
-        library = runtime.voice_library.for_model("voxcpm2")
+        library = runtime.voice_library.for_model("aniflive")
         asset = library.put_import(_wav_bytes(), "reference.wav")
         library.asset_path(asset["asset_id"]).unlink()
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
-            response = await client.get(f"/api/v1/tts/assets/voxcpm2/{asset['asset_id']}/audio")
+            response = await client.get(f"/api/v1/tts/assets/aniflive/{asset['asset_id']}/audio")
             assert response.status_code == 404
     asyncio.run(scenario())
 
@@ -358,23 +369,23 @@ def test_asset_file_missing_returns_not_found(tmp_path):
 def test_legacy_empty_transcript_can_be_corrected_without_replacing_clone_audio(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
-        library = runtime.voice_library.for_model("voxcpm2")
+        library = runtime.voice_library.for_model("aniflive")
         library.register_default(_wav_bytes(), "默认参考转写。")
         asset = library.put_import(_wav_bytes(), "legacy.wav")
-        legacy = library.create_voice({"name": "旧音色", "source": "import", "reference_asset_id": asset["asset_id"], "reference_text": ""})
+        legacy = library.create_voice({"name": "旧音色", "source": "import", "reference_asset_id": asset["asset_id"], "reference_text": "原始录音的准确转写。"})
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
-            path = "/api/v1/tts/voices/voxcpm2/" + legacy["id"]
+            path = "/api/v1/tts/voices/aniflive/" + legacy["id"]
             renamed = await client.put(path, json={**legacy, "name": "旧音色改名", "expected_revision": 1})
             assert renamed.status_code == 200
             selection = {"voice_id": legacy["id"], "revision": 2}
-            assert (await client.put("/api/v1/tts/voices/voxcpm2/selection", json={"selection": selection})).status_code == 422
+            assert (await client.put("/api/v1/tts/voices/aniflive/selection", json={"selection": selection})).status_code == 200
             corrected = await client.put(path, json={**renamed.json()["voice"], "reference_text": "人工校对后的准确转写。", "expected_revision": 2})
             assert corrected.status_code == 200
             voice = corrected.json()["voice"]
             assert voice["reference_asset_id"] == asset["asset_id"]
             selection["revision"] = 3
-            assert (await client.put("/api/v1/tts/voices/voxcpm2/selection", json={"selection": selection})).status_code == 200
-            assert library.resolve("voxcpm2", selection).reference_text == "人工校对后的准确转写。"
+            assert (await client.put("/api/v1/tts/voices/aniflive/selection", json={"selection": selection})).status_code == 200
+            assert library.resolve("aniflive", selection).reference_text == "人工校对后的准确转写。"
     asyncio.run(scenario())
 
 
@@ -393,7 +404,7 @@ def test_sequential_selection_waits_for_readiness_and_respects_explicit_stop(tmp
         runtime.controller = SimpleNamespace(_active_input=True, stop_listening=stop, start_listening=AsyncMock())
         switched = []
         entered, release = asyncio.Event(), asyncio.Event()
-        async def switch(backend, model):
+        async def switch(backend, model, **options):
             switched.append((backend, model))
             entered.set()
             await release.wait()
@@ -402,10 +413,10 @@ def test_sequential_selection_waits_for_readiness_and_respects_explicit_stop(tmp
         runtime.switch_tts_selection = switch
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime, product_settings=store)), base_url="http://test") as client:
-                first_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm1"}))
+                first_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "aniflive", "local_model": "minimax-female-shaonv-zh"}))
                 await asyncio.wait_for(entered.wait(), 2)
                 assert not runtime.state.listening
-                second_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "voxcpm1", "local_model": "voxcpm2"}))
+                second_request = asyncio.create_task(client.put("/api/v1/product/settings/tts", json={"backend": "aniflive", "local_model": "tangyuge-v2pp-d78cf598"}))
                 stopping = asyncio.create_task(runtime.stop_listening())
                 await asyncio.sleep(0)
                 release.set()
@@ -413,10 +424,10 @@ def test_sequential_selection_waits_for_readiness_and_respects_explicit_stop(tmp
                 await stopping
                 assert first.status_code == second.status_code == 200
                 assert first.json()["pending"] is False and second.json()["pending"] is False
-                assert switched == [("voxcpm1", "voxcpm1"), ("voxcpm1", "voxcpm2")]
+                assert switched == [("aniflive", "minimax-female-shaonv-zh"), ("aniflive", "tangyuge-v2pp-d78cf598")]
                 assert not runtime.state.listening
                 runtime.controller.start_listening.assert_not_awaited()
-                assert store.settings_only()["tts"]["local_model"] == "voxcpm2"
+                assert store.settings_only()["tts"]["local_model"] == "tangyuge-v2pp-d78cf598"
         finally:
             if getattr(runtime, "_tts_update_task", None) and not runtime._tts_update_task.done():
                 runtime._tts_update_task.cancel()
@@ -451,7 +462,7 @@ def test_online_tts_switch_pauses_then_waits_for_output_and_resumes(tmp_path, mo
         runtime.tts_switch_busy = lambda: busy
         switched = []
 
-        async def switch(backend, local_model):
+        async def switch(backend, local_model, **options):
             switched.append((backend, local_model, runtime.config.tts.model, runtime.config.tts.voice_id))
             runtime.tts.backend = backend
 
@@ -471,7 +482,7 @@ def test_online_tts_switch_pauses_then_waits_for_output_and_resumes(tmp_path, mo
                 assert response.status_code == 200, response.text
                 assert response.json()["pending"] is False
                 assert store.settings_only()["tts"]["online_voice_id"] == "clone-queued"
-            assert switched == [("minimax", "voxcpm2", "speech-2.8-turbo", "clone-queued")]
+            assert switched == [("minimax", "minimax-female-shaonv-zh", "speech-2.8-turbo", "clone-queued")]
             assert runtime.config.tts.model == "speech-2.8-turbo"
             assert runtime.config.tts.voice_id == "clone-queued"
             runtime.start_listening.assert_awaited_once()
@@ -502,14 +513,14 @@ def test_backend_switch_restores_online_clock_and_preserves_player_instance(tmp_
         runtime._build_tts_clients = build_tts_clients
         runtime._active_voice_snapshot = lambda model: object()
         async with runtime._session_lock:
-            await asyncio.wait_for(runtime.switch_tts_selection("voxcpm1", "voxcpm2"), 1)
+            await asyncio.wait_for(runtime.switch_tts_selection("aniflive", "tangyuge-v2pp-d78cf598"), 1)
         old.shutdown.assert_awaited_once()
-        assert runtime.config.tts.sample_rate == player.sample_rate == 48000
+        assert runtime.config.tts.sample_rate == player.sample_rate == 32000
         assert runtime.player is player and runtime.vad is vad
         async with runtime._session_lock:
-            await runtime.switch_tts_selection("minimax", "voxcpm2")
+            await runtime.switch_tts_selection("minimax", "tangyuge-v2pp-d78cf598")
         assert runtime.config.tts.sample_rate == player.sample_rate == 32000
-        assert configured_rates == [48000, 32000]
+        assert configured_rates == [32000, 32000]
         runtime.close.assert_not_awaited()
         runtime.initialize.assert_not_awaited()
     asyncio.run(scenario())

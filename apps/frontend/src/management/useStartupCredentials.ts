@@ -12,17 +12,17 @@ export function useStartupCredentials(port: DesktopCredentialsPort, afterSave?: 
   const error = ref('') // error（可展示的启动或保存错误）。
   const notice = ref('') // notice（最近一次保存说明）。
   const disabled = computed(() => loading.value || saving.value)
-  const ttsBackend = ref<'minimax' | 'voxcpm1'>('minimax') // ttsBackend（持久化语音后端）。
-  const ttsLocalModel = ref<'voxcpm1' | 'voxcpm2'>('voxcpm2') // ttsLocalModel（所选本地模型）。
+  const ttsBackend = ref<'minimax' | 'aniflive'>('minimax') // ttsBackend（持久化语音后端）。
+  const ttsLocalModel = ref<string>('minimax-female-shaonv-zh') // ttsLocalModel（所选本地模型）。
   const localTtsSnapshot = ref(false) // localTtsSnapshot（凭据接口返回的本地 TTS 就绪状态）。
   const localTtsOverride = ref<boolean | null>(null) // localTtsOverride（资源清单更新后优先使用的就绪状态）。
   const localTts = computed(() => localTtsOverride.value ?? localTtsSnapshot.value)
-  const ready = computed(() => !disabled.value && configured.value[inferenceBackend.value] && (ttsBackend.value === 'voxcpm1' ? localTts.value : configured.value.minimax))
+  const ready = computed(() => !disabled.value && configured.value[inferenceBackend.value] && (ttsBackend.value === 'aniflive' ? localTts.value : configured.value.minimax))
 
   function update(result: FixedModelCredentials) {
     inferenceBackend.value = result.inference_backend === 'minimax' ? 'minimax' : 'deepseek'
-    ttsBackend.value = result.tts_backend === 'voxcpm1' ? 'voxcpm1' : 'minimax'
-    ttsLocalModel.value = result.tts_local_model === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2'
+    ttsBackend.value = result.tts_backend === 'aniflive' ? 'aniflive' : 'minimax'
+    ttsLocalModel.value = result.tts_local_model ?? 'minimax-female-shaonv-zh'
     localTtsSnapshot.value = result.local_tts_ready === true
     configured.value = { deepseek: result.providers.deepseek.configured, minimax: result.providers.minimax.configured }
   }

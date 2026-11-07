@@ -80,6 +80,15 @@ def assemble(desktop: Path, build: str = '') -> Path:
             shutil.copy2(ROOT / '.local/build/runtime-lock' / row['file'], target)
             if digest(target) != row['sha256']:
                 raise ValueError('内置必要安装依赖摘要不符')
+    aniflive_lock = json.loads((stage / 'app/config/runtime/aniflive-runtime.lock.json').read_text('utf-8'))
+    for row in aniflive_lock['wheels']:
+        if row.get('bundled'):
+            source = ROOT / '.local/build/aniflive-runtime/wheels' / row['file']
+            if source.stat().st_size != row['size'] or digest(source) != row['sha256']:
+                raise ValueError('AnifLive 随包依赖大小或摘要不符')
+            target = stage / 'app' / row['bundled']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     roots = assembler.root_files(stage, desktop)
     inventory = [{'path': p.relative_to(stage).as_posix(), 'size': p.stat().st_size, 'sha256': digest(p)} for p in files(stage)]
     build = build or 'product-' + hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()[:16]
@@ -90,6 +99,7 @@ def assemble(desktop: Path, build: str = '') -> Path:
         'fields': {'schema': '兼容协议版本', 'rules_file': '随程序固定分发并按摘要校验的兼容规则文件'},
     }
     release.update(display_version=__version__, role='product', required_components=[], optional_components=['python', 'models', 'dsh', 'webview2'], components=[], root_files=roots,
+                   tts_retirement=1,
                    speaker_migration=speaker_migration,
                    compatibility={'desktop_protocol': 1, 'data_format': 1},
                    fields={'build': '构建编号，产品版本保持原值', 'role': 'product（统一正式程序）', 'display_version': '产品显示版本', 'files': '本体固定文件', 'path': '相对路径', 'size': '字节数', 'sha256': 'SHA-256（文件摘要）', 'components': '外置组件登记；整体语音服务启动时逐项校验', 'root_files': '正式入口及固定支持文件', 'required_components': '管理页启动所需组件，独立于整体语音服务就绪门槛', 'optional_components': '由管理页安装的外置组件；整体语音服务运行必需', 'compatibility': '接口及数据格式兼容版本', 'compatibility_engine': '安装交接时运行的强制兼容组件'})

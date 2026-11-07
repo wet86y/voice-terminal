@@ -45,6 +45,7 @@ class ApplicationHost:
         self.internal_token = secrets.token_urlsafe(48)
         self.processes: dict[str, ManagedProcess] = {}
         self.local_tts_pid: int | None = None  # local_tts_pid（本地 TTS 子进程编号）：单独计入语音合成组件。
+        self.local_tts_created_at: float | None = None  # local_tts_created_at（本地合成进程创建时间）。
         self.generations: dict[str, str] = {}
         self.manifest = {}
         self.resource_issues: dict[str, str] = {}  # resource_issues（各组件缺失本地资源的说明）。
@@ -710,6 +711,8 @@ class ApplicationHost:
             if isinstance(local_tts_pid, int) and not isinstance(local_tts_pid, bool) and local_tts_pid > 0
             else None
         )
+        created = local_tts.get('created_at') if isinstance(local_tts, dict) else None
+        self.local_tts_created_at = float(created) if type(created) in {int, float} and created > 0 else None
         for key in ("speaker", "dsh"):
             item = data[key]
             row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
@@ -989,11 +992,13 @@ class ApplicationHost:
                          if row["pid"] and not row["external"]}
         local_tts_process_ids = set()
         if self.local_tts_pid:
-            direct_owners[self.local_tts_pid] = "local-tts"
             try:
                 local_tts_process = psutil.Process(self.local_tts_pid)
-                local_tts_process_ids.add(self.local_tts_pid)
-                local_tts_process_ids.update(child.pid for child in local_tts_process.children(recursive=True))
+                expected = getattr(self, 'local_tts_created_at', None)
+                if expected is not None and abs(local_tts_process.create_time() - expected) < .01:
+                    direct_owners[self.local_tts_pid] = "local-tts"
+                    local_tts_process_ids.add(self.local_tts_pid)
+                    local_tts_process_ids.update(child.pid for child in local_tts_process.children(recursive=True))
             except psutil.Error:
                 pass
         sampled = {}

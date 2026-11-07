@@ -75,12 +75,12 @@ watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), 
 const selectionSaving = ref(false) // selectionSaving（正在保存播放目标）。
 const selectionError = ref('') // selectionError（播放目标保存失败原因）。
 async function saveTtsChoice(choice: string) {
-  if (selectionSaving.value || !['minimax', 'voxcpm1', 'voxcpm2'].includes(choice)) return
+  if (selectionSaving.value || !model.value.ttsSelection?.options.some(option => option.value === choice)) return
   selectionSaving.value = true; selectionError.value = ''
   try {
     if (!port.saveTtsSelection) throw new Error('当前宿主不支持启动前选择，请更新程序。')
-    await port.saveTtsSelection({ backend: choice === 'minimax' ? 'minimax' : 'voxcpm1',
-      local_model: choice === 'minimax' ? credentials.ttsLocalModel.value : choice as 'voxcpm1' | 'voxcpm2' })
+    await port.saveTtsSelection({ backend: choice === 'minimax' ? 'minimax' : 'aniflive',
+      local_model: choice === 'minimax' ? credentials.ttsLocalModel.value : choice })
     await Promise.all([credentials.refresh(), resources.refreshInventory()])
   } catch (failure) { selectionError.value = failure instanceof Error ? failure.message : String(failure) }
   finally { selectionSaving.value = false }
@@ -96,7 +96,7 @@ const componentBlockMessage = computed(() => updatesRequired.value
   : '启动前组件校验未通过，请先下载或导入缺失组件。')
 const tasksBusy = computed(() => resources.startingResources.value.size > 0
   || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)))
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'streaming-punctuation', 'tts-voxcpm1', 'tts-voxcpm2'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'streaming-punctuation'])
 const categoryByResource: Record<string, LocalComponentCategory> = {
   'kws-sherpa-onnx': 'extensions', 'paraformer-streaming': 'speech', 'emotion2vec-plus-base': 'extensions',
   yamnet: 'extensions',
@@ -127,7 +127,7 @@ function toManagedResource(item: ResourceStatus): ManagedResourceRow {
     ready: item.can_start === true,
     installedVersion: item.installed_version,
     resetAvailable: item.reset_available,
-    targetVersion: modelResourceIds.has(item.resource_id) ? item.version : undefined,
+    targetVersion: (modelResourceIds.has(item.resource_id) || item.resource_id.startsWith('tts-aniflive-')) ? item.version : undefined,
     error: item.error || failedJob?.error || undefined,
     retryable: Boolean(failedJob),
     busy: resourceIsBusy(item.resource_id),
@@ -166,11 +166,11 @@ const model = computed<LocalComponentsModel>(() => {
   const findResource = (id: string) => inventory.find(item => item.resource_id === id)
   const knownRows = inventory.flatMap(item => {
     const category = categoryByResource[item.resource_id]
-    if (!category || category === 'voice-server' || item.resource_id.startsWith('tts-') || item.resource_id === 'tts-audiocpp-runtime' || item.resource_id === 'paraformer-offline') return []
+    if (!category || category === 'voice-server' || item.resource_id.startsWith('tts-') || item.resource_id === 'tts-aniflive-runtime' || item.resource_id === 'paraformer-offline') return []
     return [resourceRow(item, category)]
   })
-  const ttsResources = ['tts-voxcpm2', 'tts-voxcpm1'].map(findResource).filter((item): item is ResourceStatus => Boolean(item))
-  const runtimeResource = findResource('tts-audiocpp-runtime')
+  const ttsResources = inventory.filter(item => item.resource_id.startsWith('tts-aniflive-') && item.resource_id !== 'tts-aniflive-runtime')
+  const runtimeResource = findResource('tts-aniflive-runtime')
   const minimaxReady = credentials.configured.value.minimax
   const ttsModelRows: LocalComponentRow[] = ttsResources.map((item): LocalComponentRow => {
     const model = toManagedResource(item)
@@ -187,11 +187,11 @@ const model = computed<LocalComponentsModel>(() => {
           : item.installation_state === 'incomplete' ? '不完整' : '待安装',
       available: ready,
       runtime: '',
-      description: `${item.label} 本地语音模型；需与共用 audio.cpp（原生音频推理程序）运行资源一并就绪。`,
+      description: `${item.label} 本地语音模型；需与共用 AnifLive（本地语音引擎）运行资源一并就绪。`,
       facts: [],
       resource: model,
       sharedResource: runtimeResource ? toManagedResource(runtimeResource) : undefined,
-      note: 'VoxCPM1 与 VoxCPM2 共用 audio.cpp；下载不会自动切换当前播放后端。',
+      note: '各本地模型共用 AnifLive（本地语音引擎）隔离运行依赖；配置完成后可手动保存播放目标。',
     }
   })
   const minimaxRow: LocalComponentRow = {
@@ -235,7 +235,7 @@ const model = computed<LocalComponentsModel>(() => {
       error: selectionError.value,
       options: [{ value: 'minimax', label: '在线 API（网络语音接口）' },
         ...ttsResources.filter(item => item.can_start === true && item.update_available !== true)
-          .map(item => ({ value: item.resource_id.slice(4), label: item.label }))],
+          .map(item => ({ value: item.resource_id.slice("tts-aniflive-".length), label: item.label }))],
     },
     sampledAt: resources.inventoryUpdatedAt.value ? new Date(resources.inventoryUpdatedAt.value).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '正在读取组件清单',
     resources: [],

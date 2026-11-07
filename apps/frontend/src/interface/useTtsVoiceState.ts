@@ -7,6 +7,7 @@ export const TTS_DESIGN_RECIPE = 'voxcpm2-full-decode-v2' // TTS_DESIGN_RECIPE�
 /** VoiceDraft（音色草稿）：模型、卡片、异步代次与素材独立保存。 */
 export interface VoiceDraft {
   key: string; id?: string; revision?: number; name: string // 草稿键、音色标识、旧版本、名称。
+  referenceLanguage: string // referenceLanguage（参考录音语言）。
   description: string; transcript: string; text: string // 设计描述、源校对文本、试音正文。
   targetTranscript: string // targetTranscript（目标样音实际转写）：可独立校对，不改变制作正文。
   source: (ProductTtsAsset & { filename: string }) | null // 参考音频附件。
@@ -20,7 +21,7 @@ export interface TtsVoiceState {
 }
 const key: InjectionKey<TtsVoiceState> = Symbol('tts-voices')
 export function createTtsVoiceState(): TtsVoiceState {
-  return reactive({ inferenceSteps: { voxcpm1: 10, voxcpm2: 20 }, models: { voxcpm1: { voices: [], drafts: {} }, voxcpm2: { voices: [], drafts: {} } } })
+  return reactive({ inferenceSteps: {}, models: { aniflive: { voices: [], drafts: {} } } })
 }
 export function provideTtsVoiceState() { const state = createTtsVoiceState(); provide(key, state); return state }
 export function useTtsVoiceState() { return inject(key, undefined) ?? createTtsVoiceState() }
@@ -28,7 +29,7 @@ export function voiceDraft(voice?: ProductTtsVoice): VoiceDraft {
   const source = voice?.source_reference_asset_id || (voice?.source !== 'design' ? voice?.reference_asset_id : undefined)
   return {
     key: voice?.id || crypto.randomUUID(), id: voice?.id, revision: voice?.revision,
-    name: voice?.name || '', description: voice?.design_description || '',
+    name: voice?.name || '', referenceLanguage: voice?.reference_language || 'zh', description: voice?.design_description || '',
     transcript: voice?.source_reference_text || (voice?.source !== 'design' ? voice?.reference_text || '' : ''),
     text: voice?.design_text || TTS_SAMPLE_TEXT,
     targetTranscript: voice?.source === 'design' ? voice.reference_text : '',

@@ -41,16 +41,6 @@ fn settings(context:&LaunchContext,reset_devices:bool,cancel:&AtomicBool)->Resul
     Ok(())
 }
 
-// fallback_tts（未配置在线语音时的既有回退）：保留旧兼容语义，不在分发器下载本地组件。
-fn fallback_tts(context:&LaunchContext)->Result<bool,String>{
-    if crate::credentials::configured_tts_selection(&context.data)["backend"]=="voxcpm1"
-        ||crate::credentials::status(&context.data)?["providers"]["minimax"]["configured"]==true{return Ok(false);}
-    let path=safe_path(&context.data,"config/product-settings.json")?;
-    let mut value=read(&path)?;
-    value["tts"]["backend"]=json!("voxcpm1");value["tts"]["local_model"]=json!("voxcpm2");
-    atomic_json(&path,&value)?;Ok(true)
-}
-
 fn repair_bootstrap_policy(context:&LaunchContext)->Result<(),String>{
     let path=safe_path(&context.data,"config/runtime-resources.json")?;
     if !path.exists(){return Ok(());}
@@ -132,7 +122,7 @@ fn maintain_with_settings(root:&Path,cancel:Arc<AtomicBool>,progress:&mut Progre
         if environment_ready{
             progress("兼容处理：归档故障资料并恢复有效设置",0,0);
             settings_repair(&context,reset,&finish)?;
-            if fallback_tts(&context)?{settings_repair(&context,reset,&finish)?;}
+
             checkpoint(&context,"verify",false,None)?;
         }else{
             checkpoint(&context,"settings_pending",reset,Some("请在系统组件配置运行依赖，随后完成本次设置维护。"))?;
@@ -170,7 +160,7 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
     let reset=state["enforcement"]["reset_devices"]==true;
     let result:Result<(),String>=(||{
         settings(context,reset,cancel)?;
-        if fallback_tts(context)?{settings(context,reset,cancel)?;}
+
         checkpoint(context,"verify",reset,None)?;
         let rows=complete_maintenance(context)?;
         if rows.first().is_none_or(|row|row["compatibility"]["enforcement"]["phase"]!="complete"){
@@ -335,25 +325,20 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
         assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"repair_pending");
         assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],false);
     }
-    #[test]fn cancellation_finishes_tts_fallback_and_revalidates_the_changed_settings(){
+    #[test]fn cancellation_after_settings_mutation_requires_revalidation_without_changing_online_selection(){
         let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
-        let cancel=Arc::new(AtomicBool::new(false));let mut calls=0;
-        let outcome=maintain_with_settings(&fixture.root,cancel.clone(),&mut|_,_,_|{},true,|context,reset,finish|{
-            calls+=1;assert!(!finish.load(std::sync::atomic::Ordering::Acquire));
+        let cancel=Arc::new(AtomicBool::new(false));
+        let error=maintain_with_settings(&fixture.root,cancel.clone(),&mut|_,_,_|{},true,|context,reset,finish|{
             validate_settings(context,reset,finish)?;
-            if calls==1{
-                let path=context.data.join("config/product-settings.json");let mut value=read(&path)?;
-                value["tts"]["backend"]=json!("minimax");atomic_json(&path,&value)?;
-                cancel.store(true,std::sync::atomic::Ordering::Release);
-            }
-            Ok(())
-        }).unwrap();
-        assert_eq!(outcome,MaintenanceOutcome::Cancelled);assert_eq!(calls,2);
-        let settings=fixture.context.data.join("config/product-settings.json");
-        assert_eq!(read(&settings).unwrap()["tts"]["backend"],"voxcpm1");
-        assert_eq!(read(&fixture.context.data.join("state/settings-validation.json")).unwrap()["sha256"],file_hash(&settings).unwrap());
-        assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],true);
+            let path=context.data.join("config/product-settings.json");let mut value=read(&path)?;
+            value["tts"]["backend"]=json!("minimax");atomic_json(&path,&value)?;
+            cancel.store(true,std::sync::atomic::Ordering::Release);Ok(())
+        }).unwrap_err();
+        assert!(error.contains("最终校验"));
+        assert_eq!(read(&fixture.context.data.join("config/product-settings.json")).unwrap()["tts"]["backend"],"minimax");
+        assert_eq!(resources::startup_readiness(&fixture.context).unwrap()["ready"],false);
     }
+
     #[test]fn cancellation_at_component_cleanup_keeps_confirmed_damage_and_original_files(){
         let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
         let component=fixture.root.join("models/test-model");fs::create_dir_all(&component).unwrap();fs::write(component.join("model.bin"),b"good").unwrap();
@@ -396,7 +381,7 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
         assert!(!crate::component_maintenance::pending_repairs(&fixture.context).unwrap());
         assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"complete");
     }
-    #[test]fn existing_unconfigured_online_tts_fallback_revalidates_only_changed_settings(){
+    #[test]fn unconfigured_online_tts_selection_is_preserved_without_automatic_fallback(){
         let fixture=super::super::tests::Fixture::new();runtime(&fixture.root);
         let mut calls=0;
         maintain_with_settings(&fixture.root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},false,|context,_,_|{
@@ -406,7 +391,7 @@ pub fn finish_deferred_settings(context:&LaunchContext,cancel:&AtomicBool)->Resu
             atomic_json(&path,&value)?;
             atomic_json(&context.data.join("state/settings-validation.json"),&json!({"schema":1,"settings_schema":value["schema_version"],"sha256":file_hash(&path)?}))
         }).unwrap();
-        assert_eq!(calls,2);assert_eq!(read(&fixture.context.data.join("config/product-settings.json")).unwrap()["tts"]["backend"],"voxcpm1");
+        assert_eq!(calls,1);assert_eq!(read(&fixture.context.data.join("config/product-settings.json")).unwrap()["tts"]["backend"],"minimax");
         assert!(!fixture.root.join("tmp/resource-downloads").exists());
         assert_eq!(read(&state_path(&fixture.context).unwrap()).unwrap()["enforcement"]["phase"],"complete");
     }

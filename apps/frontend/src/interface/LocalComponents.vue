@@ -105,7 +105,7 @@ function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] 
   const dependencies = row.runtimeDependencies
   // runtimeDependencies（运行依赖子卡片）仅展开到 Voice Server 分类内，不改变其他组件的分类归属。
   if (rowCategory(row) !== 'voice-server' || !dependencies?.length) return [row]
-  const order = ['voice-runtime-cpu', 'tts-audiocpp-runtime', 'voice-runtime-gpu']
+  const order = ['voice-runtime-cpu', 'tts-aniflive-runtime', 'voice-runtime-gpu']
   return [...dependencies].sort((a, b) => {
     const aIndex = order.indexOf(a.id)
     const bIndex = order.indexOf(b.id)
@@ -757,10 +757,10 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 @container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{grid-template-columns:minmax(0,1fr);padding:10px;gap:9px}.local-component-controls{justify-items:stretch}.local-category-heading{grid-template-columns:minmax(0,1fr);padding:11px 12px}.local-category-actions{justify-content:stretch}.category-download,.category-import{flex:1}.local-category-content{padding:0 10px 10px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{justify-self:stretch;width:100%;padding-inline:8px}.local-inline-resource-actions{max-width:none;justify-items:stretch}.local-inline-resource-action{justify-content:stretch}.local-inline-resource-action button{flex:1}.local-component-inline-progress{grid-template-columns:1fr;padding:0 10px 10px}.local-resource-progress{padding:0 12px 12px}.local-managed-resource{padding:10px 12px}.managed-resource-actions{gap:6px}}
 @container (max-width:560px){.local-managed-heading{align-items:flex-start}.resource-batch-import{white-space:normal;max-width:100%}}
 @container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-resource-metrics{gap:12px}.local-resource-metrics dt,.local-resource-metrics dd{font-size:var(--font-caption)}}
-.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(260px,1.2fr) minmax(0,1fr)}
-.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity h4{display:block;white-space:nowrap;word-break:normal;overflow-wrap:normal;overflow:hidden;text-overflow:clip}
-@container (max-width:560px){.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(220px,1.2fr) minmax(0,1fr)}}
-@container (max-width:440px){.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(0,1fr)}}
+.local-component-card[data-component="tts-aniflive-runtime"] .local-component-identity{grid-template-columns:minmax(260px,1.2fr) minmax(0,1fr)}
+.local-component-card[data-component="tts-aniflive-runtime"] .local-component-identity h4{display:block;white-space:nowrap;word-break:normal;overflow-wrap:normal;overflow:hidden;text-overflow:clip}
+@container (max-width:560px){.local-component-card[data-component="tts-aniflive-runtime"] .local-component-identity{grid-template-columns:minmax(220px,1.2fr) minmax(0,1fr)}}
+@container (max-width:440px){.local-component-card[data-component="tts-aniflive-runtime"] .local-component-identity{grid-template-columns:minmax(0,1fr)}}
 @media (prefers-reduced-motion:reduce){.local-component-action svg{transition:none}}
 @media (prefers-reduced-motion:reduce){.local-category-toggle svg{transition:none}}
 </style>

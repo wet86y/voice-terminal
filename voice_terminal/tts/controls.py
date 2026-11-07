@@ -114,6 +114,8 @@ def profile_for(client: Any, *, backend: str | None = None, enabled: bool = True
     model = str(getattr(client, "local_model", None) or getattr(client, "model", ""))
     voice = str(getattr(client, "voice_id", ""))
     transport = str(getattr(client, "transport", ""))
+    if backend == "aniflive" and getattr(client, "supports_speech_controls", False):
+        return SpeechControlProfile(model, enabled, native_speed=True, voice=voice, transport=transport)
     if model in {"speech-2.8-hd", "speech-2.8-turbo"} and backend != "voxcpm1":
         guidance = "none" if getattr(client, "emotion_status", "") == "unsupported" else "enum"
         return SpeechControlProfile(model, enabled, guidance, True, True, voice=voice, transport=transport)

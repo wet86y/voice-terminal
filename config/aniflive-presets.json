@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "default_model": "minimax-female-shaonv-zh",
+  "model_family": "gsv-v2proplus",
+  "source_commit": "9bc349d3a71362b3bfdccbc630983809800954fd",
+  "build": {
+    "max_len": 1000,
+    "stream_overlap_frames": 12,
+    "workspace_mib": 2048,
+    "optimization_level": 5,
+    "tf32": false,
+    "precision_policy": {
+      "ssl": "fp32",
+      "bert": "mixed-fp16",
+      "vq_encoder": "fp32",
+      "gpt_encoder": "fp32",
+      "gpt_step": "fp32",
+      "spectrogram": "fp32",
+      "sv_embedding": "fp32",
+      "sovits": "mixed-fp16",
+      "sovits_stream": "mixed-fp16"
+    },
+    "max_aux_streams_by_stage": {
+      "gpt_step": 0
+    }
+  },
+  "models": [
+    {
+      "id": "minimax-female-shaonv-zh",
+      "name": "中文少女声（通用基底）",
+      "repository": "lj1995/GPT-SoVITS",
+      "revision": "336b2ec4e8d4ac74740798dd40af44e74659ecaf",
+      "weights": [
+        {
+          "role": "gpt",
+          "path": "s1v3.ckpt",
+          "size_bytes": 155284856,
+          "sha256": "87133414860ea14ff6620c483a3db5ed07b44be42e2c3fcdad65523a729a745a"
+        },
+        {
+          "role": "sovits",
+          "path": "v2Pro/s2Gv2ProPlus.pth",
+          "size_bytes": 200125741,
+          "sha256": "d42a22bbbf65fb2bbdd45ad6a66841156977db45c7aabe0a6992ff378d9c7d3b"
+        }
+      ],
+      "metadata_recipe": "known-v2proplus-base-v1",
+      "reference": {
+        "asset": "assets/aniflive/reference.wav",
+        "size_bytes": 320044,
+        "sha256": "5ff48d3254e051594bfc114a964b6b3ff1c7fd3f56f0becfe32b9f1836898699",
+        "language": "zh",
+        "text": "你好，这是一段用于测试流式语音生成的较长中文文本。",
+        "origin": "MiniMax speech-2.8-hd / female-shaonv，2026-11-04 本机生成；裁取 0.25–5.25 秒；本次授权仅为本地随包验证。"
+      }
+    },
+    {
+      "id": "tangyuge-v2pp-d78cf598",
+      "name": "唐语歌（中文微调）",
+      "repository": "shiqianyan/TangYuGe-GPT-SoVITS-v2ProPlus",
+      "revision": "d78cf598d18350d89996637e3c9f6e16092209fb",
+      "weights": [
+        {
+          "role": "gpt",
+          "path": "weights/tangyuge_v2pp_dpo-e10.ckpt",
+          "size_bytes": 155312850,
+          "sha256": "44b77509b42338dc6bd85d6022fb5e0ec91e0ea484e3420a3a2451598aa1b145"
+        },
+        {
+          "role": "sovits",
+          "path": "weights/tangyuge_v2pp_e4_s564.pth",
+          "size_bytes": 172765158,
+          "sha256": "dcb6042184355144dc15d118e88802fd4bdb494bd105da7c72ac42454d322899"
+        }
+      ],
+      "reference": {
+        "path": "references/neutral_polite_script1_L0824.wav",
+        "size_bytes": 476744,
+        "sha256": "7ff2353ae358311ab6032100502c25678d40cf2602683de04342921bbebee425",
+        "language": "zh",
+        "text": "何同学好，当然可以呀，只要我知道的，我会言无不尽。",
+        "origin": "来源仓库所列游戏角色参考语音；模型及素材许可分别保留。"
+      }
+    }
+  ],
+  "fields": {
+    "schema": "预设锁格式",
+    "default_model": "本地默认模型编号",
+    "model_family": "支持的模型架构",
+    "source_commit": "固定引擎源码提交",
+    "build": "本机构建参数",
+    "max_len": "最大语义长度",
+    "stream_overlap_frames": "流式重叠帧数",
+    "workspace_mib": "构建工作区，兆二进制字节",
+    "optimization_level": "构建优化等级",
+    "tf32": "较低精度单精度加速开关",
+    "models": "模型预设集合",
+    "id": "稳定模型编号",
+    "name": "界面名称",
+    "repository": "模型来源仓库",
+    "revision": "固定模型提交",
+    "weights": "配对权重",
+    "role": "语义或声音权重用途",
+    "path": "来源仓库相对路径",
+    "size_bytes": "固定文件字节数",
+    "sha256": "固定输入内容摘要",
+    "metadata_recipe": "仅适用于精确已知底模的元数据兼容配方",
+    "reference": "默认参考条件",
+    "asset": "随本体提供的种子相对路径",
+    "language": "参考录音语言",
+    "text": "参考录音准确转写",
+    "origin": "素材来源及适用范围",
+    "precision_policy": "逐阶段计算图精度；混合半精度保留上游敏感算子的单精度",
+    "max_aux_streams_by_stage": "逐阶段辅助流上界；其余阶段沿用上游自动选择"
+  }
+}

@@ -177,10 +177,12 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     for name in ("startup.css", "app-icon.svg"):
         shutil.copy2(ROOT / "apps/desktop/boot" / name, startup_assets / name)
     for relative in ("voice_terminal", "apps/server", "config/dsh", "config/shadow_agent", "config/templates", "config/resources", "config/runtime", "assets/smart-turn"):
-        copy_tree(ROOT / relative, program / relative)
+        excludes = ("audiocpp",) if relative == "config/resources" else (("audio_cpp_tts.py",) if relative == "voice_terminal" else ())
+        copy_tree(ROOT / relative, program / relative, excludes=excludes)
     (program / "scripts").mkdir()
     for name in ("backend-entry.py", "managed-node.cjs", "check-desktop-environment.py", "prepare-webview2.ps1", "local-context.ps1",
-                 "manage-resources.py", "package-resources.py", "install-official-dsh.py", "dsh-npm.mjs", "relocate-workspace.py", "voice-environment-worker.py"):
+                 "manage-resources.py", "package-resources.py", "install-official-dsh.py", "dsh-npm.mjs", "relocate-workspace.py", "voice-environment-worker.py",
+                 "install-aniflive.py", "run-aniflive.py"):
         shutil.copy2(ROOT / "scripts" / name, program / "scripts" / name)
     seven_source = ROOT / ".local/build/tools/7zip"
     if seven_source.is_dir():
@@ -199,6 +201,7 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     shutil.copy2(ROOT / "config/runtime-resources.json", program / "config/runtime-resources.json")
     shutil.copy2(ROOT / "config/download-sources.json", program / "config/download-sources.json")
     shutil.copy2(ROOT / "config/compatibility.json", program / "config/compatibility.json")
+    shutil.copy2(ROOT / "config/aniflive-presets.json", program / "config/aniflive-presets.json")
     shutil.copy2(ROOT / "scripts/download-sources.mjs", program / "scripts/download-sources.mjs")
     shutil.copy2(ROOT / "scripts/download-sources.ps1", program / "scripts/download-sources.ps1")
     build_profile(ROOT, ROOT / ".local/build/dsh/bundles", program / "config/dsh/profile")

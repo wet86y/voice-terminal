@@ -31,6 +31,7 @@ DESIGN_GENERATION_RECIPE = "voxcpm2-full-decode-v2"  # DESIGN_GENERATION_RECIPE�
 MIN_REFERENCE_SECONDS = 5.0
 ALLOWED_IMPORT_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
 VOICE_MODELS = {"voxcpm1", "voxcpm2"}
+LIBRARY_MODELS = VOICE_MODELS | {"aniflive"}  # LIBRARY_MODELS（可保存参考音色的模型）。
 _ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _LOCAL_PATH_RE = re.compile(r"(?:(?:[A-Za-z]:[\\/]|\\\\)[^\s,;\"'<>|]+|(?<![\w.])/(?:[^\s,;\"'<>|]+))")
 
@@ -71,6 +72,7 @@ class ResolvedLocalTtsVoice:
     reference_mode: str = "voice"  # reference_mode（参考模式）：voice 或 design。
     is_preview: bool = False
     voice_source: str = "legacy"  # voice_source（音色来源）：design、import、recording 或 legacy。
+    reference_language: str = "zh"  # reference_language（参考录音语言）。
 
 
 def _utc_now() -> str:
@@ -109,10 +111,16 @@ class VoiceLibrary:
         self.assets_dir = self.root / "assets"
         self.index_path = self.root / "index.json"
         self._lock = threading.RLock()
+        self._check_assets_directory()
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.root.mkdir(parents=True, exist_ok=True)
         self._index = self._read_index()
         self.collect_garbage()
+
+    def _check_assets_directory(self):
+        """回收及读写均不穿透 assets（素材目录）的联接或符号链接。"""
+        if self.assets_dir.is_symlink() or self.assets_dir.resolve() != self.assets_dir:
+            raise VoiceLibraryError("音色素材目录不能是目录联接或符号链接。")
 
     @staticmethod
     def _empty_index() -> dict[str, Any]:
@@ -149,15 +157,20 @@ class VoiceLibrary:
             temporary.unlink(missing_ok=True)
 
     def _asset_path(self, asset_id: str) -> Path:
+        self._check_assets_directory()
         if not isinstance(asset_id, str) or not _ID_RE.fullmatch(asset_id):
             raise VoiceLibraryError("asset_id（音频素材标识）无效。")
-        path = (self.assets_dir / f"{asset_id}.wav").resolve()
+        candidate = self.assets_dir / f"{asset_id}.wav"
+        if candidate.is_symlink():
+            raise VoiceLibraryError("音频素材不能是符号链接。")
+        path = candidate.resolve()
         if not path.is_relative_to(self.assets_dir):
             raise VoiceLibraryError("音频素材标识无效。")
         return path
 
     @staticmethod
-    def _normalize_audio(data: bytes, filename: str) -> tuple[bytes, int]:
+    def _normalize_audio(data: bytes, filename: str, *, minimum: float = MIN_REFERENCE_SECONDS,
+                         maximum: float = MAX_REFERENCE_SECONDS) -> tuple[bytes, int]:
         extension = Path(filename or "").suffix.lower()
         if extension not in ALLOWED_IMPORT_EXTENSIONS:
             raise VoiceLibraryError("仅支持 WAV、MP3、FLAC 或 OGG 音频。")
@@ -176,8 +189,8 @@ class VoiceLibrary:
         if source_rate <= 0 or samples.size == 0 or not np.isfinite(samples).all():
             raise VoiceLibraryError("音频采样数据无效。")
         duration = samples.shape[0] / float(source_rate)
-        if not MIN_REFERENCE_SECONDS <= duration <= MAX_REFERENCE_SECONDS:
-            raise VoiceLibraryError("导入音频长度必须为 5–15 秒（官方建议至少 5 秒）。")
+        if not minimum <= duration <= maximum:
+            raise VoiceLibraryError(f"导入音频长度必须为 {minimum:g}–{maximum:g} 秒。")
         mono = samples.mean(axis=1, dtype=np.float32)
         if source_rate != 16000:
             ratio = Fraction(16000, int(source_rate))
@@ -219,8 +232,17 @@ class VoiceLibrary:
 
     def put_import(self, data: bytes, filename: str) -> dict[str, Any]:
         """严格解码用户上传并保存标准化素材。"""
-        normalized, duration_ms = self._normalize_audio(data, filename)
-        return self._put_wav(normalized, duration_ms)
+        limits = {"minimum": 3.0, "maximum": 10.0} if self.model == "aniflive" else {}
+        normalized, duration_ms = self._normalize_audio(data, filename, **limits)
+        asset = self._put_wav(normalized, duration_ms)
+        if self.model == "aniflive":
+            # 原始采样率副本供参考频谱提取；16 kHz（千赫兹）主副本用于转写。
+            import soundfile as sf
+            import numpy as np
+            samples, rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+            mono = np.clip(np.rint(samples.mean(axis=1) * 32768), -32768, 32767).astype("<i2")
+            self.put_high_fidelity_pcm(asset["asset_id"], mono.tobytes(), sample_rate=int(rate))
+        return asset
 
     def put_pcm(self, pcm: bytes, *, sample_rate: int = 16000) -> dict[str, Any]:
         """保存已经由音频适配器重采样的单声道 16-bit PCM。"""
@@ -264,9 +286,8 @@ class VoiceLibrary:
     def high_fidelity_path(self, asset_id: str) -> Path | None:
         """high_fidelity_path（高保真素材路径）：原生采样率的旁路副本，可能不存在。
 
-        编码器固定按 16 kHz 读取，所以主素材必须是 16 kHz；但 48 kHz 原生样音
-        保留了 8 kHz 以上的带宽（VoxCPM2 实测 8–16 kHz 占 1.1%–14.4%），供后续
-        音色处理使用。缺失时返回 None，调用方回退到主素材。
+        转写使用 16 kHz（千赫兹）主素材；AnifLive（本地语音）的参考处理使用
+        原采样率副本，避免导入时改变参考频谱。缺失时使用主素材。
         """
         with self._lock:
             metadata = self._index["assets"].get(asset_id)
@@ -283,8 +304,11 @@ class VoiceLibrary:
         """保存原生采样率旁路副本；只登记元数据，主素材与索引引用不变。"""
         if not isinstance(pcm, bytes) or len(pcm) < 2 or len(pcm) % 2:
             raise VoiceLibraryError("PCM（脉冲编码音频）素材无效。")
-        if int(sample_rate) <= 16000 or int(channels) != 1:
-            # 16 kHz 及以下与主素材等价，单声道以外的原生样音不做旁路。
+        rate = int(sample_rate)
+        if rate <= 0:
+            raise VoiceLibraryError('原始参考音频采样率必须为正数。')
+        if (rate <= 16000 and (self.model != 'aniflive' or rate == 16000)) or int(channels) != 1:
+            # AnifLive（本地语音）也保留低于 16 kHz 的原始参考，不把上采样当作原录音。
             return {}
         try:
             import numpy as np
@@ -335,16 +359,16 @@ class VoiceLibrary:
         if self.model and payload.get("model", self.model) != self.model:
             raise VoiceLibraryError("model（音色模型归属）与当前音色库不一致。")
         source = source or payload.get("source")
-        if self.model == "voxcpm1" and (source == "design" or payload.get("design_description")):
-            raise VoiceLibraryError("VoxCPM1（第一代模型）仅支持参考音频克隆。")
+        if self.model in {"voxcpm1", "aniflive"} and (source == "design" or payload.get("design_description")):
+            raise VoiceLibraryError("当前模型仅支持参考音频克隆。")
         if source not in {"import", "recording", "design", "legacy"}:
             raise VoiceLibraryError("source（音色来源）无效。")
         reference_asset_id = payload.get("reference_asset_id")
         if not isinstance(reference_asset_id, str) or not _ID_RE.fullmatch(reference_asset_id):
             raise VoiceLibraryError("reference_asset_id（参考音频标识）无效。")
         reference_text = _safe_text(payload.get("reference_text", ""), "reference_text", 2000)
-        if self.model == "voxcpm1" and not reference_text:
-            raise VoiceLibraryError("VoxCPM1（第一代模型）必须填写准确的参考转写。")
+        if self.model in {"voxcpm1", "aniflive"} and not reference_text:
+            raise VoiceLibraryError("当前模型必须填写准确的参考转写。")
         style = _collapse_description(payload.get("style_description", ""), "style_description", 300)
         normalized: dict[str, Any] = {
             "name": _safe_text(payload.get("name"), "name", 80, required=True),
@@ -353,6 +377,11 @@ class VoiceLibrary:
             "reference_text": reference_text,
             "style_description": style,
         }
+        if self.model == "aniflive":
+            language = payload.get("reference_language", "zh")
+            if language not in {"zh", "yue", "en", "ja", "ko"}:
+                raise VoiceLibraryError("reference_language（参考录音语言）无效。")
+            normalized["reference_language"] = language
         source_asset_id = payload.get("source_reference_asset_id")  # 原始克隆素材；reference_asset_id 为确认后的目标样音。
         if source_asset_id is not None:
             if source != "design" or not isinstance(source_asset_id, str) or not _ID_RE.fullmatch(source_asset_id):
@@ -470,7 +499,7 @@ class VoiceLibrary:
 
     def resolve(self, model: str, selection: Mapping[str, Any] | None, *, emotion: str | None = None,
                 is_preview: bool = False) -> ResolvedLocalTtsVoice:
-        if model not in VOICE_MODELS:
+        if model not in LIBRARY_MODELS:
             raise VoiceLibraryError("local_model（本地语音模型）无效。")
         if self.model is not None and model != self.model:
             raise VoiceLibraryError("音色库与请求模型不匹配。")
@@ -480,13 +509,14 @@ class VoiceLibrary:
         path = self.asset_path(voice["reference_asset_id"])
         if not voice.get("reference_text", "").strip():
             raise VoiceLibraryError("请先填写参考音频的准确转写，再启用或使用克隆音色。")
-        native_id = "voxcpm1-stream" if model == "voxcpm1" else "voxcpm2-stream"
+        native_id = "aniflive" if model == "aniflive" else "voxcpm1-stream" if model == "voxcpm1" else "voxcpm2-stream"
         return ResolvedLocalTtsVoice(
             model=model, native_model_id=native_id, voice_id=voice["id"], revision=voice["revision"],
             reference_path=path, reference_text=voice.get("reference_text", ""),
             style_description="", emotion=None,  # 已确认样音承载固定音色与语气，不再逐句注入描述。
             reference_mode="voice", is_preview=is_preview,
             voice_source=str(voice.get("source") or "legacy"),
+            reference_language=voice.get("reference_language", "zh"),
         )
 
     def resolve_design(self, description: str, *, emotion: str | None = None,
@@ -522,11 +552,12 @@ class VoiceLibrary:
         if model == "voxcpm1" and not voice["reference_text"]:
             raise VoiceLibraryError("VoxCPM1（第一代本地语音模型）需要填写参考音频转写文本。")
         return ResolvedLocalTtsVoice(
-            model=model, native_model_id="voxcpm1-stream" if model == "voxcpm1" else "voxcpm2-stream",
+            model=model, native_model_id="aniflive" if model == "aniflive" else "voxcpm1-stream" if model == "voxcpm1" else "voxcpm2-stream",
             voice_id=None, revision=None, reference_path=path,
             reference_text=voice["reference_text"], style_description="",
             emotion=None, reference_mode="voice", is_preview=is_preview,
             voice_source=str(voice.get("source") or "import"),
+            reference_language=voice.get("reference_language", "zh"),
         )
 
     def delete_voice(self, voice_id: str, active_by_model: Mapping[str, Any] | None = None) -> None:
@@ -562,6 +593,7 @@ class VoiceLibrary:
 
     def collect_garbage(self, *, max_age_seconds: float = 24 * 60 * 60) -> None:
         """仅清理超过 24 小时且不被任一版本引用的素材。"""
+        self._check_assets_directory()
         now = datetime.now(timezone.utc).timestamp()
         referenced = {
             revision.get(field)
@@ -587,6 +619,8 @@ class VoiceLibrary:
                 self._save_index(updated)
             # 兼容旧版本只移除主素材和索引时留下的无主高保真副本。
             for path in self.assets_dir.glob("*.hifi.wav"):
+                if path.is_symlink() or path.resolve().parent != self.assets_dir:
+                    continue
                 asset_id = path.name.removesuffix(".hifi.wav")
                 if (_ID_RE.fullmatch(asset_id) and asset_id not in updated["assets"]
                         and not self._leases.get(asset_id)
@@ -623,8 +657,13 @@ class VoiceLibrary:
             value = self._index.get("active_voice") or self._index.get("default_voice")
             return dict(value) if value else None
 
-    def activate(self, selection: Mapping[str, Any] | None) -> dict[str, Any]:
+    def activate(self, selection: Mapping[str, Any] | None) -> dict[str, Any] | None:
         with self._lock:
+            if self.model == "aniflive" and selection is None:
+                updated = json.loads(json.dumps(self._index))
+                updated["active_voice"] = None  # 空选择恢复当前基底包内置参考。
+                self._save_index(updated)
+                return None
             chosen = dict(selection or self._index.get("default_voice") or {})
             self.resolve(self.model, chosen)
             updated = json.loads(json.dumps(self._index))
@@ -699,13 +738,15 @@ class VoiceLibrary:
 
 
 class ModelVoiceLibraries:
-    """ModelVoiceLibraries（双库路由）：索引与音频均按模型物理隔离。"""
+    """ModelVoiceLibraries（音色库路由）：仅开放 AnifLive，旧库原件保持离线。"""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
-        self.libraries = {model: VoiceLibrary(self.root / model / "voices", model=model) for model in sorted(VOICE_MODELS)}
+        self.libraries = {model: VoiceLibrary(self.root / model / "voices", model=model) for model in ("aniflive",)}
 
     def for_model(self, model: str) -> VoiceLibrary:
+        if model == "aniflive" and model not in self.libraries:
+            self.libraries[model] = VoiceLibrary(self.root / model / "voices", model=model)
         if model not in self.libraries:
             raise VoiceLibraryError("model（音色所属模型）无效。")
         return self.libraries[model]

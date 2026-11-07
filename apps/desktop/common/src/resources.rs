@@ -50,19 +50,29 @@ pub fn audio_enhancements(data:&Path,request:Option<&Value>)->Result<Value,Strin
         if let Some(value)=settings["audio_enhancements"][key].as_bool(){selected[key]=json!(value);}
     }
     if let Some(update)=request{
+        if settings["schema_version"].as_u64().is_some_and(|schema|schema>20){return Err("产品设置格式高于当前程序，保留原件并拒绝写入。".into());}
         let object=update.as_object().ok_or("音频增强设置必须是对象。")?;
         for (key,value) in object{
             if !matches!(key.as_str(),"dual_pass"|"emotion"|"acoustic_events")||!value.is_boolean(){return Err("音频增强开关必须是有效的布尔字段。".into());}
             selected[key]=value.clone();
         }
         settings["audio_enhancements"]=selected.clone();
-        settings["schema_version"]=json!(16);
+        settings["schema_version"]=json!(20);
         atomic_json(&path,&settings)?;
     }
     Ok(selected)
 }
 pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
     let mut items=load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone();
+    let registry=load(&safe_path(&context.data,"config/aniflive-models.json")?).unwrap_or(Value::Null);
+    if let Some(template)=items.iter().find(|row|row["preparation"]=="aniflive_local_build").cloned(){
+        for (model,entry) in registry["models"].as_object().into_iter().flatten(){
+            if !crate::credentials::valid_tts_model(model)||items.iter().any(|row|row["model_id"]==*model){continue;}
+            let mut item=template.clone();item["resource_id"]=json!(format!("tts-aniflive-{model}"));item["model_id"]=json!(model);
+            item["destination"]=json!(format!("aniflive-tts/packages/{model}"));item["title"]=entry["name"].clone();
+            item["imported"]=json!(true);item["source"]=json!({"platform":"local_import"});items.push(item);
+        }
+    }
     let settings=load(&context.data.join("config/product-settings.json")).unwrap_or(Value::Null);
     let enhancements=audio_enhancements(&context.data,None)?;
     let runtime=load(&context.install.join("runtimes/python/runtime.json")).unwrap_or(Value::Null);
@@ -87,12 +97,14 @@ pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
 pub fn spec(context:&LaunchContext,id:&str)->Result<Value,String>{specs(context)?.into_iter().find(|v|v["resource_id"]==id).ok_or("不支持的资源编号".into())}
 /// download_bytes（最大远端下载字节）：随包补丁不算网络流量。
 pub fn download_bytes(item:&Value)->u64{
+    if let Some(size)=item["download_size_bytes"].as_u64(){return size;}
     let transfer=&item["source"]["transfer"];
     if let Some(artifacts)=transfer["artifacts"].as_array(){return artifacts.iter().filter_map(|row|row["size_bytes"].as_u64()).sum();}
     transfer["artifact"]["size_bytes"].as_u64().unwrap_or_else(||item["files"].as_array().into_iter().flatten()
         .filter(|row|row["optional"]!=true&&!row["asset"].is_string()).filter_map(|row|row["size_bytes"].as_u64()).sum())
 }
 pub(crate) fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
+    if spec["preparation"]=="aniflive_runtime"{return safe_path(&context.install,"runtimes/aniflive-tts");}
     let relative=spec["destination"].as_str().ok_or("资源缺少固定目录")?;
     safe_path(&context.install,&if spec["kind"]=="model"{format!("models/{relative}")}else{relative.into()})
 }
@@ -274,6 +286,10 @@ pub(crate) fn model_receipt_current(component:&Path,spec:&Value)->bool{
 
 /// current_for_upgrade（更新时复用）：仅核对当前目标及必要入口；完整内容验证由维修或实际写入负责。
 pub(crate) fn current_for_upgrade(context:&LaunchContext,item:&Value)->bool{
+    if item["preparation"]=="aniflive_runtime"{return native_runtime_status(context).is_ok_and(|row|row["can_start"]==true);}
+    if item["preparation"]=="aniflive_local_build"{
+        return aniflive_model_ready(context,item["model_id"].as_str().unwrap_or(""),false).unwrap_or(false);
+    }
     if item["kind"]=="model"{
         let Ok(root)=destination(context,item)else{return false;};
         if root.join(MODEL_RECEIPT).is_file(){model_receipt_current(&root,item)}
@@ -301,16 +317,46 @@ fn model_update_available(spec:&Value,installed:&InstalledModel)->bool{
 
 /// native_runtime_status（可选原生运行依赖卡片）：只核对收据，不引入新的启动门槛。
 pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
-    let item=spec(context,"tts-audiocpp-runtime").ok();
-    let inspected=item.as_ref().map(|item|inspect_installed_model(context,item,false));
-    let installed=inspected.as_ref().is_some_and(|value|value.is_ok());
-    let update=item.as_ref().zip(inspected.as_ref()).is_some_and(|(item,value)|value.as_ref().is_ok_and(|value|model_update_available(item,value)));
-    let present=context.install.join("models/audiocpp/runtime").exists();
-    Ok(json!({"resource_id":"tts-audiocpp-runtime","parent_resource_id":"voice-server","label":"audio.cpp（语音合成引擎）运行依赖","required":false,
-        "installation_state":if installed{"installed"}else if present{"incomplete"}else{"missing"},"files_installed":installed,"runtime_ready":installed&&!update,"can_start":installed&&!update,
-        "update_available":update,"version":item.as_ref().map(|value|value["version"].clone()),
-        "error":inspected.and_then(Result::err),
-        "fields":{"resource_id":"原生运行包资源编号","parent_resource_id":"所属语音服务组件","label":"依赖名称","required":"可选依赖，不独立阻止整体启动","installation_state":"运行包安装状态","files_installed":"运行包文件完整","runtime_ready":"运行包满足当前清单","can_start":"运行依赖已就绪","update_available":"运行包需要更新","version":"目标版本","error":"未就绪原因"}}))
+    let root=context.install.join("runtimes/aniflive-tts");
+    let wanted=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok();
+    let source=load(&safe_path(&root,"source/windows-source-receipt.json")?).unwrap_or(Value::Null);
+    let installed=wanted.is_some()&&source["patch_revision"]==3&&source["upstream_commit"]=="9bc349d3a71362b3bfdccbc630983809800954fd"
+        &&!root.join("dependency-transaction.json").exists()
+        &&["packages","export-packages"].iter().all(|folder|{
+            let receipt=load(&root.join(folder).join("aniflive-packages.json")).unwrap_or(Value::Null);
+            receipt["lock_sha256"].as_str()==wanted.as_deref()&&receipt["files"].as_array().is_some_and(|files|!files.is_empty())
+        });
+    Ok(json!({"resource_id":"tts-aniflive-runtime","parent_resource_id":"voice-server","label":"AnifLive（本地语音引擎）隔离运行依赖","required":false,
+        "installation_state":if installed{"installed"}else{"missing"},"files_installed":installed,"runtime_ready":installed,"can_start":installed,
+        "update_available":false,"version":"1.5.0b1-patch3","error":Value::Null}))
+}
+
+/// verify_aniflive_runtime（显式完整性核对）：启动盘点仍只读身份，主动维修检查真实隔离文件。
+fn verify_aniflive_runtime(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let root=safe_path(&context.install,"runtimes/aniflive-tts")?;
+    let mut batches=vec![];
+    for role in ["packages","export-packages"]{
+        let directory=safe_path(&root,role)?;
+        let receipt=load(&safe_path(&directory,"aniflive-packages.json")?)?;
+        let records=receipt["files"].as_array().filter(|files|!files.is_empty()).ok_or("AnifLive（本地语音）缺少隔离依赖文件登记")?.clone();
+        batches.push(crate::verification::Batch{root:directory,records,exact:false,python:false});
+    }
+    let source=safe_path(&root,"source")?;
+    let receipt=load(&safe_path(&source,"windows-source-receipt.json")?)?;
+    let inventory=receipt["inventory"].as_object().filter(|rows|!rows.is_empty()).ok_or("AnifLive（本地语音）缺少完整源码登记")?;
+    let mut records=vec![];
+    for (name,sha) in inventory{
+        check_cancel(cancel)?;
+        let file=safe_path(&source,name)?;
+        records.push(json!({"path":name,"size":file.metadata().map_err(|e|e.to_string())?.len(),"sha256":sha}));
+    }
+    batches.push(crate::verification::Batch{root:source,records,exact:false,python:false});
+    let requests=batches.iter().map(|batch|(batch.root.clone(),batch.records.clone())).collect::<Vec<_>>();
+    let _session=crate::verification::VerificationSession::begin();
+    crate::verification::check(batches,cancel,progress)?;
+    // 批量池保存每个组件的结论；必须消费结论，不能将调度成功误当作文件通过。
+    for (directory,records) in requests{crate::workspace::verify_records_with_progress(&directory,&records,false,cancel,progress)?;}
+    Ok(())
 }
 
 pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
@@ -327,7 +373,13 @@ pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
     for item in &catalog {
         let root=destination(context,&item)?;
         // 先以收据/旧总清单的字节数快检；只有目标文件记录变化时才复核旧文件 SHA-256（摘要）。
-        let (result,installed_version,update_available)=if item["kind"]=="model"{
+        let (result,installed_version,update_available)=if item["preparation"]=="aniflive_runtime"{
+            let status=native_runtime_status(context)?;
+            (if status["can_start"]==true{Ok(())}else{Err("AnifLive 隔离运行依赖尚未配置。".into())},None,false)
+        }else if item["preparation"]=="aniflive_local_build"{
+            let result=aniflive_model_ready(context,item["model_id"].as_str().unwrap_or(""),false).and_then(|ready|if ready{Ok(())}else{Err("请配置固定模型输入并完成本机引擎转换及合成验证。".into())});
+            (result,None,false)
+        }else if item["kind"]=="model"{
             match inspect_installed_model(context,&item,false){
                 Ok(installed)=>{
                     let update=model_update_available(&item,&installed);(Ok(()),installed.version,update)
@@ -364,7 +416,7 @@ pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
             "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
     }
-    if catalog.iter().any(|item|item["runtime_resource"]=="tts-audiocpp-runtime"){
+    if catalog.iter().any(|item|item["runtime_resource"]=="tts-aniflive-runtime"){
         rows.push(json!({"resource_id":"tts","label":"TTS（语音合成）","required":true}));
         update_tts_readiness(context,&mut rows)?;
     }
@@ -384,41 +436,65 @@ pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
 /// update_tts_readiness（语音合成目标门禁）：按已选后端与具体模型检查。
 pub fn update_tts_readiness(context:&LaunchContext,rows:&mut [Value])->Result<(),String>{
     if !rows.iter().any(|row|row["resource_id"]=="tts"){return Ok(());}
-    let runtime=rows.iter().any(|row|row["resource_id"]=="tts-audiocpp-runtime"&&row["can_start"]==true)
-        || legacy_tts_runtime_ready(context)?;
-    for row in rows.iter_mut().filter(|row|matches!(row["resource_id"].as_str(),Some("tts-voxcpm1"|"tts-voxcpm2"))){
-        row["runtime_ready"]=json!(runtime);row["can_start"]=json!(runtime&&row["files_installed"]==true&&row["update_available"]!=true);
-    }
-    let local=runtime&&rows.iter().any(|row|matches!(row["resource_id"].as_str(),Some("tts-voxcpm1"|"tts-voxcpm2"))&&row["can_start"]==true);
+    let local=rows.iter().any(|row|row["resource_id"]!="tts-aniflive-runtime"&&row["resource_id"].as_str().is_some_and(|id|id.starts_with("tts-aniflive-"))&&row["can_start"]==true);
     let selection=crate::credentials::configured_tts_selection(&context.data);
-    let selected_id=format!("tts-{}",selection["local_model"].as_str().unwrap_or("voxcpm2"));
-    let selected_local=runtime&&rows.iter().any(|row|row["resource_id"]==selected_id&&row["can_start"]==true);
+    let selected_local=aniflive_model_revision_ready(context,selection["local_model"].as_str().unwrap_or(""),selection["local_model_revision"].as_str(),false)?;
     let credentials=crate::credentials::status(&context.data)?;
     let online=credentials["providers"]["minimax"]["configured"]==true;
-    let ready=if selection["backend"]=="voxcpm1"{selected_local}else{online};
+    let ready=if selection["backend"]=="aniflive"{selected_local}else{online};
     if let Some(row)=rows.iter_mut().find(|row|row["resource_id"]=="tts"){
         *row=json!({"resource_id":"tts","label":"TTS（语音合成）","required":true,"installation_state":if ready{"installed"}else{"missing"},
             "files_installed":local,"runtime_ready":ready,"can_start":ready,"local_ready":local,"selected_local_ready":selected_local,"online_ready":online,"selection":selection,
-            "error":if ready{Value::Null}else{json!(if selection["backend"]=="voxcpm1"{"所选本地语音模型及共用运行程序未就绪，请在组件管理补齐。"}else{"所选在线语音接口未配置，请填写密钥或显式选择已就绪的本地模型。"})},
+            "error":if ready{Value::Null}else{json!(if selection["backend"]=="aniflive"{"所选本地语音模型及共用运行程序未就绪，请在组件管理补齐。"}else{"所选在线语音接口未配置，请填写密钥或显式选择已就绪的本地模型。"})},
             "fields":{"resource_id":"固定组件编号","label":"组件名称","required":"是否参与整体启动门槛","installation_state":"任选条件是否已满足",
                 "files_installed":"本地运行程序及至少一款模型完整","runtime_ready":"所选语音后端可用","can_start":"所选语音合成目标可以启动",
                 "selected_local_ready":"所选本地模型及框架可用","selection":"持久化选择的语音后端与本地模型","local_ready":"至少一款本地模型及共用运行程序可用","online_ready":"在线语音接口密钥已配置","error":"所选目标尚未就绪的原因"}});
     }Ok(())
 }
-/// legacy_tts_runtime_ready（旧原生安装兼容）：仅认可随包补丁对应的程序与模型规格摘要。
-fn legacy_tts_runtime_ready(context:&LaunchContext)->Result<bool,String>{
-    if context.install.join("models/audiocpp/runtime/cuda/audiocpp_server.exe").is_file(){return Ok(false);}
-    let Ok(item)=spec(context,"tts-audiocpp-runtime")else{return Ok(false)};
-    if item["files"].as_array().is_none_or(|rows|rows.iter().filter(|row|row["archive_id"]=="patch").count()<3){return Ok(false);}
-    for row in item["files"].as_array().into_iter().flatten().filter(|row|row["archive_id"]=="patch"){
-        let Some(name)=row["path"].as_str()else{return Ok(false)};
-        let path=if name=="cuda/audiocpp_server.exe"{context.install.join("runtimes/audiocpp").join(name)}
-            else{context.install.join("sources/audio.cpp").join(name)};
-        if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().unwrap_or(0){return Ok(false);}
+/// aniflive_model_ready（本机引擎就绪）：实际生成摘要及完整验证收据是唯一依据。
+fn aniflive_adapter_paths()->[&'static str;8]{[
+    "voice_terminal/tts/aniflive_native.py","voice_terminal/tts/aniflive_environment.py",
+    "voice_terminal/tts/aniflive_worker.py","voice_terminal/tts/aniflive_build_diagnostics.py","scripts/run-aniflive.py",
+    "voice_terminal/tts/aniflive_aliases.py","voice_terminal/tts/aniflive_shared.py","voice_terminal/tts/aniflive_service.py"]}
+pub fn aniflive_model_ready(context:&LaunchContext,model:&str,verify_hashes:bool)->Result<bool,String>{
+    aniflive_model_revision_ready(context,model,None,verify_hashes)
+}
+/// aniflive_model_revision_ready（精确版本门禁）：已保存的播放版本不能被新登记版本替代。
+fn aniflive_model_revision_ready(context:&LaunchContext,model:&str,revision:Option<&str>,verify_hashes:bool)->Result<bool,String>{
+    if !crate::credentials::valid_tts_model(model)||matches!(model,"voxcpm1"|"voxcpm2"|"aniflive"){return Ok(false);}
+    if context.install.join("tmp/resource-transaction.json").exists(){return Ok(false);}
+    let registry=load(&safe_path(&context.data,"config/aniflive-models.json")?).unwrap_or(Value::Null);
+    let entry=&registry["models"][model];
+    let Some(revision)=revision.or_else(||entry["current_revision"].as_str())else{return Ok(false)};
+    if revision.len()!=24||!revision.bytes().all(|c|c.is_ascii_hexdigit()){return Ok(false);}
+    let package=safe_path(&context.install,&format!("models/aniflive-tts/packages/{model}/{revision}"))?;
+    let manifest=load(&safe_path(&package,"manifest.json")?).unwrap_or(Value::Null);
+    if manifest["model_id"]!=model||manifest["format"]!="aniflive-tts-model-package"{return Ok(false);}
+    let receipt=load(&safe_path(&package,"application-receipt.json")?).unwrap_or(Value::Null);
+    if entry["versions"][revision]["state"]!="validated"||receipt["identity"]!=entry["versions"][revision]["identity"]||receipt["validation"]["enqueue_verified"]!=true||receipt["validation"]["engine_count"]!=9||receipt["streaming_verified"]!=true{return Ok(false);}
+    if native_runtime_status(context)?["can_start"]!=true{return Ok(false);}
+    let identity=&receipt["identity"];
+    if identity["dependency_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok().as_deref()
+        ||identity["shared_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-shared-assets.lock.json")).ok().as_deref()
+        ||identity["source"]["patch_revision"]!=3||identity["source"]["upstream_commit"]!="9bc349d3a71362b3bfdccbc630983809800954fd"{return Ok(false);}
+    let Some(adapters)=identity["adapter"].as_object()else{return Ok(false)};
+    if adapters.len()!=8{return Ok(false);}
+    for name in aniflive_adapter_paths(){
+        if adapters.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){return Ok(false);}
     }
-    // 旧自编译程序静态链接 CUDA runtime（计算运行时），其必需运行库与官方归档的动态布局不同。
-    Ok(["ggml.dll","ggml-base.dll","ggml-cuda.dll","cublas64_13.dll","cublasLt64_13.dll"].iter()
-        .all(|name|context.install.join("runtimes/audiocpp/cuda").join(name).is_file()))
+    let Some(files)=receipt["files"].as_array()else{return Ok(false)};
+    if files.is_empty(){return Ok(false);}
+    let mut expected=std::collections::HashSet::from(["checksums.json".to_owned(),"application-receipt.json".to_owned()]);
+    for row in files{
+        let Some(relative)=row["path"].as_str()else{return Ok(false)};
+        if !expected.insert(relative.into()){return Ok(false);}
+        let path=safe_path(&package,relative)?;
+        if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size"].as_u64().unwrap_or(0){return Ok(false);}
+        if verify_hashes&&file_hash(&path)?!=row["sha256"].as_str().unwrap_or(""){return Ok(false);}
+    }
+    let actual=walk(&package)?.into_iter().map(|path|path.strip_prefix(&package).unwrap().to_string_lossy().replace('\\',"/")).collect::<std::collections::HashSet<_>>();
+    if actual!=expected{return Ok(false);}
+    Ok(true)
 }
 /// startup_readiness（启动组件检查）：只读取本地清单与文件，不启动解释器、服务或下载。
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
@@ -441,6 +517,7 @@ pub(crate) fn prepare_maintenance_verification(context:&LaunchContext,cancel:&At
     }}
     for item in specs(context).unwrap_or_default(){
         let root=destination(context,&item)?;if !root.is_dir(){continue;}
+        if matches!(item["preparation"].as_str(),Some("aniflive_local_build"|"aniflive_runtime")){continue;} // 生成引擎及隔离依赖按实际收据单独核验。
         if item["kind"]=="model"{
             let records=item["files"].as_array().ok_or("模型文件清单缺失")?.iter()
                 .filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap_or("")).is_file())
@@ -477,7 +554,12 @@ pub(crate) fn maintenance_issues(context:&LaunchContext,full:bool,cancel:&Atomic
         let known_failure=prior.as_ref().is_some_and(|record|record["issues"].as_array().unwrap().iter().any(|row|row["resource_id"]==id&&row["content_failure"]==true));
         if item["required"]==false&&!root.exists()&&!known_failure{continue;}
         let valid=if full&&root.is_dir(){
-            if item["kind"]=="model"{validate_model_files_with_progress(context,&item,&root,false,cancel,progress)}
+            if item["preparation"]=="aniflive_runtime"{
+                verify_aniflive_runtime(context,cancel,progress)
+            }else if item["preparation"]=="aniflive_local_build"{
+                aniflive_model_ready(context,item["model_id"].as_str().unwrap_or(""),true)
+                    .and_then(|ready|if ready{Ok(())}else{Err("本机引擎、生成文件或完整合成验证收据不符。".into())})
+            }else if item["kind"]=="model"{validate_model_files_with_progress(context,&item,&root,false,cancel,progress)}
             else{dsh_validate_with_progress(context,&root,true,cancel,progress)}
         }else{Ok(())};
         check_cancel(cancel)?;
@@ -1330,6 +1412,34 @@ mod download_tests {
     use super::*;
 
     #[test]
+    fn isolated_aniflive_integrity_checks_real_files_instead_of_catalog_placeholder(){
+        let root=std::env::temp_dir().join(format!("voice-aniflive-integrity-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let native=root.join("runtimes/aniflive-tts");
+        for role in ["packages","export-packages"]{
+            let directory=native.join(role);fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("model.py"),b"good").unwrap();
+            atomic_json(&directory.join("aniflive-packages.json"),&json!({"files":[{"path":"model.py","size":4,"sha256":file_hash(&directory.join("model.py")).unwrap()}]})).unwrap();
+        }
+        let source=native.join("source");fs::create_dir_all(&source).unwrap();fs::write(source.join("bridge.py"),b"good").unwrap();
+        atomic_json(&source.join("windows-source-receipt.json"),&json!({"inventory":{"bridge.py":file_hash(&source.join("bridge.py")).unwrap()}})).unwrap();
+        let cancel=AtomicBool::new(false);
+        verify_aniflive_runtime(&context,&cancel,&mut|_,_,_|{}).unwrap();
+        fs::write(native.join("export-packages/model.py"),b"bad!").unwrap();
+        assert!(verify_aniflive_runtime(&context,&cancel,&mut|_,_,_|{}).is_err());
+        fs::write(native.join("export-packages/model.py"),b"good").unwrap();
+        fs::write(source.join("bridge.py"),b"bad!").unwrap();
+        assert!(verify_aniflive_runtime(&context,&cancel,&mut|_,_,_|{}).is_err());
+        let target=destination(&context,&json!({"preparation":"aniflive_runtime","kind":"model","destination":"aniflive-tts/runtime-registration"})).unwrap();
+        assert_eq!(target,native);
+        crate::workspace::remove_owned(&root,&std::env::temp_dir()).unwrap();
+    }
+
+    #[test]
     fn audio_enhancement_switches_migrate_and_save_independently(){
         let root=std::env::temp_dir().join(format!("voice-enhancements-{}",crate::workspace::new_id()));
         fs::create_dir_all(root.join("config")).unwrap();
@@ -1341,6 +1451,12 @@ mod download_tests {
         assert!(audio_enhancements(&root,Some(&json!({"emotion":1}))).is_err());
         assert_eq!(audio_enhancements(&root,None).unwrap(),value);
         assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        let settings=root.join("config/product-settings.json");
+        assert_eq!(load(&settings).unwrap()["schema_version"],20);
+        let future=json!({"schema_version":21,"tts":{"backend":"minimax"},"audio_enhancements":value});
+        atomic_json(&settings,&future).unwrap();
+        assert!(audio_enhancements(&root,Some(&json!({"emotion":false}))).is_err());
+        assert_eq!(load(&settings).unwrap(),future);
         assert!(root.file_name().unwrap().to_string_lossy().starts_with("voice-enhancements-"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -1378,31 +1494,51 @@ mod download_tests {
     }
 
     #[test]
-    fn selected_tts_survives_only_unselected_optional_model_corruption(){
+    fn selected_generated_tts_survives_only_unselected_optional_model_corruption(){
         let root=std::env::temp_dir().join(format!("voice-tts-options-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
         fs::create_dir_all(root.join("app/scripts")).unwrap();
         fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
         fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
-        let mut entries=vec![];
-        for id in ["tts-audiocpp-runtime","tts-voxcpm1","tts-voxcpm2"]{
-            let relative=format!("audiocpp/{id}");let folder=root.join("models").join(&relative);
-            fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"good").unwrap();
-            let mut item=json!({"resource_id":id,"kind":"model","title":id,"destination":relative,"version":"1","required":false,
-                "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&folder.join("model.bin")).unwrap()}]});
-            if id!="tts-audiocpp-runtime"{item["runtime_resource"]=json!("tts-audiocpp-runtime");}
-            write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
-            entries.push(item);
+        let lock=root.join("app/config/runtime/aniflive-runtime.lock.json");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();fs::write(&lock,b"{}").unwrap();
+        let lock_sha=file_hash(&lock).unwrap();
+        let shared_lock=lock.with_file_name("aniflive-shared-assets.lock.json");fs::write(&shared_lock,b"{}").unwrap();
+        let shared_sha=file_hash(&shared_lock).unwrap();
+        let native=root.join("runtimes/aniflive-tts");fs::create_dir_all(native.join("source")).unwrap();
+        atomic_json(&native.join("source/windows-source-receipt.json"),&json!({"patch_revision":3,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"})).unwrap();
+        for role in ["packages","export-packages"]{fs::create_dir_all(native.join(role)).unwrap();atomic_json(&native.join(role).join("aniflive-packages.json"),&json!({"lock_sha256":lock_sha,"files":[{"path":"fixture"}]})).unwrap();}
+        let mut adapters=serde_json::Map::new();
+        for name in aniflive_adapter_paths(){
+            let path=root.join("app").join(name);fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(&path,b"# adapter fixture").unwrap();adapters.insert(name.into(),json!(file_hash(&path).unwrap()));
+        }
+        let mut entries=vec![];let mut models=serde_json::Map::new();
+        for model in ["minimax-female-shaonv-zh","tangyuge-v2pp-d78cf598"]{
+            let revision="a".repeat(24);let relative=format!("aniflive-tts/packages/{model}");
+            let package=root.join("models").join(&relative).join(&revision);fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("model.engine"),b"good").unwrap();
+            atomic_json(&package.join("manifest.json"),&json!({"model_id":model,"format":"aniflive-tts-model-package"})).unwrap();
+            fs::write(package.join("checksums.json"),b"{}").unwrap();
+            let identity=json!({"fixture":model,"dependency_lock":lock_sha,"shared_lock":shared_sha,"source":{"patch_revision":3,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"},"adapter":adapters});
+            atomic_json(&package.join("application-receipt.json"),&json!({"identity":identity,"validation":{"enqueue_verified":true,"engine_count":9},"streaming_verified":true,
+                "files":[{"path":"model.engine","size":4,"sha256":file_hash(&package.join("model.engine")).unwrap()},
+                         {"path":"manifest.json","size":package.join("manifest.json").metadata().unwrap().len(),"sha256":file_hash(&package.join("manifest.json")).unwrap()}]})).unwrap();
+            models.insert(model.into(),json!({"current_revision":revision,"versions":{revision:{"state":"validated","identity":identity}}}));
+            entries.push(json!({"resource_id":format!("tts-aniflive-{model}"),"kind":"model","title":model,"destination":relative,"version":"1","required":false,
+                "preparation":"aniflive_local_build","model_id":model,"runtime_resource":"tts-aniflive-runtime","files":[]}));
         }
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":entries})).unwrap();
         let context=LaunchContext::portable(&root).unwrap();
-        atomic_json(&context.data.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"voxcpm1"}})).unwrap();
-        let rows=inventory(&context).unwrap();assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["local_ready"],true);
-        fs::write(root.join("models/audiocpp/tts-voxcpm2/model.bin"),b"bad!").unwrap();
-        let state=startup_readiness(&context).unwrap();assert_eq!(state["ready"],true);
-        fs::remove_file(root.join("models/audiocpp/tts-voxcpm1/model.bin")).unwrap();
-        let mut rows=inventory(&context).unwrap();validate_inventory_hashes(&context,&mut rows,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
-        assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["local_ready"],false);
+        atomic_json(&context.data.join("config/aniflive-models.json"),&json!({"schema":1,"models":models})).unwrap();
+        atomic_json(&context.data.join("config/product-settings.json"),&json!({"schema_version":20,"tts":{"backend":"aniflive","local_model":"minimax-female-shaonv-zh"}})).unwrap();
+        let other=root.join("models/aniflive-tts/packages/tangyuge-v2pp-d78cf598").join("a".repeat(24)).join("model.engine");
+        fs::write(other,b"bad!").unwrap();
+        assert!(!aniflive_model_ready(&context,"tangyuge-v2pp-d78cf598",true).unwrap());
+        let mut rows=inventory_raw(&context).unwrap();update_tts_readiness(&context,&mut rows).unwrap();
+        assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["selected_local_ready"],true);
+        fs::remove_file(root.join("models/aniflive-tts/packages/minimax-female-shaonv-zh").join("a".repeat(24)).join("model.engine")).unwrap();
+        let mut rows=inventory_raw(&context).unwrap();update_tts_readiness(&context,&mut rows).unwrap();
+        assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["selected_local_ready"],false);
         crate::workspace::remove_owned(&root,&std::env::temp_dir()).unwrap();
     }
 

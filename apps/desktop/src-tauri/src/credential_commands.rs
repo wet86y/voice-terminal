@@ -59,8 +59,8 @@ pub async fn tts_selection_save(window:WebviewWindow,desktop:State<'_,Arc<Deskto
         let _guard=desktop.credentials_guard.lock().map_err(|_|"语音配置锁不可用。")?;
         if desktop.service.lock().map_err(|_|"服务状态锁不可用。")?.is_some(){return Err("程序已启动，请在语音与音色设置中切换。".into());}
         if desktop.workspace_busy.load(std::sync::atomic::Ordering::Acquire){return Err("正在切换工作区，请稍后保存。".into());}
-        if !request.is_object()||request.as_object().unwrap().keys().any(|key|!matches!(key.as_str(),"backend"|"local_model"))
-            ||!matches!(request["backend"].as_str(),Some("minimax"|"voxcpm1"))||!matches!(request["local_model"].as_str(),Some("voxcpm1"|"voxcpm2")){return Err("语音目标必须包含有效的 backend（语音后端）与 local_model（本地模型）。".into());}
+        if !request.is_object()||request.as_object().unwrap().keys().any(|key|!matches!(key.as_str(),"backend"|"local_model"|"local_model_revision"))
+            ||!matches!(request["backend"].as_str(),Some("minimax"|"aniflive"))||!request["local_model"].as_str().is_some_and(|value|!value.is_empty()&&value.len()<=64&&value.bytes().all(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||matches!(c,b'.'|b'-'|b'_'))){return Err("语音目标必须包含有效的 backend（语音后端）与 local_model（本地模型）。".into());}
         let context=desktop.context().ok_or("请先选择工作区。")?;
         if !context.python.is_file(){return Err("请先下载 CPU（中央处理器）基础运行依赖，再保存语音目标。".into());}
         voice_desktop_common::runtime::worker(&context,&context.python,"tts-selection",&["--program".into(),context.program.to_string_lossy().into_owned(),"--data".into(),context.data.to_string_lossy().into_owned(),"--selection".into(),request.to_string()],&std::sync::atomic::AtomicBool::new(false))?;

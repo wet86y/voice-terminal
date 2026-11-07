@@ -14,6 +14,57 @@ const LEGACY_MODEL:&str="models/speaker/wespeaker-cnceleb-resnet34"; // 旧声�
 const CURRENT_MODEL:&str="models/speaker/campplus-zh-cn-common"; // 新声纹模型资源。
 pub type Progress<'a>=dyn FnMut(&str,u64,u64)+'a; // Progress（阶段及字节进度回调）。
 
+pub(crate) const RETIRED_TTS_FILES:&[(&str,&str,u64,&str)]=&[
+    ("tts-voxcpm1","models/audiocpp/tts/VoxCPM1-GGUF/voxcpm-0.5b-q8_0-audiovae-f16.gguf",847888032,"01210319c5ce617613c9d1c38e34649f7479e98a60d51b719f7df82970658241"),
+    ("tts-voxcpm2","models/audiocpp/tts/VoxCPM2-GGUF/voxcpm2-q8_0.gguf",2955000480,"c8e01ab4416011e12a28f24ede298a1aa5ce64b43f8e8aaad53b1e2fe7c96432"),
+]; // RETIRED_TTS_FILES（本轮唯一获准退役的权重）。
+
+fn prepare_retired_tts(root:&Path,stage:&Path,release:&mut Value,cancel:&AtomicBool,progress:&mut Progress)->Result<Vec<Value>,String>{
+    prepare_retired_tts_entries(root,stage,release,cancel,progress,RETIRED_TTS_FILES)
+}
+fn prepare_retired_tts_entries(root:&Path,stage:&Path,release:&mut Value,cancel:&AtomicBool,progress:&mut Progress,
+    entries:&[(&str,&str,u64,&str)])->Result<Vec<Value>,String>{
+    if release["tts_retirement"]!=1{return Ok(vec![]);}
+    let relative="models/manifest.json";
+    let path=safe_path(root,relative)?;
+    let mut manifest=crate::resources::load(&safe_path(stage,relative)?).or_else(|_|crate::resources::load(&path)).unwrap_or(Value::Null);
+    let mut removed=HashSet::new();let mut rows=vec![];
+    for (id,weight,size,hash) in entries{
+        if !RETIRED_TTS_FILES.iter().any(|(known_id,path,_,_)|known_id==id&&path==weight){return Err("旧语音清理范围超出固定许可。".into());}
+        cancelled(cancel)?;
+        let target=safe_path(root,weight)?;
+        if !target.exists(){continue;}
+        let receipt_relative=format!("{}/resource-install.json",weight.rsplit_once('/').unwrap().0);
+        let receipt_path=safe_path(root,&receipt_relative)?;
+        let receipt=crate::resources::load(&receipt_path).unwrap_or(Value::Null);
+        let filename=weight.rsplit('/').next().unwrap();
+        let receipt_owned=receipt["schema"]==1&&receipt["resource_id"]==*id&&receipt["files"].as_array().is_some_and(|files|files.len()==1&&files[0]["path"]==filename&&files[0]["size"]==*size&&files[0]["sha256"]==*hash);
+        let registered=manifest["files"].as_array().is_some_and(|files|files.iter().any(|row|row["path"]==weight.trim_start_matches("models/")&&row["size"]==*size&&row["sha256"]==*hash));
+        if (!receipt_owned&&!registered)||(receipt_path.exists()&&!receipt_owned)||target.metadata().map_err(|e|e.to_string())?.len()!=*size{
+            progress(&format!("保留无法确认受管归属的旧权重：{id}"),0,0);continue;
+        }
+        if workspace::file_hash_with_progress(&target,cancel,progress)?!=*hash{
+            progress(&format!("保留内容身份不符的旧权重：{id}"),0,0);continue;
+        }
+        rows.push(json!({"path":weight,"original":true,"delete_only":true}));
+        removed.insert(weight.trim_start_matches("models/").to_owned());
+        if receipt_owned{
+            rows.push(json!({"path":receipt_relative,"original":true,"delete_only":true}));
+            removed.insert(receipt_relative.trim_start_matches("models/").to_owned());
+        }
+    }
+    if !rows.is_empty()&&manifest["files"].is_array(){
+        manifest["files"].as_array_mut().unwrap().retain(|row|!row["path"].as_str().is_some_and(|path|removed.contains(path)));
+        atomic_json(&safe_path(stage,relative)?,&manifest)?;
+        rows.push(json!({"path":relative,"original":path.exists()}));
+        let hash=file_hash(&stage.join(relative))?;
+        if let Some(components)=release["components"].as_array_mut(){for row in components.iter_mut().filter(|row|row["kind"]=="models"){
+            row["manifest_sha256"]=json!(hash);
+        }}
+    }
+    Ok(rows)
+}
+
 // WorkspaceGuard（工作区互斥句柄）：产品运行与本体替换共用，避免检查后再次启动。
 pub struct WorkspaceGuard { _file:fs::File }
 impl WorkspaceGuard {
@@ -42,6 +93,12 @@ pub fn ensure_idle(root:&Path)->Result<(),String>{
                         if expected.as_ref().is_some_and(|expected|path.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy())){
                             return Err("目标正式程序正在运行，请退出后重试。".into());
                         }
+                    }
+                }
+                if name.eq_ignore_ascii_case("audiocpp_server.exe"){
+                    if let Some((_,path))=workspace::process_identity(row.th32ProcessID)?{
+                        let path=canonical_path(&path)?;
+                        if path.starts_with(canonical_path(root)?){return Err("旧本地语音进程仍在运行，请先结束当前工作区的语音服务。".into());}
                     }
                 }
             }
@@ -158,6 +215,7 @@ fn activate(root:&Path,stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->R
         if let Some(rows)=old["components"].as_array(){release["components"]=json!(rows.iter().filter(|row|matches!((row["kind"].as_str(),row["path"].as_str()),(Some("python"),Some("runtimes/python"))|(Some("models"),Some("models"))|(Some("dsh"),Some("runtimes/dsh"))|(Some("webview2"),Some("runtimes/webview2")))).collect::<Vec<_>>());atomic_json(&incoming,&release)?;}
     }
     let mut migration_rows=crate::compatibility::prepare_upgrade(root,stage,&mut release,cancel,progress)?;
+    migration_rows.extend(prepare_retired_tts(root,stage,&mut release,cancel,progress)?);
     let mut seen=HashSet::new();migration_rows.retain(|row|seen.insert(row["path"].as_str().unwrap_or("").to_lowercase()));
     cancelled(cancel)?;
     atomic_json(&incoming,&release)?;
@@ -292,6 +350,30 @@ pub fn launch(root:&Path)->Result<u32,String>{
 
 #[cfg(test)] mod tests{
     use super::*;
+    #[test]
+    fn retired_tts_preserves_unknown_content_and_recovers_precise_deletions(){
+        let root=fixture();let stage=root.join("tmp/publish/new");fs::create_dir_all(&stage).unwrap();
+        let (id,relative,_,_)=RETIRED_TTS_FILES[0];let weight=root.join(relative);fs::create_dir_all(weight.parent().unwrap()).unwrap();fs::write(&weight,b"managed").unwrap();
+        let hash=file_hash(&weight).unwrap();let receipt_relative=format!("{}/resource-install.json",relative.rsplit_once('/').unwrap().0);
+        let receipt=root.join(&receipt_relative);atomic_json(&receipt,&json!({"schema":1,"resource_id":id,"files":[{"path":weight.file_name().unwrap().to_string_lossy(),"size":7,"sha256":hash}]})).unwrap();
+        let user=root.join("data/tts/voxcpm1/voices/recording.wav");fs::create_dir_all(user.parent().unwrap()).unwrap();fs::write(&user,b"user recording").unwrap();
+        let runtime=root.join("runtimes/audiocpp/keep.dll");fs::create_dir_all(runtime.parent().unwrap()).unwrap();fs::write(&runtime,b"keep runtime").unwrap();
+        let original=json!({"schema":1,"kind":"models","files":[{"path":relative.trim_start_matches("models/"),"size":7,"sha256":hash},{"path":"unrelated/model","size":1,"sha256":"unknown"}]});
+        atomic_json(&root.join("models/manifest.json"),&original).unwrap();
+        let mut release=json!({"tts_retirement":1,"components":[{"kind":"models"}]});
+        let entries=[(id,relative,7,hash.as_str())];
+        let rows=prepare_retired_tts_entries(&root,&stage,&mut release,&AtomicBool::new(false),&mut|_,_,_|{},&entries).unwrap();
+        assert_eq!(rows.len(),3);assert!(rows.iter().filter(|row|row["delete_only"]==true).all(|row|row["path"]==relative||row["path"]==receipt_relative));
+        let filtered=crate::resources::load(&stage.join("models/manifest.json")).unwrap();assert_eq!(filtered["files"].as_array().unwrap().len(),1);
+        atomic_json(&root.join("tmp/update-transaction.json"),&json!({"schema":1,"state":"prepared","items":rows})).unwrap();
+        let old=root.join("tmp/publish/old").join(relative);fs::create_dir_all(old.parent().unwrap()).unwrap();fs::rename(&weight,&old).unwrap();
+        workspace::recover_install(&root).unwrap();assert_eq!(fs::read(&weight).unwrap(),b"managed");assert_eq!(crate::resources::load(&root.join("models/manifest.json")).unwrap(),original);
+        fs::write(&weight,b"unknown").unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        assert!(prepare_retired_tts_entries(&root,&stage,&mut release,&AtomicBool::new(false),&mut|_,_,_|{},&entries).unwrap().is_empty());
+        assert_eq!(fs::read(&user).unwrap(),b"user recording");assert_eq!(fs::read(&runtime).unwrap(),b"keep runtime");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn same_package_delivery_retains_matching_integrity_tool_and_rejects_wrong_package(){
         let root=fixture();let payload=package("retained-build",false);run(&payload,&root).unwrap();

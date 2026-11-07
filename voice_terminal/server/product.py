@@ -10,6 +10,7 @@ the internal Agent/Shadow trace.
 from __future__ import annotations
 
 from ..screen_capture import ScreenCaptureConfig
+from ..tts.settings import DEFAULT_LOCAL_MODEL, ANIFLIVE_OPTION_DEFAULTS, migrate_choice, valid_local_model, validate_options
 from ..audio_enhancements import AudioEnhancements
 
 import asyncio
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 19
+PRODUCT_SETTINGS_SCHEMA_VERSION = 20
 PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
@@ -119,14 +120,15 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         "custom_instructions": [],
         "hotwords": deepcopy(DEFAULT_HOTWORDS),  # hotwords（识别后热词设置）。
         "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
-        # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
+        # TTS（语音合成）播放选择与模型版本由产品设置唯一持有。
         "tts": {"backend": config.tts.backend, "local_model": config.tts.local_model,
+                "local_model_revision": config.tts.local_model_revision,
+                **{key: getattr(config.tts, key) for key in ANIFLIVE_OPTION_DEFAULTS},
                 "speech_control_enabled": config.tts.speech_control_enabled,
                 "online_model": (config.tts.model if config.tts.model in PRODUCT_MINIMAX_TTS_MODELS else "speech-2.8-hd"),
                 "online_voice_id": config.tts.voice_id,
                 "local_optimization": True, "acoustic_continuation": config.tts.acoustic_continuation,
-                "inference_steps_by_model": dict(config.tts.inference_steps_by_model),
-                "active_voice_by_model": {"voxcpm1": None, "voxcpm2": None}},
+                "active_voice_by_model": {"aniflive": None}},
         "speaker": {
             **{key: getattr(config.speaker, key, value) for key, value in TUNING_DEFAULTS.items()},
             "mode": str(getattr(config.speaker, "mode", "off")),
@@ -187,15 +189,14 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled"):
         if not isinstance(result["tts"].get(field), bool):
             result["tts"][field] = defaults["tts"][field]
-    try:
-        result["tts"]["inference_steps_by_model"] = validate_tts_inference_steps(
-            result["tts"]["inference_steps_by_model"], defaults["tts"]["inference_steps_by_model"],
-        )
-    except ValueError:
-        result["tts"]["inference_steps_by_model"] = dict(defaults["tts"]["inference_steps_by_model"])
-    if (not isinstance(result["tts"].get("local_model"), str)
-            or result["tts"].get("local_model") not in {"voxcpm1", "voxcpm2"}):
+    result["tts"]["backend"], result["tts"]["local_model"] = migrate_choice(
+        result["tts"]["backend"], result["tts"]["local_model"])
+    if not valid_local_model(result["tts"].get("local_model")):
         result["tts"]["local_model"] = defaults["tts"]["local_model"]
+    try:
+        result["tts"].update(validate_options(result["tts"]))
+    except ValueError:
+        result["tts"].update({key: defaults["tts"].get(key) for key in (*ANIFLIVE_OPTION_DEFAULTS, "local_model_revision")})
     if (not isinstance(result["tts"].get("online_model"), str)
             or result["tts"].get("online_model") not in PRODUCT_MINIMAX_TTS_MODELS):
         result["tts"]["online_model"] = defaults["tts"]["online_model"]
@@ -205,7 +206,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     else:
         result["tts"]["online_voice_id"] = online_voice_id.strip()
     active_voices = result["tts"].get("active_voice_by_model")
-    normalized_active: dict[str, dict[str, Any] | None] = {"voxcpm1": None, "voxcpm2": None}
+    normalized_active: dict[str, dict[str, Any] | None] = {"aniflive": None}
     if isinstance(active_voices, Mapping):
         for model in normalized_active:
             selected = active_voices.get(model)
@@ -299,7 +300,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
     # 旧设置可能记录了 cosyvoice；合并后统一锁定 MiniMax API（在线语音接口）。
-    if result["tts"].get("backend") not in {"minimax", "voxcpm1"}:
+    if result["tts"].get("backend") not in {"minimax", "aniflive"}:
         result["tts"]["backend"] = defaults["tts"]["backend"]
     result["tts"]["local_optimization"] = True
     speaker = result["speaker"]
@@ -395,7 +396,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             elif section_name == "wake" and field == "sensitivity":
                 invalid = invalid or type(candidate) is not int or not MIN_KWS_SENSITIVITY <= candidate <= MAX_KWS_SENSITIVITY
             elif section_name == "tts" and field == "local_model":
-                invalid = invalid or not isinstance(candidate, str) or candidate not in {"voxcpm1", "voxcpm2"}
+                invalid = invalid or (candidate not in {"voxcpm1", "voxcpm2"} and not valid_local_model(candidate))
             elif section_name == "tts" and field == "online_model":
                 invalid = invalid or not isinstance(candidate, str) or candidate not in PRODUCT_MINIMAX_TTS_MODELS
             elif section_name == "tts" and field == "online_voice_id":
@@ -410,10 +411,10 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             elif section_name == "shadow" and field == "experimental_context_gate_enabled":
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "tts" and field == "backend":
-                invalid = invalid or not isinstance(candidate, str) or candidate not in {"minimax", "voxcpm1", "cosyvoice"}
+                invalid = invalid or not isinstance(candidate, str) or candidate not in {"minimax", "aniflive", "voxcpm1", "cosyvoice"}
             elif section_name == "tts" and field == "active_voice_by_model":
                 invalid = invalid or not isinstance(candidate, Mapping) or any(
-                    model not in {"voxcpm1", "voxcpm2"}
+                    model not in {"voxcpm1", "voxcpm2", "aniflive"}
                     or selected is not None and (
                         not isinstance(selected, Mapping)
                         or not isinstance(selected.get("voice_id"), str)
@@ -587,10 +588,10 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     )
     tts = settings.get("tts") if isinstance(settings.get("tts"), Mapping) else {}
     backend = tts.get("backend", config.tts.backend)
-    if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
+    if not isinstance(backend, str) or backend not in {"minimax", "aniflive"}:
         backend = config.tts.backend
     local_model = tts.get("local_model", config.tts.local_model)
-    if not isinstance(local_model, str) or local_model not in {"voxcpm1", "voxcpm2"}:
+    if not valid_local_model(local_model):
         local_model = config.tts.local_model
     online_model = tts.get("online_model", config.tts.model)
     if not isinstance(online_model, str) or online_model not in PRODUCT_MINIMAX_TTS_MODELS:
@@ -606,10 +607,10 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         sample_rate=resolve_tts_sample_rate(backend, str(local_model), config.tts.online_sample_rate),
         provider="minimax",
         local_model=str(local_model),
+        **validate_options(tts),
         local_optimization=tts.get("local_optimization", config.tts.local_optimization),
         speech_control_enabled=tts.get("speech_control_enabled", config.tts.speech_control_enabled),
         acoustic_continuation=tts.get("acoustic_continuation", config.tts.acoustic_continuation),
-        inference_steps_by_model=tts.get("inference_steps_by_model", config.tts.inference_steps_by_model),
 
     )
     next_compute = ComputeConfig(
@@ -756,16 +757,17 @@ class ProductSettingsStore:
         """在运行切换成功后保存 backend（语音后端）及 local_model（本地模型）。"""
         if not payload or set(payload) - {
             "backend", "local_model", "online_model", "online_voice_id",
-            "local_optimization", "acoustic_continuation", "speech_control_enabled", "inference_steps_by_model",
+            "local_optimization", "acoustic_continuation", "speech_control_enabled",
+            *ANIFLIVE_OPTION_DEFAULTS, "local_model_revision",
         }:
             raise ProductSettingsError(
                 "TTS 设置字段无效：仅接受 backend（语音后端）、online_model（在线模型）、"
                 "online_voice_id（在线音色标识）、local_model（本地语音合成模型）、speech_control_enabled（智能语音调节开关）及本地合成参数。"
             )
         model = payload.get("local_model", self._settings["tts"]["local_model"])
-        if not isinstance(model, str) or model not in {"voxcpm1", "voxcpm2"}:
+        if not valid_local_model(model):
             raise ProductSettingsError(
-                "local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。"
+                "local_model（本地语音合成模型）必须为有效登记编号。"
             )
         for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled"):
             if field in payload and not isinstance(payload[field], bool):
@@ -773,15 +775,12 @@ class ProductSettingsStore:
                          "speech_control_enabled": "智能语音调节开关"}[field]
                 raise ProductSettingsError(f"{field}（{label}）必须为布尔值。")
         previous = deepcopy(self._settings["tts"])
-        try:
-            steps = validate_tts_inference_steps(
-                payload.get("inference_steps_by_model", {}), previous["inference_steps_by_model"],
-            )
-        except ValueError as exc:
-            raise ProductSettingsError(str(exc)) from exc
+        options = validate_options({**previous, **payload})
+        if model != previous["local_model"] and "local_model_revision" not in payload:
+            options["local_model_revision"] = None
         backend = payload.get("backend", previous["backend"])
-        if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
-            raise ProductSettingsError("backend（语音后端）必须为 minimax 或 voxcpm1。")
+        if not isinstance(backend, str) or backend not in {"minimax", "aniflive"}:
+            raise ProductSettingsError("backend（语音后端）必须为 minimax 或 aniflive。")
         online_model = payload.get("online_model", previous["online_model"])
         if not isinstance(online_model, str) or online_model not in PRODUCT_MINIMAX_TTS_MODELS:
             raise ProductSettingsError("online_model（在线模型）必须为 speech-2.8-turbo 或 speech-2.8-hd。")
@@ -793,7 +792,7 @@ class ProductSettingsStore:
         self._settings["tts"] = {**previous, **dict(payload), "online_model": online_model,
                                  "online_voice_id": online_voice_id, "local_optimization": True,
                                  "local_model": model, "backend": backend,
-                                 "inference_steps_by_model": steps}
+                                 **options}
         self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
         try:
             self._save_settings()
@@ -806,15 +805,15 @@ class ProductSettingsStore:
     @_settings_locked
     def save_tts_voice_selection(self, model: str, selection: Mapping[str, Any]) -> dict[str, Any]:
         """原子保存 model（本地模型）的 voice_id（音色标识）和 revision（音色版本）。"""
-        if model not in {"voxcpm1", "voxcpm2"}:
-            raise ProductSettingsError("model（本地模型）必须为 voxcpm1 或 voxcpm2。")
+        if model != "aniflive":
+            raise ProductSettingsError("model（音色库引擎）必须为 aniflive（本地语音）。")
         voice_id, revision = selection.get("voice_id"), selection.get("revision")
         if (not isinstance(voice_id, str) or not voice_id or len(voice_id) > 80
                 or type(revision) is not int or revision < 1):
             raise ProductSettingsError("音色选择必须包含有效的 voice_id（音色标识）和 revision（音色版本）。")
         previous = deepcopy(self._settings["tts"])
         previous_version = self._settings["schema_version"]
-        active = deepcopy(previous.get("active_voice_by_model") or {"voxcpm1": None, "voxcpm2": None})
+        active = deepcopy(previous.get("active_voice_by_model") or {"aniflive": None})
         active[model] = {"voice_id": voice_id, "revision": revision}
         self._settings["tts"] = {**previous, "active_voice_by_model": active}
         self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
@@ -1728,14 +1727,14 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
                          if isinstance(raw_local_tts.get("active_voice_by_model"), Mapping) else {})
         voice_state = raw_local_tts.get("voice_state")
         result["local_tts"] = {
-            "backend": raw_local_tts.get("backend") if isinstance(raw_local_tts.get("backend"), str) and raw_local_tts.get("backend") in {"minimax", "voxcpm1"} else "minimax",
-            "local_model": local_model if isinstance(local_model, str) and local_model in {"voxcpm1", "voxcpm2"} else "voxcpm1",
-            "loaded_model": loaded_model if isinstance(loaded_model, str) and loaded_model in {"voxcpm1", "voxcpm2"} else None,
+            "backend": raw_local_tts.get("backend") if isinstance(raw_local_tts.get("backend"), str) and raw_local_tts.get("backend") in {"minimax", "aniflive"} else "minimax",
+            "local_model": local_model if valid_local_model(local_model) else DEFAULT_LOCAL_MODEL,
+            "loaded_model": loaded_model if valid_local_model(loaded_model) else None,
             "load_state": _safe_display_text(raw_local_tts.get("load_state"), limit=32),
             "pending_selection": ({"backend": pending.get("backend"), "local_model": pending.get("local_model")}
                                   if isinstance(pending := raw_local_tts.get("pending_selection"), Mapping)
-                                  and pending.get("backend") in {"minimax", "voxcpm1"}
-                                  and pending.get("local_model") in {"voxcpm1", "voxcpm2"} else None),
+                                  and pending.get("backend") in {"minimax", "aniflive"}
+                                  and valid_local_model(pending.get("local_model")) else None),
             "error": (safe_voice_diagnostic(raw_local_tts.get("error"), "")
                       if raw_local_tts.get("error") else None),
             "active_voice": ({
@@ -1753,7 +1752,7 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
                         if isinstance(item, Mapping) and isinstance(item.get("voice_id"), str)
                         and type(item.get("revision")) is int and item.get("revision") > 0 else None)
                 for model, item in active_voices.items()
-                if model in {"voxcpm1", "voxcpm2"}
+                if model == "aniflive"
             },
             "voice_capabilities": {
                 key: raw_local_tts.get("voice_capabilities", {}).get(key) is True
@@ -1769,15 +1768,15 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
             } if isinstance(raw_local_tts.get("operation"), Mapping) else None),
             "models": [
                 {
-                    "id": item.get("id") if isinstance(item.get("id"), str) and item.get("id") in {"voxcpm1", "voxcpm2"} else "voxcpm1",
+                    "id": item.get("id"),
                     "name": _safe_display_text(item.get("name"), limit=80),
                     "native_sample_rate": item.get("native_sample_rate")
                     if isinstance(item.get("native_sample_rate"), int) and not isinstance(item.get("native_sample_rate"), bool)
-                    else 16000,
+                    else 32000,
                     "available": item.get("available") is True,
                     "loaded": item.get("loaded") is True,
                 }
-                for item in models if isinstance(item, Mapping)
+                for item in models if isinstance(item, Mapping) and valid_local_model(item.get("id"))
             ],
         }
     return result

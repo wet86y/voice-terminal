@@ -741,6 +741,37 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             app.outer_job.close()
 
+    async def test_local_tts_resources_require_process_creation_identity_and_deduplicate_children(self):
+        app = ApplicationHost(Path.cwd())
+        processes = {}
+        for pid in (20, 30, 40):
+            process = Mock(pid=pid)
+            process.create_time.return_value = 100 + pid
+            process.memory_info.return_value = SimpleNamespace(rss=pid, private=pid * 10)
+            process.cpu_times.return_value = SimpleNamespace(user=0., system=0.)
+            process.children.return_value = []
+            processes[pid] = process
+        processes[20].children.return_value = [processes[30], processes[40]]
+        processes[30].children.return_value = [processes[40]]
+        try:
+            app.state.component('voice', state='ready', pid=20)
+            app.local_tts_pid = 30
+            for created, expected in ((130., {20: 'voice', 30: 'local-tts', 40: 'local-tts'}),
+                                      (129., {20: 'voice', 30: 'voice', 40: 'voice'}),
+                                      (None, {20: 'voice', 30: 'voice', 40: 'voice'})):
+                app.local_tts_created_at = created
+                with (patch('psutil.Process', side_effect=processes.__getitem__),
+                      patch('voice_terminal.gpu_memory.process_vram_snapshot', return_value={20: 200, 30: 300, 40: 400})):
+                    app.sample_metrics()
+                snapshot = app.state.snapshot()
+                ledger = snapshot['resource_processes']
+                self.assertEqual({row['pid']: row['component_id'] for row in ledger}, expected)
+                self.assertEqual(snapshot['total_memory_rss_bytes'], 90)
+                self.assertEqual(snapshot['total_gpu_dedicated_bytes'], 900)
+                self.assertEqual(len(ledger), 3)
+        finally:
+            app.outer_job.close()
+
     async def test_missing_private_counter_does_not_report_virtual_address_space_as_commit(self):
         """缺少私有提交计数时保留空值，不能用虚拟地址空间代替。"""
         app = ApplicationHost(Path.cwd())

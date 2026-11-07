@@ -338,7 +338,6 @@ impl ResourceManager {
         self.configure_runtime_child(group,None)
     }
     fn configure_runtime_child(self:&Arc<Self>,group:String,parent:Option<String>)->Result<Value,String>{
-        if matches!(group.as_str(),"audiocpp"|"tts-audiocpp-runtime"){return self.download_child("tts-audiocpp-runtime".into(),parent);}
         let job_id=format!("env-{group}");
         let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
         self.start_child_job(job_id.clone(),resource_id.into(),"正在配置语音环境".into(),true,parent,move|manager,id|{
@@ -650,6 +649,22 @@ impl ResourceManager {
             .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:vec![]}})?;
         let item=voice_desktop_common::resources::spec(&self.context,resource_id)
             .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+        if item["preparation"]=="aniflive_runtime"{
+            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--program"),self.context.program.clone().into_os_string(),OsString::from("--prepare-runtime"),OsString::from("--native-ack")];
+            installed.extend(self.run_aniflive_task(job_id,&args,cancel)?);return Ok(installed);
+        }
+        if item["preparation"]=="aniflive_local_build"{
+            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
+                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            let preset=item["model_id"].as_str().ok_or_else(||JobError::Failed{message:"本地模型缺少固定输入编号。".into(),installed:installed.clone()})?;
+            let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),
+                OsString::from("--program"),self.context.program.clone().into_os_string(),
+                OsString::from("--prepare-runtime"),OsString::from(if item["imported"]==true{"--registered-model"}else{"--preset"}),OsString::from(preset),
+                OsString::from("--convert"),OsString::from("--native-ack")];
+            installed.extend(self.run_aniflive_task(job_id,&args,cancel)?);
+            return Ok(installed);
+        }
         if let Some(shared)=item["runtime_resource"].as_str().filter(|_| !matches!(resource_id,"tts-voxcpm1"|"tts-voxcpm2")){
             let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
                 .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
@@ -665,6 +680,30 @@ impl ResourceManager {
         installed.extend(result);Ok(installed)
     }
 
+    fn run_aniflive_task(&self,job_id:&str,args:&[OsString],cancel:Arc<AtomicBool>)->Result<Vec<String>,JobError>{
+        if cancel.load(Ordering::Acquire){return Err(JobError::Cancelled);}
+        let mut lease=None;
+        let result=self.run_stream_script_with_ack(job_id,&self.context.program.join("scripts/install-aniflive.py"),args,
+            Some(("等待显卡构建","{\"continue\":true}".into())),|phase,done,total|{
+                if phase=="等待显卡构建"{let paused=self.pause_service()?;self.remember_service_was_running(paused.was_running())?;lease=Some(paused);}
+                if phase.starts_with("启用"){self.begin_non_cancellable_phase(job_id,phase,done,Some(total))?;}
+                else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
+                Ok(())
+            });
+        let cleanup_args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--cleanup-aliases")];
+        let cleanup=self.run_stream_script("",&self.context.program.join("scripts/install-aniflive.py"),&cleanup_args,|_,_,_|Ok(()));
+        if let Some(lease)=lease.as_mut(){
+            let resumed=self.maybe_resume_service(lease).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+        }
+        cleanup.map_err(|error|JobError::Failed{message:format!("任务已退出，但临时盘符回收失败：{}",error.message),installed:vec![]})?;
+        let result=result.map_err(|error|if error.cancelled{JobError::Cancelled}else{JobError::Failed{message:error.message,installed:vec![]}})?;
+        if result["runtime_ready"]==true&&voice_desktop_common::resources::native_runtime_status(&self.context).is_ok_and(|row|row["can_start"]==true){return Ok(vec!["tts-aniflive-runtime".into()]);}
+        let model=result["model_id"].as_str().ok_or_else(||JobError::Failed{message:"模型任务未返回登记身份。".into(),installed:vec![]})?;
+        if !voice_desktop_common::resources::aniflive_model_ready(&self.context,model,false).unwrap_or(false){return Err(JobError::Failed{message:"模型登记与实际生成文件不一致。".into(),installed:vec![]});}
+        Ok(vec![format!("tts-aniflive-{model}")])
+    }
+
     fn run_import(self: &Arc<Self>, job_id: &str, resource_id: Option<String>) -> Result<Vec<String>, JobError> {
         let sources=voice_desktop_common::native_ui::choose_resource(resource_id.as_deref()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
         if sources.is_empty(){return Err(JobError::Cancelled);}
@@ -677,6 +716,18 @@ impl ResourceManager {
             let dependencies=self.configure_resource_dependencies(job_id,id,self.cancel_signal(job_id)?,&mut progress)
                 .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:installed.clone()}})?;
             installed.extend(dependencies);
+        }
+        if resource_id.as_deref().is_some_and(|id|id.starts_with("tts-aniflive-")){
+            let cancel=self.cancel_signal(job_id)?;
+            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            for source in sources{
+                let specification=source.join("aniflive-input.json");
+                if !specification.is_file(){return Err(JobError::Failed{message:"导入文件夹需要 aniflive-input.json（模型编号、名称、配对权重、参考录音、准确转写及语言）。".into(),installed});}
+                let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--program"),self.context.program.clone().into_os_string(),
+                    OsString::from("--prepare-runtime"),OsString::from("--input-spec"),specification.into_os_string(),OsString::from("--convert"),OsString::from("--native-ack")];
+                installed.extend(self.run_aniflive_task(job_id,&args,cancel.clone())?);
+            }
+            return Ok(installed);
         }
         for source in sources {
             let result=voice_desktop_common::resources::import_review_with_activation(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut progress,
@@ -1179,6 +1230,10 @@ impl ResourceManager {
 
     fn configure_resource_dependencies(&self,job_id:&str,resource_id:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
         let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
+        if spec["preparation"].as_str().is_some_and(|value|value.starts_with("aniflive_"))&&!self.context.python.is_file(){
+            let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
+            return self.prepare_environment(job_id,"cpu",cancel,progress);
+        }
         let Some(group)=spec["dependency_group"].as_str() else{return Ok(vec![])};
         let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
         let activation_job=job_id.to_owned();

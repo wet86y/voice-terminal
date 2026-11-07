@@ -16,7 +16,7 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
     """description（设计描述）、has_source（含源音频）、transcript（源转写）覆盖三种创建方式。"""
     async def scenario():
         owner = ModelVoiceLibraries(tmp_path)
-        library = owner.for_model("voxcpm2")
+        library = owner.for_model("aniflive")
         source = library.put_import(_wav_bytes(), "reference.wav") if has_source else None
         snapshots = []  # snapshots（合成时使用的音色快照）。
 
@@ -25,7 +25,7 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
 
         client = SimpleNamespace(ensure_ready=ready, inference_steps_by_model={"voxcpm2": 20})
         runtime = SimpleNamespace(voice_library=owner, tts=SimpleNamespace(local=client),
-            config=SimpleNamespace(tts=SimpleNamespace(backend="voxcpm1", local_model="voxcpm2")))
+            config=SimpleNamespace(tts=SimpleNamespace(backend="aniflive", local_model="tangyuge-v2pp-d78cf598")))
         manager = TtsVoiceOperationManager(runtime)
 
         async def synthesize(operation, local_client, snapshot, text):
@@ -39,36 +39,23 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
 
         monkeypatch.setattr(manager, "_collect_speech", synthesize)
         monkeypatch.setattr(manager, "_play", play)
-        operation = manager.start_preview("voxcpm2", {
-            "name": "三模式音色", "design_description": description,
-            "source_reference_asset_id": source["asset_id"] if source else None,
-            "source_reference_text": transcript,
-        }, " \n目标样音正文。  ")
+        operation = manager.start_preview("aniflive", {
+            "name": "参考音色", "design_description": description,
+            "reference_asset_id": source["asset_id"] if source else None,
+            "reference_text": transcript,
+        }, "目标样音正文。")
         await manager._items[operation["operation_id"]].task
         result = manager.get(operation["operation_id"])
-        if not description and not transcript.strip():
-            assert result["state"] == "failed" and "准确转写" in result["error"]
-            assert not snapshots
+        if description or not has_source or not transcript.strip():
+            assert result["state"] == "failed" and not snapshots
+            assert not library.list_voices()
             return
         assert result["state"] == "succeeded", result["error"]
-        candidate = result["result"]["voice"]  # candidate（试音后可保存的音色候选）。
-        assert candidate["inference_steps"] == 30
-        saved = library.create_voice(candidate)
-        restored = ModelVoiceLibraries(tmp_path).for_model("voxcpm2")
-        voice = restored.get_voice(saved["id"])
-        snapshot = restored.resolve("voxcpm2", {"voice_id": saved["id"], "revision": 1})
-        assert snapshots[0].reference_path == (library.asset_path(source["asset_id"]) if source else None)
-        assert snapshots[0].style_description == description
-        assert snapshots[0].reference_text == ("" if description else transcript.strip())
-        assert voice["source"] == ("design" if description else "import")
-        assert voice["source_reference_text"] == transcript.strip()
-        assert voice["reference_text"] == ("目标样音正文。" if description else transcript.strip())
-        assert snapshot.reference_path == restored.asset_path(voice["reference_asset_id"])
-        if description:
-            assert voice["reference_asset_id"] == result["result"]["asset_id"]
-            assert voice.get("source_reference_asset_id") == (source["asset_id"] if source else None)
-        else:
-            assert voice["reference_asset_id"] == source["asset_id"]
+        saved = library.create_voice(result["result"]["voice"])
+        restored = ModelVoiceLibraries(tmp_path).for_model("aniflive")
+        snapshot = restored.resolve("aniflive", {"voice_id": saved["id"], "revision": 1})
+        assert snapshot.reference_text == transcript.strip()
+        assert snapshot.reference_path == restored.asset_path(source["asset_id"])
         assert not manager.busy
     asyncio.run(scenario())
 
@@ -86,10 +73,10 @@ def test_reference_transcription_reuses_paraformer_without_rewriting(tmp_path, m
     monkeypatch.setattr("voice_terminal.asr.client.AsrWorkerClient", Asr)
     async def scenario():
         library = ModelVoiceLibraries(tmp_path)
-        asset = library.for_model("voxcpm2").put_import(_wav_bytes(), "reference.wav")
+        asset = library.for_model("aniflive").put_import(_wav_bytes(), "reference.wav")
         runtime = SimpleNamespace(voice_library=library, config=SimpleNamespace(asr=SimpleNamespace(worker_url="ws://current-loaded-asr")), player=None)
         manager = TtsVoiceOperationManager(runtime)
-        operation = manager.start_transcribe("voxcpm2", asset["asset_id"])
+        operation = manager.start_transcribe("aniflive", asset["asset_id"])
         await manager._items[operation["operation_id"]].task
         result = manager.get(operation["operation_id"])
         assert result["state"] == "succeeded"
@@ -111,7 +98,7 @@ def test_cancelled_voice_operation_cannot_publish_late_result(tmp_path):
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 return {"text": "迟到文本"}
-        operation = manager._new("transcribe", {"model": "voxcpm2"}, late)
+        operation = manager._new("transcribe", {"model": "aniflive"}, late)
         await entered.wait()
         manager.cancel(operation["operation_id"])
         await manager._items[operation["operation_id"]].task
@@ -124,7 +111,10 @@ def test_cancelled_voice_operation_cannot_publish_late_result(tmp_path):
 def test_sample_collection_fixes_30_steps_without_changing_formal_settings(tmp_path):
     async def scenario():
         library = ModelVoiceLibraries(tmp_path)
-        snapshot = library.for_model("voxcpm2").resolve_design("自然温和")
+        voice_library = library.for_model("aniflive")
+        asset = voice_library.put_import(_wav_bytes(), "reference.wav")
+        snapshot = voice_library.resolve_draft("aniflive", {"name": "试听", "source": "import",
+            "reference_asset_id": asset["asset_id"], "reference_text": "准确的参考正文。"})
         captured = []
         class Session:
             start = AsyncMock()
@@ -137,10 +127,11 @@ def test_sample_collection_fixes_30_steps_without_changing_formal_settings(tmp_p
         def session(**kwargs):
             captured.append(kwargs)
             return Session()
-        client = SimpleNamespace(session=session, sample_rate=16000,
+        client = SimpleNamespace(session=session, sample_rate=16000, prepare_reference=AsyncMock(),
                                  inference_steps_by_model={"voxcpm2": 17})
         manager = TtsVoiceOperationManager(SimpleNamespace(voice_library=library))
         pcm, _ = await manager._collect_speech(SimpleNamespace(id="sample-test", session=None), client, snapshot, "测试正文。")
-        assert pcm and captured[0]["inference_steps"] == 30 and captured[0]["preview"] is True
+        assert pcm and "inference_steps" not in captured[0] and captured[0]["preview"] is True
+        client.prepare_reference.assert_awaited_once()
         assert client.inference_steps_by_model["voxcpm2"] == 17
     asyncio.run(scenario())

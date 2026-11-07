@@ -42,7 +42,7 @@ def test_status_exposes_only_active_online_backend():
                 assert status.status_code == 200
                 assert status.json()["backend"] == "minimax"
                 assert status.json()["worker"] == {"state": "stopped"}
-                assert {row["id"] for row in status.json()["models"]} == {"voxcpm1", "voxcpm2"}
+                assert {row["id"] for row in status.json()["models"]} == {"minimax-female-shaonv-zh", "tangyuge-v2pp-d78cf598"}
                 snapshot = await client.get("/api/v1/product/snapshot")
                 assert snapshot.status_code == 200
                 assert snapshot.json()["runtime"]["tts_worker"] == {"state": "stopped"}
@@ -57,11 +57,11 @@ def test_compatibility_router_pins_each_transaction_until_release():
         local = SimpleNamespace(transport="worker", ensure_ready=AsyncMock(), close=AsyncMock())
         router = TtsBackendRouter(remote=remote, local=local)
         first_backend, first_client = router.bind()
-        await router.switch("voxcpm1")
+        await router.switch("aniflive")
         second_backend, second_client = router.bind()
         await router.switch("minimax")
         assert (first_backend, first_client) == ("minimax", remote)
-        assert (second_backend, second_client) == ("voxcpm1", local)
+        assert (second_backend, second_client) == ("aniflive", local)
         local.close.assert_not_awaited()
         router.release(second_backend)
         await asyncio.sleep(0)
@@ -75,11 +75,11 @@ def test_compatibility_router_pins_each_transaction_until_release():
 def test_queued_local_switch_rechecks_backend_inside_lock():
     async def scenario():
         local = SimpleNamespace(switch_model=AsyncMock(), ensure_ready=AsyncMock(), close=AsyncMock())
-        router = TtsBackendRouter(remote=SimpleNamespace(close=AsyncMock()), local=local, backend="voxcpm1")
+        router = TtsBackendRouter(remote=SimpleNamespace(close=AsyncMock()), local=local, backend="aniflive")
         await router._switch_lock.acquire()
         online = asyncio.create_task(router.switch("minimax"))
         await asyncio.sleep(0)
-        model = asyncio.create_task(router.switch_local_model("voxcpm2"))
+        model = asyncio.create_task(router.switch_local_model("tangyuge-v2pp-d78cf598"))
         await asyncio.sleep(0)
         router._switch_lock.release()
         await online

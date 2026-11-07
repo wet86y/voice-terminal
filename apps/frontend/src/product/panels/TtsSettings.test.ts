@@ -15,11 +15,11 @@ describe('音色设置只提供资源完整的本地模型', () => {
   let settings: { tts: ProductTtsSettings }
   beforeEach(() => {
     vi.restoreAllMocks()
-    settings = reactive({ tts: { backend: 'minimax', local_model: 'voxcpm1' } })
-    state.live = { status: ref<ProductLocalTtsStatus>({ backend: 'minimax', local_model: 'voxcpm1', loaded_model: null,
+    settings = reactive({ tts: { backend: 'minimax', local_model: 'minimax-female-shaonv-zh' } })
+    state.live = { status: ref<ProductLocalTtsStatus>({ backend: 'minimax', local_model: 'minimax-female-shaonv-zh', loaded_model: null,
       load_state: 'disabled', error: null, models: [
-        { id: 'voxcpm1', name: '第一代', available: false, loaded: false, native_sample_rate: 16000 },
-        { id: 'voxcpm2', name: '第二代', available: true, loaded: false, native_sample_rate: 48000 },
+        { id: 'minimax-female-shaonv-zh', name: '第一代', available: false, loaded: false, native_sample_rate: 16000 },
+        { id: 'tangyuge-v2pp-d78cf598', name: '第二代', available: true, loaded: false, native_sample_rate: 48000 },
       ] }), loading: ref(false), error: ref(''), refresh: vi.fn() }
   })
   function render(stubs: Record<string, unknown> = {}) {
@@ -53,16 +53,16 @@ describe('音色设置只提供资源完整的本地模型', () => {
   })
   it('尚未加载但已具备运行条件的模型可以选择，缺失模型隐藏', () => {
     const wrapper = render()
-    expect(wrapper.findAll('select option').map(item => item.attributes('value'))).toEqual(['minimax', 'voxcpm2'])
+    expect(wrapper.findAll('select option').map(item => item.attributes('value'))).toEqual(['minimax', 'tangyuge-v2pp-d78cf598'])
     expect(settings.tts.backend).toBe('minimax')
     wrapper.unmount()
   })
   it('切换播放目标只改变设置草稿，显式保存后才提交后端选择', async () => {
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({
-      settings: { tts: { backend: 'voxcpm1', local_model: 'voxcpm2' } },
+      settings: { tts: { backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' } },
     } as never)
     const wrapper = render()
-    await wrapper.get('.tts-target select').setValue('voxcpm2')
+    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
     expect(save).not.toHaveBeenCalled()
     expect(wrapper.find('tts-voice-library-stub').exists()).toBe(true)
     expect(wrapper.get('.tts-target').text()).toContain('当前生效：在线 API（网络语音接口）')
@@ -70,45 +70,45 @@ describe('音色设置只提供资源完整的本地模型', () => {
     await wrapper.get('button[aria-label="保存播放目标"]').trigger('click')
     await flushPromises()
     expect(save).toHaveBeenCalledOnce()
-    expect(save).toHaveBeenCalledWith({ backend: 'voxcpm1', local_model: 'voxcpm2' })
+    expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' })
     wrapper.unmount()
   })
   it('播放目标切换失败时保留原后端和未保存草稿', async () => {
     vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('模型切换失败'))
     const wrapper = render()
-    await wrapper.get('.tts-target select').setValue('voxcpm2')
+    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
     await wrapper.get('button[aria-label="保存播放目标"]').trigger('click')
     await flushPromises()
-    expect((wrapper.get('.tts-target select').element as HTMLSelectElement).value).toBe('voxcpm2')
+    expect((wrapper.get('.tts-target select').element as HTMLSelectElement).value).toBe('tangyuge-v2pp-d78cf598')
     expect(settings.tts.backend).toBe('minimax')
     expect(wrapper.text()).toContain('模型切换失败')
     wrapper.unmount()
   })
   it('本地音色生成试听自动切换到草稿模型后继续', async () => {
-    let ensureSupport!: (model: 'voxcpm1' | 'voxcpm2') => Promise<void>
+    let ensureSupport!: (model: 'minimax-female-shaonv-zh' | 'tangyuge-v2pp-d78cf598') => Promise<void>
     const LibraryStub = defineComponent({
       name: 'TtsVoiceLibrary',
       props: { ensureSupport: { type: Function, required: true } },
       setup(props) {
-        ensureSupport = props.ensureSupport as (model: 'voxcpm1' | 'voxcpm2') => Promise<void>
+        ensureSupport = props.ensureSupport as (model: 'minimax-female-shaonv-zh' | 'tangyuge-v2pp-d78cf598') => Promise<void>
         return () => h('div', { class: 'tts-voice-library-stub' })
       },
     })
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
     const wrapper = render({ TtsVoiceLibrary: LibraryStub })
-    await wrapper.get('.tts-target select').setValue('voxcpm2')
-    await ensureSupport('voxcpm2')
-    expect(save).toHaveBeenCalledWith({ backend: 'voxcpm1', local_model: 'voxcpm2' })
+    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
+    await ensureSupport('tangyuge-v2pp-d78cf598')
+    expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' })
     expect(wrapper.text()).not.toContain('确认切换')
     wrapper.unmount()
   })
   it('隐藏失效选择不改写保存的后端或模型', () => {
-    settings.tts.backend = 'voxcpm1'
+    settings.tts.backend = 'aniflive'
     const wrapper = render()
-    expect(wrapper.find('option[value="voxcpm1"]').exists()).toBe(false)
+    expect(wrapper.find('option[value="minimax-female-shaonv-zh"]').exists()).toBe(false)
     expect(wrapper.find('tts-voice-library-stub').exists()).toBe(false)
-    expect(settings.tts.backend).toBe('voxcpm1')
-    expect(settings.tts.local_model).toBe('voxcpm1')
+    expect(settings.tts.backend).toBe('aniflive')
+    expect(settings.tts.local_model).toBe('minimax-female-shaonv-zh')
     wrapper.unmount()
   })
   it('在线 API 显示 Turbo/HD 与音色 ID；保存时提交去除首尾空白后的设置', async () => {
@@ -208,53 +208,39 @@ describe('音色设置只提供资源完整的本地模型', () => {
     wrapper.unmount()
   })
   it('本地语音目标不显示在线模型和音色设置', () => {
-    settings.tts.backend = 'voxcpm1'
+    settings.tts.backend = 'aniflive'
     const wrapper = render()
     expect(wrapper.find('.online-tts-settings').exists()).toBe(false)
     wrapper.unmount()
   })
-  it('本地合成质量固定展示三个档位，保存当前模型且保留另一模型步数', async () => {
-    settings.tts.backend = 'voxcpm1'
-    settings.tts.local_model = 'voxcpm2'
-    settings.tts.inference_steps_by_model = { voxcpm1: 12, voxcpm2: 20 }
+  it('本地音色选项保存分块开关与等待毫秒，且不改变播放目标', async () => {
+    settings.tts.backend = 'aniflive'
+    settings.tts.local_model = 'tangyuge-v2pp-d78cf598'
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
     const wrapper = render()
-    const choices = wrapper.findAll('.tts-quality-options button')
-    expect(choices.map(button => button.text())).toEqual(['低', '中', '高'])
-    expect(choices[2].attributes('aria-pressed')).toBe('true')
-    expect(wrapper.find('.tts-quality summary').exists()).toBe(false)
-    const target = wrapper.get('.tts-target').element
-    const control = wrapper.get('.speech-control-row').element
-    const quality = wrapper.get('.tts-quality').element
-    const library = wrapper.get('tts-voice-library-stub').element
-    expect(target.compareDocumentPosition(library) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(library.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(control.compareDocumentPosition(quality) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    for (const [index, steps] of [10, 15, 20].entries()) {
-      await choices[index].trigger('click')
-      await flushPromises()
-      expect(save).toHaveBeenLastCalledWith({ inference_steps_by_model: { voxcpm1: 12, voxcpm2: steps } })
-      expect(settings.tts.inference_steps_by_model).toEqual({ voxcpm1: 12, voxcpm2: steps })
-      expect(choices[index].attributes('aria-pressed')).toBe('true')
-    }
+    const chunk = wrapper.get('input[aria-label="后续分块优化"]')
+    expect((chunk.element as HTMLInputElement).checked).toBe(true)
+    await chunk.setValue(false); await flushPromises()
+    expect(save).toHaveBeenLastCalledWith({ aniflive_chunk_optimization: false })
+    const wait = wrapper.get('input[aria-label="首音等待"]')
+    expect(wait.attributes('min')).toBe('0'); expect(wait.attributes('max')).toBe('200'); expect(wait.attributes('step')).toBe('1')
+    await wait.setValue('137'); await flushPromises()
+    expect(save).toHaveBeenLastCalledWith({ aniflive_first_audio_wait_ms: 137 })
+    expect(settings.tts.backend).toBe('aniflive')
+    expect(wrapper.find('.tts-quality').exists()).toBe(false)
     wrapper.unmount()
   })
-  it('保存合成质量期间禁用档位，失败后恢复原步数和选中状态', async () => {
-    settings.tts.backend = 'voxcpm1'
-    settings.tts.local_model = 'voxcpm2'
-    settings.tts.inference_steps_by_model = { voxcpm1: 10, voxcpm2: 15 }
-    let rejectSave!: (error: Error) => void // rejectSave（模拟保存失败）：验证在途状态与回滚。
+  it('保存本地选项期间禁用控件，失败后恢复参数', async () => {
+    settings.tts.backend = 'aniflive'; settings.tts.local_model = 'tangyuge-v2pp-d78cf598'
+    let rejectSave!: (error: Error) => void
     vi.spyOn(productApi, 'saveTts').mockImplementation(() => new Promise((_resolve, reject) => { rejectSave = reject }))
-    const wrapper = render()
-    const choices = wrapper.findAll('.tts-quality-options button')
-    await choices[0].trigger('click')
-    expect(choices.every(button => (button.element as HTMLButtonElement).disabled)).toBe(true)
-    rejectSave(new Error('质量设置保存失败'))
-    await flushPromises()
-    expect(choices[1].attributes('aria-pressed')).toBe('true')
-    expect(choices.every(button => !(button.element as HTMLButtonElement).disabled)).toBe(true)
-    expect(settings.tts.inference_steps_by_model.voxcpm2).toBe(15)
-    expect(wrapper.text()).toContain('质量设置保存失败')
+    const wrapper = render(); const control = wrapper.get('input[aria-label="显卡高性能"]')
+    await control.setValue(true)
+    expect(control.attributes('disabled')).toBeDefined()
+    rejectSave(new Error('本地设置保存失败')); await flushPromises()
+    expect((control.element as HTMLInputElement).checked).toBe(false)
+    expect(control.attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('本地设置保存失败')
     wrapper.unmount()
   })
   it('在线目标保留语音调节并隐藏本地合成质量', () => {

@@ -85,7 +85,7 @@ fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) ->
 
 pub fn ready(status: &Value) -> bool {
     status["providers"][if status["inference_backend"]=="minimax" {"minimax"} else {"deepseek"}]["configured"] == true
-        && if status["tts_backend"] == "voxcpm1" {status["local_tts_ready"] == true} else {status["providers"]["minimax"]["configured"] == true}
+        && if status["tts_backend"] == "aniflive" {status["local_tts_ready"] == true} else {status["providers"]["minimax"]["configured"] == true}
 }
 
 /// status_for_context（工作区凭据状态）：本地模型可用时在线合成密钥可选。
@@ -99,7 +99,7 @@ pub fn status_for_context(context:&crate::LaunchContext)->Result<Value,String>{
 
 /// configured_tts_selection（持久化播放目标）：产品设置优先，旧工作区沿用本地配置。
 pub fn configured_tts_selection(data:&Path)->Value{
-    let mut selection=json!({"backend":"minimax","local_model":"voxcpm2","fields":{"backend":"语音后端，minimax（在线接口）或 voxcpm1（本地兼容路由）","local_model":"持久化选择的 VoxCPM（本地语音）模型"}});
+    let mut selection=json!({"backend":"minimax","local_model":"minimax-female-shaonv-zh","fields":{"backend":"语音后端，minimax（在线接口）或 aniflive（本地引擎）","local_model":"持久化选择的 AnifLive（本地语音）模型"}});
     if let Ok(config)=fs::read_to_string(data.join("config/local.yaml")){
         let mut in_tts=false;
         for raw in config.lines(){
@@ -109,20 +109,29 @@ pub fn configured_tts_selection(data:&Path)->Value{
             if indentation==0{in_tts=body=="tts:";continue;}
             if in_tts&&indentation==2{if let Some((key,value))=body.split_once(':'){
                 let value=value.trim().trim_matches(|c|c=='\''||c=='"');
-                if (key.trim()=="backend"&&matches!(value,"minimax"|"voxcpm1"))||(key.trim()=="local_model"&&matches!(value,"voxcpm1"|"voxcpm2")){selection[key.trim()]=json!(value);}
+                if (key.trim()=="backend"&&matches!(value,"minimax"|"aniflive"|"voxcpm1"))||(key.trim()=="local_model"&&valid_tts_model(value))||(key.trim()=="local_model_revision"&&valid_tts_revision(value)){selection[key.trim()]=json!(value);}
             }}
         }
     }
     if let Ok(bytes)=fs::read(data.join("config/product-settings.json")){
         if let Ok(settings)=serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)){
             if settings["schema_version"].as_u64().is_some_and(|version|version>=11){
-                for key in ["backend","local_model"]{if let Some(value)=settings["tts"][key].as_str(){
-                    if (key=="backend"&&matches!(value,"minimax"|"voxcpm1"))||(key=="local_model"&&matches!(value,"voxcpm1"|"voxcpm2")){selection[key]=json!(value);}
+                if settings["tts"].get("local_model").is_some(){selection["local_model_revision"]=Value::Null;}
+                for key in ["backend","local_model","local_model_revision"]{if let Some(value)=settings["tts"][key].as_str(){
+                    if (key=="backend"&&matches!(value,"minimax"|"aniflive"|"voxcpm1"))||(key=="local_model"&&valid_tts_model(value))||(key=="local_model_revision"&&valid_tts_revision(value)){selection[key]=json!(value);}
                 }}
             }
         }
-    }selection
+    }
+    if selection["backend"]=="voxcpm1"{selection["backend"]=json!("aniflive");}
+    if matches!(selection["local_model"].as_str(),Some("voxcpm1"|"voxcpm2")){selection["local_model"]=json!("minimax-female-shaonv-zh");selection["local_model_revision"]=Value::Null;}
+    selection
 }
+pub(crate) fn valid_tts_model(value:&str)->bool{
+    let stem=value.split('.').next().unwrap_or("");
+    !value.is_empty()&&value.len()<=64&&!value.ends_with('.')&& !matches!(stem,"con"|"prn"|"aux"|"nul"|"com1"|"com2"|"com3"|"com4"|"com5"|"com6"|"com7"|"com8"|"com9"|"lpt1"|"lpt2"|"lpt3"|"lpt4"|"lpt5"|"lpt6"|"lpt7"|"lpt8"|"lpt9")&&value.bytes().all(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||matches!(c,b'.'|b'-'|b'_'))&&value.as_bytes()[0].is_ascii_alphanumeric()
+}
+fn valid_tts_revision(value:&str)->bool{value.len()==24&&value.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c))}
 /// configured_inference（启动时推理选择）：旧设置默认 DeepSeek（深度求索）。
 pub fn configured_inference(data:&Path)->Value{
     let backend=fs::read(data.join("config/product-settings.json")).ok()
@@ -131,7 +140,7 @@ pub fn configured_inference(data:&Path)->Value{
         .is_some_and(|value|value["inference"]["backend"]=="minimax");
     json!({"backend":if backend{"minimax"}else{"deepseek"}})
 }
-fn configured_tts_backend(data:&Path)->&'static str{if configured_tts_selection(data)["backend"]=="voxcpm1"{"voxcpm1"}else{"minimax"}}
+fn configured_tts_backend(data:&Path)->&'static str{if configured_tts_selection(data)["backend"]=="aniflive"{"aniflive"}else{"minimax"}}
 
 fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
     environment_keys(data, PROVIDERS.iter().filter_map(|(_, name)| std::env::var(name).ok().map(|value| (name.to_string(),value))).collect())
@@ -144,7 +153,7 @@ pub fn status(data: &Path) -> Result<Value,String> {
     result["tts_backend"] = json!(configured_tts_backend(data));
     result["tts_local_model"] = configured_tts_selection(data)["local_model"].clone();
     result["fields"]["tts_local_model"] = json!("持久化选择的本地语音模型");
-    result["fields"]["tts_backend"] = json!("TTS（语音合成）实际运行后端；voxcpm1 无需 MiniMax 接口密钥");
+    result["fields"]["tts_backend"] = json!("TTS（语音合成）实际运行后端；aniflive 无需 MiniMax 接口密钥");
     Ok(result)
 }
 
@@ -321,8 +330,8 @@ mod tests {
         let root=std::env::temp_dir().join(format!("voice-tts-choice-{}",crate::workspace::new_id()));
         fs::create_dir_all(root.join("config")).unwrap();
         fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
-        crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}})).unwrap();
-        assert_eq!(configured_tts_backend(&root),"voxcpm1");
+        crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"minimax-female-shaonv-zh"}})).unwrap();
+        assert_eq!(configured_tts_backend(&root),"aniflive");
         crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"minimax"}})).unwrap();
         assert_eq!(configured_tts_backend(&root),"minimax");
         fs::remove_dir_all(root).unwrap();
@@ -330,9 +339,9 @@ mod tests {
     #[test] fn selected_inference_provider_alone_controls_startup_gate() {
         let status=json!({"inference_backend":"minimax","tts_backend":"minimax","providers":{"deepseek":{"configured":false},"minimax":{"configured":true}}});
         assert!(ready(&status));
-        let status=json!({"inference_backend":"deepseek","tts_backend":"voxcpm1","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        let status=json!({"inference_backend":"deepseek","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(ready(&status));
-        let status=json!({"inference_backend":"minimax","tts_backend":"voxcpm1","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        let status=json!({"inference_backend":"minimax","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(!ready(&status));
     }
     #[test]

@@ -40,7 +40,10 @@ from ..core.state import (
 from ..kws.detector import KwsDetector, KwsError
 from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
-from ..providers.audio_cpp_tts import AudioCppTtsClient, AudioCppTtsServer
+from ..providers.aniflive_tts import AnifLiveTtsClient
+from ..providers.aniflive_server import AnifLiveTtsServer
+from ..tts.aniflive_models import AnifLiveModelRegistry
+from ..tts.settings import DEFAULT_LOCAL_MODEL, valid_local_model
 from ..tts.voices import ModelVoiceLibraries, VoiceLibraryError, safe_voice_diagnostic
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
@@ -234,7 +237,6 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._session_lock = asyncio.Lock()
         from .tts_voice_runtime import TtsVoiceOperationManager
         self.tts_voice_operations = TtsVoiceOperationManager(self)
-        self._migrate_legacy_default_voice()
         if self.product_settings is not None:
             self.product_settings._tts_voice_selections = self._active_voices_by_model
         self.build_info: dict[str, Any] = {}
@@ -610,14 +612,14 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             )
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
-            if self.config.tts.backend == "voxcpm1":
+            if self.config.tts.backend == "aniflive":
                 if self.config.tts.sample_rate not in LOCAL_TTS_PLAYER_RATES:
-                    raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）不受支持")
+                    raise RuntimeError("AnifLive 播放器 sample_rate（采样率）不受支持")
                 self._local_tts_load_state = "loading"
                 self.state.set_service("tts", "STARTING")
                 await self.tts.ensure_ready()
                 # 音色尚未配置时模型仍保持就绪，设置页可以继续导入或设计音色。
-                if self._active_voice_snapshot(self.config.tts.local_model) is not None:
+                if self.tts.supports_prewarm:
                     # 初始化完成前丢弃一次预热音频，避免首笔对话承担冷态计算。
                     await self.tts.prewarm()
                 self._local_tts_load_state = "ready"
@@ -631,7 +633,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             self._clear_service_error("tts")
             return True
         except Exception as exc:
-            if self.config.tts.backend == "voxcpm1":
+            if self.config.tts.backend == "aniflive":
                 self._local_tts_load_state = "error"
                 self._local_tts_error = str(exc)[:500]
             self._record_error("tts", str(exc))
@@ -643,13 +645,13 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         会话控制器持有播放器引用并挂载播放回调；能力级恢复不能替换实例，
         否则回调与设备时钟会脱离，只有首次初始化才新建。
 
-        本地下行采样率跟随所选本地模型的原生率（VoxCPM1 16 kHz、VoxCPM2 48 kHz）。
+        本地下行采样率跟随所选本地模型的原生率（AnifLive 32 kHz）。
         这时**原地**置换设备时钟（`PcmPlayer.reclock`），同样不替换实例——控制器、
         事务输出与语音管线都缓存了这个引用。只在播放器空闲时置换。
         """
         desired = int(self.config.tts.sample_rate)
         pending = self._pending_local_tts_rate
-        if pending and self.config.tts.backend != "voxcpm1":
+        if pending and self.config.tts.backend != "aniflive":
             # 本地下行的延迟换率不能覆盖在线 API 的独立采样率。
             self._pending_local_tts_rate = None
             pending = None
@@ -704,7 +706,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         if local is not None:
             try:
                 await local.ensure_ready()
-                if self._active_voice_snapshot(self.config.tts.local_model) is not None:
+                if self.tts.supports_prewarm:
                     await self.tts.prewarm()
             except Exception as exc:
                 self._record_error("tts", f"恢复后重新准备失败：{type(exc).__name__}: {exc}")
@@ -876,7 +878,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             value.payload["can_start"] = False
         tts_config = getattr(getattr(self, "config", None), "tts", None)
         operations = getattr(self, "tts_voice_operations", None)
-        if ((tts_config is not None and tts_config.backend == "voxcpm1"
+        if ((tts_config is not None and tts_config.backend == "aniflive"
              and local_tts_status.get("voice_state") != "ready")
                 or (operations is not None and operations.busy)):
             value.payload["can_start"] = False
@@ -907,92 +909,44 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         return value
 
     def local_tts_status_payload(self) -> dict[str, Any]:
-        """返回本地模型状态，不向客户端暴露任何本机文件路径。"""
+        """返回实际托管模型及已验证候选，不暴露本机路径。"""
         client = getattr(getattr(self, "tts", None), "local", None)
-        tts_config = getattr(getattr(self, "config", None), "tts", None)
-        configured = getattr(tts_config, "local_model", "voxcpm1")
-        runtime_root = getattr(self, "_runtime_local_root", None)
-        status = client.model_status() if callable(getattr(client, "model_status", None)) else (
-            AudioCppTtsServer.catalog_snapshot(runtime_root, local_model=configured) if runtime_root else {}
-        )
-        status_local_model = status.get("local_model") if isinstance(status, Mapping) else None
-        loaded_model = status.get("loaded_model") if isinstance(status, Mapping) else None
-        model_rows = status.get("models") if isinstance(status, Mapping) else None
-        if not isinstance(model_rows, list):
-            model_rows = [
-                {"id": "voxcpm1", "name": "VoxCPM1", "native_sample_rate": 16000,
-                 "available": False, "loaded": False},
-                {"id": "voxcpm2", "name": "VoxCPM2", "native_sample_rate": 48000,
-                 "available": False, "loaded": False},
-            ]
-        voice_selection = self._active_voice_selection(configured)
-        libraries = getattr(self, "voice_library", None)
-        library = libraries.for_model(configured) if libraries else None
-        active_voice = None
-        voice_state = "unconfigured"
-        voice_error = getattr(self, "_local_tts_voice_error", None)
-        if library is None:
-            voice_state = "invalid"
-        if voice_selection is not None and library is not None:
-            try:
-                voice = library.get_voice(
-                    str(voice_selection.get("voice_id") or ""), voice_selection.get("revision"),
-                )
-                library.asset_path(voice["reference_asset_id"])
-                if configured == "voxcpm1" and not voice.get("reference_text", "").strip():
-                    voice_state = "reference_text_missing"
-                    voice_error = "VoxCPM1（第一代本地语音模型）需要参考音频对应的转写文本。"
-                else:
-                    voice_state = "ready"
-                    voice_error = None
-                active_voice = {"voice_id": voice["id"], "revision": voice["revision"],
-                                "name": voice["name"]}
-            except FileNotFoundError as exc:
-                voice_state = "asset_missing"
-                voice_error = str(exc)
-            except VoiceLibraryError as exc:
-                voice_state = "invalid"
-                voice_error = str(exc)
-        elif voice_selection is not None:
-            voice_state = "invalid"
-        caps = {
-            "voice_clone": True,
-            "voice_design": configured == "voxcpm2",
-            "style_control": configured == "voxcpm2",
-            "emotion_control": False,  # emotion_control（动态情绪控制）已停用。
-            "requires_reference_text": configured == "voxcpm1",
+        config = self.config.tts
+        status = client.model_status() if callable(getattr(client, "model_status", None)) else {
+            "models": AnifLiveModelRegistry(self._runtime_local_root, self._tts_voice_root.parent).models(),
+            "loaded_model": None, "load_state": "unloaded",
         }
-        emotion_diagnostic = (
-            "VoxCPM1 不支持文字情绪控制；情绪标签不会发送给本地模型。"
-            if configured == "voxcpm1" else
-            "VoxCPM2 可用参考音频、文字设计或两者共同生成目标样音；播报沿用样音，同一回答内续接上一完整分段。"
-        )
+        selection = self._active_voice_selection("aniflive")
+        active, voice_error = None, None
+        if selection and self.voice_library:
+            try:
+                library = self.voice_library.for_model("aniflive")
+                voice = library.get_voice(selection["voice_id"], selection["revision"])
+                library.asset_path(voice["reference_asset_id"])
+                active = {"voice_id": voice["id"], "revision": voice["revision"], "name": voice["name"]}
+            except (VoiceLibraryError, FileNotFoundError) as exc:
+                voice_error = safe_voice_diagnostic(exc)
+        pending = getattr(self, "_pending_tts_update", None) or getattr(self, "_applying_tts_selection", None)
         return {
-            "backend": getattr(tts_config, "backend", "minimax"),  # backend（当前语音合成后端）。
-            "local_model": status_local_model if status_local_model in {"voxcpm1", "voxcpm2"} else configured,
-            "loaded_model": loaded_model if loaded_model in {"voxcpm1", "voxcpm2"} else None,
-            "load_state": getattr(self, "_local_tts_load_state", "unloaded"),  # load_state（本地模型加载状态）。
-            "error": (safe_voice_diagnostic(getattr(self, "_local_tts_error", None), "")
-                      if getattr(self, "_local_tts_error", None) else None),  # error（最近一次本地模型错误）。
-            "models": model_rows,
-            "active_voice": active_voice,
-            "voice_state": voice_state,
-            "voice_error": safe_voice_diagnostic(voice_error, "") if voice_error else None,
-            "voice_capabilities": caps,
-            "emotion_diagnostic": emotion_diagnostic,
-            "pending_selection": ({"backend": pending["backend"], "local_model": pending["local_model"]}
-                                  if isinstance(pending := (getattr(self, "_pending_tts_update", None) or getattr(self, "_applying_tts_selection", None)), Mapping) else None),  # 等待事务结束或正在应用的模型选择。
-            "active_voice_by_model": self._active_voices_by_model(),
+            **status, "backend": config.backend, "local_model": config.local_model,
+            "local_model_revision": getattr(getattr(client, "server", None), "revision", config.local_model_revision),
+            "error": safe_voice_diagnostic(getattr(self, "_local_tts_error", None), "") if getattr(self, "_local_tts_error", None) else status.get("error"),
+            "active_voice": active, "voice_state": "invalid" if voice_error else "ready",
+            "voice_error": voice_error, "active_voice_by_model": self._active_voices_by_model(),
+            "voice_capabilities": {"voice_clone": True, "voice_design": False, "style_control": False,
+                                   "emotion_control": False, "requires_reference_text": True},
+            "emotion_diagnostic": "参考录音与准确转写决定音色和语气；未启用自定义音色时使用模型随包默认参考。",
+            "pending_selection": {"backend": pending["backend"], "local_model": pending["local_model"]} if isinstance(pending, Mapping) else None,
             "operation": self.tts_voice_operations.current_payload() if getattr(self, "tts_voice_operations", None) else None,
         }
 
     def _active_voices_by_model(self) -> dict[str, Any]:
         libraries = getattr(self, "voice_library", None)
-        return libraries.selections() if libraries else {"voxcpm1": None, "voxcpm2": None}
+        return libraries.selections() if libraries else {"aniflive": None}
 
     def _active_voice_selection(self, model: str) -> Mapping[str, Any] | None:
         libraries = getattr(self, "voice_library", None)
-        selected = libraries.for_model(model).active_selection if libraries else None
+        selected = libraries.for_model("aniflive").active_selection if libraries else None
         return selected if isinstance(selected, Mapping) else None
 
     def _active_voice_snapshot(self, model: str, *, emotion: str | None = "calm"):
@@ -1003,46 +957,13 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             return None
         try:
             return self.voice_library.resolve(
-                model, selection,
+                "aniflive", selection,
                 emotion=None,
             )
         except (VoiceLibraryError, FileNotFoundError):
             return None
 
-    def _migrate_legacy_default_voice(self) -> None:
-        """从已校验的本机种子分别注册两款模型默认项，不复制其他配置。"""
-        if self.voice_library is None:
-            return
-        seed = self._runtime_local_root / "models" / "audiocpp" / "voice-seed"
-        audio, text = seed / "default.wav", seed / "default.json"
-        if not audio.is_file() or not text.is_file():
-            seed = self.paths.program_root / "config/resources/assets/tts"
-            audio, text = seed / "default.wav", seed / "default.json"
-        if not audio.is_file() or not text.is_file():
-            # 兼容实验安装的默认样音；读取旧配置先于重新生成运行配置。
-            legacy_config = self._runtime_local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
-            try:
-                previous = json.loads(legacy_config.read_text(encoding="utf-8"))
-                preset = next((item.get("default_voice_preset") for item in previous.get("models", [])
-                               if isinstance(item.get("default_voice_preset"), dict)), None)
-                if preset and preset.get("voice_ref") and preset.get("reference_text"):
-                    legacy_audio = Path(preset["voice_ref"])
-                    if legacy_audio.is_file():
-                        for library in self.voice_library.libraries.values():
-                            library.register_default(legacy_audio.read_bytes(), preset["reference_text"])
-                        return
-            except (OSError, ValueError, KeyError) as exc:
-                self._local_tts_voice_error = safe_voice_diagnostic(exc)
-        if audio.is_file() and text.is_file():
-            try:
-                transcript = json.loads(text.read_text(encoding="utf-8"))["reference_text"]
-                for library in self.voice_library.libraries.values():
-                    library.register_default(audio.read_bytes(), transcript)
-                self._local_tts_voice_error = None
-            except (OSError, ValueError, KeyError) as exc:
-                self._local_tts_voice_error = safe_voice_diagnostic(exc)
-
-    async def switch_local_tts_model(self, local_model: str) -> None:
+    async def switch_local_tts_model(self, local_model: str, revision=None) -> None:
         """调用本地 TTS 适配层切换模型并更新加载诊断。"""
         if self.tts is None:
             raise RuntimeError("TTS（语音合成）组件尚未初始化。")
@@ -1053,7 +974,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._local_tts_load_state = "loading"
         self._local_tts_error = None
         try:
-            await self.tts.switch_local_model(local_model)
+            await self.tts.switch_local_model(local_model, revision=revision)
             model_switched = True
             # 模型与设备时钟属于同一切换事务，设备拒绝新率也必须回滚原生模型。
             await self._sync_local_tts_sample_rate(local_model)
@@ -1061,7 +982,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if model_switched:
                 self.config = previous_config
                 try:
-                    await self.tts.switch_local_model(previous_config.tts.local_model)
+                    await self.tts.switch_local_model(previous_config.tts.local_model, revision=previous_config.tts.local_model_revision)
                     local = getattr(self.tts, "local", None)
                     if local is not None:
                         local.sample_rate = previous_config.tts.sample_rate
@@ -1081,6 +1002,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             raise
         self._local_tts_load_state = "ready"
         self._local_tts_error = None
+        local = getattr(self.tts, "local", None)
+        self.config = replace(self.config, tts=replace(self.config.tts, local_model=local_model,
+            local_model_revision=getattr(getattr(local, "server", None), "revision", None)))
 
     async def _sync_local_tts_sample_rate(self, local_model: str) -> None:
         """_sync_local_tts_sample_rate（同步下行率）：把本地下行率对齐到模型原生率。
@@ -1107,21 +1031,21 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         logger.info("tts.local_sample_rate_changed local_model=%s previous_rate=%d sample_rate=%d",
                     local_model, current, desired)
 
-    async def switch_tts_selection(self, backend: str, local_model: str) -> None:
+    async def switch_tts_selection(self, backend: str, local_model: str, *, revision=None) -> None:
         """在停止监听时准备语音后端，失败保留原配置；调用方持有会话锁。"""
         if self.tts is None:
             raise RuntimeError("TTS（语音合成）组件尚未初始化。")
         if not self._player_is_idle():
             raise RuntimeError("播放器音频尚未排空，请等待当前播报结束后切换语音后端。")
-        if backend == self.config.tts.backend == "voxcpm1":
-            await self.switch_local_tts_model(local_model)
-            if self._active_voice_snapshot(local_model) is not None:
+        if backend == self.config.tts.backend == "aniflive":
+            await self.switch_local_tts_model(local_model, revision=revision)
+            if self.tts.supports_prewarm:
                 await self.tts.prewarm()
             return
         previous_config, previous_router = self.config, self.tts
         next_config = replace(previous_config, tts=replace(
-            previous_config.tts, backend=backend, local_model=local_model,
-            sample_rate=(local_tts_native_rate(local_model) if backend == "voxcpm1"
+            previous_config.tts, backend=backend, local_model=local_model, local_model_revision=revision,
+            sample_rate=(local_tts_native_rate(local_model) if backend == "aniflive"
                          else previous_config.tts.online_sample_rate),
         ))
         candidate = None
@@ -1164,7 +1088,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self.state.current.update(
             tts_transport=candidate.transport, tts_scheduling=candidate.effective_scheduling,
         )
-        self._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
+        self._local_tts_load_state = "ready" if backend == "aniflive" else "disabled"
         self._local_tts_error = None
         try:
             await previous_router.shutdown()
@@ -1296,10 +1220,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if not self._api_key(current.api_key_env):
                 raise RuntimeError("所选在线 TTS（文本转语音）接口未配置，请填写密钥或显式选择已就绪的本地模型。")
             return
-        available = AudioCppTtsServer.available_models(self._runtime_local_root, local_model=current.local_model)
-        if current.local_model not in available:
-            raise RuntimeError(f"所选 {current.local_model}（本地语音模型）或 audio.cpp（原生语音框架）未就绪，请在组件管理补齐。")
-        self.config = replace(self.config, tts=replace(current, sample_rate=local_tts_native_rate(current.local_model)))
+        _, revision, _ = AnifLiveModelRegistry(self._runtime_local_root, self._tts_voice_root.parent).resolve(
+            current.local_model, current.local_model_revision)
+        self.config = replace(self.config, tts=replace(current, sample_rate=32000, local_model_revision=revision))
 
     def _build_tts_clients(self):
         """按本机 backend（语音运行后端）配置创建 TTS provider（语音合成供应方）。"""
@@ -1334,28 +1257,23 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                     sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
                     first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
                 )
-        elif self.config.tts.backend == "voxcpm1":
-            local_config = self._runtime_local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
-            self._migrate_legacy_default_voice()
-            AudioCppTtsServer.write_runtime_config(self._runtime_local_root, local_config)
-            local_tts = AudioCppTtsClient(
-                AudioCppTtsServer(
-                    self._runtime_local_root,
-                    local_config,
-                    local_model=self.config.tts.local_model,
-                ),
-                sample_rate=self.config.tts.sample_rate,
+        elif self.config.tts.backend == "aniflive":
+            if self.voice_library is None:
+                raise RuntimeError("本地参考音色库不可用，请先修复音色资料。")
+            library = self.voice_library.for_model("aniflive")
+            local_tts = AnifLiveTtsClient(
+                server=AnifLiveTtsServer(self._runtime_local_root, self.paths.program_root,
+                    local_model=self.config.tts.local_model, revision=self.config.tts.local_model_revision,
+                    library_root=library.root, data=self._tts_voice_root.parent),
+                model_id=self.config.tts.local_model, language=self.config.tts.aniflive_language,
                 sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
                 sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
                 sentence_tick_ms=self.config.tts.sentence_tick_ms,
-                first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
-                local_optimization=self.config.tts.local_optimization,
-                acoustic_continuation=self.config.tts.acoustic_continuation,
                 gpu_max_performance=self.config.tts.gpu_max_performance,
-                voice_library=self.voice_library,
-                active_voice_provider=self._active_voice_selection,
-                emotion_mode="off",
-                inference_steps_by_model=self.config.tts.inference_steps_by_model,
+                prewarm_enabled=self.config.tts.local_optimization,
+                aniflive_chunk_optimization=self.config.tts.aniflive_chunk_optimization,
+                aniflive_first_audio_wait_ms=self.config.tts.aniflive_first_audio_wait_ms,
+                voice_library=library,
             )
         return remote_tts, local_tts
 

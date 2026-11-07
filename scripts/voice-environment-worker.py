@@ -512,7 +512,16 @@ def main():
         local=data/'config/local.yaml'
         config=load_config(Path(args.program)/'config/default.yaml',local if local.is_file() else None)
         store=ProductSettingsStore(path=data/'config/product-settings.json',config=config)
-        result=(store.save_inference(json.loads(args.selection)) if args.operation == 'inference-selection' else store.save_tts_local_model(json.loads(args.selection)))
+        selection=json.loads(args.selection)
+        if args.operation == 'tts-selection':
+            if selection.get('backend', store.snapshot()['tts']['backend']) == 'aniflive':
+                from voice_terminal.tts.aniflive_models import AnifLiveModelRegistry
+                model=selection.get('local_model',store.snapshot()['tts']['local_model'])
+                _,revision,_=AnifLiveModelRegistry(data.parent,data).resolve(model,selection.get('local_model_revision'))
+                selection['local_model_revision']=revision
+            result=store.save_tts_local_model(selection)
+        else:
+            result=store.save_inference(selection)
     elif args.operation=='interpreter': result=interpreter()
     elif args.operation=='reuse': result=reuse(runtime_lock(args.lock,args.gpu_lock),names,Path(args.target))
     elif args.operation=='inventory': result=inventory(names,runtime_lock(args.lock,args.gpu_lock),args.compatible_gpu)
