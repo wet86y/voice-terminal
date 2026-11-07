@@ -57,7 +57,7 @@ def recover_dependencies(runtime: Path):
     if not isinstance(rows, list) or not rows:
         raise ValueError('隔离依赖恢复记录缺少目录。')
     for row in rows:
-        if row.get('target') not in {'packages', 'export-packages'} or type(row.get('original')) is not bool:
+        if row.get('target') not in {'packages', 'export-packages', 'source'} or type(row.get('original')) is not bool:
             raise ValueError('隔离依赖恢复目标不在固定范围。')
         for key in ('backup', 'stage'):
             name = row.get(key)

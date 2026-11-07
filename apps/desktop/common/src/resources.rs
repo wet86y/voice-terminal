@@ -320,7 +320,7 @@ pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
     let root=context.install.join("runtimes/aniflive-tts");
     let wanted=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok();
     let source=load(&safe_path(&root,"source/windows-source-receipt.json")?).unwrap_or(Value::Null);
-    let installed=wanted.is_some()&&source["patch_revision"]==3&&source["upstream_commit"]=="9bc349d3a71362b3bfdccbc630983809800954fd"
+    let installed=wanted.is_some()&&source["patch_revision"]==5&&source["upstream_commit"]=="9bc349d3a71362b3bfdccbc630983809800954fd"
         &&!root.join("dependency-transaction.json").exists()
         &&["packages","export-packages"].iter().all(|folder|{
             let receipt=load(&root.join(folder).join("aniflive-packages.json")).unwrap_or(Value::Null);
@@ -328,7 +328,7 @@ pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
         });
     Ok(json!({"resource_id":"tts-aniflive-runtime","parent_resource_id":"voice-server","label":"AnifLive（本地语音引擎）隔离运行依赖","required":false,
         "installation_state":if installed{"installed"}else{"missing"},"files_installed":installed,"runtime_ready":installed,"can_start":installed,
-        "update_available":false,"version":"1.5.0b1-patch3","error":Value::Null}))
+        "update_available":false,"version":"1.5.0b1-patch5","error":Value::Null}))
 }
 
 /// verify_aniflive_runtime（显式完整性核对）：启动盘点仍只读身份，主动维修检查真实隔离文件。
@@ -452,10 +452,26 @@ pub fn update_tts_readiness(context:&LaunchContext,rows:&mut [Value])->Result<()
     }Ok(())
 }
 /// aniflive_model_ready（本机引擎就绪）：实际生成摘要及完整验证收据是唯一依据。
-fn aniflive_adapter_paths()->[&'static str;8]{[
+fn aniflive_adapter_paths()->[&'static str;9]{[
     "voice_terminal/tts/aniflive_native.py","voice_terminal/tts/aniflive_environment.py",
     "voice_terminal/tts/aniflive_worker.py","voice_terminal/tts/aniflive_build_diagnostics.py","scripts/run-aniflive.py",
-    "voice_terminal/tts/aniflive_aliases.py","voice_terminal/tts/aniflive_shared.py","voice_terminal/tts/aniflive_service.py"]}
+    "voice_terminal/tts/aniflive_aliases.py","voice_terminal/tts/aniflive_shared.py","voice_terminal/tts/aniflive_service.py","voice_terminal/tts/aniflive_export.py"]}
+/// reviewed_export_compatibility（已审阅导出兼容）：保留旧构建身份，逐项核对新旧摘要。
+fn reviewed_export_compatibility(context:&LaunchContext,identity:&Value)->Result<bool,String>{
+    let rules=load(&context.installed_program().join("config/runtime/aniflive-build-compatibility.json")).unwrap_or(Value::Null);
+    if rules["schema"]!=1{return Ok(false);}
+    for profile in rules["profiles"].as_array().into_iter().flatten(){
+        if profile["source"]!=identity["source"]||profile["adapter"]!=identity["adapter"]{continue;}
+        let Some(runtime)=profile["runtime_adapter"].as_object()else{continue;};
+        if runtime.len()!=aniflive_adapter_paths().len(){continue;}
+        let mut matches=true;
+        for name in aniflive_adapter_paths(){
+            if runtime.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){matches=false;break;}
+        }
+        if matches{return Ok(true);}
+    }
+    Ok(false)
+}
 pub fn aniflive_model_ready(context:&LaunchContext,model:&str,verify_hashes:bool)->Result<bool,String>{
     aniflive_model_revision_ready(context,model,None,verify_hashes)
 }
@@ -476,11 +492,13 @@ fn aniflive_model_revision_ready(context:&LaunchContext,model:&str,revision:Opti
     let identity=&receipt["identity"];
     if identity["dependency_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok().as_deref()
         ||identity["shared_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-shared-assets.lock.json")).ok().as_deref()
-        ||identity["source"]["patch_revision"]!=3||identity["source"]["upstream_commit"]!="9bc349d3a71362b3bfdccbc630983809800954fd"{return Ok(false);}
+        ||identity["source"]["upstream_commit"]!="9bc349d3a71362b3bfdccbc630983809800954fd"{return Ok(false);}
     let Some(adapters)=identity["adapter"].as_object()else{return Ok(false)};
-    if adapters.len()!=8{return Ok(false);}
-    for name in aniflive_adapter_paths(){
-        if adapters.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){return Ok(false);}
+    if !reviewed_export_compatibility(context,identity)?{
+        if identity["source"]["patch_revision"]!=5||adapters.len()!=aniflive_adapter_paths().len(){return Ok(false);}
+        for name in aniflive_adapter_paths(){
+            if adapters.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){return Ok(false);}
+        }
     }
     let Some(files)=receipt["files"].as_array()else{return Ok(false)};
     if files.is_empty(){return Ok(false);}
@@ -1494,6 +1512,32 @@ mod download_tests {
     }
 
     #[test]
+    fn reviewed_export_upgrade_preserves_old_identity_but_rejects_runtime_changes(){
+        let root=std::env::temp_dir().join(format!("voice-aniflive-compat-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/config")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let mut runtime=serde_json::Map::new();
+        let mut old=serde_json::Map::new();
+        for name in aniflive_adapter_paths(){
+            let path=root.join("app").join(name);fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(&path,b"current runtime").unwrap();
+            runtime.insert(name.into(),json!(file_hash(&path).unwrap()));
+            if !name.ends_with("aniflive_export.py"){old.insert(name.into(),json!("a".repeat(64)));}
+        }
+        let identity=json!({"source":{"patch_revision":3,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"},"adapter":old});
+        let rules=root.join("app/config/runtime/aniflive-build-compatibility.json");fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        atomic_json(&rules,&json!({"schema":1,"profiles":[{"source":identity["source"],"adapter":identity["adapter"],"runtime_adapter":runtime}]})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        assert!(reviewed_export_compatibility(&context,&identity).unwrap());
+        assert_eq!(identity["source"]["patch_revision"],3);
+        let mut unknown=identity.clone();unknown["adapter"]["scripts/run-aniflive.py"]=json!("b".repeat(64));
+        assert!(!reviewed_export_compatibility(&context,&unknown).unwrap());
+        fs::write(root.join("app/voice_terminal/tts/aniflive_service.py"),b"changed inference behavior").unwrap();
+        assert!(!reviewed_export_compatibility(&context,&identity).unwrap());
+    }
+
+    #[test]
     fn selected_generated_tts_survives_only_unselected_optional_model_corruption(){
         let root=std::env::temp_dir().join(format!("voice-tts-options-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
@@ -1506,7 +1550,7 @@ mod download_tests {
         let shared_lock=lock.with_file_name("aniflive-shared-assets.lock.json");fs::write(&shared_lock,b"{}").unwrap();
         let shared_sha=file_hash(&shared_lock).unwrap();
         let native=root.join("runtimes/aniflive-tts");fs::create_dir_all(native.join("source")).unwrap();
-        atomic_json(&native.join("source/windows-source-receipt.json"),&json!({"patch_revision":3,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"})).unwrap();
+        atomic_json(&native.join("source/windows-source-receipt.json"),&json!({"patch_revision":5,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"})).unwrap();
         for role in ["packages","export-packages"]{fs::create_dir_all(native.join(role)).unwrap();atomic_json(&native.join(role).join("aniflive-packages.json"),&json!({"lock_sha256":lock_sha,"files":[{"path":"fixture"}]})).unwrap();}
         let mut adapters=serde_json::Map::new();
         for name in aniflive_adapter_paths(){
@@ -1519,7 +1563,7 @@ mod download_tests {
             fs::write(package.join("model.engine"),b"good").unwrap();
             atomic_json(&package.join("manifest.json"),&json!({"model_id":model,"format":"aniflive-tts-model-package"})).unwrap();
             fs::write(package.join("checksums.json"),b"{}").unwrap();
-            let identity=json!({"fixture":model,"dependency_lock":lock_sha,"shared_lock":shared_sha,"source":{"patch_revision":3,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"},"adapter":adapters});
+            let identity=json!({"fixture":model,"dependency_lock":lock_sha,"shared_lock":shared_sha,"source":{"patch_revision":5,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"},"adapter":adapters});
             atomic_json(&package.join("application-receipt.json"),&json!({"identity":identity,"validation":{"enqueue_verified":true,"engine_count":9},"streaming_verified":true,
                 "files":[{"path":"model.engine","size":4,"sha256":file_hash(&package.join("model.engine")).unwrap()},
                          {"path":"manifest.json","size":package.join("manifest.json").metadata().unwrap().len(),"sha256":file_hash(&package.join("manifest.json")).unwrap()}]})).unwrap();
