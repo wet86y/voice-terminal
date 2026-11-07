@@ -1005,7 +1005,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         store = product_store_or_404()
         if not body or set(body) - {
             "backend", "local_model", "online_model", "online_voice_id",
-            "local_optimization", "acoustic_continuation", "speech_control_enabled", "inference_steps_by_model",
+            "local_optimization", "acoustic_continuation", "speech_control_enabled", "gpu_max_performance", "aniflive_chunk_optimization",
+            "aniflive_first_audio_wait_ms", "local_model_revision",
         }:
             raise HTTPException(
                 status_code=422,
@@ -1015,23 +1016,26 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         for field in ("local_optimization", "acoustic_continuation", "speech_control_enabled")}
         if any(not isinstance(value, bool) for value in optimization.values()):
             raise HTTPException(status_code=422, detail="智能语音调节、本地优化与声学续接开关必须为布尔值。")
-        from ..config import validate_tts_inference_steps
+        from ..tts.settings import validate_options, valid_local_model
         try:
-            optimization["inference_steps_by_model"] = validate_tts_inference_steps(
-                body.get("inference_steps_by_model", {}), runtime.config.tts.inference_steps_by_model,
-            )
+            optimization.update(validate_options({**{key: getattr(runtime.config.tts, key) for key in
+                ("gpu_max_performance", "aniflive_chunk_optimization", "aniflive_first_audio_wait_ms", "local_model_revision")}, **body}))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        optimization["local_optimization"] = True  # 旧字段不再选择通用提前合成调度。
         local_model = body.get("local_model", runtime.config.tts.local_model)
-        backend = body.get("backend", "voxcpm1" if "local_model" in body else runtime.config.tts.backend)
-        if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
-            raise HTTPException(status_code=422, detail="backend（语音后端）必须为 minimax 或 voxcpm1。")
-        if not isinstance(local_model, str) or local_model not in {"voxcpm1", "voxcpm2"}:
-            raise HTTPException(
-                status_code=422,
-                detail="local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。",
-            )
+        backend = body.get("backend", runtime.config.tts.backend)
+        if backend not in {"minimax", "aniflive"} or not valid_local_model(local_model):
+            raise HTTPException(status_code=422, detail="backend（语音后端）或 local_model（登记模型编号）无效。")
+        if local_model != runtime.config.tts.local_model and "local_model_revision" not in body:
+            optimization["local_model_revision"] = None
+        if backend == "aniflive":
+            from ..tts.aniflive_models import AnifLiveModelRegistry
+            try:
+                _, revision, _ = AnifLiveModelRegistry(runtime._runtime_local_root, runtime._tts_voice_root.parent).resolve(
+                    local_model, optimization["local_model_revision"])
+                optimization["local_model_revision"] = revision
+            except (ValueError, OSError, KeyError) as exc:
+                raise HTTPException(status_code=422, detail="所选本地模型尚未完成组件配置及本机验证。") from exc
         selection_requested = bool(set(body) & {"backend", "local_model"})
         online_requested = bool(set(body) & {"online_model", "online_voice_id"})
         online_settings: dict[str, str] = {}
@@ -1061,18 +1065,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if "speech_control_enabled" in body and callable(getattr(output, "refresh_speech_controls", None)):
                     output.refresh_speech_controls("settings_changed")
                 local_client = getattr(runtime.tts, "local", None)
-                if local_client is not None:
-                    for key, value in optimization.items():
-                        setattr(local_client, key, value)
-                    local_client._warmed = False
+                if callable(getattr(local_client, "configure_optimization", None)):
+                    await local_client.configure_optimization(**optimization)
                 await runtime.bus.publish(runtime.snapshot())
                 return {"settings": {"tts": saved}, "effective_from": "next_synthesis" if "speech_control_enabled" in body else "next_answer", "pending": False,
                         "message": "合成设置已热更新，下一回答使用新参数。", "tts": runtime.local_tts_status_payload()}
         if not prepared:
             if runtime.application_initializing:
                 raise HTTPException(status_code=409, detail="应用正在初始化，请稍后切换语音模型。")
-            names = {"voxcpm1": "VoxCPM1", "voxcpm2": "VoxCPM2"}
-            label = "语音合成 · " + ("MiniMax（在线）" if backend == "minimax" else names[local_model])
+            names = {row["id"]: row["name"] for row in runtime.local_tts_status_payload().get("models", [])}
+            label = "语音合成 · " + ("MiniMax（在线）" if backend == "minimax" else names.get(local_model, local_model))
             async with runtime_operation(runtime, "tts_selection", label, pause=True, wait_output=True):
                 return await apply_product_tts(body, prepared=True)
         if runtime.application_initializing:
@@ -1116,12 +1118,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 # 新后端构造及预热均读取这份参数；从在线切到本地时也使用新步数。
                 runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization, **online_config))
                 local_client = getattr(runtime.tts, "local", None)
-                if local_client is not None:
-                    for key, value in optimization.items():
-                        setattr(local_client, key, value)
-                    if optimization["inference_steps_by_model"] != previous_options["inference_steps_by_model"]:
-                        local_client._warmed = False
-                await runtime.switch_tts_selection(backend, local_model)
+                if callable(getattr(local_client, "configure_optimization", None)):
+                    await local_client.configure_optimization(**optimization)
+                if optimization['local_model_revision'] is None:
+                    await runtime.switch_tts_selection(backend, local_model)
+                else:
+                    await runtime.switch_tts_selection(backend, local_model, revision=optimization['local_model_revision'])
                 saved = store.save_tts_local_model({"backend": backend, "local_model": local_model,
                                                     **optimization, **online_settings})
                 runtime.tts.speech_control_enabled = optimization["speech_control_enabled"]
@@ -1134,18 +1136,19 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 **optimization, **online_config),
                 )
                 runtime.state.set_service("tts", "READY")
-                runtime._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
+                runtime._local_tts_load_state = "ready" if backend == "aniflive" else "disabled"
                 runtime._local_tts_error = None
             except BaseException as exc:
                 logger.exception("tts.selection_failed backend=%s local_model=%s", backend, local_model)
                 try:
                     runtime.config = replace(runtime.config, tts=previous_tts_config)
                     local_client = getattr(runtime.tts, "local", None)
-                    if local_client is not None:
-                        for key, value in previous_options.items():
-                            setattr(local_client, key, value)
-                        local_client._warmed = False
-                    await runtime.switch_tts_selection(previous_backend, previous_model)
+                    if callable(getattr(local_client, "configure_optimization", None)):
+                        await local_client.configure_optimization(**previous_options)
+                    if previous_tts_config.local_model_revision is None:
+                        await runtime.switch_tts_selection(previous_backend, previous_model)
+                    else:
+                        await runtime.switch_tts_selection(previous_backend, previous_model, revision=previous_tts_config.local_model_revision)
                     runtime.config = replace(runtime.config, tts=previous_tts_config)
                     restored = True
                 except Exception:

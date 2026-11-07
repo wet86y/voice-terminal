@@ -205,7 +205,7 @@ def _repair_speaker(data: Path, archive: Archive) -> None:
 def _repair_voices(data: Path, archive: Archive, selections: dict) -> set[str]:
     from .tts.voices import VoiceLibrary, VoiceLibraryError
     affected = set()
-    for model in ("voxcpm1", "voxcpm2"):
+    for model in ("aniflive",):
         relative = f"tts/{model}/voices"
         root = _safe(data, relative)
         index = _safe(data, f"{relative}/index.json")
@@ -255,22 +255,8 @@ def _repair_policy(program: Path, data: Path, archive: Archive) -> None:
 
 
 def _restore_default_voices(program: Path, data: Path, candidate: dict) -> None:
-    """本地合成必须有实际可解析音色；使用随新版程序校验过的种子重建。"""
-    if candidate["tts"]["backend"] != "voxcpm1":
-        return
-    from .tts.voices import VoiceLibrary
-    seed = program / "config/resources/assets/tts"
-    audio, text = seed / "default.wav", seed / "default.json"
-    for model in ("voxcpm1", "voxcpm2"):
-        library = VoiceLibrary(_safe(data, f"tts/{model}/voices"), model=model)
-        selection = library.active_selection
-        if not selection:
-            if not audio.is_file() or not text.is_file():
-                raise ValueError("本地语音默认音色缺失，当前程序包需要包含有效默认音色种子")
-            transcript = json.loads(text.read_text(encoding="utf-8"))["reference_text"]
-            library.register_default(audio.read_bytes(), transcript)
-            selection = library.active_selection
-        library.resolve(model, selection)
+    """AnifLive 默认参考随已验证模型包提供；不修改旧音色资料。"""
+    return
 
 
 def _archive_session(data: Path, archive: Archive) -> None:

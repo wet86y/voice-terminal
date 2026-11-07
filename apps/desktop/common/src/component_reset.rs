@@ -40,6 +40,11 @@ fn ids(id: &str) -> Vec<String> {
     }
 }
 fn targets(c: &LaunchContext, id: &str) -> Result<Vec<String>, String> {
+    if id == "tts-aniflive-runtime" {
+        // 隔离依赖目录与模型、输入缓存、音色资料分开重置。
+        resources::spec(c, id)?;
+        return Ok(vec!["runtimes/aniflive-tts".into()]);
+    }
     if matches!(
         id,
         "voice-server" | "voice-runtime-cpu" | "voice-runtime-gpu"
@@ -87,9 +92,6 @@ fn targets(c: &LaunchContext, id: &str) -> Result<Vec<String>, String> {
             ]
             .map(str::to_owned),
         );
-    }
-    if id == "tts-audiocpp-runtime" {
-        result.push("runtimes/audiocpp".into());
     }
     Ok(result)
 }
@@ -277,7 +279,7 @@ pub fn execute(
         rows.retain(|r| r["kind"] != kind);
     }
     atomic_json(&release_path, &release)?;
-    if kind.is_empty() {
+    if kind.is_empty() && id != "tts-aniflive-runtime" {
         let item = resources::spec(c, id)?;
         let prefix = format!("{}/", item["destination"].as_str().ok_or("模型目录缺失")?);
         let p = c.install.join("models/manifest.json");
@@ -362,6 +364,18 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aniflive_runtime_reset_scope_preserves_models_inputs_and_recordings() {
+        let (root,c)=fixture();
+        let catalog=root.join("app/config/resources/catalog.json");
+        fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        atomic_json(&catalog,&json!({"resources":[{"resource_id":"tts-aniflive-runtime","kind":"model","destination":"aniflive-tts/runtime-registration","preparation":"aniflive_runtime"}]})).unwrap();
+        // 资源目录实际格式由规范读取；此处直接核对固定特殊范围。
+        let result=targets(&c,"tts-aniflive-runtime");
+        assert!(result.is_ok(),"{result:?}");
+        assert_eq!(result.unwrap(),vec!["runtimes/aniflive-tts"]);
+        crate::workspace::remove_owned(&root,root.parent().unwrap()).unwrap();
+    }
     pub(super) fn fixture() -> (std::path::PathBuf, LaunchContext) {
         let owner = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../.local/tmp/component-reset-tests");
@@ -451,7 +465,7 @@ mod reset_scenarios {
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[
    {"resource_id":"model-a","kind":"model","destination":"test/a","files":[]},
    {"resource_id":"model-b","kind":"model","destination":"test/b","files":[]},
-   {"resource_id":"tts-audiocpp-runtime","kind":"model","destination":"audiocpp/runtime","files":[]},
+   {"resource_id":"tts-aniflive-runtime","kind":"model","destination":"aniflive-tts/runtime-registration","preparation":"aniflive_runtime","files":[]},
    {"resource_id":"dsh","kind":"dsh","destination":"runtimes/dsh"}
   ]})).unwrap();
         fs::create_dir_all(root.join("models")).unwrap();
@@ -511,17 +525,23 @@ mod reset_scenarios {
         remove_owned(&root, root.parent().unwrap()).unwrap();
     }
     #[test]
-    fn audio_reset_removes_legacy_reuse_source_but_keeps_weights() {
+    fn aniflive_reset_keeps_legacy_runtime_weights_and_recordings() {
         let (root, c) = setup();
         for p in [
             "models/audiocpp/runtime/cuda/audiocpp_server.exe",
             "runtimes/audiocpp/cuda/audiocpp_server.exe",
             "models/audiocpp/tts/model.gguf",
+            "runtimes/aniflive-tts/packages/model.dll",
+            "data/tts/aniflive/voices/assets/user.wav",
         ] {
             put(&root, p);
         }
-        reset(&c, "tts-audiocpp-runtime").unwrap();
-        assert!(!root.join("runtimes/audiocpp").exists());
+        assert!(reset(&c, "tts-audiocpp-runtime").is_err());
+        reset(&c, "tts-aniflive-runtime").unwrap();
+        assert!(!root.join("runtimes/aniflive-tts").exists());
+        assert!(root.join("runtimes/audiocpp/cuda/audiocpp_server.exe").exists());
+        assert!(root.join("models/audiocpp/runtime/cuda/audiocpp_server.exe").exists());
+        assert!(root.join("data/tts/aniflive/voices/assets/user.wav").exists());
         assert!(root.join("models/audiocpp/tts/model.gguf").exists());
         remove_owned(&root, root.parent().unwrap()).unwrap();
     }

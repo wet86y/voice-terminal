@@ -388,6 +388,19 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._tts_prewarm_tasks[ws.turn_id] = task
         self._track(task)
 
+    def _refresh_vad_tts_prewarm(self, ws: TurnWorkspace, *, trigger: str) -> None:
+        """合并正在执行的事件预热，完成后允许下一次人声边沿刷新。"""
+        if not bool(getattr(getattr(self, "tts", None), "vad_prewarm", False)):
+            return
+        task = self._tts_prewarm_tasks.get(ws.turn_id)
+        if task is not None and not task.done():
+            return
+        ws.tts_prewarm_started = False
+        ws.timings["tts_prewarm_vad_trigger"] = trigger
+        ws.timings["tts_prewarm_requested"] = time.monotonic()
+        ws.timings.pop("tts_prewarm_ready", None)
+        self._start_tts_prewarm(ws)
+
     async def _cancel_tts_prewarm(self, turn_id: str | None = None) -> None:
         tasks = []
         for key, task in list(self._tts_prewarm_tasks.items()):
@@ -625,6 +638,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 # A new VAD speech epoch may belong to a different person;
                 # do not reuse the previous epoch's identity evidence.
                 self._speaker_turn_start_sample = self._speech_start_sample
+        if self.workspace is not None and self._active_input and (activity.speech_started or activity.speech_ended):
+            self._refresh_vad_tts_prewarm(self.workspace, trigger="vad_start" if activity.speech_started else "vad_end")
         if activity.speech_end_sample is not None:
             self._speech_end_sample = self._vad_origin + activity.speech_end_sample
             if self._speech_start_sample is not None:
@@ -809,6 +824,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             self.hotwords._turn(ws.token)  # 发言开始固定词表，不受中途保存影响。
             self.segmenter.store.boundary_adjuster = lambda text, limit: self.hotwords.protect_boundary(text, limit, ws.token, self.options.min_segment_chars)
         self._active_input = True
+        if bool(getattr(self.tts, "vad_prewarm", False)):
+            self._start_tts_prewarm(ws)
         self.barge_in_gate.reset()
         self._turn_cancel = asyncio.Event()
         self._sub_parts.clear()
@@ -852,6 +869,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._sub_generations[self._sub_id] = self.workspace.generation
         self._register_enhancement_stream()
         self._queue_asr(AudioChunk(self._sub_id, pcm))
+        self._refresh_vad_tts_prewarm(self.workspace, trigger="asr_start")
 
     def _stop_generation(self) -> list[asyncio.Task]:
         stopped: list[asyncio.Task] = []
@@ -1349,6 +1367,8 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         self._reset_vad_pending = True
 
     async def stop_listening(self) -> None:
+        if bool(getattr(self.tts, "vad_prewarm", False)):
+            await self._cancel_tts_prewarm()
         await self._cancel_wake_preparation()
         self._activation_generation += 1
         recovery = self._asr_recovery_task

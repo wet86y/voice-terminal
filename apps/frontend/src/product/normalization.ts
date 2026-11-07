@@ -8,11 +8,11 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 19,
+  schema_version: 20,
   audio_enhancements: { dual_pass: true, emotion: true, acoustic_events: true },
   screen_capture: { enabled: true, crop_width: 960, crop_height: 640, global_max_edge: 1920, app_overrides: [] },
   inference: { backend: 'deepseek' },
-  tts: { backend: 'minimax', speech_control_enabled: true, local_model: 'voxcpm2', online_model: 'speech-2.8-hd', online_voice_id: 'female-shaonv', inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20 } },
+  tts: { backend: 'minimax', speech_control_enabled: true, local_model: 'minimax-female-shaonv-zh', online_model: 'speech-2.8-hd', online_voice_id: 'female-shaonv', gpu_max_performance: false, aniflive_chunk_optimization: true, aniflive_first_audio_wait_ms: 0 },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   quiet_hours: { enabled: false, start: '23:00', end: '07:00' },
@@ -94,7 +94,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       [key, !isRecord(value.audio_enhancements) || value.audio_enhancements[key] !== false])) as ProductSettingsSnapshot['audio_enhancements'],
     quiet_hours: { enabled: quiet.enabled === true, start: text(quiet.start) || '23:00', end: text(quiet.end) || '07:00' },
     inference: { backend: isRecord(value.inference) && value.inference.backend === 'minimax' ? 'minimax' : 'deepseek' },
-    tts: { backend: tts.backend === 'voxcpm1' ? 'voxcpm1' : 'minimax', speech_control_enabled: typeof tts.speech_control_enabled === 'boolean' ? tts.speech_control_enabled : true, local_model: tts.local_model === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2', online_model: onlineModel, online_voice_id: onlineVoiceId, inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20, ...(isRecord(tts.inference_steps_by_model) ? tts.inference_steps_by_model : {}) } },
+    tts: { backend: tts.backend === 'aniflive' || tts.backend === 'voxcpm1' ? 'aniflive' : 'minimax', speech_control_enabled: typeof tts.speech_control_enabled === 'boolean' ? tts.speech_control_enabled : true, local_model: typeof tts.local_model === 'string' && !['voxcpm1', 'voxcpm2'].includes(tts.local_model) ? tts.local_model : 'minimax-female-shaonv-zh', online_model: onlineModel, online_voice_id: onlineVoiceId, gpu_max_performance: tts.gpu_max_performance === true, aniflive_chunk_optimization: tts.aniflive_chunk_optimization !== false, aniflive_first_audio_wait_ms: Number.isInteger(tts.aniflive_first_audio_wait_ms) ? Math.max(0, Math.min(200, Number(tts.aniflive_first_audio_wait_ms))) : 0, local_model_revision: typeof tts.local_model_revision === "string" ? tts.local_model_revision : null },
     wake: {
       enabled: wake.enabled === true,
       keyword: primaryKeyword,

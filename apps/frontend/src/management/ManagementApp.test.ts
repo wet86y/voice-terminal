@@ -172,18 +172,18 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   })
 
   it('启动前显式选择已就绪本地模型只保存配置，不启动服务', async () => {
-    inventory.push({ ...row('tts-voxcpm1', 'VoxCPM1（第一代模型）', true), required: false },
-      { ...row('tts-voxcpm2', 'VoxCPM2（第二代模型）'), required: false })
+    inventory.push({ ...row('tts-aniflive-minimax-female-shaonv-zh', 'VoxCPM1（第一代模型）', true), required: false },
+      { ...row('tts-aniflive-tangyuge-v2pp-d78cf598', 'VoxCPM2（第二代模型）'), required: false })
     const save = vi.fn(async (request: desktop.TtsSelection) => request)
     const port = desktop.desktopPort() as desktop.DesktopPort & desktop.DesktopWorkspacePort
     port.saveTtsSelection = save
     wrapper = mount(ManagementApp)
     await flushPromises()
     await expandCategory('tts')
-    expect(wrapper.find('option[value="voxcpm2"]').exists()).toBe(false)
-    await wrapper.get('.local-tts-selection select').setValue('voxcpm1')
+    expect(wrapper.find('option[value="tangyuge-v2pp-d78cf598"]').exists()).toBe(false)
+    await wrapper.get('.local-tts-selection select').setValue('minimax-female-shaonv-zh')
     await flushPromises()
-    expect(save).toHaveBeenCalledWith({ backend: 'voxcpm1', local_model: 'voxcpm1' })
+    expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'minimax-female-shaonv-zh' })
     expect(start).not.toHaveBeenCalled()
     expect(download).not.toHaveBeenCalled()
   })
@@ -192,7 +192,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
     inventory[0]!.runtime_components = [
       { ...row('voice-runtime-cpu', 'CPU（中央处理器）运行依赖', true), required: true },
-      { ...row('tts-audiocpp-runtime', 'audio.cpp（语音合成引擎）运行依赖'), required: false },
+      { ...row('tts-aniflive-runtime', 'audio.cpp（语音合成引擎）运行依赖'), required: false },
       { ...row('voice-runtime-gpu', 'GPU（图形处理器）运行依赖'), required: false },
     ]
     wrapper = mount(ManagementApp)

@@ -520,7 +520,7 @@ mod tests {
         let state=status(&context).unwrap();let rows=state["components"].as_array().unwrap();
         assert_eq!(state["full_ready"],true);assert_eq!(rows.len(),3);
         assert_eq!(rows[0]["resource_id"],CPU_RESOURCE);assert_eq!(rows[0]["required"],true);assert_eq!(rows[0]["can_start"],true);
-        assert_eq!(rows[1]["resource_id"],"tts-audiocpp-runtime");assert_eq!(rows[1]["required"],false);
+        assert_eq!(rows[1]["resource_id"],"tts-aniflive-runtime");assert_eq!(rows[1]["required"],false);
         assert_eq!(rows[2]["resource_id"],GPU_RESOURCE);assert_eq!(rows[2]["required"],false);assert_eq!(rows[2]["can_start"],false);
         assert!(effective_lock(&context,false).is_ok());assert!(effective_lock(&context,true).is_err());
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();

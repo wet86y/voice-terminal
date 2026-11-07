@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .screen_capture import ScreenCaptureConfig
+from .tts.settings import DEFAULT_LOCAL_MODEL, migrate_choice, valid_local_model, validate_options
 
 import os
 from dataclasses import dataclass, field
@@ -253,8 +254,8 @@ LOCAL_TTS_PLAYER_RATES = frozenset({16000, 24000, 32000, 48000})
 
 
 def local_tts_native_rate(local_model: str) -> int:
-    """local_tts_native_rate（本地模型原生率）：未知模型按最保守的 16 kHz 处理。"""
-    return LOCAL_TTS_NATIVE_RATE.get(str(local_model or "").strip().lower(), 16000)
+    """local_tts_native_rate（本地模型原生率）：AnifLive 统一使用 32 kHz。"""
+    return 32000
 
 
 def resolve_tts_sample_rate(backend: str, local_model: str, configured: Any) -> int:
@@ -264,8 +265,8 @@ def resolve_tts_sample_rate(backend: str, local_model: str, configured: Any) -> 
     8 kHz 以上全部能量（实测原生 8–16 kHz 占 1.1%–14.4%）。因此本地下行率
     由模型决定；只有在线后端才沿用可配置值。
     """
-    if backend == "voxcpm1":
-        return local_tts_native_rate(local_model)
+    if backend == "aniflive":
+        return 32000
     return int(configured)
 
 
@@ -285,13 +286,16 @@ class TtsConfig:
     speech_control_enabled: bool = True  # speech_control_enabled（智能语音调节总开关）。
     # backend（语音运行后端）；provider（模型元数据供应商）保留 MiniMax 兼容值。
     backend: str = "minimax"
-    local_model: str = "voxcpm2"  # local_model（本地 TTS 模型）：audio.cpp（原生音频推理框架）中的 VoxCPM 选择。
+    local_model: str = DEFAULT_LOCAL_MODEL  # local_model（已登记的本地模型编号）。
+    local_model_revision: str | None = None  # local_model_revision（精确模型版本）。
+    aniflive_language: str = "zh"  # aniflive_language（待合成文本语言）。
+    aniflive_chunk_optimization: bool = True  # aniflive_chunk_optimization（48 标记分块优化）。
+    aniflive_first_audio_wait_ms: int = 0  # aniflive_first_audio_wait_ms（网络首音到达后等待毫秒）。
     local_optimization: bool = True  # local_optimization（通用本地提前合成优化）。
     acoustic_continuation: bool = True  # acoustic_continuation（声学续接独立开关）。
     # gpu_max_performance（本地合成期间请求显卡优先最大性能）：免管理员权限、按进程生效，
     # 等价于 NVIDIA 控制面板的电源管理模式；进程退出即自动还原。
-    gpu_max_performance: bool = True
-    inference_steps_by_model: dict[str, int] = field(default_factory=lambda: dict(LOCAL_TTS_DEFAULT_STEPS))  # 逐模型推理步数。
+    gpu_max_performance: bool = False
     base_url: str = "https://api.minimaxi.com"
     websocket_path: str = "/ws/v1/t2a_v2"
     transport: str = "websocket"
@@ -324,11 +328,13 @@ class TtsConfig:
     def __post_init__(self) -> None:
         if self.online_sample_rate is None:
             object.__setattr__(self, "online_sample_rate", int(self.sample_rate))
-        object.__setattr__(self, "inference_steps_by_model", validate_tts_inference_steps(self.inference_steps_by_model))
-        if self.backend not in {"minimax", "voxcpm1"}:
-            raise ValueError("tts.backend（语音运行后端）必须为 minimax 或 voxcpm1")
-        if self.local_model not in {"voxcpm1", "voxcpm2"}:
-            raise ValueError("tts.local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2")
+        if self.backend not in {"minimax", "aniflive"}:
+            raise ValueError("tts.backend（语音运行后端）必须为 minimax 或 aniflive")
+        if not valid_local_model(self.local_model):
+            raise ValueError("tts.local_model（本地模型编号）必须为有效登记标识。")
+        validate_options(self.__dict__)
+        if self.aniflive_language not in {"zh", "yue", "en", "ja", "ko"}:
+            raise ValueError("aniflive_language（待合成语言）无效。")
         if self.transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
         if self.scheduling not in {"auto", "direct", "playback_window", "sentence_window"}:
@@ -735,6 +741,8 @@ class AppConfig:
         configured_tts_backend = _string(tts.get("backend"), "minimax").strip().lower()
         if configured_tts_backend == "cosyvoice":
             configured_tts_backend = "minimax"
+        configured_tts_backend, configured_local_tts_model = migrate_choice(
+            configured_tts_backend, _string(tts.get("local_model"), DEFAULT_LOCAL_MODEL).strip().lower())
         configured_online_tts_sample_rate = int(_number(tts.get("sample_rate"), 32000))  # configured_online_tts_sample_rate（配置文件中的在线采样率）。
         bridge = _section(data, "text_bridge")
         screen_capture = ScreenCaptureConfig(**_section(data, "screen_capture"))
@@ -1051,7 +1059,11 @@ class AppConfig:
             tts=TtsConfig(
                 provider="minimax",
                 backend=configured_tts_backend,
-                local_model=_string(tts.get("local_model"), "voxcpm2").strip().lower(),
+                local_model=configured_local_tts_model,
+                local_model_revision=tts.get("local_model_revision"),
+                aniflive_language=_string(tts.get("aniflive_language"), "zh"),
+                aniflive_chunk_optimization=tts.get("aniflive_chunk_optimization", True),
+                aniflive_first_audio_wait_ms=tts.get("aniflive_first_audio_wait_ms", 0),
                 base_url=os.environ.get("MINIMAX_API_HOST", "").strip() or _string(tts.get("base_url"), "https://api.minimaxi.com"),
                 websocket_path=_string(tts.get("websocket_path"), "/ws/v1/t2a_v2"),
                 transport=_string(tts.get("transport"), "websocket"),
@@ -1061,7 +1073,7 @@ class AppConfig:
                 output_format=_string(tts.get("output_format"), "pcm"),
                 sample_rate=resolve_tts_sample_rate(
                     configured_tts_backend,
-                    _string(tts.get("local_model"), "voxcpm2").strip().lower(),
+                    configured_local_tts_model,
                     configured_online_tts_sample_rate,
                 ),
                 online_sample_rate=configured_online_tts_sample_rate,
@@ -1084,8 +1096,7 @@ class AppConfig:
                 first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),
                 local_optimization=_bool(tts.get("local_optimization"), True),
                 acoustic_continuation=_bool(tts.get("acoustic_continuation"), True),
-                gpu_max_performance=_bool(tts.get("gpu_max_performance"), True),
-                inference_steps_by_model=validate_tts_inference_steps(tts.get("inference_steps_by_model", {})),
+                gpu_max_performance=tts.get("gpu_max_performance", False),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

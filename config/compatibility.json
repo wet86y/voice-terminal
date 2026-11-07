@@ -1,9 +1,39 @@
 {
   "schema": 1,
-  "revision": 6,
-  "settings_schema_max": 19,
-  "upgrade_handlers": ["speaker", "tts_audiocpp"],
-  "settings_rules": [],
+  "revision": 7,
+  "settings_schema_max": 20,
+  "upgrade_handlers": [
+    "speaker"
+  ],
+  "settings_rules": [
+    {
+      "id": "tts-aniflive-backend",
+      "action": "replace_value",
+      "field": "/tts/backend",
+      "expected": "voxcpm1",
+      "value": "aniflive",
+      "min_schema": 1,
+      "max_schema": 19
+    },
+    {
+      "id": "tts-aniflive-voxcpm1",
+      "action": "replace_value",
+      "field": "/tts/local_model",
+      "expected": "voxcpm1",
+      "value": "minimax-female-shaonv-zh",
+      "min_schema": 1,
+      "max_schema": 19
+    },
+    {
+      "id": "tts-aniflive-voxcpm2",
+      "action": "replace_value",
+      "field": "/tts/local_model",
+      "expected": "voxcpm2",
+      "value": "minimax-female-shaonv-zh",
+      "min_schema": 1,
+      "max_schema": 19
+    }
+  ],
   "fields": {
     "schema": "兼容规则格式版本；未知版本拒绝执行",
     "revision": "规则修订号；内容摘要同时参与即时性核对",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from .settings import valid_local_model
 
 logger = logging.getLogger(__name__)
 
@@ -12,16 +13,16 @@ logger = logging.getLogger(__name__)
 class TtsBackendRouter:
     def __init__(self, *, remote: Any | None, local: Any | None = None,
                  backend: str = "minimax", speech_control_enabled: bool = True) -> None:
-        if backend not in {"minimax", "voxcpm1"}:
-            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
-        if backend == "voxcpm1" and local is None:
+        if backend not in {"minimax", "aniflive"}:
+            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 aniflive。")
+        if backend == "aniflive" and local is None:
             raise ValueError("本地 TTS 后端尚未接入。")
         self.remote = remote
         self.local = local
         self.backend = backend
         self.speech_control_enabled = speech_control_enabled
         self._local_leases = 0
-        self._local_ready = backend == "voxcpm1"
+        self._local_ready = backend == "aniflive"
         self._switch_lock = asyncio.Lock()
         self._local_switching = False
 
@@ -45,7 +46,7 @@ class TtsBackendRouter:
     @property
     def supports_prewarm(self) -> bool:
         client = self.current_client()
-        return bool(client is not None and callable(getattr(client, "prewarm", None)))
+        return bool(client is not None and callable(getattr(client, "prewarm", None)) and getattr(client, "prewarm_enabled", True))
 
     @property
     def playback_startup_buffer_ms(self) -> int:
@@ -60,7 +61,7 @@ class TtsBackendRouter:
         return int(getattr(client, "playback_resume_buffer_ms", 0) or 0)
 
     def current_client(self) -> Any | None:
-        return self.local if self.backend == "voxcpm1" else self.remote
+        return self.local if self.backend == "aniflive" else self.remote
 
     @property
     def local_model(self) -> str | None:
@@ -76,10 +77,10 @@ class TtsBackendRouter:
 
     def bind(self, *, backend: str | None = None) -> tuple[str, Any | None]:
         backend = self.backend if backend is None else backend  # backend（续写沿用原回应的合成后端）。
-        if backend not in {"minimax", "voxcpm1"}:
-            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
-        client = self.local if backend == "voxcpm1" else self.remote
-        if backend == "voxcpm1":
+        if backend not in {"minimax", "aniflive"}:
+            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 aniflive。")
+        client = self.local if backend == "aniflive" else self.remote
+        if backend == "aniflive":
             if self._local_switching:
                 raise RuntimeError("本地 TTS 模型正在切换，请等待切换完成后再发起播报。")
             self._local_leases += 1
@@ -90,19 +91,19 @@ class TtsBackendRouter:
         ensure_ready = getattr(client, "ensure_ready", None)
         if callable(ensure_ready):
             await ensure_ready()
-            if self.backend == "voxcpm1":
+            if self.backend == "aniflive":
                 self._local_ready = True
 
     def release(self, backend: str) -> None:
-        if backend != "voxcpm1":
+        if backend != "aniflive":
             return
         self._local_leases = max(0, self._local_leases - 1)
-        if self._local_leases == 0 and self.backend != "voxcpm1":
+        if self._local_leases == 0 and self.backend != "aniflive":
             asyncio.create_task(self._stop_after_drain(), name="local-tts-drain-stop")
 
     async def _stop_after_drain(self) -> None:
         async with self._switch_lock:
-            if (self._local_leases == 0 and self.backend != "voxcpm1"
+            if (self._local_leases == 0 and self.backend != "aniflive"
                     and self.local is not None and self._local_ready):
                 await self.local.close()
                 self._local_ready = False
@@ -110,12 +111,12 @@ class TtsBackendRouter:
                             self.backend, self.local_model)
 
     async def switch(self, backend: str) -> None:
-        if backend not in {"minimax", "voxcpm1"}:
-            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
+        if backend not in {"minimax", "aniflive"}:
+            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 aniflive。")
         async with self._switch_lock:
             previous = self.backend
             try:
-                if backend == "voxcpm1":
+                if backend == "aniflive":
                     if self.local is None:
                         raise ValueError("本地 TTS 后端尚未接入。")
                     await self.local.ensure_ready()
@@ -137,7 +138,7 @@ class TtsBackendRouter:
         client = self.current_client()
         if client is None:
             return {"status": "DISABLED", "reason": "provider_unavailable"}
-        local_backend = self.backend == "voxcpm1"
+        local_backend = self.backend == "aniflive"
         if local_backend:
             if self._local_switching:
                 return {"status": "DISABLED", "reason": "model_switching"}
@@ -157,18 +158,18 @@ class TtsBackendRouter:
             return await prewarm(turn_id=turn_id)
         finally:
             if local_backend:
-                self.release("voxcpm1")
+                self.release("aniflive")
 
-    async def switch_local_model(self, local_model: str) -> None:
+    async def switch_local_model(self, local_model: str, revision=None) -> None:
         """在没有本地 TTS 会话租约时切换模型。"""
-        if self.backend != "voxcpm1":
-            raise RuntimeError("当前 TTS 后端未启用本地 VoxCPM。")
+        if self.backend != "aniflive":
+            raise RuntimeError("当前 TTS 后端未启用本地 AnifLive。")
         if self.local is None:
             raise RuntimeError("本地 TTS 后端尚未接入。")
-        if local_model not in {"voxcpm1", "voxcpm2"}:
-            raise ValueError("local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。")
+        if not valid_local_model(local_model):
+            raise ValueError("local_model（本地语音合成模型）必须为已登记模型编号。")
         async with self._switch_lock:
-            if self.backend != "voxcpm1":
+            if self.backend != "aniflive":
                 raise RuntimeError("当前 TTS（语音合成）后端已切换为在线接口，无法切换本地模型。")
             if self._local_leases:
                 raise RuntimeError("当前仍有 TTS（语音合成）会话，请等播报事务结束后再切换模型。")
@@ -180,7 +181,10 @@ class TtsBackendRouter:
             self._local_switching = True
             logger.info("tts.local_model_switch_started local_model=%s", local_model)
             try:
-                await switch_model(local_model)
+                if revision is None:
+                    await switch_model(local_model)
+                else:
+                    await switch_model(local_model, revision=revision)
                 self._local_ready = True
             except Exception as exc:
                 logger.warning("tts.local_model_switch_failed local_model=%s error_type=%s error=%s",
@@ -191,8 +195,23 @@ class TtsBackendRouter:
             logger.info("tts.local_model_switch_finished local_model=%s", local_model)
 
     async def discard_prewarm(self, *, turn_id: str | None = None) -> None:
-        if self.remote is not None:
-            await self.remote.discard_prewarm(turn_id=turn_id)
+        client = self.current_client()
+        discard = getattr(client, "discard_prewarm", None)
+        if callable(discard):
+            await discard(turn_id=turn_id)
+
+    @property
+    def vad_prewarm(self) -> bool:
+        return bool(getattr(self.current_client(), "vad_prewarm", False))
+
+    async def configure_optimization(self, **options) -> None:
+        configure = getattr(self.local, "configure_optimization", None)
+        if callable(configure):
+            await configure(**options)
+
+    @property
+    def aniflive_first_audio_wait_ms(self) -> int:
+        return int(getattr(self.current_client(), "aniflive_first_audio_wait_ms", 0))
 
     async def close(self) -> None:
         if self.remote is not None:

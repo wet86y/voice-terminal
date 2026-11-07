@@ -122,7 +122,7 @@ class TtsVoiceOperationManager:
         return self.runtime.voice_library.for_model(model)
 
     def _require_local_client(self, model):
-        if self.runtime.config.tts.backend != "voxcpm1" or self.runtime.config.tts.local_model != model:
+        if self.runtime.config.tts.backend != "aniflive" or model != "aniflive":
             raise TtsVoiceOperationError("请先切换到目标本地模型，再执行试音。")
         client = getattr(self.runtime.tts, "local", None)
         if client is None:
@@ -277,26 +277,10 @@ class TtsVoiceOperationManager:
         client = self._require_local_client(model)
         await client.ensure_ready()
         voice = dict(operation.request["voice"])
-        description = " ".join(str(voice.get("design_description") or "").split())
-        source = voice.get("source_reference_asset_id") or (voice.get("reference_asset_id") if not description else None)
-        # 单纯克隆使用参考音频与准确转写；混合创作仅保留源转写为编辑资料，
-        # 隔离音色参考与设计描述生成目标样音后，再以目标转写高保真克隆。
-        source_text = _collapsed_text(voice.get("source_reference_text") or voice.get("reference_text", ""))
-        if description:
-            if model != "voxcpm2":
-                raise TtsVoiceOperationError("VoxCPM1（第一代模型）不支持音色设计。")
-            snapshot = library.resolve_design(description, is_preview=True)
-            if source:
-                # 混合创作使用隔离音色参考；续写提示与设计描述并用会被模型当成可朗读正文。
-                # 源转写保留编辑资料，生成目标样音后再使用目标转写进行正式高保真克隆。
-                snapshot = replace(snapshot, reference_path=library.asset_path(source),
-                                   reference_mode="voice", reference_text="")
-        else:
-            if not source_text:
-                raise TtsVoiceOperationError("请先填写参考音频的准确转写，再试音克隆效果。")
-            snapshot = library.resolve_draft(model, {"name": voice.get("name") or "新音色", "source": "import",
-                "reference_asset_id": source, "reference_text": source_text})
-        steps = DESIGN_INFERENCE_STEPS if model == "voxcpm2" else client.inference_steps_by_model[model]
+        if voice.get("design_description") or voice.get("reference_mode") == "design":
+            raise TtsVoiceOperationError("AnifLive 使用参考录音与准确转写克隆音色。")
+        source = voice.get("reference_asset_id")
+        snapshot = library.resolve_draft(model, {**voice, "name": voice.get("name") or "新音色", "source": "import"})
         pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"])
         asset = await asyncio.to_thread(library.put_pcm, pcm, sample_rate=16000)
         if high_fidelity is not None:
@@ -311,16 +295,9 @@ class TtsVoiceOperationManager:
                 logging.getLogger(__name__).warning(
                     "tts_voice.high_fidelity_store_failed asset=%s error_type=%s error=%s",
                     asset["asset_id"], type(exc).__name__, str(exc)[:200])
-        payload = {"name": voice.get("name") or "新音色", "source": "design" if description else "import",
-            "reference_asset_id": asset["asset_id"] if description else source,
-            "reference_text": operation.request["text"] if description else snapshot.reference_text,
-            "source_reference_asset_id": source if description else None,
-            "source_reference_text": source_text,
-            "design_description": description, "design_text": operation.request["text"],
-            "design_model": "voxcpm2", "inference_steps": steps}
-        if description:
-            payload["generation_recipe"] = DESIGN_GENERATION_RECIPE
-            library.mark_design(asset["asset_id"], payload)
+        payload = {"name": voice.get("name") or "新音色", "source": "import",
+            "reference_asset_id": source, "reference_text": snapshot.reference_text,
+            "reference_language": snapshot.reference_language}
         operation.result = {**asset, "voice": payload}
         operation.request["asset_id"] = asset["asset_id"]
         await self._play(operation)
@@ -333,8 +310,7 @@ class TtsVoiceOperationManager:
         编码器固定读 16 kHz，所以主素材必须是 16 kHz；原生 48 kHz 样音另存
         一份，保留 8 kHz 以上带宽供后续音色处理。
         """
-        steps = DESIGN_INFERENCE_STEPS if snapshot.model == "voxcpm2" else client.inference_steps_by_model[snapshot.model]
-        session = client.session(voice_snapshot=snapshot, preview=True, inference_steps=steps)
+        session = client.session(voice_snapshot=snapshot, preview=True)
         operation.session = session
         output = bytearray()
 
@@ -370,6 +346,7 @@ class TtsVoiceOperationManager:
             client._warmed = False
             try:
                 await session.close()
+                await client.prepare_reference()
             finally:
                 operation.session = None
 

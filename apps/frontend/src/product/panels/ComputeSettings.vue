@@ -315,10 +315,10 @@ const rows = computed<LocalComponentRow[]>(() => {
     || capability && ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state))
   const ttsFailed = !ttsLoading && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
   const ttsBackend = tts.status.value?.backend ?? settings.tts.backend
-  const selectedLocalModel = ttsBackend === 'voxcpm1' ? `tts-${tts.status.value?.local_model ?? settings.tts.local_model ?? 'voxcpm1'}` : undefined
-  const localRuntime = managedResource('tts-audiocpp-runtime')
+  const selectedLocalModel = ttsBackend === 'aniflive' ? `tts-aniflive-${tts.status.value?.local_model ?? settings.tts.local_model ?? 'minimax-female-shaonv-zh'}` : undefined
+  const localRuntime = managedResource('tts-aniflive-runtime')
   const localRuntimeReady = localRuntime?.state === 'installed' && !localRuntime.updateAvailable
-  const localModelResources = ['tts-voxcpm2', 'tts-voxcpm1']
+  const localModelResources = (tts.status.value?.models.map(row => `tts-aniflive-${row.id}`) ?? [])
     .map(id => managedResource(id)).filter((resource): resource is ManagedResourceRow => Boolean(resource))
     .map(resource => ({
       ...resource,
@@ -326,11 +326,11 @@ const rows = computed<LocalComponentRow[]>(() => {
         : resource.state === 'installed' ? localRuntimeReady ? '已就绪' : '已安装，运行环境待配置'
           : resource.state === 'incomplete' ? '不完整' : '待安装',
     }))
-  const loadedLocalModelId = ttsBackend === 'voxcpm1' && tts.status.value?.load_state === 'ready'
-    && tts.status.value.loaded_model ? `tts-${tts.status.value.loaded_model}` : undefined
+  const loadedLocalModelId = ttsBackend === 'aniflive' && tts.status.value?.load_state === 'ready'
+    && tts.status.value.loaded_model ? `tts-aniflive-${tts.status.value.loaded_model}` : undefined
   components.push(...localModelResources.map((resource): LocalComponentRow => {
     const selected = resource.id === selectedLocalModel
-    // local-tts（本地语音进程）的整进程采样只归当前已加载的 VoxCPM 模型，避免与 audio.cpp 依赖卡重复累计。
+    // local-tts（本地语音进程）的整进程采样只归当前已加载的 AnifLive 模型，避免与 共用运行依赖卡重复累计。
     const localModelMetrics = resource.id === loadedLocalModelId ? localMetrics : undefined
     const ready = resource.state === 'installed' && !resource.updateAvailable && localRuntimeReady
     const busy = selected && ttsLoading
@@ -361,12 +361,12 @@ const rows = computed<LocalComponentRow[]>(() => {
         vram: localModelMetrics.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
           ? localModelMetrics.gpu_dedicated_bytes : undefined,
       } : undefined,
-      description: `${resource.label} 本地语音模型；与另一款 VoxCPM 共用 audio.cpp 运行程序。`,
+      description: `${resource.label} 本地语音模型；使用 AnifLive（本地语音引擎）隔离运行依赖。`,
       error: failed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
       facts: [],
       resource,
       sharedResource: localRuntime,
-      note: 'VoxCPM1 与 VoxCPM2 共用 audio.cpp；下载不会自动切换当前播放后端。',
+      note: '各本地模型共用隔离运行依赖；配置完成后可手动保存播放目标。',
     }
   }))
   const minimaxConfigured = providerConfigured.value.minimax

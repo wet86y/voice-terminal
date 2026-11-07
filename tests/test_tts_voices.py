@@ -38,19 +38,20 @@ def _create_voice(library: VoiceLibrary, *, text: str = "测试声音会清楚�
 def test_model_libraries_default_active_version_and_inflight_asset(tmp_path):
     from voice_terminal.tts.voices import ModelVoiceLibraries
     owner = ModelVoiceLibraries(tmp_path / "tts")
-    first, second = owner.for_model("voxcpm1"), owner.for_model("voxcpm2")
+    first = owner.for_model("aniflive")
+    second = VoiceLibrary(tmp_path / "separate-aniflive", model="aniflive")
     for library in (first, second):
         library.register_default(_wav_bytes(), "这是默认音色的准确参考转写。")
     assert first.active_selection != second.active_selection
     with pytest.raises(FileNotFoundError):
-        second.resolve("voxcpm2", first.active_selection)
+        second.resolve("aniflive", first.active_selection)
     with pytest.raises(VoiceLibraryError):
         first.resolve("voxcpm2", first.active_selection)
     with pytest.raises(VoiceDeleteConflict):
         first.delete_voice(first.active_selection["voice_id"])
     asset, voice = _create_voice(first)
     first.activate({"voice_id": voice["id"], "revision": 1})
-    frozen = first.resolve("voxcpm1", first.active_selection)
+    frozen = first.resolve("aniflive", first.active_selection)
     release = first.pin(frozen)
     changed = first.update_voice(voice["id"], 1, {**voice, "name": "新名称"})
     assert first.active_selection == {"voice_id": voice["id"], "revision": 2}
@@ -258,3 +259,14 @@ def test_default_repair_does_not_replace_a_user_reference_with_the_same_transcri
     library.asset_path(imported["asset_id"]).unlink()
     with pytest.raises(VoiceLibraryError, match="重新导入原参考音频"):
         library.register_default(_wav_bytes(), "相同转写。")
+
+
+@pytest.mark.parametrize('rate', [8000, 16000, 22050, 44100, 48000])
+def test_aniflive_reference_keeps_original_rate_with_separate_transcription_audio(tmp_path, rate):
+    library = VoiceLibrary(tmp_path / 'voices', model='aniflive')
+    asset = library.put_import(_wav_bytes(sample_rate=rate, seconds=4), 'reference.wav')
+    normalized = library.asset_path(asset['asset_id'])
+    original = library.high_fidelity_path(asset['asset_id']) or normalized
+    assert sf.info(str(normalized)).samplerate == 16000
+    assert sf.info(str(original)).samplerate == rate
+    assert sf.info(str(original)).channels == 1

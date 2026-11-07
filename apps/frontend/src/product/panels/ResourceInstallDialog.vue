@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import type { LocalDownloadItem } from '../../interface/local-components'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'tts-voxcpm1', 'tts-voxcpm2'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
   if (!plan) return false
@@ -16,7 +16,7 @@ const gpuDependencyPlan = computed(() => props.controller.pendingDownloadPlan.va
 const agentResourcePlan = computed(() => props.controller.pendingDownloadPlan.value?.resource_id === 'dsh')
 const targetModelVersion = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
-  if (!plan || !modelResourceIds.has(plan.resource_id)) return null
+  if (!plan || !(modelResourceIds.has(plan.resource_id) || plan.resource_id.startsWith('tts-aniflive-'))) return null
   return props.controller.resources.value.find(item => item.resource_id === plan.resource_id)?.version ?? null
 })
 const lightweightVadPlan = computed(() =>
@@ -80,7 +80,7 @@ function confirmBundle() {
       <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
       <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
-      <p v-if="['tts-voxcpm1', 'tts-voxcpm2'].includes(controller.pendingDownloadPlan.value.resource_id)">此计划仅下载本地模型自身文件。audio.cpp（原生语音合成框架）在语音服务分类单独管理；实际使用时需要模型与框架都就绪。默认参考音频由模型本体提供。</p>
+      <p v-if="controller.pendingDownloadPlan.value.resource_id.startsWith('tts-aniflive-')">此任务下载固定来源的权重、参考录音与隔离运行依赖，并在本机生成推理引擎。构建阶段会暂停当前语音服务；通过数值与真实合成验证后才登记模型，不会改变播放目标。</p>
       <p v-if="!controller.pendingDownloadPlan.value.environment && !controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
       <template v-if="controller.pendingDownloadPlan.value.environment">
         <p v-if="gpuDependencyPlan">这是可选显卡运行依赖。将为现用语音环境安装配套的 PyTorch（张量框架）与 torchaudio（音频扩展）显卡版，继续复用已有模型；未安装时可继续使用 CPU（中央处理器）。安装后仍需通过本机显卡检查。</p>

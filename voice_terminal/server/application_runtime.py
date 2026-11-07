@@ -81,7 +81,7 @@ class ApplicationRuntimeMixin:
         local_tts = getattr(self.tts, "local", None) if self.tts is not None else None
         local_tts_server = getattr(local_tts, "server", None)
         local_tts_process = getattr(local_tts_server, "_process", None)
-        local_tts_pid = None
+        local_tts_pid = getattr(local_tts_server, 'pid', None)
         if local_tts_process is not None:
             try:
                 if local_tts_process.poll() is None:
@@ -102,7 +102,7 @@ class ApplicationRuntimeMixin:
                 "phase": "声纹连接已就绪" if speaker_state == "ready" else "按配置停用" if speaker_state == "disabled" else "加载声纹工作进程" if speaker_state == "starting" else "声纹工作进程不可用",
                 "error": str(speaker_service.get("last_error") or "") if speaker_state == "failed" else "",
                 "pid": speaker_process.pid if speaker_process and speaker_process.returncode is None else None},
-            "local_tts": {"pid": local_tts_pid},  # local_tts（本地语音合成子进程），供宿主独立统计资源。
+            "local_tts": {"pid": local_tts_pid, "created_at": getattr(local_tts_server, 'created_at', None)},  # 编号及创建时间共同确认本地语音进程。
             # capabilities（分能力行）：宿主与界面据此显示“启动中/不可用”并单独恢复。
             "capabilities": self.capability_rows(),
         }

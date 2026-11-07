@@ -245,8 +245,8 @@ export interface ProductProvider {
 /** FixedModelCredentials（固定供应商密钥状态）：前端只接收是否已配置。 */
 export interface FixedModelCredentials {
   inference_backend?: InferenceBackend // inference_backend（启动时推理后端）。
-  tts_local_model?: 'voxcpm1' | 'voxcpm2' // tts_local_model（持久化本地语音模型）。
-  tts_backend?: 'minimax' | 'voxcpm1' // tts_backend（启动时语音后端）。
+  tts_local_model?: string // tts_local_model（持久化本地语音模型）。
+  tts_backend?: 'minimax' | 'aniflive' // tts_backend（启动时语音后端）。
   local_tts_ready?: boolean // local_tts_ready（至少一款本地模型及运行程序就绪）。
   providers: { deepseek: { configured: boolean }; minimax: { configured: boolean } }; // providers（两家固定服务的配置状态）。
   vault_available: boolean; // vault_available（本机凭据存储是否可用）。

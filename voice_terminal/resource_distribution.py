@@ -153,7 +153,7 @@ class ResourceCatalog:
                 _safe_relative(asset)
             seen.add(path)
             files.append(ResourceFile(path, size, digest, optional, asset, source_path))
-        if kind == "model" and not any(not item.optional for item in files):
+        if kind == "model" and not any(not item.optional for item in files) and raw.get("preparation") not in {"aniflive_local_build", "aniflive_runtime"}:
             raise ResourceError("catalog_invalid", "模型资源缺少必需文件。")
         if kind == "dsh" and raw.get("origin") not in {"official_installer", "npm_package"}:
             raise ResourceError("catalog_invalid", "DSH 资源只能声明固定官方安装器来源。")
@@ -993,7 +993,7 @@ class ResourceManager:
             if file.is_symlink() or not file.resolve().is_relative_to(self.models_root.resolve()):
                 raise ResourceError("unsafe_path", "模型目录包含指向目录之外的文件。")
             rel = file.relative_to(self.models_root).as_posix()
-            if rel.startswith(target_relative):
+            if rel.startswith(target_relative) or rel.startswith("aniflive-tts/shared/.cache/"):
                 continue
             prior = old_records.get(rel)
             metadata = file.stat()
@@ -1029,7 +1029,7 @@ class ResourceManager:
                       "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(), "optional": True})
         return "app/release.json", _json_bytes(release)
 
-    def _commit_candidate(self, spec: ResourceSpec, candidate: Path, task_id: str) -> None:
+    def _commit_candidate(self, spec: ResourceSpec, candidate: Path, task_id: str, *, model_registration: bytes | None = None) -> None:
         target = self._spec_target(spec)
         with _install_lock(self.root):
             self.recover_pending_transaction()
@@ -1045,11 +1045,19 @@ class ResourceManager:
                     self._check_source_file(path, item)
                     receipt_files.append({"path": item.path, "size": item.size_bytes,
                                           "sha256": item.sha256, "optional": item.optional})
-                _atomic_write(candidate / RECEIPT_NAME, _json_bytes(model_receipt(spec.resource_id, spec.version, receipt_files)))
+                if model_registration is None:
+                    _atomic_write(candidate / RECEIPT_NAME, _json_bytes(model_receipt(spec.resource_id, spec.version, receipt_files)))
+                elif (not spec.resource_id.startswith('tts-aniflive-') or not spec.destination.startswith('aniflive-tts/packages/')
+                      or not {'application-receipt.json', 'checksums.json'}.issubset({row['path'] for row in receipt_files})):
+                    raise ResourceError('invalid_model_registration', '生成模型必须携带应用验证收据和完整计算包摘要。')
+                # AnifLive（本地语音）包严格校验文件集合，使用其应用收据与版本登记。
+                # 另塞通用收据会令包无效；将其列入包摘要又会形成收据与摘要的循环依赖。
                 model_manifest = self._model_manifest_after_swap(spec, candidate)
                 model_bytes = _json_bytes(model_manifest)
                 release_rel, release_bytes = self._release_after_swap("models", model_manifest, model_bytes)
                 metadata = [(f"{self.models_relative}/manifest.json", model_bytes), (release_rel, release_bytes)]
+                if model_registration is not None:
+                    metadata.append(("data/config/aniflive-models.json", model_registration))
             else:
                 manifest_path = candidate / "manifest.json"
                 try:

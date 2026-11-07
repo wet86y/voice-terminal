@@ -634,15 +634,20 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         # ``hold_unplayed`` mark it HELD instead of only setting the global
         # gate and leaving the handle READY.
         self.inference_boundary.authorize_new(h)
-        if getattr(h.tts_client, "resolve_voice", None) is not None:
+        if getattr(h.tts_client, "resolve_voice", None) is not None or getattr(h.tts_client, "freeze_session_at_admission", False):
             try:
-                if _continuation_parent is not None and _continuation_parent.tts_voice_snapshot is not None:
+                if _continuation_parent is not None and (getattr(h.tts_client, "freeze_session_at_admission", False) or _continuation_parent.tts_voice_snapshot is not None):
                     h.tts_session = h.tts_client.session(voice_snapshot=_continuation_parent.tts_voice_snapshot,
                                                         inference_steps=_continuation_parent.tts_inference_steps,
                                                         turn_id=turn_id, speech_id=h.speech_id)
                 else:
                     h.tts_session = h.tts_client.session(turn_id=turn_id, speech_id=h.speech_id)
                 h.tts_session_prepared = True
+                if _continuation_parent is not None and getattr(h.tts_client, "freeze_session_at_admission", False):
+                    previous_session = _continuation_parent.tts_session
+                    h.tts_session.chunk_optimization = previous_session.chunk_optimization
+                    h.tts_session.first_audio_wait_ms = previous_session.first_audio_wait_ms
+                    h.tts_session.gpu_max_performance = getattr(previous_session, 'gpu_max_performance', False)
                 if getattr(h.tts_client, "supports_speech_controls", False):
                     h.tts_session.speech_control_reader = lambda: self._handle_controls(h)
                 h.tts_voice_snapshot = getattr(h.tts_session, "voice_snapshot", None)

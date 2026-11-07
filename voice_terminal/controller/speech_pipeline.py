@@ -70,7 +70,7 @@ def stream_reserve_clamp_reason(*, requested_ms: int, cap_ms: int, prefetch_ms: 
 def gpu_snapshot_fields(client) -> dict:
     """读取显卡取证字段，供"合成慢于实时"现场定位使用。
 
-    优先用 ``AudioCppTtsClient.gpu_performance`` 的 ``contention()``：它在既有
+    优先用本地语音客户端 ``gpu_performance``（显卡性能状态）的 ``contention()``（争用检查）：它在既有
     NVML 绑定（频率/功耗/利用率）之上补了两项现场必需证据——**外部显卡进程**
     与 **Windows 硬件加速 GPU 调度（HAGS）状态**。这两项正是"是外部程序在抢
     显卡，还是原生推理本身变慢"的判别依据；只靠原来那个快照无法区分。
@@ -610,7 +610,7 @@ class SpeechPipeline:
                     audio_signal.set()
                     if "first_audio" not in ws.timings:
                         from ..speaker.audit import audit
-                        ws.timings["first_audio"] = time.monotonic()
+                        ws.timings["first_audio"] = getattr(active_session, "first_audio_ready_at", None) or time.monotonic()
                         audit("synthesis_first_audio（合成首音频）", turn_id=ws.turn_id,
                               generation=ws.generation, timings=dict(ws.timings))
                     ws.timings.setdefault("first_pcm", time.monotonic())

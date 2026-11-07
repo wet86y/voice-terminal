@@ -5,11 +5,6 @@ use voice_desktop_common::{runtime,workspace::{atomic_json,safe_path},resources}
 use super::{Desktop,ResourceManager};
 fn allowed(window:&WebviewWindow,desktop:&Desktop)->Result<(),String>{super::trusted(window,desktop)?;super::require_command(desktop.mode,super::DesktopCommand::FocusMain)}
 fn dependency_plan(context:&voice_desktop_common::LaunchContext,group:&str)->Result<Value,String>{
-    if matches!(group,"audiocpp"|"tts-audiocpp-runtime"){
-        let item=resources::spec(context,"tts-audiocpp-runtime")?;
-        return Ok(json!({"resource_id":"tts-audiocpp-runtime","group":"audiocpp","required":false,"already_ready":resources::native_runtime_status(context)?["can_start"],"wheels":[],"system_candidates":[],"total_bytes":resources::download_bytes(&item),"source":item["source"],
-            "fields":{"resource_id":"可选原生语音运行依赖编号","group":"依赖卡片类型","required":"不独立阻塞整体启动","already_ready":"当前原生运行依赖已就绪","wheels":"此依赖不使用解释器预编译包","system_candidates":"此依赖不复用系统解释器","total_bytes":"原生运行依赖最大下载字节数","source":"固定官方来源及随包补丁"}}));
-    }
     runtime::plan(context,group)
 }
 #[tauri::command(rename_all="snake_case")]
@@ -21,7 +16,7 @@ pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Des
         let spec=resources::spec(&context,&resource_id)?;
         let model_bytes=resources::download_bytes(&spec);
         let mut shared_resources=vec![];
-        if let Some(shared)=spec["runtime_resource"].as_str().filter(|_| !matches!(resource_id.as_str(),"tts-voxcpm1"|"tts-voxcpm2")){
+        if let Some(shared)=spec["runtime_resource"].as_str().filter(|_| spec["preparation"]!="aniflive_local_build"){
             let ready=resources::inventory(&context)?.iter().any(|row|row["resource_id"]==shared&&row["can_start"]==true);
             if !ready{let item=resources::spec(&context,shared)?;shared_resources.push(json!({"resource_id":shared,"title":item["title"],"download_bytes":resources::download_bytes(&item)}));}
         }

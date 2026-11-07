@@ -144,8 +144,8 @@ export interface DesktopPort {
   listen?<T>(eventName: string, handler: (event: DesktopEvent<T>) => void): Promise<() => void>
 }
 
-/** TtsSelection（持久化语音目标）：voxcpm1（本地兼容后端），local_model（具体模型）。 */
-export interface TtsSelection { backend: 'minimax' | 'voxcpm1'; local_model: 'voxcpm1' | 'voxcpm2' }
+/** TtsSelection（持久化语音目标）：aniflive（本地引擎），local_model（具体模型）。 */
+export interface TtsSelection { backend: 'minimax' | 'aniflive'; local_model: string }
 
 /** DesktopWorkspacePort（桌面工作区扩展）：资源准备阶段直接由原生入口提供。 */
 export interface DesktopWorkspacePort {
