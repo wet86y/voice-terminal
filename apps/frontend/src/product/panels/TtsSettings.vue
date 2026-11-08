@@ -4,8 +4,7 @@ import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import TtsVoiceLibrary from '../../interface/TtsVoiceLibrary.vue'
 import TtsSynthesisPreferences from '../../interface/TtsSynthesisPreferences.vue'
 import OnlineTtsVoiceSettings from '../../interface/OnlineTtsVoiceSettings.vue'
-import AnifLiveModelImport from './AnifLiveModelImport.vue'
-import { productApi, type AnifLiveImportJob } from '../api'
+import { productApi } from '../api'
 import { desktopPort } from '../desktop-port'
 import { useProductContext } from '../product-context'
 import { isRecord } from '../../record'
@@ -13,14 +12,7 @@ import type { ProductLocalTtsModelId, ProductLocalTtsStatus, ProductOnlineTtsMod
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
 
 const props = withDefaults(defineProps<{ demo?: boolean }>(), { demo: false })
-type AnifLiveImportCompletion = {
-  model_id: string
-  revision?: string | null
-  task_id: string
-  scan_id?: string
-  reference_candidates?: AnifLiveImportJob['reference_candidates']
-}
-const emit = defineEmits<{ 'import-completed': [value: AnifLiveImportCompletion] }>()
+const emit = defineEmits<{ 'open-aniflive-components': [] }>()
 const context = props.demo ? undefined : useProductContext()
 const desktop = desktopPort()
 const settings = context?.settings ?? reactive({ tts: { backend: 'minimax', local_model: 'minimax-female-shaonv-zh' } as ProductTtsSettings })
@@ -38,14 +30,12 @@ const onlineVoiceIdDraft = ref(settings.tts.online_voice_id ?? 'female-shaonv')
 let onlinePreviewOperationId: string | undefined
 let selectionGeneration = 0 // selectionGeneration（选择请求代次）：连续操作保留最后目标。
 const error = ref('')
-const importOpen = ref(false)
 const demoStatus = reactive<ProductLocalTtsStatus>({ backend: 'minimax', local_model: 'minimax-female-shaonv-zh', loaded_model: null, load_state: 'disabled', error: null,
   models: [{ id: 'minimax-female-shaonv-zh', name: '中文少女声（通用基底）', available: true, loaded: false, native_sample_rate: 32000 }, { id: 'tangyuge-v2pp-d78cf598', name: '唐语歌（中文微调）', available: true, loaded: false, native_sample_rate: 32000 }] })
 const live = useLocalTtsStatus(() => !props.demo)
 const status = computed(() => props.demo ? demoStatus : live.status.value)
 const readyModels = computed(() => status.value?.models.filter(item => item.available === true) ?? []) // readyModels（可启动的本地模型）。
 const selectedReady = computed(() => selected.value === 'minimax' || readyModels.value.some(item => item.id === selected.value))
-const model = computed(() => selected.value)
 const options = reactive({ gpu_max_performance: settings.tts.gpu_max_performance ?? false, aniflive_chunk_optimization: settings.tts.aniflive_chunk_optimization ?? true, aniflive_first_audio_wait_ms: settings.tts.aniflive_first_audio_wait_ms ?? 0 })
 const effective = computed(() => status.value?.backend === 'aniflive' ? status.value.local_model : 'minimax')
 const unavailable = computed(() => saving.value || !!status.value?.pending_selection)
@@ -65,6 +55,7 @@ watch(() => status.value, value => {
   previousEffective = nextEffective
   if (!value.pending_selection) {
     settings.tts.backend = value.backend; settings.tts.local_model = value.local_model
+    localDraft.value = value.local_model
     if (!saving.value && draftFollowedPreviousEffective) selected.value = nextEffective
   }
 })
@@ -73,15 +64,6 @@ onBeforeUnmount(() => {
 })
 onMounted(() => { if (!props.demo) void live.refresh() })
 function refreshStatus() { if (!props.demo) void live.refresh() }
-async function handleAnifLiveImportCompleted(result: AnifLiveImportCompletion) {
-  await live.refresh(true)
-  if (readyModels.value.some(item => item.id === result.model_id)) {
-    // draft（草稿）仅更新页面选择；用户按下保存后才切换实际播放目标。
-    localDraft.value = result.model_id as ProductLocalTtsModelId
-    if (selected.value !== 'minimax') selected.value = localDraft.value
-  }
-  emit('import-completed', result)
-}
 async function setSpeechControl(enabled: boolean) {
   const previous = settings.tts.speech_control_enabled ?? true
   savingControls.value = true; error.value = ''
@@ -97,33 +79,10 @@ async function setSpeechControl(enabled: boolean) {
     error.value = failure instanceof Error ? failure.message : '保存语音调节失败。'
   } finally { savingControls.value = false }
 }
-function selectTarget(event: Event) {
-  const choice = (event.target as HTMLSelectElement).value as Choice
-  if (choice !== 'minimax' && !status.value?.models.some(item => item.id === choice)) return
-  selected.value = choice
-  if (choice !== 'minimax') localDraft.value = choice
-  error.value = ''
-}
 function selectMode(mode: 'online' | 'local') {
+  if (mode === 'local' && !status.value?.models.some(model => model.id === localDraft.value) && readyModels.value.length) localDraft.value = readyModels.value[0]!.id
   selected.value = mode === 'online' ? 'minimax' : localDraft.value
   error.value = ''
-}
-async function saveLocalModel() {
-  if (!readyModels.value.some(item => item.id === localDraft.value)) return
-  if (status.value?.backend === 'aniflive') {
-    try { await applyTarget(localDraft.value) } catch { /* 错误已展示。 */ }
-    return
-  }
-  saving.value = true; error.value = ''
-  try {
-    if (!props.demo) {
-      const result = await productApi.saveTts({ local_model: localDraft.value })
-      if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
-      await live.refresh(true)
-    } else demoStatus.local_model = localDraft.value
-  } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : '保存本地模型失败。'
-  } finally { saving.value = false }
 }
 async function applyTarget(choice: Choice) {
   if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) {
@@ -161,6 +120,9 @@ async function ensureTargetSupport(_engine: ProductLocalTtsModelId) {
 }
 async function saveOption(key: keyof typeof options, value: boolean | number) {
   if (savingQuality.value) return
+  if (key === 'aniflive_first_audio_wait_ms') {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 200) { error.value = '首音等待请输入 0–200 之间的整数（毫秒）。'; return }
+  }
   const previous = { ...options }
   savingQuality.value = true; error.value = ''
   Object.assign(options, { [key]: value })
@@ -240,15 +202,15 @@ async function openOfficialVoiceLibrary() {
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
     <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :disabled="saving" :demo="demo" :lookup-voice-name="productApi.minimaxVoiceName" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
-    <AnifLiveModelImport :demo="demo" :open="importOpen" @update:open="importOpen = $event" @completed="handleAnifLiveImportCompleted" />
-    <section v-if="selected !== 'minimax'" class="tts-target preference-card">
-      <div class="tts-model-row"><label class="form-field"><span>基础模型引擎</span><select :value="selected" :disabled="unavailable" @change="selectTarget"><option v-for="item in status?.models ?? []" :key="item.id" :value="item.id">{{ names[item.id] }}{{ item.available ? '' : '（未就绪）' }}</option></select></label><button class="outline-button" type="button" :disabled="demo" @click="importOpen = true">导入</button><button class="save-button" type="button" :disabled="unavailable || !selectedReady || localDraft === status?.local_model" @click="saveLocalModel">保存</button></div>
-    </section>
-    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="selected" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" />
+    <div v-if="selected !== 'minimax'" class="tts-model-row">
+      <label v-if="status?.models.length" class="form-field"><span>本地模型</span><select v-model="selected" :disabled="unavailable" @change="localDraft = selected"><option v-for="model in status.models" :key="model.id" :value="model.id" :disabled="!model.available">{{ model.name }}{{ model.available ? '' : '（未就绪）' }}</option></select></label>
+      <div v-else class="tts-model-link"><p class="instruction-hint">暂无已登记的本地模型，请先导入。</p><button class="outline-button" type="button" :disabled="demo" @click="emit('open-aniflive-components')">模型导入</button></div>
+    </div>
+    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="selected" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" @model-import="emit('open-aniflive-components')" />
     <section v-if="selected !== 'minimax'" class="aniflive-options" aria-label="AnifLive 音色选项">
-      <label class="switch-row"><div><strong>显卡高性能</strong><span>开启后暂停并取消事件预热。下一回答生效。</span></div><input type="checkbox" role="switch" aria-label="显卡高性能" :checked="options.gpu_max_performance" :disabled="savingQuality" @change="saveOption('gpu_max_performance', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
-      <label class="switch-row"><div><strong>后续分块优化</strong><span>开启使用 48 个语义标记，关闭使用 96 个。下一回答生效。</span></div><input type="checkbox" role="switch" aria-label="后续分块优化" :checked="options.aniflive_chunk_optimization" :disabled="savingQuality" @change="saveOption('aniflive_chunk_optimization', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
-      <label class="form-field"><span>首音等待 · {{ options.aniflive_first_audio_wait_ms }} 毫秒</span><input type="range" min="0" max="200" step="1" aria-label="首音等待" :value="options.aniflive_first_audio_wait_ms" :disabled="savingQuality" @change="saveOption('aniflive_first_audio_wait_ms', Number(($event.target as HTMLInputElement).value))"><small>从网络首块实际到达开始等待，期间继续接收音频。下一回答生效。</small></label>
+      <label class="switch-row"><div><strong>高性能</strong><span title="开启后暂停并取消事件预热，下一回答生效。">暂停事件预热</span></div><input type="checkbox" role="switch" aria-label="显卡高性能" :checked="options.gpu_max_performance" :disabled="savingQuality" @change="saveOption('gpu_max_performance', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
+      <label class="switch-row"><div><strong>分块优化</strong><span title="开启使用 48 个语义标记，关闭使用 96 个，下一回答生效。">优化后续音频分块</span></div><input type="checkbox" role="switch" aria-label="分块优化" :checked="options.aniflive_chunk_optimization" :disabled="savingQuality" @change="saveOption('aniflive_chunk_optimization', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
+      <label class="switch-row"><div><strong>首音等待（毫秒）</strong><span title="从网络首块实际到达开始等待，期间继续接收音频，下一回答生效。">下一回答生效</span></div><input class="wait-input" type="number" min="0" max="200" step="1" aria-label="首音等待" :value="options.aniflive_first_audio_wait_ms" :disabled="savingQuality" @change="saveOption('aniflive_first_audio_wait_ms', Number(($event.target as HTMLInputElement).value))"></label>
     </section>
     <TtsSynthesisPreferences
       :speech-control-enabled="settings.tts.speech_control_enabled ?? true"
@@ -262,11 +224,18 @@ async function openOfficialVoiceLibrary() {
 </template>
 
 <style scoped>
-.aniflive-options { display: grid; gap: 12px; }
+.aniflive-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; gap: 12px; }
+.aniflive-options .switch-row { margin: 0; padding: 14px 16px; min-width: 0; height: 64px; box-sizing: border-box; }
+.aniflive-options .switch-row > div { min-width: 0; }
+.aniflive-options .switch-row span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.aniflive-options .wait-input { position: static; opacity: 1; flex: none; width: 76px; height: 36px; padding: 6px 10px; box-sizing: border-box; }
+@media(max-width:600px) { .aniflive-options { grid-template-columns: minmax(0, 1fr); } }
 .tts-settings { display: grid; gap: 22px; }
 .tts-target { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--panel); }
 .tts-target-row { display: grid; grid-template-columns: minmax(0,520px) auto; align-items: end; gap: 12px; }
-.tts-model-row { display: grid; grid-template-columns: minmax(0,520px) auto auto; align-items: end; gap: 12px; }
+.tts-model-link { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 12px; }
+.tts-model-link strong { font-size: var(--font-section); }
+.tts-model-link p { margin: 6px 0 0; }
 .tts-target-save { min-height: 42px; white-space: nowrap; }
-@media(max-width:600px) { .tts-target-row { grid-template-columns: minmax(0,1fr); } .tts-target-save { justify-self: end; } }
+@media(max-width:600px) { .tts-target-row { grid-template-columns: minmax(0,1fr); } .tts-target-save { justify-self: end; } .tts-model-link { grid-template-columns: minmax(0,1fr); } .tts-model-link .outline-button { justify-self: end; } }
 </style>

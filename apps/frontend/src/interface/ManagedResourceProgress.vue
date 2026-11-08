@@ -19,7 +19,8 @@ const done = computed(() => kind.value === 'download' ? props.job.downloadComple
 const total = computed(() => kind.value === 'download' ? props.job.downloadTotalBytes ?? props.job.totalBytes
   : kind.value === 'verify' ? props.job.verificationTotalBytes ?? props.job.totalBytes : props.job.totalBytes)
 const percent = computed(() => props.job.progressKind && ['install', 'waiting'].includes(props.job.progressKind)
-  ? undefined : progressPercent(done.value, total.value))
+  ? undefined : typeof props.job.percentage === 'number' && Number.isFinite(props.job.percentage)
+    ? Math.max(0, Math.min(100, Math.round(props.job.percentage))) : progressPercent(done.value, total.value))
 const stageLabel = computed(() => kind.value === 'download' ? '下载：' : kind.value === 'verify' ? '校验：' : '')
 function formatBytes(value: number | null | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
@@ -37,7 +38,7 @@ function formatBytes(value: number | null | undefined) {
       <div class="managed-job-progress" :class="{ indeterminate: percent === undefined }" role="progressbar" :aria-label="`${label}进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="percent">
         <span :style="percent !== undefined ? { width: `${percent}%` } : undefined"></span>
       </div>
-      <small v-if="percent !== undefined"><template v-if="kind === 'build'">已完成步骤 {{ done }} / {{ total }}</template><template v-else>{{ stageLabel }}{{ formatBytes(done) }} / {{ formatBytes(total) }}</template> · {{ percent }}%</small>
+      <small v-if="percent !== undefined"><template v-if="job.percentage === undefined"><template v-if="kind === 'build'">已完成步骤 {{ done }} / {{ total }}</template><template v-else>{{ stageLabel }}{{ formatBytes(done) }} / {{ formatBytes(total) }}</template> · </template>{{ percent }}%</small>
       <small v-else>请稍候…</small>
     </div>
     <p v-if="job.error" class="managed-job-error" role="alert">{{ job.error }}</p>

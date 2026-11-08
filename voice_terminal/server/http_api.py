@@ -854,6 +854,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "worker": {"state": "stopped"},  # worker（旧式本地工作进程）兼容字段。
         }
 
+    @app.patch("/api/v1/tts/aniflive/models/{model_id}")
+    async def rename_aniflive_model(model_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """model_id（稳定模型标识）；body（只含 name（模型显示名称））。"""
+        if set(body) != {"name"}:
+            raise HTTPException(status_code=422, detail="模型重命名只接受 name（显示名称）。")
+        try:
+            from ..tts.aniflive_models import AnifLiveModelRegistry
+            registry = AnifLiveModelRegistry(runtime._runtime_local_root, runtime._tts_voice_root.parent)
+            return await asyncio.to_thread(registry.rename, model_id, body.get("name"))
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     def tts_voice_library_or_503(model=None):
         libraries = getattr(runtime, "voice_library", None)
         if libraries is None:
@@ -998,6 +1010,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             return {"voice": voice}
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put('/api/v1/tts/voices/{model}/{voice_id}/default-reference')
+    async def set_tts_default_reference(model: str, voice_id: str, body: dict[str, Any]):
+        if set(body) != {'reference_id', 'expected_revision'}:
+            raise HTTPException(status_code=422, detail='仅接受 reference_id（参考编号，可为空）和 expected_revision（预期版本）。')
+        async with runtime._session_lock:
+            try:
+                voice = await asyncio.to_thread(tts_voice_library_or_503(model).set_default_reference,
+                    voice_id, body['expected_revision'], body['reference_id'])
+                client = getattr(runtime.tts, 'local', None)
+                if client:
+                    client._warmed = False
+                    client._prepared_expression_snapshot = None
+                await runtime.bus.publish(runtime.snapshot())
+                return {'voice': voice}
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.put("/api/v1/tts/voices/{model}/selection")
     async def select_tts_voice(model: str, body: dict[str, Any]):

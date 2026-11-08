@@ -56,7 +56,7 @@ export function useWorkspaceResources() {
   const startingResources = ref(new Set<string>())
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
-  const pendingResetPlan = ref<{ resource_id: string; paths: string[]; token: string; message: string } | null>(null) // pendingResetPlan（一次删除范围确认）。
+  const pendingResetPlan = ref<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string } | null>(null) // pendingResetPlan（一次删除范围确认）。
   const pendingDownloadPlan = ref<ResourceInstallPlan | null>(null)
   const pendingDownloadBundlePlan = ref<ResourceDownloadBundlePlan | null>(null) // pendingDownloadBundlePlan（分类下载确认草稿）。
   const preparingDownloadBundle = ref(false) // preparingDownloadBundle（正在并行读取分类资源计划）。
@@ -435,6 +435,10 @@ export function useWorkspaceResources() {
       schedulePoll(ACTIVE_REFRESH_MS)
     } catch (error) { resourceError.value = String(error) }
   }
+  async function requestReset(resourceId: string) {
+    try { pendingResetPlan.value = await port.resourceResetPlan(resourceId) }
+    catch (error) { resourceError.value = String(error) }
+  }
   async function importResource(resourceId?: string) {
     const rows = resources.value.flatMap(row => [row, ...(row.runtime_components ?? [])])
     if (resourceId && rows.find(row => row.resource_id === resourceId)?.reset_available) {
@@ -541,6 +545,7 @@ export function useWorkspaceResources() {
     downloadResource,
     downloadRequiredResources: () => startResourceJob('required-batch', 'required'),
     pendingResetPlan,
+    requestReset,
     confirmReset,
     pendingDownloadPlan,
     confirmDownload,

@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   src?: string // src（参考音频播放地址）。
   filename: string // filename（音频文件名称）。
   durationMs: number // durationMs（音频时长，单位为毫秒）。
   busy: boolean // busy（音色任务正在执行）。
   transcribing: boolean // transcribing（正在识别校对文本）。
   active: boolean // active（当前附件拥有播放焦点）。
-}>()
+  compact?: boolean // compact（仅显示试听按钮的紧凑模式）。
+  removable?: boolean // removable（是否显示移除参考音频按钮）。
+  transcribable?: boolean // transcribable（是否显示转写校对按钮）。
+}>(), { compact: false, removable: true, transcribable: true })
 const emit = defineEmits<{ play: []; transcribe: []; remove: []; error: [message: string] }>()
 const audio = ref<HTMLAudioElement>() // audio（原生音频播放器）。
 const playing = ref(false) // playing（实际播放状态）。
@@ -45,25 +48,27 @@ onBeforeUnmount(pause)
 </script>
 
 <template>
-  <div class="audio-attachment" role="group" aria-label="参考音频播放器">
+  <div class="audio-attachment" :class="{ compact }" role="group" aria-label="参考音频播放器">
     <audio v-if="src" ref="audio" :src="src" preload="metadata" @loadedmetadata="loaded" @durationchange="loaded" @timeupdate="updateTime" @play="playing = true" @pause="playing = false" @ended="playing = false" @error="playing = false; emit('error', '参考音频加载失败，请重试或重新上传。')"></audio>
     <button type="button" class="audio-play" :aria-label="playing ? '暂停参考音频' : '播放参考音频'" :title="playing ? '暂停参考音频' : '播放参考音频'" :disabled="!src" @click="togglePlayback">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="playing" d="M8 5v14M16 5v14" /><path v-else d="m9 5 10 7-10 7Z" /></svg>
     </button>
-    <div class="audio-details">
-      <div class="audio-summary"><strong :title="filename">{{ filename }}</strong><button type="button" class="transcribe-action" :disabled="busy" @click="emit('transcribe')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12v9H9l-4 3v-3H4ZM7 7h6M7 10h4" /></svg>{{ transcribing ? '正在识别…' : '开始校对文本' }}</button></div>
+    <div v-if="!compact" class="audio-details">
+      <div class="audio-summary"><strong :title="filename">{{ filename }}</strong><button v-if="transcribable" type="button" class="transcribe-action" :disabled="busy" @click="emit('transcribe')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12v9H9l-4 3v-3H4ZM7 7h6M7 10h4" /></svg>{{ transcribing ? '正在识别…' : '开始校对文本' }}</button></div>
       <div class="audio-timeline"><input type="range" aria-label="参考音频播放进度" min="0" :max="duration || 1" step="0.01" :value="currentTime" :disabled="!src || !duration" :style="{ '--audio-progress': `${progress}%` }" :aria-valuetext="`${timeLabel(currentTime)} / ${timeLabel(duration)}`" @input="seek"><small>{{ timeLabel(currentTime) }} / {{ timeLabel(duration) }}</small></div>
     </div>
-    <button type="button" class="audio-remove" aria-label="移除参考音频" title="移除参考音频" :disabled="busy" @click="emit('remove')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+    <button v-if="removable && !compact" type="button" class="audio-remove" aria-label="移除参考音频" title="移除参考音频" :disabled="busy" @click="emit('remove')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
   </div>
 </template>
 
 <style scoped>
 .audio-attachment { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); min-width: 0; }
+.audio-attachment.compact { gap: 0; padding: 0; border: 0; background: transparent; }
 audio { display: none; }
 button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .audio-play { width: 36px; height: 36px; padding: 8px; border-radius: 50%; border-color: color-mix(in srgb, var(--accent) 25%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
+.audio-attachment.compact .audio-play { width: 32px; height: 32px; padding: 7px; }
 .audio-play:hover:enabled { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 .audio-details { flex: 1; min-width: 0; display: grid; gap: 7px; }
 .audio-summary { display: flex; align-items: center; gap: 8px; min-width: 0; }

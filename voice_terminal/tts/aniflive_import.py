@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 from http.client import HTTPException
 import json
+import logging
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ MAX_TEXT_BYTES = 256 * 1024
 MAX_TEXT_CHARS = 2000
 ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 TASK_PATTERN = re.compile(r"[a-f0-9]{32}\Z")
+LOGGER = logging.getLogger(__name__)  # LOGGER（导入诊断日志）：只记录文件用途与相对路径，不记录录音转写正文。
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -82,9 +84,18 @@ def _classify(files: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     audio: list[dict[str, Any]] = []
     transcripts: list[dict[str, Any]] = []
     configs: list[dict[str, Any]] = []
+    audio_stems = {str(Path(row['path']).with_suffix('')).casefold() for row in files
+                   if Path(row['path']).suffix.casefold() in AUDIO_EXTENSIONS}
+    has_reference_directory = any('references' in row['path'].casefold().split('/')[:-1] for row in files)
     for source in files:
         path = source["path"]
+        parts = {part.casefold().replace('-', '_') for part in path.split('/')[:-1]}
+        # 引擎覆盖、预训练资源与合成输出示例保留在完整清单，不作为角色模型或参考资料。
+        if parts & {'gpt_sovits_overlay', 'pretrained_models', 'g2pwmodel'}:
+            continue
         extension = Path(path).suffix.casefold()
+        if has_reference_directory and extension in AUDIO_EXTENSIONS and parts & {'samples', 'examples'}:
+            continue
         entry = {
             "file_id": _file_id(path),  # file_id（文件候选标识）：绑定扫描清单内的单个相对路径。
             "path": path,  # path（仓库内相对路径）：仅用于显示和后续受控读取。
@@ -97,7 +108,8 @@ def _classify(files: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
             weights.append(entry)
         if extension in AUDIO_EXTENSIONS:
             audio.append(entry)
-        if extension in TEXT_EXTENSIONS:
+        if extension == '.list' or (extension in TEXT_EXTENSIONS and
+                str(Path(path).with_suffix('')).casefold() in audio_stems):
             transcripts.append(entry)
         if extension in REFERENCE_CONFIG_EXTENSIONS:
             configs.append(entry)
@@ -199,7 +211,15 @@ def _persist_reference_candidates(stage: Path, data_root: Path, task_id: str) ->
     manifest['persisted_files'] = rows
     manifest['fields']['persisted_files'] = '已持久化文件的来源路径、相对路径、内容摘要及字节数'
     _atomic_json(candidate / 'reference-candidates.json', manifest)
-    os.replace(candidate, destination)
+    for attempt in range(3):
+        try:
+            os.replace(candidate, destination)
+            break
+        except OSError as exc:
+            # Windows（操作系统）索引或防护进程可能短暂占用刚关闭的候选目录。
+            if attempt == 2 or getattr(exc, 'winerror', None) not in {5, 32, 33}:
+                raise
+            time.sleep(.05 * (attempt + 1))
     return destination
 
 
@@ -442,10 +462,10 @@ class AnifLiveImportService:
                 "file_id": "候选文件标识，用于绑定本次清单中的文件。",
                 "path": "来源中的相对文件路径。",
                 "size": "文件大小字节数；来源未提供时为空。",
-                "candidates": "按常见文件扩展名整理的候选分组。",
-                "weights": "可能的 GPT 或 SoVITS 权重；名称只用于排序。",
+                "candidates": "按用途整理的候选；排除引擎资源与输出示例。",
+                "weights": "角色模型权重候选；唯一角色自动匹配，内容兼容性由正式转换校验。",
                 "audio": "WAV、MP3、FLAC 或 OGG 参考音频候选。",
-                "transcripts": "TXT、LAB、TEXT 或 LIST 参考转写候选。",
+                "transcripts": "与录音同名的 TXT、LAB、TEXT 旁注及 LIST 标注清单。",
                 "role": "依据文件路径推测的权重角色；不决定最终兼容性。",
                 "fields": "本响应字段说明。",
             },
@@ -466,12 +486,23 @@ class AnifLiveImportService:
             raise ValueError("模型名称需为 1–80 个字符。")
         selected_gpt = body.get("selected_gpt")
         selected_sovits = body.get("selected_sovits")
+        candidates = _classify(record["files"])
+        for role, selected in (('gpt', selected_gpt), ('sovits', selected_sovits)):
+            eligible = [row for row in candidates['weights'] if row['role'] == role]
+            if len(eligible) == 1:
+                if selected and selected != eligible[0]['file_id']:
+                    raise ValueError('权重角色与自动识别结果不一致，请重新扫描。')
+                if role == 'gpt':
+                    selected_gpt = eligible[0]['file_id']
+                else:
+                    selected_sovits = eligible[0]['file_id']
+            elif not isinstance(selected, str) or selected not in {row['file_id'] for row in eligible}:
+                raise ValueError('存在多份权重或无法识别权重角色，请选择对应角色的权重或缩小扫描目录。')
         if not isinstance(selected_gpt, str) or not isinstance(selected_sovits, str) or selected_gpt == selected_sovits:
             raise ValueError("请选择一份 GPT 权重和一份 SoVITS 权重。")
         by_id = {_file_id(row["path"]): row for row in record["files"]}
         gpt = by_id.get(selected_gpt)
         sovits = by_id.get(selected_sovits)
-        candidates = _classify(record["files"])
         weight_ids = {row["file_id"] for row in candidates["weights"]}
         audio_ids = {row["file_id"] for row in candidates["audio"]}
         transcript_ids = {row["file_id"] for row in candidates["transcripts"]}
@@ -483,6 +514,12 @@ class AnifLiveImportService:
             raise ValueError("参考音频候选不在本次扫描清单中。")
         if selected_text is not None and (not isinstance(selected_text, str) or selected_text not in transcript_ids):
             raise ValueError("参考转写候选不在本次扫描清单中。")
+        if selected_text:
+            audio_path = by_id[selected_audio]['path'] if selected_audio else ''
+            text_path = by_id[selected_text]['path']
+            if (Path(text_path).suffix.casefold() == '.list' or not audio_path or
+                    str(Path(text_path).with_suffix('')).casefold() != str(Path(audio_path).with_suffix('')).casefold()):
+                raise ValueError('基础参考转写必须与所选录音同名配对；清单转写由系统按录音路径解析。')
         selected_references = body.get('selected_reference_files', list(audio_ids))
         if (not isinstance(selected_references, list) or len(selected_references) > MAX_FILES
                 or any(not isinstance(item, str) or item not in audio_ids for item in selected_references)
@@ -493,6 +530,8 @@ class AnifLiveImportService:
         reference_text = body.get("reference_text", "")
         if not isinstance(reference_text, str) or len(reference_text.strip()) > MAX_TEXT_CHARS:
             raise ValueError("参考转写最多 2000 个字符。")
+        if reference_text.strip() and not selected_audio:
+            raise ValueError('手动填写转写前请明确选择对应录音；自动匹配模式会读取来源的配对转写。')
         language = body.get("reference_language", "zh")
         if language not in {"zh", "yue", "en", "ja", "ko"}:
             raise ValueError("参考语言需为 zh（中文）、yue（粤语）、en（英语）、ja（日语）或 ko（韩语）。")
@@ -575,16 +614,25 @@ class AnifLiveImportService:
             package, _, _ = AnifLiveModelRegistry(self.local_root, self.data_root).resolve(task['model_id'])
             if task.get('bundled_reference_only'):
                 from .aniflive_reference_registration import register_model_default
-                voice = register_model_default(self.voice_libraries.for_model(task['model_id']), package)
-                self._update(task_id, status='complete', phase='模型默认参考已登记', progress=100, error=None,
-                             reference_registration={'ready': 1, 'pending': 0, 'voice_id': voice['id'], 'revision': voice['revision']})
+                library = self.voice_libraries.for_model(task['model_id'])
+                voice = register_model_default(library, package, registered=False)
+                if not voice.get('references') and voice.get('default_reference_registered') is False:
+                    voice = library.update_voice(voice['id'], voice['revision'], {**voice, 'references': [{
+                        'id': voice['default_reference_id'], 'name': '随包参考录音', 'tag': 'bundled_reference',
+                        'asset_id': voice['reference_asset_id'], 'source_asset_id': None, 'intensity': .5,
+                        'reference_text': voice['reference_text'], 'reference_language': voice['reference_language'],
+                        'status': 'ready', 'error': '', 'verification_source': 'automatic', 'provenance': {'source': 'bundled'}}]})
+                registered = voice.get('default_reference_registered', True)
+                self._update(task_id, status='complete', phase='随包参考已独立登记', progress=100, error=None,
+                             reference_registration={'ready': 1, 'pending': 0, 'voice_id': voice['id'], 'revision': voice['revision'],
+                                 'default_registered': registered, 'warning': '' if registered else '模型默认合成参考未登记，请在参考音频中设置。'})
                 return
             if record is None:
                 source = task['preset_source']
                 revision, files = _huggingface_files(source['repository'], source['revision'])
                 if revision != source['revision']:
                     raise ValueError('预设参考来源修订与固定版本不匹配。')
-                files = [row for row in files if row['path'].startswith(('references/', 'profiles/'))]
+                files = [row for row in files if row['path'].startswith(('references/', 'profiles/', 'manifests/', 'configs/'))]
                 record = {'source_type': 'huggingface', 'source': source['repository'], 'revision': revision, 'files': files}
             candidates = _classify(record['files'])
             valid = {row['file_id'] for row in candidates['audio']}
@@ -736,6 +784,11 @@ class AnifLiveImportService:
                 documents[relative] = candidate.read_bytes()
         catalog = discover_references([row['path'] for row in record['files']
             if Path(row['path']).suffix.casefold() not in AUDIO_EXTENSIONS or _file_id(row['path']) in selected_ids], documents)
+        if task.get('reference_audio') and task.get('reference_text'):
+            for item in catalog:
+                if _file_id(item['path']) == task['reference_audio']:
+                    item.update(reference_text=task['reference_text'], reference_language=task['reference_language'],
+                                status='ready', error=None, verification_source='manual')
         for item in catalog:
             relative = item['path']
             item['staged_path'] = staged_candidates.get(relative)
@@ -748,20 +801,51 @@ class AnifLiveImportService:
                     VoiceLibrary._normalize_audio(source.read_bytes(), source.name, minimum=3.0, maximum=10.0)
                 except (ValueError, OSError, OverflowError) as exc:
                     item.update(status='pending', error=str(exc))
+        declared = {item['path'] for item in catalog if item.get('is_default')}
+        recommended = next(iter(declared)) if len(declared) == 1 else None
+        matching = [item for item in catalog if item['path'] == recommended]
+        if not matching or any(item['status'] != 'ready' for item in matching) or len({
+                (item['reference_text'], item['reference_language']) for item in matching}) != 1:
+            recommended = None
+        # 转换验收条件与默认选择分离：可用参考只供验收，不按排序登记默认音色。
+        if not task.get('reference_audio') and task.get('job_kind') != 'reference_import':
+            usable = [item for item in catalog if item['status'] == 'ready']
+            if recommended or usable:
+                task['reference_audio'] = _file_id(recommended or usable[0]['path'])
+        if task.get('reference_audio'):
+            self._update(task_id, reference_audio=task['reference_audio'])
         _atomic_json(stage / 'reference-candidates.json', {
             'schema': 1, 'task_id': task_id, 'model_id': task['model_id'],
             'source': record['source'], 'source_type': record['source_type'],
             'revision': record['revision'], 'references': catalog,
-            'default_audio': by_id[task['reference_audio']]['path'] if task.get('reference_audio') else None,
+            'reference_policy': 'independent-v1',
+            'validation_audio': by_id[task['reference_audio']]['path'] if task.get('reference_audio') else None,
+            'recommendation_audio': recommended,
+            'recommendation_status': 'matched' if recommended else 'ambiguous' if len(declared) > 1 else 'unregistered',
+            'default_audio': None,
+            'default_source': 'source_config' if recommended else None,
             'files': staged_candidates, 'errors': candidate_errors,
             'fields': {'schema': '参考候选清单格式', 'task_id': '导入任务编号',
                        'model_id': '模型编号', 'source': '来源目录或仓库',
                        'source_type': '来源类型', 'revision': '来源修订',
-                       'default_audio': '转换时选择的默认参考来源路径',
+                       'reference_policy': '独立参考登记策略；验收音频不自动成为默认',
+                       'validation_audio': '仅用于本轮转换验收的参考来源路径',
+                       'recommendation_audio': '来源明确推荐且配对完整的参考；仅供首次登记消费一次',
+                       'recommendation_status': '推荐匹配、存在冲突或默认未登记',
+                       'default_audio': '旧格式默认选择字段；独立参考策略始终为空',
+                       'default_source': '一次性推荐的来源依据',
+                       'is_default': '来源配置是否明确声明该录音为默认参考',
                        'references': '已配对及待完善参考', 'files': '来源路径与暂存文件对应',
                        'errors': '未能暂存候选及原因'}})
         persistent = _persist_reference_candidates(stage, self.data_root, task_id)
         self._update(task_id, reference_bundle=str(persistent))
+        LOGGER.info('本地语音参考整理完成 task_id（任务编号）=%s model_id（模型编号）=%s '
+                    'recommendation_audio（一次性推荐录音）=%s validation_audio（转换验收录音）=%s '
+                    'ready（就绪数）=%s pending（待完善数）=%s',
+                    task_id, task['model_id'], recommended,
+                    by_id[task['reference_audio']]['path'] if task.get('reference_audio') else None,
+                    sum(item['status'] == 'ready' for item in catalog),
+                    sum(item['status'] != 'ready' for item in catalog))
         return persistent
 
     def _stage_worker(self, task_id: str, record: dict[str, Any], task: dict[str, Any]) -> None:
@@ -800,10 +884,15 @@ class AnifLiveImportService:
                 self._update(task_id, progress=min(99, int(sum(max(1, int(item.get("size") or 1)) for item in rows[:index + 1]) * 99 / max(total, 1))),
                              phase=f"已整理 {index + 1}/{len(rows)} 个所选文件", staged_bytes=size)
             bundle = self._stage_candidate_bundle(task_id, record, task, stage, total)
+            manifest = json.loads((bundle / 'reference-candidates.json').read_text(encoding='utf-8'))
+            if 'reference' not in staged and task.get('reference_audio'):
+                source_path = by_id[task['reference_audio']]['path']
+                candidate = manifest['files'].get(source_path)
+                if candidate:
+                    staged['reference'] = _normalize_reference_audio(bundle / candidate, stage / 'reference' / 'audio.wav')
             transcript = task.get("reference_text", "")
             needs_review = False
             if not transcript and task.get('reference_audio'):
-                manifest = json.loads((bundle / 'reference-candidates.json').read_text(encoding='utf-8'))
                 source_path = by_id[task['reference_audio']]['path']
                 matching = [row for row in manifest.get('references', [])
                             if row.get('path') == source_path and row.get('reference_text', '').strip()]
@@ -868,6 +957,7 @@ class AnifLiveImportService:
             "reference_text": record["reference_text"].strip(),
             "reference_language": record.get("reference_language", "zh"),
             "import_id": record["task_id"],
+            "reference_policy": "independent-v1",  # reference_policy（参考策略）：验收参考不得隐式登记为默认。
         }
         path = stage / "aniflive-input.json"
         _atomic_json(path, spec)

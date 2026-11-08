@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import type { LocalDownloadItem } from '../../interface/local-components'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
+const deletingModel = computed(() => /^tts-aniflive-(?!runtime$)/.test(props.controller.pendingResetPlan.value?.resource_id ?? '')) // deletingModel（登记模型删除确认）。
 const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
@@ -65,12 +66,13 @@ function confirmBundle() {
 <template>
   <div v-if="controller.pendingResetPlan?.value" class="install-plan-backdrop">
     <section role="dialog" aria-modal="true" aria-labelledby="reset-plan-title" class="install-plan panel">
-      <h2 id="reset-plan-title">重置组件</h2>
+      <h2 id="reset-plan-title">{{ deletingModel ? '删除模型' : '重置组件' }}</h2>
       <p>{{ controller.pendingResetPlan.value.message }}</p>
-      <p>确认后将完全删除以下组件文件与缓存，开始删除后不可取消。完成后请自行选择下载或导入。</p>
+      <p>{{ deletingModel ? '确认后将删除模型和所属音色包，开始删除后不可取消。再次使用需重新导入。' : '确认后将完全删除以下组件文件与缓存，开始删除后不可取消。完成后请自行选择下载或导入。' }}</p>
       <ul><li v-for="path in controller.pendingResetPlan.value.paths" :key="path">{{ path }}</li></ul>
+      <template v-if="deletingModel"><p>同时移除该模型全部音色条目、历史版本和默认参考设置。</p><ul><li v-for="path in controller.pendingResetPlan.value.voice_paths" :key="path">{{ path }}</li></ul></template>
       <button class="outline-button" @click="controller.pendingResetPlan.value = null">取消</button>
-      <button class="outline-button" @click="controller.confirmReset()">确认重置</button>
+      <button class="outline-button" @click="controller.confirmReset()">{{ deletingModel ? '确认删除' : '确认重置' }}</button>
     </section>
   </div>
   <div v-if="controller.pendingDownloadPlan.value" class="install-plan-backdrop">

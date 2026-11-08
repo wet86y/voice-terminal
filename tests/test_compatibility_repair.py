@@ -17,6 +17,19 @@ def workspace(tmp_path):
     return program, data
 
 
+def test_missing_default_reference_is_valid_and_does_not_archive_imported_audio(tmp_path):
+    from voice_terminal.compatibility import Archive, _repair_voices
+    from voice_terminal.tts.voices import ModelVoiceLibraries
+    from tests.test_tts_voices import _wav_bytes
+    data = tmp_path / 'data'
+    owner = ModelVoiceLibraries(data / 'tts')
+    library = owner.for_model('test-model')
+    voice = library.register_default(_wav_bytes(), '转换验收参考。', registered=False)
+    archive = Archive(data)
+    assert _repair_voices(data, archive, {'test-model': library.active_selection}) == set()
+    assert library.index_path.is_file() and library.asset_path(voice['reference_asset_id']).is_file()
+
+
 def test_hotwords_and_required_punctuation_migrate_without_resetting_other_settings(tmp_path):
     import yaml
     program, data = workspace(tmp_path)

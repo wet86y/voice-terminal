@@ -922,6 +922,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             try:
                 library = self.voice_library.for_model(config.local_model)
                 voice = library.get_voice(selection["voice_id"], selection["revision"])
+                if voice.get('default_reference_registered') is False:
+                    raise VoiceLibraryError('模型默认合成参考未登记，请在参考音频中选择一段已就绪录音并设为默认。')
                 library.asset_path(voice["reference_asset_id"])
                 active = {"voice_id": voice["id"], "revision": voice["revision"], "name": voice["name"]}
             except (VoiceLibraryError, FileNotFoundError) as exc:
@@ -935,7 +937,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             "voice_error": voice_error, "active_voice_by_model": self._active_voices_by_model(),
             "voice_capabilities": {"voice_clone": True, "voice_design": False, "style_control": False,
                                    "emotion_control": False, "requires_reference_text": True},
-            "emotion_diagnostic": "参考录音与准确转写决定音色和语气；未启用自定义音色时使用模型随包默认参考。",
+            "emotion_diagnostic": "参考录音与准确转写决定音色和语气；模型默认合成参考可在参考音频中设置。",
             "pending_selection": {"backend": pending["backend"], "local_model": pending["local_model"]} if isinstance(pending, Mapping) else None,
             "operation": self.tts_voice_operations.current_payload() if getattr(self, "tts_voice_operations", None) else None,
         }

@@ -175,7 +175,7 @@ export interface DesktopWorkspacePort {
   saveTtsSelection?(request: TtsSelection): Promise<TtsSelection> // saveTtsSelection（仅保存，不启动）。
   audioEnhancements?(request?: Record<string, boolean>): Promise<{ dual_pass: boolean; emotion: boolean; acoustic_events: boolean }> // audioEnhancements（启动前读取或保存音频增强）。
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
-  resourceResetPlan(resourceId: string): Promise<{ resource_id: string; paths: string[]; token: string; message: string }> // resourceResetPlan（读取重置确认范围）。
+  resourceResetPlan(resourceId: string): Promise<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string }> // resourceResetPlan（读取重置确认范围）。
   resetResource(resourceId: string, token: string): Promise<{ job_id: string }> // resetResource（确认并删除受管组件）。
   importResource(resourceId?: string): Promise<{ job_id: string }>
   /** resource_open_source（打开上游）：由原生宿主打开资源来源页面。 */

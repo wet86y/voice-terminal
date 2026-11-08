@@ -15,7 +15,54 @@ def test_generic_project_directory_does_not_label_auxiliary_weights():
     rows = importer._classify([{'path': path} for path in paths])['weights']
     assert next(row for row in rows if row['role'] == 'gpt')['path'] == paths[1]
     assert next(row for row in rows if row['role'] == 'sovits')['path'] == paths[2]
-    assert next(row for row in rows if row['path'] == paths[0])['role'] == 'unknown'
+    assert {row['path'] for row in rows} == set(paths[1:])
+
+
+def test_scan_keeps_engine_files_visible_but_out_of_model_and_reference_choices(tmp_path):
+    source = tmp_path / 'source'
+    names = ['weights/voice.ckpt', 'weights/voice.pth', 'references/neutral.wav',
+             'references/neutral.lab', 'samples/output.wav',
+             'GPT-SoVITS-overlay/GPT_SoVITS/text/G2PWModel/POLYPHONIC_CHARS.txt',
+             'GPT-SoVITS-overlay/GPT_SoVITS/pretrained_models/s1v3.ckpt']
+    for name in names:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'fixture')
+    (tmp_path / 'local/data').mkdir(parents=True)
+    service = importer.AnifLiveImportService(tmp_path / 'local', tmp_path / 'local/data')
+    scan = service.scan('local', str(source))
+    assert {row['path'] for row in scan['files']} == set(names)
+    assert [row['path'] for row in scan['candidates']['audio']] == ['references/neutral.wav']
+    assert [row['path'] for row in scan['candidates']['transcripts']] == ['references/neutral.lab']
+    assert len(scan['candidates']['weights']) == 2
+    request = {'scan_id': scan['scan_id'], 'model_id': 'new-voice', 'name': '测试模型'}
+    with pytest.raises(ValueError, match='角色'):
+        service.start({**request, 'selected_gpt': importer._file_id('weights/voice.pth')})
+    with pytest.raises(ValueError, match='同名配对'):
+        service.start({**request, 'reference_text_file': importer._file_id('references/neutral.lab')})
+    with pytest.raises(ValueError, match='明确选择对应录音'):
+        service.start({**request, 'reference_text': '不能绑定到未经选择的录音'})
+
+
+def test_unique_roles_are_resolved_by_backend_and_ambiguous_roles_are_not_guessed(tmp_path, monkeypatch):
+    source = tmp_path / 'source'; source.mkdir()
+    for name in ('voice.ckpt', 'voice.pth'):
+        (source / name).write_bytes(b'fixture')
+    (tmp_path / 'local/data').mkdir(parents=True)
+    service = importer.AnifLiveImportService(tmp_path / 'local', tmp_path / 'local/data')
+    monkeypatch.setattr(service, '_stage_worker', lambda *args: None)
+    scan = service.scan('local', str(source))
+    request = {'scan_id': scan['scan_id'], 'model_id': 'new-voice', 'name': '测试模型'}
+    result = service.start(request)
+    service._threads[result['task_id']].join()
+    import json
+    job = json.loads(service._job_path(result['task_id']).read_text(encoding='utf-8'))
+    assert job['selected_gpt'] == importer._file_id('voice.ckpt')
+    assert job['selected_sovits'] == importer._file_id('voice.pth')
+    (source / 'other.ckpt').write_bytes(b'fixture')
+    scan = service.scan('local', str(source))
+    with pytest.raises(ValueError, match='多份权重'):
+        service.start({**request, 'scan_id': scan['scan_id']})
 
 
 def test_modelscope_query_revision_and_recursive_listing(monkeypatch):

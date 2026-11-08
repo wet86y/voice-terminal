@@ -77,16 +77,14 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' })
     wrapper.unmount()
   })
-  it('在线运行时保存本地模型不会切换播放后端', async () => {
-    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({
-      settings: { tts: { backend: 'minimax', local_model: 'tangyuge-v2pp-d78cf598' } },
-    } as never)
+  it('模型导入使用统一跳转入口，模型选择没有额外保存按钮', async () => {
     const wrapper = render()
     await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
     await wrapper.get('.tts-model-row select').setValue('tangyuge-v2pp-d78cf598')
-    await wrapper.get('.tts-model-row .save-button').trigger('click')
+    expect(wrapper.find('.tts-model-row .save-button').exists()).toBe(false)
+    wrapper.getComponent({ name: 'TtsVoiceLibrary' }).vm.$emit('modelImport')
     await flushPromises()
-    expect(save).toHaveBeenCalledWith({ local_model: 'tangyuge-v2pp-d78cf598' })
+    expect(wrapper.getComponent(TtsSettings).emitted('open-aniflive-components')).toHaveLength(1)
     expect(settings.tts.backend).toBe('minimax')
     wrapper.unmount()
   })
@@ -236,7 +234,7 @@ describe('音色设置只提供资源完整的本地模型', () => {
     settings.tts.local_model = 'tangyuge-v2pp-d78cf598'
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
     const wrapper = render()
-    const chunk = wrapper.get('input[aria-label="后续分块优化"]')
+    const chunk = wrapper.get('input[aria-label="分块优化"]')
     expect((chunk.element as HTMLInputElement).checked).toBe(true)
     await chunk.setValue(false); await flushPromises()
     expect(save).toHaveBeenLastCalledWith({ aniflive_chunk_optimization: false })

@@ -54,7 +54,7 @@ const {
               type="text"
               :aria-label="`唤醒词 ${index + 1}`"
               autocomplete="off"
-              :placeholder="index === 0 ? '例如：七三' : '例如：你好七三'"
+              placeholder="输入唤醒词"
             /><button
               type="button"
               class="outline-button wake-keyword-remove"
@@ -77,9 +77,7 @@ const {
             <small>命中任意一个即唤醒</small
             ><small>最多 {{ maxWakeKeywords }} 个说法</small>
           </div>
-          <small
-            >建议把称呼说得长一点（如"你好七三""七三同学"），短词在噪声里更容易漏检；支持中文、英文和常见标点，后端会自动生成并验证每个标签。</small
-          >
+          <small>支持中文、英文和常见标点；保存后会自动生成并验证识别标签。</small>
         </div>
         <label class="form-field"
           ><span
