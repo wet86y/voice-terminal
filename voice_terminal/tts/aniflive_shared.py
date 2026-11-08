@@ -95,6 +95,6 @@ def activate(program: Path, local: Path, inputs):
     atomic_json(root / 'shared-assets.json', {'schema': 1,
         'gpt_sovits': {'repo': lock['repository'], 'revision': lock['revision']},
         'asset_lock_sha256': upstream['_digest'](upstream['ASSET_LOCK_PATH']), 'files': files,
-        'nltk_trees': trees, 'licenses': 'See THIRD_PARTY_NOTICES.md and licenses/（第三方许可说明）',
+        'nltk_trees': trees, 'licenses': 'See LICENSING.md and licenses/（许可证范围与第三方许可文本）',
         'fields': {'files': '固定共享模型文件身份', 'nltk_trees': '离线词典目录摘要', 'licenses': '第三方许可说明'}})
     return {'shared': str(root), 'files': len(inputs), 'nltk_trees': trees}
