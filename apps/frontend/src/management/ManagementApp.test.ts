@@ -246,6 +246,25 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
   })
 
+  it('重新进入页面不恢复已成功重试的历史失败，但保留当前未解决失败', async () => {
+    const recovery: NonNullable<ResourceJob['recovery']> = { event: 'transfer', state: 'retry_available', next_action: 'retry', message: '旧导入下载暂未完成' }
+    jobs = [
+      { job_id: 'history-aniflive-import-task-100', resource_id: 'tts-aniflive-import', state: 'failed', phase: '失败', created_at: 100, recovery },
+      { job_id: 'aniflive-import-task', resource_id: 'tts-aniflive-import', state: 'complete', phase: '完成', created_at: 200 },
+    ]
+    Object.assign(desktop.desktopPort(), { resourceJobSnapshots: vi.fn(async () => jobs) })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.find('[aria-label="组件恢复处理"]').exists()).toBe(false)
+    wrapper.unmount()
+    jobs = [...jobs, { job_id: 'current-failure', resource_id: 'voice-server', state: 'failed', phase: '失败',
+      created_at: 300, recovery: { ...recovery, message: '当前组件需要重试' } }]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('[aria-label="组件恢复处理"]').text()).toContain('当前组件需要重试')
+    expect(wrapper.text()).not.toContain('旧导入下载暂未完成')
+  })
+
   it('丢失完成事件时两秒补查终态和组件就绪，卸载后停止计时', async () => {
     vi.useFakeTimers()
     jobs = [{ job_id: 'first-install', resource_id: 'voice-server', state: 'running', phase: '下载中', created_at: 100, revision: 2 }]
