@@ -82,6 +82,8 @@ export function useWorkspaceResources() {
   const latestWorkspaceJob = computed(() => workspaceJobs.value.at(-1) ?? null)
 
   function upsertResourceJob(incoming: ResourceJob, refreshAfterUpdate = true) {
+    // history（历次尝试归档）只供追溯；重试后的当前任务由原编号提供。
+    if (incoming.job_id.startsWith('history-')) return
     const index = resourceJobs.value.findIndex(job => job.job_id === incoming.job_id)
     const previous = resourceJobs.value[index]
     if (previous && incoming.created_at !== undefined && previous.created_at !== undefined) {
@@ -114,7 +116,10 @@ export function useWorkspaceResources() {
           ? await port.resourceJobSnapshots()
           : typeof port.environmentStatus === 'function' ? (await port.environmentStatus()).jobs ?? [] : []
         if (!mounted) return
+        // 清除旧页面曾恢复的归档，避免其失败提示覆盖已经完成的当前任务。
+        resourceJobs.value = resourceJobs.value.filter(job => !job.job_id.startsWith('history-'))
         for (const job of jobs) {
+          if (job.job_id.startsWith('history-')) continue
           const known = resourceJobs.value.some(current => current.job_id === job.job_id)
           // 只恢复活动任务；已知任务则接收完成/失败快照，补救丢失的终态事件。
           if (!known && TERMINAL_JOB_STATES.has(job.state) && !(job.state === 'failed' && job.recovery?.next_action !== 'none' && job.recovery?.next_action)) continue

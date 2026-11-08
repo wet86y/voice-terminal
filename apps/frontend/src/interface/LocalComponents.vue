@@ -68,8 +68,14 @@ const latestJobs = computed(() => {
 })
 const failedRecoveryJobs = computed(() => [...latestJobs.value.values()].filter(job => job.state === 'failed' && job.recovery && job.recovery.state !== 'resolved'))
 const needsIntegrity = computed(() => failedRecoveryJobs.value.some(job => job.recovery?.next_action === 'check_integrity'))
-function retryRecovery(job: ManagedResourceJob) {
-  if (job.resourceId === 'required-batch') emit('resourceDownloadRequired')
+async function retryRecovery(job: ManagedResourceJob) {
+  if (job.resourceId === 'tts-aniflive-import') {
+    expandedCategories.value = new Set(expandedCategories.value).add('tts')
+    expandedComponents.value = new Set(expandedComponents.value).add('tts-aniflive')
+    await nextTick()
+    document.getElementById('aniflive-model-import')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+  }
+  else if (job.resourceId === 'required-batch') emit('resourceDownloadRequired')
   else if (job.resourceId === 'batch') emit('resourceImportAll')
   else if (/^(im-|env-import)/.test(job.id)) emit('resourceImport', job.resourceId)
   else emit('resourceDownload', job.resourceId)
@@ -490,7 +496,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
     <section v-if="failedRecoveryJobs.length" class="panel component-recovery" aria-label="组件恢复处理">
       <div v-for="job in failedRecoveryJobs" :key="job.id">
         <p role="status">{{ job.label }}：{{ job.recovery?.message }}</p>
-        <button v-if="job.recovery?.next_action === 'retry' && model.resourceActionsAvailable" class="outline-button" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="retryRecovery(job)">{{ /^(im-|env-import)/.test(job.id) || job.resourceId === 'batch' ? '重新导入' : '重试此任务' }}</button>
+        <button v-if="job.recovery?.next_action === 'retry' && model.resourceActionsAvailable" class="outline-button" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="retryRecovery(job)">{{ job.resourceId === 'tts-aniflive-import' ? '前往导入处理' : /^(im-|env-import)/.test(job.id) || job.resourceId === 'batch' ? '重新导入' : '重试此任务' }}</button>
       </div>
       <p v-if="needsIntegrity">完整性校验会检查程序及全部组件，由校验结果确定修复对象和范围。</p>
       <p v-if="needsIntegrity && model.integrityMessage" role="status">{{ model.integrityMessage }}</p>

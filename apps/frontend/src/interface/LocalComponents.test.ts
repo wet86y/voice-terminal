@@ -33,6 +33,20 @@ it('网络与占用仅给重试建议，内容恢复失败才进入既有全面�
   wrapper.unmount()
 })
 
+it('模型转换失败入口进入专用导入面板，不请求普通组件下载', async () => {
+  const value = model()
+  value.managedResourceJobs = [{ id: 'aniflive-import-task', resourceId: 'tts-aniflive-import', label: '模型导入',
+    state: 'failed', phase: '失败', canCancel: false,
+    recovery: { event: 'transfer', state: 'retry_available', next_action: 'retry', message: '请重试导入' } }]
+  const wrapper = mount(LocalComponents, { props: { model: value } })
+  const button = wrapper.get('[aria-label="组件恢复处理"] button')
+  expect(button.text()).toBe('前往导入处理')
+  await button.trigger('click')
+  expect(wrapper.emitted('resourceDownload')).toBeUndefined()
+  expect(wrapper.emitted('resourceImport')).toBeUndefined()
+  wrapper.unmount()
+})
+
 it('后续已恢复的失败记录不再显示故障横幅或分类失败进度', () => {
   const value=model()
   value.managedResourceJobs=[{id:'old-failure',resourceId:'voice-server',label:'语音依赖',state:'failed',phase:'旧失败',canCancel:false,recovery:{event:'recovered',state:'resolved',next_action:'none',message:'该组件已恢复'}}]
