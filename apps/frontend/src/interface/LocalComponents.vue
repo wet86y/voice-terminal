@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import SettingsPageHeader from './SettingsPageHeader.vue'
 import ManagedResourceProgress from './ManagedResourceProgress.vue'
 import ManagedResourceActions from './ManagedResourceActions.vue'
@@ -11,6 +11,7 @@ const props = defineProps<{
   /** model（页面状态与指标）与 saving（保存中）。 */
   model: LocalComponentsModel
   saving?: boolean
+  expandAnifLiveTts?: boolean // expandAnifLiveTts（从其他页面跳入时展开本地合成卡片）。
 }>()
 const visibleResources = computed(() => props.model.resources.filter(resource => resource.used !== undefined))
 // batchImportAvailable（批量导入入口）：有任一缺失资源时展示，含不阻塞启动的可选运行依赖。
@@ -38,10 +39,20 @@ const emit = defineEmits<{
 }>()
 const expandedCategories = ref(new Set<LocalComponentCategory>()) // expandedCategories（已展开用途分类）。
 const expandedComponents = ref(new Set<string>()) // expandedComponents（已展开组件详情）。
+watch(() => props.expandAnifLiveTts, async expand => {
+  if (!expand) return
+  expandedCategories.value = new Set(expandedCategories.value).add('tts')
+  expandedComponents.value = new Set(expandedComponents.value).add('tts-aniflive')
+  await nextTick()
+  const importCard = document.getElementById('aniflive-model-import')
+  const componentCard = document.querySelector<HTMLElement>('.local-component-card[data-component="tts-aniflive"]')
+  const target = importCard ?? componentCard
+  target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}, { immediate: true, flush: 'post' })
 const providerUsageRevision = ref(0) // providerUsageRevision（密钥更新后刷新在线服务额度摘要）。
 const categoryDefinitions: Array<{ id: LocalComponentCategory; title: string; description: string }> = [
   { id: 'speech', title: '语音识别', description: '语音活动检测、转写、轮次判断与流式标点' },
-  { id: 'tts', title: '语音合成', description: '本地 VoxCPM 模型或 MiniMax 在线 API（程序接口）' },
+  { id: 'tts', title: '语音合成', description: 'AnifLive-TTS 本地合成或 MiniMax 在线 API（程序接口）' },
   { id: 'inference', title: '推理执行', description: '主语音在线推理与 DSH（后台执行宿主）组件' },
   { id: 'extensions', title: '拓展组件', description: '唤醒词、声纹、情绪背景、声学事件与热词修订' },
   { id: 'voice-server', title: 'Voice Server（语音服务）', description: '独立管理桌面语音运行环境' },
@@ -353,6 +364,7 @@ function rowActionResources(row: LocalComponentRow) {
 }
 function componentDetailsActionAvailable(row: LocalComponentRow) {
   if (expandedComponents.value.has(row.id) || row.runtimeDependencies?.length) return true
+  if (row.id === 'tts-aniflive') return true
   const hasUninstalledPrimaryResource = Boolean(row.resource && row.resource.state !== 'installed')
     || Boolean(row.resourceChoices?.some(resource => resource.state !== 'installed'))
   // componentDetailsActionAvailable（组件详情入口是否可显示）：增强开关不能绕过未安装主资源的原有操作布局。
@@ -549,7 +561,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   </dl>
                 </div>
                 <div class="local-component-controls">
-                <div v-if="row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
+                <div v-if="row.id !== 'tts-aniflive' && row.resourceChoices?.length && rowActionResources(row).length && model.resourceActionsAvailable && !rowHasActiveJob(row)" class="local-inline-resource-actions">
                   <div v-for="resource in selectedResources(row)" :key="resource.id" class="local-inline-resource-action">
                     <span class="local-inline-resource-status"><strong>{{ resource.label }}</strong><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></span>
                     <ManagedResourceActions v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)" :resource="resource" :download-label="resourceActionLabel(resource)" :reset-blocked="model.resourceTasksBusy" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
@@ -597,6 +609,19 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   <dl v-if="resourceRuntimeFacts(row.sharedResource).length" class="local-resource-versions"><div v-for="fact in resourceRuntimeFacts(row.sharedResource)" :key="fact.label"><dt>{{ fact.label }}</dt><dd :title="fact.value">{{ fact.value }}</dd></div></dl>
                   <p v-if="row.sharedResource.error && !rowHasActiveJob(row)" class="local-error" role="status">{{ row.sharedResource.error }}</p>
                 </section>
+                <slot v-if="row.id === 'tts-aniflive'" name="aniflive-tts" :row="row" />
+                <section v-if="row.id === 'tts-aniflive' && row.resourceChoices?.length" class="local-aniflive-model-resources" aria-label="AnifLive 模型下载与导入">
+                  <h5>模型下载与导入</h5>
+                  <article v-for="resource in row.resourceChoices" :key="resource.id" class="local-download-choice" :data-model-resource="resource.id">
+                    <div class="local-managed-resource-heading"><strong>{{ resource.label }}</strong><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
+                    <ManagedResourceProgress v-if="visibleJob(resourceJob(resource.id))" :job="visibleJob(resourceJob(resource.id))!" :label="resource.label" />
+                    <div v-if="model.resourceActionsAvailable && !jobIsActive(resourceJob(resource.id)) && (resource.state !== 'installed' || resource.updateAvailable || resource.resetAvailable)" class="managed-resource-actions">
+                      <ManagedResourceActions :resource="resource" :download-label="resourceActionLabel(resource)" :reset-blocked="model.resourceTasksBusy" :loading="model.resourceLoading" @download="emit('resourceDownload', $event)" @import="emit('resourceImport', $event)" @source="emit('openResourceSource', $event)" />
+                    </div>
+                    <button v-if="jobIsActive(resourceJob(resource.id))" class="outline-button local-resource-cancel" type="button" :aria-label="`${resource.label}：取消任务`" :disabled="!resourceJob(resource.id)?.canCancel" @click="emit('cancelResource', resourceJob(resource.id)!.id)">取消任务</button>
+                    <p v-if="resource.error && !jobIsActive(resourceJob(resource.id))" class="local-error" role="status">{{ resource.error }}</p>
+                  </article>
+                </section>
                 <div v-if="row.inference" class="local-device-editor">
                   <label :for="`inference-${row.id}`"><span>后端模型</span><select :id="`inference-${row.id}`" :value="row.inference.value" :disabled="row.inference.disabled" @change="row.inference.change(($event.target as HTMLSelectElement).value as 'deepseek' | 'minimax')"><option value="deepseek">DeepSeek Flash</option><option value="minimax">MiniMax M3.1 Flash</option></select></label>
                   <button class="save-button" type="button" :disabled="row.inference.disabled" @click="row.inference.save()">{{ row.inference.disabled ? '等待切换' : '保存' }}</button>
@@ -640,6 +665,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 
 <style scoped>
 .local-runtime-dependencies{display:grid;gap:12px;width:100%;min-width:0}.local-runtime-dependencies .local-managed-resource-heading{color:var(--text);flex-wrap:wrap}.local-runtime-dependencies .managed-resource-actions{margin-top:0}
+.local-aniflive-model-resources{display:grid;gap:10px}.local-aniflive-model-resources h5{margin:0;font-size:var(--font-body)}
 .local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}
 .local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}

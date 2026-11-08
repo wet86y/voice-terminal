@@ -161,13 +161,22 @@ class TtsVoiceOperationManager:
                 finally:
                     if restore:
                         await actual.ensure_ready()
-                        await actual.prepare_reference()
+                        await self._restore_formal_reference(actual)
             task = asyncio.create_task(cleanup())
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 await task
                 raise
+
+    async def _restore_formal_reference(self, client):
+        """试听结束恢复正式选择；无默认时保持未登记，不恢复包内验收录音。"""
+        library = getattr(client, 'voice_library', None)
+        selected = library.active_selection if library is not None else None
+        if selected and library.get_voice(selected['voice_id'], selected.get('revision')).get('default_reference_registered') is False:
+            client._prepared_expression_snapshot = None
+            return
+        await client.prepare_reference()
 
     def start_preview(self, model, voice, text=DESIGN_SAMPLE_TEXT):
         if not isinstance(voice, Mapping) or not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000:
@@ -398,7 +407,7 @@ class TtsVoiceOperationManager:
             client._warmed = False
             try:
                 await session.close()
-                await client.prepare_reference()
+                await self._restore_formal_reference(client)
             finally:
                 operation.session = None
 

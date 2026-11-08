@@ -173,6 +173,7 @@ export interface ManagedResourceJob {
   /** completedBytes（已处理字节）与 totalBytes（总字节）。 */
   completedBytes?: number | null
   totalBytes?: number | null
+  percentage?: number // percentage（仅返回百分比的导入阶段）：不将百分比误显示为字节或步骤。
   /** download*（下载进度）；verification*（本地摘要校验进度）。 */
   downloadCompletedBytes?: number | null
   downloadTotalBytes?: number | null

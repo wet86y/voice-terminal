@@ -26,6 +26,38 @@ function button(wrapper: ReturnType<typeof mount>, label: string) {
 }
 
 describe('本地音色卡片', () => {
+  it('独立参考可设为默认或取消，未登记时明确提示且不启用验收录音', async () => {
+    let voice = { id: 'library', revision: 1, name: '模型参考音频', source: 'legacy', model: 'aniflive',
+      is_default: true, enabled: false, reference_asset_id: 'validation-only', reference_text: '验收参考',
+      default_reference_registered: false, default_reference_id: 'seed', references: [
+        { id: 'neutral', name: '平实', tag: 'neutral', asset_id: 'audio-neutral', reference_text: '平实转写', reference_language: 'zh', intensity: .5, status: 'ready' },
+        { id: 'soft', name: '温柔', tag: 'soft', asset_id: 'audio-soft', reference_text: '温柔转写', reference_language: 'zh', intensity: .5, status: 'ready' },
+      ] } as ProductTtsVoice
+    const setDefault = vi.fn(async (_model, _voice, reference: string | null) => {
+      const row = voice.references!.find(item => item.id === reference)
+      voice = { ...voice, revision: voice.revision + 1, default_reference_registered: !!row,
+        ...(row ? { default_reference_id: row.id, reference_asset_id: row.asset_id!, reference_text: row.reference_text } : {}) }
+      return { voice }
+    })
+    const port = { ttsVoices: vi.fn(async () => ({ voices: [voice] })), setDefaultTtsReference: setDefault,
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav') } as unknown as TtsVoicePort
+    const view = harness(port); await flushPromises()
+    expect(view.wrapper.text()).toContain('模型默认合成参考未登记')
+    expect(view.state.models.aniflive.drafts.library.source).toBeNull()
+    await button(view.wrapper, '编辑').trigger('click')
+    expect(view.wrapper.text()).toContain('已就绪 2 · 待完善 0')
+    const selector = () => view.wrapper.get('.expression-default-toggle input[role="switch"]')
+    await selector().setValue(true); await flushPromises()
+    expect(setDefault).toHaveBeenLastCalledWith('aniflive', 'library', 'neutral', 1)
+    expect(selector().attributes('aria-checked')).toBe('true')
+    expect(view.wrapper.text()).toContain('从情绪候选中排除')
+    expect(view.state.models.aniflive.drafts.library.references).toHaveLength(2)
+    await selector().setValue(false); await flushPromises()
+    expect(setDefault).toHaveBeenLastCalledWith('aniflive', 'library', null, 2)
+    expect(view.wrapper.text()).toContain('模型默认合成参考未登记')
+    expect(view.state.models.aniflive.drafts.library.references).toHaveLength(2)
+    view.wrapper.unmount()
+  })
   it('基底和微调共用参考草稿，界面仅展示参考克隆', async () => {
     const view = harness(); await flushPromises()
     await button(view.wrapper, '＋ 添加音色').trigger('click')
@@ -149,7 +181,7 @@ describe('本地音色卡片', () => {
     view.wrapper.unmount()
   })
 
-  it('整行上传区与播放器互斥切换，删除附件恢复上传并清空校对文本', async () => {
+  it('主卡上传后保留播放器，隐藏直接删除和转写入口', async () => {
     const port = {
       ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
       uploadTtsAsset: vi.fn().mockResolvedValue({ asset: { asset_id: 'source', duration_ms: 5680 } }),
@@ -166,12 +198,10 @@ describe('本地音色卡片', () => {
     await flushPromises()
     expect(view.wrapper.find('.voice-reference audio').attributes('src')).toBe('http://localhost/reference.wav')
     expect(view.wrapper.find('input[type="file"]').exists()).toBe(false)
-    await button(view.wrapper, '开始校对文本').trigger('click'); await flushPromises()
-    expect(port.startTtsTranscribe).toHaveBeenCalledTimes(2)
-    await view.wrapper.find('button[aria-label="移除参考音频"]').trigger('click')
-    expect(view.wrapper.find('.audio-attachment').exists()).toBe(false)
-    expect(view.wrapper.find('.voice-reference input[type="file"]').exists()).toBe(true)
-    expect(view.wrapper.findAll('textarea')[0].element.value).toBe('')
+    expect(button(view.wrapper, '开始校对文本')).toBeUndefined()
+    expect(view.wrapper.find('button[aria-label="移除参考音频"]').exists()).toBe(false)
+    expect(port.startTtsTranscribe).toHaveBeenCalledOnce()
+    expect(view.wrapper.find('.audio-attachment').exists()).toBe(true)
     view.wrapper.unmount()
   })
 })

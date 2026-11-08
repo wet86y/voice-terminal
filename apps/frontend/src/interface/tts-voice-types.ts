@@ -33,11 +33,11 @@ export interface ProductLocalTtsStatus {
   voice_error?: string | null // voice_error（音色错误）。
   pending_selection?: { backend: 'minimax' | 'aniflive'; local_model: ProductLocalTtsModelId } | null // 待切换目标。
   active_voice_by_model?: Record<ProductLocalTtsModelId, ProductTtsVoiceSelection | null> // 各库启用选择。
-  models: Array<{ id: ProductLocalTtsModelId; name: string; available: boolean; loaded: boolean; native_sample_rate: number }> // 模型标识、名称、可用、加载、采样率。
+  models: Array<{ id: ProductLocalTtsModelId; name: string; registered?: boolean; available: boolean; loaded: boolean; native_sample_rate: number }> // id（模型标识）、name（显示名称）、registered（登记状态）、available（是否可用）、loaded（是否已加载）、native_sample_rate（原生采样率）。
 }
 /** ProductTtsReference（情绪参考）：录音、配对文字、标记及准备状态。 */
 export interface ProductTtsReference {
-  kind?: 'emotion' // kind（参考类型）：此集合中的条目为情绪参考。
+  kind?: 'emotion' | 'reference' // kind（参考类型）：兼容旧情绪记录，新记录独立保存。
   id: string; name: string; tag: string; intensity: number // 参考编号、名称、情绪标记、强度档位。
   asset_id: string | null; source_asset_id?: string | null // 工作音频及原始音频编号。
   reference_text: string; reference_language: string // 配对转写及语言。
@@ -50,6 +50,8 @@ export interface ProductTtsVoice {
   model: ProductLocalTtsModelId; is_default: boolean; enabled: boolean // 归属模型、默认项、启用状态。
   reference_asset_id: string; reference_text: string // 正式样音标识及转写。
   reference_language?: string // reference_language（参考录音语言）。
+  default_reference_id?: string // default_reference_id（已选模型默认参考编号）。
+  default_reference_registered?: boolean // default_reference_registered（默认合成参考是否已登记）；缺省兼容旧音色。
   duration_ms?: number; source_reference_duration_ms?: number // 目标和源素材时长（毫秒）。
   source_reference_asset_id?: string | null; source_reference_text?: string // 原始克隆素材及校对文本。
   design_description?: string; design_text?: string; inference_steps?: number // 设计描述、生成正文、推理步数。
@@ -60,7 +62,7 @@ export interface ProductTtsVoice {
 /** ProductTtsAsset（音频附件）：标识与毫秒时长。 */
 export interface ProductTtsAsset { asset_id: string; duration_ms: number }
 /** TtsReferenceImportJob（模型参考导入任务）。 */
-export interface TtsReferenceImportJob { task_id: string; status: string; phase: string; error?: string | null; reference_registration?: { ready: number; pending: number } }
+export interface TtsReferenceImportJob { task_id: string; status: string; phase: string; error?: string | null; reference_registration?: { ready: number; pending: number; default_registered?: boolean; warning?: string } }
 /** ProductTtsOperation（后台任务）：身份、模型、执行状态及结果。 */
 export interface ProductTtsOperation {
   operation_id: string; model: ProductLocalTtsModelId | ProductOnlineTtsModelId; kind: string // 操作标识、本地或在线模型、任务种类。
@@ -76,6 +78,7 @@ export interface TtsVoicePort {
   deleteTtsVoice(model: ProductLocalTtsModelId, id: string): Promise<unknown>
   selectTtsVoice(model: ProductLocalTtsModelId, selection: ProductTtsVoiceSelection | null): Promise<unknown>
   restoreDefaultTtsVoice(model: ProductLocalTtsModelId): Promise<unknown> // 恢复模型来源默认配置并保留历史版本。
+  setDefaultTtsReference?(model: ProductLocalTtsModelId, voice: string, reference: string | null, revision: number): Promise<{ voice: ProductTtsVoice }> // 设置或取消模型默认参考。
   uploadTtsAsset(model: ProductLocalTtsModelId, file: File): Promise<{ asset: ProductTtsAsset }>
   uploadTtsSource(model: ProductLocalTtsModelId, file: File): Promise<{ asset: ProductTtsAsset }> // 保存可裁剪的原始录音。
   clipTtsAsset(model: ProductLocalTtsModelId, asset_id: string, start_ms: number, end_ms: number): Promise<{ asset: ProductTtsAsset }>

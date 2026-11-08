@@ -3,7 +3,7 @@ import TtsSettings from "./panels/TtsSettings.vue";
 import OperationNotice from './OperationNotice.vue';
 import { provideTtsVoiceState } from "../interface/useTtsVoiceState";
 provideTtsVoiceState();
-import { computed, onBeforeUnmount, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { useProductControls } from "./useProductControls";
 import ApplicationStartup from "./ApplicationStartup.vue";
 import ApplicationMotion from './ApplicationMotion.vue';
@@ -11,6 +11,7 @@ import { useApplicationHost } from './application-host';
 import AppFrame from "../interface/AppFrame.vue";
 import SettingsFrame from "../interface/SettingsFrame.vue";
 import Workbench from "../interface/Workbench.vue";
+import type { SettingsSection } from "../interface/settings";
 import { desktopPort } from "./desktop-port";
 import "./application.css";
 import WakeSettings from "./panels/WakeSettings.vue";
@@ -52,6 +53,7 @@ const {
   floatingSessionAction,
 } = controls;
 const desktop = desktopPort();
+const expandAnifLiveTtsCard = ref(false) // expandAnifLiveTtsCard（从音色设置跳转时展开本地合成卡片）。
 const operations = computed(() => [
   ...(controls.voice.runtimeOperations?.value ?? []),
   ...(applicationSnapshot.value?.runtime_operations ?? []),
@@ -124,6 +126,14 @@ function nativeAction(action: () => Promise<void>) {
     lastError.value = String(error);
   });
 }
+function openAnifLiveComponentCard() {
+  expandAnifLiveTtsCard.value = true
+  activeSettingsTab.value = 'compute'
+}
+function setSettingsTab(section: SettingsSection) {
+  activeSettingsTab.value = section
+  if (section !== 'compute') expandAnifLiveTtsCard.value = false
+}
 function exportLogs() {
   void desktop.exportLogs().then(path => {
     if (path) setNotice('日志压缩包已保存到所选文件夹。');
@@ -172,7 +182,7 @@ function exportLogs() {
       @back="activePage = 'home'"
       @logs="exportLogs"
       @exit="nativeAction(desktop.exit)"
-      @section="activeSettingsTab = $event"
+      @section="setSettingsTab"
     >
       <template #warnings
         ><div v-if="settings.warnings.length" class="model-safety">
@@ -183,11 +193,11 @@ function exportLogs() {
       <article class="settings-panel panel" :class="`settings-panel-${activeSettingsTab}`">
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
-        <TtsSettings v-if="activeSettingsTab === 'tts'" />
+        <TtsSettings v-if="activeSettingsTab === 'tts'" @open-aniflive-components="openAnifLiveComponentCard" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <HotwordSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
-        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" />
+        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" :expand-aniflive-tts="expandAnifLiveTtsCard" />
         <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
     ></SettingsFrame>
     <template #overlays>

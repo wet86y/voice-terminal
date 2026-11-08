@@ -8,6 +8,16 @@ from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager
 from unittest.mock import AsyncMock
 
 
+def test_preview_cleanup_keeps_missing_default_unregistered(tmp_path):
+    library = ModelVoiceLibraries(tmp_path / 'tts').for_model('test-model')
+    library.register_default(_wav_bytes(), '验收录音', registered=False)
+    client = SimpleNamespace(voice_library=library, prepare_reference=AsyncMock(), _prepared_expression_snapshot=('temporary',))
+    manager = TtsVoiceOperationManager(SimpleNamespace())
+    asyncio.run(manager._restore_formal_reference(client))
+    client.prepare_reference.assert_not_awaited()
+    assert client._prepared_expression_snapshot is None
+
+
 def test_temporary_preview_restores_formal_engine_after_failure(tmp_path, monkeypatch):
     import voice_terminal.providers.aniflive_server as server_module
     import voice_terminal.providers.aniflive_tts as client_module

@@ -446,6 +446,15 @@ class VoiceLibrary:
         }
         if self.model == "aniflive":
             language = payload.get("reference_language", "zh")
+            registered = payload.get('default_reference_registered', True)
+            if not isinstance(registered, bool):
+                raise VoiceLibraryError('default_reference_registered（默认参考登记状态）必须为布尔值。')
+            if 'default_reference_registered' in payload:
+                normalized['default_reference_registered'] = registered
+            if payload.get('default_reference_id'):
+                if not isinstance(payload['default_reference_id'], str) or not _ID_RE.fullmatch(payload['default_reference_id']):
+                    raise VoiceLibraryError('default_reference_id（默认参考编号）无效。')
+                normalized['default_reference_id'] = payload['default_reference_id']
             if language not in {"zh", "yue", "en", "ja", "ko"}:
                 raise VoiceLibraryError("reference_language（参考录音语言）无效。")
             normalized["reference_language"] = language
@@ -492,13 +501,20 @@ class VoiceLibrary:
                     verification = raw.get('verification_source', 'automatic')
                     if verification not in {'automatic', 'automatic_transcription', 'manual'}:
                         raise VoiceLibraryError('verification_source（参考校验来源）无效。')
-                    entries.append({"id": ref_id, "kind": "emotion", "asset_id": asset, "source_asset_id": source_asset, "tag": tag,
+                    entries.append({"id": ref_id, "kind": "reference", "asset_id": asset, "source_asset_id": source_asset, "tag": tag,
                                     "name": _safe_text(raw.get("name", tag), "name", 80, required=True),
                                     "intensity": float(strength), "reference_language": lang,
                                     "reference_text": _safe_text(raw.get("reference_text", ""), "reference_text", 2000, required=status == 'ready'),
                                     'status': status, 'error': _safe_text(raw.get('error') or '', 'error', 500),
                                     'verification_source': verification, 'provenance': provenance})
                 normalized["references"] = entries
+                selected = normalized.get('default_reference_id')
+                chosen = next((row for row in entries if row['id'] == selected), None)
+                if registered and chosen is not None:
+                    if chosen['status'] != 'ready':
+                        raise VoiceLibraryError('默认参考尚未就绪；请先取消默认登记再修改为待完善资料。')
+                    normalized.update(reference_asset_id=chosen['asset_id'], reference_text=chosen['reference_text'],
+                                      reference_language=chosen['reference_language'])
         source_asset_id = payload.get("source_reference_asset_id")  # 原始克隆素材；reference_asset_id 为确认后的目标样音。
         if source_asset_id is not None:
             if source != "design" or not isinstance(source_asset_id, str) or not _ID_RE.fullmatch(source_asset_id):
@@ -542,7 +558,7 @@ class VoiceLibrary:
                 raise FileNotFoundError("克隆源音频素材不存在。")
             voice_id = uuid4().hex
             if self.model == 'aniflive':
-                voice['default_reference_id'] = uuid4().hex  # default_reference_id（基础参考的稳定编号）。
+                voice.setdefault('default_reference_id', uuid4().hex)  # default_reference_id（基础参考的稳定编号）。
                 if hasattr(self, 'model_id'):
                     voice['base_model_id'] = self.model_id  # base_model_id（所属基础模型）。
             revision = {**voice, "revision": 1, "created_at": _utc_now()}
@@ -563,10 +579,19 @@ class VoiceLibrary:
             previous = current['revisions'][str(expected_revision)]
             if self.model == 'aniflive' and 'references' not in payload and 'references' in previous:
                 payload = {**payload, 'references': previous['references']}
+            if self.model == 'aniflive' and 'default_reference_registered' not in payload and 'default_reference_registered' in previous:
+                payload = {**payload, 'default_reference_registered': previous['default_reference_registered']}
+            if self.model == 'aniflive' and 'default_reference_id' not in payload and previous.get('default_reference_id'):
+                payload = {**payload, 'default_reference_id': previous['default_reference_id']}
+            if (self.model == 'aniflive' and previous.get('default_reference_registered', True)
+                    and any(row['id'] == previous.get('default_reference_id') for row in previous.get('references', []))
+                    and payload.get('default_reference_registered', True)
+                    and not any(row.get('id') == previous['default_reference_id'] for row in payload.get('references', []))):
+                raise VoiceLibraryError('请先取消默认参考登记，再删除对应参考录音。')
             voice = self._normalize_voice(payload)
             if self.model == 'aniflive':
-                voice['default_reference_id'] = previous.get('default_reference_id') or hashlib.sha256(
-                    ('base-reference:' + voice_id).encode()).hexdigest()[:32]
+                voice.setdefault('default_reference_id', previous.get('default_reference_id') or hashlib.sha256(
+                    ('base-reference:' + voice_id).encode()).hexdigest()[:32])
                 if hasattr(self, 'model_id'):
                     voice['base_model_id'] = self.model_id
             if voice["reference_asset_id"] not in self._index["assets"]:
@@ -618,7 +643,7 @@ class VoiceLibrary:
                     "id": voice_id, "latest_revision": latest, **json.loads(json.dumps(record)),
                     "model": self.model,
                     "is_default": (self._index.get("default_voice") or {}).get("voice_id") == voice_id,
-                    "enabled": (self.active_selection or {}).get("voice_id") == voice_id if self.model else bool(active),
+                    "enabled": ((self.active_selection or {}).get("voice_id") == voice_id and record.get('default_reference_registered') is not False) if self.model else bool(active),
                     "duration_ms": asset.get("duration_ms"), "active_by_model": active,
                     "source_reference_duration_ms": self._index["assets"].get(record.get("source_reference_asset_id"), {}).get("duration_ms"),
                     "compatibility": {
@@ -639,6 +664,8 @@ class VoiceLibrary:
         if not isinstance(selection, Mapping):
             raise VoiceLibraryError("尚未配置可用音色，请先导入或创建音色并启用。")
         voice = self.get_voice(str(selection.get("voice_id") or ""), selection.get("revision"))
+        if model == 'aniflive' and voice.get('default_reference_registered') is False:
+            raise VoiceLibraryError('模型默认合成参考未登记，请在参考音频中选择一段已就绪录音并设为默认。')
         path = self.asset_path(voice["reference_asset_id"])
         if not voice.get("reference_text", "").strip():
             raise VoiceLibraryError("请先填写参考音频的准确转写，再启用或使用克隆音色。")
@@ -651,7 +678,9 @@ class VoiceLibrary:
             voice_source=str(voice.get("source") or "legacy"),
             reference_language=voice.get("reference_language", "zh"),
             references=tuple({key: row[key] for key in ('id', 'asset_id', 'tag', 'name', 'intensity', 'reference_language', 'reference_text')}
-                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'),
+                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'
+                             and row['id'] != voice.get('default_reference_id')
+                             and row['asset_id'] != voice['reference_asset_id']),
         )
 
     def resolve_design(self, description: str, *, emotion: str | None = None,
@@ -696,7 +725,9 @@ class VoiceLibrary:
             voice_source=str(voice.get("source") or "import"),
             reference_language=voice.get("reference_language", "zh"),
             references=tuple({key: row[key] for key in ('id', 'asset_id', 'tag', 'name', 'intensity', 'reference_language', 'reference_text')}
-                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'),
+                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'
+                             and row['id'] != voice.get('default_reference_id')
+                             and row['asset_id'] != voice['reference_asset_id']),
         )
 
     def delete_voice(self, voice_id: str, active_by_model: Mapping[str, Any] | None = None) -> None:
@@ -817,11 +848,45 @@ class VoiceLibrary:
             self._save_index(updated)
             return chosen
 
-    def register_default(self, data: bytes, transcript: str, *, language: str = 'zh') -> dict[str, Any]:
+    def set_default_reference(self, voice_id: str, expected_revision: int, reference_id: str | None) -> dict[str, Any]:
+        """切换模型默认参考；录音记录保留，运行时情绪候选排除默认录音。"""
+        if self.model != 'aniflive':
+            raise VoiceLibraryError('仅本地语音参考库支持设置模型默认参考。')
+        with self._lock:
+            voice = self.get_voice(voice_id)
+            if type(expected_revision) is not int or voice['revision'] != expected_revision:
+                raise VoiceRevisionConflict('音色版本已更新，请刷新后重试。')
+            entries = list(voice.get('references', []))
+            # 旧版本基础参考补成独立记录，保留其原编号及素材，不丢失旧默认。
+            base_id = voice.get('default_reference_id') or hashlib.sha256(('base-reference:' + voice_id).encode()).hexdigest()[:32]
+            if voice.get('default_reference_registered', True) and not any(row['id'] == base_id for row in entries):
+                entries.append({'id': base_id, 'name': '原基础参考', 'tag': 'base_' + base_id[:12],
+                    'asset_id': voice['reference_asset_id'], 'source_asset_id': None,
+                    'reference_text': voice['reference_text'], 'reference_language': voice.get('reference_language', 'zh'),
+                    'intensity': .5, 'status': 'ready', 'error': '', 'verification_source': 'manual', 'provenance': {}})
+            payload = {**voice, 'references': entries, 'default_reference_registered': reference_id is not None}
+            if reference_id is not None:
+                row = next((item for item in entries if item['id'] == reference_id), None)
+                if not row or row.get('status') != 'ready' or not row.get('asset_id'):
+                    raise VoiceLibraryError('默认参考必须是本模型内已就绪的参考录音。')
+                self.asset_path(row['asset_id'])
+                payload.update(default_reference_id=row['id'], reference_asset_id=row['asset_id'],
+                               reference_text=row['reference_text'], reference_language=row['reference_language'])
+            result = self.update_voice(voice_id, expected_revision, payload)
+            updated = json.loads(json.dumps(self._index))
+            updated['default_voice'] = {'voice_id': voice_id, 'revision': result['revision']}
+            updated['active_voice'] = dict(updated['default_voice'])
+            updated['migrations']['default_reference_choice'] = {'source': 'manual', 'registered': reference_id is not None}
+            self._save_index(updated)
+            return result
+
+    def register_default(self, data: bytes, transcript: str, *, language: str = 'zh', registered: bool = True) -> dict[str, Any]:
         """register_default（登记默认项）：完整素材就绪后才写入启用选择。"""
         with self._lock:
             if self._index.get("default_voice"):
                 voice = self.get_voice(self._index["default_voice"]["voice_id"])
+                if voice.get('default_reference_registered') is False:
+                    return voice  # 未登记是合法状态；不能把验收参考再次自动设为默认。
                 try:
                     self.asset_path(voice["reference_asset_id"])
                 except FileNotFoundError:
@@ -852,7 +917,8 @@ class VoiceLibrary:
                         temporary.unlink(missing_ok=True)
                 return voice
             asset = self.put_import(data, "default.wav")
-            voice = self.create_voice({"name": "默认音色", "source": "legacy", "reference_asset_id": asset["asset_id"], "reference_text": transcript, "reference_language": language})
+            voice = self.create_voice({"name": "默认音色" if registered else "模型参考音频", "source": "legacy", "reference_asset_id": asset["asset_id"], "reference_text": transcript, "reference_language": language,
+                                       **({'default_reference_registered': False} if not registered else {})})
             updated = json.loads(json.dumps(self._index))
             selection = {"voice_id": voice["id"], "revision": voice["revision"]}
             updated["default_voice"] = selection

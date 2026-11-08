@@ -27,16 +27,20 @@ export function createTtsVoiceState(): TtsVoiceState {
 export function provideTtsVoiceState() { const state = createTtsVoiceState(); provide(key, state); return state }
 export function useTtsVoiceState() { return inject(key, undefined) ?? createTtsVoiceState() }
 export function voiceDraft(voice?: ProductTtsVoice): VoiceDraft {
-  const source = voice?.source_reference_asset_id || (voice?.source !== 'design' ? voice?.reference_asset_id : undefined)
+  const referenceLanguage = voice?.reference_language || 'zh' // referenceLanguage（主卡片当前参考录音语言）。
+  const source = voice?.default_reference_registered === false ? undefined :
+    voice?.default_reference_registered === true ? voice?.reference_asset_id :
+      voice?.source_reference_asset_id || (voice?.source !== 'design' ? voice?.reference_asset_id : undefined) // source（基础参考播放器当前展示的音频）。
   return {
     key: voice?.id || crypto.randomUUID(), id: voice?.id, revision: voice?.revision,
-    name: voice?.name || '', referenceLanguage: voice?.reference_language || 'zh', description: voice?.design_description || '',
-    transcript: voice?.source_reference_text || (voice?.source !== 'design' ? voice?.reference_text || '' : ''),
+    name: voice?.name || '', referenceLanguage, description: voice?.design_description || '',
+    transcript: voice?.default_reference_registered === false ? '' : voice?.default_reference_registered === true ? voice.reference_text || '' :
+      voice?.source_reference_text || (voice?.source !== 'design' ? voice?.reference_text || '' : ''),
     text: voice?.design_text || TTS_SAMPLE_TEXT,
     targetTranscript: voice?.source === 'design' ? voice.reference_text : '',
-    source: source ? { asset_id: source, duration_ms: voice?.source_reference_duration_ms || voice?.duration_ms || 0, filename: '参考音频.wav' } : null,
+    source: source ? { asset_id: source, duration_ms: voice?.default_reference_registered === true ? 0 : voice?.source_reference_duration_ms || voice?.duration_ms || 0, filename: '参考音频.wav' } : null,
     candidate: voice?.source === 'design' ? { ...voice } : null, signature: '',
     expanded: false, busy: false, generation: 0, error: '', notice: '',
-    references: (voice?.references || []).map(item => ({ ...item, provenance: { ...item.provenance } })),
+    references: (voice?.references || []).map(item => ({ ...item, reference_language: referenceLanguage, provenance: { ...item.provenance } })),
   }
 }

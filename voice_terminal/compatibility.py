@@ -280,10 +280,12 @@ def _repair_voices(data: Path, archive: Archive, selections: dict) -> set[str]:
                         raise VoiceLibraryError('模型音色集合无效')
                     scoped = _ScopedVoiceLibrary(SimpleNamespace(shared=library), model_id)
                     scoped.list_voices()
-                    if scoped.active_selection:
-                        scoped.resolve(model_id, scoped.active_selection)
-                    if selections.get(model_id):
-                        scoped.resolve(model_id, selections[model_id])
+                    for selected in (scoped.active_selection, selections.get(model_id)):
+                        if selected:
+                            voice = scoped.get_voice(selected.get('voice_id', ''), selected.get('revision'))
+                            # 无默认参考是合法的已导入状态，不把转换验收录音当默认，也不归档用户资料。
+                            if voice.get('default_reference_registered') is not False:
+                                scoped.resolve(model_id, selected)
             else:
                 library.list_voices()
                 selection = library.active_selection

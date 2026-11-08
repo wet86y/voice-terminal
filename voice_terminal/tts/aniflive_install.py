@@ -322,7 +322,7 @@ class AnifLiveInstallTask:
         text = root / 'reference.txt'
         text.write_text(preset['reference']['text'] + '\n', encoding='utf-8')
         records.update(reference_text=str(text), reference_language=preset['reference']['language'],
-                       model_id=model_id, metadata_recipe=preset.get('metadata_recipe'))
+                       model_id=model_id, metadata_recipe=preset.get('metadata_recipe'), reference_policy='independent-v1')
         atomic_json(root / 'input.json', records)
         return root / 'input.json'
 
@@ -367,6 +367,8 @@ class AnifLiveInstallTask:
                     'shared_lock': digest(self.program / 'config/runtime/aniflive-shared-assets.lock.json'),
                     'adapter': {name: digest(self.program / name) for name in BUILD_ADAPTER_FILES},
                     'hardware': {key: value for key, value in hardware.items() if key not in {'imports', 'free_vram_bytes'}}}
+        if values.get('reference_policy'):
+            identity['reference_policy'] = values['reference_policy']  # reference_policy（独立参考登记策略）。
         revision = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
         registry = AnifLiveModelRegistry(self.local)
         try:
@@ -426,11 +428,13 @@ class AnifLiveInstallTask:
         if diagnostics['capture_probe_fallbacks']:
             emit('已验证图捕获回退为普通显卡执行；保留完整构建诊断')
         atomic_json(candidate / 'application-receipt.json', {'schema': 1, 'identity': identity, **verified,
+                    **({'reference_policy': values['reference_policy']} if values.get('reference_policy') else {}),
                     'build_diagnostics': diagnostics,
                     'files': [{'path': p.relative_to(candidate).as_posix(), 'size': p.stat().st_size,
                                'sha256': digest(p)} for p in sorted(candidate.rglob('*'))
                               if p.is_file() and p.name not in {'checksums.json', 'application-receipt.json'}],
                     'fields': {'schema': '应用模型收据格式', 'identity': '完整输入及构建身份',
+                               'reference_policy': '参考登记策略；独立参考不把验收录音预置为默认',
                                'validation': '实际引擎加载及完整合成验证', 'streaming_verified': '流式实际执行通过',
                                'streaming': '流式音频结果', 'files': '实际生成文件、大小及摘要'}})
         # 新收据也是模型包的一部分，由固定上游工具重新生成完整摘要清单。
@@ -483,9 +487,11 @@ class AnifLiveInstallTask:
             raise ValueError('模型导入描述必须为不超过 1 MiB（兆二进制字节）的普通本机文件。')
         values = json.loads(spec_path.read_text(encoding='utf-8'))
         required = {'model_id', 'name', 'gpt', 'sovits', 'reference', 'reference_text', 'reference_language'}
-        optional = {'import_id'}
+        optional = {'import_id', 'reference_policy'}
         if not required.issubset(values) or set(values) - required - optional or values['reference_language'] not in {'zh', 'yue', 'en', 'ja', 'ko'}:
             raise ValueError('模型导入需要模型编号、名称、成对权重、录音、准确转写和语言。')
+        if 'reference_policy' in values and values['reference_policy'] != 'independent-v1':
+            raise ValueError('未知参考音频登记策略，保留输入等待新版兼容。')
         from .aniflive_models import validate_model_id
         model_id = validate_model_id(values['model_id'])
         if not isinstance(values['reference_text'], str) or not 1 <= len(values['reference_text'].strip()) <= 2000:

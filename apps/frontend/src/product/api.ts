@@ -56,7 +56,7 @@ export interface AnifLiveImportJob {
   reference_audio_staged?: boolean // reference_audio_staged（暂存中是否已有参考录音）。
   stage_ready?: boolean // stage_ready（完整转换输入已暂存）：仅此状态允许重试正式转换。
   reference_candidates?: { audio: AnifLiveImportFile[]; transcripts: AnifLiveImportFile[] } // reference_candidates（全部音频及旁注候选）：保留多条素材的来源路径和修订元数据。
-  reference_registration?: { ready: number; pending: number; voice_id: string; revision: number } // reference_registration（参考登记统计与音色版本）。
+  reference_registration?: { ready: number; pending: number; voice_id: string; revision: number; default_registered?: boolean; warning?: string } // reference_registration（参考登记统计、默认状态及提示）。
   job_kind?: 'reference_import' // job_kind（已有模型参考资料导入任务）。
 }
 
@@ -200,6 +200,13 @@ export const productApi = {
   getTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}`),
   cancelTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}/cancel`, { method: 'POST' }),
   ttsStatus: () => request<ProductLocalTtsStatus>('/api/v1/tts/status'),
+  /** setDefaultTtsReference（模型默认参考选择）：空值取消登记，参考记录与历史版本保留。 */
+  setDefaultTtsReference: (model: ProductLocalTtsModelId, voice: string, reference: string | null, revision: number) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${encodeURIComponent(model)}/${encodeURIComponent(voice)}/default-reference`, { method: 'PUT', body: JSON.stringify({ reference_id: reference, expected_revision: revision }) }),
+  /** renameAnifLiveModel（重命名已登记 AnifLive 模型）：保留 model_id（稳定模型标识）及其版本身份。 */
+  renameAnifLiveModel: (modelId: ProductLocalTtsModelId, name: string) => request<{
+    id: ProductLocalTtsModelId // id（稳定模型标识）。
+    name: string // name（已保存的模型显示名称）。
+  }>(`/api/v1/tts/aniflive/models/${encodeURIComponent(modelId)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   /** scanAnifLiveImport（只读扫描 AnifLive 输入）：不会下载网页仓库文件。 */
   scanAnifLiveImport: (source_type: AnifLiveImportScan['source_type'], source: string) => request<AnifLiveImportScan>('/api/v1/tts/aniflive/import/scan', { method: 'POST', body: JSON.stringify({ source_type, source }) }),
   /** startAnifLiveImport（确认后暂存选中文件）：网页来源此时才开始下载。 */

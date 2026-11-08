@@ -65,7 +65,10 @@ pub fn audio_enhancements(data:&Path,request:Option<&Value>)->Result<Value,Strin
 pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
     let mut items=load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone();
     let registry=load(&safe_path(&context.data,"config/aniflive-models.json")?).unwrap_or(Value::Null);
-    if let Some(template)=items.iter().find(|row|row["preparation"]=="aniflive_local_build").cloned(){
+    let template=items.iter().find(|row|row["preparation"]=="aniflive_local_build").cloned();
+    // 预设只保留为旧安装兼容模板；可用模型由本机登记表决定。
+    items.retain(|row|row["preparation"]!="aniflive_local_build");
+    if let Some(template)=template{
         for (model,entry) in registry["models"].as_object().into_iter().flatten(){
             if !crate::credentials::valid_tts_model(model)||items.iter().any(|row|row["model_id"]==*model){continue;}
             let mut item=template.clone();item["resource_id"]=json!(format!("tts-aniflive-{model}"));item["model_id"]=json!(model);
@@ -424,7 +427,7 @@ pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
             "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
     }
-    if catalog.iter().any(|item|item["runtime_resource"]=="tts-aniflive-runtime"){
+    if catalog.iter().any(|item|item["resource_id"]=="tts-aniflive-runtime" || item["runtime_resource"]=="tts-aniflive-runtime"){
         rows.push(json!({"resource_id":"tts","label":"TTS（语音合成）","required":true}));
         update_tts_readiness(context,&mut rows)?;
     }

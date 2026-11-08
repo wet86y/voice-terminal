@@ -17,6 +17,13 @@ from voice_terminal.tts.router import TtsBackendRouter
 from voice_terminal.audio.player import PcmPlayer
 
 
+def test_fresh_registry_has_no_preconfigured_local_models(tmp_path):
+    """新工作区只显示实际导入登记的模型。"""
+    from voice_terminal.tts.aniflive_models import AnifLiveModelRegistry
+    registry = AnifLiveModelRegistry(tmp_path / 'fresh-local')
+    assert registry.models() == []
+
+
 @pytest.fixture(autouse=True)
 def registered_model_fixtures(tmp_path):
     import hashlib
@@ -73,6 +80,35 @@ def test_scoped_voice_api_and_settings_projection(tmp_path):
             assert persisted["tts"]["backend"] == "minimax"
             assert "active_voice_by_model" not in persisted["tts"]
             assert (await client.post("/api/v1/tts/voices/aniflive", json={**payload, "source": "design"})).status_code == 422
+    asyncio.run(scenario())
+
+
+def test_default_reference_api_is_versioned_and_keeps_independent_audio(tmp_path):
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / 'data')
+        library = runtime.voice_library.for_model('aniflive')
+        voice = library.register_default(_wav_bytes(), '验收参考', registered=False)
+        asset = library.put_import(_wav_bytes(sample_rate=32000), 'reference.wav')
+        voice = library.update_voice(voice['id'], voice['revision'], {**voice, 'references': [{
+            'id': 'a' * 32, 'name': '平实', 'tag': 'neutral', 'asset_id': asset['asset_id'],
+            'reference_text': '平实参考', 'reference_language': 'zh', 'intensity': .5, 'status': 'ready'}]})
+        path = '/api/v1/tts/voices/aniflive/' + voice['id'] + '/default-reference'
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url='http://test') as client:
+            selected = await client.put(path, json={'reference_id': 'a' * 32, 'expected_revision': voice['revision']})
+            assert selected.status_code == 200, selected.text
+            current = selected.json()['voice']
+            assert current['default_reference_registered'] and len(current['references']) == 1
+            snapshot = library.resolve('aniflive', library.active_selection)
+            assert snapshot.reference_text == '平实参考' and not snapshot.references
+            assert (await client.put(path, json={'reference_id': None, 'expected_revision': voice['revision']})).status_code == 409
+            cleared = await client.put(path, json={'reference_id': None, 'expected_revision': current['revision']})
+            assert cleared.status_code == 200 and not cleared.json()['voice']['default_reference_registered']
+            assert len(cleared.json()['voice']['references']) == 1
+            listed = await client.get('/api/v1/tts/voices/aniflive')
+            assert listed.status_code == 200
+            assert listed.json()['voices'][0]['default_reference_registered'] is False
+            status = runtime.local_tts_status_payload()
+            assert status['voice_state'] == 'invalid' and '默认合成参考未登记' in status['voice_error']
     asyncio.run(scenario())
 
 

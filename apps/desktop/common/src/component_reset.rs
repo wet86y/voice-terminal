@@ -7,7 +7,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{fs, sync::Mutex};
+use std::{collections::BTreeSet, fs, sync::Mutex};
 static LOCK: Mutex<()> = Mutex::new(()); // LOCK（重置记录写入互斥）。
 fn path(c: &LaunchContext) -> Result<std::path::PathBuf, String> {
     safe_path(&c.data, "state/component-reset.json")
@@ -163,9 +163,76 @@ pub fn apply(c: &LaunchContext, rows: &mut [Value]) -> Result<(), String> {
     project(&v, rows);
     Ok(())
 }
+// voice_assets（音色素材引用）：同时检查历史版本与迁移来源，保护跨模型共享素材。
+fn voice_assets(value: &Value, found: &mut BTreeSet<String>) {
+    match value {
+        Value::String(value) => { found.insert(value.clone()); },
+        Value::Array(rows) => for row in rows { voice_assets(row, found); },
+        Value::Object(rows) => for row in rows.values() { voice_assets(row, found); },
+        _ => {},
+    }
+}
+fn voice_removal(c: &LaunchContext, model: &str) -> Result<(Value, Vec<String>), String> {
+    let p = safe_path(&c.data, "tts/aniflive/voices/index.json")?;
+    if !p.exists() { return Ok((Value::Null, vec![])); }
+    let index = resources::load(&p)?;
+    if index["schema_version"] != 2 || !index["models"].is_object() || !index["assets"].is_object() {
+        return Err("音色包格式无法确认，请先修复音色库后再删除模型。".into());
+    }
+    let mut removed = BTreeSet::new();
+    voice_assets(&index["models"][model], &mut removed);
+    let mut keep = BTreeSet::new();
+    for (key, bucket) in index["models"].as_object().unwrap() {
+        if key != model { voice_assets(bucket, &mut keep); }
+    }
+    voice_assets(&index["migrations"], &mut keep);
+    let mut assets = vec![];
+    for asset in removed.difference(&keep) {
+        if index["assets"].get(asset).is_none() { continue; }
+        if asset.len() != 32 || !asset.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("音色素材编号无效，保留原件。".into());
+        }
+        for suffix in ["wav", "hifi.wav", "source"] {
+            safe_path(&c.data, &format!("tts/aniflive/voices/assets/{asset}.{suffix}"))?;
+        }
+        assets.push(asset.clone());
+    }
+    Ok((index, assets))
+}
+fn delete_model_voices(c: &LaunchContext, model: &str) -> Result<(), String> {
+    let (mut index, assets) = voice_removal(c, model)?;
+    if index.is_null() { return Ok(()); }
+    for asset in &assets {
+        for suffix in ["wav", "hifi.wav", "source"] {
+            let p = safe_path(&c.data, &format!("tts/aniflive/voices/assets/{asset}.{suffix}"))?;
+            remove_owned(&p, &c.data)?;
+        }
+        index["assets"].as_object_mut().unwrap().remove(asset);
+    }
+    index["models"].as_object_mut().unwrap().remove(model);
+    atomic_json(&safe_path(&c.data, "tts/aniflive/voices/index.json")?, &index)?;
+    let p = safe_path(&c.data, "config/product-settings.json")?;
+    if p.exists() {
+        let mut settings = resources::load(&p)?;
+        if let Some(selections) = settings["tts"]["active_voice_by_model"].as_object_mut() { selections.remove(model); }
+        atomic_json(&p, &settings)?;
+    }
+    Ok(())
+}
 pub fn plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
     let v = load(c)?;
-    if !v["faults"][id].is_string() {
+    let model = id.strip_prefix("tts-aniflive-").filter(|model| *model != "runtime");
+    let registry = if model.is_some() { resources::load(&safe_path(&c.data, "config/aniflive-models.json")?)? } else { Value::Null };
+    let registered = model.is_some_and(|model| registry["models"][model].is_object());
+    let (voice_index, assets) = if registered { voice_removal(c, model.unwrap())? } else { (Value::Null, vec![]) };
+    let voice_paths: Vec<String> = assets.iter().flat_map(|asset| ["wav", "hifi.wav", "source"].map(|suffix| format!("tts/aniflive/voices/assets/{asset}.{suffix}"))).collect();
+    if registered {
+        let settings = resources::load(&safe_path(&c.data, "config/product-settings.json")?).unwrap_or(Value::Null);
+        if settings["tts"]["backend"] == "aniflive" && settings["tts"]["local_model"].as_str() == model {
+            return Err("该模型是当前播放目标，请先在音色设置中切换播放目标后再删除。".into());
+        }
+    }
+    if !registered && !v["faults"][id].is_string() {
         return Err("当前组件没有待重置的维护异常。".into());
     }
     let paths = targets(c, id)?;
@@ -188,15 +255,22 @@ pub fn plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
                 id,
                 paths,
                 transaction,
+                registry,
+                voice_index,
                 v["faults"][id]
             ])
             .to_string()
             .as_bytes()
         )
     );
-    Ok(
-        json!({"resource_id":id,"resource_ids":ids(id),"paths":paths,"token":token,"reason":v["faults"][id],"message":if ids(id).len()>1{"将删除整个 CPU（中央处理器）和 GPU（图形处理器）共享环境及下载缓存；模型与用户资料保留。"}else{"将删除此组件及对应下载缓存；其他组件和用户资料保留。"},"fields":{"resource_id":"请求的组件编号","resource_ids":"实际重置的组件组","paths":"工作区内受管删除目录","token":"本次范围确认身份","reason":"维护异常原因","message":"删除影响中文说明"}}),
-    )
+    let mut result =
+        json!({"resource_id":id,"resource_ids":ids(id),"paths":paths,"token":token,"reason":v["faults"][id],"message":if ids(id).len()>1{"将删除整个 CPU（中央处理器）和 GPU（图形处理器）共享环境及下载缓存；模型与用户资料保留。"}else{"将删除此组件及对应下载缓存；其他组件和用户资料保留。"},"fields":{"resource_id":"请求的组件编号","resource_ids":"实际重置的组件组","paths":"工作区内受管删除目录","token":"本次范围确认身份","reason":"维护异常原因","message":"删除影响中文说明"}});
+    if registered {
+        result["voice_paths"] = json!(voice_paths);
+        result["message"] = json!("将删除此模型全部版本、该模型的音色包和独占参考录音；其他模型仍在引用的共享录音保留。");
+        result["fields"]["voice_paths"] = json!("资料目录内待删除的独占音色素材；同时从共享索引移除该模型音色包");
+    }
+    Ok(result)
 }
 pub fn pending(c: &LaunchContext) -> Result<Option<Value>, String> {
     let v = load(c)?;
@@ -336,6 +410,13 @@ pub fn execute(
         binding.program = c.installed_program();
         resources::bind_component(&binding, "models", "models", &c.install.join("models"))?;
     }
+    if let Some(model) = id.strip_prefix("tts-aniflive-").filter(|model| *model != "runtime") {
+        delete_model_voices(c, model)?;
+        let p = safe_path(&c.data, "config/aniflive-models.json")?;
+        let mut registry = resources::load(&p)?;
+        registry["models"].as_object_mut().ok_or("模型登记格式无效")?.remove(model);
+        atomic_json(&p, &registry)?;
+    }
     if id == "dsh" {
         let p = safe_path(&c.data, "state/native-dsh-binding.json")?;
         if p.exists() {
@@ -364,6 +445,38 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_voice_deletion_removes_all_owned_versions_and_preserves_shared_assets() {
+        let (root, c) = fixture();
+        let owned = "11111111111111111111111111111111";
+        let shared = "22222222222222222222222222222222";
+        let other = "33333333333333333333333333333333";
+        let index = json!({"schema_version":2,"assets":{owned:{},shared:{},other:{}},"migrations":{},"models":{
+            "delete-me":{"voices":{"voice":{"revisions":{"old":{"reference_asset_id":owned},"new":{"references":[{"asset_id":shared}]}}}}},
+            "keep-me":{"voices":{"voice":{"revisions":{"one":{"reference_asset_id":shared,"source_reference_asset_id":other}}}}}
+        }});
+        let p = c.data.join("tts/aniflive/voices/index.json");
+        fs::create_dir_all(p.parent().unwrap().join("assets")).unwrap();
+        atomic_json(&p, &index).unwrap();
+        for asset in [owned, shared, other] { for suffix in ["wav", "hifi.wav", "source"] {
+            fs::write(p.parent().unwrap().join(format!("assets/{asset}.{suffix}")), b"audio").unwrap();
+        }}
+        atomic_json(&c.data.join("config/product-settings.json"), &json!({"tts":{"active_voice_by_model":{"delete-me":{"voice_id":"voice"},"keep-me":{"voice_id":"voice"}}}})).unwrap();
+        delete_model_voices(&c, "delete-me").unwrap();
+        let result = resources::load(&p).unwrap();
+        assert!(result["models"].get("delete-me").is_none());
+        assert_eq!(result["models"]["keep-me"], index["models"]["keep-me"]);
+        assert!(result["assets"].get(owned).is_none());
+        for suffix in ["wav", "hifi.wav", "source"] {
+            assert!(!p.parent().unwrap().join(format!("assets/{owned}.{suffix}")).exists());
+            assert!(p.parent().unwrap().join(format!("assets/{shared}.{suffix}")).exists());
+        }
+        let settings = resources::load(&c.data.join("config/product-settings.json")).unwrap();
+        assert!(settings["tts"]["active_voice_by_model"].get("delete-me").is_none());
+        assert!(settings["tts"]["active_voice_by_model"]["keep-me"].is_object());
+        delete_model_voices(&c, "delete-me").unwrap();
+        crate::workspace::remove_owned(&root, root.parent().unwrap()).unwrap();
+    }
     #[test]
     fn aniflive_runtime_reset_scope_preserves_models_inputs_and_recordings() {
         let (root,c)=fixture();
@@ -459,6 +572,27 @@ mod tests {
 #[cfg(test)]
 mod reset_scenarios {
     use super::*;
+    #[test]
+    fn registered_model_deletion_requires_target_switch_and_removes_registration() {
+        let (root, c) = setup();
+        let catalog = c.installed_program().join("config/resources/catalog.json");
+        let mut value = resources::load(&catalog).unwrap();
+        value["resources"].as_array_mut().unwrap().push(json!({"resource_id":"tts-aniflive-template","model_id":"template","kind":"model","preparation":"aniflive_local_build","destination":"aniflive-tts/packages/template","files":[]}));
+        atomic_json(&catalog, &value).unwrap();
+        let p = c.data.join("config/aniflive-models.json");
+        atomic_json(&p, &json!({"schema":1,"models":{"mine":{"name":"我的模型","versions":{},"current_revision":"test"}}})).unwrap();
+        let settings = c.data.join("config/product-settings.json");
+        atomic_json(&settings, &json!({"tts":{"backend":"aniflive","local_model":"mine"}})).unwrap();
+        assert!(plan(&c, "tts-aniflive-mine").unwrap_err().contains("切换播放目标"));
+        atomic_json(&settings, &json!({"tts":{"backend":"minimax","local_model":"mine"}})).unwrap();
+        put(&root, "models/aniflive-tts/packages/mine/test/engine.bin");
+        let approved = plan(&c, "tts-aniflive-mine").unwrap();
+        execute(&c, "tts-aniflive-mine", approved["token"].as_str().unwrap(), &mut |_,_,_|{}).unwrap();
+        assert!(resources::load(&p).unwrap()["models"].get("mine").is_none());
+        assert!(!root.join("models/aniflive-tts/packages/mine").exists());
+        assert!(!resources::specs(&c).unwrap().iter().any(|row| row["preparation"] == "aniflive_local_build"));
+        remove_owned(&root, root.parent().unwrap()).unwrap();
+    }
     fn setup() -> (std::path::PathBuf, LaunchContext) {
         let (root, c) = super::tests::fixture();
         fs::create_dir_all(root.join("app/config/resources")).unwrap();

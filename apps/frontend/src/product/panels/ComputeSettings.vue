@@ -1,21 +1,29 @@
 <script setup lang="ts">
 import ResourceInstallDialog from './ResourceInstallDialog.vue';
+import AnifLiveTtsManagement from './AnifLiveTtsManagement.vue'
 import { computed, onMounted, ref, watch } from 'vue'
 import LocalComponents from '../../interface/LocalComponents.vue'
 import { formatComponentMemory, type FixedProviderId, type LocalComponentCategory, type LocalComponentRow, type LocalComponentsModel, type LocalDownloadItem, type LocalProviderSettings, type ManagedResourceRow } from '../../interface/local-components'
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
 import { useProductContext } from '../product-context'
 import { productApi } from '../api'
-import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
+import type { ComputeDeviceMode, ProductLocalModelId, ProductLocalTtsModelId } from '../types'
 import { componentResources, modelComponentOwners as owners } from '../component-resources'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
 import { operationPhaseLabel, type RuntimeOperation } from '../../runtime/runtime-operations'
 
-const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources>; operations?: RuntimeOperation[] }>()
+const props = defineProps<{
+  resourceController?: ReturnType<typeof useWorkspaceResources>
+  operations?: RuntimeOperation[]
+  expandAnifLiveTts?: boolean // expandAnifLiveTts（从音色设置跳转时展开本地合成卡片）。
+}>()
 const { voice, settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
+watch(() => props.resourceController?.resourceJobs.value.map(job => `${job.job_id}:${job.state}`).join('|'), () => {
+  if (props.resourceController?.resourceJobs.value.some(job => job.job_id.startsWith('reset-tts-aniflive-') && job.state === 'complete')) void tts.refresh(true)
+})
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
 const enhancementBusy = ref(false) // enhancementBusy（增强切换事务进行中）。
@@ -50,6 +58,10 @@ async function saveInference() {
     settings.inference = { backend: result.backend }
   } catch (failure) { inferenceError.value = failure instanceof Error ? failure.message : String(failure) }
   finally { inferenceSaving.value = false }
+}
+async function handleAnifLiveModelImportCompleted(_result: { model_id: string }) {
+  await tts.refresh(true)
+  await props.resourceController?.refreshInventory()
 }
 const providerLoading = ref(true) // providerLoading（正在读取在线服务配置状态）。
 const providerSaving = ref(false) // providerSaving（正在保存在线服务密钥）。
@@ -296,7 +308,7 @@ const rows = computed<LocalComponentRow[]>(() => {
       description: loading && !failure ? active && retrying.value.has(active.id) && !active.retrying ? '正在重新启动组件' : active?.phase || '等待系统服务启动' : '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
       error: failure ? `${failure.name}：${failure.error || failure.phase}` : undefined,
       resource: managedResource('voice-server'),
-      runtimeDependencies: environment?.runtime_components?.flatMap(resource => {
+      runtimeDependencies: environment?.runtime_components?.filter(resource => resource.resource_id !== 'tts-aniflive-runtime').flatMap(resource => {
         const managed = managedResource(resource.resource_id)
         return managed ? [{ ...managed, label: resource.label }] : []
       }),
@@ -315,60 +327,52 @@ const rows = computed<LocalComponentRow[]>(() => {
     || capability && ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state))
   const ttsFailed = !ttsLoading && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
   const ttsBackend = tts.status.value?.backend ?? settings.tts.backend
-  const selectedLocalModel = ttsBackend === 'aniflive' ? `tts-aniflive-${tts.status.value?.local_model ?? settings.tts.local_model ?? 'minimax-female-shaonv-zh'}` : undefined
   const localRuntime = managedResource('tts-aniflive-runtime')
   const localRuntimeReady = localRuntime?.state === 'installed' && !localRuntime.updateAvailable
-  const localModelResources = (tts.status.value?.models.map(row => `tts-aniflive-${row.id}`) ?? [])
-    .map(id => managedResource(id)).filter((resource): resource is ManagedResourceRow => Boolean(resource))
-    .map(resource => ({
-      ...resource,
-      status: resource.updateAvailable ? '需更新'
-        : resource.state === 'installed' ? localRuntimeReady ? '已就绪' : '已安装，运行环境待配置'
-          : resource.state === 'incomplete' ? '不完整' : '待安装',
-    }))
+  const ttsModels = tts.status.value?.models ?? []
+  const registeredLocalModels = ttsModels.filter(row => row.registered ?? row.available)
+  const usableLocalModels = ttsModels.filter(row => row.available)
   const loadedLocalModelId = ttsBackend === 'aniflive' && tts.status.value?.load_state === 'ready'
     && tts.status.value.loaded_model ? `tts-aniflive-${tts.status.value.loaded_model}` : undefined
-  components.push(...localModelResources.map((resource): LocalComponentRow => {
-    const selected = resource.id === selectedLocalModel
-    // local-tts（本地语音进程）的整进程采样只归当前已加载的 AnifLive 模型，避免与 共用运行依赖卡重复累计。
-    const localModelMetrics = resource.id === loadedLocalModelId ? localMetrics : undefined
-    const ready = resource.state === 'installed' && !resource.updateAvailable && localRuntimeReady
-    const busy = selected && ttsLoading
-    const failed = selected && ttsFailed
-    const state = busy ? 'loading' : failed ? 'failed'
-      : resource.updateAvailable ? 'failed' : ready ? 'ready' : 'disabled'
-    const status = busy ? tts.status.value?.pending_selection ? '切换中' : '启动中'
-      : failed ? '待配置或恢复'
-        : resource.updateAvailable ? '需更新' : ready ? selected && application.snapshot.value?.startup_complete ? '运行中' : '已就绪'
-          : resource.state === 'installed' ? '已安装，运行环境待配置' : resource.state === 'incomplete' ? '不完整' : '待安装'
-    return {
-      id: resource.id,
-      name: resource.label,
-      category: 'tts',
-      state,
-      status,
-      available: ready && !busy && !failed,
-      busy,
-      retryable: failed && Boolean(capability?.retry),
-      runtime: '',
-      residentMemory: formatComponentMemory(localModelMetrics?.memory_rss_bytes),
-      privateMemory: formatComponentMemory(localModelMetrics?.memory_private_commit_bytes),
-      vram: localModelMetrics?.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
-        ? formatComponentMemory(localModelMetrics.gpu_dedicated_bytes) : undefined,
-      resourceBytes: localModelMetrics ? {
-        resident: localModelMetrics.memory_rss_bytes ?? undefined,
-        privateCommit: localModelMetrics.memory_private_commit_bytes ?? undefined,
-        vram: localModelMetrics.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
-          ? localModelMetrics.gpu_dedicated_bytes : undefined,
-      } : undefined,
-      description: `${resource.label} 本地语音模型；使用 AnifLive（本地语音引擎）隔离运行依赖。`,
-      error: failed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
-      facts: [],
-      resource,
-      sharedResource: localRuntime,
-      note: '各本地模型共用隔离运行依赖；配置完成后可手动保存播放目标。',
-    }
-  }))
+  const localTtsPending = Boolean(tts.status.value?.pending_selection
+    && (tts.status.value.pending_selection.backend === 'aniflive' || ttsBackend === 'aniflive'))
+  const localTtsRunning = Boolean(loadedLocalModelId && ttsBackend === 'aniflive')
+  const localTtsLoading = Boolean(localTtsPending || ttsBackend === 'aniflive' && (tts.status.value?.load_state === 'loading'
+    || application.snapshot.value?.startup_complete === false && !application.snapshot.value?.startup_skipped
+    || capability && ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state)))
+  const localTtsFailed = !localTtsLoading && ttsBackend === 'aniflive'
+    && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
+  const localTtsModelReady = localRuntimeReady && usableLocalModels.length > 0
+  const localTtsReady = localTtsRunning || localTtsModelReady
+  // local-tts（本地语音进程）的整进程采样只归当前 AnifLive 卡片，模型资源子项不重复计量。
+  const localModelMetrics = localTtsRunning && loadedLocalModelId ? localMetrics : undefined
+  components.push({
+    id: 'tts-aniflive', name: 'AnifLive-TTS 本地合成', category: 'tts',
+    state: localTtsLoading ? 'loading' : localTtsFailed ? 'failed' : localTtsReady ? 'ready' : 'disabled',
+    status: localTtsLoading ? tts.status.value?.pending_selection ? '切换中' : '启动中'
+      : localTtsFailed ? '待配置或恢复' : localTtsRunning ? '运行中' : localTtsReady ? '已就绪'
+        : localRuntime?.state === 'installed' ? '运行环境待配置' : '待安装',
+    available: localTtsReady && !localTtsLoading && !localTtsFailed,
+    busy: localTtsLoading,
+    retryable: localTtsFailed && Boolean(capability?.retry),
+    runtime: '', location: '本机',
+    residentMemory: formatComponentMemory(localModelMetrics?.memory_rss_bytes),
+    privateMemory: formatComponentMemory(localModelMetrics?.memory_private_commit_bytes),
+    vram: localModelMetrics?.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
+      ? formatComponentMemory(localModelMetrics.gpu_dedicated_bytes) : undefined,
+    resourceBytes: localModelMetrics ? {
+      resident: localModelMetrics.memory_rss_bytes ?? undefined,
+      privateCommit: localModelMetrics.memory_private_commit_bytes ?? undefined,
+      vram: localModelMetrics.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
+        ? localModelMetrics.gpu_dedicated_bytes : undefined,
+    } : undefined,
+    description: registeredLocalModels.length
+      ? `${registeredLocalModels.length} 款已转换并登记的 AnifLive-TTS 模型；名称、下载和导入入口位于卡片详情。`
+      : '暂无已转换并登记的 AnifLive-TTS 模型；可在卡片详情中导入。',
+    error: localTtsFailed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
+    facts: [], runtimeDependencies: localRuntime ? [localRuntime] : [], settingsSection: 'tts',
+    note: '本地语音进程的常驻内存、提交内存和显存只计入当前运行模型；模型列表不重复累计。',
+  })
   const minimaxConfigured = providerConfigured.value.minimax
   const minimaxSelected = ttsBackend === 'minimax'
   components.push({
@@ -517,5 +521,16 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()" />
+  <LocalComponents :model="model" :saving="saving" :expand-aniflive-tts="props.expandAnifLiveTts" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()">
+    <template #aniflive-tts>
+      <AnifLiveTtsManagement
+        :models="tts.status.value?.models ?? []"
+        :open-import="props.expandAnifLiveTts"
+        :disabled="Boolean(tts.status.value?.pending_selection)"
+        @import-completed="handleAnifLiveModelImportCompleted"
+        @refresh="void tts.refresh(true)"
+        @delete-model="resourceController?.requestReset(`tts-aniflive-${$event}`)"
+      />
+    </template>
+  </LocalComponents>
 </template>

@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import threading
 
 from .aniflive_native import contained, digest, UPSTREAM_COMMIT, PATCH_REVISION, PATCHED_SHA256
-from .aniflive_install import atomic_json, DEFAULT_MODEL
+from .aniflive_install import atomic_json
 from .settings import valid_local_model
 
 _MODEL_ID = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}\Z')
 _REVISION = re.compile(r'[a-f0-9]{24}\Z')
+_REGISTRY_LOCK = threading.RLock()  # _REGISTRY_LOCK（模型登记与重命名的读写锁）。
 BUILD_ADAPTER_FILES = (
     'voice_terminal/tts/aniflive_native.py', 'voice_terminal/tts/aniflive_environment.py',
     'voice_terminal/tts/aniflive_worker.py', 'voice_terminal/tts/aniflive_build_diagnostics.py',
@@ -168,25 +170,48 @@ class AnifLiveModelRegistry:
         validate_model_id(model_id)
         if not _REVISION.fullmatch(revision):
             raise ValueError('模型版本编号无效。')
-        value = self.read()
-        entry = value['models'].setdefault(model_id, {'name': name, 'versions': {}})
-        previous = entry['versions'].get(revision)
-        if previous is not None and previous.get('identity') != identity:
-            raise ValueError('模型版本身份冲突，保留原登记。')
-        entry['versions'][revision] = {'state': 'validated', 'identity': identity}
-        entry['current_revision'] = revision
-        entry['name'] = str(name)[:80]
-        value['fields'] = {'schema': '模型登记格式', 'models': '已登记模型', 'name': '显示名称',
+        with _REGISTRY_LOCK:
+            value = self.read()
+            entry = value['models'].setdefault(model_id, {'name': name, 'versions': {}})
+            previous = entry['versions'].get(revision)
+            if previous is not None and previous.get('identity') != identity:
+                raise ValueError('模型版本身份冲突，保留原登记。')
+            entry['versions'][revision] = {'state': 'validated', 'identity': identity}
+            entry['current_revision'] = revision
+            # 已登记名称是用户可编辑的持久别名；新版本登记不得覆盖它。
+            if not isinstance(entry.get('name'), str) or not entry['name'].strip():
+                entry['name'] = str(name)[:80]
+            value['fields'] = {'schema': '模型登记格式', 'models': '已登记模型', 'name': '显示名称',
+                               'versions': '不可变模型版本', 'current_revision': '新选择采用的已验证版本',
+                               'state': '本机验证状态', 'identity': '原始输入及完整构建身份'}
+            if persist:
+                atomic_json(self.path, value)
+            return value
+
+    def rename(self, model_id, name):
+        """rename（重命名登记模型）：model_id（稳定模型标识）；name（新显示名称）。"""
+        validate_model_id(model_id)
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+            raise ValueError('模型名称需为 1–80 个字符。')
+        display_name = name.strip()
+        if any(ord(character) < 32 for character in display_name):
+            raise ValueError('模型名称不能包含控制字符。')
+        with _REGISTRY_LOCK:
+            value = self.read()
+            entry = value['models'].get(model_id)
+            if not isinstance(entry, dict):
+                raise ValueError('所选 AnifLive 模型尚未登记。')
+            entry['name'] = display_name
+            fields = value.setdefault('fields', {})
+            fields.update({'schema': '模型登记格式', 'models': '已登记模型', 'name': '显示名称',
                            'versions': '不可变模型版本', 'current_revision': '新选择采用的已验证版本',
-                           'state': '本机验证状态', 'identity': '原始输入及完整构建身份'}
-        if persist:
+                           'state': '本机验证状态', 'identity': '原始输入及完整构建身份'})
             atomic_json(self.path, value)
-        return value
+        return {'id': model_id, 'name': display_name}
 
     def models(self):
-        defaults = {DEFAULT_MODEL: '中文少女声（通用基底）', 'tangyuge-v2pp-d78cf598': '唐语歌（中文微调）'}
         registered = self.read()['models']
-        defaults.update({key: row.get('name', key) for key, row in registered.items()})
+        defaults = {key: row.get('name', key) for key, row in registered.items()}
         rows = []
         for model_id, name in defaults.items():
             available, revision = False, None
@@ -195,6 +220,7 @@ class AnifLiveModelRegistry:
                 available = True
             except (ValueError, KeyError, OSError, TypeError):
                 pass
-            rows.append({'id': model_id, 'name': name, 'available': available, 'revision': revision,
+            rows.append({'id': model_id, 'name': name, 'registered': model_id in registered,  # registered（是否在本机登记表中）。
+                         'available': available, 'revision': revision,
                          'loaded': False, 'native_sample_rate': 32000})
         return rows

@@ -35,6 +35,45 @@ def _create_voice(library: VoiceLibrary, *, text: str = "测试声音会清楚�
     return asset, voice
 
 
+def test_default_reference_is_a_reversible_selection_and_is_excluded_from_emotions(tmp_path):
+    from voice_terminal.tts.voices import ModelVoiceLibraries
+    library = ModelVoiceLibraries(tmp_path / 'tts').for_model('test-model')
+    seed = library.register_default(_wav_bytes(), '仅用于转换验收。', registered=False)
+    first = library.put_import(_wav_bytes(sample_rate=32000), 'one.wav')
+    second = library.put_import(_wav_bytes(sample_rate=24000), 'two.wav')
+    refs = [{'id': key * 32, 'name': name, 'tag': name, 'asset_id': asset['asset_id'],
+        'reference_text': name, 'reference_language': 'zh', 'intensity': .5, 'status': 'ready'}
+        for key, name, asset in [('a', 'neutral', first), ('b', 'soft', second)]]
+    voice = library.update_voice(seed['id'], seed['revision'], {**seed, 'references': refs})
+    assert not library.list_voices()[0]['enabled']
+    with pytest.raises(VoiceLibraryError, match='默认合成参考未登记'):
+        library.resolve('test-model', library.active_selection)
+    selected = library.set_default_reference(voice['id'], voice['revision'], 'a' * 32)
+    frozen = library.resolve('test-model', library.active_selection)
+    assert frozen.reference_text == 'neutral'
+    assert [row['tag'] for row in frozen.references] == ['soft']
+    assert len(selected['references']) == 2
+    with pytest.raises(VoiceRevisionConflict):
+        library.set_default_reference(voice['id'], voice['revision'], 'b' * 32)
+    with pytest.raises(VoiceLibraryError, match='先取消'):
+        library.update_voice(selected['id'], selected['revision'], {**selected, 'references': [refs[1]]})
+    changed = library.set_default_reference(selected['id'], selected['revision'], 'b' * 32)
+    current = library.resolve('test-model', library.active_selection)
+    assert current.reference_text == 'soft' and [row['tag'] for row in current.references] == ['neutral']
+    assert frozen.reference_text == 'neutral'  # 已创建会话继续使用原快照。
+    revised_rows = [{**row, 'reference_text': '校正后的温柔参考'} if row['id'] == 'b' * 32 else row for row in changed['references']]
+    edited = library.update_voice(changed['id'], changed['revision'], {'name': changed['name'], 'source': changed['source'],
+        'reference_asset_id': changed['reference_asset_id'], 'reference_text': changed['reference_text'], 'references': revised_rows})
+    assert library.resolve('test-model', library.active_selection).reference_text == '校正后的温柔参考'
+    cleared = library.set_default_reference(edited['id'], edited['revision'], None)
+    assert len(cleared['references']) == 2 and not cleared['default_reference_registered']
+    assert library.register_default(_wav_bytes(), '仅用于转换验收。')['revision'] == cleared['revision']
+    with pytest.raises(VoiceLibraryError, match='默认合成参考未登记'):
+        library.resolve('test-model', library.active_selection)
+    library.collect_garbage(max_age_seconds=-1)
+    assert library.asset_path(first['asset_id']).is_file() and library.asset_path(second['asset_id']).is_file()
+
+
 def test_aniflive_emotion_references_survive_edit_and_garbage_collection(tmp_path):
     library = VoiceLibrary(tmp_path / 'voices', model='aniflive')
     base = library.put_import(_wav_bytes(), 'base.wav')
