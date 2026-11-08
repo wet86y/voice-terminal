@@ -22,6 +22,8 @@ Voice Terminal 最开始是准备作为 [OpenClaw](https://github.com/openclaw) 
 
 项目目标很简单：**低延迟、低成本、易配置**的个人语音 agent。
 
+项目仍处于早期开发阶段，功能快速迭代中
+
 ---
 
 ## 核心能力
