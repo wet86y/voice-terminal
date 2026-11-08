@@ -25,7 +25,7 @@ export interface WorkspaceChoice {
 export interface ResourceStatus {
   reset_available?: boolean // reset_available（维护异常允许手动重置）。
   reset_reason?: string | null // reset_reason（中文重置原因）。
-  /** runtime_components（语音服务下的三个运行依赖卡片），parent_resource_id（所属组件编号）。 */
+  /** runtime_components（由后端列出的运行依赖子组件），parent_resource_id（后端所属组件编号）。 */
   runtime_components?: ResourceStatus[]
   parent_resource_id?: string
   /** required（必需组件）：false（否）时缺失、损坏或待更新均不阻塞整体启动。 */

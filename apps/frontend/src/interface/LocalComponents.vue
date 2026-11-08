@@ -23,7 +23,6 @@ const emit = defineEmits<{
   /** resourceDownload/resourceImport（下载或导入资源）、openResourceSource（打开上游）、cancelResource（取消任务）。 */
   resourceDownload: [id: string]
   resourceDownloadRequired: [] // resourceDownloadRequired（一键必要组件）。
-  ttsSelection: [choice: string] // ttsSelection（显式播放目标）。
   /** resourceBundleDownload（分类批量下载）：先读取清单，确认后并行启动适用资源。 */
   resourceBundleDownload: [request: { title: string; entries: LocalDownloadItem[] }]
   /** resourceRefresh（展开资源详情后刷新一次资源清单）。 */
@@ -120,7 +119,7 @@ function resourceStateLabel(state: string) {
 }
 function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] {
   const dependencies = row.runtimeDependencies
-  // runtimeDependencies（运行依赖子卡片）仅展开到 Voice Server 分类内，不改变其他组件的分类归属。
+  // Voice Server（语音服务）的运行依赖展开为同级卡片；其他分类保留在所属组件详情内。
   if (rowCategory(row) !== 'voice-server' || !dependencies?.length) return [row]
   const order = ['voice-runtime-cpu', 'tts-aniflive-runtime', 'voice-runtime-gpu']
   return [...dependencies].sort((a, b) => {
@@ -540,14 +539,6 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
           <ManagedResourceProgress v-if="!expandedCategories.has(category.id) && category.progress" class="local-category-progress" :job="category.progress" :label="category.title" />
         </header>
         <div v-if="expandedCategories.has(category.id)" :id="`local-category-${category.id}`" class="local-category-content">
-          <label v-if="category.id === 'tts' && model.ttsSelection" class="local-tts-selection form-field">
-            <span>语音播放目标</span>
-            <select :value="model.ttsSelection.options.some(option => option.value === model.ttsSelection!.value) ? model.ttsSelection.value : ''" :disabled="model.ttsSelection.saving || model.resourceTasksBusy" @change="emit('ttsSelection', ($event.target as HTMLSelectElement).value)">
-              <option v-if="!model.ttsSelection.options.some(option => option.value === model.ttsSelection!.value)" value="" disabled>当前选择未就绪，请补齐资源或选择其他目标</option>
-              <option v-for="option in model.ttsSelection.options" :key="option.value" :value="option.value">{{ option.label }}</option>
-            </select>
-            <small v-if="model.ttsSelection.error" class="local-error">{{ model.ttsSelection.error }}</small>
-          </label>
           <p v-if="!category.rows.length" class="resource-empty">暂无该分类的组件状态。</p>
           <div v-else class="local-component-list">
             <article v-for="{ row, job, enhancementResource, enhancementJob } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
@@ -677,7 +668,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-managed-heading>div{display:grid;gap:4px;min-width:0}
 .local-managed-heading>div>small{color:var(--muted)}
-.resource-batch-import{white-space:nowrap}.local-managed-heading .local-heading-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.local-managed-heading h3{font-size:var(--font-section);margin:0}.local-tts-selection{max-width:520px;padding:12px 0}.managed-batch-progress{grid-column:1 / -1}
+.resource-batch-import{white-space:nowrap}.local-managed-heading .local-heading-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.local-managed-heading h3{font-size:var(--font-section);margin:0}.managed-batch-progress{grid-column:1 / -1}
 .resource-empty{padding:14px 16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted);font-size:var(--font-body)}
 .local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 8px 14px}.local-category-content>.resource-empty{margin-top:2px}
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}

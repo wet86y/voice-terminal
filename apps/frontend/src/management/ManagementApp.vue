@@ -72,19 +72,6 @@ watch(credentials.inferenceBackend, value => { inferenceDraft.value = value }, {
 watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), item => {
   credentials.setLocalTtsReady(item ? item.selected_local_ready === true : null)
 }, { immediate: true })
-const selectionSaving = ref(false) // selectionSaving（正在保存播放目标）。
-const selectionError = ref('') // selectionError（播放目标保存失败原因）。
-async function saveTtsChoice(choice: string) {
-  if (selectionSaving.value || !model.value.ttsSelection?.options.some(option => option.value === choice)) return
-  selectionSaving.value = true; selectionError.value = ''
-  try {
-    if (!port.saveTtsSelection) throw new Error('当前宿主不支持启动前选择，请更新程序。')
-    await port.saveTtsSelection({ backend: choice === 'minimax' ? 'minimax' : 'aniflive',
-      local_model: choice === 'minimax' ? credentials.ttsLocalModel.value : choice })
-    await Promise.all([credentials.refresh(), resources.refreshInventory()])
-  } catch (failure) { selectionError.value = failure instanceof Error ? failure.message : String(failure) }
-  finally { selectionSaving.value = false }
-}
 const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
 const logExportError = ref('') // logExportError（日志打包错误）。
 const logExportSuccess = ref(false) // logExportSuccess（日志包已保存）。
@@ -171,6 +158,18 @@ const model = computed<LocalComponentsModel>(() => {
   })
   const ttsResources = inventory.filter(item => item.resource_id.startsWith('tts-aniflive-') && item.resource_id !== 'tts-aniflive-runtime')
   const runtimeResource = findResource('tts-aniflive-runtime')
+  const anifliveRuntime = runtimeResource ? toManagedResource(runtimeResource) : undefined
+  const anifliveModelReady = ttsResources.some(item => item.can_start === true && item.update_available !== true)
+  const anifliveReady = anifliveRuntime?.ready === true && anifliveModelReady
+  const anifliveRow: LocalComponentRow = {
+    id: 'tts-aniflive', name: 'AnifLive-TTS 本地合成', category: 'tts',
+    state: anifliveReady ? 'ready' : 'disabled',
+    status: anifliveReady ? '已就绪' : anifliveRuntime?.state === 'installed' ? '运行环境待配置' : '待安装',
+    available: anifliveReady, runtime: '', location: '本机',
+    description: '管理 AnifLive 本地语音合成使用的隔离运行依赖。',
+    facts: [], runtimeDependencies: anifliveRuntime ? [anifliveRuntime] : [],
+    note: '仅在使用 AnifLive 本地语音合成时需要；缺失时不影响在线语音。',
+  }
   const minimaxReady = credentials.configured.value.minimax
   const ttsModelRows: LocalComponentRow[] = ttsResources.map((item): LocalComponentRow => {
     const model = toManagedResource(item)
@@ -187,11 +186,10 @@ const model = computed<LocalComponentsModel>(() => {
           : item.installation_state === 'incomplete' ? '不完整' : '待安装',
       available: ready,
       runtime: '',
-      description: `${item.label} 本地语音模型；需与共用 AnifLive（本地语音引擎）运行资源一并就绪。`,
+      description: `${item.label} 本地语音模型；共用运行依赖位于 AnifLive-TTS 本地合成卡片。`,
       facts: [],
       resource: model,
-      sharedResource: runtimeResource ? toManagedResource(runtimeResource) : undefined,
-      note: '各本地模型共用 AnifLive（本地语音引擎）隔离运行依赖；配置完成后可手动保存播放目标。',
+      note: '各本地模型共用 AnifLive（本地语音引擎）隔离运行依赖，状态与下载入口统一显示在本地合成卡片中。',
     }
   })
   const minimaxRow: LocalComponentRow = {
@@ -215,7 +213,12 @@ const model = computed<LocalComponentsModel>(() => {
       error: inferenceError.value || undefined,
   }
   const voiceServer = findResource('voice-server')
-  const voiceRow: LocalComponentRow = voiceServer ? resourceRow(voiceServer, 'voice-server') : {
+  const voiceRow: LocalComponentRow = voiceServer ? {
+    ...resourceRow(voiceServer, 'voice-server'),
+    runtimeDependencies: voiceServer.runtime_components
+      ?.filter(resource => resource.resource_id !== 'tts-aniflive-runtime')
+      .map(toManagedResource),
+  } : {
     id: 'voice-system', name: 'Voice Server（语音服务）', category: 'voice-server',
     state: 'disabled', status: '待配置', available: false, runtime: '本地系统服务',
     description: '统一准备 Python（后端解释器）和全部语音运行依赖。', facts: [],
@@ -225,18 +228,10 @@ const model = computed<LocalComponentsModel>(() => {
     state: 'ready', status: '内置能力', available: true, runtime: '语音主服务内',
     description: '在实时及整句识别之后修订热词；复用语音主服务，不需要独立下载。', facts: [],
   }
-  const rows = [...knownRows, ...ttsModelRows, minimaxRow, deepseekRow, hotwordRow, voiceRow]
+  const rows = [...knownRows, anifliveRow, ...ttsModelRows, minimaxRow, deepseekRow, hotwordRow, voiceRow]
   const failedJobs = resources.resourceJobs.value.filter(job => job.state === 'failed')
   return {
     status: '本地组件管理可用', state: 'ready',
-    ttsSelection: {
-      value: credentials.ttsBackend.value === 'minimax' ? 'minimax' : credentials.ttsLocalModel.value,
-      saving: selectionSaving.value || credentials.loading.value,
-      error: selectionError.value,
-      options: [{ value: 'minimax', label: '在线 API（网络语音接口）' },
-        ...ttsResources.filter(item => item.can_start === true && item.update_available !== true)
-          .map(item => ({ value: item.resource_id.slice("tts-aniflive-".length), label: item.label }))],
-    },
     sampledAt: resources.inventoryUpdatedAt.value ? new Date(resources.inventoryUpdatedAt.value).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '正在读取组件清单',
     resources: [],
     downloadResources: inventory.map(toManagedResource),
@@ -325,7 +320,7 @@ function exportLogs() {
             <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置所选推理服务与语音合成。' : componentBlockMessage }}</p>
             <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
           </div>
-          <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @tts-selection="saveTtsChoice" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
+          <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
         </template>
         <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
         <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>

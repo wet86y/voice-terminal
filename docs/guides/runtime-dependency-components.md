@@ -1,13 +1,13 @@
 # 语音服务运行依赖卡片
 
-Voice Server（语音服务）的环境状态包含 CPU（中央处理器）基础依赖、GPU（图形处理器）可选依赖和 AnifLive（本地语音引擎）隔离依赖。AnifLive 隔离依赖由本地 TTS 组件使用；产品页将其显示在 AnifLive-TTS 卡片中，组件维护接口仍将其登记为可选运行依赖。
+Voice Server（语音服务）的环境状态包含 CPU（中央处理器）基础依赖、GPU（图形处理器）可选依赖和 AnifLive（本地语音引擎）隔离依赖。AnifLive 隔离依赖由本地 TTS 组件使用；首次配置页和正式设置页都将其显示在 AnifLive-TTS 卡片中，组件维护接口仍将其登记为 Voice Server 的可选运行依赖。
 
 | 卡片 | 资源编号 | 安装规则 |
 | --- | --- | --- |
 | CPU（中央处理器）运行依赖 | `voice-runtime-cpu`（基础运行依赖编号） | 必需；保留 `voice-server`（原语音服务资源编号）入口兼容。一次配置现有六个基础依赖组 |
 | GPU（图形处理器）运行依赖 | `voice-runtime-gpu`（可选显卡运行依赖编号） | 可选；同一解释器中按进程隔离处理器与显卡张量包，只有实际使用显卡的进程选择显卡构建 |
 
-AnifLive 独立运行依赖编号为 `tts-aniflive-runtime`（AnifLive 隔离依赖资源编号），仅由本地 AnifLive 模型使用。它安装在独立的 `runtimes/aniflive-tts`（AnifLive 隔离环境目录），不与共享 Python 解释器依赖混装；运行状态页将它归入本地 TTS 组件卡片。
+AnifLive 独立运行依赖编号为 `tts-aniflive-runtime`（AnifLive 隔离依赖资源编号），仅由本地 AnifLive 模型使用。它安装在独立的 `runtimes/aniflive-tts`（AnifLive 隔离环境目录），不与共享 Python 解释器依赖混装；首次配置页和运行状态页都将它归入本地 TTS 组件卡片。
 
 分类级下载和一键下载只包含必需 CPU（中央处理器）环境，不包含 GPU（图形处理器）与 AnifLive 隔离依赖。CPU 主清单覆盖六组、111 个固定预编译包，产品运行诊断沿用这份完整闭包；开发和模型导出工具使用各自清单。TTS（语音合成）启动门禁以保存的播放目标为准：在线目标需要其接口密钥，本地目标需要指定模型及 AnifLive 隔离运行依赖均就绪，不自动切换其他可用后端。程序更新在组件缺失、待更新或服务未启动时仍可从管理页执行。
 

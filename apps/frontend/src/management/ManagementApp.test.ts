@@ -171,36 +171,47 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
-  it('启动前显式选择已就绪本地模型只保存配置，不启动服务', async () => {
-    inventory.push({ ...row('tts-aniflive-minimax-female-shaonv-zh', '中文少女声（通用基底）（AnifLive 本地语音）', true), required: false },
-      { ...row('tts-aniflive-tangyuge-v2pp-d78cf598', '唐语歌（中文微调）（AnifLive 本地语音）'), required: false })
+  it('首次配置将 AnifLive 运行依赖放在语音合成卡且不显示旧播放目标选择', async () => {
+    const runtime = { ...row('tts-aniflive-runtime', 'AnifLive（本地语音引擎）隔离运行依赖'), required: false }
+    inventory.push(runtime)
+    inventory[0]!.runtime_components = [runtime]
     const save = vi.fn(async (request: desktop.TtsSelection) => request)
     const port = desktop.desktopPort() as desktop.DesktopPort & desktop.DesktopWorkspacePort
     port.saveTtsSelection = save
     wrapper = mount(ManagementApp)
     await flushPromises()
     await expandCategory('tts')
-    expect(wrapper.find('option[value="tangyuge-v2pp-d78cf598"]').exists()).toBe(false)
-    await wrapper.get('.local-tts-selection select').setValue('minimax-female-shaonv-zh')
-    await flushPromises()
-    expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'minimax-female-shaonv-zh' })
+    expect(wrapper.find('.local-tts-selection').exists()).toBe(false)
+    const aniflive = wrapper.get('[data-category="tts"] [data-component="tts-aniflive"]')
+    await aniflive.get('button[aria-label="AnifLive-TTS 本地合成：详情"]').trigger('click')
+    expect(aniflive.find('[data-runtime-dependency="tts-aniflive-runtime"]').exists()).toBe(true)
+    expect(aniflive.find('button[aria-label="AnifLive（本地语音引擎）隔离运行依赖：下载"]').exists()).toBe(true)
+    await expandCategory('voice-server')
+    expect(wrapper.find('[data-category="voice-server"] [data-runtime-dependency="tts-aniflive-runtime"]').exists()).toBe(false)
+    expect(wrapper.find('[data-category="voice-server"] [data-component="tts-aniflive-runtime"]').exists()).toBe(false)
+    expect(save).not.toHaveBeenCalled()
     expect(start).not.toHaveBeenCalled()
     expect(download).not.toHaveBeenCalled()
   })
 
-  it('语音运行依赖分为三个子卡片，可选依赖默认不勾选且不阻塞启动', async () => {
+  it('语音服务只展开 CPU 与 GPU 依赖，AnifLive 运行依赖归入语音合成且不阻塞启动', async () => {
     inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
     inventory[0]!.runtime_components = [
       { ...row('voice-runtime-cpu', 'CPU（中央处理器）运行依赖', true), required: true },
       { ...row('tts-aniflive-runtime', 'AnifLive（本地语音引擎）隔离运行依赖'), required: false },
       { ...row('voice-runtime-gpu', 'GPU（图形处理器）运行依赖'), required: false },
     ]
+    inventory.push({ ...row('tts-aniflive-runtime', 'AnifLive（本地语音引擎）隔离运行依赖'), required: false })
     wrapper = mount(ManagementApp)
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
     await expandCategory('voice-server')
-    expect(wrapper.findAll('[data-category="voice-server"] [data-component]')).toHaveLength(3)
+    expect(wrapper.findAll('[data-category="voice-server"] [data-component]')).toHaveLength(2)
     expect(wrapper.find('[data-category="voice-server"] .category-download').exists()).toBe(false)
+    await expandCategory('tts')
+    const aniflive = wrapper.get('[data-category="tts"] [data-component="tts-aniflive"]')
+    await aniflive.get('button[aria-label="AnifLive-TTS 本地合成：详情"]').trigger('click')
+    expect(aniflive.find('[data-runtime-dependency="tts-aniflive-runtime"]').exists()).toBe(true)
     const gpuCard = wrapper.get('[data-component="voice-runtime-gpu"]')
     await gpuCard.get('button[aria-label="GPU（图形处理器）运行依赖：下载"]').trigger('click')
     await flushPromises()

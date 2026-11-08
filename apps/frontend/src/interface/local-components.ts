@@ -81,7 +81,7 @@ export interface LocalComponentRow {
   /** resourceChoices（可选模型）与 sharedResource（共用运行程序）：摘要显示状态，详情显示安装信息。 */
   resourceChoices?: ManagedResourceRow[]
   sharedResource?: ManagedResourceRow
-  /** runtimeDependencies（语音服务运行依赖）：中央处理器必需，AnifLive 本地语音与显卡可选。 */
+  /** runtimeDependencies（组件运行依赖）：中央处理器必需，AnifLive 本地语音与显卡可选。 */
   runtimeDependencies?: ManagedResourceRow[]
   /** runtimeDependencyMetrics（依赖进程指标）：按依赖编号提供独占进程采样，避免把共享进程重复记到模型卡。 */
   runtimeDependencyMetrics?: Record<string, {
@@ -190,8 +190,6 @@ export interface LocalComponentsModel {
   integrityReady?: boolean
   integrityBusy?: boolean
   integrityMessage?: string
-  /** ttsSelection（启动前播放目标）：只提供已就绪的本地选项，value（当前选择）可以尚未就绪。 */
-  ttsSelection?: { value: string; options: Array<{ value: string; label: string }>; saving: boolean; error?: string }
   /** status（整体状态）、state（状态类别）与 sampledAt（采样时间）。 */
   status: string
   state: LocalComponentState
