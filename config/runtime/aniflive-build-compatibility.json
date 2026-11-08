@@ -1,5 +1,28 @@
 {
   "schema": 1,
+  "runtime_contract": {
+    "revision": 1,
+    "upstream_commit": "9bc349d3a71362b3bfdccbc630983809800954fd",
+    "source_patch_revisions": [3, 5],
+    "model_family": "gsv-v2proplus",
+    "backend": "TensorRT-11",
+    "runtime_packages": {
+      "torch": "2.10.0+cu128",
+      "torchaudio": "2.10.0+cu128",
+      "tensorrt-cu12": "11.2.1.2",
+      "transformers": "5.5.0",
+      "tokenizers": "0.22.2",
+      "huggingface-hub": "1.28.0"
+    },
+    "fields": {
+      "revision": "推理兼容协议版本；引擎接口发生不兼容变更时递增",
+      "upstream_commit": "受支持上游版本",
+      "source_patch_revisions": "可加载既有引擎的已审阅补丁修订",
+      "model_family": "支持的模型计算架构",
+      "backend": "支持的引擎运行后端",
+      "runtime_packages": "推理关键依赖版本；导出依赖和工具源码摘要不作为启动门槛"
+    }
+  },
   "profiles": [
     {
       "name": "patch3-export-only-upgrade-to-patch5",
@@ -53,14 +76,73 @@
         "scripts/run-aniflive.py": "960e2b7de84214e85d82ebd53ccc193e4ba273f80ac9c9ce0fa73c3f4d39ec88",
         "voice_terminal/tts/aniflive_aliases.py": "58609d3cd0ab7310ac10f6a3508304eef6e2e8fc33ae32ddff1931930cf94453",
         "voice_terminal/tts/aniflive_shared.py": "1e3d4a92586da4ef8f3f3167aae5dd6833f559edc3f75b904333fc71a06067f6",
+        "voice_terminal/tts/aniflive_service.py": "bfe508465678e06a39aff1c0379ce129d8627ac4c361b384a3ae2b3cb0e5640a",
+        "voice_terminal/tts/aniflive_export.py": "5d3ea75ee6a76960d5eddbb5768c03d936d6ec7aae86bc54ed605553f32da1c8"
+      },
+      "reason": "旧修订引擎保留原始身份；当前桥接增加参考目录的事务式准备，不更改引擎计算。"
+    },
+    {
+      "name": "patch5-application-reference-catalog",
+      "source": {
+        "upstream_commit": "9bc349d3a71362b3bfdccbc630983809800954fd",
+        "archive_sha256": "67929fedc70df998a6006028b6385743611c5d5a78a5ede3b6713f64435eada2",
+        "patch_revision": 5,
+        "files": [
+          {
+            "path": "minimal_inference/export_onnx.py",
+            "before_sha256": "96b462e9ae31d0bf2a95e232bcc6df2d3f951e2dbe793148c06e8eac8e103c0c",
+            "after_sha256": "da5f9bc8dff89c38ec2a297b6754736d529a2a9fb401456efcb39ff4dc7b9bbf"
+          },
+          {
+            "path": "minimal_inference/GPT_SoVITS/text/korean.py",
+            "before_sha256": "f7b9a3c4f99a64fa192352641e893e4fe67d3759c8b5f45d2cd232d3edd332a1",
+            "after_sha256": "07b5f540a6664b028bfcdabaed1c0a064d0e3a2d2fc61d9f87d1a111bb974fe7"
+          },
+          {
+            "path": "src/aniflive_tts/service.py",
+            "before_sha256": "df07665b5d0ccef556d9415737ed7551d3e32a31b524f01d12e01e86731451c8",
+            "after_sha256": "ba3ed25c5eac40522af6986450e2e4f03407bfa531770517edd6ecf3d56be29e"
+          },
+          {
+            "path": "src/aniflive_tts/backend/trt_builder.py",
+            "before_sha256": "9cb7a43da3cfae873fe1db9d96a5c2e3a09a64a060774a27e122007a30b503b0",
+            "after_sha256": "70f8b41a9f71dc0311cadcc3bc48a4a5fcb9da2951ef2e2a63cd490e3f1d7753"
+          },
+          {
+            "path": "scripts/setup_shared_assets.py",
+            "before_sha256": "bc57723d5b01e701565fa0f6c11218fe9f4946b08f458d59d3051a0aa9711030",
+            "after_sha256": "13c89086b7a499b0be3d408f476032832c7961e5840fbd3c9764ee98a430dc84"
+          }
+        ]
+      },
+      "adapter": {
+        "voice_terminal/tts/aniflive_native.py": "2b0c58d6cbdfec40ebf82a587bb3c294d3d72d19b79c66d50e404ec56eb59a25",
+        "voice_terminal/tts/aniflive_environment.py": "e089cd3f5235e9a0f0f70f45800ddf30cf9f3207df49701946b36c8620133802",
+        "voice_terminal/tts/aniflive_worker.py": "ba263a06f036ee7d4ed830ff77186742cabc14cf0e9f3a045e8ef8dd7375a7ed",
+        "voice_terminal/tts/aniflive_build_diagnostics.py": "6b4652c6ef78fa8c02815a7ff0817cbc599828541ed58a6679b3ec8061e2af80",
+        "scripts/run-aniflive.py": "960e2b7de84214e85d82ebd53ccc193e4ba273f80ac9c9ce0fa73c3f4d39ec88",
+        "voice_terminal/tts/aniflive_aliases.py": "58609d3cd0ab7310ac10f6a3508304eef6e2e8fc33ae32ddff1931930cf94453",
+        "voice_terminal/tts/aniflive_shared.py": "1e3d4a92586da4ef8f3f3167aae5dd6833f559edc3f75b904333fc71a06067f6",
         "voice_terminal/tts/aniflive_service.py": "fce7874b6d3c84beba12a84561bfa8e0114a6e8e6c980255e0a0f34afdd4d3ae",
         "voice_terminal/tts/aniflive_export.py": "5d3ea75ee6a76960d5eddbb5768c03d936d6ec7aae86bc54ed605553f32da1c8"
       },
-      "reason": "修订3到5仅改变导出调度、编码器参考校验和源码准备；推理依赖、共享锁、服务桥接及路径解析运算保持兼容。原始构建身份不变，实际加载和合成另行验证。"
+      "runtime_adapter": {
+        "voice_terminal/tts/aniflive_native.py": "2b0c58d6cbdfec40ebf82a587bb3c294d3d72d19b79c66d50e404ec56eb59a25",
+        "voice_terminal/tts/aniflive_environment.py": "e089cd3f5235e9a0f0f70f45800ddf30cf9f3207df49701946b36c8620133802",
+        "voice_terminal/tts/aniflive_worker.py": "ba263a06f036ee7d4ed830ff77186742cabc14cf0e9f3a045e8ef8dd7375a7ed",
+        "voice_terminal/tts/aniflive_build_diagnostics.py": "6b4652c6ef78fa8c02815a7ff0817cbc599828541ed58a6679b3ec8061e2af80",
+        "scripts/run-aniflive.py": "960e2b7de84214e85d82ebd53ccc193e4ba273f80ac9c9ce0fa73c3f4d39ec88",
+        "voice_terminal/tts/aniflive_aliases.py": "58609d3cd0ab7310ac10f6a3508304eef6e2e8fc33ae32ddff1931930cf94453",
+        "voice_terminal/tts/aniflive_shared.py": "1e3d4a92586da4ef8f3f3167aae5dd6833f559edc3f75b904333fc71a06067f6",
+        "voice_terminal/tts/aniflive_service.py": "bfe508465678e06a39aff1c0379ce129d8627ac4c361b384a3ae2b3cb0e5640a",
+        "voice_terminal/tts/aniflive_export.py": "5d3ea75ee6a76960d5eddbb5768c03d936d6ec7aae86bc54ed605553f32da1c8"
+      },
+      "reason": "修订5引擎保留原始构建身份；当前桥接增加参考目录的事务式准备，不更改引擎计算。"
     }
   ],
   "fields": {
     "schema": "兼容规则格式",
+    "runtime_contract": "稳定推理协议；将启动兼容与构建源码溯源分离",
     "profiles": "逐项审阅的构建与当前运行适配组合",
     "name": "规则名称",
     "source": "原始源码构建身份，不重新标注修订",

@@ -49,6 +49,8 @@
     "allow-resource-reset",
     "allow-resource-import",
     "allow-resource-import-confirm",
+    "allow-aniflive-import-choose-folder",
+    "allow-aniflive-import-start",
     "allow-resource-open-source",
     "allow-resource-cancel",
     "core:event:allow-listen",

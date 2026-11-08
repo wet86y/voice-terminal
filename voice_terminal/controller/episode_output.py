@@ -422,6 +422,9 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                     session = client.session(fresh=fresh)
                 except TypeError:
                     session = client.session()
+        if h is not None and getattr(client, 'supports_local_audio_controls', False):
+            from ..tts.aniflive_audio_session import AnifLiveAudioSession
+            session = AnifLiveAudioSession(client, session)
         if h is not None:
             if getattr(client, "supports_speech_controls", False):
                 session.speech_control_reader = lambda: self._handle_controls(h)
@@ -642,6 +645,9 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                                                         turn_id=turn_id, speech_id=h.speech_id)
                 else:
                     h.tts_session = h.tts_client.session(turn_id=turn_id, speech_id=h.speech_id)
+                if getattr(h.tts_client, 'supports_local_audio_controls', False):
+                    from ..tts.aniflive_audio_session import AnifLiveAudioSession
+                    h.tts_session = AnifLiveAudioSession(h.tts_client, h.tts_session)
                 h.tts_session_prepared = True
                 if _continuation_parent is not None and getattr(h.tts_client, "freeze_session_at_admission", False):
                     previous_session = _continuation_parent.tts_session

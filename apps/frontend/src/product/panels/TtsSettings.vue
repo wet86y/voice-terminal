@@ -4,7 +4,8 @@ import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import TtsVoiceLibrary from '../../interface/TtsVoiceLibrary.vue'
 import TtsSynthesisPreferences from '../../interface/TtsSynthesisPreferences.vue'
 import OnlineTtsVoiceSettings from '../../interface/OnlineTtsVoiceSettings.vue'
-import { productApi } from '../api'
+import AnifLiveModelImport from './AnifLiveModelImport.vue'
+import { productApi, type AnifLiveImportJob } from '../api'
 import { desktopPort } from '../desktop-port'
 import { useProductContext } from '../product-context'
 import { isRecord } from '../../record'
@@ -12,12 +13,21 @@ import type { ProductLocalTtsModelId, ProductLocalTtsStatus, ProductOnlineTtsMod
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
 
 const props = withDefaults(defineProps<{ demo?: boolean }>(), { demo: false })
+type AnifLiveImportCompletion = {
+  model_id: string
+  revision?: string | null
+  task_id: string
+  scan_id?: string
+  reference_candidates?: AnifLiveImportJob['reference_candidates']
+}
+const emit = defineEmits<{ 'import-completed': [value: AnifLiveImportCompletion] }>()
 const context = props.demo ? undefined : useProductContext()
 const desktop = desktopPort()
 const settings = context?.settings ?? reactive({ tts: { backend: 'minimax', local_model: 'minimax-female-shaonv-zh' } as ProductTtsSettings })
 type Choice = 'minimax' | ProductLocalTtsModelId // Choice（播放目标）。
 const officialVoiceLibraryUrl = 'https://solutions.minimaxi.com/voices'
 const selected = ref<Choice>(settings.tts.backend === 'minimax' ? 'minimax' : settings.tts.local_model || 'minimax-female-shaonv-zh')
+const localDraft = ref<ProductLocalTtsModelId>(settings.tts.local_model || 'minimax-female-shaonv-zh') // localDraft（本地模型草稿）。
 const saving = ref(false)
 const savingOnline = ref(false)
 const previewingOnline = ref(false)
@@ -28,6 +38,7 @@ const onlineVoiceIdDraft = ref(settings.tts.online_voice_id ?? 'female-shaonv')
 let onlinePreviewOperationId: string | undefined
 let selectionGeneration = 0 // selectionGeneration（选择请求代次）：连续操作保留最后目标。
 const error = ref('')
+const importOpen = ref(false)
 const demoStatus = reactive<ProductLocalTtsStatus>({ backend: 'minimax', local_model: 'minimax-female-shaonv-zh', loaded_model: null, load_state: 'disabled', error: null,
   models: [{ id: 'minimax-female-shaonv-zh', name: '中文少女声（通用基底）', available: true, loaded: false, native_sample_rate: 32000 }, { id: 'tangyuge-v2pp-d78cf598', name: '唐语歌（中文微调）', available: true, loaded: false, native_sample_rate: 32000 }] })
 const live = useLocalTtsStatus(() => !props.demo)
@@ -62,6 +73,15 @@ onBeforeUnmount(() => {
 })
 onMounted(() => { if (!props.demo) void live.refresh() })
 function refreshStatus() { if (!props.demo) void live.refresh() }
+async function handleAnifLiveImportCompleted(result: AnifLiveImportCompletion) {
+  await live.refresh(true)
+  if (readyModels.value.some(item => item.id === result.model_id)) {
+    // draft（草稿）仅更新页面选择；用户按下保存后才切换实际播放目标。
+    localDraft.value = result.model_id as ProductLocalTtsModelId
+    if (selected.value !== 'minimax') selected.value = localDraft.value
+  }
+  emit('import-completed', result)
+}
 async function setSpeechControl(enabled: boolean) {
   const previous = settings.tts.speech_control_enabled ?? true
   savingControls.value = true; error.value = ''
@@ -79,9 +99,31 @@ async function setSpeechControl(enabled: boolean) {
 }
 function selectTarget(event: Event) {
   const choice = (event.target as HTMLSelectElement).value as Choice
-  if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) return
+  if (choice !== 'minimax' && !status.value?.models.some(item => item.id === choice)) return
   selected.value = choice
+  if (choice !== 'minimax') localDraft.value = choice
   error.value = ''
+}
+function selectMode(mode: 'online' | 'local') {
+  selected.value = mode === 'online' ? 'minimax' : localDraft.value
+  error.value = ''
+}
+async function saveLocalModel() {
+  if (!readyModels.value.some(item => item.id === localDraft.value)) return
+  if (status.value?.backend === 'aniflive') {
+    try { await applyTarget(localDraft.value) } catch { /* 错误已展示。 */ }
+    return
+  }
+  saving.value = true; error.value = ''
+  try {
+    if (!props.demo) {
+      const result = await productApi.saveTts({ local_model: localDraft.value })
+      if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+      await live.refresh(true)
+    } else demoStatus.local_model = localDraft.value
+  } catch (failure) {
+    error.value = failure instanceof Error ? failure.message : '保存本地模型失败。'
+  } finally { saving.value = false }
 }
 async function applyTarget(choice: Choice) {
   if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) {
@@ -115,7 +157,7 @@ async function ensureTargetSupport(_engine: ProductLocalTtsModelId) {
   if (props.demo) return
   const current = status.value
   if (current?.backend === 'aniflive' && current.local_model === target && current.load_state === 'ready') return
-  await applyTarget(target)
+  // 试听任务负责临时加载草稿模型，并在结束后恢复原运行状态。
 }
 async function saveOption(key: keyof typeof options, value: boolean | number) {
   if (savingQuality.value) return
@@ -189,7 +231,7 @@ async function openOfficialVoiceLibrary() {
   <div class="tts-settings">
     <section class="tts-target preference-card">
       <div class="tts-target-row">
-        <label class="form-field"><span>语音播放目标</span><select :value="selectedReady ? selected : ''" :disabled="saving || !!status?.pending_selection" @change="selectTarget"><option value="minimax">{{ names.minimax }}</option><option v-if="!selectedReady" value="" disabled>当前目标未就绪，请在组件设置补齐资源</option><option v-for="item in readyModels" :key="item.id" :value="item.id">{{ names[item.id] }}</option></select></label>
+        <div class="form-field"><span>语音播放目标</span><div class="mode-options" role="group" aria-label="语音播放目标"><button type="button" :class="{ selected: selected === 'minimax' }" :aria-pressed="selected === 'minimax'" :disabled="unavailable" @click="selectMode('online')">在线</button><button type="button" :class="{ selected: selected !== 'minimax' }" :aria-pressed="selected !== 'minimax'" :disabled="unavailable" @click="selectMode('local')">本地</button></div></div>
         <button class="save-button tts-target-save" type="button" aria-label="保存播放目标" :disabled="targetSaveDisabled" @click="saveTarget">{{ saving ? '正在切换…' : '保存播放目标' }}</button>
       </div>
       <p class="instruction-hint" role="status">当前生效：{{ names[effective] }} · {{ saving ? '正在切换…' : states[status?.load_state || 'unloaded'] || '等待状态' }}<template v-if="status?.pending_selection"> · 等待当前事务结束后切换</template></p>
@@ -197,8 +239,12 @@ async function openOfficialVoiceLibrary() {
       <p v-if="selected === 'minimax'" class="instruction-hint">在线接口密钥与账号用量可在“组件设置 → 语音合成”中管理。</p>
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
-    <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :disabled="saving" :demo="demo" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
-    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" model="aniflive" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" />
+    <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :disabled="saving" :demo="demo" :lookup-voice-name="productApi.minimaxVoiceName" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
+    <AnifLiveModelImport :demo="demo" :open="importOpen" @update:open="importOpen = $event" @completed="handleAnifLiveImportCompleted" />
+    <section v-if="selected !== 'minimax'" class="tts-target preference-card">
+      <div class="tts-model-row"><label class="form-field"><span>基础模型引擎</span><select :value="selected" :disabled="unavailable" @change="selectTarget"><option v-for="item in status?.models ?? []" :key="item.id" :value="item.id">{{ names[item.id] }}{{ item.available ? '' : '（未就绪）' }}</option></select></label><button class="outline-button" type="button" :disabled="demo" @click="importOpen = true">导入</button><button class="save-button" type="button" :disabled="unavailable || !selectedReady || localDraft === status?.local_model" @click="saveLocalModel">保存</button></div>
+    </section>
+    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="selected" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" />
     <section v-if="selected !== 'minimax'" class="aniflive-options" aria-label="AnifLive 音色选项">
       <label class="switch-row"><div><strong>显卡高性能</strong><span>开启后暂停并取消事件预热。下一回答生效。</span></div><input type="checkbox" role="switch" aria-label="显卡高性能" :checked="options.gpu_max_performance" :disabled="savingQuality" @change="saveOption('gpu_max_performance', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
       <label class="switch-row"><div><strong>后续分块优化</strong><span>开启使用 48 个语义标记，关闭使用 96 个。下一回答生效。</span></div><input type="checkbox" role="switch" aria-label="后续分块优化" :checked="options.aniflive_chunk_optimization" :disabled="savingQuality" @change="saveOption('aniflive_chunk_optimization', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
@@ -220,6 +266,7 @@ async function openOfficialVoiceLibrary() {
 .tts-settings { display: grid; gap: 22px; }
 .tts-target { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line-strong); border-radius: 18px; background: var(--panel); }
 .tts-target-row { display: grid; grid-template-columns: minmax(0,520px) auto; align-items: end; gap: 12px; }
+.tts-model-row { display: grid; grid-template-columns: minmax(0,520px) auto auto; align-items: end; gap: 12px; }
 .tts-target-save { min-height: 42px; white-space: nowrap; }
 @media(max-width:600px) { .tts-target-row { grid-template-columns: minmax(0,1fr); } .tts-target-save { justify-self: end; } }
 </style>

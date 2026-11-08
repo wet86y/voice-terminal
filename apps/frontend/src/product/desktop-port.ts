@@ -71,7 +71,7 @@ export interface ResourceJob {
   /** state（任务状态）与 phase（当前阶段说明）。 */
   state: string
   phase: string
-  progress_kind?: 'download' | 'verify' | 'install' | 'waiting' // progress_kind（当前进度类型）。
+  progress_kind?: 'download' | 'verify' | 'build' | 'install' | 'waiting' // progress_kind（当前进度类型，构建按完成步骤计数）。
   attempt?: number // attempt（自动恢复轮次）。
   parent_job_id?: string | null // parent_job_id（所属一键任务）。
   /** completed_bytes（已处理字节）及 total_bytes（总字节）；未知时为空。 */
@@ -164,6 +164,10 @@ export interface DesktopWorkspacePort {
   resourceInventory(): Promise<ResourceStatus[]>
   /** resourceJobSnapshots（轻量任务快照）：定时补查进度，不执行环境扫描。 */
   resourceJobSnapshots?(): Promise<ResourceJob[]>
+  /** chooseAnifLiveImportFolder（选择 AnifLive 模型文件夹）：返回本机只读扫描目录。 */
+  chooseAnifLiveImportFolder(): Promise<string | null>
+  /** startAnifLiveImport（启动受管转换）：沿用现有 GPU（图形处理器）交接与资源任务互斥。 */
+  startAnifLiveImport(taskId: string): Promise<{ job_id: string }>
   /** resource_download（下载资源）：启动固定版本资源下载任务。 */
   downloadResource(resourceId: string): Promise<{ job_id: string }>
   downloadRequiredResources?(): Promise<{ job_id: string }> // downloadRequiredResources（一键必要资源）。
@@ -278,6 +282,8 @@ export function desktopPort(): DesktopPort {
     migrateWorkspace: targetRoot => call<{ job_id: string }>('workspace_migrate', { target_root: targetRoot }),
     resourceInventory: () => call<ResourceStatus[]>('resource_inventory'),
     resourceJobSnapshots: () => call<ResourceJob[]>('resource_jobs'),
+    chooseAnifLiveImportFolder: () => call<string | null>('aniflive_import_choose_folder'),
+    startAnifLiveImport: taskId => call<{ job_id: string }>('aniflive_import_start', { task_id: taskId }),
     confirmImport: (jobId, accepted) => call('resource_import_confirm', { job_id: jobId, accepted }),
     resourceInstallPlan: resourceId => call('resource_install_plan', { resource_id: resourceId }),
     downloadResource: resourceId => call<{ job_id: string }>('resource_download', { resource_id: resourceId }),

@@ -35,6 +35,53 @@ def _create_voice(library: VoiceLibrary, *, text: str = "测试声音会清楚�
     return asset, voice
 
 
+def test_aniflive_emotion_references_survive_edit_and_garbage_collection(tmp_path):
+    library = VoiceLibrary(tmp_path / 'voices', model='aniflive')
+    base = library.put_import(_wav_bytes(), 'base.wav')
+    emotion = library.put_import(_wav_bytes(sample_rate=32000), 'emotion.wav')
+    payload = {'name': '音色', 'source': 'import', 'reference_asset_id': base['asset_id'],
+               'reference_text': '基础参考', 'references': [{'asset_id': emotion['asset_id'],
+                   'name': '温柔', 'tag': 'soft', 'reference_text': '温柔参考', 'intensity': .5}]}
+    created = library.create_voice(payload)
+    selection = {'voice_id': created['id'], 'revision': 1}
+    snapshot = library.resolve('aniflive', selection)
+    assert snapshot.references[0]['tag'] == 'soft'
+    release = library.pin(snapshot)
+    updated = library.update_voice(created['id'], 1, {key: value for key, value in payload.items() if key != 'references'})
+    assert updated['references'] == created['references']
+    library.collect_garbage(max_age_seconds=-1)
+    assert library.asset_path(emotion['asset_id']).exists()
+    release()
+    duplicate = [created['references'][0], {**created['references'][0], 'id': 'c' * 32}]
+    with pytest.raises(VoiceLibraryError, match='不能重复'):
+        library.update_voice(created['id'], 2, {**payload, 'references': duplicate})
+
+
+def test_shared_voice_migrates_to_independent_model_indexes_without_copying_audio(tmp_path):
+    import json
+    from voice_terminal.tts.voices import ModelVoiceLibraries
+    data = tmp_path / 'data'
+    tts = data / 'tts'
+    old = VoiceLibrary(tts / 'aniflive' / 'voices', model='aniflive')
+    asset, voice = _create_voice(old)
+    old.activate({'voice_id': voice['id'], 'revision': voice['revision']})
+    (data / 'config').mkdir(parents=True)
+    (data / 'config' / 'aniflive-models.json').write_text(json.dumps({'models': {'model-a': {}, 'model-b': {}}}), encoding='utf-8')
+    owner = ModelVoiceLibraries(tts)
+    first, second = owner.for_model('model-a'), owner.for_model('model-b')
+    assert owner.shared._index['schema_version'] == 2
+    assert first.active_selection == second.active_selection == {'voice_id': voice['id'], 'revision': 1}
+    assert first.asset_path(asset['asset_id']) == second.asset_path(asset['asset_id'])
+    updated = first.update_voice(voice['id'], 1, {**voice, 'name': '模型甲'})
+    assert updated['revision'] == 2
+    assert second.get_voice(voice['id'])['name'] == voice['name']
+    assert second.active_selection['revision'] == 1
+    assert list((data / 'archives' / 'compatibility').rglob('index-v1.json'))
+    first.delete_voice(voice['id'])
+    first.collect_garbage(max_age_seconds=-1)
+    assert second.asset_path(asset['asset_id']).is_file()
+
+
 def test_model_libraries_default_active_version_and_inflight_asset(tmp_path):
     from voice_terminal.tts.voices import ModelVoiceLibraries
     owner = ModelVoiceLibraries(tmp_path / "tts")
@@ -259,6 +306,36 @@ def test_default_repair_does_not_replace_a_user_reference_with_the_same_transcri
     library.asset_path(imported["asset_id"]).unlink()
     with pytest.raises(VoiceLibraryError, match="重新导入原参考音频"):
         library.register_default(_wav_bytes(), "相同转写。")
+
+
+def test_restore_default_creates_new_revision_and_keeps_user_history(tmp_path):
+    library = VoiceLibrary(tmp_path / 'voices', model='aniflive')
+    initial = library.register_default(_wav_bytes(), '来源参考文字。')
+    changed = library.update_voice(initial['id'], initial['revision'], {**initial, 'name': '用户编辑', 'reference_text': '编辑后的文字。'})
+    assert changed['default_reference_id'] == initial['default_reference_id']
+    restored = library.restore_default()
+    assert restored['revision'] == changed['revision'] + 1
+    assert restored['reference_text'] == '来源参考文字。'
+    assert library.get_voice(initial['id'], changed['revision'])['name'] == '用户编辑'
+    assert library.active_selection == {'voice_id': initial['id'], 'revision': restored['revision']}
+
+
+def test_compatibility_accepts_model_index_and_pending_source_without_archiving(tmp_path):
+    from voice_terminal.compatibility import Archive, _repair_voices
+    from voice_terminal.tts.voices import ModelVoiceLibraries
+    data = tmp_path / 'data'
+    library = ModelVoiceLibraries(data / 'tts').for_model('aniflive')
+    voice = library.register_default(_wav_bytes(), '默认参考。')
+    source = library.put_source(_wav_bytes(seconds=12), 'long.wav')
+    library.update_voice(voice['id'], voice['revision'], {**voice, 'references': [{
+        'id': 'a' * 32, 'name': '待裁剪', 'tag': 'pending', 'intensity': .5,
+        'reference_language': 'zh', 'reference_text': '', 'status': 'pending',
+        'asset_id': None, 'source_asset_id': source['asset_id'], 'error': '录音过长',
+    }]})
+    archive = Archive(data)
+    assert _repair_voices(data, archive, {}) == set()
+    assert not archive.rows
+    assert (data / 'tts/aniflive/voices/index.json').is_file()
 
 
 @pytest.mark.parametrize('rate', [8000, 16000, 22050, 44100, 48000])

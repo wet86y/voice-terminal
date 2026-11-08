@@ -35,6 +35,15 @@ export interface ProductLocalTtsStatus {
   active_voice_by_model?: Record<ProductLocalTtsModelId, ProductTtsVoiceSelection | null> // 各库启用选择。
   models: Array<{ id: ProductLocalTtsModelId; name: string; available: boolean; loaded: boolean; native_sample_rate: number }> // 模型标识、名称、可用、加载、采样率。
 }
+/** ProductTtsReference（情绪参考）：录音、配对文字、标记及准备状态。 */
+export interface ProductTtsReference {
+  kind?: 'emotion' // kind（参考类型）：此集合中的条目为情绪参考。
+  id: string; name: string; tag: string; intensity: number // 参考编号、名称、情绪标记、强度档位。
+  asset_id: string | null; source_asset_id?: string | null // 工作音频及原始音频编号。
+  reference_text: string; reference_language: string // 配对转写及语言。
+  status: 'ready' | 'pending'; error?: string // 状态和待完善原因。
+  verification_source?: string; provenance?: Record<string, unknown> // 校验方式和来源。
+}
 /** ProductTtsVoice（音色）：源素材、正式样音、设计参数及启用状态。 */
 export interface ProductTtsVoice {
   id: string; revision: number; name: string; source: string // 标识、版本、名称、来源。
@@ -45,9 +54,13 @@ export interface ProductTtsVoice {
   source_reference_asset_id?: string | null; source_reference_text?: string // 原始克隆素材及校对文本。
   design_description?: string; design_text?: string; inference_steps?: number // 设计描述、生成正文、推理步数。
   generation_recipe?: string // generation_recipe（样音生成配方版本）。
+  references?: ProductTtsReference[] // references（情绪参考集合）。
+  preview_guidance?: string; preview_intensity?: number // 试听用情绪标记与强度档位。
 }
 /** ProductTtsAsset（音频附件）：标识与毫秒时长。 */
 export interface ProductTtsAsset { asset_id: string; duration_ms: number }
+/** TtsReferenceImportJob（模型参考导入任务）。 */
+export interface TtsReferenceImportJob { task_id: string; status: string; phase: string; error?: string | null; reference_registration?: { ready: number; pending: number } }
 /** ProductTtsOperation（后台任务）：身份、模型、执行状态及结果。 */
 export interface ProductTtsOperation {
   operation_id: string; model: ProductLocalTtsModelId | ProductOnlineTtsModelId; kind: string // 操作标识、本地或在线模型、任务种类。
@@ -62,7 +75,12 @@ export interface TtsVoicePort {
   updateTtsVoice(model: ProductLocalTtsModelId, id: string, voice: Partial<ProductTtsVoice>, revision: number): Promise<{ voice: ProductTtsVoice }>
   deleteTtsVoice(model: ProductLocalTtsModelId, id: string): Promise<unknown>
   selectTtsVoice(model: ProductLocalTtsModelId, selection: ProductTtsVoiceSelection | null): Promise<unknown>
+  restoreDefaultTtsVoice(model: ProductLocalTtsModelId): Promise<unknown> // 恢复模型来源默认配置并保留历史版本。
   uploadTtsAsset(model: ProductLocalTtsModelId, file: File): Promise<{ asset: ProductTtsAsset }>
+  uploadTtsSource(model: ProductLocalTtsModelId, file: File): Promise<{ asset: ProductTtsAsset }> // 保存可裁剪的原始录音。
+  clipTtsAsset(model: ProductLocalTtsModelId, asset_id: string, start_ms: number, end_ms: number): Promise<{ asset: ProductTtsAsset }>
+  startAnifLiveReferenceImport(model: ProductLocalTtsModelId): Promise<TtsReferenceImportJob> // 启动已有模型参考资料导入。
+  getAnifLiveImport(task_id: string): Promise<TtsReferenceImportJob> // 参考导入进度。
   /** ttsAssetAudioUrl（参考音频地址）：供原生播放器读取音频并定位播放进度。 */
   ttsAssetAudioUrl(model: ProductLocalTtsModelId, asset_id: string): string
   startTtsTranscribe(model: ProductLocalTtsModelId, asset_id: string): Promise<ProductTtsOperation>

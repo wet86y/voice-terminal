@@ -28,6 +28,14 @@ describe('资源进度按阶段独立计数', () => {
     expect(wrapper.text()).not.toContain('%')
   })
 
+  it('引擎构建显示实际完成步骤与百分比，不误标成字节', () => {
+    const wrapper = mount(ManagedResourceProgress, { props: { job: { ...job, progressKind: 'build',
+      phase: '构建推理引擎：已完成 3 / 9', completedBytes: 9, totalBytes: 15 }, label: '模型' } })
+    expect(wrapper.get('[role="progressbar"]').attributes('aria-valuenow')).toBe('60')
+    expect(wrapper.text()).toContain('已完成步骤 9 / 15 · 60%')
+    expect(wrapper.text()).not.toContain(' B')
+  })
+
   it('兼容没有进度类型的旧任务记录，仍只显示一条', () => {
     const wrapper = mount(ManagedResourceProgress, { props: { job: { ...job, progressKind: undefined, phase: '批量校验进度：校验下载文件' }, label: '模型' } })
     expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)

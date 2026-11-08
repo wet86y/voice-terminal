@@ -8,6 +8,58 @@ import type {
   WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductMinimaxVoiceName, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
 
+/** AnifLiveImportFile（模型导入文件）：扫描结果中的单个文件及仓库相对路径。 */
+export interface AnifLiveImportFile {
+  file_id: string // file_id（文件候选标识）：绑定一次扫描清单中的候选文件。
+  path: string // path（来源相对路径）：用于选择、展示和转换前读取。
+  size?: number | null // size（文件字节数）：未知时为空。
+  role?: 'gpt' | 'sovits' | 'unknown' // role（推测权重角色）：只帮助排序，不决定最终兼容性。
+  revision?: string | null // revision（候选文件修订）：公开仓库扫描时保留不可变修订。
+}
+
+/** AnifLiveImportScan（模型来源扫描）：网页仓库版本在扫描时固定。 */
+export interface AnifLiveImportScan {
+  scan_id: string // scan_id（扫描编号）：后续提交只使用本次清单。
+  source_type: 'local' | 'huggingface' | 'modelscope' // source_type（来源类型）：本地文件夹或公开模型仓库。
+  source: string // source（本地目录或仓库编号）。
+  revision?: string | null // revision（固定仓库修订）：远程仓库的版本线索。
+  files: AnifLiveImportFile[] // files（发现的全部文件清单）。
+  candidates: { weights: AnifLiveImportFile[]; audio: AnifLiveImportFile[]; transcripts: AnifLiveImportFile[]; configs?: AnifLiveImportFile[] } // candidates（按常见扩展名整理的候选）。
+}
+
+/** AnifLiveImportRequest（模型导入请求）：只提交用户在扫描预览中选择的候选。 */
+export interface AnifLiveImportRequest {
+  scan_id: string // scan_id（扫描编号）：引用已展示的模型文件清单。
+  selected_gpt: string // selected_gpt（选定 GPT 权重候选）。
+  selected_sovits: string // selected_sovits（选定 SoVITS 权重候选）。
+  model_id: string // model_id（新模型英文编号）：要求当前未登记且不覆盖已有模型。
+  name: string // name（新模型界面名称）。
+  reference_audio?: string // reference_audio（可选参考音频候选）。
+  selected_reference_files?: string[] // selected_reference_files（同时登记的参考录音候选）。
+  reference_text_file?: string // reference_text_file（可选转写旁注候选）。
+  reference_text?: string // reference_text（人工填写的准确转写）。
+  reference_language: 'zh' | 'yue' | 'en' | 'ja' | 'ko' // reference_language（参考语言）。
+}
+
+/** AnifLiveImportJob（模型导入任务）：转换进度由桌面受管任务补充。 */
+export interface AnifLiveImportJob {
+  task_id: string // task_id（导入任务编号）。
+  scan_id?: string // scan_id（来源扫描清单编号）：用于追溯未选中的文件候选。
+  model_id?: string // model_id（新模型编号）。
+  revision?: string | null // revision（来源仓库修订）：导入完成后仍用于追溯来源。
+  name?: string // name（界面模型名称）。
+  status: string // status（暂存、待补参考、待转换、转换中或终态）。
+  phase: string // phase（当前阶段说明）。
+  progress?: number // progress（扫描、下载和暂存的百分比）。
+  error?: string | null // error（用户可见失败原因）。
+  reference_text_draft?: string | null // reference_text_draft（待校对转写草稿）。
+  reference_audio_staged?: boolean // reference_audio_staged（暂存中是否已有参考录音）。
+  stage_ready?: boolean // stage_ready（完整转换输入已暂存）：仅此状态允许重试正式转换。
+  reference_candidates?: { audio: AnifLiveImportFile[]; transcripts: AnifLiveImportFile[] } // reference_candidates（全部音频及旁注候选）：保留多条素材的来源路径和修订元数据。
+  reference_registration?: { ready: number; pending: number; voice_id: string; revision: number } // reference_registration（参考登记统计与音色版本）。
+  job_kind?: 'reference_import' // job_kind（已有模型参考资料导入任务）。
+}
+
 export class ProductApiError extends Error implements ProductApiErrorShape {
   readonly status: number
   readonly code?: string // code（业务错误码）：声纹采集回退等业务判断使用。
@@ -133,7 +185,11 @@ export const productApi = {
   updateTtsVoice: (model: ProductLocalTtsModelId, id: string, voice: Partial<ProductTtsVoice>, revision: number) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${model}/${id}`, jsonBody({ ...voice, expected_revision: revision })),
   deleteTtsVoice: (model: ProductLocalTtsModelId, id: string) => request(`/api/v1/tts/voices/${model}/${id}`, { method: 'DELETE' }),
   selectTtsVoice: (model: ProductLocalTtsModelId, selection: { voice_id: string; revision: number } | null) => request(`/api/v1/tts/voices/${model}/selection`, jsonBody({ selection })),
+  restoreDefaultTtsVoice: (model: ProductLocalTtsModelId) => request(`/api/v1/tts/voices/${model}/restore-default`, { method: 'POST' }),
   uploadTtsAsset: (model: ProductLocalTtsModelId, file: File) => request<{ asset: ProductTtsAsset }>(`/api/v1/tts/assets/${model}/import?filename=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }),
+  uploadTtsSource: (model: ProductLocalTtsModelId, file: File) => request<{ asset: ProductTtsAsset }>(`/api/v1/tts/assets/${model}/source?filename=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }),
+  clipTtsAsset: (model: ProductLocalTtsModelId, asset_id: string, start_ms: number, end_ms: number) => request<{ asset: ProductTtsAsset }>(`/api/v1/tts/assets/${model}/${encodeURIComponent(asset_id)}/clip`, { ...jsonBody({ start_ms, end_ms }), method: 'POST' }),
+  startAnifLiveReferenceImport: (model: ProductLocalTtsModelId) => request<AnifLiveImportJob>(`/api/v1/tts/aniflive/models/${encodeURIComponent(model)}/references/import`, { ...jsonBody({}), method: 'POST' }),
   /** ttsAssetAudioUrl（参考音频地址）：沿用桌面宿主提供的语音服务地址。 */
   ttsAssetAudioUrl: (model: ProductLocalTtsModelId, asset_id: string) => `${apiBaseUrl()}/api/v1/tts/assets/${model}/${encodeURIComponent(asset_id)}/audio`,
   startTtsPreview: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>, text: string) => request<ProductTtsOperation>('/api/v1/tts/operations/preview', { ...jsonBody({ model, voice, text }), method: 'POST' }),
@@ -144,6 +200,14 @@ export const productApi = {
   getTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}`),
   cancelTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}/cancel`, { method: 'POST' }),
   ttsStatus: () => request<ProductLocalTtsStatus>('/api/v1/tts/status'),
+  /** scanAnifLiveImport（只读扫描 AnifLive 输入）：不会下载网页仓库文件。 */
+  scanAnifLiveImport: (source_type: AnifLiveImportScan['source_type'], source: string) => request<AnifLiveImportScan>('/api/v1/tts/aniflive/import/scan', { method: 'POST', body: JSON.stringify({ source_type, source }) }),
+  /** startAnifLiveImport（确认后暂存选中文件）：网页来源此时才开始下载。 */
+  startAnifLiveImport: (value: AnifLiveImportRequest) => request<AnifLiveImportJob>('/api/v1/tts/aniflive/import/jobs', { method: 'POST', body: JSON.stringify(value) }),
+  getAnifLiveImport: (task_id: string) => request<AnifLiveImportJob>(`/api/v1/tts/aniflive/import/jobs/${encodeURIComponent(task_id)}`),
+  pendingAnifLiveImports: () => request<{ jobs: AnifLiveImportJob[] }>('/api/v1/tts/aniflive/import/pending'),
+  /** completeAnifLiveImportReference（补齐参考录音与人工校对后的转写）。 */
+  completeAnifLiveImportReference: (task_id: string, value: { reference_asset_id?: string; reference_text: string; reference_language: string }) => request<AnifLiveImportJob>(`/api/v1/tts/aniflive/import/jobs/${encodeURIComponent(task_id)}/reference`, { method: 'POST', body: JSON.stringify(value) }),
   speakerStatus: () => request<Record<string, unknown>>('/api/v1/speaker/status'),
   speakerProfile: () => request<Record<string, unknown>>('/api/v1/speaker/profile'),
   startSpeakerEnrollment: () => request<Record<string, unknown>>('/api/v1/speaker/enrollment/start', { method: 'POST' }),

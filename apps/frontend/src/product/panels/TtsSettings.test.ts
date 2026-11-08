@@ -51,9 +51,12 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(wrapper.text()).toContain('设置无法保存')
     wrapper.unmount()
   })
-  it('尚未加载但已具备运行条件的模型可以选择，缺失模型隐藏', () => {
+  it('尚未加载和缺失的模型均可浏览，但缺失模型不能保存', async () => {
     const wrapper = render()
-    expect(wrapper.findAll('select option').map(item => item.attributes('value'))).toEqual(['minimax', 'tangyuge-v2pp-d78cf598'])
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    expect(wrapper.findAll('.tts-model-row select option').map(item => item.attributes('value'))).toEqual(['minimax-female-shaonv-zh', 'tangyuge-v2pp-d78cf598'])
+    expect(wrapper.get('.tts-model-row select').text()).toContain('未就绪')
+    expect(wrapper.get('button[aria-label="保存播放目标"]').attributes('disabled')).toBeDefined()
     expect(settings.tts.backend).toBe('minimax')
     wrapper.unmount()
   })
@@ -62,7 +65,8 @@ describe('音色设置只提供资源完整的本地模型', () => {
       settings: { tts: { backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' } },
     } as never)
     const wrapper = render()
-    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    await wrapper.get('.tts-model-row select').setValue('tangyuge-v2pp-d78cf598')
     expect(save).not.toHaveBeenCalled()
     expect(wrapper.find('tts-voice-library-stub').exists()).toBe(true)
     expect(wrapper.get('.tts-target').text()).toContain('当前生效：在线 API（网络语音接口）')
@@ -73,18 +77,32 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' })
     wrapper.unmount()
   })
+  it('在线运行时保存本地模型不会切换播放后端', async () => {
+    const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({
+      settings: { tts: { backend: 'minimax', local_model: 'tangyuge-v2pp-d78cf598' } },
+    } as never)
+    const wrapper = render()
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    await wrapper.get('.tts-model-row select').setValue('tangyuge-v2pp-d78cf598')
+    await wrapper.get('.tts-model-row .save-button').trigger('click')
+    await flushPromises()
+    expect(save).toHaveBeenCalledWith({ local_model: 'tangyuge-v2pp-d78cf598' })
+    expect(settings.tts.backend).toBe('minimax')
+    wrapper.unmount()
+  })
   it('播放目标切换失败时保留原后端和未保存草稿', async () => {
     vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('模型切换失败'))
     const wrapper = render()
-    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    await wrapper.get('.tts-model-row select').setValue('tangyuge-v2pp-d78cf598')
     await wrapper.get('button[aria-label="保存播放目标"]').trigger('click')
     await flushPromises()
-    expect((wrapper.get('.tts-target select').element as HTMLSelectElement).value).toBe('tangyuge-v2pp-d78cf598')
+    expect((wrapper.get('.tts-model-row select').element as HTMLSelectElement).value).toBe('tangyuge-v2pp-d78cf598')
     expect(settings.tts.backend).toBe('minimax')
     expect(wrapper.text()).toContain('模型切换失败')
     wrapper.unmount()
   })
-  it('本地音色生成试听自动切换到草稿模型后继续', async () => {
+  it('试听草稿模型时不隐式切换播放目标', async () => {
     let ensureSupport!: (model: 'minimax-female-shaonv-zh' | 'tangyuge-v2pp-d78cf598') => Promise<void>
     const LibraryStub = defineComponent({
       name: 'TtsVoiceLibrary',
@@ -96,16 +114,16 @@ describe('音色设置只提供资源完整的本地模型', () => {
     })
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({} as never)
     const wrapper = render({ TtsVoiceLibrary: LibraryStub })
-    await wrapper.get('.tts-target select').setValue('tangyuge-v2pp-d78cf598')
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    await wrapper.get('.tts-model-row select').setValue('tangyuge-v2pp-d78cf598')
     await ensureSupport('tangyuge-v2pp-d78cf598')
-    expect(save).toHaveBeenCalledWith({ backend: 'aniflive', local_model: 'tangyuge-v2pp-d78cf598' })
-    expect(wrapper.text()).not.toContain('确认切换')
+    expect(save).not.toHaveBeenCalled()
     wrapper.unmount()
   })
-  it('隐藏失效选择不改写保存的后端或模型', () => {
+  it('展示失效选择不改写保存的后端或模型', () => {
     settings.tts.backend = 'aniflive'
     const wrapper = render()
-    expect(wrapper.find('option[value="minimax-female-shaonv-zh"]').exists()).toBe(false)
+    expect(wrapper.find('option[value="minimax-female-shaonv-zh"]').text()).toContain('未就绪')
     expect(wrapper.find('tts-voice-library-stub').exists()).toBe(false)
     expect(settings.tts.backend).toBe('aniflive')
     expect(settings.tts.local_model).toBe('minimax-female-shaonv-zh')

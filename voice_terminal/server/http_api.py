@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import time
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote
 from uuid import uuid4
@@ -145,6 +146,32 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
     app = FastAPI(title="Voice Terminal Server", version=__version__, lifespan=lifespan)
+    aniflive_import_service = None
+
+    def aniflive_import_or_503():
+        nonlocal aniflive_import_service
+        if aniflive_import_service is not None:
+            return aniflive_import_service
+        local_root = getattr(runtime, "_runtime_local_root", None)
+        paths = getattr(runtime, "paths", None)
+        install_root = getattr(paths, "install_root", None)
+        data_root = (getattr(paths, "data_root", None) or
+                     (Path(install_root) / "data" if install_root is not None else None))
+        if local_root is None or data_root is None:
+            raise HTTPException(status_code=503, detail="AnifLive 模型导入暂存目录尚未就绪。")
+        try:
+            from ..tts.aniflive_import import AnifLiveImportService
+            aniflive_import_service = AnifLiveImportService(local_root, data_root, voice_libraries=getattr(runtime, 'voice_library', None))
+            return aniflive_import_service
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=f"AnifLive 模型导入暂存目录不可用：{exc}") from exc
+
+    # 恢复尚在运行或等待参考登记的导入交接，不依赖用户重新打开设置页。
+    if getattr(runtime, 'voice_library', None) is not None and getattr(runtime, '_runtime_local_root', None) is not None:
+        try:
+            aniflive_import_or_503().pending()
+        except HTTPException:
+            pass  # 现有接口会在用户访问时返回具体错误，不阻断无关功能。
     configured_origins = [
         item.strip() for item in os.environ.get("VOICE_WEB_ORIGINS", "").split(",")
         if item.strip() and item.strip() != "*"
@@ -832,7 +859,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if libraries is None:
             raise HTTPException(status_code=503, detail="音色库不可用。")
         try:
-            return libraries.for_model(model) if model else libraries
+            target = runtime.config.tts.local_model if model == 'aniflive' else model
+            return libraries.for_model(target) if target else libraries
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -841,6 +869,71 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if operations is None:
             raise HTTPException(status_code=503, detail="音色操作服务未就绪。")
         return operations
+
+    @app.post("/api/v1/tts/aniflive/import/scan")
+    async def scan_aniflive_import(body: dict[str, Any]):
+        try:
+            return await asyncio.to_thread(
+                aniflive_import_or_503().scan, body.get("source_type"), body.get("source"),
+            )
+        except (ValueError, OSError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tts/aniflive/import/jobs")
+    async def start_aniflive_import(body: dict[str, Any]):
+        if runtime.application_initializing:
+            raise HTTPException(status_code=409, detail="应用正在初始化，请稍后导入。")
+        try:
+            return JSONResponse(await asyncio.to_thread(aniflive_import_or_503().start, body), status_code=202)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="扫描记录已过期，请重新扫描模型来源。") from exc
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tts/aniflive/import/jobs/{task_id}")
+    async def get_aniflive_import(task_id: str):
+        try:
+            return await asyncio.to_thread(aniflive_import_or_503().task, task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="AnifLive 导入任务不存在或已清理。") from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tts/aniflive/import/pending")
+    async def get_pending_aniflive_imports():
+        try:
+            return {"jobs": await asyncio.to_thread(aniflive_import_or_503().pending)}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tts/aniflive/import/jobs/{task_id}/reference")
+    async def add_aniflive_import_reference(task_id: str, body: dict[str, Any]):
+        try:
+            reference_path = None
+            asset_id = body.get("reference_asset_id")
+            if asset_id is not None:
+                library = tts_voice_library_or_503("aniflive")
+                reference_path = library.high_fidelity_path(asset_id) or library.asset_path(asset_id)
+            service = aniflive_import_or_503()
+            result = await asyncio.to_thread(
+                service.add_reference, task_id,
+                reference_path=reference_path,
+                reference_text=body.get("reference_text", ""),
+                reference_language=body.get("reference_language", "zh"),
+            )
+            return service._public_task(result)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="导入任务或参考音频不存在。") from exc
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post('/api/v1/tts/aniflive/models/{model_id}/references/import')
+    async def start_aniflive_reference_import(model_id: str, body: dict[str, Any]):
+        try:
+            return JSONResponse(await asyncio.to_thread(
+                aniflive_import_or_503().start_existing_references, model_id, body), status_code=202)
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     async def start_tts_voice_operation(callback):
         if runtime.application_initializing:
@@ -854,8 +947,36 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.get("/api/v1/tts/voices/{model}")
     async def get_tts_voices(model: str):
         library = tts_voice_library_or_503(model)
+        if not library._index.get('default_voice'):
+            try:
+                from ..tts.aniflive_models import AnifLiveModelRegistry
+                from ..tts.aniflive_reference_registration import register_model_default
+                target = runtime.config.tts.local_model if model == 'aniflive' else model
+                package, _, _ = await asyncio.to_thread(
+                    AnifLiveModelRegistry(runtime._runtime_local_root, runtime._tts_voice_root.parent).resolve, target)
+                await asyncio.to_thread(register_model_default, library, package)
+            except (OSError, ValueError, KeyError) as exc:
+                from ..tts.voices import safe_voice_diagnostic
+                raise HTTPException(status_code=409, detail='模型默认参考无法登记：' + safe_voice_diagnostic(exc)) from exc
         return {"voices": library.list_voices({model: library.active_selection}),
                 "active_voice": library.active_selection, "model": model}
+
+    @app.get("/api/v1/tts/voices/{model}/capabilities")
+    async def get_tts_voice_capabilities(model: str):
+        """只返回实际生效且完成准备的音色能力。"""
+        from ..tts.controls import profile_for
+        library = tts_voice_library_or_503(model)
+        client = getattr(runtime.tts, 'local', None)
+        actual_model = getattr(client, 'model_id', None)
+        target = runtime.config.tts.local_model if model == 'aniflive' else model
+        active = library.active_selection
+        if client is None or actual_model != target or runtime.config.tts.backend != 'aniflive':
+            return {'model': target, 'active_voice': active, 'prepared': False, 'capabilities': [], 'expressions': [], 'digest': None}
+        profile = profile_for(client, backend='aniflive', enabled=getattr(runtime.tts, 'speech_control_enabled', True))
+        return {'model': target, 'active_voice': active, 'prepared': bool(getattr(client, '_prepared_expression_snapshot', None)),
+                'capabilities': list(profile.names),
+                'expressions': [{'tag': tag, 'name': name, 'intensity_levels': list(levels)} for tag, name, levels in profile.expressions],
+                'digest': profile.identity}
 
     @app.post("/api/v1/tts/minimax/voice-name")
     async def get_minimax_voice_name(body: dict[str, Any]):
@@ -892,6 +1013,15 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 client._warmed = False
             await runtime.bus.publish(runtime.snapshot())
             return {"selection": selected, "effective_from": "next_answer"}
+
+    @app.post("/api/v1/tts/voices/{model}/restore-default")
+    async def restore_tts_default(model: str):
+        try:
+            voice = await asyncio.to_thread(tts_voice_library_or_503(model).restore_default)
+            await runtime.bus.publish(runtime.snapshot())
+            return {"voice": voice, "effective_from": "next_answer"}
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.put("/api/v1/tts/voices/{model}/{voice_id}")
     async def update_tts_voice(model: str, voice_id: str, body: dict[str, Any]):
@@ -948,13 +1078,43 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except (ValueError, OverflowError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post('/api/v1/tts/assets/{model}/source')
+    async def import_tts_source(model: str, request: Request, filename: str = ''):
+        """先保存原录音，超出工作参考时长时仍可播放和裁剪。"""
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > 20 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail='来源录音超过 20 MiB（二进制兆字节）。')
+        try:
+            asset = await asyncio.to_thread(tts_voice_library_or_503(model).put_source, bytes(data), filename)
+            return {'asset': asset}
+        except (ValueError, OverflowError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/api/v1/tts/assets/{model}/{asset_id}/audio")
     async def get_tts_asset_audio(model: str, asset_id: str):
         try:
-            data = await asyncio.to_thread(tts_voice_library_or_503(model).asset_bytes, asset_id)
-            return Response(content=data, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+            library = tts_voice_library_or_503(model)
+            metadata = library._index['assets'].get(asset_id, {})
+            if metadata.get('format') != 'source':
+                library.asset_path(asset_id)  # 主素材缺失时不能把残留旁路副本当成完整素材。
+            original = library.high_fidelity_path(asset_id)
+            data = await asyncio.to_thread(original.read_bytes if original else library.asset_bytes, *(() if original else (asset_id,)))
+            return Response(content=data, media_type='audio/wav' if original else library.asset_media_type(asset_id), headers={"Cache-Control": "no-store"})
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post('/api/v1/tts/assets/{model}/{asset_id}/clip')
+    async def clip_tts_asset(model: str, asset_id: str, body: dict[str, Any]):
+        if set(body) != {'start_ms', 'end_ms'}:
+            raise HTTPException(status_code=422, detail='裁剪只接受起点与终点毫秒。')
+        try:
+            asset = await asyncio.to_thread(tts_voice_library_or_503(model).clip_source,
+                                            asset_id, body['start_ms'], body['end_ms'])
+            return {'asset': asset}
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/tts/operations/preview")
     async def start_tts_preview(body: dict[str, Any]):

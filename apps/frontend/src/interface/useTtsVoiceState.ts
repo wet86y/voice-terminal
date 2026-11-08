@@ -1,5 +1,5 @@
 import { inject, provide, reactive, type InjectionKey } from 'vue'
-import type { ProductLocalTtsModelId, ProductTtsAsset, ProductTtsVoice } from './tts-voice-types'
+import type { ProductLocalTtsModelId, ProductTtsAsset, ProductTtsVoice, ProductTtsReference } from './tts-voice-types'
 
 export const TTS_SAMPLE_TEXT = '你好，很高兴认识你。现在开始测试这个音色，我会用自然的语气清楚地说话。'
 export const TTS_DESIGN_STEPS = 30 // TTS_DESIGN_STEPS（样音制作步数）：独立于正式播报设置。
@@ -14,6 +14,7 @@ export interface VoiceDraft {
   candidate: Partial<ProductTtsVoice> | null; signature: string // 生成候选及输入签名。
   expanded: boolean; busy: boolean; generation: number; operationId?: string // 展开、任务状态、代次、操作标识。
   error: string; notice: string // 当前卡片的错误和反馈。
+  references: ProductTtsReference[] // references（情绪参考草稿）。
 }
 export interface TtsVoiceState {
   inferenceSteps: Record<ProductLocalTtsModelId, number> // 各模型当前推理步数。
@@ -36,5 +37,6 @@ export function voiceDraft(voice?: ProductTtsVoice): VoiceDraft {
     source: source ? { asset_id: source, duration_ms: voice?.source_reference_duration_ms || voice?.duration_ms || 0, filename: '参考音频.wav' } : null,
     candidate: voice?.source === 'design' ? { ...voice } : null, signature: '',
     expanded: false, busy: false, generation: 0, error: '', notice: '',
+    references: (voice?.references || []).map(item => ({ ...item, provenance: { ...item.provenance } })),
   }
 }

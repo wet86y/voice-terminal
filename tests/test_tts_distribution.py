@@ -46,7 +46,7 @@ def test_missing_online_credentials_do_not_trigger_local_fallback(tmp_path):
     assert runtime.config.tts.backend == 'minimax'
 
 
-@pytest.mark.parametrize('damage', [b'wrong-size', b'bad-engine!'])
+@pytest.mark.parametrize('damage', [b'wrong-size', b''])
 def test_corrupt_model_cannot_spawn_managed_service(tmp_path, monkeypatch, damage):
     registry = AnifLiveModelRegistry(tmp_path)
     package, revision, _ = registry.resolve(BASE)
@@ -60,7 +60,7 @@ def test_corrupt_model_cannot_spawn_managed_service(tmp_path, monkeypatch, damag
     assert server.pid is None
 
 
-@pytest.mark.parametrize('field', ['dependency_lock', 'source'])
+@pytest.mark.parametrize('field', ['runtime_contract', 'source'])
 def test_self_consistent_outdated_build_is_unavailable(tmp_path, field):
     registry = AnifLiveModelRegistry(tmp_path)
     package, revision, _ = registry.resolve(BASE)
@@ -68,13 +68,13 @@ def test_self_consistent_outdated_build_is_unavailable(tmp_path, field):
     path = package / 'application-receipt.json'
     receipt = json.loads(path.read_text(encoding='utf-8'))
     if field == 'source':
-        receipt['identity']['source']['patch_revision'] -= 1
+        receipt['identity']['source']['patch_revision'] = 999
     else:
-        receipt['identity'][field] = '0' * 64
+        receipt['identity'][field] = 999
     record['models'][BASE]['versions'][revision]['identity'] = receipt['identity']
     path.write_text(json.dumps(receipt), encoding='utf-8')
     registry.path.write_text(json.dumps(record), encoding='utf-8')
-    with pytest.raises(ValueError, match='身份已变化'):
+    with pytest.raises(ValueError, match='推理协议'):
         registry.resolve(BASE)
     assert not next(row for row in registry.models() if row['id'] == BASE)['available']
     assert next(row for row in registry.models() if row['id'] == TANG)['available']
@@ -84,8 +84,9 @@ def test_unlisted_installer_receipt_is_rejected(tmp_path):
     registry = AnifLiveModelRegistry(tmp_path)
     package, _, _ = registry.resolve(BASE)
     (package / 'resource-install.json').write_text('{}', encoding='utf-8')
+    registry.resolve(BASE)  # 普通启动不因额外旁车记录拒绝已验证引擎。
     with pytest.raises(ValueError, match='未登记文件'):
-        registry.resolve(BASE)
+        registry.resolve(BASE, verify_hashes=True)
 
 
 def test_catalog_pins_inputs_and_seed_instead_of_device_engines():
@@ -119,7 +120,7 @@ def test_old_recordings_are_preserved_without_initializing_old_libraries(tmp_pat
         for name in ('index.json', 'recording.wav'):
             file = folder / name; file.write_bytes(b'legacy-user-material'); originals[file] = file.read_bytes()
     runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / 'data')
-    assert set(runtime.voice_library.libraries) == {'aniflive'}
+    assert set(runtime.voice_library.libraries) == {runtime.config.tts.local_model}
     assert all(file.read_bytes() == content for file, content in originals.items())
     for model in ('voxcpm1', 'voxcpm2'):
         with pytest.raises(ValueError):

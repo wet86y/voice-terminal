@@ -18,6 +18,30 @@ class SpeechControlMixin:
     def speech_control_profile(self):
         return profile_for(self.tts, enabled=getattr(self.tts, "speech_control_enabled", True))
 
+    async def prepare_speech_capabilities(self) -> None:
+        """空闲时先准备当前音色，模型请求只看到已经准备成功的情绪。"""
+        if getattr(self.tts, 'backend', None) != 'aniflive' or getattr(self, 'busy', False):
+            return
+        client = self.tts.current_client() if callable(getattr(self.tts, 'current_client', None)) else self.tts
+        library = getattr(client, 'voice_library', None)
+        selection = library.active_selection if library else None
+        if not selection or getattr(client, '_foreground_sessions', None):
+            return
+        prepared = getattr(client, '_prepared_expression_snapshot', None)
+        identity = (getattr(client, 'model_id', None), selection.get('voice_id'), selection.get('revision'))
+        if prepared and prepared[:3] == identity:
+            return
+        try:
+            snapshot = library.resolve('aniflive', selection)
+            if not snapshot.references:
+                return
+            await client.ensure_ready()
+            async with client._reference_lock:
+                if not client._foreground_sessions and library.active_selection == selection:
+                    await client.prepare_reference(snapshot, use_selection=False)
+        except Exception as exc:
+            logger.warning('speech.reference_prepare_failed（音色参考准备失败） error=%s', type(exc).__name__)
+
     @property
     def session_speech_controls(self) -> SpeechControls:
         """按当前实际能力读取会话保持值，不从已结束的播放句柄恢复。"""

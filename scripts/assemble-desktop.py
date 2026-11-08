@@ -182,7 +182,7 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     (program / "scripts").mkdir()
     for name in ("backend-entry.py", "managed-node.cjs", "check-desktop-environment.py", "prepare-webview2.ps1", "local-context.ps1",
                  "manage-resources.py", "package-resources.py", "install-official-dsh.py", "dsh-npm.mjs", "relocate-workspace.py", "voice-environment-worker.py",
-                 "install-aniflive.py", "run-aniflive.py"):
+                 "install-aniflive.py", "run-aniflive.py", "register-aniflive-references.py"):
         shutil.copy2(ROOT / "scripts" / name, program / "scripts" / name)
     seven_source = ROOT / ".local/build/tools/7zip"
     if seven_source.is_dir():

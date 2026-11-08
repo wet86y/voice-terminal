@@ -167,7 +167,7 @@ export interface ManagedResourceJob {
   /** state（任务状态）与 phase（当前阶段）。 */
   state: string
   phase: string
-  progressKind?: 'download' | 'verify' | 'install' | 'waiting' // progressKind（当前进度类型）。
+  progressKind?: 'download' | 'verify' | 'build' | 'install' | 'waiting' // progressKind（当前进度类型，构建按完成步骤计数）。
   attempt?: number // attempt（自动恢复轮次）。
   parentJobId?: string | null // parentJobId（所属一键任务）。
   /** completedBytes（已处理字节）与 totalBytes（总字节）。 */

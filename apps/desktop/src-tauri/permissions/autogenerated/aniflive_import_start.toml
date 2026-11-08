@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-aniflive-import-start"
+description = "Enables the aniflive_import_start command without any pre-configured scope."
+commands.allow = ["aniflive_import_start"]
+
+[[permission]]
+identifier = "deny-aniflive-import-start"
+description = "Denies the aniflive_import_start command without any pre-configured scope."
+commands.deny = ["aniflive_import_start"]

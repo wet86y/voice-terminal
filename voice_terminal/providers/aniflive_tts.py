@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 import ipaddress
@@ -25,7 +26,8 @@ class AnifLiveTtsClient:
     """通过 HTTP（超文本传输协议）接入 AnifLive PCM（脉冲编码调制）会话。"""
 
     transport = "http_pcm"  # transport（传输方式）：HTTP（超文本传输协议）承载原始 PCM（脉冲编码调制）音频。
-    supports_speech_controls = True  # supports_speech_controls（语音调节）：按文本段提交原生语速。
+    supports_speech_controls = True  # supports_speech_controls（语音调节）：情绪按文本段提交，语速和音量在本地处理。
+    supports_local_audio_controls = True  # supports_local_audio_controls（本地流式变速及音量处理）。
     freeze_session_at_admission = True  # freeze_session_at_admission（受理回答时固定参考及选项）。
     scheduling = "playback_window"  # scheduling（调度策略）：使用播放窗口限制文本提交量。
     effective_scheduling = "playback_window"  # effective_scheduling（生效调度策略）。
@@ -49,7 +51,7 @@ class AnifLiveTtsClient:
         aniflive_chunk_optimization: bool = True,  # aniflive_chunk_optimization（后续分块优化）。
         aniflive_first_audio_wait_ms: int = 0,  # 首音到达后等待毫秒。
         gpu_max_performance: bool = False,  # gpu_max_performance（显卡优先最大性能请求）。
-        prewarm_timeout_seconds: float = 3.0,  # prewarm_timeout_seconds（静默预热总时限，秒）。
+        prewarm_timeout_seconds: float = 3.0,  # prewarm_timeout_seconds（参考就绪后的静默推理时限，秒）。
         prewarm_enabled: bool = True,  # prewarm_enabled（静默预热开关），由本地优化配置传入。
         voice_library: Any | None = None,  # voice_library（当前基底的参考音色库）。
     ) -> None:
@@ -92,6 +94,7 @@ class AnifLiveTtsClient:
         self.aniflive_chunk_optimization = aniflive_chunk_optimization
         self.aniflive_first_audio_wait_ms = aniflive_first_audio_wait_ms
         self.voice_library = voice_library
+        self._prepared_expression_snapshot = None  # 已成功准备的模型、音色版本与情绪能力。
         self._reference_lock = asyncio.Lock()  # reference_lock（参考准备与会话创建的互斥锁）。
 
     async def prepare_reference(self, snapshot=None, *, use_selection=True, chunk_optimization=None) -> None:
@@ -108,11 +111,32 @@ class AnifLiveTtsClient:
         values = {"stream_chunk_tokens": 48 if optimized else 96, "model": self.model_id, "asset_id": snapshot.reference_path.stem if snapshot else None,
                   "reference_text": snapshot.reference_text if snapshot else "",
                   "reference_language": snapshot.reference_language if snapshot else "zh"}
+        if snapshot and getattr(snapshot, 'references', ()):
+            values['references'] = list(snapshot.references)  # references（冻结的情绪参考集合）。
         http = await self._client()
         response = await http.post(f"{self.base_url}/internal/application/reference", json=values,
                                    headers={"Authorization": "Bearer " + token_path.read_text(encoding="ascii").strip()})
         if response.status_code != 200:
             raise AnifLiveTtsError("参考音色准备失败，请确认本机参考音色服务已启动、没有其他语音会话，并检查录音与转写。")
+        if snapshot and getattr(snapshot, 'references', ()):
+            groups = {}
+            for row in snapshot.references:
+                entry = groups.setdefault(row['tag'], [row['name'], set()])
+                entry[1].add(row['intensity'])
+            self._prepared_expression_snapshot = (self.model_id, snapshot.voice_id, snapshot.revision,
+                tuple((tag, entry[0], tuple(sorted(entry[1]))) for tag, entry in sorted(groups.items())))
+        else:
+            self._prepared_expression_snapshot = None
+
+    @property
+    def prepared_expression_capabilities(self):
+        """只公布当前已启用且完成参考准备的音色能力。"""
+        prepared = self._prepared_expression_snapshot
+        selection = self.voice_library.active_selection if self.voice_library else None
+        if (not prepared or not selection or prepared[:3] !=
+                (self.model_id, selection.get('voice_id'), selection.get('revision'))):
+            return ()
+        return prepared[3]
 
     async def activate_model(self, model_id: str, revision=None) -> None:
         """activate_model（切换模型包）：经本机认证入口，确认服务实际加载的模型。"""
@@ -126,6 +150,9 @@ class AnifLiveTtsClient:
             await self._http.aclose()
             self._http = None
         self.model_id = self.local_model = model_id
+        if self.voice_library is not None and hasattr(self.voice_library, 'owner'):
+            self.voice_library = self.voice_library.owner.for_model(model_id)
+        self._prepared_expression_snapshot = None
         self._ready = False
         await self.ensure_ready()
 
@@ -140,6 +167,9 @@ class AnifLiveTtsClient:
                 await self.server.close()
                 self.server.local_model, self.server.revision = previous, previous_revision
             self.model_id = self.local_model = previous
+            if self.voice_library is not None and hasattr(self.voice_library, 'owner'):
+                self.voice_library = self.voice_library.owner.for_model(previous)
+            self._prepared_expression_snapshot = None
             if self._http is not None:
                 await self._http.aclose()
                 self._http = None
@@ -255,10 +285,10 @@ class AnifLiveTtsClient:
         session = AnifLiveTtsSession(self, turn_id=turn_id, prewarm=True)
         reader: asyncio.Task | None = None
         try:
+            # 冷态模型与整组参考的准备受服务启动／请求时限约束；不占用三秒推理预热预算。
+            await self.ensure_ready()
+            await session.start()
             async with asyncio.timeout(self.prewarm_timeout_seconds):
-                await self.ensure_ready()
-                await session.start()
-
                 async def drain() -> None:
                     async for _ in session.audio_chunks():
                         pass
@@ -338,6 +368,8 @@ class AnifLiveTtsSession:
         self._finished = False
         self._consumer_started = False
         self._segment_index = 0
+        self._last_expression = (None, None)  # 上一已提交的情绪与强度。
+        self._last_expression_boundary = True  # 上一文本段是否允许切换情绪。
         self._started_at = 0.0
         self._session_attempt_index = 0
         self._client_age_ms = 0.0
@@ -544,6 +576,14 @@ class AnifLiveTtsSession:
         if self._segment_index == 1:
             self._first_segment_submit_at = submit_at
             self._first_segment_chars = len(content)
+        controls = self.speech_control_reader() if callable(getattr(self, 'speech_control_reader', None)) else None
+        requested = (getattr(controls, 'guidance', None), getattr(controls, 'intensity', None))
+        chosen = requested if self._last_expression_boundary else self._last_expression
+        expression = {'enabled': bool(chosen[0])}
+        if chosen[0]:
+            expression['profile'] = chosen[0]
+            if chosen[1] is not None:
+                expression['intensity'] = chosen[1]
         await self._request(
             "POST",
             f"/v1/sessions/{self.session_id}/segments",
@@ -551,10 +591,12 @@ class AnifLiveTtsSession:
                 "segment_id": f"app-{uuid.uuid4().hex}",  # segment_id（唯一文本段标识）。
                 "text": content,  # text（待合成文本）。
                 "language": self.client.language,  # language（文本语言）。
-                "generation": {"speed": getattr(self.speech_control_reader(), "speed", 1.0)}
-                    if callable(getattr(self, "speech_control_reader", None)) else {},  # generation（逐段生成参数）。
+                "generation": {"speed": 1.0},  # 固定引擎只支持默认原生语速。
+                "expression": expression,  # expression（本段已登记的情绪选择）。
             },
         )
+        self._last_expression = chosen
+        self._last_expression_boundary = bool(re.search(r'[。！？!?.,，；;、][\"\'”’」』》〉】]*\s*$', content))
         ack_at = time.monotonic()
         if self._segment_index == 1:
             self._first_segment_ack_at = ack_at

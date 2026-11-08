@@ -9,7 +9,7 @@ from typing import Any
 
 
 EMOTIONS = ("calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised")
-CONTROL_NAMES = ("guidance", "speed", "volume")
+CONTROL_NAMES = ("guidance", "speed", "volume", "intensity")
 
 
 class SpeechControlError(ValueError):
@@ -21,6 +21,7 @@ class SpeechControls:
     guidance: str | None = None  # guidance（语气引导）；空值为模型自然表达。
     speed: float = 1.0  # speed（语速倍率）。
     volume: float = 1.0  # volume（相对音量倍率）。
+    intensity: float | None = None  # intensity（情绪参考强度档位）。
 
     @property
     def is_default(self) -> bool:
@@ -46,6 +47,7 @@ class SpeechControlProfile:
     local_volume: bool = False  # local_volume（本机音量处理已接入）。
     voice: str = ""  # voice（音色身份），参与能力冻结。
     transport: str = ""  # transport（传输方式）。
+    expressions: tuple = ()  # expressions（已准备的情绪标记、名称及可用强度档位）。
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -55,6 +57,7 @@ class SpeechControlProfile:
             ("guidance", self.guidance_kind != "none"),
             ("speed", self.native_speed or self.local_tempo),
             ("volume", self.native_volume or self.local_volume),
+            ("intensity", any(len(item[2]) > 1 for item in self.expressions)),
         ) if supported)
 
     @property
@@ -68,8 +71,12 @@ class SpeechControlProfile:
         guidance = values.guidance if "guidance" in self.names else None
         if self.guidance_kind == "enum" and guidance not in EMOTIONS:
             guidance = None
+        if self.guidance_kind == 'catalog' and guidance not in {item[0] for item in self.expressions}:
+            guidance = None
+        levels = next((item[2] for item in self.expressions if item[0] == guidance), ())
+        intensity = values.intensity if len(levels) > 1 and values.intensity in levels else None
         return SpeechControls(guidance, values.speed if "speed" in self.names else 1,
-                              values.volume if "volume" in self.names else 1)
+                              values.volume if "volume" in self.names else 1, intensity)
 
     def protocol(self) -> str:
         """只介绍当前可执行参数；未支持的名称及示例不进入当前能力说明。"""
@@ -80,6 +87,12 @@ class SpeechControlProfile:
             if self.guidance_kind == "enum":
                 lines.append("guidance（语气引导）接受情绪枚举字符串：" + ", ".join(EMOTIONS)
                              + "；对应平静、高兴、悲伤、愤怒、害怕、厌恶、惊讶。")
+            elif self.guidance_kind == 'catalog':
+                lines.append('guidance（语气引导）只能选择当前音色登记的情绪标记：' +
+                             json.dumps([{'tag': tag, 'name': name, 'intensity_levels': levels}
+                                         for tag, name, levels in self.expressions], ensure_ascii=False) + '。')
+                if 'intensity' in self.names:
+                    lines.append('intensity（情绪强度）仅能选择所选标记列出的实际档位；单档情绪不能调节强度。')
             else:
                 lines.append("guidance（语气引导）接受 style guidance（风格引导）的简洁自然语言描述，"
                              "最多500字，可描述情绪、语气和表达方式，例如‘轻柔、亲近，略带笑意’。"
@@ -115,7 +128,23 @@ def profile_for(client: Any, *, backend: str | None = None, enabled: bool = True
     voice = str(getattr(client, "voice_id", ""))
     transport = str(getattr(client, "transport", ""))
     if backend == "aniflive" and getattr(client, "supports_speech_controls", False):
-        return SpeechControlProfile(model, enabled, native_speed=True, voice=voice, transport=transport)
+        # 固定版 V2ProPlus（模型架构）的计算图没有语速输入；上游会拒绝非 1 的倍率。
+        # 只有处理链及依赖均就绪时才开放本地变速。
+        expressions = getattr(client, 'prepared_expression_capabilities', ())
+        library = getattr(client, 'voice_library', None)
+        selection = getattr(library, 'active_selection', None) if library else None
+        model_revision = getattr(getattr(client, 'server', None), 'revision', None)
+        if isinstance(selection, dict):
+            voice = '/'.join(str(item or '') for item in (model_revision, selection.get('voice_id'), selection.get('revision')))
+        elif getattr(client, '_prepared_expression_snapshot', None):
+            voice = '/'.join(str(item or '') for item in client._prepared_expression_snapshot[:3])
+        local_audio = bool(getattr(client, 'supports_local_audio_controls', False))
+        if local_tempo is None and local_audio:
+            from ..audio.speech_controls import tempo_available
+            local_tempo = tempo_available()
+        return SpeechControlProfile(model, enabled, guidance_kind='catalog' if expressions else 'none',
+                                    local_tempo=bool(local_audio and local_tempo), local_volume=local_audio,
+                                    voice=voice, transport=transport, expressions=expressions)
     if model in {"speech-2.8-hd", "speech-2.8-turbo"} and backend != "voxcpm1":
         guidance = "none" if getattr(client, "emotion_status", "") == "unsupported" else "enum"
         return SpeechControlProfile(model, enabled, guidance, True, True, voice=voice, transport=transport)
@@ -131,8 +160,8 @@ def profile_for(client: Any, *, backend: str | None = None, enabled: bool = True
 def merge_controls(profile: SpeechControlProfile, base: SpeechControls,
                    patch: Any) -> SpeechControls:
     """先完整校验再构造结果，任何无效项都不能部分提交。"""
-    if not isinstance(patch, (list, tuple)) or len(patch) > 3:
-        raise SpeechControlError("参数补丁必须是最多三项的列表。")
+    if not isinstance(patch, (list, tuple)) or len(patch) > 4:
+        raise SpeechControlError("参数补丁必须是最多四项的列表。")
     changes: dict[str, Any] = {}
     for item in patch:
         if not isinstance(item, dict) or set(item) != {"name", "value"}:
@@ -148,6 +177,8 @@ def merge_controls(profile: SpeechControlProfile, base: SpeechControls,
         elif name == "guidance":
             if profile.guidance_kind == "enum" and value not in EMOTIONS:
                 raise SpeechControlError("语气引导不属于当前允许的情绪枚举。")
+            if profile.guidance_kind == 'catalog' and value not in {item[0] for item in profile.expressions}:
+                raise SpeechControlError('情绪标记不属于当前音色。')
             if not value or len(value) > 500 or any(ord(char) < 32 and not char.isspace() for char in value):
                 raise SpeechControlError("风格引导必须是1至500字的有效描述。")
             changes[name] = " ".join(value.split())
@@ -156,8 +187,17 @@ def merge_controls(profile: SpeechControlProfile, base: SpeechControls,
                 number = float(value)
             except ValueError as exc:
                 raise SpeechControlError("语速或音量不是有效数值。") from exc
-            low, high = (0.8, 1.2) if name == "speed" else (0.6, 1.4)
+            low, high = (0.8, 1.2) if name == "speed" else (0, 1) if name == 'intensity' else (0.6, 1.4)
             if not math.isfinite(number) or not low <= number <= high:
                 raise SpeechControlError(f"{name}（倍率）必须在{low}至{high}之间。")
             changes[name] = number
-    return replace(profile.normalize(base), **changes)
+    result = replace(profile.normalize(base), **changes)
+    if profile.guidance_kind == 'catalog':
+        levels = next((item[2] for item in profile.expressions if item[0] == result.guidance), ())
+        if 'intensity' in changes and changes['intensity'] is not None and (len(levels) < 2 or result.intensity not in levels):
+            raise SpeechControlError('情绪强度不属于当前标记的可用档位。')
+        if result.guidance != base.guidance and 'intensity' not in changes:
+            result = replace(result, intensity=min(levels, key=lambda n: (round(abs(n - .5), 12), n)) if len(levels) > 1 else None)
+        elif len(levels) < 2:
+            result = replace(result, intensity=None)
+    return result

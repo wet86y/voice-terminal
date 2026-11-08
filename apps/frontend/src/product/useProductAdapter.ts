@@ -268,6 +268,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function setError(error: unknown) {
+    // 受管构建会主动暂停业务服务；该窗口期由组件任务展示进度，不能循环弹连接错误。
+    if (application.recovery?.value?.suspended) return
     clearNoticeTimers()
     lastError.value = messageFromError(error)
     notice.value = ''

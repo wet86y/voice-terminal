@@ -20,7 +20,21 @@ BUILD_ADAPTER_FILES = (
 
 
 def validate_build_identity(identity, program: Path):
-    """检查完整构建身份；只允许明确审阅过的导出改动兼容旧引擎。"""
+    """按稳定推理协议判断兼容性；旧规则仍支持精确审阅的兼容组合。"""
+    rules_path = program / 'config/runtime/aniflive-build-compatibility.json'
+    rules = json.loads(rules_path.read_text(encoding='utf-8')) if rules_path.is_file() else {}
+    contract = rules.get('runtime_contract')
+    if contract is not None:
+        from .aniflive_environment import RUNTIME_VERSIONS
+        # 源码摘要保留为构建溯源；启动依赖稳定推理协议，避免普通工具修改强制重编。
+        source = identity.get('source', {})
+        if (rules.get('schema') != 1 or not isinstance(contract, dict) or contract.get('revision') != 1
+                or contract.get('runtime_packages') != RUNTIME_VERSIONS
+                or source.get('upstream_commit') != contract.get('upstream_commit')
+                or source.get('patch_revision') not in contract.get('source_patch_revisions', [])
+                or identity.get('runtime_contract', 1) != contract['revision']):
+            raise ValueError('模型推理协议或上游架构不兼容，请在组件列表重新转换。')
+        return
     source = identity.get('source', {})
     if (identity.get('dependency_lock') != digest(program / 'config/runtime/aniflive-runtime.lock.json')
             or identity.get('shared_lock') != digest(program / 'config/runtime/aniflive-shared-assets.lock.json')
@@ -65,6 +79,25 @@ def validate_model_id(value):
     return value
 
 
+def validate_registered_package(local: Path, package: Path) -> dict:
+    """受管推理启动的轻量校验；显式维修及外部导入继续执行完整内容检查。"""
+    package = contained(local, package)
+    relative = package.relative_to(Path(local) / 'models/aniflive-tts/packages')
+    if len(relative.parts) != 2:
+        raise ValueError('启动模型必须为受管的精确模型版本目录。')
+    model, revision = relative.parts
+    actual, _, _ = AnifLiveModelRegistry(local).resolve(model, revision)
+    if actual != package:
+        raise ValueError('启动模型目录与登记不一致。')
+    checksums = json.loads(contained(package, package / 'checksums.json').read_text(encoding='utf-8'))
+    receipt = json.loads((package / 'application-receipt.json').read_text(encoding='utf-8'))
+    expected = {row['path']: row['sha256'] for row in receipt['files']}
+    expected['application-receipt.json'] = digest(package / 'application-receipt.json')
+    if checksums != expected:
+        raise ValueError('模型摘要清单与实际验证收据不一致，请执行完整性校验。')
+    return checksums
+
+
 class AnifLiveModelRegistry:
     def __init__(self, local: Path, data: Path | None = None):
         self.local = Path(local).absolute()
@@ -102,6 +135,10 @@ class AnifLiveModelRegistry:
                 or validation.get('engine_count') != 9 or receipt.get('streaming_verified') is not True):
             raise ValueError('模型缺少完整的本机合成验证收据。')
         validate_build_identity(version['identity'], Path(__file__).resolve().parents[2])
+        rules = json.loads((Path(__file__).resolve().parents[2] / 'config/runtime/aniflive-build-compatibility.json').read_text(encoding='utf-8'))
+        contract = rules.get('runtime_contract')
+        if contract and (manifest.get('model_family') != contract['model_family'] or manifest.get('backend') != contract['backend']):
+            raise ValueError('模型计算架构或推理后端不兼容。')
         files = receipt.get('files')
         if not isinstance(files, list) or not files:
             raise ValueError('模型缺少实际生成文件清单。')
@@ -118,9 +155,13 @@ class AnifLiveModelRegistry:
                 raise ValueError('模型生成文件摘要无效。')
             if verify_hashes and digest(target) != row['sha256']:
                 raise ValueError('模型生成文件摘要不符。')
-        actual = {path.relative_to(package).as_posix() for path in package.rglob('*') if path.is_file()}
-        if actual != seen | {'checksums.json', 'application-receipt.json'}:
-            raise ValueError('模型包存在未登记文件或缺少最终摘要文件。')
+        if not contained(package, package / 'checksums.json').is_file():
+            raise ValueError('模型包缺少最终摘要文件。')
+        # 普通启动检查登记文件属性；主动完整性校验才遍历并检查额外文件。
+        if verify_hashes:
+            actual = {path.relative_to(package).as_posix() for path in package.rglob('*') if path.is_file()}
+            if actual != seen | {'checksums.json', 'application-receipt.json'}:
+                raise ValueError('模型包存在未登记文件或缺少最终摘要文件。')
         return package, revision, version
 
     def register(self, model_id, revision, name, identity, *, persist=True):

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { ProductOnlineTtsModelId } from './tts-voice-types'
-import { productApi } from '../product/api'
 
 const model = defineModel<ProductOnlineTtsModelId>('model', { required: true }) // model（在线模型草稿）。
 const voiceId = defineModel<string>('voiceId', { required: true }) // voiceId（在线音色标识草稿）。
@@ -10,6 +9,7 @@ const props = withDefaults(defineProps<{
   previewing?: boolean // previewing（正在试听）。
   disabled?: boolean // disabled（目标切换期间暂不可操作）。
   demo?: boolean // demo（仅演示界面，不提交真实配置）。
+  lookupVoiceName?: (id: string) => Promise<{ voice_id: string; voice_name: string | null }> // 在线音色名称查询接口。
 }>(), { demo: false })
 const emit = defineEmits<{
   save: [] // save（保存在线模型与音色）。
@@ -38,7 +38,8 @@ watch(voiceId, value => {
   voiceLookupState.value = 'checking'
   voiceLookupTimer = setTimeout(async () => {
     try {
-      const result = await productApi.minimaxVoiceName(id)
+      if (!props.lookupVoiceName) throw new Error('音色查询接口不可用。')
+      const result = await props.lookupVoiceName(id)
       if (generation !== voiceLookupGeneration) return
       if (result.voice_id === id && typeof result.voice_name === 'string' && result.voice_name.trim()) {
         voiceName.value = result.voice_name.trim()

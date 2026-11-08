@@ -8,6 +8,7 @@ import pytest
 
 from voice_terminal.tts.aniflive_models import BUILD_ADAPTER_FILES, validate_build_identity
 from voice_terminal.tts.aniflive_native import UPSTREAM_COMMIT
+from voice_terminal.tts.aniflive_environment import RUNTIME_VERSIONS
 
 
 def fixture_program(root):
@@ -54,3 +55,24 @@ def test_current_release_accepts_only_pinned_historical_build():
               'dependency_lock':hashlib.sha256((program/'config/runtime/aniflive-runtime.lock.json').read_bytes()).hexdigest(),
               'shared_lock':hashlib.sha256((program/'config/runtime/aniflive-shared-assets.lock.json').read_bytes()).hexdigest()}
     validate_build_identity(identity,program)
+
+
+def test_runtime_contract_ignores_tool_and_lock_digest_changes_but_rejects_unknown_protocol(tmp_path):
+    identity = fixture_program(tmp_path)
+    path = tmp_path / 'config/runtime/aniflive-build-compatibility.json'
+    rules = json.loads(path.read_text())
+    rules['runtime_contract'] = {'revision': 1, 'upstream_commit': UPSTREAM_COMMIT,
+                                 'source_patch_revisions': [3, 5],
+                                 'runtime_packages': RUNTIME_VERSIONS}
+    path.write_text(json.dumps(rules))
+    identity['adapter'] = {'old-export-tool': 'a' * 64}
+    identity['dependency_lock'] = 'old dependency provenance（旧依赖溯源）'
+    (tmp_path / BUILD_ADAPTER_FILES[0]).write_bytes(b'new tool implementation')
+    original = deepcopy(identity)
+    validate_build_identity(identity, tmp_path)
+    assert identity == original  # 旧收据保持真实身份，不伪造为新构建。
+    for changed in ({**identity, 'runtime_contract': 2},
+                    {**identity, 'source': {**identity['source'], 'patch_revision': 999}},
+                    {**identity, 'source': {**identity['source'], 'upstream_commit': 'unknown'}}):
+        with pytest.raises(ValueError, match='推理协议'):
+            validate_build_identity(changed, tmp_path)

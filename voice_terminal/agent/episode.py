@@ -3406,6 +3406,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         instruction_candidates = await self._request_instruction_candidates(
             source_turn_id, kinds, prompt_kind=prompt_kind, recovery=recovery,
         )
+        prepare_voice = getattr(self.output, 'prepare_speech_capabilities', None)
+        if callable(prepare_voice):
+            await prepare_voice()
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,

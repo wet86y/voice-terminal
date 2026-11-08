@@ -64,7 +64,8 @@ def test_registry_full_loading_check_rejects_same_length_damage(tmp_path):
     folder.mkdir(parents=True)
     engine = folder / 'model.engine'
     engine.write_bytes(b'original')
-    (folder / 'manifest.json').write_text(json.dumps({'model_id': model, 'format': 'aniflive-tts-model-package'}), encoding='utf-8')
+    (folder / 'manifest.json').write_text(json.dumps({'model_id': model, 'format': 'aniflive-tts-model-package',
+        'model_family': 'gsv-v2proplus', 'backend': 'TensorRT-11'}), encoding='utf-8')
     (folder / 'checksums.json').write_text('{}', encoding='utf-8')
     from tests.aniflive_fixtures import build_identity
     identity = {**build_identity(), 'input': 'fixture'}
@@ -74,6 +75,16 @@ def test_registry_full_loading_check_rejects_same_length_damage(tmp_path):
                   for p in (engine, folder / 'manifest.json')]}), encoding='utf-8')
     registry = AnifLiveModelRegistry(tmp_path)
     registry.register(model, revision, '测试模型', identity)
+    from voice_terminal.tts.aniflive_models import validate_registered_package
+    checksums = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in (engine, folder / 'manifest.json', folder / 'application-receipt.json')}
+    (folder / 'checksums.json').write_text(json.dumps(checksums), encoding='utf-8')
+    assert validate_registered_package(tmp_path, folder) == checksums
+    (folder / 'notes.txt').write_text('启动不扫描额外旁注文件', encoding='utf-8')
+    assert validate_registered_package(tmp_path, folder) == checksums
+    with pytest.raises(ValueError, match='未登记文件'):
+        registry.resolve(model, verify_hashes=True)
+    (folder / 'notes.txt').unlink()
     registry.resolve(model, verify_hashes=True)
     engine.write_bytes(b'modified')
     with pytest.raises(ValueError, match='摘要不符'):
@@ -82,22 +93,26 @@ def test_registry_full_loading_check_rejects_same_length_damage(tmp_path):
     assert not next(row for row in registry.models() if row['id'] == model)['available']
 
 
-def test_build_identity_rejects_stale_dependency_patch_and_adapter():
+def test_build_identity_preserves_provenance_and_rejects_incompatible_runtime_protocol():
     from copy import deepcopy
     from tests.aniflive_fixtures import build_identity
     from voice_terminal.tts.aniflive_models import validate_build_identity
     program = Path(__file__).resolve().parents[1]
     identity = build_identity()
     validate_build_identity(identity, program)
-    for field in ('dependency_lock', 'shared_lock', 'source', 'adapter'):
+    for field in ('dependency_lock', 'shared_lock', 'adapter'):
         stale = deepcopy(identity)
         if field in {'dependency_lock', 'shared_lock'}:
             stale[field] = '0' * 64
-        elif field == 'source':
-            stale[field]['patch_revision'] -= 1
         else:
             stale[field]['scripts/run-aniflive.py'] = '0' * 64
-        with pytest.raises(ValueError, match='身份已变化'):
+        validate_build_identity(stale, program)  # 工具与下载锁摘要属于溯源，不是推理协议。
+    for field in ('patch', 'upstream', 'protocol'):
+        stale = deepcopy(identity)
+        if field == 'patch': stale['source']['patch_revision'] = 999
+        elif field == 'upstream': stale['source']['upstream_commit'] = '0' * 40
+        else: stale['runtime_contract'] = 999
+        with pytest.raises(ValueError, match='推理协议'):
             validate_build_identity(stale, program)
 
 

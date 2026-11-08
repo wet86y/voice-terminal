@@ -36,6 +36,33 @@ def test_missing_tempo_hides_only_unavailable_speed():
     assert profile.names == ("guidance", "volume")
 
 
+def test_aniflive_does_not_advertise_unsupported_native_speed():
+    client = SimpleNamespace(local_model="example", supports_speech_controls=True)
+    profile = profile_for(client, backend="aniflive")
+    assert not profile.native_speed
+    assert "speed" not in profile.names
+    with pytest.raises(SpeechControlError):
+        merge_controls(profile, DEFAULT_CONTROLS, [{"name": "speed", "value": "0.8"}])
+
+
+def test_aniflive_expression_catalog_validates_exact_intensity_and_changes_identity():
+    client = SimpleNamespace(local_model='model', supports_speech_controls=True,
+        prepared_expression_capabilities=(('soft', '温柔', (.3, .7)), ('calm', '平静', (.5,))),
+        _prepared_expression_snapshot=('model', 'voice', 1, ()))
+    profile = profile_for(client, backend='aniflive')
+    assert profile.names == ('guidance', 'intensity')
+    current = merge_controls(profile, DEFAULT_CONTROLS, [{'name': 'guidance', 'value': 'soft'}])
+    assert current.guidance == 'soft' and current.intensity == .3
+    changed = merge_controls(profile, current, [{'name': 'intensity', 'value': '0.7'}])
+    assert changed.intensity == .7
+    with pytest.raises(SpeechControlError):
+        merge_controls(profile, current, [{'name': 'intensity', 'value': '0.6'}])
+    changed = merge_controls(profile, changed, [{'name': 'guidance', 'value': 'calm'}])
+    assert changed.intensity is None
+    client._prepared_expression_snapshot = ('model', 'voice', 2, ())
+    assert profile_for(client, backend='aniflive').identity != profile.identity
+
+
 def test_patch_inheritance_partial_reset_and_atomic_validation():
     profile = profile_for(SimpleNamespace(model="speech-2.8-hd"))
     first = merge_controls(profile, DEFAULT_CONTROLS, [
