@@ -45,12 +45,10 @@ Invoke-WebRequest -Uri "https://github.com/wet86y/voice-terminal/releases/latest
 
 ## 为什么是它
 
-| | |
-|---|---|
-| **低延迟交互** | 语音合成分块流式返回，边合成边播放，首块音频不必等整段生成；唤醒词与静默窗口让对话连续，不必反复唤醒或重新点按。 |
-| **低性能占用** | 模型按需加载，空闲时只保留必要组件；识别、分析与本地语音最多三路并发，资源不足时自动降并发。本地语音跑在显卡上时，CPU 也能承担基础识别与活动检测。 |
-| **GUI 一键下载** | 所有组件、模型与运行环境都在图形界面里下载、更新、导入和重置，带进度、可取消、可重试；不需要用户碰命令行、包管理器或虚拟环境。 |
-| **配置简单** | 人格、指令、唤醒词、静默、声纹、定时任务都在设置页完成；凭据交给系统凭据管理器保存，配置即时生效，无需重启。 |
+- **低延迟交互** —— 语音合成分块流式返回，边合成边播放，首块音频不必等整段生成；唤醒词与静默窗口让对话连续，不必反复唤醒或重新点按。
+- **低性能占用** —— 模型按需加载，空闲时只保留必要组件；识别、分析与本地语音最多三路并发，资源不足时自动降并发。本地语音跑在显卡上时，CPU 也能承担基础识别与活动检测。
+- **GUI 一键下载** —— 所有组件、模型与运行环境都在图形界面里下载、更新、导入和重置，带进度、可取消、可重试；不需要用户碰命令行、包管理器或虚拟环境。
+- **配置简单** —— 人格、指令、唤醒词、静默、声纹、定时任务都在设置页完成；凭据交给系统凭据管理器保存，配置即时生效，无需重启。
 
 ---
 
@@ -108,12 +106,10 @@ Invoke-WebRequest -Uri "https://github.com/wet86y/voice-terminal/releases/latest
 
 完整文档按架构、说明、测试与交付四类整理，目录说明与分类索引见 **[文档索引](docs/README.md)**。
 
-| 类别 | 入口 |
-| --- | --- |
-| 架构 | [架构与生命周期](docs/architecture/architecture.md) · [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md) · [WebSocket 协议](docs/architecture/websocket-protocol.md) · [上下文与工具](docs/architecture/context-and-tools.md) · [连续性底座](docs/architecture/continuity-foundation.md) |
-| 说明 | [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md) |
-| 测试 | [测试、启动与现场验收入口](docs/testing/operations-and-quality.md) · [当前已知问题](docs/testing/known-issues.md) |
-| 交付 | [当前交付](docs/releases/current-release.md) · [v0.9.12 发行说明](docs/releases/v0.9.12.md) · [GitHub 发布流程](docs/development/github-release.md) |
+- **架构** — [架构与生命周期](docs/architecture/architecture.md) · [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md) · [WebSocket 协议](docs/architecture/websocket-protocol.md) · [上下文与工具](docs/architecture/context-and-tools.md) · [连续性底座](docs/architecture/continuity-foundation.md)
+- **说明** — [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md)
+- **测试** — [测试、启动与现场验收入口](docs/testing/operations-and-quality.md) · [当前已知问题](docs/testing/known-issues.md)
+- **交付** — [当前交付](docs/releases/current-release.md) · [v0.9.12 发行说明](docs/releases/v0.9.12.md) · [GitHub 发布流程](docs/development/github-release.md)
 
 **运行环境要求**：Windows 10 / 11 x64；系统 WebView2（网页运行引擎）；本地语音合成需兼容的 NVIDIA（英伟达）显卡，并预留足够的显存、内存与磁盘空间。
 
