@@ -61,6 +61,7 @@
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
 - [当前已知问题](testing/known-issues.md)
 - [AnifLive 模型导入匹配审计（2026-11-08）](testing/aniflive-import-audit-20261108.md)
+- [v1.0.0 构建与公开发行验收（2026-11-08）](testing/release-1.0.0-20261108.md)
 - [AnifLive 无人值守交付验收（2026-11-08）](testing/aniflive-unattended-delivery-20261108.md)
 - [AnifLive 无人值守构建验收（2026-11-07）](testing/aniflive-unattended-build-20261107.md)
 - [AnifLive 本机程序更新验收（2026-11-07）](testing/aniflive-local-update-20261107.md)
