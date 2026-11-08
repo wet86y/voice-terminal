@@ -247,9 +247,9 @@ MINIMAX_API_KEY=
 
 ## 许可与致谢
 
-本项目使用 [Apache License 2.0](LICENSE) 开源，第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目自行创作且未另行标注来源的代码采用 [Apache License 2.0](LICENSE)（Apache 2.0 开源许可证）；该许可不覆盖第三方源码、模型、录音、依赖或组件。各自许可范围、AnifLive-TTS（本地语音引擎）兼容补丁来源及正式程序包的声明状态，统一见[许可证范围与第三方声明](LICENSING.md)。
 
-- **[AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)** —— 由 [Hiruynk](https://github.com/Hiruynk) 开发的极低延迟、低显存占用的双流式 TTS 推理框架，本项目的本地语音合成能力建立在其上。
+- **[AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)** —— 由 [Hiruynk](https://github.com/Hiruynk) 开发的双流式 TTS（文本转语音）推理框架；其原创代码采用 PolyForm Noncommercial 1.0.0（非商业用途许可证），上游派生代码和依赖各自保留原许可。本项目的本地语音合成能力建立在其上，使用边界见 [许可证范围说明](LICENSING.md#aniflive-tts本地语音引擎)。
 - **[DeepSeek Harness](https://github.com/deepseek-ai/dsh)** —— 后台执行宿主与插件体系。
 - **[FunASR](https://github.com/modelscope/FunASR)** —— 语音识别框架。
 - **[MiniMax](https://www.minimaxi.com/)** —— 在线低延迟 TTS 服务。

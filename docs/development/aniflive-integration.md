@@ -8,6 +8,8 @@
 
 上游固定为 v1.5.0-beta，提交 `9bc349d3a71362b3bfdccbc630983809800954fd`。来源见[官方说明](https://github.com/Hiruynk/AnifLive-TTS/blob/9bc349d3a71362b3bfdccbc630983809800954fd/README_ZH_CN.md)、[官方转换器](https://github.com/Hiruynk/AnifLive-TTS/blob/9bc349d3a71362b3bfdccbc630983809800954fd/src/aniflive_tts/converter.py)。转换退出成功只说明命令完成；本项目另外执行九个引擎加载、中文合成及 48／96 标记分块流式验证。
 
+许可证按源码来源区分：本项目独立编写的适配器与补丁编排逻辑采用 Apache-2.0（Apache 2.0 开源许可证）；被修改的 AnifLive-TTS 原创文件、GPT-SoVITS 派生文件及 Minimal Inference（最小推理实现）文件继续适用各自许可证。完整补丁目标表、第三方组件许可清单、必留版权声明及正式程序包当前没有携带根目录许可证文档的事实，统一见[许可证范围与第三方声明](../../LICENSING.md)。
+
 补丁权威为 `voice_terminal/tts/aniflive_native.py`（固定源码准备模块），主程序及隔离运行源码当前均为修订 5；唐语歌已登记引擎仍保留其修订 3 的真实构建身份，并由下述精确兼容规则接入。官方归档 SHA-256（内容摘要）为 `67929fedc70df998a6006028b6385743611c5d5a78a5ede3b6713f64435eada2`。每处替换检查官方原文件摘要，准备后保留完整源码文件清单和补丁前后摘要；不接受摘要不符的任意本机源码。
 
 | 补丁 | 审阅决定与边界 |
