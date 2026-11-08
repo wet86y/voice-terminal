@@ -1,41 +1,135 @@
-# Voice Terminal
+<p align="center">
+  <img src="apps/desktop/src-tauri/icons/icon.png" alt="Voice Terminal 图标" width="88" height="88">
+</p>
 
-项目使用 [Apache License 2.0](LICENSE) 开源，第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。公开源码与 Windows（操作系统）发行资产位于 [wet86y/voice-terminal](https://github.com/wet86y/voice-terminal)，本机发行流程见[GitHub 发布说明](docs/development/github-release.md)。
+<h1 align="center">Voice Terminal</h1>
 
-“识别与修订”设置页统一管理声纹识别策略与热词修订；词表配置见[热词替换](docs/guides/asr-hotwords.md)。
+<p align="center"><strong>Windows 上的个人语音 Agent —— 说一句，它就动手。</strong></p>
 
-Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口是主产品唯一的运行、开发和界面验收入口，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管，其独立管理控制台继续由系统默认浏览器打开。
+<p align="center">
+  <a href="https://github.com/wet86y/voice-terminal/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/wet86y/voice-terminal?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=%2350c878"></a>
+  <a href="LICENSE"><img alt="许可证" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
+  <img alt="平台" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0078d4?logo=windows&logoColor=white">
+  <img alt="状态" src="https://img.shields.io/badge/status-%E5%BC%80%E5%8F%91%E4%B8%AD-orange">
+  <img alt="语言" src="https://img.shields.io/badge/speech-ASR%20%E2%86%92%20LLM%20%E2%86%92%20TTS-8b5cf6">
+</p>
 
-当前代码包版本为 `0.9.10`，变更见 [v0.9.10 发行说明](docs/releases/v0.9.10.md)。最新发行、版本标签与交付核验状态见[当前交付](docs/releases/current-release.md)。默认 LLM（大语言模型）路径是 DeepSeek Responses（响应接口）与 strict `json_schema`（严格结构化输出）；`voice_decision_v06`（语音决策协议兼容标识）保持冻结，不是发布版本号。
+<p align="center">开发中的个人语音 Agent。语音识别、决策与合成的整条链路跑在你自己电脑上，界面是一个窗口，配置是几次点击。</p>
 
-> 安全边界：默认服务只绑定 `127.0.0.1`。当前管理 API、WebSocket 和模型探测接口不适合直接暴露到局域网或公网；需要远程部署时，先完成 [当前已知问题](docs/testing/known-issues.md) 中的认证和 SSRF 防护工作。
-
-## 运行结构
-
-```text
-用户 → ASR → 主 Agent/LLM → Speech transaction → TTS / Player
-                         └→ request_shadow({"request": true})
-                                      │
-                                      ▼
-                         单一 ShadowRuntime → 当前后端已授予的工具
-                                      │
-                                      ├─ progress（进度）→ 二等信箱 → 每 4 秒检查 / 随普通请求携带
-                                      ├─ information（影子信息）→ 可替换信息槽 → 普通事件调度
-                                      └─ input_required（需用户输入）/ result（结果）/ failed（失败）→ 语义历史
-```
-
-主语音链只有一个调度循环和一个语音事务 owner（所有者）。未播放的 assistant（助手）草稿不会写入历史；只有用户输入、实际传达的助手文本、有效 refinement（转写精修）和有语义影响的打断会进入会话账本。Shadow（影子代理）是同一 session（会话）的认知旁路；DSH（代理执行宿主）根代理仅可在用户明确要求或已启用的影子自定义指令明确规定时，请求提前执行静默前最终检查，其余语音、TTS（语音合成）、播放器和主调度控制仍由 Voice（语音主线）拥有。DSH status observer（代理宿主状态观察器）摘要仅进入二等信箱，按来源覆盖和版本确认消费，不进入前台摘要、最新进展或长期语义历史。progress（影子进度）继续更新产品 UI（界面），实质变化合并进入二等信箱；普通请求会携带，否则在活跃静默窗口内每 4 秒复用唯一 400 毫秒心跳检查非空信箱。上下文冻结成功后确认版本，空信箱不请求，最终静默优先，二等检查不延长最终期限。二等信箱由账本统一存储，来源开放；主模型可选调用 `continue_listening`（继续倾听），以 `count`（新增注入次数）1/2/3请求后续评估，尚未注入余额最多4，消费清空后逐条补注入。它不创建定时任务或延长监听期限。详见 [Bridge 2.0（第二版桥接协议）](docs/architecture/bridge-2.0-protocol.md)。
+---
 
 ## 快速开始
 
-本地布局与覆盖更新的权威说明见[本地目录与覆盖发布](docs/guides/local-layout.md)。构建编号只记录在清单，常态不保留整包或环境备份。
-开发过程的资产归属、覆盖更新、失败现场保留与提交大小约束见[开发资产治理](docs/development/asset-governance.md)。需要自动提交检查时，可执行 `npm run assets:hook`（启用本地提交钩子）；容量维护按需使用 `npm run assets:audit`（只读预算审计）。这些命令不作为启动或日常调试的前置条件。
+**1. 下载安装器**（Windows 10 / 11 x64，~115 MB）
 
-当前目录结构、空间规则、备份与恢复方式见[本地目录与覆盖发布](docs/guides/local-layout.md)。
+```powershell
+# 打开下载页选择最新版本
+Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
+```
 
-本地开发和用户使用同一套正式程序。本机正式入口是 `.local/VoiceTerminal.exe`（正式启动程序）；对外分发 `.local/releases/installer/VoiceTerminalSetup.exe`（安装器），只负责选择工作区、展开或重装同一正式程序包、创建桌面快捷方式与启动交接。组件下载、导入、配置及维护全部由正式程序承担。详见[统一正式程序与分发安装器](docs/guides/unified-product-installer.md)及[当前交付](docs/releases/current-release.md)。`.local/VoiceTerminalUIDemo.exe`（前端演示入口）继续使用隔离缓存。
+或直接取安装器：
 
-源码开发复用项目 `.local/portable.json`（布局配置）指定的开发业务环境：Python（后端解释器）位于 `.local/runtimes/python/`，Node.js（脚本解释器）从 `.local/runtimes/dsh/runtime.json`（代理宿主运行清单）解析。开发依赖由 npm（包管理器）安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`（本机工具目录），构建输出统一进入 `.local/build/`（受控构建缓存）。
+```powershell
+Invoke-WebRequest -Uri "https://github.com/wet86y/voice-terminal/releases/latest/download/VoiceTerminalSetup.exe" -OutFile "$env:USERPROFILE\Downloads\VoiceTerminalSetup.exe"
+```
+
+**2. 安装并启动** —— 安装器只负责选择工作区、展开程序、创建桌面快捷方式，不做额外配置。
+
+**3. 在图形界面里一键下载组件** —— 打开程序进入组件管理页，点“一键下载”，程序自动补齐语音环境、识别模型与后台执行宿主；全程有统一进度条、可取消、可重试。组件就绪后点“启动程序”即可开始对话。
+
+**4. 说话** —— 可直接按住说话，也可在设置里开启唤醒词，进入随时待命的语音状态。
+
+> 需要模型与运行环境的组件会在首次启动时由程序自行下载与校验；下载和转换过程较长属正常现象，本地语音引擎的转换尤其依赖显卡与内存资源。
+
+---
+
+## 为什么是它
+
+| | |
+|---|---|
+| **低延迟交互** | 语音合成分块流式返回，边合成边播放，首块音频不必等整段生成；唤醒词与静默窗口让对话连续，不必反复唤醒或重新点按。 |
+| **低性能占用** | 模型按需加载，空闲时只保留必要组件；识别、分析与本地语音最多三路并发，资源不足时自动降并发。本地语音跑在显卡上时，CPU 也能承担基础识别与活动检测。 |
+| **GUI 一键下载** | 所有组件、模型与运行环境都在图形界面里下载、更新、导入和重置，带进度、可取消、可重试；不需要用户碰命令行、包管理器或虚拟环境。 |
+| **配置简单** | 人格、指令、唤醒词、静默、声纹、定时任务都在设置页完成；凭据交给系统凭据管理器保存，配置即时生效，无需重启。 |
+
+---
+
+## 功能介绍
+
+### 本地语音合成（可选）
+
+可选接入本地 TTS（语音合成），离线也能出声。推理框架使用 **[AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)**，由 [Hiruynk](https://github.com/Hiruynk) 开发，为个人消费级设备提供稳定可靠的低延迟、高质量 TTS 模型方案。在此向 Hiruynk 致谢。
+
+- 支持固定预设与配对权重导入：确认模型、参考录音与转写后，后台自动完成下载、转换、验证与音色登记
+- 按模型管理情绪与场景参考音色，支持上传、试听、启用与默认参考恢复
+- 48 / 96 语义标记分块流式输出，提供显卡高性能、首音等待等选项
+- 引擎在本机生成并真实验证，不同显卡与依赖身份的引擎不互相套用
+- 也可选择 MiniMax 在线语音作为播放目标，两者可在设置中随时切换
+
+### 静默与唤醒词
+
+- 静默窗口（默认 90 秒）内可直接接话，无需重新喊唤醒词
+- 唤醒词可配置，唤醒命中或模型主动发声后麦克风交给识别
+- 窗口到期时由最终静默检查交回唤醒待机；主动结束录音或进入唤醒待机会立即失效
+
+### 自定义指令设置与人格设定
+
+- 人格风格与用户资料独立配置，首次激活时读取，设置页保存后立即对后续对话生效
+- 自定义指令可约束助手的行为边界与任务处理方式
+- 默认大模型路径为 DeepSeek Responses 接口与严格结构化输出
+
+### 声纹识别
+
+- 主人 / 非主人二分，证据不足时按非主人处理
+- 拦截模式在身份结算前暂缓输入派发，放行本轮主人及有效连续主人
+- 阈值与连续放宽量可在页面编辑后保存，主人打断采用独立开关
+
+### 定时任务
+
+- 支持 1 分钟至 24 小时间隔，可选择持续循环或设定成功触发次数
+- 页面与后台执行工具均可创建、修改和查询
+- 到期提醒通过语音事件回到主对话链路
+
+### 后台协作
+
+- 后台执行与语音交互构成同一个助手：实际操作、外部查询与定时请求交给后台，语音侧只汇报进展
+- 待决权限请求可单次同意、连续同意或拒绝；开启语音确认后，模型会先说明待授权操作再按你的明确答复处理
+
+---
+
+## 开发路线图
+
+1. **长记忆模块** —— 让助手跨会话记住偏好与上下文，而不是每次从零开始。
+2. **局域网互联** —— 多设备场景下，由一台设备承担算力消耗，为其他设备提供更低占用的语音交互能力。
+
+---
+
+## 文档
+
+完整文档按架构、说明、测试与交付四类整理，目录说明与分类索引见 **[文档索引](docs/README.md)**。
+
+| 类别 | 入口 |
+| --- | --- |
+| 架构 | [架构与生命周期](docs/architecture/architecture.md) · [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md) · [WebSocket 协议](docs/architecture/websocket-protocol.md) · [上下文与工具](docs/architecture/context-and-tools.md) · [连续性底座](docs/architecture/continuity-foundation.md) |
+| 说明 | [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md) |
+| 测试 | [测试、启动与现场验收入口](docs/testing/operations-and-quality.md) · [当前已知问题](docs/testing/known-issues.md) |
+| 交付 | [当前交付](docs/releases/current-release.md) · [v0.9.12 发行说明](docs/releases/v0.9.12.md) · [GitHub 发布流程](docs/development/github-release.md) |
+
+**运行环境要求**：Windows 10 / 11 x64；系统 WebView2（网页运行引擎）；本地语音合成需兼容的 NVIDIA（英伟达）显卡，并预留足够的显存、内存与磁盘空间。
+
+**安全边界**：默认服务只绑定 `127.0.0.1`。当前管理 API、WebSocket 和模型探测接口不适合直接暴露到局域网或公网；需要远程部署时，先完成[当前已知问题](docs/testing/known-issues.md)中的认证和 SSRF 防护工作。
+
+---
+
+## 开发者速查
+
+以下内容面向在源码上工作的开发者。日常开发复用现有环境，常规更新采用固定位置覆盖。
+
+### 本地开发
+
+本地开发和用户使用同一套正式程序。本机正式入口是 `.local/VoiceTerminal.exe`；对外分发 `.local/releases/installer/VoiceTerminalSetup.exe`，只负责选择工作区、展开或重装同一正式程序包、创建桌面快捷方式与启动交接。组件下载、导入、配置及维护全部由正式程序承担。详见[统一正式程序与分发安装器](docs/guides/unified-product-installer.md)及[当前交付](docs/releases/current-release.md)。
+
+源码开发复用项目 `.local/portable.json` 指定的开发业务环境：Python 位于 `.local/runtimes/python/`，Node.js 从 `.local/runtimes/dsh/runtime.json` 解析。开发依赖由 npm 安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`，构建输出统一进入 `.local/build/`。
 
 ```powershell
 .\scripts\setup.ps1 -SkipInstall -SkipDsh
@@ -45,119 +139,85 @@ npm run desktop:start
 
 组件与构建依赖默认采用国内镜像优先、失败回退原站，版本及内容校验保持不变。来源映射、离线安装及验证边界见[国内镜像与原站回退](docs/guides/download-sources.md)。
 
-普通无参数启动从可执行文件位置确定工作区，读取已发布 `app`（程序本体）内的业务和静态界面；不查找源码祖先，也不读取或更新系统用户目录中的工作区定位记录。`npm run desktop:start`（正式启动）与本地双击完全一致。`npm run dev`（源码热更新）通过同一正式入口显式传入 `--dev`（调试开关）及 `--source-root`（源码目录），沿用正式工作区、组件管理、单实例及退出流程。`npm run desktop:publish`（本地发布）使用统一程序包事务替换本体，保留用户数据与组件。各构建、更新与发行入口的选择和复用规则见[开发、构建与同包交付流程](docs/development/desktop-pipeline.md)。
+```powershell
+npm run dev          # 真实业务桌面热更新；别名 npm run desktop:dev
+npm run dev:ui       # 桌面样例热更新；别名 npm run desktop:ui
+npm run build        # 统一正式界面、原生宿主及根入口；别名 npm run desktop:build
+npm run desktop:prepare  # 按内容复用或准备正式程序包，不安装
+npm run desktop:publish  # 准备程序包并更新本机正式入口
+npm run desktop:dist    # 准备程序包并构建独立 EXE（安装器）
+npm run desktop:deliver # 更新本机并构建安装器，共用同一程序包
+npm run github:release:local # 同包更新本机并发布 GitHub 发行
+```
 
-设置、历史、声纹、DSH（代理宿主）状态及凭据引用按当前工作区的 `data`（用户数据）目录加载；凭据继续使用 Windows Credential Manager（系统凭据管理器）。不要将开发凭据提交到 Git（源码管理工具）：
+开发过程的资产归属、覆盖更新、失败现场保留与提交大小约束见[开发资产治理](docs/development/asset-governance.md)。需要自动提交检查时，可执行 `npm run assets:hook`；容量维护按需使用 `npm run assets:audit`（只读预算审计）。这些命令不作为启动或日常调试的前置条件。
+
+凭据继续使用 Windows Credential Manager。不要将开发凭据提交到 Git：
 
 ```text
 DEEPSEEK_API_KEY=
 MINIMAX_API_KEY=
 ```
 
-默认入口：
+### 运行结构
 
-- Product UI（产品界面）：通过桌面程序打开；普通浏览器访问本机地址只显示启动说明。
-- Voice Server（语音服务）：使用宿主 `endpoints.voice`（语音服务实际端点），首选端口 8765 被占用时由系统分配。
-- WebSocket（实时通信）：使用实际语音服务地址的 `/ws`（实时通信路径）。
-- 健康检查：使用实际语音服务地址的 `/health`（健康检查路径）。
-- DSH（代理执行宿主）控制台：从工作台“后台协作”面板底部的“代理控制台”进入；桌面应用在系统默认浏览器打开网页。
-- 无界面后端调试：`.\scripts\start.ps1`
-
-启动门槛遵循随包清单的 `required`（是否必需）字段。必需组件缺失、待更新或文件检查失败时进入本地组件管理。CAM++（声纹嵌入模型）由正式程序组件列表安装或更新；分发器保留现用模型和注册资料，不在本体升级时安装或清除组件。缺少有效CAM++档案时进入观察状态，重新注册后恢复已保存的筛选和主人打断偏好。DSH（代理执行宿主）即使显示版本相同，来源不满足当前发行要求时仍显示待更新，详见[启动与显卡环境排查](docs/guides/local-model-compute.md)。普通启动只检查必要入口、版本登记、收据和文件大小，不重算模型完整摘要或按期限自动全扫。完整性维护由用户主动发起，组件问题交回本体组件列表修复。下载、导入及更新继续执行完整内容校验。`/health`（语音服务健康检查）可应答不代表全部模型推理已就绪。
-
-从原生首屏开始统一显示应用图标、当前启动组件、共享进度条和“跳过”按钮；模型与 DSH 的启动复核通过后，ASR（自动语音识别）、分析进程和语音本地模型按实时资源预算最多同时加载三路，资源不足时减少并发。组件和服务启动门槛见[组件更新说明](docs/guides/model-resource-updates.md)，校验缓存及显卡环境迁移见[启动与显卡环境排查](docs/guides/local-model-compute.md)，调度细节见[启动调度梳理](docs/guides/runtime-resource-management.md)及[并行启动验收](docs/testing/startup-parallel-acceptance.md)。
-
-## 本地组件与模型设备
-
-语音服务、模型和 DSH（代理执行宿主）按随包清单区分必需与可选组件。更新由用户点击卡片中的更新或导入入口触发，也可打开官方来源；待更新的必需组件会阻止整体服务启动。模型版本、文件摘要校验、事务恢复和安装验证见[程序升级与必需组件更新](docs/guides/model-resource-updates.md)。
-
-组件提交或下载任务结束后立即重读清单，活动任务每两秒补查、空闲每十秒刷新，并显示实际更新时间。全部组件和接口配置就绪后，点击“启动程序”立即进入统一启动动画；宿主重新读取新安装的组件路径，快速盘点 Voice Server（语音服务），并将全部组件校验合并到一条累计进度条，无需退出重进。下载、复制、共享依赖复用及校验进度的规则和实测见[下载与首次启动修复](docs/testing/download-startup-flow-20261010.md)。
-
-2026-10-10 的默认实现包括 PyTorch（深度学习框架）权重内存映射加载、FunASR（语音模型框架）按需导入、声纹临时实例生命周期释放，以及 CPU（中央处理器）模式下自动选择已校验的轻量 ONNX（开放神经网络交换格式）FSMN-VAD（语音活动检测）模型。SenseVoice（语音识别与理解）量化候选未通过默认启用条件，仍使用原精度模型。各项实测和资源口径见[运行资源管理与内存优化](docs/guides/runtime-resource-management.md)及[本地模型运行设备](docs/guides/local-model-compute.md)。
-
-便携桌面启动由应用宿主提供预构建界面，不在用户启动期间安装依赖或执行开发构建。正式界面地址优先使用 5173 端口，被占用时分配空闲端口，以桌面实际加载地址为准。私有进程管道提供一次性桌面入口凭据；界面资源、运行配置和宿主管理操作均需本实例会话。关闭产品窗口隐藏到托盘；从应用菜单、托盘或“设置 → 系统运行”明确退出时，回收全部受管组件。
-
-构建桌面程序及根目录启动入口：
-
-```powershell
-.\scripts\build-desktop.ps1
+```text
+用户 → ASR → 主 Agent/LLM → Speech transaction → TTS / Player
+                         └→ request_shadow({"request": true})
+                                      │
+                                      ▼
+                         单一 ShadowRuntime → 当前后端已授予的工具
 ```
 
-正式程序发布与数据备份见[本地目录与覆盖发布](docs/guides/local-layout.md)。对外交付单个 `VoiceTerminalSetup.exe`（分发安装器），内嵌同一正式程序包。使用系统 WebView2 Evergreen Runtime（自动更新网页引擎）；没有 Python（后端环境）也能由正式程序进入组件管理和关于页。组件由正式程序维护，详见[统一正式程序与分发安装器](docs/guides/unified-product-installer.md)。
+主语音链只有一个调度循环和一个语音事务 owner。未播放的助手草稿不会写入历史；只有用户输入、实际传达的助手文本、有效转写精修和有语义影响的打断会进入会话账本。后台执行是同一会话的认知旁路，详见 [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md)。
 
-源码界面开发统一使用桌面命令：
+### 默认入口
 
-```powershell
-npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
-npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
-npm run build    # 统一正式界面、原生宿主及根入口；别名 npm run desktop:build
-npm run desktop:prepare # 按内容复用或准备正式程序包，不安装
-npm run desktop:publish # 准备程序包并更新本机正式入口
-npm run desktop:dist # 准备程序包并构建独立 EXE（安装器）
-npm run desktop:deliver # 更新本机并构建安装器，共用同一程序包
-npm run github:release:local # 同包更新本机并发布 GitHub（代码托管平台）发行
-```
+- 产品界面：通过桌面程序打开；普通浏览器访问本机地址只显示启动说明。
+- 语音服务：使用宿主端点表中的实际地址，首选端口 8765 被占用时由系统分配。
+- WebSocket：使用实际语音服务地址的 `/ws`。
+- 健康检查：使用实际语音服务地址的 `/health`；可应答不代表全部模型推理已就绪。
+- 后台执行控制台：从工作台“后台协作”面板底部的“代理控制台”进入。
 
-正式启动直接读取已发布本体。源码调试使用同一正式入口和工作区，显式切换业务源码与前端输入；普通模式与调试模式共享单实例，冲突时提示退出后重启。前端演示使用隔离缓存，只启动界面服务，可与正式程序同时运行。实际端点以宿主端点表为准。启动诊断见[独立应用启动与系统管理](docs/guides/application-lifecycle.md)，入口、安装与恢复规则见[统一正式程序与分发安装器](docs/guides/unified-product-installer.md)。
+### 组件与资源
 
-## 产品页面
+语音服务、模型和后台执行宿主按随包清单区分必需与可选组件。更新由用户点击卡片中的更新或导入入口触发；待更新的必需组件会阻止整体服务启动。模型版本、文件摘要校验、事务恢复和安装验证见[程序升级与必需组件更新](docs/guides/model-resource-updates.md)。
 
-- `/`：当前真实 Product UI，连接 Product API 和 Voice Server。
-- `/?settings=system`：独立应用的“系统运行”设置页；管理状态来自应用宿主，语音服务失败时仍可诊断、重试和退出。
-- 语音事件回放：从桌面样例工具选择固定回放场景；产品地址不再通过查询参数绕过宿主管理。
-- 桌面样例：覆盖工作台和七个设置页（唤醒词与静默设置已合并）；使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
+本地语音引擎的接入、导出、引擎编译与登记过程见 [AnifLive 本地语音接入记录](docs/development/aniflive-integration.md)。
 
-后台协作工作台以运行轨迹为主，最新进展显示实际投递给语音模型的后台文本。DSH（代理执行宿主）的状态观察器摘要不映射到前台；它只作为二等信箱内容随模型请求冻结，成功冻结后按版本确认已消费，不写入长期语义历史。提示词要求模型面向用户说明任务和进展，通常不展示内部任务编号。
+从原生首屏开始统一显示应用图标、当前启动组件、共享进度条和“跳过”按钮；模型与后台执行宿主的启动复核通过后，识别、分析进程和本地语音模型按实时资源预算最多同时加载三路。组件和服务启动门槛见[组件更新说明](docs/guides/model-resource-updates.md)，校验缓存及显卡环境迁移见[启动与显卡环境排查](docs/guides/local-model-compute.md)，调度细节见[启动调度梳理](docs/guides/runtime-resource-management.md)。
 
-待决权限请求可单次同意、连续同意或拒绝。设置中的 `approvals.voice_confirmation_enabled`（语音确认开关）允许模型先说明待授权操作，再根据用户对该操作的明确答复处理原请求；`approvals.continuous_enabled`（首次语音确认后连续提权开关）在首条语音授权通过后放行当前录音窗口中的后续请求。连续授权在进入 KWS（关键词唤醒）待机、手动停止录音或会话作用域结束时失效；再次唤醒需要重新确认。
+### 主要配置
 
-调优外观时，双击 `.local/VoiceTerminalUIDemo.exe`（前端演示入口）直接打开演示主窗口，随后在同一窗口内加载界面服务；重复双击唤回已有主窗口。该入口直接运行已构建的宿主，不执行源码构建。修改原生宿主源码后，执行 `npm run dev:ui`（构建并启动演示开发）。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭演示窗口立即回收其开发服务。界面修订在共享组件和样式中完成；验收后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），再启动正式入口验证真实业务。
+下列 `.local/data` 路径描述开发渠道；分发渠道的对应位置为所选工作区的 `data` 目录。
 
-正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），无后端管理界面位于 `apps/frontend/src/management/`（原生组件管理），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。入口先验证原生桌面状态再动态加载对应界面；正式业务入口随后读取宿主运行配置。正式构建包含产品和原生管理入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/guides/desktop-application.md)及[统一启动实现](docs/guides/unified-product-installer.md)。
+- `config/default.yaml`：默认运行参数、首选端口、模型、唤醒词、音频和后台执行配置；分发程序使用工作区 `app/config/default.yaml`。
+- `.local/data/config/local.yaml`：保存当前非密钥运行参数，不提交真实凭据。
+- `.local/data/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）；通过设置页保存后立即对后续请求生效。源码 `config/templates/persona/` 只用于补齐缺失资料。
+- `config/shadow_agent/`：后台执行指令和工具策略。
+- `config/dsh/`：后台执行宿主基线；新分发程序锁定上游预发布版 DSH `0.2.1-rc.5`，项目插件 `@voice-terminal/dsh-plugin` 更新为 0.2.2。维护要求见[DSH 插件维护手册](docs/guides/dsh-plugin-maintenance.md)。
+- `.local/data/config/product-settings.json`：唤醒词、静默、后台执行、自定义指令和声纹设置等非密钥内容。
+- `.local/data/speaker/`：声纹注册资料、模板和特征指纹。
 
-Product UI 只有工作台和设置两个一级页面。页面切换应保留组件状态，真实协议和会话排序以服务端事件为准，详见 [WebSocket 协议](docs/architecture/websocket-protocol.md)。
-
-普通对话区隐藏 `empty_input`（空输入状态）且 `text`（转写文本）为空或仅含空白字符的用户气泡，后台诊断记录和服务端顺序号仍保留。“嗯”等非空短回答正常展示；空输入记录本身不触发 LLM（大语言模型）请求。识别工作进程在完整音频分块后的空结束包上执行最终刷新，避免遗漏缓存尾字，详见[架构与生命周期](docs/architecture/architecture.md#语音端点与分析模型)。
-
-## 主要配置
-
-下列 `.local/data`（开发数据）路径描述开发渠道；分发渠道的对应位置为所选工作区的 `data`（用户数据）。
-
-- `config/default.yaml`（默认配置模板）：默认运行参数、首选端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置；分发程序使用工作区 `app/config/default.yaml`（随本体发布的模板）。
-- `.local/data/config/local.yaml`（本机配置覆盖）：保存当前非密钥运行参数，不提交真实凭据。
-- `.local/data/persona/`（当前人格资料）：`personality.md`（人格风格）和 `user.md`（用户资料）首次激活时读取；通过设置页保存后，当前会话的后续模型请求立即使用新快照。旧 `instructions.md`（历史工作指令）仅留档，不再加载。源码 `config/templates/persona/`（人格模板）只用于补齐缺失资料。
-- `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
-- `config/dsh/`（代理宿主基线）：新分发程序锁定上游预发布版 DSH（代理执行宿主）`0.2.1-rc.2`，提交号 `687f282e8625c6b8d11ff58211a90524be2e4317`；项目插件 `@voice-terminal/dsh-plugin`（统一功能包）更新为 0.2.1，包含桥接、项目唤醒任务、浏览器和影子预设；Bridge protocol（桥接协议）保留 2.0。分发包携带目标锁、组件清单、构建插件和宿主兼容记录，旧 DSH 运行目录可先随程序本体更新保留，再由用户在组件页手动点击下载更新；启用前会复核版本、入口、兼容记录和逐文件摘要，未通过则回滚。开发宿主位于 `.local/runtimes/dsh/`，状态存放在 `.local/data/dsh/`；分发宿主与状态分别使用工作区 `runtimes/dsh`（运行资源）及 `data/dsh`（代理数据）。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。维护要求见[DSH 插件维护手册](docs/guides/dsh-plugin-maintenance.md)，分发和当前验收见[0.9.0 独立启动实现](docs/guides/unified-product-installer.md)，上游版本来源见[下载与分发规划](docs/guides/model-resource-updates.md)。
-- `.local/data/config/product-settings.json`（本机产品设置）：包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
-- `.local/data/speaker/`（当前声纹资料）：保存注册资料、模板和特征指纹；详见 [声纹增强](docs/guides/speaker-enhancement.md)。
-
-诊断日志集中在工作区 `cache/logs`（运行日志目录），属于可回收缓存。该目录保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭），超出后按最旧优先逐步剔除轮转文件；被存活进程打开的文件在 Windows（操作系统）上无法回收，会保留并在日志中说明。在设置页左下角点击“日志”时，程序会先刷新当前日志，再打开 Windows 文件夹选择器；选定保存目录后自动生成 `VoiceTerminal-logs-<时间戳>.zip`（日志压缩包），运行期间也可导出。本地 TTS（语音合成）日志的关联键、失败路径与四个诊断开关（`VOICE_TTS_NATIVE_TRACE`、`VOICE_TTS_LOG_TEXT`、`VOICE_TTS_NATIVE_LOG_PUMP`、`VOICE_LOG_LEVEL`）见[本地 TTS 可观测性](docs/guides/local-tts-observability-20261015.md)。维护者的本机 TTS 诊断记录可能包含本机路径、硬件信息或音频证据，仅保存在本机，不纳入源码仓库。
-
-配置模板随代码更新，已有用户设置由数据目录保存。普通覆盖发布复用模型与运行环境，不覆盖 `.local/data/`（真实用户数据）；重要数据的唯一滚动备份和显式交付导出命令见[本地目录与覆盖发布](docs/guides/local-layout.md)。
+诊断日志集中在工作区 `cache/logs`，属于可回收缓存，保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭）。
 
 ### 运行模式
 
-当前程序使用两个运行模式，已与界面精简、连续播放衔接、识别优化和显卡支持一起更新原正式目录；构建标识、近期变更和验证概况见[当前正式交付](docs/releases/current-release.md)，现场验收范围见[桌面现场验收](docs/testing/desktop-acceptance.md)。
+- `fast`（快速，默认）：主 LLM 使用 `reasoning.effort=none`。
+- `deep`（深度）：主请求直接使用 `reasoning.effort=low`。
 
-- `fast`（快速，默认）：主 LLM（大语言模型）使用 `reasoning.effort=none`（关闭思考）。
-- `deep`（深度）：主请求直接使用 `reasoning.effort=low`（低强度思考）。
-- 均衡模式的实现、测试及探测脚本保存在 Git（版本控制）中的均衡模式历史，不参与当前启动和默认测试。
+`llm.reasoning_mode` 与 `session.reasoning_mode` 仅允许 `fast` 与 `deep`。参数及恢复说明见[思考模式说明](docs/guides/llm-json-schema-migration.md)。
 
-`llm.reasoning_mode`（运行模式配置）和 `session.reasoning_mode`（会话模式命令）仅允许 `fast`（快速）与 `deep`（深度）。升级前将显式使用 `balanced`（均衡）的本机配置改为其中一种；历史 `thinking_action_enabled`（追加思考开关）不再读取。参数及恢复说明见[思考模式说明](docs/guides/llm-json-schema-migration.md#思考模式)。
+### 测试与验收
 
-- KWS（关键词唤醒）：手动点击开始语音会话时，`session.start`（启动会话）直接进入 ASR（自动语音识别）；开启唤醒后仍在静默最终检查结束时交回唤醒词待机。
-  唤醒命中或模型主动发声把麦克风交给 ASR 后，输入所有权只在静默窗口（`silence.seconds`，默认 90s）
-  到期时由 `final_silence`（静默前最终检查）系统检查交回 KWS；DSH 的 `request_early_silence`（请求提前静默）调用后立即标记 `final_pending`（最终检查待处理），不会打断用户输入或当前播报。新输入重置静默窗口时，请求会保留并在新窗口重新标记；最终检查只在输入、模型处理和实际输出都空闲后派发。窗口内接话不需要再喊唤醒词，语音结算和播放结束都不改变所有权。
-- Shadow（后台执行环节）：默认开启、异步运行，与语音交互链路共同构成同一助手。实际操作、外部查询和定时请求直接交给后台执行；DSH（后台执行宿主）使用执行环境已授予的工具和权限，原生后端仍只提供只读业务工具。DSH 根执行环节另有明确授权下的提前静默工具。它不是主语音链路启动的必要条件；活跃期上下文更新按安全点合并，
-  收敛要求由首条受管系统提示词一次性给出，默认不再按间隔重复注入提醒（`shadow_agent.runtime_reminder_interval_ms`
-  默认 `0`，设为正数毫秒值可恢复周期性软性提醒）。
+自动化测试、专项回归、文档链接检查、正式包核对和真实设备现场验收的入口与边界见[测试、启动与现场验收入口](docs/testing/operations-and-quality.md)。本地 `.local/cache/logs/` 和 `.local/cache/reports/` 属于本机产物，不属于项目文档。
 
-KWS（关键词唤醒）和声纹是独立能力。前者负责输入所有权和唤醒待机；声纹采用主人／非主人二分，证据不足或模型异常按非主人输出。拦截模式在身份结算前暂缓输入派发，放行本轮主人及有效连续主人，服务降级仍拦截。阈值和连续放宽量在页面编辑后点击保存，主人打断采用独立开关。详见[声纹增强](docs/guides/speaker-enhancement.md)。
+---
 
-## 测试与验收
+## 许可与致谢
 
-自动化测试、专项回归、文档链接检查、正式包核对和真实设备现场验收的入口与边界见[测试、启动与现场验收入口](docs/testing/operations-and-quality.md)。本地 `.local/cache/logs/`（诊断日志）和 `.local/cache/reports/`（诊断报告）属于本机产物，不属于项目文档。
+本项目使用 [Apache License 2.0](LICENSE) 开源，第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 文档入口
-
-项目文档按架构、说明、测试和交付四类整理。目录说明、分类索引及各文档用途见[文档索引](docs/README.md)。
+- **[AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)** —— 由 [Hiruynk](https://github.com/Hiruynk) 开发的本地 TTS 推理框架，本项目的本地语音合成能力建立在其上。
+- **[DSH](https://github.com/deepseek-ai/dsh)** —— 后台执行宿主与插件体系。
+- **[Tauri](https://tauri.app)** —— 桌面窗口、托盘、单实例与服务管理宿主。
