@@ -41,7 +41,7 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, A
                     # stop and replace.
                     "state": {"type": "string",
                               "enum": ["speak", "revision", "cancel", "wait"]},
-                    "controls": {"type": "array", "maxItems": 3, "items": {
+                    "controls": {"type": "array", "maxItems": 4, "items": {
                         "type": "object", "additionalProperties": False,
                         "required": ["name", "value"],
                         "properties": {"name": {"type": "string"}, "value": {"type": "string"}},

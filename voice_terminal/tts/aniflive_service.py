@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -46,6 +47,9 @@ def install_bridge(app, upstream, library: Path, token: str):
             text, language, asset = values.get('reference_text', ''), values.get('reference_language', 'zh'), values.get('asset_id')
             if language not in {'zh', 'yue', 'en', 'ja', 'ko'} or not isinstance(text, str) or len(text) > 2000:
                 raise ValueError('参考录音语言或转写无效。')
+            references = values.get('references', [])
+            if not isinstance(references, list) or len(references) > 100 or (references and asset is None):
+                raise ValueError('情绪参考集合无效。')
             path = None
             if asset is not None:
                 if not isinstance(asset, str) or not re.fullmatch('[a-f0-9]{32}', asset) or not text.strip():
@@ -57,8 +61,38 @@ def install_bridge(app, upstream, library: Path, token: str):
                 info = soundfile.info(str(path))
                 if info.channels != 1 or not 3 <= info.duration <= 10:
                     raise ValueError('参考录音必须为 3–10 秒单声道音频。')
+            prepared_rows = []
+            ids, keys = set(), set()
+            for row in references:
+                if not isinstance(row, dict) or set(row) != {'id', 'asset_id', 'tag', 'name', 'intensity', 'reference_language', 'reference_text'}:
+                    raise ValueError('情绪参考字段无效。')
+                ref_id, ref_asset, tag = row['id'], row['asset_id'], row['tag']
+                ref_text, ref_lang, intensity = row['reference_text'], row['reference_language'], row['intensity']
+                if (not isinstance(ref_id, str) or not re.fullmatch('[a-f0-9]{32}', ref_id) or ref_id in ids
+                        or not isinstance(ref_asset, str) or not re.fullmatch('[a-f0-9]{32}', ref_asset)
+                        or not isinstance(tag, str) or tag in {'default', 'base_internal'} or not re.fullmatch('[a-z0-9][a-z0-9_-]{0,63}', tag)
+                        or not isinstance(row['name'], str) or not 1 <= len(row['name']) <= 80
+                        or not isinstance(ref_text, str) or not 1 <= len(ref_text.strip()) <= 2000
+                        or ref_lang not in {'zh', 'yue', 'en', 'ja', 'ko'}
+                        or isinstance(intensity, bool) or not isinstance(intensity, (int, float))
+                        or not math.isfinite(intensity) or not 0 <= intensity <= 1):
+                    raise ValueError('情绪参考编号、标记、转写或强度无效。')
+                if (tag, ref_lang, intensity) in keys:
+                    raise ValueError('情绪参考标记、语言与强度重复。')
+                ids.add(ref_id)
+                keys.add((tag, ref_lang, intensity))
+                ref_path = contained(library, library / 'assets' / (ref_asset + '.hifi.wav'))
+                if not ref_path.is_file():
+                    ref_path = contained(library, library / 'assets' / (ref_asset + '.wav'))
+                import soundfile
+                info = soundfile.info(str(ref_path))
+                if info.channels != 1 or not 3 <= info.duration <= 10:
+                    raise ValueError('情绪参考必须为 3–10 秒单声道音频。')
+                prepared_rows.append((row, ref_path, hashlib.sha256(ref_path.read_bytes()).hexdigest()))
             key = hashlib.sha256(json.dumps([hashlib.sha256(path.read_bytes()).hexdigest() if path else None,
-                                             text.strip() if path else '', language if path else '', tokens]).encode()).hexdigest()
+                                             text.strip() if path else '', language if path else '', tokens,
+                                             [(row, digest) for row, _, digest in prepared_rows]],
+                                            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             if state['service'] is service and state['key'] == key:
                 return {'changed': False}
             if service._is_busy():
@@ -78,6 +112,21 @@ def install_bridge(app, upstream, library: Path, token: str):
                         bank = type(streamer.reference_bank)(identity_id='default')
                         bank.add(prepared)
                         wav, transcript, lang, catalog = path, text.strip(), language, None
+                        if prepared_rows:
+                            from aniflive_tts.expression import ExpressionCatalog, ReferenceDescriptor, ConditioningPolicy
+                            descriptors = [ReferenceDescriptor(id='default', emotion='base_internal', intensity=0.0,
+                                reference_audio=path, reference_text=transcript, reference_language=lang,
+                                manual_verified=False)]
+                            for row, ref_path, _ in prepared_rows:
+                                ref = streamer._prepare_reference(reference_id=row['id'], reference_wav=ref_path,
+                                    reference_text=row['reference_text'].strip(), reference_language=row['reference_language'])
+                                bank.add(ref)
+                                descriptors.append(ReferenceDescriptor(id=row['id'], emotion=row['tag'],
+                                    intensity=float(row['intensity']), reference_audio=ref_path,
+                                    reference_text=row['reference_text'].strip(), reference_language=row['reference_language'],
+                                    manual_verified=False))
+                            catalog = ExpressionCatalog(default_profile='base_internal', profiles=tuple(descriptors),
+                                                        preferred_policy=ConditioningPolicy.SEMANTIC_STYLE)
                     lease.ensure_valid()
                     streamer._application_chunk_tokens = tokens
                     streamer.reference_bank = bank
@@ -95,11 +144,11 @@ def install_bridge(app, upstream, library: Path, token: str):
         body = bytearray()
         async for block in request.stream():
             body.extend(block)
-            if len(body) > 16384:
+            if len(body) > 256 * 1024:
                 return JSONResponse({'detail': '参考请求超出大小限制。'}, status_code=413)
         try:
             values = json.loads(body)
-            if not isinstance(values, dict) or set(values) - {'model', 'asset_id', 'reference_text', 'reference_language', 'stream_chunk_tokens'}:
+            if not isinstance(values, dict) or set(values) - {'model', 'asset_id', 'reference_text', 'reference_language', 'stream_chunk_tokens', 'references'}:
                 raise ValueError('参考请求字段无效。')
             async with app.state.session_model_lock:
                 if await upstream.SESSION_MANAGER.has_active():
@@ -141,7 +190,11 @@ def main():
     import aniflive_tts
     if aniflive_tts.__version__ != '1.5.0b1':
         raise RuntimeError('参考桥接只支持已审阅的 AnifLive 1.5.0b1 固定版本。')
-    from aniflive_tts.api import create_app
+    import aniflive_tts.api as package_api
+    from .aniflive_models import validate_registered_package
+    # 仅受认证应用子进程使用受管登记校验；外部包导入、转换验收及主动维修仍走上游完整摘要。
+    package_api.validate_checksums = lambda requested: validate_registered_package(local, Path(requested))
+    create_app = package_api.create_app
     import aniflive_tts.streaming as streaming
     original = streaming.TensorRTFixedReferenceStreamer
     class ApplicationStreamer(original):

@@ -7,6 +7,7 @@ from http.client import HTTPException
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,6 +27,37 @@ DEFAULT_MODEL = 'minimax-female-shaonv-zh'  # DEFAULT_MODEL（本地默认模型
 def emit(phase: str, done=0, total=0):
     with _PRINT_LOCK:
         print(json.dumps({'phase': phase, 'completed_bytes': done, 'total_bytes': total}, ensure_ascii=False), flush=True)
+
+
+def conversion_progress(log: str, engines: set[str], *, complete=False) -> tuple[str, int, int]:
+    """根据子进程已完成阶段和实际引擎文件投影进度，不以耗时伪造百分比。"""
+    labels = {'ssl': '语音表征', 'bert': '文本表征', 'gpt': '语义生成',
+              'sovits': '声学生成', 'sv': '声纹嵌入'}
+    order = ('ssl', 'bert', 'vq_encoder', 'gpt_encoder', 'gpt_step',
+             'spectrogram', 'sv_embedding', 'sovits', 'sovits_stream')
+    finished = set(re.findall(r"阶段完成 \{'stage': '(ssl|bert|gpt|sovits|sv)'\}", log))
+    builds = re.findall(r'Building TensorRT \d+ engine: ([a-z_]+)', log)
+    if builds or engines:
+        # 最后一个开始构建的文件可能仍在写入；下一模块开始或包原子发布后才计入。
+        finished_engines = set(order) & engines & (set(order) if complete else set(builds[:-1]))
+        completed = len(finished_engines)
+        current = next((name for name in reversed(builds) if name not in finished_engines), None)
+        phase = f'构建推理引擎：已完成 {completed} / 9'
+        if current:
+            engine_labels = {'ssl': '语音表征', 'bert': '文本表征', 'vq_encoder': '音频语义编码',
+                             'gpt_encoder': '语义上下文编码', 'gpt_step': '逐步语义生成',
+                             'spectrogram': '参考频谱', 'sv_embedding': '声纹嵌入',
+                             'sovits': '声学波形生成', 'sovits_stream': '流式声学波形生成'}
+            phase += f'，正在构建 {current}（{engine_labels.get(current, "引擎模块")}）'
+        return phase, 6 + completed, 15
+    if 'onnx_to_fp16.py' in log:
+        return '构建模型：五项计算图已导出，正在转换计算精度', 5, 15
+    started = re.findall(r"启动独立阶段 \{'stage': '(ssl|bert|gpt|sovits|sv)'", log)
+    active = [labels[name] for name in started if name not in finished]
+    phase = f'构建模型：已导出 {len(finished)} / 5 项计算图'
+    if active:
+        phase += '，正在导出' + '、'.join(dict.fromkeys(active))
+    return phase, len(finished), 15
 
 
 def atomic_json(path: Path, value):
@@ -114,6 +146,10 @@ class AnifLiveInstallTask:
         self.native_ack = False
         if not (self.local / 'portable.json').is_file():
             raise ValueError('AnifLive 配置需要已初始化的受管工作区。')
+        from .aniflive_preflight import require_writable_workspace
+        portable = json.loads((self.local / 'portable.json').read_text(encoding='utf-8'))
+        data = contained(self.local, self.local / portable.get('data_dir', 'data'))
+        require_writable_workspace(self.local, data)
         from .aniflive_aliases import cleanup_aliases
         cleanup_aliases(self.local)
         shared = contained(self.local, self.local / 'models/aniflive-tts/shared')
@@ -143,32 +179,25 @@ class AnifLiveInstallTask:
             receipt = target / 'aniflive-packages.json'
             try:
                 current = json.loads(receipt.read_text(encoding='utf-8')) if receipt.is_file() else {}
+                if not isinstance(current, dict):
+                    raise ValueError('隔离依赖登记必须为对象。')
                 records = current.get('files')
-                valid = current.get('lock_sha256') == self.lock_sha and isinstance(records, list) and bool(records)
-                if valid:
-                    total, done, last = sum(row['size'] for row in records), 0, time.monotonic()
-                    phase = '核对隔离' + ('运行' if role == 'runtime' else '导出') + '依赖'
-                    emit(phase, 0, total)
-                    for row in records:
-                        file = contained(target, target / row['path'])
-                        if not file.is_file() or file.stat().st_size != row['size'] or digest(file) != row['sha256']:
-                            valid = False
-                            break
-                        done += row['size']
-                        if time.monotonic() - last >= .5:
-                            emit(phase, done, total)
-                            last = time.monotonic()
-                    if valid:
-                        emit(phase, done, total)
+                expected = {name: version for name, version in self.lock[role].items()
+                            if role == 'runtime' or self.lock['runtime'].get(name) != version}
+                # 普通转换复用已登记依赖；逐文件内容检查由主动完整性校验承担。
+                valid = (current.get('schema') == 1 and current.get('role') == role
+                         and current.get('packages') == expected and isinstance(records, list) and bool(records))
                 current_by_role[role] = valid
             except (ValueError, KeyError, TypeError, OSError):
                 current_by_role[role] = False
         if all(current_by_role.values()):
-            emit('隔离运行与导出依赖已通过完整文件校验')
+            emit('复用已登记的隔离运行与导出依赖')
             return
         self.require_build_space()
         rows = {(r['name'], r['version']): r for r in self.lock['wheels']}
-        required = set(self.lock['runtime'].items()) | set(self.lock['export'].items())
+        required = {(name, version) for role in ('runtime', 'export') if not current_by_role[role]
+                    for name, version in self.lock[role].items()
+                    if role == 'runtime' or self.lock['runtime'].get(name) != version}
         cache = self.local / 'cache/aniflive-wheels'
         def fetch(identity):
             row = rows[identity]
@@ -236,7 +265,7 @@ class AnifLiveInstallTask:
         return [sys.executable, '-S', '-B', '-X', 'utf8', str(self.program / 'scripts/run-aniflive.py'),
                 '--root', str(self.local), '--role', role, '--', *map(str, arguments)]
 
-    def run(self, command, report: Path):
+    def run(self, command, report: Path, *, progress=None):
         report = contained(self.local, report)
         report.parent.mkdir(parents=True, exist_ok=True)
         from ..application.windows import Job, ManagedProcess
@@ -247,7 +276,17 @@ class AnifLiveInstallTask:
             process = ManagedProcess(command, cwd=self.program, env=dict(os.environ), output=report,
                 outer_job=owner, event_name='Local\\VoiceTerminal.AnifLive.' + uuid4().hex,
                 key='aniflive-configure')
+            previous, checked = None, 0.0
             while (code := process.poll()) is None:
+                if progress is not None and time.monotonic() - checked >= .5:
+                    checked = time.monotonic()
+                    try:
+                        current = progress()
+                    except OSError:
+                        current = previous  # 包原子换入期间的短暂路径变化不能让转换因进度展示而失败。
+                    if current is not None and current != previous:
+                        emit(*current)
+                        previous = current
                 time.sleep(.1)
             if code:
                 raise RuntimeError(f'AnifLive 子任务失败，退出码 {code}；详见 {report.name}')
@@ -323,12 +362,21 @@ class AnifLiveInstallTask:
                     'reference': digest(Path(values['reference'])),
                     'reference_text': Path(values['reference_text']).read_text(encoding='utf-8').strip(),
                     'language': values['reference_language'], 'build': self.presets['build'],
+                    'runtime_contract': 1,  # runtime_contract（稳定推理协议，独立于工具源码摘要）。
                     'source': {key: source_receipt[key] for key in ('upstream_commit', 'archive_sha256', 'patch_revision', 'files')}, 'dependency_lock': self.lock_sha,
                     'shared_lock': digest(self.program / 'config/runtime/aniflive-shared-assets.lock.json'),
                     'adapter': {name: digest(self.program / name) for name in BUILD_ADAPTER_FILES},
                     'hardware': {key: value for key, value in hardware.items() if key not in {'imports', 'free_vram_bytes'}}}
         revision = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
         registry = AnifLiveModelRegistry(self.local)
+        try:
+            _, existing, version = registry.resolve(model_id)
+            # 输入、计算配置和设备相同即可复用；工具源码摘要仍保留在原收据作溯源。
+            reusable = ('gpt', 'sovits', 'reference', 'reference_text', 'language', 'build', 'hardware')
+            if all(version['identity'].get(key) == identity.get(key) for key in reusable):
+                return {'model_id': model_id, 'revision': existing, 'reused': True}
+        except (ValueError, KeyError, OSError):
+            pass
         try:
             package, existing, version = registry.resolve(model_id, revision, verify_hashes=True)
             if version['identity'] == identity:
@@ -354,13 +402,20 @@ class AnifLiveInstallTask:
             raise ValueError('新建 AnifLive 引擎需要至少 4 GiB（吉比字节）空闲物理内存；请释放占用后重试，原可用模型保持不变。')
         build = self.presets['build']
         emit('导出计算图并构建九个推理引擎')
+        def progress():
+            # 只读取本次日志与小型引擎目录，不扫描模型／运行依赖或读取大文件内容。
+            report = job / 'conversion.log'
+            log = report.read_text(encoding='utf-8', errors='replace') if report.is_file() else ''
+            engines = {path.stem for folder in [candidate, *job.glob('.package.staging-*')]
+                       for path in folder.glob('engines/*/*.engine') if path.stat().st_size > 0}
+            return conversion_progress(log, engines, complete=(candidate / 'manifest.json').is_file())
         self.run(self.command('export', 'model', 'convert', '--gpt', values['gpt'], '--sovits', values['sovits'],
                     '--reference-audio', values['reference'], '--reference-text-file', values['reference_text'],
                     '--reference-language', values['reference_language'], '--model-id', model_id,
                     '--output', candidate, '--shared-dir', shared_root,
                     '--source-dir', self.runtime / 'source/minimal_inference', '--max-len', build['max_len'],
                     '--stream-overlap-frames', build['stream_overlap_frames'], '--workspace-mib', build['workspace_mib'],
-                    '--optimization-level', build['optimization_level']), job / 'conversion.log')
+                    '--optimization-level', build['optimization_level']), job / 'conversion.log', progress=progress)
         emit('执行完整音频及流式合成验证')
         verified = self.worker('inference', 'validate', job, package=candidate)
         if verified.get('validation', {}).get('enqueue_verified') is not True or verified.get('streaming_verified') is not True:
@@ -428,7 +483,8 @@ class AnifLiveInstallTask:
             raise ValueError('模型导入描述必须为不超过 1 MiB（兆二进制字节）的普通本机文件。')
         values = json.loads(spec_path.read_text(encoding='utf-8'))
         required = {'model_id', 'name', 'gpt', 'sovits', 'reference', 'reference_text', 'reference_language'}
-        if set(values) != required or values['reference_language'] not in {'zh', 'yue', 'en', 'ja', 'ko'}:
+        optional = {'import_id'}
+        if not required.issubset(values) or set(values) - required - optional or values['reference_language'] not in {'zh', 'yue', 'en', 'ja', 'ko'}:
             raise ValueError('模型导入需要模型编号、名称、成对权重、录音、准确转写和语言。')
         from .aniflive_models import validate_model_id
         model_id = validate_model_id(values['model_id'])
@@ -436,25 +492,55 @@ class AnifLiveInstallTask:
             raise ValueError('模型参考转写必须为 1–2000 个字符。')
         if not isinstance(values['name'], str) or not 1 <= len(values['name'].strip()) <= 80:
             raise ValueError('导入模型名称必须为 1–80 个字符。')
-        folder = self.local / 'cache/aniflive-tts/inputs/imports' / uuid4().hex
-        folder.mkdir(parents=True)
-        result = dict(values)
-        for key, extension in [('gpt', '.ckpt'), ('sovits', '.pth'), ('reference', '.wav')]:
-            source = Path(values[key])
-            source = source.absolute() if source.is_absolute() else contained(spec_path.parent, spec_path.parent / source)
-            if any(parent.is_symlink() or parent.is_junction() for parent in (source, *source.parents)) or not source.is_file():
-                raise ValueError('模型导入源必须是普通本机文件。')
-            if source.stat().st_size > 4 * 1024**3:
-                raise ValueError('模型输入超过允许大小。')
-            destination = folder / (key + extension)
-            shutil.copyfile(source, destination)
-            if digest(source) != digest(destination):
-                raise ValueError('模型复制期间源内容发生变化。')
-            result[key] = str(destination)
-        transcript = folder / 'reference.txt'
-        transcript.write_text(values['reference_text'].strip() + '\n', encoding='utf-8')
-        result['reference_text'] = str(transcript)
-        if digest(Path(result['sovits'])) == 'd42a22bbbf65fb2bbdd45ad6a66841156977db45c7aabe0a6992ff378d9c7d3b':
-            result['metadata_recipe'] = 'known-v2proplus-base-v1'
-        atomic_json(folder / 'input.json', result)
+        import_id = values.get('import_id')
+        if import_id is not None and (not isinstance(import_id, str) or len(import_id) != 32
+                                      or any(char not in '0123456789abcdef' for char in import_id)):
+            raise ValueError('受管导入任务编号无效。')
+        folder = contained(self.local, self.local / 'cache/aniflive-tts/inputs/imports' / (import_id or uuid4().hex))
+        if folder.exists():
+            if folder.is_symlink() or folder.is_junction():
+                raise ValueError('同一导入任务的暂存目录不能是符号链接或目录联接；原件已保留。')
+            existing = folder / 'input.json'
+            if not import_id or not existing.is_file() or existing.is_symlink():
+                raise ValueError('同一导入任务的暂存目录已存在，但无法安全恢复；原件已保留。')
+            previous = json.loads(existing.read_text(encoding='utf-8'))
+            if previous.get('import_id') != import_id or previous.get('model_id') != model_id:
+                raise ValueError('同一导入任务的暂存目录不属于本次任务，原件已保留。')
+            folder_root = folder.resolve()
+            for key in ('gpt', 'sovits', 'reference', 'reference_text'):
+                cached = contained(folder, Path(previous.get(key, '')).absolute())
+                if not cached.exists() or not cached.resolve().is_relative_to(folder_root):
+                    raise ValueError('待重试导入任务的缓存文件越出任务目录或已缺失；原件已保留。')
+            # 每次重试都从任务暂存中的原始文件重新整理，避免安全预处理后的派生 SoVITS 文件被重复处理。
+            shutil.rmtree(folder)
+        folder.mkdir(parents=True, exist_ok=False)
+        try:
+            result = dict(values)
+            for key, extension in [('gpt', '.ckpt'), ('sovits', '.pth'), ('reference', '.wav')]:
+                source = Path(values[key])
+                source = source.absolute() if source.is_absolute() else contained(spec_path.parent, spec_path.parent / source)
+                if any(parent.is_symlink() or parent.is_junction() for parent in (source, *source.parents)) or not source.is_file():
+                    raise ValueError('模型导入源必须是普通本机文件。')
+                if source.stat().st_size > 4 * 1024**3:
+                    raise ValueError('模型输入超过允许大小。')
+                destination = folder / (key + extension)
+                shutil.copyfile(source, destination)
+                if digest(source) != digest(destination):
+                    raise ValueError('模型复制期间源内容发生变化。')
+                result[key] = str(destination)
+            transcript = folder / 'reference.txt'
+            transcript.write_text(values['reference_text'].strip() + '\n', encoding='utf-8')
+            result['reference_text'] = str(transcript)
+            if digest(Path(result['sovits'])) == 'd42a22bbbf65fb2bbdd45ad6a66841156977db45c7aabe0a6992ff378d9c7d3b':
+                result['metadata_recipe'] = 'known-v2proplus-base-v1'
+            atomic_json(folder / 'input.json', result)
+        except Exception:
+            # 仅清理由本次入口刚创建的派生目录；源暂存始终留给重试。
+            try:
+                owned_folder = contained(self.local, folder)
+                if owned_folder.exists() and not owned_folder.is_symlink() and not owned_folder.is_junction():
+                    shutil.rmtree(owned_folder)
+            except (OSError, ValueError):
+                pass
+            raise
         return folder / 'input.json', values['name']

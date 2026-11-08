@@ -73,6 +73,8 @@ class ResolvedLocalTtsVoice:
     is_preview: bool = False
     voice_source: str = "legacy"  # voice_source（音色来源）：design、import、recording 或 legacy。
     reference_language: str = "zh"  # reference_language（参考录音语言）。
+    references: tuple = ()  # references（冻结的情绪参考资料）。
+    base_model_id: str | None = None  # base_model_id（所属基础模型编号）。
 
 
 def _utc_now() -> str:
@@ -104,7 +106,7 @@ def _safe_text(value: Any, field: str, limit: int, *, required: bool = False) ->
 class VoiceLibrary:
     """本地音频素材和不可变音色版本的原子存储。"""
 
-    def __init__(self, root: Path, *, model: str | None = None) -> None:
+    def __init__(self, root: Path, *, model: str | None = None, defer_gc: bool = False) -> None:
         self.model = model  # model（库所属模型）：生产库必须绑定模型。
         self._leases: dict[str, int] = {}  # leases（在途素材引用计数）。
         self.root = Path(root).resolve()
@@ -115,7 +117,8 @@ class VoiceLibrary:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.root.mkdir(parents=True, exist_ok=True)
         self._index = self._read_index()
-        self.collect_garbage()
+        if not defer_gc:
+            self.collect_garbage()
 
     def _check_assets_directory(self):
         """回收及读写均不穿透 assets（素材目录）的联接或符号链接。"""
@@ -133,9 +136,9 @@ class VoiceLibrary:
             value = json.loads(self.index_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise VoiceLibraryError("音色库索引损坏；原文件已保留，请修复后再操作。") from exc
-        if (not isinstance(value, dict) or value.get("schema_version") != 1
+        if (not isinstance(value, dict) or value.get("schema_version") not in {1, 2}
                 or not isinstance(value.get("assets"), dict)
-                or not isinstance(value.get("voices"), dict)
+                or not isinstance(value.get("voices" if value.get("schema_version") == 1 else "models"), dict)
                 or not isinstance(value.get("migrations"), dict)):
             raise VoiceLibraryError("音色库索引格式无效；原文件已保留，请修复后再操作。")
         return value
@@ -299,6 +302,37 @@ class VoiceLibrary:
     def _high_fidelity_path(self, asset_id: str) -> Path:
         return self._asset_path(asset_id).with_suffix(".hifi.wav")
 
+    def _source_path(self, asset_id: str) -> Path:
+        path = self._asset_path(asset_id).with_suffix('.source')
+        if path.is_symlink():
+            raise VoiceLibraryError('来源音频不能是符号链接。')
+        return path
+
+    def put_source(self, data: bytes, filename: str) -> dict[str, Any]:
+        """保留待裁剪或待校对的原始参考素材。"""
+        extension = Path(filename).suffix.lower()
+        if extension not in ALLOWED_IMPORT_EXTENSIONS or not data or len(data) > MAX_IMPORT_BYTES:
+            raise VoiceLibraryError('来源录音格式无效或超过 20 MiB（二进制兆字节）。')
+        asset_id = uuid4().hex
+        destination = self._source_path(asset_id)
+        temporary = self.assets_dir / ('.' + asset_id + '.source.tmp')
+        with self._lock:
+            try:
+                with temporary.open('xb') as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, destination)
+                updated = json.loads(json.dumps(self._index))
+                updated['assets'][asset_id] = {'created_at': _utc_now(), 'format': 'source',
+                    'extension': extension, 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                self._save_index(updated)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                raise
+        return {'asset_id': asset_id, **updated['assets'][asset_id]}
+
     def put_high_fidelity_pcm(self, asset_id: str, pcm: bytes, *, sample_rate: int,
                               channels: int = 1) -> dict[str, Any]:
         """保存原生采样率旁路副本；只登记元数据，主素材与索引引用不变。"""
@@ -353,7 +387,40 @@ class VoiceLibrary:
             return path
 
     def asset_bytes(self, asset_id: str) -> bytes:
+        with self._lock:
+            metadata = self._index['assets'].get(asset_id)
+            if isinstance(metadata, dict) and metadata.get('format') == 'source':
+                return self._source_path(asset_id).read_bytes()
         return self.asset_path(asset_id).read_bytes()
+
+    def asset_media_type(self, asset_id: str) -> str:
+        with self._lock:
+            metadata = self._index['assets'].get(asset_id)
+            if not isinstance(metadata, dict):
+                raise FileNotFoundError('音频素材不存在。')
+            return {'.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.ogg': 'audio/ogg'}.get(metadata.get('extension'), 'audio/wav')
+
+    def clip_source(self, asset_id: str, start_ms: int, end_ms: int) -> dict[str, Any]:
+        """从原始录音提取工作参考；转写必须重新确认。"""
+        if type(start_ms) is not int or type(end_ms) is not int or start_ms < 0 or not 3000 <= end_ms - start_ms <= 10000:
+            raise VoiceLibraryError('参考片段必须为 3–10 秒，开始时间不能为负。')
+        data = self.asset_bytes(asset_id)
+        try:
+            import soundfile as sf
+            with sf.SoundFile(io.BytesIO(data)) as source:
+                first = round(start_ms * source.samplerate / 1000)
+                last = round(end_ms * source.samplerate / 1000)
+                if first >= last or last > len(source):
+                    raise VoiceLibraryError('参考片段超出原录音时长。')
+                source.seek(first)
+                samples = source.read(last - first, dtype='float32', always_2d=True)
+                output = io.BytesIO()
+                sf.write(output, samples, source.samplerate, format='WAV', subtype='PCM_16')
+            return self.put_import(output.getvalue(), 'reference.wav')
+        except (VoiceLibraryError, OverflowError):
+            raise
+        except Exception as exc:
+            raise VoiceLibraryError('来源录音无法裁剪。') from exc
 
     def _normalize_voice(self, payload: Mapping[str, Any], *, source: str | None = None) -> dict[str, Any]:
         if self.model and payload.get("model", self.model) != self.model:
@@ -382,6 +449,56 @@ class VoiceLibrary:
             if language not in {"zh", "yue", "en", "ja", "ko"}:
                 raise VoiceLibraryError("reference_language（参考录音语言）无效。")
             normalized["reference_language"] = language
+            if "references" in payload:
+                records = payload["references"]
+                if not isinstance(records, list) or len(records) > 100:
+                    raise VoiceLibraryError("references（情绪参考）必须是最多 100 项的列表。")
+                entries = []
+                keys = set()
+                ids = set()
+                for raw in records:
+                    if not isinstance(raw, Mapping):
+                        raise VoiceLibraryError("情绪参考条目格式无效。")
+                    ref_id = raw.get("id") or uuid4().hex
+                    asset = raw.get("asset_id")
+                    source_asset = raw.get('source_asset_id')
+                    status = raw.get('status', 'ready')
+                    tag = raw.get("tag")
+                    lang = raw.get("reference_language", "zh")
+                    strength = raw.get("intensity", 0.5)
+                    if not isinstance(ref_id, str) or not _ID_RE.fullmatch(ref_id) or ref_id in ids:
+                        raise VoiceLibraryError("情绪参考编号无效或重复。")
+                    if status not in {'ready', 'pending'}:
+                        raise VoiceLibraryError('情绪参考状态无效。')
+                    if (asset is not None and (not isinstance(asset, str) or not _ID_RE.fullmatch(asset))
+                            or source_asset is not None and (not isinstance(source_asset, str) or not _ID_RE.fullmatch(source_asset))
+                            or status == 'ready' and asset is None
+                            or status == 'pending' and source_asset is None and not raw.get('error')):
+                        raise VoiceLibraryError("情绪参考音频编号无效。")
+                    if not isinstance(tag, str) or tag in {'default', 'base_internal'} or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", tag):
+                        raise VoiceLibraryError("情绪标记必须是小写字母、数字、下划线或短横线。")
+                    if lang not in ({"zh", "yue", "en", "ja", "ko"} if status == 'ready' else {"", "zh", "yue", "en", "ja", "ko"}):
+                        raise VoiceLibraryError("情绪参考语言无效。")
+                    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not math.isfinite(strength) or not 0 <= strength <= 1:
+                        raise VoiceLibraryError("情绪参考强度必须在 0 至 1 之间。")
+                    key = (tag, lang, float(strength))
+                    if key in keys:
+                        raise VoiceLibraryError("同一情绪标记、语言及强度不能重复。")
+                    ids.add(ref_id)
+                    keys.add(key)
+                    provenance = raw.get('provenance', {})
+                    if not isinstance(provenance, dict) or len(json.dumps(provenance, ensure_ascii=False)) > 8192:
+                        raise VoiceLibraryError('情绪参考来源信息无效。')
+                    verification = raw.get('verification_source', 'automatic')
+                    if verification not in {'automatic', 'automatic_transcription', 'manual'}:
+                        raise VoiceLibraryError('verification_source（参考校验来源）无效。')
+                    entries.append({"id": ref_id, "kind": "emotion", "asset_id": asset, "source_asset_id": source_asset, "tag": tag,
+                                    "name": _safe_text(raw.get("name", tag), "name", 80, required=True),
+                                    "intensity": float(strength), "reference_language": lang,
+                                    "reference_text": _safe_text(raw.get("reference_text", ""), "reference_text", 2000, required=status == 'ready'),
+                                    'status': status, 'error': _safe_text(raw.get('error') or '', 'error', 500),
+                                    'verification_source': verification, 'provenance': provenance})
+                normalized["references"] = entries
         source_asset_id = payload.get("source_reference_asset_id")  # 原始克隆素材；reference_asset_id 为确认后的目标样音。
         if source_asset_id is not None:
             if source != "design" or not isinstance(source_asset_id, str) or not _ID_RE.fullmatch(source_asset_id):
@@ -419,9 +536,15 @@ class VoiceLibrary:
         with self._lock:
             if voice["reference_asset_id"] not in self._index["assets"]:
                 raise FileNotFoundError("参考音频素材不存在。")
+            if any(item is not None and item not in self._index['assets'] for row in voice.get('references', []) for item in (row['asset_id'], row['source_asset_id'])):
+                raise FileNotFoundError("情绪参考音频素材不存在。")
             if voice.get("source_reference_asset_id") and voice["source_reference_asset_id"] not in self._index["assets"]:
                 raise FileNotFoundError("克隆源音频素材不存在。")
             voice_id = uuid4().hex
+            if self.model == 'aniflive':
+                voice['default_reference_id'] = uuid4().hex  # default_reference_id（基础参考的稳定编号）。
+                if hasattr(self, 'model_id'):
+                    voice['base_model_id'] = self.model_id  # base_model_id（所属基础模型）。
             revision = {**voice, "revision": 1, "created_at": _utc_now()}
             updated = json.loads(json.dumps(self._index))
             updated["voices"][voice_id] = {"latest_revision": 1, "revisions": {"1": revision}}
@@ -431,15 +554,25 @@ class VoiceLibrary:
     def update_voice(self, voice_id: str, expected_revision: int, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(voice_id, str) or not _ID_RE.fullmatch(voice_id):
             raise FileNotFoundError("音色条目不存在。")
-        voice = self._normalize_voice(payload)
         with self._lock:
             current = self._index["voices"].get(voice_id)
             if current is None:
                 raise FileNotFoundError("音色条目不存在。")
             if type(expected_revision) is not int or expected_revision != current["latest_revision"]:
                 raise VoiceRevisionConflict("音色版本已更新，请刷新条目后再保存。")
+            previous = current['revisions'][str(expected_revision)]
+            if self.model == 'aniflive' and 'references' not in payload and 'references' in previous:
+                payload = {**payload, 'references': previous['references']}
+            voice = self._normalize_voice(payload)
+            if self.model == 'aniflive':
+                voice['default_reference_id'] = previous.get('default_reference_id') or hashlib.sha256(
+                    ('base-reference:' + voice_id).encode()).hexdigest()[:32]
+                if hasattr(self, 'model_id'):
+                    voice['base_model_id'] = self.model_id
             if voice["reference_asset_id"] not in self._index["assets"]:
                 raise FileNotFoundError("参考音频素材不存在。")
+            if any(item is not None and item not in self._index['assets'] for row in voice.get('references', []) for item in (row['asset_id'], row['source_asset_id'])):
+                raise FileNotFoundError("情绪参考音频素材不存在。")
             if voice.get("source_reference_asset_id") and voice["source_reference_asset_id"] not in self._index["assets"]:
                 raise FileNotFoundError("克隆源音频素材不存在。")
             revision_no = int(expected_revision) + 1
@@ -517,6 +650,8 @@ class VoiceLibrary:
             reference_mode="voice", is_preview=is_preview,
             voice_source=str(voice.get("source") or "legacy"),
             reference_language=voice.get("reference_language", "zh"),
+            references=tuple({key: row[key] for key in ('id', 'asset_id', 'tag', 'name', 'intensity', 'reference_language', 'reference_text')}
+                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'),
         )
 
     def resolve_design(self, description: str, *, emotion: str | None = None,
@@ -548,6 +683,8 @@ class VoiceLibrary:
         with self._lock:
             if voice["reference_asset_id"] not in self._index["assets"]:
                 raise FileNotFoundError("参考音频素材不存在。")
+            if any(row['asset_id'] not in self._index['assets'] for row in voice.get('references', []) if row['status'] == 'ready'):
+                raise FileNotFoundError('情绪参考音频素材不存在。')
             path = self.asset_path(voice["reference_asset_id"])
         if model == "voxcpm1" and not voice["reference_text"]:
             raise VoiceLibraryError("VoxCPM1（第一代本地语音模型）需要填写参考音频转写文本。")
@@ -558,6 +695,8 @@ class VoiceLibrary:
             emotion=None, reference_mode="voice", is_preview=is_preview,
             voice_source=str(voice.get("source") or "import"),
             reference_language=voice.get("reference_language", "zh"),
+            references=tuple({key: row[key] for key in ('id', 'asset_id', 'tag', 'name', 'intensity', 'reference_language', 'reference_text')}
+                             for row in voice.get('references', []) if row.get('status', 'ready') == 'ready'),
         )
 
     def delete_voice(self, voice_id: str, active_by_model: Mapping[str, Any] | None = None) -> None:
@@ -593,6 +732,8 @@ class VoiceLibrary:
 
     def collect_garbage(self, *, max_age_seconds: float = 24 * 60 * 60) -> None:
         """仅清理超过 24 小时且不被任一版本引用的素材。"""
+        if self._index.get('schema_version') != 1:
+            raise VoiceLibraryError('多模型音色索引必须通过模型音色库路由回收，已保留全部素材。')
         self._check_assets_directory()
         now = datetime.now(timezone.utc).timestamp()
         referenced = {
@@ -601,6 +742,10 @@ class VoiceLibrary:
             for revision in voice.get("revisions", {}).values()
             for field in ("reference_asset_id", "source_reference_asset_id")
         }
+        referenced.update(row.get(field) for voice in self._index.get('voices', {}).values()
+                          for revision in voice.get('revisions', {}).values()
+                          for row in revision.get('references', []) if isinstance(row, dict)
+                          for field in ('asset_id', 'source_asset_id'))
         with self._lock:
             updated = json.loads(json.dumps(self._index))
             changed = False
@@ -613,6 +758,7 @@ class VoiceLibrary:
                 if asset_id not in referenced and not self._leases.get(asset_id) and age > max_age_seconds:
                     self._asset_path(asset_id).unlink(missing_ok=True)
                     self._high_fidelity_path(asset_id).unlink(missing_ok=True)
+                    self._source_path(asset_id).unlink(missing_ok=True)
                     del updated["assets"][asset_id]
                     changed = True
             if changed:
@@ -671,7 +817,7 @@ class VoiceLibrary:
             self._save_index(updated)
             return chosen
 
-    def register_default(self, data: bytes, transcript: str) -> dict[str, Any]:
+    def register_default(self, data: bytes, transcript: str, *, language: str = 'zh') -> dict[str, Any]:
         """register_default（登记默认项）：完整素材就绪后才写入启用选择。"""
         with self._lock:
             if self._index.get("default_voice"):
@@ -706,7 +852,7 @@ class VoiceLibrary:
                         temporary.unlink(missing_ok=True)
                 return voice
             asset = self.put_import(data, "default.wav")
-            voice = self.create_voice({"name": "默认音色", "source": "legacy", "reference_asset_id": asset["asset_id"], "reference_text": transcript})
+            voice = self.create_voice({"name": "默认音色", "source": "legacy", "reference_asset_id": asset["asset_id"], "reference_text": transcript, "reference_language": language})
             updated = json.loads(json.dumps(self._index))
             selection = {"voice_id": voice["id"], "revision": voice["revision"]}
             updated["default_voice"] = selection
@@ -714,20 +860,39 @@ class VoiceLibrary:
             # default_seed（默认种子来源）：asset_id（原素材编号）及 sha256（规范化音频摘要）。
             updated["migrations"]["default_seed"] = {"asset_id": asset["asset_id"],
                 "sha256": hashlib.sha256(self.asset_bytes(asset["asset_id"])).hexdigest()}
+            # default_source（来源默认配置）：恢复时创建新版本，历史版本继续保留。
+            updated["migrations"]["default_source"] = {"voice_id": voice["id"], "revision": voice["revision"], "references": []}
             self._save_index(updated)
             return voice
 
+    def restore_default(self) -> dict[str, Any]:
+        """从登记的来源创建默认音色新版本，并启用该版本。"""
+        with self._lock:
+            source = self._index['migrations'].get('default_source')
+            if not isinstance(source, dict):
+                raise VoiceLibraryError('没有可核实的模型默认来源，请先同步模型参考。')
+            voice_id = source['voice_id']
+            seed = self.get_voice(voice_id, source['revision'])
+            current = self.get_voice(voice_id)
+            restored = self.update_voice(voice_id, current['revision'], {**seed, 'references': source.get('references', [])})
+            self.activate({'voice_id': voice_id, 'revision': restored['revision']})
+            return restored
+
     def pin(self, snapshot: ResolvedLocalTtsVoice):
         """pin（在途引用）：删除条目后也不回收正在使用的参考素材。"""
-        asset_id = snapshot.reference_path.stem if snapshot.reference_path else None
-        if asset_id:
+        assets = {snapshot.reference_path.stem} if snapshot.reference_path else set()
+        assets.update(row['asset_id'] for row in snapshot.references)
+        if assets:
             with self._lock:
-                self.asset_path(asset_id)  # 素材已回收时拒绝建立失效租约。
-                self._leases[asset_id] = self._leases.get(asset_id, 0) + 1
+                for asset_id in assets:
+                    self.asset_path(asset_id)  # 素材已回收时拒绝建立失效租约。
+                for asset_id in assets:
+                    self._leases[asset_id] = self._leases.get(asset_id, 0) + 1
         def release():
-            if asset_id:
+            if assets:
                 with self._lock:
-                    self._leases[asset_id] = max(0, self._leases.get(asset_id, 0) - 1)
+                    for asset_id in assets:
+                        self._leases[asset_id] = max(0, self._leases.get(asset_id, 0) - 1)
         return release
 
     @contextmanager
@@ -737,18 +902,123 @@ class VoiceLibrary:
             yield
 
 
+class _ScopedVoiceLibrary(VoiceLibrary):
+    """按基础模型查看共享素材与独立音色版本。"""
+    def __init__(self, owner, model_id):
+        self.owner = owner
+        self.model_id = model_id
+        self.model = 'aniflive'
+        self.root = owner.shared.root
+        self.assets_dir = owner.shared.assets_dir
+        self.index_path = owner.shared.index_path
+        self._lock = owner.shared._lock
+        self._leases = owner.shared._leases
+
+    @property
+    def _index(self):
+        value = self.owner.shared._index
+        bucket = value['models'][self.model_id]
+        return {'schema_version': 1, 'assets': value['assets'], **bucket}
+
+    def _save_index(self, value):
+        shared = json.loads(json.dumps(self.owner.shared._index))
+        shared['assets'] = value['assets']
+        shared['models'][self.model_id] = {key: item for key, item in value.items()
+                                            if key not in {'schema_version', 'assets'}}
+        self.owner.shared._save_index(shared)
+
+    def _normalize_voice(self, payload, *, source=None):
+        if payload.get('model') == self.model_id:
+            payload = {**payload, 'model': 'aniflive'}
+        return super()._normalize_voice(payload, source=source)
+
+    def list_voices(self, active_by_model=None):
+        rows = super().list_voices(active_by_model)
+        for row in rows:
+            row['model'] = self.model_id
+        return rows
+
+    def resolve(self, model, selection, **kwargs):
+        from dataclasses import replace
+        if model not in {'aniflive', self.model_id}:
+            raise VoiceLibraryError('音色库与请求模型不匹配。')
+        return replace(super().resolve('aniflive', selection, **kwargs), base_model_id=self.model_id)
+
+    def resolve_draft(self, model, payload, **kwargs):
+        from dataclasses import replace
+        if model not in {'aniflive', self.model_id}:
+            raise VoiceLibraryError('音色库与请求模型不匹配。')
+        return replace(super().resolve_draft('aniflive', payload, **kwargs), base_model_id=self.model_id)
+
+    def collect_garbage(self, *, max_age_seconds=24 * 60 * 60):
+        """共享素材必须同时核对全部模型及历史音色版本。"""
+        with self._lock:
+            all_voices = [voice for bucket in self.owner.shared._index['models'].values()
+                          for voice in bucket.get('voices', {}).values()]
+            referenced = set()
+            for voice in all_voices:
+                for revision in voice.get('revisions', {}).values():
+                    referenced.update(revision.get(key) for key in ('reference_asset_id', 'source_reference_asset_id'))
+                    referenced.update(row.get(field) for row in revision.get('references', []) if isinstance(row, dict)
+                                      for field in ('asset_id', 'source_asset_id'))
+            updated = json.loads(json.dumps(self.owner.shared._index))
+            now = datetime.now(timezone.utc).timestamp()
+            changed = False
+            for asset_id, metadata in list(updated['assets'].items()):
+                try:
+                    age = now - datetime.fromisoformat(str(metadata.get('created_at')).replace('Z', '+00:00')).timestamp()
+                except (ValueError, TypeError):
+                    continue
+                if asset_id not in referenced and not self._leases.get(asset_id) and age > max_age_seconds:
+                    self._asset_path(asset_id).unlink(missing_ok=True)
+                    self._high_fidelity_path(asset_id).unlink(missing_ok=True)
+                    self._source_path(asset_id).unlink(missing_ok=True)
+                    del updated['assets'][asset_id]
+                    changed = True
+            if changed:
+                self.owner.shared._save_index(updated)
+
+
 class ModelVoiceLibraries:
     """ModelVoiceLibraries（音色库路由）：仅开放 AnifLive，旧库原件保持离线。"""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
-        self.libraries = {model: VoiceLibrary(self.root / model / "voices", model=model) for model in ("aniflive",)}
+        self.shared = VoiceLibrary(self.root / 'aniflive' / 'voices', model='aniflive', defer_gc=True)
+        self.libraries = {}
+        with self.shared._lock:
+            old = self.shared._index
+            if old['schema_version'] == 1:
+                from ..compatibility import migrate_tts_voice_index
+                value = migrate_tts_voice_index(self.root, old, self.shared.index_path)
+                self.shared._save_index(value)
+        # 初始化当前本地模型的轻量路由，不触碰旧 VoxCPM（旧语音模型）资料。
+        self.for_model('aniflive')
+
+    def _current_model(self):
+        try:
+            settings = json.loads((self.root.parent / 'config' / 'product-settings.json').read_text(encoding='utf-8'))
+            value = settings.get('tts', {}).get('local_model')
+            if value in self.shared._index['models']:
+                return value
+        except (OSError, ValueError, TypeError):
+            pass
+        models = self.shared._index['models']
+        return 'aniflive' if 'aniflive' in models else next(iter(models), 'aniflive')
 
     def for_model(self, model: str) -> VoiceLibrary:
-        if model == "aniflive" and model not in self.libraries:
-            self.libraries[model] = VoiceLibrary(self.root / model / "voices", model=model)
-        if model not in self.libraries:
+        if model == 'aniflive':
+            model = self._current_model()
+        from .settings import valid_local_model
+        if model != 'aniflive' and not valid_local_model(model):
             raise VoiceLibraryError("model（音色所属模型）无效。")
+        with self.shared._lock:
+            if model not in self.shared._index['models']:
+                updated = json.loads(json.dumps(self.shared._index))
+                updated['models'][model] = {'voices': {}, 'migrations': {}}
+                self.shared._save_index(updated)
+            if model not in self.libraries:
+                self.libraries[model] = _ScopedVoiceLibrary(self, model)
         return self.libraries[model]
 
     def resolve(self, model, selection, **kwargs):
@@ -758,7 +1028,8 @@ class ModelVoiceLibraries:
         return self.for_model(model).resolve_draft(model, payload, **kwargs)
 
     def selections(self):
-        return {model: library.active_selection for model, library in self.libraries.items()}
+        with self.shared._lock:
+            return {model: _ScopedVoiceLibrary(self, model).active_selection for model in self.shared._index['models']}
 
     def pin(self, snapshot):
-        return self.for_model(snapshot.model).pin(snapshot)
+        return self.for_model(snapshot.base_model_id or snapshot.model).pin(snapshot)

@@ -22,6 +22,12 @@ const PROGRESS_EVENT: &str = "desktop://resource-progress";
 const MAX_PERSISTED_JOBS: usize = 128;
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
+// ready_import（待接续导入）：失败、取消、参考缺失及已派发任务均不自动重试。
+fn ready_import(task: &Value, id: &str, known: bool) -> bool {
+    !known && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && task["task_id"] == id && task["status"] == "ready_to_convert"
+}
+
 // ServiceControl（服务控制）：返回是否存在需要恢复的服务，管理页下载不自动启动后台。
 pub type ServiceControl = Arc<dyn Fn(bool) -> Result<bool, String> + Send + Sync>;
 
@@ -113,6 +119,31 @@ pub struct ResourceManager {
 }
 
 impl ResourceManager {
+    /// import_dispatcher（导入后台接续）：仅执行用户已确认且已完成暂存的任务，不依赖设置页面。
+    pub fn start_import_dispatcher(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let Some(manager) = weak.upgrade() else { break; };
+            if !manager.accepting_jobs.load(Ordering::Acquire) { continue; }
+            let Ok(root) = voice_desktop_common::workspace::safe_path(&manager.context.install, "cache/aniflive-tts/import-jobs") else { continue; };
+            let Ok(entries) = fs::read_dir(root) else { continue; };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(id) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
+                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { continue; }
+                let Ok(path) = voice_desktop_common::workspace::safe_path(&manager.context.install,
+                    &format!("cache/aniflive-tts/import-jobs/{id}.json")) else { continue; };
+                let Some(task) = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) else { continue; };
+                // 已创建的任务（包括失败或取消）由用户重试，不能后台循环重建。
+                let known = manager.jobs.lock().map(|jobs| jobs.contains_key(&format!("aniflive-import-{id}"))).unwrap_or(true);
+                if !ready_import(&task, id, known) { continue; }
+                if let Err(error) = manager.start_aniflive_import(id.to_owned()) {
+                    eprintln!("导入后台接续暂未启动：{error}");
+                }
+            }
+        });
+    }
     /// Create a manager（建立管理器）from the resolved product context.
     pub fn new(
         context: LaunchContext,
@@ -512,6 +543,171 @@ impl ResourceManager {
         Ok(json!({ "job_id": job_id }))
     }
 
+    /// AnifLive import（AnifLive 导入）：使用一份已暂存输入说明启动现有转换任务，保持唯一转换链路。
+    pub fn start_aniflive_import(self: &Arc<Self>, task_id: String) -> Result<Value, String> {
+        if task_id.len() != 32 || !task_id.bytes().all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()) {
+            return Err("AnifLive 导入任务编号无效。".into());
+        }
+        let stage_relative = format!("cache/aniflive-tts/import-staging/{task_id}");
+        let job_id = format!("aniflive-import-{task_id}");
+        if self.jobs.lock().map_err(|_| "资源任务状态不可用。")?.get(&job_id)
+            .is_some_and(|job| !terminal(&job.snapshot.state) || job.snapshot.state == "complete") {
+            return Ok(json!({ "job_id": job_id }));
+        }
+        let stage = voice_desktop_common::workspace::safe_path(&self.context.install, &stage_relative)?;
+        let spec = stage.join("aniflive-input.json");
+        if !spec.is_file() || spec.is_symlink() {
+            return Err("模型尚未完成暂存，或仍需补充参考录音与转写。".into());
+        }
+        let manifest: Value = serde_json::from_slice(&fs::read(stage.join("import-manifest.json")).map_err(|_| "导入暂存清单不可用。")?)
+            .map_err(|_| "导入暂存清单格式无效。")?;
+        if manifest["task_id"] != task_id || manifest["model_id"].as_str().is_none() {
+            return Err("导入暂存清单与任务编号不匹配。".into());
+        }
+        let input: Value = serde_json::from_slice(&fs::read(&spec).map_err(|_| "转换输入说明文件不可用。")?)
+            .map_err(|_| "转换输入说明文件格式无效。")?;
+        if input["import_id"] != task_id || input["model_id"] != manifest["model_id"] {
+            return Err("转换输入说明与本次导入任务不匹配。".into());
+        }
+        let model_id = input["model_id"].as_str().ok_or("导入模型编号缺失。")?.to_owned();
+        if model_id.len() > 50 || model_id.is_empty() || !model_id.bytes().enumerate().all(|(index, value)| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || (index > 0 && matches!(value, b'.' | b'_' | b'-'))
+        }) {
+            return Err("导入模型编号超出受管资源编号范围。".into());
+        }
+        self.start_job(job_id.clone(), "tts-aniflive-import".into(), "等待 AnifLive 模型转换".into(), true,
+            move |manager, id| {
+                let cancel = manager.cancel_signal(&id)?;
+                let mut progress = |phase: &str, done: u64, total: u64| {
+                    manager.set_phase(&id, phase, !phase.starts_with("启用"), done, if total == 0 { None } else { Some(total) });
+                };
+                let _runtime = acquire_environment_lock(&manager.tts_runtime, &cancel, &mut progress)
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                let registration_marker = stage.join("conversion-registered.json");
+                let input_cache_relative = format!("cache/aniflive-tts/inputs/imports/{task_id}");
+                let input_cache = voice_desktop_common::workspace::safe_path(&manager.context.install, &input_cache_relative)
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                let installed = if registration_marker.is_file() {
+                    let marker: Value = serde_json::from_slice(&fs::read(&registration_marker)
+                        .map_err(|_| JobError::Failed { message: "转换登记收据无法读取，暂存文件保留。".into(), installed: vec![] })?)
+                        .map_err(|_| JobError::Failed { message: "转换登记收据格式无效，暂存文件保留。".into(), installed: vec![] })?;
+                    if marker["task_id"] != task_id || marker["model_id"] != model_id
+                        || !voice_desktop_common::resources::aniflive_model_ready(&manager.context, &model_id, false).unwrap_or(false) {
+                        return Err(JobError::Failed { message: "已登记模型与本次导入收据不匹配，暂存文件保留。".into(), installed: vec![] });
+                    }
+                    vec![format!("tts-aniflive-{model_id}")]
+                } else {
+                    let registry_path = voice_desktop_common::workspace::safe_path(&manager.context.data, "config/aniflive-models.json")
+                        .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                    let mut already_registered = false;
+                    if registry_path.is_file() {
+                        let registry: Value = serde_json::from_slice(&fs::read(&registry_path)
+                            .map_err(|_| JobError::Failed { message: "AnifLive 模型登记不可读取，未覆盖现有模型。".into(), installed: vec![] })?)
+                            .map_err(|_| JobError::Failed { message: "AnifLive 模型登记格式无效，未覆盖现有模型。".into(), installed: vec![] })?;
+                        if registry["models"].get(model_id.as_str()).is_some() {
+                            let owned_input = input_cache.join("input.json");
+                            let cached = fs::read(&owned_input).ok()
+                                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                            let revision = registry["models"][model_id.as_str()]["current_revision"].as_str().unwrap_or("");
+                            let identity = registry["models"][model_id.as_str()]["versions"][revision]["identity"].clone();
+                            let inputs_match = cached.as_ref().is_some_and(|cached| {
+                                if cached["import_id"] != task_id || cached["model_id"] != model_id { return false; }
+                                let hash_matches = ["gpt", "sovits", "reference"].into_iter().all(|field| {
+                                    let Some(source) = cached[field].as_str().map(PathBuf::from) else { return false; };
+                                    let Ok(relative) = source.strip_prefix(&input_cache) else { return false; };
+                                    let relative = relative.to_string_lossy().replace('\\', "/");
+                                    let Ok(source) = voice_desktop_common::workspace::safe_path(&input_cache, &relative) else { return false; };
+                                    let Ok(actual) = voice_desktop_common::workspace::file_hash(&source) else { return false; };
+                                    identity[field].as_str() == Some(actual.as_str())
+                                });
+                                let transcript = cached["reference_text"].as_str().and_then(|path| fs::read_to_string(path).ok());
+                                hash_matches
+                                    && transcript.as_deref().map(str::trim) == identity["reference_text"].as_str()
+                                    && cached["reference_language"] == identity["language"]
+                            });
+                            if !inputs_match || !voice_desktop_common::resources::aniflive_model_ready(&manager.context, &model_id, false).unwrap_or(false) {
+                                return Err(JobError::Failed { message: "该模型编号已经登记；请为导入模型使用一个新的唯一编号。".into(), installed: vec![] });
+                            }
+                            voice_desktop_common::workspace::atomic_json(&registration_marker,
+                                &json!({"task_id":task_id,"model_id":model_id,"state":"registered","fields":{"task_id":"对应的导入任务编号","model_id":"已验证登记模型编号","state":"该导入任务已完成转换、验证与登记"}}))
+                                .map_err(|message| JobError::Failed { message: format!("已登记模型的任务收据写入失败，暂存文件保留：{message}"), installed: vec![] })?;
+                            already_registered = true;
+                        }
+                    }
+                    if already_registered {
+                        vec![format!("tts-aniflive-{model_id}")]
+                    } else {
+                        let args = vec![
+                            OsString::from("--root"), manager.context.install.clone().into_os_string(),
+                            OsString::from("--program"), manager.context.program.clone().into_os_string(),
+                            OsString::from("--prepare-runtime"), OsString::from("--input-spec"), spec.into_os_string(),
+                            OsString::from("--convert"), OsString::from("--native-ack"),
+                        ];
+                        let installed = manager.run_aniflive_task(&id, &args, Arc::clone(&cancel))?;
+                        voice_desktop_common::workspace::atomic_json(&registration_marker,
+                            &json!({"task_id":task_id,"model_id":model_id,"state":"registered","fields":{"task_id":"对应的导入任务编号","model_id":"已验证登记模型编号","state":"该导入任务已完成转换、验证与登记"}}))
+                            .map_err(|message| JobError::Failed { message: format!("模型已登记，但转换收据写入失败，暂存文件保留：{message}"), installed: installed.clone() })?;
+                        installed
+                    }
+                };
+                // 独占暂停业务后登记参考资料，避免依赖页面请求恢复后端监视器。
+                let mut lease = manager.pause_service().map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                manager.remember_service_was_running(lease.was_running()).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                manager.set_phase(&id, "正在登记音色参考", true, 0, None);
+                let registration_args = vec![OsString::from("--root"), manager.context.install.clone().into_os_string(),
+                    OsString::from("--data"), manager.context.data.clone().into_os_string(), OsString::from("--task"), OsString::from(&task_id)];
+                let result = manager.run_stream_script(&id, &manager.context.program.join("scripts/register-aniflive-references.py"),
+                    &registration_args, |_, done, total| { manager.set_phase(&id, "正在登记音色参考", true, done,
+                        if total == 0 { None } else { Some(total) }); Ok(()) });
+                let resumed = manager.maybe_resume_service(&mut lease).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                clear_resume_intent_if_resumed(&manager.resume_pending, resumed);
+                result.map_err(|error| if error.cancelled { JobError::Cancelled } else { JobError::Failed {
+                    message: format!("模型已登记，但参考资料登记失败，可重试：{}", error.message), installed: installed.clone() } })?;
+                let receipt_relative = format!("tts/aniflive/reference-imports/{task_id}/reference-registration.json");
+                let reference_receipt = voice_desktop_common::workspace::safe_path(&manager.context.data, &receipt_relative)
+                    .map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                // 大模型的完整摘要核验可能超过三分钟；超时仍保留模型与全部暂存供重试。
+                let deadline = Instant::now() + Duration::from_secs(1800);
+                while !reference_receipt.is_file() {
+                    if cancel.load(Ordering::Acquire) { return Err(JobError::Cancelled); }
+                    if Instant::now() >= deadline {
+                        return Err(JobError::Failed { message: "等待参考资料登记超时；模型已登记，暂存资料已保留，可重试。".into(), installed });
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                let reference: Value = serde_json::from_slice(&fs::read(&reference_receipt)
+                    .map_err(|_| JobError::Failed { message: "参考资料登记收据无法读取，暂存文件保留。".into(), installed: installed.clone() })?)
+                    .map_err(|_| JobError::Failed { message: "参考资料登记收据格式无效，暂存文件保留。".into(), installed: installed.clone() })?;
+                if reference["task_id"] != task_id || reference["model_id"] != model_id || !reference["registration"].is_object() {
+                    return Err(JobError::Failed { message: "参考资料登记收据与当前任务不匹配，暂存文件保留。".into(), installed });
+                }
+                if input_cache.exists() {
+                    let cached_bytes = fs::read(input_cache.join("input.json"))
+                        .map_err(|_| JobError::Failed { message: "导入输入缓存无法确认归属，保留等待人工核对。".into(), installed: installed.clone() })?;
+                    let cached: Value = serde_json::from_slice(&cached_bytes)
+                        .map_err(|_| JobError::Failed { message: "导入输入缓存格式无效，保留等待人工核对。".into(), installed: installed.clone() })?;
+                    if cached["import_id"] != task_id || cached["model_id"] != model_id {
+                        return Err(JobError::Failed { message: "导入输入缓存不属于本次任务，未执行清理。".into(), installed });
+                    }
+                    voice_desktop_common::workspace::remove_owned(&input_cache, &manager.context.install)
+                        .map_err(|message| JobError::Failed { message: format!("模型已登记，但本次输入缓存清理失败：{message}"), installed: installed.clone() })?;
+                }
+                let stage_for_cleanup = voice_desktop_common::workspace::safe_path(&manager.context.install, &stage_relative)
+                    .map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                let saved_bytes = fs::read(stage_for_cleanup.join("import-manifest.json"))
+                    .map_err(|_| JobError::Failed { message: "导入暂存清单丢失，原件保留。".into(), installed: installed.clone() })?;
+                let saved: Value = serde_json::from_slice(&saved_bytes)
+                    .map_err(|_| JobError::Failed { message: "导入暂存清单格式无效，原件保留。".into(), installed: installed.clone() })?;
+                if saved["task_id"] != task_id {
+                    return Err(JobError::Failed { message: "导入暂存目录不属于本次任务，未执行清理。".into(), installed });
+                }
+                voice_desktop_common::workspace::remove_owned(&stage_for_cleanup, &manager.context.install)
+                    .map_err(|message| JobError::Failed { message: format!("模型已登记，但本次暂存文件清理失败：{message}"), installed: installed.clone() })?;
+                Ok(installed)
+            })?;
+        Ok(json!({ "job_id": job_id }))
+    }
+
     /// OpenSource（打开来源）：read only the locally pinned URL from the packaged catalog.
     pub fn open_source(&self, resource_id: &str) -> Result<(), String> {
         if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{
@@ -662,7 +858,21 @@ impl ResourceManager {
                 OsString::from("--program"),self.context.program.clone().into_os_string(),
                 OsString::from("--prepare-runtime"),OsString::from(if item["imported"]==true{"--registered-model"}else{"--preset"}),OsString::from(preset),
                 OsString::from("--convert"),OsString::from("--native-ack")];
-            installed.extend(self.run_aniflive_task(job_id,&args,cancel)?);
+            installed.extend(self.run_aniflive_task(job_id,&args,cancel.clone())?);
+            if item["imported"] != true {
+                // 独占暂停业务服务，由组件任务中的唯一写入者登记；结束后恢复原服务。
+                let mut lease = self.pause_service().map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                self.remember_service_was_running(lease.was_running()).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                self.set_phase(job_id, "正在登记预设音色参考", true, 0, None);
+                let registration_args = vec![OsString::from("--root"), self.context.install.clone().into_os_string(),
+                    OsString::from("--data"), self.context.data.clone().into_os_string(), OsString::from("--model"), OsString::from(preset)];
+                let result = self.run_stream_script(job_id, &self.context.program.join("scripts/register-aniflive-references.py"), &registration_args,
+                    |phase, done, total| { self.set_phase(job_id, phase, true, done, if total == 0 { None } else { Some(total) }); Ok(()) });
+                let resumed = self.maybe_resume_service(&mut lease).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+                result.map_err(|error| if error.cancelled { JobError::Cancelled } else { JobError::Failed {
+                    message: format!("模型已登记，但参考资料登记失败，可重试：{}", error.message), installed: installed.clone() } })?;
+            }
             return Ok(installed);
         }
         if let Some(shared)=item["runtime_resource"].as_str().filter(|_| !matches!(resource_id,"tts-voxcpm1"|"tts-voxcpm2")){
@@ -789,6 +999,9 @@ impl ResourceManager {
             .stdin(if native_ack.is_some() { Stdio::piped() } else { Stdio::null() });
         command.env_clear();
         self.context.configure_command(&mut command);
+        // Windows（操作系统）隔离环境没有 USERNAME（用户名）时，PyTorch 无法推导默认缓存目录。
+        // 始终使用受管项目缓存，避免导出时回退到平台不存在的 pwd（用户数据库）模块。
+        command.env("TORCHINDUCTOR_CACHE_DIR", self.context.install.join("cache/torchinductor"));
         #[cfg(windows)] {
             // SystemRoot（Windows 系统目录变量）供 Python 的 Windows socket/asyncio 模块加载系统网络提供程序。
             if let Some(system_root) = std::env::var_os("SystemRoot") {
@@ -1374,7 +1587,8 @@ fn validate_batch_admission(jobs:&HashMap<String,JobControl>,resource:&str,paren
 }
 
 fn progress_kind(phase:&str)->&'static str{ // progress_kind（阶段投影）：字节只属于当前阶段。
-    if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX){"download"}
+    if phase.starts_with("构建模型：")||phase.starts_with("构建推理引擎："){"build"}
+    else if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX){"download"}
     else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){"verify"}
     else if phase.contains("下载固定资源")||phase.contains("正在下载"){"download"}
     else if phase.contains("等待")||phase.contains("来源")||phase.starts_with("一键下载：")||phase.starts_with("自动恢复"){"waiting"}
@@ -1425,6 +1639,28 @@ fn command_allowed(window: &WebviewWindow, desktop: &State<'_, Arc<super::Deskto
 #[tauri::command]
 pub fn resource_jobs(window:WebviewWindow,desktop:State<'_,Arc<super::Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Vec<Value>,String>{
     command_allowed(&window,&desktop)?;Ok(manager.snapshots())
+}
+
+#[tauri::command]
+pub async fn aniflive_import_choose_folder(window: WebviewWindow, desktop: State<'_, Arc<super::Desktop>>) -> Result<Option<String>, String> {
+    command_allowed(&window, &desktop)?;
+    tauri::async_runtime::spawn_blocking(|| voice_desktop_common::native_ui::choose_folder("选择 GPT-SoVITS 模型包所在文件夹"))
+        .await
+        .map_err(|_| "模型文件夹选择器无法启动。".to_string())?
+        .map(|path| path.map(|value| value.to_string_lossy().into_owned()))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn aniflive_import_start(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    task_id: String,
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.start_aniflive_import(task_id))
+        .await.map_err(|_| "AnifLive 转换任务无法启动。".to_string())?
 }
 
 #[tauri::command]
@@ -1498,6 +1734,17 @@ pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Des
 #[cfg(test)]
 mod service_tests {
     #[test]
+    fn unattended_import_dispatch_only_accepts_confirmed_unstarted_tasks() {
+        let id = "a".repeat(32);
+        let task = serde_json::json!({"task_id": id, "status": "ready_to_convert"});
+        assert!(super::ready_import(&task, &id, false));
+        assert!(!super::ready_import(&task, &id, true));
+        assert!(!super::ready_import(&task, &"b".repeat(32), false));
+        for status in ["staging", "pending_reference", "failed", "cancelled", "complete", "converting"] {
+            assert!(!super::ready_import(&serde_json::json!({"task_id": id, "status": status}), &id, false));
+        }
+    }
+    #[test]
     fn restored_jobs_preserve_event_classification_and_action_after_restart(){
         let root=std::env::temp_dir().join(format!("voice-recovery-jobs-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();let path=root.join("jobs.json");
         voice_desktop_common::workspace::atomic_json(&path,&json!({"jobs":[
@@ -1513,6 +1760,7 @@ mod service_tests {
     }
     #[test]
     fn source_and_speed_details_preserve_transfer_progress_kind(){
+        assert_eq!(super::progress_kind("构建推理引擎：已完成 3 / 9"),"build");
         assert_eq!(super::progress_kind("下载固定资源（四路加速） · 8.20 MiB/秒（兆二进制字节每秒） · 来源：GitHub（代码托管平台）原站"),"download");
         assert_eq!(super::progress_kind("来源测速：GitHub（代码托管平台）原站"),"waiting");
         assert_eq!(super::progress_kind("校验下载文件"),"verify");

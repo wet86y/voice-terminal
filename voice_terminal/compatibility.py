@@ -202,8 +202,47 @@ def _repair_speaker(data: Path, archive: Archive) -> None:
             archive.move(relative, "声纹注册资料损坏、模板缺失或特征格式不兼容，恢复未注册状态")
 
 
+def migrate_tts_voice_index(root: Path, old: dict, index_path: Path) -> dict:
+    """将旧共享音色索引转换为按基础模型隔离的格式，原索引先归档。"""
+    from .tts.voices import VoiceLibraryError
+    from .tts.settings import valid_local_model
+    data = Path(root).parent
+    registry_path = _safe(data, 'config/aniflive-models.json')
+    try:
+        registry = json.loads(registry_path.read_text(encoding='utf-8')) if registry_path.is_file() else {}
+        models = list(registry.get('models', {}))
+    except (OSError, ValueError, TypeError) as exc:
+        raise VoiceLibraryError('模型登记无法读取，音色迁移未执行。') from exc
+    if any(not valid_local_model(model) for model in models):
+        raise VoiceLibraryError('模型登记包含无效编号，音色迁移未执行。')
+    if not models:
+        models = ['aniflive']
+    bucket = {key: deepcopy(value) for key, value in old.items() if key not in {'schema_version', 'assets'}}
+    if models != ['aniflive']:
+        bucket['active_voice'] = bucket.get('active_voice') or bucket.get('default_voice')
+        bucket.pop('default_voice', None)
+    if index_path.is_file():
+        archive = _safe(data, 'archives/compatibility/tts-voices-' + uuid4().hex)
+        archive.mkdir(parents=True, exist_ok=False)
+        with (archive / 'index-v1.json').open('xb') as target:
+            target.write(index_path.read_bytes())
+            target.flush()
+            os.fsync(target.fileno())
+    migrated = {}
+    for model in models:
+        model_bucket = deepcopy(bucket)
+        for voice_id, voice in model_bucket.get('voices', {}).items():
+            reference_id = hashlib.sha256(('base-reference:' + voice_id).encode()).hexdigest()[:32]
+            for revision in voice.get('revisions', {}).values():
+                revision.setdefault('default_reference_id', reference_id)
+                revision['base_model_id'] = model
+                revision.setdefault('references', [])
+        migrated[model] = model_bucket
+    return {'schema_version': 2, 'assets': old['assets'], 'migrations': {'legacy_v1': True}, 'models': migrated}
+
+
 def _repair_voices(data: Path, archive: Archive, selections: dict) -> set[str]:
-    from .tts.voices import VoiceLibrary, VoiceLibraryError
+    from .tts.voices import VoiceLibrary, VoiceLibraryError, _ScopedVoiceLibrary
     affected = set()
     for model in ("aniflive",):
         relative = f"tts/{model}/voices"
@@ -220,21 +259,38 @@ def _repair_voices(data: Path, archive: Archive, selections: dict) -> set[str]:
             library = VoiceLibrary.__new__(VoiceLibrary)
             library.root, library.assets_dir, library.index_path, library.model = root, root / "assets", index, model
             library._lock = threading.RLock()
+            library._leases = {}
             value = library._read_index()
             for identifier, asset in value["assets"].items():
                 if not isinstance(asset, dict):
                     raise VoiceLibraryError("音频素材登记格式无效")
             library._index = value
             for identifier in value["assets"]:
+                if value['assets'][identifier].get('format') == 'source':
+                    if not library._source_path(identifier).is_file():
+                        raise VoiceLibraryError('来源参考录音缺失')
+                    continue
                 with wave.open(str(library.asset_path(identifier)), "rb") as audio:
                     if audio.getnframes() <= 0:
                         raise VoiceLibraryError("音色参考音频为空")
-            library.list_voices()  # 全部条目都会参与音色页投影，也需要排除故障来源。
-            selection = library.active_selection
-            if selection:
-                library.resolve(model, selection)
-            if selections.get(model):
-                library.resolve(model, selections[model])
+            if value['schema_version'] == 2:
+                from types import SimpleNamespace
+                for model_id, bucket in value['models'].items():
+                    if not isinstance(bucket, dict) or not isinstance(bucket.get('voices'), dict):
+                        raise VoiceLibraryError('模型音色集合无效')
+                    scoped = _ScopedVoiceLibrary(SimpleNamespace(shared=library), model_id)
+                    scoped.list_voices()
+                    if scoped.active_selection:
+                        scoped.resolve(model_id, scoped.active_selection)
+                    if selections.get(model_id):
+                        scoped.resolve(model_id, selections[model_id])
+            else:
+                library.list_voices()
+                selection = library.active_selection
+                if selection:
+                    library.resolve(model, selection)
+                if selections.get(model):
+                    library.resolve(model, selections[model])
         except (VoiceLibraryError, ValueError, TypeError, KeyError, AttributeError, OSError, wave.Error, EOFError):
             archive.move(relative, "音色索引、已选音色版本或引用素材不兼容，恢复默认音色")
             affected.add(model)

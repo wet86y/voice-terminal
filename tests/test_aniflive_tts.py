@@ -106,6 +106,22 @@ def test_prewarm_drains_a_private_completed_segment_and_never_reuses_it():
     asyncio.run(run())
 
 
+def test_cold_reference_preparation_does_not_consume_inference_prewarm_budget(monkeypatch):
+    from voice_terminal.providers.aniflive_tts import AnifLiveTtsSession
+    original = AnifLiveTtsSession.start
+    async def cold_start(session):
+        await asyncio.sleep(.05)  # 模拟模型／多情绪参考准备，超过静默推理预算。
+        await original(session)
+    monkeypatch.setattr(AnifLiveTtsSession, 'start', cold_start)
+    async def run():
+        client = SpeechService().client(prewarm_timeout_seconds=.025)
+        try:
+            assert (await client.prewarm())['status'] == 'READY'
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
 def test_prewarm_can_be_disabled_independently_of_the_performance_option():
     async def run():
         service = SpeechService()

@@ -44,7 +44,7 @@ describe('本地音色卡片', () => {
     await button(view.wrapper, '＋ 添加音色').trigger('click')
     await view.wrapper.find('textarea').setValue('只有文字，没有录音。')
     expect(button(view.wrapper, '保存').attributes('disabled')).toBeDefined()
-    expect(button(view.wrapper, '试音').attributes('disabled')).toBeDefined()
+    expect(button(view.wrapper, '合成试音').attributes('disabled')).toBeDefined()
     expect(view.wrapper.text()).toContain('请添加参考音频')
     view.wrapper.unmount()
   })

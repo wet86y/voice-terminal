@@ -318,14 +318,22 @@ fn model_update_available(spec:&Value,installed:&InstalledModel)->bool{
 /// native_runtime_status（可选原生运行依赖卡片）：只核对收据，不引入新的启动门槛。
 pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
     let root=context.install.join("runtimes/aniflive-tts");
-    let wanted=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok();
+    let wanted=file_hash(&context.program.join("config/runtime/aniflive-runtime.lock.json")).ok();
     let source=load(&safe_path(&root,"source/windows-source-receipt.json")?).unwrap_or(Value::Null);
-    let installed=wanted.is_some()&&source["patch_revision"]==5&&source["upstream_commit"]=="9bc349d3a71362b3bfdccbc630983809800954fd"
+    let rules=load(&context.program.join("config/runtime/aniflive-build-compatibility.json")).unwrap_or(Value::Null);
+    let contract=&rules["runtime_contract"];
+    let receipt=load(&root.join("packages/aniflive-packages.json")).unwrap_or(Value::Null);
+    let compatible=if contract.is_object(){
+        rules["schema"]==1&&contract["revision"]==1&&source["schema"]==1&&receipt["schema"]==1&&receipt["role"]=="runtime"
+            &&source["upstream_commit"]==contract["upstream_commit"]
+            &&contract["source_patch_revisions"].as_array().is_some_and(|rows|rows.contains(&source["patch_revision"]))
+            &&contract["runtime_packages"].as_object().is_some_and(|rows|rows.len()==6
+                &&["torch","torchaudio","tensorrt-cu12","transformers","tokenizers","huggingface-hub"].iter().all(|name|rows.contains_key(*name))
+                &&rows.iter().all(|(name,version)|version.is_string()&&receipt["packages"][name]==*version))
+    }else{wanted.is_some()&&source["patch_revision"]==5&&source["upstream_commit"]=="9bc349d3a71362b3bfdccbc630983809800954fd"&&receipt["lock_sha256"].as_str()==wanted.as_deref()};
+    let installed=compatible
         &&!root.join("dependency-transaction.json").exists()
-        &&["packages","export-packages"].iter().all(|folder|{
-            let receipt=load(&root.join(folder).join("aniflive-packages.json")).unwrap_or(Value::Null);
-            receipt["lock_sha256"].as_str()==wanted.as_deref()&&receipt["files"].as_array().is_some_and(|files|!files.is_empty())
-        });
+        &&receipt["files"].as_array().is_some_and(|files|!files.is_empty());
     Ok(json!({"resource_id":"tts-aniflive-runtime","parent_resource_id":"voice-server","label":"AnifLive（本地语音引擎）隔离运行依赖","required":false,
         "installation_state":if installed{"installed"}else{"missing"},"files_installed":installed,"runtime_ready":installed,"can_start":installed,
         "update_available":false,"version":"1.5.0b1-patch5","error":Value::Null}))
@@ -458,7 +466,7 @@ fn aniflive_adapter_paths()->[&'static str;9]{[
     "voice_terminal/tts/aniflive_aliases.py","voice_terminal/tts/aniflive_shared.py","voice_terminal/tts/aniflive_service.py","voice_terminal/tts/aniflive_export.py"]}
 /// reviewed_export_compatibility（已审阅导出兼容）：保留旧构建身份，逐项核对新旧摘要。
 fn reviewed_export_compatibility(context:&LaunchContext,identity:&Value)->Result<bool,String>{
-    let rules=load(&context.installed_program().join("config/runtime/aniflive-build-compatibility.json")).unwrap_or(Value::Null);
+    let rules=load(&context.program.join("config/runtime/aniflive-build-compatibility.json")).unwrap_or(Value::Null);
     if rules["schema"]!=1{return Ok(false);}
     for profile in rules["profiles"].as_array().into_iter().flatten(){
         if profile["source"]!=identity["source"]||profile["adapter"]!=identity["adapter"]{continue;}
@@ -466,7 +474,7 @@ fn reviewed_export_compatibility(context:&LaunchContext,identity:&Value)->Result
         if runtime.len()!=aniflive_adapter_paths().len(){continue;}
         let mut matches=true;
         for name in aniflive_adapter_paths(){
-            if runtime.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){matches=false;break;}
+            if runtime.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.program,name)?).ok().as_deref(){matches=false;break;}
         }
         if matches{return Ok(true);}
     }
@@ -490,15 +498,25 @@ fn aniflive_model_revision_ready(context:&LaunchContext,model:&str,revision:Opti
     if entry["versions"][revision]["state"]!="validated"||receipt["identity"]!=entry["versions"][revision]["identity"]||receipt["validation"]["enqueue_verified"]!=true||receipt["validation"]["engine_count"]!=9||receipt["streaming_verified"]!=true{return Ok(false);}
     if native_runtime_status(context)?["can_start"]!=true{return Ok(false);}
     let identity=&receipt["identity"];
-    if identity["dependency_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-runtime.lock.json")).ok().as_deref()
-        ||identity["shared_lock"].as_str()!=file_hash(&context.installed_program().join("config/runtime/aniflive-shared-assets.lock.json")).ok().as_deref()
+    // program（当前业务源码）与构建工作进程一致；源码调试不能拿旧正式包的摘要拒绝新引擎。
+    let rules=load(&context.program.join("config/runtime/aniflive-build-compatibility.json")).unwrap_or(Value::Null);
+    let contract=&rules["runtime_contract"];
+    if contract.is_object(){
+        if contract["revision"]!=1||identity["source"]["upstream_commit"]!=contract["upstream_commit"]
+            ||!contract["source_patch_revisions"].as_array().is_some_and(|rows|rows.contains(&identity["source"]["patch_revision"]))
+            ||identity.get("runtime_contract").is_some_and(|value|value!=&contract["revision"])
+            ||manifest["model_family"]!=contract["model_family"]||manifest["backend"]!=contract["backend"]{return Ok(false);}
+    }else{
+    if identity["dependency_lock"].as_str()!=file_hash(&context.program.join("config/runtime/aniflive-runtime.lock.json")).ok().as_deref()
+        ||identity["shared_lock"].as_str()!=file_hash(&context.program.join("config/runtime/aniflive-shared-assets.lock.json")).ok().as_deref()
         ||identity["source"]["upstream_commit"]!="9bc349d3a71362b3bfdccbc630983809800954fd"{return Ok(false);}
     let Some(adapters)=identity["adapter"].as_object()else{return Ok(false)};
     if !reviewed_export_compatibility(context,identity)?{
         if identity["source"]["patch_revision"]!=5||adapters.len()!=aniflive_adapter_paths().len(){return Ok(false);}
         for name in aniflive_adapter_paths(){
-            if adapters.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.installed_program(),name)?).ok().as_deref(){return Ok(false);}
+            if adapters.get(name).and_then(Value::as_str)!=file_hash(&safe_path(&context.program,name)?).ok().as_deref(){return Ok(false);}
         }
+    }
     }
     let Some(files)=receipt["files"].as_array()else{return Ok(false)};
     if files.is_empty(){return Ok(false);}
@@ -510,8 +528,11 @@ fn aniflive_model_revision_ready(context:&LaunchContext,model:&str,revision:Opti
         if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size"].as_u64().unwrap_or(0){return Ok(false);}
         if verify_hashes&&file_hash(&path)?!=row["sha256"].as_str().unwrap_or(""){return Ok(false);}
     }
-    let actual=walk(&package)?.into_iter().map(|path|path.strip_prefix(&package).unwrap().to_string_lossy().replace('\\',"/")).collect::<std::collections::HashSet<_>>();
-    if actual!=expected{return Ok(false);}
+    if !safe_path(&package,"checksums.json")?.is_file(){return Ok(false);}
+    if verify_hashes{
+        let actual=walk(&package)?.into_iter().map(|path|path.strip_prefix(&package).unwrap().to_string_lossy().replace('\\',"/")).collect::<std::collections::HashSet<_>>();
+        if actual!=expected{return Ok(false);}
+    }
     Ok(true)
 }
 /// startup_readiness（启动组件检查）：只读取本地清单与文件，不启动解释器、服务或下载。
@@ -1561,7 +1582,7 @@ mod download_tests {
             let revision="a".repeat(24);let relative=format!("aniflive-tts/packages/{model}");
             let package=root.join("models").join(&relative).join(&revision);fs::create_dir_all(&package).unwrap();
             fs::write(package.join("model.engine"),b"good").unwrap();
-            atomic_json(&package.join("manifest.json"),&json!({"model_id":model,"format":"aniflive-tts-model-package"})).unwrap();
+            atomic_json(&package.join("manifest.json"),&json!({"model_id":model,"format":"aniflive-tts-model-package","model_family":"gsv-v2proplus","backend":"TensorRT-11"})).unwrap();
             fs::write(package.join("checksums.json"),b"{}").unwrap();
             let identity=json!({"fixture":model,"dependency_lock":lock_sha,"shared_lock":shared_sha,"source":{"patch_revision":5,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"},"adapter":adapters});
             atomic_json(&package.join("application-receipt.json"),&json!({"identity":identity,"validation":{"enqueue_verified":true,"engine_count":9},"streaming_verified":true,
@@ -1580,6 +1601,20 @@ mod download_tests {
         assert!(!aniflive_model_ready(&context,"tangyuge-v2pp-d78cf598",true).unwrap());
         let mut rows=inventory_raw(&context).unwrap();update_tts_readiness(&context,&mut rows).unwrap();
         assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["selected_local_ready"],true);
+        // 源码开发的稳定协议可接受旧工具摘要；缺少导出目录不影响既有模型启动。
+        let source=root.join("source/config/runtime");fs::create_dir_all(&source).unwrap();
+        let packages=json!({"torch":"expected","torchaudio":"expected","tensorrt-cu12":"expected",
+            "transformers":"expected","tokenizers":"expected","huggingface-hub":"expected"});
+        let contract=json!({"revision":1,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd",
+            "source_patch_revisions":[3,5],"model_family":"gsv-v2proplus","backend":"TensorRT-11","runtime_packages":packages});
+        atomic_json(&source.join("aniflive-build-compatibility.json"),&json!({"schema":1,"runtime_contract":contract})).unwrap();
+        atomic_json(&native.join("source/windows-source-receipt.json"),&json!({"schema":1,"patch_revision":5,"upstream_commit":"9bc349d3a71362b3bfdccbc630983809800954fd"})).unwrap();
+        atomic_json(&native.join("packages/aniflive-packages.json"),&json!({"schema":1,"role":"runtime","packages":packages,"files":[{"path":"fixture"}]})).unwrap();
+        crate::workspace::remove_owned(&native.join("export-packages"),&root).unwrap();
+        let mut development=context.clone();development.program=root.join("source");development.dev=true;
+        assert!(aniflive_model_ready(&development,"minimax-female-shaonv-zh",true).unwrap());
+        atomic_json(&native.join("packages/aniflive-packages.json"),&json!({"packages":{"torch":"incompatible"},"files":[{"path":"fixture"}]})).unwrap();
+        assert!(!aniflive_model_ready(&development,"minimax-female-shaonv-zh",false).unwrap());
         fs::remove_file(root.join("models/aniflive-tts/packages/minimax-female-shaonv-zh").join("a".repeat(24)).join("model.engine")).unwrap();
         let mut rows=inventory_raw(&context).unwrap();update_tts_readiness(&context,&mut rows).unwrap();
         assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["selected_local_ready"],false);

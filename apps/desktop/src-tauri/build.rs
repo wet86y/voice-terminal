@@ -17,7 +17,7 @@ fn main() {
             "publish_floating_model", "get_floating_model", "return_to_workbench", "start_floating_drag", "control_floating_session",
             "workspace_info", "workspace_choose", "workspace_link", "workspace_migrate",
             "app_integrity_status", "app_integrity_download", "app_integrity_check", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library",
-            "resource_reset_plan", "resource_reset", "resource_inventory", "resource_jobs", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel",
+            "resource_reset_plan", "resource_reset", "resource_inventory", "resource_jobs", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel", "aniflive_import_choose_folder", "aniflive_import_start",
         ]),
     ))
     .expect("桌面权限清单构建失败");

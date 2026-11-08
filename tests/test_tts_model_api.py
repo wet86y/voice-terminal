@@ -26,7 +26,8 @@ def registered_model_fixtures(tmp_path):
         folder = tmp_path / "models/aniflive-tts/packages" / model / revision
         folder.mkdir(parents=True)
         (folder / "fixture.engine").write_bytes(b"test-engine")
-        (folder / "manifest.json").write_text(json.dumps({"format": "aniflive-tts-model-package", "model_id": model}), encoding="utf-8")
+        (folder / "manifest.json").write_text(json.dumps({"format": "aniflive-tts-model-package", "model_id": model,
+            "model_family": "gsv-v2proplus", "backend": "TensorRT-11"}), encoding="utf-8")
         (folder / "checksums.json").write_text('{}', encoding='utf-8')
         from tests.aniflive_fixtures import build_identity
         identity = {**build_identity(), "fixture": model}
@@ -363,6 +364,22 @@ def test_asset_file_missing_returns_not_found(tmp_path):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
             response = await client.get(f"/api/v1/tts/assets/aniflive/{asset['asset_id']}/audio")
             assert response.status_code == 404
+    asyncio.run(scenario())
+
+
+def test_long_source_can_be_played_and_cropped_without_losing_original(tmp_path):
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / 'data')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url='http://test') as client:
+            original = _wav_bytes(seconds=12)
+            response = await client.post('/api/v1/tts/assets/aniflive/source?filename=long.wav', content=original)
+            assert response.status_code == 200
+            asset_id = response.json()['asset']['asset_id']
+            audio = await client.get(f'/api/v1/tts/assets/aniflive/{asset_id}/audio')
+            assert audio.status_code == 200 and audio.content == original
+            cropped = await client.post(f'/api/v1/tts/assets/aniflive/{asset_id}/clip', json={'start_ms': 1000, 'end_ms': 6000})
+            assert cropped.status_code == 200 and cropped.json()['asset']['duration_ms'] == 5000
+            assert (await client.get(f'/api/v1/tts/assets/aniflive/{asset_id}/audio')).content == original
     asyncio.run(scenario())
 
 

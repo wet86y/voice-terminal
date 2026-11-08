@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 from uuid import uuid4
@@ -122,12 +123,51 @@ class TtsVoiceOperationManager:
         return self.runtime.voice_library.for_model(model)
 
     def _require_local_client(self, model):
-        if self.runtime.config.tts.backend != "aniflive" or model != "aniflive":
+        if self.runtime.config.tts.backend != "aniflive" or model not in {"aniflive", self.runtime.config.tts.local_model}:
             raise TtsVoiceOperationError("请先切换到目标本地模型，再执行试音。")
         client = getattr(self.runtime.tts, "local", None)
         if client is None:
             raise TtsVoiceOperationError("本地模型尚未就绪。")
         return client
+
+    @asynccontextmanager
+    async def _preview_client(self, model, library):
+        """试听独立模型时暂借运行资源，不修改实际播放目标或持久设置。"""
+        runtime = self.runtime
+        actual = getattr(runtime.tts, 'local', None)
+        effective = getattr(runtime.config.tts, 'local_model', None)
+        target = effective if model == 'aniflive' else model
+        if runtime.config.tts.backend == 'aniflive' and actual is not None and target == effective:
+            yield actual
+            return
+        from ..providers.aniflive_server import AnifLiveTtsServer
+        from ..providers.aniflive_tts import AnifLiveTtsClient
+        config = runtime.config.tts
+        temporary = AnifLiveTtsClient(
+            server=AnifLiveTtsServer(runtime._runtime_local_root, runtime.paths.program_root,
+                local_model=target, library_root=library.root, data=runtime._tts_voice_root.parent),
+            model_id=target, language=config.aniflive_language, voice_library=library,
+            aniflive_chunk_optimization=config.aniflive_chunk_optimization,
+            aniflive_first_audio_wait_ms=0, prewarm_enabled=False)
+        restore = bool(actual is not None and runtime.config.tts.backend == 'aniflive')
+        try:
+            if restore:
+                await actual.close()
+            yield temporary
+        finally:
+            async def cleanup():
+                try:
+                    await temporary.close()
+                finally:
+                    if restore:
+                        await actual.ensure_ready()
+                        await actual.prepare_reference()
+            task = asyncio.create_task(cleanup())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
 
     def start_preview(self, model, voice, text=DESIGN_SAMPLE_TEXT):
         if not isinstance(voice, Mapping) or not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000:
@@ -274,14 +314,14 @@ class TtsVoiceOperationManager:
     async def _preview(self, operation):
         model = operation.request["model"]
         library = self._require_library(model)
-        client = self._require_local_client(model)
-        await client.ensure_ready()
         voice = dict(operation.request["voice"])
         if voice.get("design_description") or voice.get("reference_mode") == "design":
             raise TtsVoiceOperationError("AnifLive 使用参考录音与准确转写克隆音色。")
         source = voice.get("reference_asset_id")
         snapshot = library.resolve_draft(model, {**voice, "name": voice.get("name") or "新音色", "source": "import"})
-        pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"])
+        async with self._preview_client(model, library) as client:
+            await client.ensure_ready()
+            pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"])
         asset = await asyncio.to_thread(library.put_pcm, pcm, sample_rate=16000)
         if high_fidelity is not None:
             native_pcm, native_rate = high_fidelity
@@ -310,7 +350,17 @@ class TtsVoiceOperationManager:
         编码器固定读 16 kHz，所以主素材必须是 16 kHz；原生 48 kHz 样音另存
         一份，保留 8 kHz 以上带宽供后续音色处理。
         """
+        preview_voice = getattr(operation, 'request', {}).get('voice', {})
+        selected_tag = preview_voice.get('preview_guidance')
+        selected_intensity = preview_voice.get('preview_intensity')
+        if selected_tag is not None:
+            matches = [row for row in snapshot.references if row['tag'] == selected_tag]
+            if not matches or (selected_intensity is not None and selected_intensity not in {row['intensity'] for row in matches}):
+                raise TtsVoiceOperationError('试听情绪或强度不属于当前音色的已就绪参考。')
         session = client.session(voice_snapshot=snapshot, preview=True)
+        if selected_tag is not None:
+            from ..tts.controls import SpeechControls
+            session.speech_control_reader = lambda: SpeechControls(guidance=selected_tag, intensity=selected_intensity)
         operation.session = session
         output = bytearray()
 
@@ -320,9 +370,10 @@ class TtsVoiceOperationManager:
                 if len(output) > int(getattr(client, "sample_rate", 16000)) * 2 * 17:
                     raise TtsVoiceOperationError("生成音频超过 15 秒，请缩短正文后重新生成。")
 
-        reader = asyncio.create_task(collect(), name=f"tts-voice-reader-{operation.id[:8]}")
+        reader = None
         try:
             await session.start()
+            reader = asyncio.create_task(collect(), name=f"tts-voice-reader-{operation.id[:8]}")
             await session.send_text(text)
             await session.finish()
             await reader
@@ -337,8 +388,9 @@ class TtsVoiceOperationManager:
                 return converted, (native, rate)
             return native, None
         except BaseException:
-            reader.cancel()
-            await asyncio.gather(reader, return_exceptions=True)
+            if reader is not None:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
             await session.cancel()
             raise
         finally:

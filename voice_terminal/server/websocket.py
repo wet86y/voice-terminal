@@ -920,7 +920,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         active, voice_error = None, None
         if selection and self.voice_library:
             try:
-                library = self.voice_library.for_model("aniflive")
+                library = self.voice_library.for_model(config.local_model)
                 voice = library.get_voice(selection["voice_id"], selection["revision"])
                 library.asset_path(voice["reference_asset_id"])
                 active = {"voice_id": voice["id"], "revision": voice["revision"], "name": voice["name"]}
@@ -946,7 +946,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
 
     def _active_voice_selection(self, model: str) -> Mapping[str, Any] | None:
         libraries = getattr(self, "voice_library", None)
-        selected = libraries.for_model("aniflive").active_selection if libraries else None
+        selected = libraries.for_model(self.config.tts.local_model).active_selection if libraries else None
         return selected if isinstance(selected, Mapping) else None
 
     def _active_voice_snapshot(self, model: str, *, emotion: str | None = "calm"):
@@ -957,7 +957,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             return None
         try:
             return self.voice_library.resolve(
-                "aniflive", selection,
+                self.config.tts.local_model, selection,
                 emotion=None,
             )
         except (VoiceLibraryError, FileNotFoundError):
@@ -1260,7 +1260,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         elif self.config.tts.backend == "aniflive":
             if self.voice_library is None:
                 raise RuntimeError("本地参考音色库不可用，请先修复音色资料。")
-            library = self.voice_library.for_model("aniflive")
+            library = self.voice_library.for_model(self.config.tts.local_model)
             local_tts = AnifLiveTtsClient(
                 server=AnifLiveTtsServer(self._runtime_local_root, self.paths.program_root,
                     local_model=self.config.tts.local_model, revision=self.config.tts.local_model_revision,

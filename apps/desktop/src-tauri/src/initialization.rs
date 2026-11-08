@@ -38,6 +38,7 @@ pub fn install_manager(app:&tauri::AppHandle,state:Arc<Desktop>,context:&LaunchC
         *state.error.lock().map_err(|_|"启动错误状态不可用")?=Some(error.clone());
         state.startup_skipped.store(true,Ordering::Release);
     }
+    manager.start_import_dispatcher();
     app.manage(manager);
     // 页面真正加载后才登记就绪，迁移不能把窗口创建之前的阶段视为启动成功。
     Ok(())

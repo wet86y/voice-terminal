@@ -37,7 +37,7 @@ function formatBytes(value: number | null | undefined) {
       <div class="managed-job-progress" :class="{ indeterminate: percent === undefined }" role="progressbar" :aria-label="`${label}进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="percent">
         <span :style="percent !== undefined ? { width: `${percent}%` } : undefined"></span>
       </div>
-      <small v-if="percent !== undefined">{{ stageLabel }}{{ formatBytes(done) }} / {{ formatBytes(total) }} · {{ percent }}%</small>
+      <small v-if="percent !== undefined"><template v-if="kind === 'build'">已完成步骤 {{ done }} / {{ total }}</template><template v-else>{{ stageLabel }}{{ formatBytes(done) }} / {{ formatBytes(total) }}</template> · {{ percent }}%</small>
       <small v-else>请稍候…</small>
     </div>
     <p v-if="job.error" class="managed-job-error" role="alert">{{ job.error }}</p>

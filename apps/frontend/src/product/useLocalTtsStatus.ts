@@ -42,6 +42,11 @@ export function useLocalTtsStatus(localBackendEnabled: () => boolean) {
       timer = undefined
     }
     if (request) return afterPending ? request.then(() => refresh()) : request
+    if (application.recovery?.value?.suspended) {
+      error.value = ''
+      if (!disposed) timer = window.setTimeout(() => { timer = undefined; void refresh() }, 1100)
+      return Promise.resolve()
+    }
     loading.value = true
     request = productApi.ttsStatus().then(value => {
       status.value = value

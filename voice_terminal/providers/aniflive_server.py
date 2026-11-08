@@ -51,7 +51,8 @@ class AnifLiveTtsServer:
             if self.loaded_model:
                 return
             await self._stop()
-            package, self.revision, _ = self.registry.resolve(self.local_model, self.revision, verify_hashes=True)
+            # 普通启动只做登记与文件属性检查，磁盘操作不阻塞业务状态事件循环。
+            package, self.revision, _ = await asyncio.to_thread(self.registry.resolve, self.local_model, self.revision)
             self.library.mkdir(parents=True, exist_ok=True)
             token_path = contained(self.local, self.library / 'reference-control.token')
             try:

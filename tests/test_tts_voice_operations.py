@@ -8,6 +8,38 @@ from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager
 from unittest.mock import AsyncMock
 
 
+def test_temporary_preview_restores_formal_engine_after_failure(tmp_path, monkeypatch):
+    import voice_terminal.providers.aniflive_server as server_module
+    import voice_terminal.providers.aniflive_tts as client_module
+    events = []
+    class Server:
+        def __init__(self, *args, **kwargs):
+            events.append(('temporary_model', kwargs['local_model']))
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def close(self):
+            events.append('temporary_closed')
+    monkeypatch.setattr(server_module, 'AnifLiveTtsServer', Server)
+    monkeypatch.setattr(client_module, 'AnifLiveTtsClient', Client)
+    async def mark(name):
+        events.append(name)
+    formal = SimpleNamespace(close=lambda: mark('formal_closed'), ensure_ready=lambda: mark('formal_ready'),
+                             prepare_reference=lambda: mark('formal_reference'))
+    config = SimpleNamespace(backend='aniflive', local_model='formal', aniflive_language='zh',
+                             aniflive_chunk_optimization=True)
+    runtime = SimpleNamespace(tts=SimpleNamespace(local=formal), config=SimpleNamespace(tts=config),
+        paths=SimpleNamespace(program_root=tmp_path), _runtime_local_root=tmp_path, _tts_voice_root=tmp_path / 'tts')
+    manager = TtsVoiceOperationManager(runtime)
+    async def run():
+        with pytest.raises(RuntimeError, match='试听失败'):
+            async with manager._preview_client('other', SimpleNamespace(root=tmp_path)):
+                raise RuntimeError('试听失败')
+        assert events == [('temporary_model', 'other'), 'formal_closed', 'temporary_closed', 'formal_ready', 'formal_reference']
+        assert config.backend == 'aniflive' and config.local_model == 'formal'
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("description,has_source", [
     ("空灵、特殊的声音", False), ("温和清晰的女声", True), ("", True),
 ])

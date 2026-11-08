@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ReferenceAudioPlayer from './ReferenceAudioPlayer.vue'
 import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE, type VoiceDraft } from './useTtsVoiceState'
-import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, TtsVoicePort } from './tts-voice-types'
+import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, ProductTtsReference, TtsVoicePort } from './tts-voice-types'
 
 const props = withDefaults(defineProps<{
   model: ProductLocalTtsModelId
@@ -15,16 +15,25 @@ const props = withDefaults(defineProps<{
 const productApi = props.port! // port（业务接口）：演示模式仅使用模拟数据。
 const emit = defineEmits<{ changed: [] }>()
 const state = useTtsVoiceState()
+function ensureModelBucket(model: ProductLocalTtsModelId) {
+  state.models[model] ??= { voices: [], drafts: {} }
+}
+ensureModelBucket(props.model)
+watch(() => props.model, model => ensureModelBucket(model), { flush: 'sync' })
 const libraryError = ref('') // libraryError（默认参考恢复或全库操作错误）。
 const restoringDefault = ref(false) // restoringDefault（默认参考恢复中）。
+const syncingReferences = ref(false) // syncingReferences（模型参考资料同步中）。
+let disposed = false
 const activeReferenceKey = ref('') // activeReferenceKey（当前播放附件所属草稿）。
 const transcribingKey = ref('') // transcribingKey（正在识别的草稿）。
 const localAudioUrls = ref<Record<string, string>>({}) // localAudioUrls（演示附件的临时播放地址）。
+const clipStarts = ref<Record<string, number>>({}) // 参考片段起点，单位秒。
+const clipEnds = ref<Record<string, number>>({}) // 参考片段终点，单位秒。
 function releaseLocalAudio(draft: VoiceDraft) {
   const assetId = draft.source?.asset_id
   if (assetId && localAudioUrls.value[assetId]) { URL.revokeObjectURL(localAudioUrls.value[assetId]); delete localAudioUrls.value[assetId] }
 }
-onBeforeUnmount(() => { for (const url of Object.values(localAudioUrls.value)) URL.revokeObjectURL(url) })
+onBeforeUnmount(() => { disposed = true; for (const url of Object.values(localAudioUrls.value)) URL.revokeObjectURL(url) })
 function referenceUrl(draft: VoiceDraft) {
   if (!draft.source) return undefined
   return props.demo ? localAudioUrls.value[draft.source.asset_id] : productApi.ttsAssetAudioUrl(props.model, draft.source.asset_id)
@@ -54,7 +63,8 @@ async function refresh(model = props.model) {
       state.models[model].voices = [{ id: 'demo-default', revision: 1, name: '默认音色', source: 'legacy', model, is_default: true, enabled: true, reference_asset_id: 'demo-reference', reference_text: TTS_SAMPLE_TEXT, duration_ms: 5680 }]
     } else if (!props.demo) state.models[model].voices = (await productApi.ttsVoices(model)).voices
     for (const voice of state.models[model].voices) {
-      if (!state.models[model].drafts[voice.id]) {
+      const old = state.models[model].drafts[voice.id]
+      if (!old || (!old.expanded && !old.busy && old.revision !== voice.revision)) {
         const draft = voiceDraft(voice)
         // 已保存样音保留原制作配方，允许改名或校对转写；改变生成输入仍会使候选失效。
         draft.signature = signature(draft, model)
@@ -69,11 +79,87 @@ async function refresh(model = props.model) {
 onMounted(() => refresh())
 watch(() => props.model, model => { void refresh(model) })
 function add() { const draft = voiceDraft(); draft.expanded = true; bucket.value.drafts[draft.key] = draft }
+async function syncModelReferences() {
+  if (syncingReferences.value || props.demo) return
+  const model = props.model
+  syncingReferences.value = true; libraryError.value = ''
+  try {
+    let job = await productApi.startAnifLiveReferenceImport(model)
+    while (!disposed && !['complete', 'reference_failed', 'failed', 'cancelled'].includes(job.status)) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
+      job = await productApi.getAnifLiveImport(job.task_id)
+    }
+    if (disposed) return
+    if (job.status !== 'complete') throw new Error(job.error || '模型参考资料同步失败。')
+    await refresh(model)
+    const counts = job.reference_registration
+    libraryError.value = counts ? `参考资料已同步：${counts.ready} 项就绪，${counts.pending} 项待完善。` : '参考资料已同步。'
+    emit('changed')
+  } catch (error) { libraryError.value = error instanceof Error ? error.message : '模型参考资料同步失败。' }
+  finally { syncingReferences.value = false }
+}
+function addExpression(draft: VoiceDraft) {
+  draft.references.push({ id: crypto.randomUUID().replace(/-/g, ''), name: '新情绪', tag: '', intensity: .5,
+    asset_id: null, source_asset_id: null, reference_text: '', reference_language: 'zh', status: 'pending', error: '请添加参考录音。' })
+}
+function expressionChanged(item: ProductTtsReference) {
+  item.status = item.asset_id && item.reference_text.trim() && item.reference_language ? 'ready' : 'pending'
+  item.error = item.status === 'ready' ? '' : item.error || '请补齐音频、转写和语言。'
+}
+async function uploadExpression(draft: VoiceDraft, item: ProductTtsReference, event: Event) {
+  const input = event.target as HTMLInputElement; const file = input.files?.[0]; input.value = ''
+  if (!file) return
+  await run(draft, async () => {
+    const source = props.demo ? null : (await productApi.uploadTtsSource(props.model, file)).asset
+    item.source_asset_id = source?.asset_id ?? null; item.asset_id = null; item.reference_text = ''
+    let asset
+    try {
+      asset = props.demo ? { asset_id: crypto.randomUUID().replace(/-/g, ''), duration_ms: 5680 } : (await productApi.uploadTtsAsset(props.model, file)).asset
+    } catch (error) {
+      item.error = error instanceof Error ? error.message : '原录音已保存，请选择 3–10 秒片段。'
+      expressionChanged(item)
+      return
+    }
+    if (props.demo) localAudioUrls.value[asset.asset_id] = URL.createObjectURL(file)
+    item.asset_id = asset.asset_id; item.reference_text = ''; item.error = ''
+    expressionChanged(item)
+  })
+  if (item.asset_id) await transcribeExpression(draft, item)
+}
+async function transcribeExpression(draft: VoiceDraft, item: ProductTtsReference) {
+  const asset = item.asset_id; if (!asset) return
+  transcribingKey.value = item.id
+  try {
+    await run(draft, async generation => {
+      if (props.demo) { item.reference_text = '这是一段参考音频的演示转写。'; expressionChanged(item); return }
+      const result = await monitor(draft, () => productApi.startTtsTranscribe(props.model, asset), generation)
+      if (draft.generation === generation && item.asset_id === asset && result.result?.text) {
+        item.reference_text = result.result.text; item.verification_source = 'automatic_transcription'; expressionChanged(item)
+      }
+    })
+  } finally { transcribingKey.value = '' }
+}
+function expressionUrl(item: ProductTtsReference) {
+  const asset = item.asset_id || item.source_asset_id
+  return asset ? (props.demo ? localAudioUrls.value[asset] : productApi.ttsAssetAudioUrl(props.model, asset)) : undefined
+}
+async function clipExpression(draft: VoiceDraft, item: ProductTtsReference) {
+  const source = item.source_asset_id; if (!source) return
+  await run(draft, async () => {
+    if (props.demo) throw new Error('演示界面不能裁剪音频。')
+    const start = Math.round(Number(clipStarts.value[item.id] ?? 0) * 1000)
+    const end = Math.round(Number(clipEnds.value[item.id] ?? 5) * 1000)
+    const result = await productApi.clipTtsAsset(props.model, source, start, end)
+    item.asset_id = result.asset.asset_id; item.reference_text = ''; item.error = '请确认裁剪片段的准确转写。'
+    expressionChanged(item)
+  })
+  if (item.asset_id) await transcribeExpression(draft, item)
+}
 async function restoreDefault() {
   restoringDefault.value = true; libraryError.value = ''
   try {
     if (props.demo) for (const voice of bucket.value.voices) voice.enabled = false
-    else { await productApi.selectTtsVoice(props.model, null); await refresh() }
+    else { await productApi.restoreDefaultTtsVoice(props.model); await refresh() }
     emit('changed')
   } catch (error) { libraryError.value = error instanceof Error ? error.message : '恢复默认参考失败。' }
   finally { restoringDefault.value = false }
@@ -143,10 +229,11 @@ async function upload(draft: VoiceDraft, files: FileList | File[]) {
 function fileChange(draft: VoiceDraft, event: Event) { const input = event.target as HTMLInputElement; if (input.files?.length) void upload(draft, input.files); input.value = '' }
 function drop(draft: VoiceDraft, event: DragEvent) { if (!globalBusy.value && event.dataTransfer?.files.length) void upload(draft, event.dataTransfer.files) }
 function removeSource(draft: VoiceDraft) { releaseLocalAudio(draft); invalidate(draft); draft.source = null; draft.transcript = '' }
-async function preview(draft: VoiceDraft) {
+async function preview(draft: VoiceDraft, expression?: ProductTtsReference) {
   const model = props.model; const prepared = signature(draft, model)
   await run(draft, async generation => {
-    const voice = { name: voiceName(draft), source: 'import', reference_asset_id: draft.source?.asset_id, reference_text: draft.transcript, reference_language: draft.referenceLanguage }
+    const voice = { name: voiceName(draft), source: 'import', reference_asset_id: draft.source?.asset_id, reference_text: draft.transcript, reference_language: draft.referenceLanguage, references: draft.references,
+      ...(expression ? { preview_guidance: expression.tag, preview_intensity: Number(expression.intensity) } : {}) }
     if (props.demo) {
       draft.candidate = { ...voice, source: 'import', reference_asset_id: 'demo-target', reference_text: draft.text, design_text: draft.text, inference_steps: TTS_DESIGN_STEPS, generation_recipe: TTS_DESIGN_RECIPE }
       draft.targetTranscript = draft.text
@@ -170,6 +257,14 @@ async function play(draft: VoiceDraft) {
 }
 /** saveBlockReason（保存阻碍说明）：按钮与提示使用相同的内容校验，名称可自动补全。 */
 function saveBlockReason(draft: VoiceDraft) {
+  const keys = new Set<string>()
+  for (const item of draft.references) {
+    if (!item.name.trim() || ['default', 'base_internal'].includes(item.tag) || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(item.tag)) return '请填写情绪名称及英文小写标记；default 和 base_internal 为系统保留标记。'
+    if (!Number.isFinite(Number(item.intensity)) || Number(item.intensity) < 0 || Number(item.intensity) > 1) return '情绪强度必须在 0 到 1 之间。'
+    const key = `${item.tag}:${item.reference_language}:${item.intensity}`
+    if (keys.has(key)) return '同一情绪标记、语言和强度不能重复。'
+    keys.add(key)
+  }
   if (unchangedContent(draft)) return ''
   const mode = voiceMode(draft) // mode（当前音色创建方式）。
   if (mode !== 'clone') {
@@ -192,9 +287,9 @@ async function save(draft: VoiceDraft) {
   if (!saveable(draft)) return
   const model = props.model; const name = voiceName(draft)
   await run(draft, async () => {
-    const payload = unchangedContent(draft) ? { ...stored(draft)!, name } : voiceMode(draft) !== 'clone' ? { ...draft.candidate, name, reference_text: draft.targetTranscript.trim() } : {
+    const payload = unchangedContent(draft) ? { ...stored(draft)!, name, references: draft.references } : voiceMode(draft) !== 'clone' ? { ...draft.candidate, name, reference_text: draft.targetTranscript.trim(), references: draft.references } : {
       name, source: 'import', reference_asset_id: draft.source!.asset_id,
-      reference_language: draft.referenceLanguage, reference_text: draft.transcript, source_reference_text: draft.transcript,
+      reference_language: draft.referenceLanguage, reference_text: draft.transcript, source_reference_text: draft.transcript, references: draft.references,
     }
     if (props.demo) {
       const original = state.models[model].voices.find(voice => voice.id === draft.id)
@@ -236,15 +331,16 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
 
 <template>
   <section class="voice-library" aria-label="本地音色库">
-    <header class="library-heading"><div><h3>音色库</h3><p>参考音色在 AnifLive 模型间共用，启用后用于下一次回答。</p></div><button type="button" class="outline-button" :disabled="globalBusy || restoringDefault" @click="restoreDefault">恢复默认参考</button><button type="button" class="outline-button" :disabled="restoringDefault" @click="add">＋ 添加音色</button></header>
+    <header class="library-heading"><div><h3>音色库</h3><p>音色按基础模型独立管理，启用后用于下一次回答。</p></div><button type="button" class="outline-button" :disabled="globalBusy || syncingReferences || demo" @click="syncModelReferences">{{ syncingReferences ? '正在同步…' : '同步模型参考' }}</button><button type="button" class="outline-button" :disabled="globalBusy || restoringDefault" @click="restoreDefault">恢复默认参考</button><button type="button" class="outline-button" :disabled="restoringDefault" @click="add">＋ 添加音色</button></header>
     <p v-if="libraryError" class="instruction-error" role="alert">{{ libraryError }}</p>
     <p v-if="!drafts.length" class="instruction-hint">当前使用模型随包默认参考。添加参考音频与准确转写后可保存自定义音色。</p>
     <article v-for="draft in drafts" :key="draft.key" class="voice-card" :class="{ enabled: stored(draft)?.enabled }">
-      <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="音色名称（可选）" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
-        <div class="voice-actions"><button type="button" :disabled="!draft.id || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
+      <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="音色名称（可选）" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small><small>已就绪 {{ (draft.source && draft.transcript.trim() ? 1 : 0) + draft.references.filter(item => item.status === 'ready').length }} · 待完善 {{ draft.references.filter(item => item.status !== 'ready').length + (draft.source && draft.transcript.trim() ? 0 : 1) }}</small></div>
+        <div class="voice-actions"><button type="button" :disabled="!draft.id || globalBusy" @click="play(draft)">播放参考</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
           <label class="voice-toggle"><input type="checkbox" role="switch" :aria-label="`启用 ${draft.name || '音色'}`" :checked="stored(draft)?.enabled" :disabled="!draft.id || globalBusy || (stored(draft)?.is_default && stored(draft)?.enabled)" @change="toggle(draft, ($event.target as HTMLInputElement).checked)"><span aria-hidden="true"></span></label>
         </div></header>
       <div v-if="draft.expanded" :id="`voice-editor-${draft.key}`" class="voice-editor">
+        <strong>基础参考</strong>
         <div class="voice-inputs" :class="{ single: model === 'aniflive' }">
           <label class="form-field"><span>参考录音语言</span><select v-model="draft.referenceLanguage" :disabled="globalBusy" @change="invalidate(draft)"><option value="zh">中文</option><option value="yue">粤语</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option></select></label>
           <label class="form-field"><span>音频转写 <small>准确转写必填</small></span><textarea v-model="draft.transcript" class="compact-textarea" rows="1" placeholder="添加音频后自动识别，也可手动输入并校对。" @input="invalidate(draft)"></textarea></label>
@@ -260,7 +356,26 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
           </div>
           <small class="reference-hint">支持 3–10 秒清晰单声道参考录音，保留原采样率，最大 20 MiB（二进制兆字节）。</small>
         </div>
-        <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
+        <div class="expression-list">
+          <div class="voice-heading"><strong>情绪参考</strong><button type="button" :disabled="globalBusy" @click="addExpression(draft)">＋ 添加情绪参考</button></div>
+          <details v-for="(item, index) in draft.references" :key="item.id" class="expression-card">
+            <summary>{{ item.name || '情绪参考' }} · {{ item.tag || '未设置标记' }} · {{ item.status === 'ready' ? '已就绪' : '待完善' }}</summary>
+            <div class="expression-editor">
+              <label class="form-field"><span>情绪名称</span><input v-model="item.name" maxlength="80"></label>
+              <label class="form-field"><span>情绪标记</span><input v-model="item.tag" maxlength="64" placeholder="例如 soft"></label>
+              <label class="form-field"><span>参考强度 · {{ item.intensity }}</span><input v-model.number="item.intensity" type="range" min="0" max="1" step="0.1"></label>
+              <label class="form-field"><span>参考录音语言</span><select v-model="item.reference_language" @change="expressionChanged(item)"><option value="">待确认</option><option value="zh">中文</option><option value="yue">粤语</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option></select></label>
+              <label class="form-field"><span>参考录音转写</span><textarea v-model="item.reference_text" class="compact-textarea" rows="1" @input="item.verification_source = 'manual'; expressionChanged(item)"></textarea></label>
+              <ReferenceAudioPlayer v-if="item.asset_id || item.source_asset_id" :src="expressionUrl(item)" :filename="item.name + '.wav'" :duration-ms="0" :busy="globalBusy" :transcribing="transcribingKey === item.id" :active="activeReferenceKey === item.id" @play="activeReferenceKey = item.id" @transcribe="transcribeExpression(draft, item)" @remove="item.asset_id = null; item.source_asset_id = null; expressionChanged(item)" @error="draft.error = $event" />
+              <label class="form-field"><span>导入或替换参考录音（3–10 秒）</span><input type="file" accept=".wav,.mp3,.flac,.ogg" :disabled="globalBusy" @change="uploadExpression(draft, item, $event)"></label>
+              <div v-if="item.source_asset_id" class="expression-clip"><label>起点（秒）<input v-model.number="clipStarts[item.id]" type="number" min="0" step="0.1" placeholder="0"></label><label>终点（秒）<input v-model.number="clipEnds[item.id]" type="number" min="0" step="0.1" placeholder="5"></label><button type="button" :disabled="globalBusy" @click="clipExpression(draft, item)">裁剪参考</button></div>
+              <p v-if="item.error" class="instruction-hint">{{ item.error }}</p>
+              <button type="button" :disabled="unavailable || globalBusy || item.status !== 'ready' || !draft.source || !draft.transcript.trim()" @click="preview(draft, item)">合成试音</button>
+              <button type="button" class="danger-action" :disabled="globalBusy" @click="draft.references.splice(index, 1)">删除情绪参考</button>
+            </div>
+          </details>
+        </div>
+        <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">合成试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
         <p v-if="saveBlockReason(draft)" class="instruction-hint">{{ saveBlockReason(draft) }}</p>
         <p v-if="!draft.name.trim()" class="instruction-hint">未填写名称时，将保存为“{{ voiceName(draft) }}”。</p>
       </div>
@@ -286,6 +401,12 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
 .voice-toggle span { width: 36px; height: 20px; border-radius: 20px; background: var(--line-strong); }.voice-toggle span::after { content: ''; display: block; width: 14px; height: 14px; margin: 3px; border-radius: 50%; background: var(--muted); transition: transform 160ms; }
 .voice-toggle input:checked + span { background: var(--mint); }.voice-toggle input:checked + span::after { transform: translateX(16px); background: var(--bg); }.voice-toggle input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 3px; }.voice-toggle input:disabled + span { opacity: .5; }
 .voice-editor { display: grid; gap: 18px; border-top: 1px solid var(--line); padding-top: 18px; }
+.expression-list, .expression-editor { display: grid; gap: 12px; }
+.expression-card { padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.expression-card summary { cursor: pointer; }
+.expression-editor { margin-top: 12px; }
+.expression-clip { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.expression-clip label { display: grid; gap: 4px; }
 .voice-inputs { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; align-items: start; }.voice-inputs.single { grid-template-columns: 1fr; }
 .voice-inputs .form-field { min-width: 0; }
 .voice-reference { display: grid; gap: 8px; min-width: 0; }.reference-input { min-width: 0; }
