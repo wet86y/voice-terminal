@@ -1,6 +1,6 @@
 {
   "name": "voice-terminal",
-  "version": "0.9.12",
+  "version": "1.0.0",
   "license": "Apache-2.0",
   "private": true,
   "description": "本地模块化实时语音终端",
@@ -13,6 +13,7 @@
     "assets:check": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py check-index",
     "assets:prune": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py prune",
     "assets:hook": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py install-hook",
+    "version:check": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/check-version-consistency.py",
     "dev": "npm run desktop:dev",
     "dev:ui": "npm run desktop:ui",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -Dev",

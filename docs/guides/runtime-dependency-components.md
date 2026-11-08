@@ -1,14 +1,15 @@
 # 语音服务运行依赖卡片
 
-Voice Server（语音服务）展开后显示三个运行依赖卡片，沿用组件页的安装计划、下载、导入、来源跳转、进度及取消入口。
+Voice Server（语音服务）的环境状态包含 CPU（中央处理器）基础依赖、GPU（图形处理器）可选依赖和 AnifLive（本地语音引擎）隔离依赖。AnifLive 隔离依赖由本地 TTS 组件使用；产品页将其显示在 AnifLive-TTS 卡片中，组件维护接口仍将其登记为可选运行依赖。
 
 | 卡片 | 资源编号 | 安装规则 |
 | --- | --- | --- |
 | CPU（中央处理器）运行依赖 | `voice-runtime-cpu`（基础运行依赖编号） | 必需；保留 `voice-server`（原语音服务资源编号）入口兼容。一次配置现有六个基础依赖组 |
-| audio.cpp（语音合成引擎）运行依赖 | `tts-audiocpp-runtime`（原生语音运行包编号） | 可选；沿用现有固定官方归档和随包补丁，本地 VoxCPM（语音合成模型）共用 |
 | GPU（图形处理器）运行依赖 | `voice-runtime-gpu`（可选显卡运行依赖编号） | 可选；同一解释器中按进程隔离处理器与显卡张量包，只有实际使用显卡的进程选择显卡构建 |
 
-分类级下载和一键下载只包含必需 CPU（中央处理器）环境，不包含两个可选依赖。CPU 主清单覆盖六组、111 个固定预编译包，产品运行诊断沿用这份完整闭包；开发和模型导出工具使用各自清单。TTS（语音合成）启动门禁以保存的播放目标为准：在线目标需要其接口密钥，本地目标需要指定模型及原生运行包均就绪，不自动切换其他可用后端。程序更新在组件缺失、待更新或服务未启动时仍可从管理页执行。
+AnifLive 独立运行依赖编号为 `tts-aniflive-runtime`（AnifLive 隔离依赖资源编号），仅由本地 AnifLive 模型使用。它安装在独立的 `runtimes/aniflive-tts`（AnifLive 隔离环境目录），不与共享 Python 解释器依赖混装；运行状态页将它归入本地 TTS 组件卡片。
+
+分类级下载和一键下载只包含必需 CPU（中央处理器）环境，不包含 GPU（图形处理器）与 AnifLive 隔离依赖。CPU 主清单覆盖六组、111 个固定预编译包，产品运行诊断沿用这份完整闭包；开发和模型导出工具使用各自清单。TTS（语音合成）启动门禁以保存的播放目标为准：在线目标需要其接口密钥，本地目标需要指定模型及 AnifLive 隔离运行依赖均就绪，不自动切换其他可用后端。程序更新在组件缺失、待更新或服务未启动时仍可从管理页执行。
 
 ## 安装与模型共享
 
@@ -26,13 +27,13 @@ Paraformer（语音识别）、emotion2vec+ base（情绪背景）和 CAM++（�
 
 ## 后端接口与字段
 
-`resource_inventory`（桌面资源清单接口）的语音服务条目通过 `runtime_components`（运行依赖子卡片）返回三个卡片；`voice_environment_status`（环境状态接口）通过 `components`（运行依赖卡片）返回同样结构。前端把子卡片纳入统一资源查找与任务刷新，父级进程资源仍只计量一次。
+`resource_inventory`（桌面资源清单接口）的语音服务条目通过 `runtime_components`（运行依赖子卡片）返回环境依赖记录；`voice_environment_status`（环境状态接口）通过 `components`（运行依赖卡片）返回相同状态。前端把 CPU／GPU 依赖放在语音服务下，并把 AnifLive 隔离依赖归到本地 TTS 卡片；父级进程资源仍只计量一次。
 
 | 接口或字段 | 中文说明 |
 | --- | --- |
-| `resource_install_plan`、`resource_download`、`resource_import`、`resource_open_source` | 安装计划、下载、导入及打开来源；均支持两个新增卡片编号与原生运行包编号 |
-| `voice_environment_plan`、`voice_environment_configure` | 环境计划与配置；`group`（安装分组）支持 `cpu`（基础依赖）、`gpu`（显卡依赖）、`audiocpp`（原生语音依赖）及原有基础分组入口 |
-| `required` | 是否参与整体启动门槛；两个可选卡片为否 |
+| `resource_install_plan`、`resource_download`、`resource_import`、`resource_open_source` | 安装计划、下载、导入及打开来源；支持 AnifLive 模型与隔离运行依赖编号 |
+| `voice_environment_plan`、`voice_environment_configure` | 基础与显卡运行环境计划及配置；`group`（安装分组）支持 `cpu`（基础依赖）、`gpu`（显卡依赖）及原有基础分组入口 |
+| `required` | 是否参与整体启动门槛；GPU 与 AnifLive 隔离依赖为可选项 |
 | `parent_resource_id` | 所属语音服务组件编号 |
 | `runtime_ready`、`can_start` | 该卡片运行依赖已就绪，不代表所有模型已通过真实显卡推理 |
 | `update_available` | 该已安装依赖需要更新；可选卡片的该字段不作为基础依赖门禁 |

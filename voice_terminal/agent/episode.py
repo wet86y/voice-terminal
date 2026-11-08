@@ -155,7 +155,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
     CONTEXT_ASSISTANT_CONTENT_CHARS = 4000
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
-                 options=None, tools_enabled=True, reasoning_mode="deep", persona_config=None,
+                 options=None, tools_enabled=True, reasoning_mode="fast", persona_config=None,
                  custom_instructions_provider=None, instruction_matcher=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  can_dispatch_final_silence=None,

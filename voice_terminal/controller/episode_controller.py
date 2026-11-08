@@ -140,7 +140,7 @@ class EpisodeController(RealtimeController):
                 self._early_silence_task = None
 
     def _make_episode(self):
-        mode = getattr(self, "reasoning_mode", "deep")
+        mode = getattr(self, "reasoning_mode", "fast")
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=True,
