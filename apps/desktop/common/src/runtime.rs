@@ -139,7 +139,7 @@ pub fn status(context:&LaunchContext)->Result<Value,String>{
     let components=vec![component(CPU_RESOURCE,"CPU（中央处理器）运行依赖",true,installed,full_ready,update_available),
         resources::native_runtime_status(context)?,component(GPU_RESOURCE,"GPU（图形处理器）运行依赖",false,gpu_installed,gpu_ready,gpu_installed&&!gpu_ready)];
     Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"full_ready":full_ready,"python":context.python,"version":record["python"],"update_available":update_available,"groups":groups,"components":components,
-        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"六个必需语音依赖组与基础锁定清单一致，不要求安装可选显卡或原生语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"必需运行环境的依赖锁版本可更新","groups":"内部共享依赖组","components":"语音服务下三个运行依赖卡片","ready":"该组就绪","reason":"未就绪原因"}}))
+        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"六个必需语音依赖组与基础锁定清单一致，不要求安装可选显卡或 AnifLive 语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"必需运行环境的依赖锁版本可更新","groups":"内部共享依赖组","components":"语音服务下三个运行依赖卡片","ready":"该组就绪","reason":"未就绪原因"}}))
 }
 /// current_for_upgrade（更新复用条件）：既有完整安装登记及依赖锁匹配，不创建解释器探测进程。
 pub(crate) fn current_for_upgrade(context:&LaunchContext)->Result<bool,String>{

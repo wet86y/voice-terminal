@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,14 +59,14 @@ def _episode(provider=None, *, conversation=None, ledger=None, **options):
     return runtime
 
 
-def test_config_runtime_and_public_snapshot_default_to_deep(tmp_path):
+def test_config_runtime_and_public_snapshot_default_to_fast(tmp_path):
     default_yaml = Path(__file__).resolve().parents[1] / "config/default.yaml"
-    assert load_config(default_yaml).llm.reasoning_mode == "deep"
-    assert AppConfig.from_mapping({}).llm.reasoning_mode == "deep"
-    assert _episode().reasoning_mode == "deep"
+    assert load_config(default_yaml).llm.reasoning_mode == "fast"
+    assert AppConfig.from_mapping({}).llm.reasoning_mode == "fast"
+    assert _episode().reasoning_mode == "fast"
     session = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "runtime")
-    assert session.snapshot().payload["reasoning_mode"] == "deep"
-    assert sanitize_runtime_snapshot({})["reasoning_mode"] == "deep"
+    assert session.snapshot().payload["reasoning_mode"] == "fast"
+    assert sanitize_runtime_snapshot({})["reasoning_mode"] == "fast"
 
 
 @pytest.mark.parametrize("mode", ["fast", "deep"])
@@ -88,7 +89,7 @@ def test_retired_and_invalid_modes_are_rejected_at_config_and_agent_boundaries(m
 
 def test_legacy_thinking_switch_cannot_enable_an_archived_action():
     config = AppConfig.from_mapping({"llm": {"thinking_action_enabled": True}})
-    assert config.llm.reasoning_mode == "deep"
+    assert config.llm.reasoning_mode == "fast"
     assert not hasattr(config.llm, "thinking_action_enabled")
     with pytest.raises(ValueError, match="已归档"):
         decision_schema([{"name": "request_thinking", "parameters": {}}])
@@ -144,8 +145,9 @@ def test_pause_switch_resume_updates_provider_effort_without_replacing_live_work
 ):
     """暂停后双向切换：Responses（响应接口）参数更新，原请求与会话历史保留。"""
     async def scenario():
+        config = replace(AppConfig.from_mapping({"llm": {"reasoning_mode": initial_mode}}), paths=None)
         session = SessionRuntime(
-            AppConfig.from_mapping({"llm": {"reasoning_mode": initial_mode}}),
+            config,
             runtime_data_dir=tmp_path / "runtime",
         )
         session._application_phased_startup = False

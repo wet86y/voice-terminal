@@ -184,7 +184,7 @@ function resourceJob(id: string) { return latestJobs.value.get(id) ?? (id === 'v
 function runtimeDescription(id: string) {
   if (id === 'voice-runtime-cpu') return '必需依赖，提供基础语音运行能力。更新会保留已安装的显卡能力。'
   if (id === 'voice-runtime-gpu') return '可选依赖，为流式识别、整句精修和声纹提供显卡运行能力；复用现有模型。安装后刷新环境检查，再选择模型运行位置。'
-  return '可选依赖，由本地 VoxCPM 语音合成模型共用；使用在线语音合成时无需安装。'
+  return '可选依赖，为 AnifLive 本地语音引擎提供隔离运行环境；使用在线语音合成时无需安装。'
 }
 function runtimeNeedsAction(resource: ManagedResourceRow) { return resource.state !== 'installed' || resource.updateAvailable || resourceRetryable(resource) }
 function rowCategory(row: LocalComponentRow): LocalComponentCategory {

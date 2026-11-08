@@ -45,12 +45,12 @@ class RuntimeHarness(InferenceRuntimeMixin):
         return self.inference_snapshot()
 
 
-def test_settings_18_upgrade_defaults_and_selection_roundtrip(tmp_path):
+def test_settings_18_upgrade_to_current_schema_defaults_and_selection_roundtrip(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text('{"schema_version":18,"silence":{"seconds":25}}', encoding="utf-8")
     config = AppConfig(model_dir=tmp_path)
     store = ProductSettingsStore(path=path, config=config)
-    assert store.settings_only()["schema_version"] == 19
+    assert store.settings_only()["schema_version"] == 20
     assert store.settings_only()["inference"] == {"backend": "deepseek"}
     legacy_path = tmp_path / "legacy-m3.json"
     legacy_path.write_text('{"schema_version":18}', encoding="utf-8")

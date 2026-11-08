@@ -6,6 +6,10 @@ $Repo=Get-ProjectRoot
 Enter-DesktopPipeline
 Push-Location $Repo
 try {
+  $VersionCheckPython=Join-Path $Repo '.local/runtimes/python/python.exe'
+  if (-not (Test-Path -LiteralPath $VersionCheckPython -PathType Leaf)) { throw '缺少本机 Python 运行环境，无法检查程序版本字段。' }
+  & $VersionCheckPython -B -X utf8 (Join-Path $Repo 'scripts/check-version-consistency.py')
+  if ($LASTEXITCODE) { throw '程序版本字段不一致，已停止 GitHub 发行。' }
   if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw '未找到 GitHub CLI（GitHub 命令行工具）gh。' }
   & gh auth status --hostname github.com *> $null
   if ($LASTEXITCODE) { throw 'GitHub CLI 尚未登录 github.com。' }

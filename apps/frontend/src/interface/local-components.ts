@@ -81,7 +81,7 @@ export interface LocalComponentRow {
   /** resourceChoices（可选模型）与 sharedResource（共用运行程序）：摘要显示状态，详情显示安装信息。 */
   resourceChoices?: ManagedResourceRow[]
   sharedResource?: ManagedResourceRow
-  /** runtimeDependencies（语音服务运行依赖）：中央处理器必需，原生语音与显卡可选。 */
+  /** runtimeDependencies（语音服务运行依赖）：中央处理器必需，AnifLive 本地语音与显卡可选。 */
   runtimeDependencies?: ManagedResourceRow[]
   /** runtimeDependencyMetrics（依赖进程指标）：按依赖编号提供独占进程采样，避免把共享进程重复记到模型卡。 */
   runtimeDependencyMetrics?: Record<string, {
@@ -148,9 +148,9 @@ export interface LocalDownloadItem {
   status?: string
   updateAvailable?: boolean
   busy?: boolean
-  /** optional（用户可选项）：用于 VoxCPM1／VoxCPM2 等可选本地模型。 */
+  /** optional（用户可选项）：用于 AnifLive 本地语音模型等可选组件。 */
   optional?: boolean
-  /** forcePlan（依赖待修复时强制读取安装计划）：本地语音模型文件已在，但共享运行程序尚未就绪。 */
+  /** forcePlan（依赖待修复时强制读取安装计划）：本地语音模型文件已在，但共用运行依赖尚未就绪。 */
   forcePlan?: boolean
   /** note（为何跳过或是否另行配置）。 */
   note?: string

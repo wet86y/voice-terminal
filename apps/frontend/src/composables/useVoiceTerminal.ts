@@ -80,7 +80,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
   const quietHours = reactive({ passive_quiet: false, user_interaction: false, within_quiet_hours: false })
   const inference = ref<import('../product/types').InferenceSnapshot | null>(null) // inference（服务端实际模型状态）。
-  const reasoningMode = ref<ReasoningMode>('deep') // reasoningMode（运行模式）：默认深度，仍可切换快速。
+  const reasoningMode = ref<ReasoningMode>('fast') // reasoningMode（运行模式）：默认快速，仍可切换深度。
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
   const currentLatency = reactive<LatencyValues>(createEmptyLatency())
@@ -649,7 +649,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     canStart.value = fixture.canStart ?? true
     wakeAlwaysOn.value = fixture.wakeAlwaysOn ?? false
     inputOwner.value = fixture.inputOwner ?? 'none'
-    reasoningMode.value = fixture.reasoningMode ?? 'deep'
+    reasoningMode.value = fixture.reasoningMode ?? 'fast'
     currentTurnId.value = fixture.current.turn_id ?? null
     Object.assign(current, createEmptyCurrentTurn(), fixture.current)
     Object.assign(currentLatency, createEmptyLatency(), fixture.currentLatency || {})

@@ -33,7 +33,7 @@ class InferenceRuntimeMixin:
                 "dsh_sync_pending": getattr(self, "_minimax_dsh_sync_pending", False),
                 "pending_backend": getattr(self, "_pending_inference", None),
                 "reasoning_mode_selectable": not mini,
-                "reasoning_effort": "low" if mini or getattr(self, "reasoning_mode", "deep") == "deep" else "none"}
+                "reasoning_effort": "low" if mini or getattr(self, "reasoning_mode", "fast") == "deep" else "none"}
 
     async def switch_inference(self, backend: str, *, persist=True):
         from .providers.deepseek import DeepSeekClient

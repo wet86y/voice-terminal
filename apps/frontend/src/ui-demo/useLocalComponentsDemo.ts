@@ -21,9 +21,9 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     { id: 'campplus-zh-cn-common', label: 'CAM++（中文通用声纹模型）', state: 'installed', status: '已安装' },
     { id: 'fsmn-vad', label: 'FSMN-VAD（语音活动检测）', state: 'missing', status: '未安装' },
     { id: 'streaming-punctuation', label: 'CTTransformerStreaming（流式标点）', state: 'missing', status: '未安装' },
-    { id: 'tts-voxcpm1', label: 'VoxCPM1（本地语音合成模型）', state: 'missing', status: '未安装', required: false },
-    { id: 'tts-voxcpm2', label: 'VoxCPM2（本地语音合成模型）', state: 'installed', status: '已安装', required: false },
-    { id: 'tts-audiocpp-runtime', label: 'audio.cpp（语音合成共享运行程序）', state: 'installed', status: '已安装', required: false },
+    { id: 'tts-aniflive-minimax-female-shaonv-zh', label: '中文少女声（通用基底）（AnifLive 本地语音）', state: 'missing', status: '未安装', required: false },
+    { id: 'tts-aniflive-tangyuge-v2pp-d78cf598', label: '唐语歌（中文微调）（AnifLive 本地语音）', state: 'installed', status: '已安装', required: false },
+    { id: 'tts-aniflive-runtime', label: 'AnifLive（本地语音引擎）隔离运行依赖', state: 'installed', status: '已安装', required: false },
     { id: 'dsh', label: 'DSH（代理执行宿主）', state: 'missing', status: '未安装' },
     { id: 'voice-server', label: 'Voice Server（语音服务）', state: 'installed', status: '已安装' },
     { id: 'voice-runtime-cpu', label: 'CPU（中央处理器）运行依赖', state: 'installed', status: '已安装', required: true },
@@ -81,7 +81,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       ],
       resource: resource && scene.value === 'error' && ['emotion', 'dsh'].includes(baseId)
         ? { ...resource, state: 'installed', status: '已安装', error: undefined } : resource,
-      runtimeDependencies: baseId === 'voice' ? ['voice-runtime-cpu', 'tts-audiocpp-runtime', 'voice-runtime-gpu']
+      runtimeDependencies: baseId === 'voice' ? ['voice-runtime-cpu', 'tts-aniflive-runtime', 'voice-runtime-gpu']
         .flatMap(id => resourceSamples.find(resource => resource.id === id) ?? []) : undefined,
       device: model ? {
         value: selectedDevices[item.id] ?? savedDevices[item.id] ?? model.device,
@@ -119,11 +119,11 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     const tts: LocalComponentRow = {
       id: 'tts', name: 'TTS（语音合成）', category: 'tts',
       state: 'ready', status: '本地模型已就绪', available: true,
-      runtime: 'audio.cpp（原生音频推理框架）',
-      description: '任一本地 VoxCPM 模型与共享运行程序就绪，或配置 MiniMax 在线 API，即可通过语音合成校验。',
+      runtime: 'AnifLive（本地语音引擎）',
+      description: '任一本地 AnifLive 模型与隔离运行依赖就绪，或配置 MiniMax 在线 API，即可通过语音合成校验。',
       facts: [], provider: providerSettings('minimax'),
-      resourceChoices: resourceSamples.filter(row => ['tts-voxcpm1', 'tts-voxcpm2'].includes(row.id)),
-      sharedResource: resourceSamples.find(row => row.id === 'tts-audiocpp-runtime'),
+      resourceChoices: resourceSamples.filter(row => row.id.startsWith('tts-aniflive-') && row.id !== 'tts-aniflive-runtime'),
+      sharedResource: resourceSamples.find(row => row.id === 'tts-aniflive-runtime'),
     }
     const deepseek: LocalComponentRow = {
       id: 'deepseek', name: '主语音推理（在线接口）', category: 'inference',

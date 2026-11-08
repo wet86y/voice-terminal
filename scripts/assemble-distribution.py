@@ -20,6 +20,8 @@ from voice_terminal.distribution import digest, files, manifest, safe_path, veri
 from voice_terminal.local_layout import default_portable
 from voice_terminal.paths import atomic_json
 
+PROJECT_VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8-sig"))["version"]  # PROJECT_VERSION（项目统一版本）。
+
 PART_SIZE = 1024 ** 3  # 分片（每片 1 GiB）。
 ARCHIVE_NAMES = {"app": "app.zip", "python": "runtime.zip", "webview2": "webview2.zip"}
 
@@ -290,7 +292,7 @@ def assemble(output: Path, desktop: Path, python_runtime: Path, webview2_runtime
          "manifest_sha256": digest(output / "runtimes/webview2/manifest.json")},
     ]
     app_record.update(
-        display_version="0.8.0",  # display_version（显示版本）。
+        display_version=PROJECT_VERSION,  # display_version（显示版本）。
         channel="distribution",  # channel（启动渠道）。
         required_components=["python", "webview2"],  # required_components（必需组件）。
         optional_components=["models", "dsh"],  # optional_components（可选组件）。
@@ -579,7 +581,7 @@ def assemble_reusing_qualification(output: Path, desktop: Path, baseline: Path,
                            "manifest_sha256": digest(output / relative / "manifest.json")})
     app_record = manifest(app, kind="app", build=datetime.now(timezone.utc).strftime("distribution-%Y%m%d-%H%M%S"))
     app_record.update(
-        display_version="0.8.0",  # display_version（显示版本）。
+        display_version=PROJECT_VERSION,  # display_version（显示版本）。
         channel="distribution",  # channel（启动渠道）。
         required_components=["python", "webview2"],  # required_components（启动必需组件）。
         optional_components=["models", "dsh"],  # optional_components（可选组件）。

@@ -1,5 +1,7 @@
 # 本地语音、独立音色库与提前合成
 
+> 历史技术记录（2026-10-14）：本文描述的 VoxCPM（旧本地语音模型）运行和音色设计流程已由 AnifLive（本地语音引擎）替代，不再作为现行操作指南。当前行为见 [TTS 运行说明](tts-runtime.md) 和 [AnifLive 接入记录](../development/aniflive-integration.md)。
+
 本指南说明 VoxCPM（本地语音模型）运行路由、按模型隔离的音色库与通用提前合成规则。资源安装与下载见[TTS 组件分发](tts-component-distribution-20261015.md)，播放事务与用户操作见[TTS 运行说明](tts-runtime.md)。
 
 ## 运行与音色

@@ -77,7 +77,7 @@ const overlay = ref<PreviewOverlay>(
 /** confirmPurpose（确认画面用途）：只决定文案，不执行退出或重启。 */
 const confirmPurpose = ref<"apply" | "exit">("apply");
 const toolsOpen = ref(false);
-const reasoningMode = ref<ReasoningMode>("deep"); // reasoningMode（运行模式）：默认深度。
+const reasoningMode = ref<ReasoningMode>("fast"); // reasoningMode（运行模式）：默认快速。
 const feedback = ref("");
 const feedbackError = ref(false);
 const resetKey = ref(0);
@@ -177,7 +177,7 @@ function resetPreview() {
   page.value = "home";
   scene.value = "normal";
   runtimeState.value = "standby";
-  reasoningMode.value = "deep";
+  reasoningMode.value = "fast";
   closeOverlays();
   resetKey.value += 1;
 }

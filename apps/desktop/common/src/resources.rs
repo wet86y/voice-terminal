@@ -379,7 +379,7 @@ pub(crate) fn inventory_raw(context:&LaunchContext)->Result<Vec<Value>,String>{
     let mut rows=vec![json!({"resource_id":"voice-server","label":"Voice Server（语音服务）","installation_state":if runtime["interpreter_ready"]==true{"installed"}else{"missing"},
         "required":true,"files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
         "runtime_components":runtime["components"],"update_available":runtime["update_available"],"source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else if runtime["update_available"]==true{json!("语音运行依赖有更新，请更新完整运行环境后再启动。")}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
-        "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部必需语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新必需组件","runtime_components":"语音服务下的中央处理器、原生语音与显卡运行依赖卡片","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
+        "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部必需语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新必需组件","runtime_components":"语音服务下的中央处理器、AnifLive 本地语音与显卡运行依赖卡片","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
     let catalog=specs(context)?;
     for item in &catalog {
         let root=destination(context,&item)?;

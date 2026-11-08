@@ -33,6 +33,7 @@
 - [在线切换、自动停听与状态提示](guides/runtime-switching.md)
 - [国内镜像与原站回退](guides/download-sources.md)
 - [模型运行环境配置指南](guides/模型运行环境配置指南.md)
+- [AnifLive（本地语音）接入与运行维护](development/aniflive-integration.md)
 - [应用生命周期](guides/application-lifecycle.md)
 - [ASR（自动语音识别）热词](guides/asr-hotwords.md)
 - [ASR 延迟与 CUDA（显卡计算平台）配置](guides/asr-latency-and-cuda.md)
@@ -43,8 +44,7 @@
 - [本地目录与覆盖发布](guides/local-layout.md)
 - [本地模型运行设备](guides/local-model-compute.md)
 - [音频增强：双路精修、情绪背景与声学信箱](guides/audio-enhancements.md)
-- [本地 TTS（语音合成）接入](guides/local-tts-integration-20261014.md)
-- [本地 TTS 日志与可观测性](guides/local-tts-observability-20261015.md)
+- [本地语音日志容量与旧后端诊断记录](guides/local-tts-observability-20261015.md)
 - [LLM JSON Schema（结构化数据约束）迁移](guides/llm-json-schema-migration.md)
 - [模型资源更新](guides/model-resource-updates.md)
 - [运行资源管理](guides/runtime-resource-management.md)
@@ -53,7 +53,6 @@
 - [可选声纹增强](guides/speaker-enhancement.md)
 - [启动与退出图标动画](guides/startup-logo-animation.md)
 - [流式标点补全](guides/streaming-punctuation.md)
-- [TTS 组件分发](guides/tts-component-distribution-20261015.md)
 - [TTS 运行说明](guides/tts-runtime.md)
 - [统一正式程序与分发安装器](guides/unified-product-installer.md)
 
@@ -61,6 +60,11 @@
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
 - [当前已知问题](testing/known-issues.md)
+- [AnifLive 模型导入匹配审计（2026-11-08）](testing/aniflive-import-audit-20261108.md)
+- [AnifLive 无人值守交付验收（2026-11-08）](testing/aniflive-unattended-delivery-20261108.md)
+- [AnifLive 无人值守构建验收（2026-11-07）](testing/aniflive-unattended-build-20261107.md)
+- [AnifLive 本机程序更新验收（2026-11-07）](testing/aniflive-local-update-20261107.md)
+- [v0.9.12 本机更新与 GitHub（代码托管平台）发行验收](testing/release-0.9.12-20261101.md)
 - [桌面现场验收](testing/desktop-acceptance.md)
 - [启动与维护界面连续性验收](testing/startup-ui-continuity.md)
 - [项目进程管理验收（2026-10-24）](testing/process-management-20261024.md)
@@ -110,6 +114,10 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v1.0.0 发行说明](releases/v1.0.0.md)
+- [v0.9.12 发行说明](releases/v0.9.12.md)
+- [v0.9.11 发行说明](releases/v0.9.11.md)
+- [v0.9.10 发行说明](releases/v0.9.10.md)
 - [v0.9.9 定时任务间隔、声纹拦截与进程管理](releases/v0.9.9.md)
 - [v0.9.8 持续倾听、声纹筛选与播报修订](releases/v0.9.8.md)
 - [v0.9.7 发行说明](releases/v0.9.7.md)

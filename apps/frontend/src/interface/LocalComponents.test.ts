@@ -218,17 +218,17 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     wrapper.unmount()
   })
 
-  it('共享框架任务只属于框架卡片，不激活两款本地模型的进度', async () => {
+  it('共享运行依赖任务只属于运行依赖卡片，不激活本地模型的进度', async () => {
     const value = model()
     value.rows[0]!.runtimeDependencies = [
       { id: 'voice-runtime-cpu', label: '中央处理器依赖', state: 'installed', status: '已安装', required: true },
-      { id: 'tts-audiocpp-runtime', label: '原生语音框架', state: 'missing', status: '缺失', required: false },
+      { id: 'tts-aniflive-runtime', label: 'AnifLive（本地语音引擎）隔离运行依赖', state: 'missing', status: '缺失', required: false },
     ]
-    value.rows.push(...['tts-voxcpm1', 'tts-voxcpm2'].map(id => ({ ...value.rows[0]!, id, name: id,
+    value.rows.push(...['tts-aniflive-minimax-female-shaonv-zh', 'tts-aniflive-tangyuge-v2pp-d78cf598'].map(id => ({ ...value.rows[0]!, id, name: id,
       category: 'tts' as const, runtimeDependencies: undefined,
       resource: { id, label: id, state: 'installed' as const, status: '已安装', required: false },
-      sharedResource: { id: 'tts-audiocpp-runtime', label: '原生语音框架', state: 'missing' as const, status: '缺失', required: false } })))
-    value.managedResourceJobs = [{ id: 'framework', resourceId: 'tts-audiocpp-runtime', label: '框架', state: 'running', phase: '下载固定资源', progressKind: 'download', canCancel: true }]
+      sharedResource: { id: 'tts-aniflive-runtime', label: 'AnifLive（本地语音引擎）隔离运行依赖', state: 'missing' as const, status: '缺失', required: false } })))
+    value.managedResourceJobs = [{ id: 'framework', resourceId: 'tts-aniflive-runtime', label: '运行依赖', state: 'running', phase: '下载固定资源', progressKind: 'download', canCancel: true }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
     expect(wrapper.find('[data-category="tts"] [data-job]').exists()).toBe(false)
     await expandCategory(wrapper, 'tts')
@@ -265,7 +265,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     const value = model()
     value.rows[0]!.runtimeDependencies = [
       { id: 'voice-runtime-cpu', label: 'CPU（中央处理器）运行依赖', state: 'installed', status: '已安装', required: true },
-      { id: 'tts-audiocpp-runtime', label: 'audio.cpp（语音合成引擎）运行依赖', state: 'missing', status: '缺失', required: false },
+      { id: 'tts-aniflive-runtime', label: 'AnifLive（本地语音引擎）隔离运行依赖', state: 'missing', status: '缺失', required: false },
       { id: 'voice-runtime-gpu', label: 'GPU（图形处理器）运行依赖', state: 'missing', status: '缺失', required: false },
     ]
     const wrapper = mount(LocalComponents, { props: { model: value } })
@@ -306,18 +306,18 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.rows = [{ id: 'tts', name: 'TTS（语音合成）', state: 'failed', status: '待配置', available: true,
       runtime: '在线或本地', description: '任一本地模型或在线接口可用即可启动。', facts: [],
       resourceChoices: [
-        { id: 'tts-voxcpm2', label: 'VoxCPM2（第二代模型）', state: 'missing', status: '缺失', required: false },
-        { id: 'tts-voxcpm1', label: 'VoxCPM1（第一代模型）', state: 'missing', status: '缺失', required: false },
+        { id: 'tts-aniflive-minimax-female-shaonv-zh', label: '中文少女声（通用基底）（AnifLive 本地语音）', state: 'missing', status: '缺失', required: false },
+        { id: 'tts-aniflive-tangyuge-v2pp-d78cf598', label: '唐语歌（中文微调）（AnifLive 本地语音）', state: 'missing', status: '缺失', required: false },
       ],
-      sharedResource: { id: 'tts-audiocpp-runtime', label: 'audio.cpp（共用运行程序）', state: 'missing', status: '缺失', required: false },
+      sharedResource: { id: 'tts-aniflive-runtime', label: 'AnifLive（本地语音引擎）隔离运行依赖', state: 'missing', status: '缺失', required: false },
     }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'tts', 'tts')
     expect(card.find('select').exists()).toBe(false)
-    expect(card.text()).toContain('VoxCPM2（第二代模型）')
-    expect(card.text()).toContain('VoxCPM1（第一代模型）')
-    await card.get('button[aria-label="VoxCPM2（第二代模型）：下载"]').trigger('click')
-    expect(wrapper.emitted('resourceDownload')).toEqual([['tts-voxcpm2']])
+    expect(card.text()).toContain('唐语歌（中文微调）（AnifLive 本地语音）')
+    expect(card.text()).toContain('中文少女声（通用基底）（AnifLive 本地语音）')
+    await card.get('button[aria-label="唐语歌（中文微调）（AnifLive 本地语音）：下载"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['tts-aniflive-tangyuge-v2pp-d78cf598']])
     expect(wrapper.find('[data-category="tts"] .category-download').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('自动准备共用运行程序')
     wrapper.unmount()
