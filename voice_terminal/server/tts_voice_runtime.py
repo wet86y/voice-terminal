@@ -37,10 +37,12 @@ class VoiceOperation:
     error: str | None = None  # error（可展示错误）。
     completed_monotonic: float | None = None  # 完成时刻，用于回收过期操作记录。
     ticket: Any = None  # ticket（同步预约的运行操作）。
+    playback_outcome: str | None = None  # playback_outcome（音频设备停止结果：stopped（已确认）或 unknown（未知））。
 
     def payload(self):
         return {"operation_id": self.id, "kind": self.kind, "state": self.state,
-                "model": self.request["model"], "result": self.result, "error": self.error}
+                "model": self.request["model"], "result": self.result, "error": self.error,
+                "playback_outcome": self.playback_outcome}
 
 class TtsVoiceOperationManager:
     """TtsVoiceOperationManager（音色任务管理）：同一运行时仅一个音色操作。"""
@@ -276,7 +278,14 @@ class TtsVoiceOperationManager:
             duration = len(pcm) / max(1, int(player.sample_rate) * int(player.channels) * 2)
             self._allow_user_initiated_playback(player, operation.id)
             player_allowed = True
-            player.enqueue(operation.id, pcm)
+            enqueue_async = getattr(player, "enqueue_async", None)
+            if callable(enqueue_async):
+                await enqueue_async(operation.id, pcm)
+            else:
+                player.enqueue(operation.id, pcm)
+            finish_stream = getattr(player, "finish_stream_async", None)
+            if callable(finish_stream):
+                await finish_stream(operation.id)
             await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
             if not player.has_started(operation.id):
                 raise TtsVoiceOperationError("试听音频未从当前输出设备播放，请检查静音策略或设备状态。")
@@ -285,8 +294,8 @@ class TtsVoiceOperationManager:
             if reader is not None:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if player is not None and player_allowed:
-                player.stop_and_snapshot(operation.id)
+            if player is not None and player_allowed and operation.playback_outcome != "stopped":
+                await self._confirm_playback_stop(operation, player)
             raise
         finally:
             operation.session = None
@@ -437,17 +446,59 @@ class TtsVoiceOperationManager:
         if player.channels == 2:
             pcm = np.repeat(mono.reshape(-1, 1), 2, axis=1).astype("<i2", copy=False).tobytes()
         self._allow_user_initiated_playback(player, operation.id)
-        player.enqueue(operation.id, pcm)
+        enqueue_async = getattr(player, "enqueue_async", None)
+        if callable(enqueue_async):
+            await enqueue_async(operation.id, pcm)
+        else:
+            player.enqueue(operation.id, pcm)
+        finish_stream = getattr(player, "finish_stream_async", None)
+        if callable(finish_stream):
+            await finish_stream(operation.id)
         duration = len(pcm) / (player.sample_rate * player.channels * 2)
         try:
             await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
             if not player.has_started(operation.id):
                 raise TtsVoiceOperationError("音频未从当前输出设备播放，请检查静音策略或设备状态。")
         finally:
-            player.stop_and_snapshot(operation.id)
+            if operation.playback_outcome != "stopped":
+                await self._confirm_playback_stop(operation, player)
         return {"asset_id": asset_id, "duration_ms": round(duration * 1000)}
 
+    @staticmethod
+    async def _confirm_playback_stop(operation, player):
+        stop = getattr(player, "stop_and_snapshot_confirmed", None)
+        if not callable(stop):
+            operation.playback_outcome = "unknown"
+            operation.error = operation.error or "音频设备未提供停止确认，播放结果未知。"
+            return None
+        try:
+            snapshot = await stop(operation.id)
+        except Exception as exc:
+            operation.playback_outcome = "unknown"
+            operation.error = operation.error or f"播放停止结果未知：{type(exc).__name__}。"
+            return None
+        operation.playback_outcome = "stopped"
+        return snapshot
+
     def cancel(self, operation_id):
+        item = self._items.get(operation_id)
+        if item is None:
+            raise KeyError("音色任务不存在。")
+        if item.state == "running":
+            player = getattr(self.runtime, "player", None)
+            stop = getattr(player, "stop_and_snapshot", None) if player is not None else None
+            if player is not None and not callable(stop):
+                raise TtsVoiceOperationError("当前音频设备需要异步停止确认，请使用 cancel_confirmed（确认取消）。")
+            if callable(stop):
+                stop(item.id)
+                item.playback_outcome = "stopped"
+            item.state = "cancelled"
+            if item.task:
+                item.task.cancel()
+        return item.payload()
+
+    async def cancel_confirmed(self, operation_id):
+        """Cancel a voice task and report whether the fixed output confirmed silence."""
         item = self._items.get(operation_id)
         if item is None:
             raise KeyError("音色任务不存在。")
@@ -455,7 +506,7 @@ class TtsVoiceOperationManager:
             item.state = "cancelled"
             player = getattr(self.runtime, "player", None)
             if player:
-                player.stop_and_snapshot(item.id)
+                await self._confirm_playback_stop(item, player)
             if item.task:
                 item.task.cancel()
         return item.payload()
@@ -463,7 +514,7 @@ class TtsVoiceOperationManager:
     async def close(self):
         item = self._items.get(self._active_id)
         if item:
-            self.cancel(item.id)
+            await self.cancel_confirmed(item.id)
             await asyncio.gather(item.task, return_exceptions=True)
 
     def _prune(self):

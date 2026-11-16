@@ -23,6 +23,7 @@
     "desktop:icons": "node scripts/generate-app-icons.mjs",
     "desktop:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-desktop.ps1",
     "desktop:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-desktop-product.ps1",
+    "desktop:prepare:client": "npm run desktop:prepare && .local\\runtimes\\python\\python.exe -B -X utf8 scripts/assemble-device-client-package.py",
     "desktop:deliver": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deliver-desktop.ps1",
     "desktop:dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/distribute-desktop.ps1",
     "github:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1",

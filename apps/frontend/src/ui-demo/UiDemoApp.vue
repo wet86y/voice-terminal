@@ -29,6 +29,7 @@ import {
 } from "./demo-data";
 import { voiceShadowReplayDemo } from './voice-shadow-replay'
 import { useVoiceSessionDemo } from './useVoiceSessionDemo'
+import type { DesktopSettingsSection } from '../interface/settings'
 
 // URL（页面地址）只记录展示选择，方便刷新和热更新后继续查看同一画面。
 const query = new URLSearchParams(window.location.search);
@@ -52,6 +53,10 @@ const page = ref<PreviewPage>(
     "home",
   ),
 );
+function setPreviewPage(section: DesktopSettingsSection) {
+  if (section === 'devices') return
+  page.value = section
+}
 const scene = ref<PreviewScene>(
   validChoice(
     query.get("scene"),
@@ -266,7 +271,7 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
       v-show="page !== 'home'"
       :section="page"
       @back="page = 'home'"
-      @section="page = $event"
+      @section="setPreviewPage"
       ><div
         v-if="page !== 'compute' && (scene === 'loading' || scene === 'error')"
         class="info-callout"

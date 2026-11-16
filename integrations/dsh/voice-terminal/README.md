@@ -1,24 +1,26 @@
 # Voice Terminal DSH 插件
 
-一个项目内 Bundle（功能包）`@voice-terminal/dsh-plugin`，包含桥接、项目唤醒任务、浏览器界面和影子代理预设。组件职责及依赖见 [`components.json`](components.json)（组件声明），完整维护流程见[DSH 插件维护手册](../../../docs/guides/dsh-plugin-maintenance.md)。
+一个项目内 Bundle（功能包）`@voice-terminal/dsh-plugin`，包含设备控制、桥接、项目唤醒任务、浏览器界面和影子代理预设。设备控制加载行目前提供根代理 `device_list`（设备列表）；观察复核和远端动作执行仍待接入。组件职责及依赖见 [`components.json`](components.json)（组件声明），完整维护流程见[DSH 插件维护手册](../../../docs/guides/dsh-plugin-maintenance.md)。
 
 安装只操作项目 `.local/build/dsh`。工具名、HTTP（网络接口）路径、Loader（加载器）行标识、设置命名空间、消息来源和任务存储格式保留历史契约。
 
 - 根入口：桥接 `voice-terminal-shadow-bridge`（语音会话桥接）。
+- 子入口 `./device-control`：`voice-terminal-device-control`（已绑定根代理的设备列表）。
 - 子入口 `./wake-tasks`：`voice-terminal-wake-tasks`（项目唤醒任务）。
 - `lib/client.js`：官方浏览器模块闭包（设置页与消息渲染）。
-- `cordis.patch.yml`：两个宿主组件及 `preset-shadow-agent`（影子代理预设）的组合补丁，由构建生成。
+- `cordis.patch.yml`：三个宿主组件及 `preset-shadow-agent`（影子代理预设）的组合补丁，由构建生成。
 
 在插件目录运行 `npm test`：执行类型检查、组件依赖检查、官方浏览器构建和回归测试。项目安装使用 `scripts/setup-dsh.ps1`；已有锁定宿主可使用 `-Offline -SkipInstall`（离线且跳过宿主依赖安装），最后用 `-Offline -ValidateOnly`（离线只校验）。
 
 项目唤醒任务使用 `storages/voice-terminal-wake-tasks.json`（任务存储），与官方 `schedule_*`（会话调度工具）独立。已有官方 Automation（自动化）功能包选择会保留。冻结参考上下文只在 `read_wake_reference`（读取任务参考）调用时读取，不自动注入模型。
 
-桥接协议保持 2.0；9 个根代理工具均只用于其绑定的根代理，其中 `capture_screen`（按需截屏工具）通过受鉴权接口获取当前屏幕双图。终结型回执保留激活水位与幂等规则。预设保留原有默认工具、压缩、子代理和工作流能力。
+桥接协议保持 2.0；桥接工具和设备工具只用于各自已绑定的根代理，其中 `capture_screen`（按需截屏工具）通过受鉴权接口获取当前屏幕双图，`device_list`（设备列表）读取核心主机的统一设备快照。终结型回执保留激活水位与幂等规则。预设保留原有默认工具、压缩、子代理和工作流能力。
 
 运行轨迹通过根代理公开实时流的 `reasoning-delta`（思考增量）及 `tool/call`、`tool/result`（工具开始与结果）回调到工作台固定单槽。`action_seq`（动作序号）统一排序思考、工具和运行状态；旧会话、旧激活及乱序动作拒收。工具仅显示名称与状态，思考正文仅留在有界界面内存中。字段、取消方式和拒收规则见 [Bridge 2.0（桥接协议）活动端点](../../../docs/architecture/bridge-2.0-protocol.md)。
 
 | 组件 | 保留能力 |
 | --- | --- |
+| 设备控制（开发中） | 派生上游观察缓存和常驻桌面辅助进程，按设备及连接、执行器代次隔离；远程工具与设备路由尚未接入。 |
 | 桥接 | 上下文合并与安全门禁、旁路文字读取、按需屏幕双图捕获、进度与信息发布、提前静默、澄清、结果与无需动作终态、状态观察、会话导出与解绑 |
 | 项目唤醒任务 | 规则解析、创建／查询／修改／取消、持久删除确认、旧项目任务迁移、重启恢复、冻结参考按需读取、语音事件发布 |
 | 浏览器 | 官方设置表单、工作区和模型选择、推理强度、恢复提示、桥接消息渲染及语言资源 |

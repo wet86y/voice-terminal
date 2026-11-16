@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from tests.test_tts_voices import _wav_bytes
 from voice_terminal.tts.voices import ModelVoiceLibraries
-from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager
+from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager, TtsVoiceOperationError
 from unittest.mock import AsyncMock
 
 
@@ -147,6 +147,34 @@ def test_cancelled_voice_operation_cannot_publish_late_result(tmp_path):
         result = manager.get(operation["operation_id"])
         assert result["state"] == "cancelled" and result["result"] is None
         assert not manager.busy
+    asyncio.run(scenario())
+
+
+def test_sync_cancel_requires_async_stop_confirmation_for_remote_player(tmp_path):
+    async def scenario():
+        player = SimpleNamespace(stop_and_snapshot_confirmed=AsyncMock(return_value=None))
+        manager = TtsVoiceOperationManager(SimpleNamespace(
+            voice_library=ModelVoiceLibraries(tmp_path), player=player,
+        ))
+        entered = asyncio.Event()
+
+        async def runner(_item):
+            entered.set()
+            await asyncio.Event().wait()
+
+        operation = manager._new("transcribe", {"model": "aniflive"}, runner)
+        await entered.wait()
+        with pytest.raises(TtsVoiceOperationError, match="异步停止确认"):
+            manager.cancel(operation["operation_id"])
+        item = manager._items[operation["operation_id"]]
+        assert item.state == "running"
+        player.stop_and_snapshot_confirmed.assert_not_awaited()
+
+        await manager.cancel_confirmed(operation["operation_id"])
+        await item.task
+        player.stop_and_snapshot_confirmed.assert_awaited_once_with(operation["operation_id"])
+        assert item.playback_outcome == "stopped"
+
     asyncio.run(scenario())
 
 

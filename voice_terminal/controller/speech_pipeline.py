@@ -253,10 +253,12 @@ class SpeechPipeline:
             if self.player is not None else 32000 * 2
         )
 
-        def reject_audio() -> None:
+        async def reject_audio() -> None:
             """异常生成立即停止待播队列，已经听到的正文不自动重播。"""
             if self.player is not None:
-                self.player.stop_and_snapshot(playback_key)
+                stop = getattr(self.player, "stop_and_snapshot_confirmed", None)
+                if callable(stop):
+                    await stop(playback_key)
         await synthesis_permission()
         if not self._valid(token) or not ws.committed:
             return ""
@@ -631,7 +633,11 @@ class SpeechPipeline:
                             return
                         if getattr(active_session, "audio_rejected", False):
                             return
-                        self.player.enqueue(playback_key, pcm)
+                        enqueue_async = getattr(self.player, "enqueue_async", None)
+                        if callable(enqueue_async):
+                            await enqueue_async(playback_key, pcm)
+                        else:
+                            self.player.enqueue(playback_key, pcm)
                         if not first_enqueued:
                             first_enqueued = True
                             ready_at = getattr(active_session, "first_audio_ready_at", None)
@@ -662,8 +668,11 @@ class SpeechPipeline:
                     await emit_progress(status="STREAMING", trigger="audio_received")
                     await self._latency(ws)
             finally:
+                finish_stream_async = getattr(self.player, "finish_stream_async", None)
                 finish_stream = getattr(self.player, "finish_stream", None)
-                if callable(finish_stream):
+                if callable(finish_stream_async):
+                    await finish_stream_async(playback_key)
+                elif callable(finish_stream):
                     finish_stream(playback_key)
                 close = getattr(audio_iterator, "aclose", None) if audio_iterator is not None else None
                 if close is not None:
@@ -1125,7 +1134,7 @@ class SpeechPipeline:
                 state.close()
                 progress_stop.set()
                 if getattr(exc, "discard_audio", False):
-                    reject_audio()
+                    await reject_audio()
                     self.state.current["tts_status"] = "DEGRADED"
                     await self._detail("tts.status", provider=tts_backend, status="DEGRADED",
                                        waiting_text="", audio_buffer_ms=0, error=str(exc))

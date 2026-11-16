@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-worker-desktop-helper-health"
+description = "Enables the device_worker_desktop_helper_health command without any pre-configured scope."
+commands.allow = ["device_worker_desktop_helper_health"]
+
+[[permission]]
+identifier = "deny-device-worker-desktop-helper-health"
+description = "Denies the device_worker_desktop_helper_health command without any pre-configured scope."
+commands.deny = ["device_worker_desktop_helper_health"]

@@ -316,6 +316,45 @@ def test_private_pipe_honors_exit_budget_and_rejects_malformed_messages(monkeypa
         assert before + budget <= application.shutdown_deadline <= time.monotonic() + budget
 
 
+def test_desktop_device_helper_rpc_is_scoped_and_matches_one_private_pipe_reply():
+    application = SimpleNamespace(loop=None, exit_event=asyncio.Event())
+    control = DesktopControl(application)
+    sent = []
+
+    async def run_valid_call():
+        loop = asyncio.get_running_loop()
+        application.loop = loop
+        request_id = "task-123"
+
+        def send(kind, **values):
+            sent.append((kind, values))
+            loop.call_soon(control._settle_device_helper, {
+                "protocol": 1, "kind": "device_helper_response", "request_id": request_id,
+                "ok": True, "response": {"protocol_version": 1, "request_id": request_id,
+                    "ok": True, "result": {"windows": []}},
+            })
+
+        control.send = send
+        return await control.call_device_helper({
+            "request_id": request_id, "device_id": "local", "operation": "windows",
+            "arguments": {}, "timeout_ms": 1000,
+            "connection_generation": 1, "executor_generation": 1,
+        })
+
+    result = asyncio.run(run_valid_call())
+    assert result["request_id"] == "task-123"
+    assert sent[0][0] == "device_helper_request"
+    assert sent[0][1]["device_id"] == "local"
+    for payload in (
+        {"request_id": "task-2", "device_id": "remote", "operation": "windows", "arguments": {}, "timeout_ms": 1000,
+         "connection_generation": 1, "executor_generation": 1},
+        {"request_id": "task-3", "device_id": "local", "operation": "powershell", "arguments": {}, "timeout_ms": 1000,
+         "connection_generation": 1, "executor_generation": 1},
+    ):
+        with pytest.raises(ValueError):
+            asyncio.run(control.call_device_helper(payload))
+
+
 def test_desktop_ready_frame_carries_one_time_token_only_over_private_pipe(monkeypatch):
     from voice_terminal.application import desktop
     output = io.StringIO()

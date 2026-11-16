@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..asr.client import AsrWorkerClient
-from ..audio.capture import AudioCapture
-from ..audio.player import PcmPlayer, PlaybackSnapshot
-from ..audio.processing import AudioPreprocessor
+from ..devices.contracts import CapturePort, PlaybackPort, ProcessingPort
+from ..audio.player import PlaybackSnapshot
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
@@ -23,16 +23,16 @@ class InputController:
     """V0.6 shared device/input lifecycle, without an answer pipeline."""
 
     def __init__(self, *, state: RuntimeState, bus: EventBus, history: Any,
-                 capture: AudioCapture | None, kws: KwsWorker | None,
+                 capture: CapturePort | None, kws: KwsWorker | None,
                  vad: FsmnVadDetector | None, asr: AsrWorkerClient | None,
                  llm: DeepSeekClient | None, tts: MiniMaxTtsClient | None,
-                 player: PcmPlayer | None, wake_enabled: bool, wake_keyword: str,
+                 player: PlaybackPort | None, wake_enabled: bool, wake_keyword: str,
                  wake_preroll_ms: int, vad_min_speech_ms: int,
                  vad_end_silence_ms: int, max_turn_ms: int, bridge_min_chars: int,
                  bridge_max_chars: int, bridge_max_wait_ms: int, bridge_breaks: str,
                  wake_always_on: bool = False,
                  wake_keywords: Sequence[str] | None = None,
-                 audio_processor: AudioPreprocessor | None = None,
+                 audio_processor: ProcessingPort | None = None,
                  aec_failure_policy: str = "pause_recover",
                  barge_in_gate: BargeInGate | None = None,
                  listening_start_allowed: Callable[[], bool] | None = None) -> None:
@@ -64,6 +64,7 @@ class InputController:
         self._turn_cancel: asyncio.Event | None = None
         self._active_input = False
         self._closed = False
+        self._last_playback_stop_unknown = False  # _last_playback_stop_unknown（最近一次设备停止是否未确认）。
         self._loop: asyncio.AbstractEventLoop | None = None
         if self.asr is not None:
             self.asr.on_result = self._on_asr_result
@@ -200,9 +201,17 @@ class InputController:
             self.state.current["audio_processing_error"] = self.audio_processor.error or ""
         return processed
 
-    def _stop_playback_snapshot(self, key: str | None = None) -> PlaybackSnapshot | None:
+    async def _stop_playback_snapshot(self, key: str | None = None) -> PlaybackSnapshot | None:
+        self._last_playback_stop_unknown = False
         if self.player is None:
             return None
+        stop = getattr(self.player, "stop_and_snapshot_confirmed", None)
+        if callable(stop):
+            try:
+                return await stop(key)
+            except Exception:
+                self._last_playback_stop_unknown = True
+                return None
         stop = getattr(self.player, "stop_and_snapshot", None)
         if callable(stop):
             return stop(key)
@@ -210,6 +219,11 @@ class InputController:
         if callable(block):
             block()
         return None
+
+    async def _confirmed_stop_snapshot(self, key: str | None = None) -> PlaybackSnapshot | None:
+        """Accept legacy synchronous test doubles while production awaits device receipts."""
+        result = self._stop_playback_snapshot(key)
+        return await result if inspect.isawaitable(result) else result
 
     @staticmethod
     def _add_playback_delivery_fields(delivery: dict[str, Any], snapshot: PlaybackSnapshot | None) -> dict[str, Any]:

@@ -113,7 +113,7 @@ try {
   const entries = []
   function walk(tree) { for (const entry of Object.values(tree.store)) { entries.push(entry); if (entry.subtree) walk(entry.subtree) } }
   walk(ctx.loader)
-  for (const id of ['voice-terminal-shadow-bridge', 'voice-terminal-wake-tasks', 'preset-shadow-agent']) {
+  for (const id of ['voice-terminal-device-control', 'voice-terminal-shadow-bridge', 'voice-terminal-wake-tasks', 'preset-shadow-agent']) {
     assert.equal(entries.filter(entry => entry.options.id === id || entry.id === id).length, 1, `${id} 只加载一次`)
   }
   // 通过 Loader（加载器）拥有的 Fiber（生命周期）释放组件，验证无遗留代理或路由。

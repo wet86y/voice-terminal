@@ -55,45 +55,48 @@ def test_reclock_rebuilds_cue_and_synchronizes_reference_before_start(old, new):
     assert len(player._wake_cue_pcm) == round(new * .18) * 2
 
 
-@pytest.mark.parametrize("old_rate", [16000, 32000])
-def test_remote_to_v2_changes_all_output_clocks_without_replacing_player(old_rate):
+@pytest.mark.parametrize("online_rate", [16000, 48000])
+def test_switching_online_to_aniflive_uses_native_rate_without_replacing_player(online_rate):
     async def scenario():
         runtime = SessionRuntime.__new__(SessionRuntime)
-        runtime.config = replace(AppConfig(), tts=replace(AppConfig().tts, sample_rate=old_rate))
+        defaults = AppConfig()
+        runtime.config = replace(defaults, tts=replace(
+            defaults.tts, backend="minimax", sample_rate=online_rate, online_sample_rate=online_rate,
+        ))
         previous = runtime.tts = SimpleNamespace(shutdown=AsyncMock())
-        player = runtime.player = PcmPlayer(sample_rate=old_rate, channels=1, output_device=None)
+        player = runtime.player = PcmPlayer(sample_rate=online_rate, channels=1, output_device=None)
         player.start = Mock()
-        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=old_rate)
+        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=online_rate)
         runtime._pending_local_tts_rate = None
         runtime.state = SimpleNamespace(current={})
         runtime.controller = None
         runtime._active_voice_snapshot = lambda model: None
         runtime._build_tts_clients = lambda: (None, SimpleNamespace(
             ensure_ready=AsyncMock(), sample_rate=runtime.config.tts.sample_rate))
-        await runtime.switch_tts_selection("voxcpm1", "voxcpm2")
+        await runtime.switch_tts_selection("aniflive", "local-model")
         assert runtime.player is player
-        assert runtime.config.tts.sample_rate == runtime.tts.local.sample_rate == 48000
-        assert player.sample_rate == runtime.audio_processor.reverse_sample_rate == 48000
+        assert runtime.config.tts.sample_rate == runtime.tts.local.sample_rate == 32000
+        assert player.sample_rate == runtime.audio_processor.reverse_sample_rate == 32000
         previous.shutdown.assert_awaited_once()
     asyncio.run(scenario())
 
-@pytest.mark.parametrize("old_model,new_model,rate", [
-    ("voxcpm1", "voxcpm2", 48000), ("voxcpm2", "voxcpm1", 16000),
-])
-def test_local_model_sync_keeps_player_and_reverse_clock_aligned(old_model, new_model, rate):
+@pytest.mark.parametrize("previous_rate", [16000, 48000])
+def test_local_model_sync_keeps_player_and_reverse_clock_at_aniflive_rate(previous_rate):
     async def scenario():
         runtime = SessionRuntime.__new__(SessionRuntime)
-        runtime.config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1", "local_model": old_model}})
-        old_rate = runtime.config.tts.sample_rate
-        runtime.tts = SimpleNamespace(local=SimpleNamespace(sample_rate=old_rate))
-        player = runtime.player = PcmPlayer(sample_rate=old_rate, channels=1, output_device=None)
+        defaults = AppConfig()
+        runtime.config = replace(defaults, tts=replace(
+            defaults.tts, backend="aniflive", local_model="previous-model", sample_rate=previous_rate,
+        ))
+        runtime.tts = SimpleNamespace(local=SimpleNamespace(sample_rate=previous_rate))
+        player = runtime.player = PcmPlayer(sample_rate=previous_rate, channels=1, output_device=None)
         player.start = Mock()
-        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=old_rate)
+        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=previous_rate)
         runtime.state = SimpleNamespace(current={})
-        await runtime._sync_local_tts_sample_rate(new_model)
+        await runtime._sync_local_tts_sample_rate("next-model")
         assert runtime.player is player
-        assert runtime.config.tts.sample_rate == runtime.tts.local.sample_rate == rate
-        assert player.sample_rate == runtime.audio_processor.reverse_sample_rate == rate
+        assert runtime.config.tts.sample_rate == runtime.tts.local.sample_rate == 32000
+        assert player.sample_rate == runtime.audio_processor.reverse_sample_rate == 32000
     asyncio.run(scenario())
 
 
@@ -211,67 +214,82 @@ def test_degenerate_audio_stops_pipeline_and_reports_failure_without_replay():
 def test_failed_device_reclock_restores_previous_output_clocks():
     async def scenario():
         runtime = SessionRuntime.__new__(SessionRuntime)
-        runtime.config = AppConfig()
+        defaults = AppConfig()
+        runtime.config = replace(defaults, tts=replace(
+            defaults.tts, backend="minimax", sample_rate=48000, online_sample_rate=48000,
+        ))
         previous = runtime.tts = SimpleNamespace(shutdown=AsyncMock())
         runtime.controller = None
         runtime.state = SimpleNamespace(current={})
         runtime._pending_local_tts_rate = None
-        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=32000)
-        runtime.player = PcmPlayer(sample_rate=32000, channels=1, output_device=None)
+        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=48000)
+        runtime.player = PcmPlayer(sample_rate=48000, channels=1, output_device=None)
         attempts = []
         def start():
             attempts.append(runtime.player.sample_rate)
-            if runtime.player.sample_rate == 48000:
-                raise RuntimeError("模拟设备拒绝 48 kHz")
+            if runtime.player.sample_rate == 32000:
+                raise RuntimeError("模拟设备拒绝 32 kHz")
         runtime.player.start = start
         runtime._active_voice_snapshot = lambda model: None
-        local = SimpleNamespace(ensure_ready=AsyncMock(), close=AsyncMock())
+        local = SimpleNamespace(ensure_ready=AsyncMock(), close=AsyncMock(), sample_rate=32000)
         runtime._build_tts_clients = lambda: (None, local)
         with pytest.raises(RuntimeError, match="设备拒绝"):
-            await runtime.switch_tts_selection("voxcpm1", "voxcpm2")
+            await runtime.switch_tts_selection("aniflive", "local-model")
         assert runtime.tts is previous
-        assert runtime.config.tts.sample_rate == runtime.player.sample_rate == 32000
-        assert runtime.audio_processor.reverse_sample_rate == 32000
-        assert attempts == [48000, 32000]
+        assert runtime.config.tts.sample_rate == runtime.player.sample_rate == 48000
+        assert runtime.audio_processor.reverse_sample_rate == 48000
+        assert attempts == [32000, 48000]
         local.close.assert_awaited_once()
     asyncio.run(scenario())
 
 
-def test_local_model_device_failure_rolls_back_native_model_and_all_clocks():
+def test_local_model_switch_failure_preserves_selection_and_all_clocks():
     async def scenario():
         runtime = SessionRuntime.__new__(SessionRuntime)
-        runtime.config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1", "local_model": "voxcpm1"}})
-        local = SimpleNamespace(sample_rate=16000)
-        runtime.tts = SimpleNamespace(local=local, switch_local_model=AsyncMock())
-        runtime.player = PcmPlayer(sample_rate=16000, channels=1, output_device=None)
-        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=16000)
+        defaults = AppConfig()
+        runtime.config = replace(defaults, tts=replace(
+            defaults.tts, backend="aniflive", local_model="current-model", sample_rate=32000,
+        ))
+        local = SimpleNamespace(sample_rate=32000, model_status=lambda: {"loaded_model": "current-model"})
+        runtime.tts = SimpleNamespace(
+            local=local,
+            switch_local_model=AsyncMock(side_effect=RuntimeError("模拟本地模型切换失败")),
+        )
+        runtime.player = PcmPlayer(sample_rate=32000, channels=1, output_device=None)
+        runtime.audio_processor = AudioPreprocessor(reverse_sample_rate=32000)
         runtime._pending_local_tts_rate = None
         runtime.state = SimpleNamespace(current={})
-        def start():
-            if runtime.player.sample_rate == 48000:
-                raise RuntimeError("模拟本地模型设备换率失败")
-        runtime.player.start = start
-        with pytest.raises(RuntimeError, match="设备换率失败"):
-            await runtime.switch_tts_selection("voxcpm1", "voxcpm2")
-        assert [call.args[0] for call in runtime.tts.switch_local_model.call_args_list] == ["voxcpm2", "voxcpm1"]
-        assert runtime.config.tts.local_model == "voxcpm1"
-        assert runtime.config.tts.sample_rate == local.sample_rate == 16000
-        assert runtime.player.sample_rate == runtime.audio_processor.reverse_sample_rate == 16000
+        with pytest.raises(RuntimeError, match="模型切换失败"):
+            await runtime.switch_local_tts_model("next-model")
+        runtime.tts.switch_local_model.assert_awaited_once_with("next-model", revision=None)
+        assert runtime.config.tts.local_model == "current-model"
+        assert runtime.config.tts.sample_rate == local.sample_rate == 32000
+        assert runtime.player.sample_rate == runtime.audio_processor.reverse_sample_rate == 32000
         assert runtime._local_tts_load_state == "ready"
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("backend,model,available,rate", [
-    ("minimax", "voxcpm2", [], 32000),
-    ("voxcpm1", "voxcpm2", ["voxcpm2"], 48000),
-    ("voxcpm1", "voxcpm1", ["voxcpm1"], 16000),
+@pytest.mark.parametrize("backend,model,configured_rate,rate", [
+    ("minimax", "minimax-female-shaonv-zh", 48000, 48000),
+    ("aniflive", "local-model", 16000, 32000),
 ])
-def test_startup_selection_and_first_player_share_native_reverse_rate(tmp_path, monkeypatch, backend, model, available, rate):
+def test_startup_selection_and_first_player_share_backend_reverse_rate(tmp_path, monkeypatch, backend, model,
+                                                                       configured_rate, rate):
+    from voice_terminal.tts.aniflive_models import AnifLiveModelRegistry
+
+    defaults = AppConfig()
     runtime = SessionRuntime.__new__(SessionRuntime)
-    runtime.config = replace(AppConfig(), tts=replace(AppConfig().tts, backend=backend, local_model=model))
+    runtime.config = replace(defaults, tts=replace(
+        defaults.tts, backend=backend, local_model=model,
+        sample_rate=configured_rate, online_sample_rate=configured_rate,
+    ))
     runtime._runtime_local_root = tmp_path
+    runtime._tts_voice_root = tmp_path / "data" / "tts"
     runtime._api_key = lambda name: "test-minimax-api-key" if backend == "minimax" else ""
-    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root, **_kwargs: available)
+    monkeypatch.setattr(
+        AnifLiveModelRegistry, "resolve",
+        lambda _self, _model, _revision=None: (tmp_path / "model", "a" * 24, {}),
+    )
     runtime._select_available_tts()
     assert runtime.config.tts.sample_rate == rate
     runtime.player = None

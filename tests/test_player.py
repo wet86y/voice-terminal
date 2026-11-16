@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from voice_terminal.audio.player import PcmPlayer
 
@@ -41,6 +43,79 @@ class PcmPlayerTests(unittest.TestCase):
         self.assertEqual(after["enqueued_ms"], 1000)
         self.assertEqual(after["played_ms"], 500)
         self.assertEqual(after["buffered_ms"], 500)
+
+
+class PcmPlayerRemoteOutputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_pause_and_resume_route_to_the_playback_key_device(self) -> None:
+        player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
+        transactions = SimpleNamespace(
+            pause_confirmed=AsyncMock(return_value=True),
+            resume_confirmed=AsyncMock(return_value=True),
+        )
+        player.configure_remote_output(
+            enqueue=AsyncMock(return_value=True),
+            is_bound=lambda key: key == "remote-speech",
+            progress=lambda _key: None,
+            buffered_ms=lambda _key: 0,
+            wait_until_complete=AsyncMock(),
+            finish_stream=AsyncMock(),
+            transactions=lambda key: transactions if key == "remote-speech" else None,
+        )
+
+        self.assertTrue(await player.pause_confirmed("remote-speech"))
+        self.assertTrue(await player.resume_confirmed("remote-speech"))
+        transactions.pause_confirmed.assert_awaited_once_with("remote-speech")
+        transactions.resume_confirmed.assert_awaited_once_with("remote-speech")
+
+    async def test_async_enqueue_uses_remote_route_and_waits_for_device_completion(self) -> None:
+        player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
+        remote_enqueue = AsyncMock(return_value=True)
+        remote_finish = AsyncMock(return_value=True)
+        remote_wait = AsyncMock(return_value=None)
+        player.configure_remote_output(
+            enqueue=remote_enqueue,
+            is_bound=lambda key: key == "remote-speech",
+            progress=lambda key: {
+                "key": key, "enqueued_ms": 20, "played_ms": 20, "buffered_ms": 0,
+                "output_estimated_ms": 20, "started": True, "precision": "device_time",
+                "host_output_time": 10.0,
+            },
+            buffered_ms=lambda _key: 0,
+            wait_until_complete=remote_wait,
+            finish_stream=remote_finish,
+            transactions=lambda _key: None,
+        )
+        player.allow("remote-speech")
+        await player.enqueue_async("remote-speech", b"\x01\x00" * 320)
+        await player.finish_stream_async("remote-speech")
+        await player.wait_until_output_complete(timeout_seconds=1.0)
+
+        remote_enqueue.assert_awaited_once_with("remote-speech", 16_000, b"\x01\x00" * 320)
+        remote_finish.assert_awaited_once_with("remote-speech")
+        remote_wait.assert_awaited_once_with("remote-speech", 1.0)
+        self.assertEqual(player._buffered_bytes, 0)
+        self.assertEqual(player.progress("remote-speech")["output_estimated_ms"], 20)
+        self.assertTrue(player.has_started("remote-speech"))
+
+    async def test_remote_enqueue_failure_never_falls_back_to_local_audio(self) -> None:
+        player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
+
+        async def fail_remote(_key: str, _rate: int, _pcm: bytes) -> bool:
+            raise RuntimeError("media channel lost")
+
+        player.configure_remote_output(
+            enqueue=fail_remote,
+            is_bound=lambda _key: False,
+            progress=lambda _key: None,
+            buffered_ms=lambda _key: 0,
+            wait_until_complete=AsyncMock(),
+            finish_stream=AsyncMock(),
+            transactions=lambda _key: None,
+        )
+        player.allow("remote-speech")
+        with self.assertRaisesRegex(RuntimeError, "media channel lost"):
+            await player.enqueue_async("remote-speech", b"\x01\x00" * 320)
+        self.assertEqual(player._buffered_bytes, 0)
 
 
 if __name__ == "__main__":

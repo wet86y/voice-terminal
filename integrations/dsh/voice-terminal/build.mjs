@@ -51,12 +51,15 @@ async function compile(directory) {
 }
 const hostLock = JSON.parse((await readFile(resolve(repo, 'config/dsh/runtime.lock.json'), 'utf8')).replace(/^\uFEFF/u, ''))
 const sourcePackage = JSON.parse(await readFile(resolve(sourceRoot, 'package.json'), 'utf8'))
+const hostRequire = createRequire(resolve(sourceRoot, 'packages/session/session-projection/package.json'))
+const hostZod = JSON.parse(await readFile(hostRequire.resolve('zod/package.json'), 'utf8'))
 const pluginPeers = Object.entries(manifest.peerDependencies)
 if (sourcePackage.version !== hostLock.version
   || pluginPeers.some(([name, version]) => name.startsWith('@deepseek-ai/dsh-') && version !== hostLock.version)
   || manifest.engines?.dsh !== hostLock.version
   || manifest.peerDependencies['@deepseek-ai/cordis'] !== '~4.0.5'
   || manifest.dependencies['@deepseek-ai/schemastery'] !== '~3.18.5'
+  || manifest.dependencies.zod !== hostZod.version
   || manifest.devDependencies['@deepseek-ai/cordis-plugin-loader'] !== '~1.0.6') {
   throw new Error('插件源码、兼容范围或 DSH（代理宿主）依赖尚未同步至目标版本')
 }
@@ -80,6 +83,11 @@ if (/tools\.restrict|exact safe tool surface/u.test(composition)) throw new Erro
 const presetPatch = `- insert:\n    - id: preset-shadow-agent\n      name: '@deepseek-ai/dsh-agent-preset'\n      config:\n        id: shadow-agent\n        name: ${yamlField('name')}\n        description: ${yamlField('description')}\n        order: 5\n        plugins:\n${composition.split(/\r?\n/u).map(line => `          ${line}`).join('\n')}\n`
 await writeFile(resolve(outputRoot, 'cordis.patch.yml'), `${(await readFile(resolve(here, 'host.patch.yml'), 'utf8')).trimEnd()}\n${presetPatch}`)
 for (const file of ['package.json', 'README.md', 'components.json']) await copyFile(resolve(here, file), resolve(outputRoot, file))
+// 上游观察代码为 MIT（宽松开源许可证）派生，功能包必须携带原始版权和许可。
+await copyFile(resolve(repo, 'licenses/dsh-windows-remote-ssh-MIT.txt'), resolve(outputRoot, 'dsh-windows-remote-ssh-MIT.txt'))
+const deviceNative = resolve(outputRoot, 'native/win32') // deviceNative（设备辅助进程打包目录）。
+await mkdir(deviceNative, { recursive: true })
+await copyFile(resolve(here, 'native/win32/device-helper.ps1'), resolve(deviceNative, 'device-helper.ps1'))
 for (const language of ['en', 'zh-CN']) {
   const target = resolve(outputRoot, `lib/wake-tasks/locale/${language}.json`)
   await mkdir(dirname(target), { recursive: true })
@@ -109,7 +117,7 @@ if (process.argv.includes('--test')) {
   }
   const entrypointCheck = spawnSync(process.execPath, ['--input-type=module', '-e', [
     "import { readFile } from 'node:fs/promises'",
-    "for (const specifier of ['@voice-terminal/dsh-plugin', '@voice-terminal/dsh-plugin/wake-tasks']) {",
+    "for (const specifier of ['@voice-terminal/dsh-plugin', '@voice-terminal/dsh-plugin/device-control', '@voice-terminal/dsh-plugin/wake-tasks']) {",
     '  const plugin = await import(specifier)',
     "  if (typeof plugin.apply !== 'function') throw new Error(`${specifier} has no plugin apply export`)",
     '}',
@@ -118,7 +126,7 @@ if (process.argv.includes('--test')) {
     "  const resource = JSON.parse(await readFile(url, 'utf8'))",
     "  if (!resource.meta?.title || !resource.meta?.description) throw new Error(`Wake task ${language} metadata is incomplete`)",
     '}',
-    "console.log('Both plugin entries and wake-task locale exports load successfully.')",
+    "console.log('Bridge, device-control and wake-task entries load successfully.')",
     '',
   ].join('\n')], { cwd: outputRoot, stdio: 'inherit', windowsHide: true })
   if (entrypointCheck.error) throw entrypointCheck.error
@@ -133,6 +141,7 @@ await writeFile(resolve(outputRoot, 'dsh-compatibility.json'), JSON.stringify({
   plugin_version: manifest.version,
   package_exports: {
     bridge: manifest.exports['.'],
+    device_control: manifest.exports['./device-control'],
     wake_tasks: manifest.exports['./wake-tasks'],
     wake_tasks_locale_en: manifest.exports['./wake-tasks/locale/en.json'],
     wake_tasks_locale_zh_cn: manifest.exports['./wake-tasks/locale/zh-CN.json'],
@@ -141,7 +150,7 @@ await writeFile(resolve(outputRoot, 'dsh-compatibility.json'), JSON.stringify({
   fields: {
     schema: '适配记录格式', dsh_version: '已适配宿主版本', bridge_protocol: '桥接协议', adapter: '运行适配器',
     package_name: '功能包名称', plugin_version: '项目插件版本', package_exports: '必须可解析的入口与子路径元数据',
-    bridge: '桥接入口导出目标', wake_tasks: '唤醒任务入口导出目标', wake_tasks_locale_en: '唤醒任务英文元数据导出目标',
+    bridge: '桥接入口导出目标', device_control: '设备控制入口导出目标', wake_tasks: '唤醒任务入口导出目标', wake_tasks_locale_en: '唤醒任务英文元数据导出目标',
     wake_tasks_locale_zh_cn: '唤醒任务简体中文元数据导出目标', peer_dependencies: '插件要求的宿主包版本',
   },
 }, null, 2) + '\n')

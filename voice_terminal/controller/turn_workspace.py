@@ -9,6 +9,7 @@ class AudioFrame:
     pcm: bytes
     start_sample: int
     captured_at: float
+    clock_uncertainty_seconds: float | None = None  # clock_uncertainty_seconds（采集时间映射误差；本机无需映射）。
 
     @property
     def end_sample(self) -> int:

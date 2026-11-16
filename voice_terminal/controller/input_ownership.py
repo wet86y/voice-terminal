@@ -252,13 +252,13 @@ class InputOwnershipMixin:
                     buffered = context.frames.popleft()
                     await self.handle_frame(buffered, _wake_replay=True)
                     # 回放仍由原采集循环串行执行，及时接收积压采集帧，避免 64 帧队列溢出。
-                    capture_queue = getattr(getattr(self, "capture", None), "queue", None)
-                    if capture_queue is not None:
-                        for _ in range(capture_queue.qsize()):
+                    capture = getattr(self, "capture", None)
+                    if capture is not None:
+                        for _ in range(capture.pending_frame_count()):
                             if not self._wake_preparation_valid(context):
                                 break
                             try:
-                                captured = capture_queue.get_nowait()
+                                captured = capture.read_pending_frame()
                             except asyncio.QueueEmpty:
                                 break
                             await self.handle_frame(captured)
@@ -314,7 +314,7 @@ class InputOwnershipMixin:
                         await self._fail_wake_preparation(context, "检测结果后的音频保留窗口存在缺口。")
                         return
                     context.frames.append(AudioFrame(frame.pcm[(start - frame.start_sample) * 2:],
-                                                     start, frame.captured_at))
+                                                     start, frame.captured_at, frame.clock_uncertainty_seconds))
                     context.next_sample = frame.end_sample
             logger.info("controller.wake_detected source_id=%s label=%s start_sample=%s end_sample=%s",
                         source_id, detection.label, detection.start_sample, detection.end_sample)

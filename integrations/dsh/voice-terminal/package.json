@@ -8,12 +8,15 @@
     "lib/**/*.js",
     "lib/**/*.js.map",
     "lib/**/*.json",
+    "native/win32/device-helper.ps1",
     "cordis.patch.yml",
     "README.md",
+    "dsh-windows-remote-ssh-MIT.txt",
     "components.json"
   ],
   "exports": {
     ".": "./lib/bridge/plugin.js",
+    "./device-control": "./lib/device-control/plugin.js",
     "./wake-tasks": "./lib/wake-tasks/plugin.js",
     "./wake-tasks/locale/en.json": "./lib/wake-tasks/locale/en.json",
     "./wake-tasks/locale/zh-CN.json": "./lib/wake-tasks/locale/zh-CN.json",
@@ -59,7 +62,7 @@
   },
   "description": "Voice Terminal DSH 功能包：桥接、项目唤醒任务和影子代理预设组件。",
   "dependencies": {
-    "zod": "4.6.5",
+    "zod": "4.4.3",
     "@deepseek-ai/schemastery": "~3.18.5"
   },
   "devDependencies": {

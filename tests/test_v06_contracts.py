@@ -140,6 +140,7 @@ def test_real_playback_start_emits_one_observational_event():
 
 def test_subscription_snapshot_uses_live_episode_without_rewriting_cached_agent():
     runtime = object.__new__(SessionRuntime)
+    runtime.local_tts_status_payload = lambda: {"backend": "minimax"}
     runtime.state = RuntimeState()
     runtime.state.agent = {"conversation_id": "stale", "speak_snapshot": {"queue_status": "speaking"}}
     live = {"conversation_id": "live", "speak_snapshot": {"queue_status": "empty"}}
@@ -155,6 +156,7 @@ def test_subscription_snapshot_uses_live_episode_without_rewriting_cached_agent(
 
 def test_subscription_snapshot_keeps_cached_agent_without_controller():
     runtime = object.__new__(SessionRuntime)
+    runtime.local_tts_status_payload = lambda: {"backend": "minimax"}
     runtime.state = RuntimeState()
     runtime.state.agent = {"conversation_id": "cached"}
     runtime.controller = None
@@ -166,6 +168,7 @@ def test_subscription_snapshot_keeps_cached_agent_without_controller():
 
 def test_subscription_snapshot_falls_back_when_live_episode_snapshot_fails():
     runtime = object.__new__(SessionRuntime)
+    runtime.local_tts_status_payload = lambda: {"backend": "minimax"}
     runtime.state = RuntimeState()
     runtime.state.agent = {"conversation_id": "cached"}
 
@@ -726,7 +729,7 @@ def test_completed_playback_overrides_missing_alignment_and_settles_before_queue
         captured = {}
 
         class Player:
-            def stop_and_snapshot(self, key):
+            async def stop_and_snapshot_confirmed(self, key):
                 return PlaybackSnapshot(key, 500, 500, 0, 500, True, 1.0)
 
         async def emit(*_args):
@@ -1985,7 +1988,11 @@ def test_speak_cancel_stops_playing_output_instead_of_ignoring_it():
             active = True
             status = "SPEAKING"
             speak_snapshot = {"queue_status": "speaking", "speech_id": "old_speech"}
-            def cancel_all(self, reason): seen.append(reason)
+            async def cancel_all_confirmed(self, reason):
+                await asyncio.sleep(0)
+                seen.append(reason)
+            def cancel_all(self, _reason):
+                raise AssertionError("a production output must await its stop receipt")
 
         async def emit(*_): pass
         conversation = ConversationRuntime(); conversation.begin_turn("turn")

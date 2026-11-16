@@ -27,11 +27,11 @@ class HandoffRuntimeMixin:
         loop = getattr(output, "loop", None)
         if loop is None or loop.is_closed():
             return
-        def suppress():
+        async def suppress():
             for handle in list(output._handles_by_token.values()):
                 if handle.workspace.playback_key == playback_key:
-                    output.cancel(handle.speech_id, "passive_quiet")
-        loop.call_soon_threadsafe(suppress)
+                    await output.cancel_confirmed(handle.speech_id, "passive_quiet")
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(suppress(), name="quiet-playback-cancel"))
 
     async def _handoff_failed(self, exc: Exception) -> None:
         await self.bus.publish(event("error", code="HANDOFF_ORGANIZER_FAILED",
@@ -115,7 +115,7 @@ class HandoffRuntimeMixin:
             if snapshot["passive_quiet"]:
                 output = getattr(self.controller, "output", None)
                 if output is not None:
-                    output.cancel_all("passive_quiet")
+                    await output.cancel_all_confirmed("passive_quiet")
             await self.bus.publish(self.snapshot())
 
     async def _quiet_clock(self) -> None:

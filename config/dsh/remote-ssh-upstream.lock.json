@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/pureexe/dsh-windows-remote-ssh.git",
+  "commit": "b640f268c1e1ee1134e6fa5b51f15736b2bab26b",
+  "version": "0.1.1",
+  "license": "MIT",
+  "target_dsh_version": "0.2.1-rc.5",
+  "adaptation_revision": 1,
+  "imported_files": [
+    {
+      "source": "src/observe.ts",
+      "source_sha256": "ea8f87f153443ec32fbd03b12f1bf0be89b8eee46ec582b673f9b1a2ea3b3a79",
+      "destination": "integrations/dsh/voice-terminal/src/device-control/observe.ts",
+      "changes": "绑定设备及连接、执行器代次，隔离观察标识并拒绝过期或被替换记录"
+    },
+    {
+      "source": "src/actions.ts",
+      "source_sha256": "9532ab42e83ccdf6f1650c1722bb5f366bdc694222b8f1f7d3d18f10c8dd8b76",
+      "destination": "integrations/dsh/voice-terminal/src/device-control/executor.ts",
+      "changes": "按设备路由和现有审批接口重建窗口动作边界，审批后再次复核并区分未知结果"
+    },
+    {
+      "source": "src/sanitize.ts",
+      "source_sha256": "fb7f67a948d752be59b6b6fb083131226ab8bf145f48441d5e60c9bc5e8de664",
+      "destination": "integrations/dsh/voice-terminal/src/device-control/sanitize.ts",
+      "changes": "添加来源说明并修正零长度显示预算"
+    },
+    {
+      "source": "src/filesystem.ts",
+      "source_sha256": "b4541117f495b8f75a545d21efe744989af3d160cb7baf4cdaa1a51e9be8861c",
+      "destination": "integrations/dsh/voice-terminal/src/device-control/filesystem.ts",
+      "changes": "添加来源与许可说明"
+    },
+    {
+      "source": "src/platform/types.ts",
+      "source_sha256": "65d6eecf14b1af41b683da0fc38824adcb012fd6488cf62fbd6a4f4c2dcb9d47",
+      "destination": "integrations/dsh/voice-terminal/src/device-control/types.ts",
+      "changes": "提取观察所需窗口字段并新增设备代次类型"
+    },
+    {
+      "source": "tests/unit/observe.spec.ts",
+      "source_sha256": "d1225724ddff880c6c7794da3ae6cab7cd92e760b9ec35b80e3842bcd83dd445",
+      "destination": "integrations/dsh/voice-terminal/test/bridge/device-observation.test.mjs",
+      "changes": "迁移观察新鲜度及缓存边界，并增加跨设备和代次隔离验证"
+    },
+    {
+      "source": "tests/unit/sanitize.spec.ts",
+      "source_sha256": "511871b1cc0b10f032d84503c823fb94535a8f6d02b2a96c6aa729f6df50274a",
+      "destination": "integrations/dsh/voice-terminal/test/bridge/device-data.test.mjs",
+      "changes": "迁移脱敏及显示长度行为测试"
+    },
+    {
+      "source": "tests/unit/filesystem.spec.ts",
+      "source_sha256": "24f7d5244bf6d9c24eac98cad61c6bb2a9583cc8363c43cff9010173207bdf3d",
+      "destination": "integrations/dsh/voice-terminal/test/bridge/device-data.test.mjs",
+      "changes": "迁移文件签名及文本识别行为测试"
+    },
+    {
+      "source": "native/win32/dsh-windows-remote-ssh-helper.ps1",
+      "source_sha256": "ddd7003107bd563e943e1cdf38c8ec27f06a3123369cd11e4f658436fa3fa1d1",
+      "destination": "integrations/dsh/voice-terminal/native/win32/device-helper.ps1",
+      "changes": "改为常驻进程及受限长度前缀管道，去除逐次文件轮询和任意命令入口"
+    },
+    {
+      "source": "LICENSE",
+      "source_sha256": "639e9e393dcb745a114f509fa67017d223b4f7b88c10bf3eb7c1d11e48dae3d1",
+      "destination": "licenses/dsh-windows-remote-ssh-MIT.txt",
+      "changes": "原样保留上游许可证与版权声明"
+    }
+  ],
+  "baseline_sha256": {
+    "LICENSE": "639e9e393dcb745a114f509fa67017d223b4f7b88c10bf3eb7c1d11e48dae3d1",
+    "package.json": "fe1124fffa6d5f06775348b03462251601466717930dbdc4f9026a82820f4461",
+    "package-lock.json": "e1f57d66152b8daf29267699f4f8ef3a44ad648b1ac7af8ddde08c576a03f544",
+    "src/platform/types.ts": "65d6eecf14b1af41b683da0fc38824adcb012fd6488cf62fbd6a4f4c2dcb9d47",
+    "src/actions.ts": "9532ab42e83ccdf6f1650c1722bb5f366bdc694222b8f1f7d3d18f10c8dd8b76",
+    "src/observe.ts": "ea8f87f153443ec32fbd03b12f1bf0be89b8eee46ec582b673f9b1a2ea3b3a79",
+    "native/win32/dsh-windows-remote-ssh-helper.ps1": "ddd7003107bd563e943e1cdf38c8ec27f06a3123369cd11e4f658436fa3fa1d1"
+  },
+  "fields": {
+    "schema_version": "上游锁格式版本",
+    "repository": "上游源码仓库",
+    "commit": "固定上游提交",
+    "version": "上游包版本",
+    "license": "上游声明的许可证",
+    "target_dsh_version": "计划适配的本项目代理宿主版本，尚未代表验证通过",
+    "adaptation_revision": "项目派生适配修订号；零表示尚未导入派生源码",
+    "imported_files": "已导入本项目的上游文件、来源摘要及修改说明",
+    "source": "上游文件路径",
+    "source_sha256": "上游原件 SHA-256（内容摘要）",
+    "destination": "本项目维护路径",
+    "changes": "相对于上游原件的修改说明",
+    "baseline_sha256": "固定提交中已核对文件的 SHA-256（内容摘要）"
+  }
+}

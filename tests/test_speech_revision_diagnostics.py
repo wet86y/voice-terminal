@@ -211,7 +211,8 @@ class _SettlementPlayer:
     def __init__(self, snapshot):
         self.snapshot = snapshot
 
-    def stop_and_snapshot(self, _key):
+    async def stop_and_snapshot_confirmed(self, _key):
+        """等待式停止回执：匹配生产播放接口的异步确认契约。"""
         return self.snapshot
 
 

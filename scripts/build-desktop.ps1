@@ -48,7 +48,7 @@ try {
     } else {
       $Features=@()
       if (-not $BootstrapOnly -and -not $DemoLauncherOnly) {
-        $CargoArgs+=@('-p','voice-terminal-desktop','--bin','VoiceTerminalDesktop');$Features+='voice-terminal-desktop/custom-protocol';$Built+='desktop'
+        $CargoArgs+=@('-p','voice-terminal-desktop','--bin','VoiceTerminalDesktop');$Features+='voice-terminal-desktop/custom-protocol';$Features+='voice-terminal-desktop/native-audio';$Features+='voice-terminal-desktop/ssh-device';$Built+='desktop'
       }
       if (-not $DesktopOnly) {
         $Bin=if ($DemoLauncherOnly) {'VoiceTerminalUIDemo'} else {'VoiceTerminal'}
@@ -57,6 +57,13 @@ try {
       $CargoArgs+=@('--features',($Features -join ','))
     }
     $Components=$Built -join ','
+    if ($BuildTarget -eq 'product' -and $Built -contains 'desktop' -and -not $RequireExisting) {
+      Invoke-DesktopStage '准备固定原生 AEC（回声消除）依赖' {
+        & (Join-Path $PSScriptRoot 'prepare-native-audio.ps1')
+        & (Join-Path $PSScriptRoot 'prepare-libopus.ps1')
+        if ($LASTEXITCODE) {throw '原生 AEC 固定依赖准备失败。'}
+      }
+    }
     if (-not (Invoke-DesktopBuildState -Operation check -Stage $BuildTarget -Optimization $OptimizationLevel -Components $Components -Qualification:$Qualification)) {
       if ($RequireExisting) {throw '要求复用的原生产物缺失、输入变化或摘要不符；未重新编译。'}
       Invoke-DesktopStage ('原生优化构建：'+$Components) {

@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from voice_terminal.application.state import ApplicationState
 from voice_terminal.application.supervisor import ApplicationHost
-from voice_terminal.application.launch import _wait_for_frontend, parse_args
+from voice_terminal.application.launch import (
+    _wait_for_frontend,
+    parse_args,
+    parse_device_pairing_console_command,
+    run_device_pairing_console,
+)
 from voice_terminal.application.web import FALLBACK_HTML, HostWeb
 from voice_terminal.application.windows import Job, ManagedProcess, SingleInstance, external_environment
 
@@ -71,6 +76,70 @@ class ApplicationStateTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    def test_pairing_requires_a_valid_saved_shared_host_role(self):
+        path = self.app.paths.config / "device-runtime.json"
+        self.assertFalse(self.app._shared_host_role_is_saved())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shared_host = {
+            "schema_version": 2,
+            "device_id": "host-a",
+            "desired_role": "shared_host",
+            "audio_mode": "pcm",
+            "host": None,
+        }
+        path.write_text(json.dumps(shared_host), encoding="utf-8")
+        self.assertTrue(self.app._shared_host_role_is_saved())
+        path.write_text(json.dumps({**shared_host, "desired_role": "standalone"}), encoding="utf-8")
+        self.assertFalse(self.app._shared_host_role_is_saved())
+        original = b'{"schema_version":2,"schema_version":2}'
+        path.write_bytes(original)
+        self.assertFalse(self.app._shared_host_role_is_saved())
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_saved_shared_host_configuration_requires_explicit_gateway_launch_flag(self):
+        path = self.app.paths.config / "device-runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schema_version": 2,
+            "device_id": "host-a",
+            "desired_role": "shared_host",
+            "audio_mode": "pcm",
+            "host": None,
+        }), encoding="utf-8")
+        standalone_launcher = ApplicationHost(Path(self.directory.name))
+        self.assertFalse(standalone_launcher._shared_host_role_is_saved())
+
+    def test_device_pairing_controls_require_desktop_session_and_same_origin(self):
+        route = self.web.origin + "/api/v1/application/device-pairing"
+        status = {"window_open": False, "pending_requests": [], "trust": {"state": "missing", "devices": []}}
+        with patch.object(self.app, "device_pairing", return_value=status) as pairing:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(route)
+            self.assertEqual(error.exception.code, 403)
+
+            self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
+            with self.client.open(route) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+                self.assertEqual(json.load(response), status)
+            pairing.assert_called_once_with({"operation": "status"})
+
+            body = json.dumps({"operation": "open", "ttl_seconds": 120}).encode()
+            for headers in ({"Origin": "https://untrusted.invalid"}, {"Host": "untrusted.invalid"}):
+                request = urllib.request.Request(route, body,
+                    {"Content-Type": "application/json", "Origin": self.web.origin, **headers})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.client.open(request)
+                self.assertEqual(error.exception.code, 403)
+            pairing.assert_called_once_with({"operation": "status"})
+
+            request = urllib.request.Request(route, body,
+                {"Content-Type": "application/json", "Origin": self.web.origin})
+            with self.client.open(request) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.load(response), status)
+            pairing.assert_called_with({"operation": "open", "ttl_seconds": 120})
+
     def test_manual_task_create_checks_cookie_host_and_origin(self):
         route = self.web.origin + '/api/v1/application/wake-tasks'
         payload = {'text': '手动说明', 'daily': {'time': '09:00', 'time_zone': 'Asia/Hong_Kong'}}
@@ -96,7 +165,7 @@ class WebTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         (Path(self.directory.name) / "index.html").write_text("<html><head></head><body>product-ui</body></html>", encoding="utf-8")
         (Path(self.directory.name) / "assets.js").write_text("window.product = true", encoding="utf-8")
-        self.app = ApplicationHost(Path(self.directory.name))
+        self.app = ApplicationHost(Path(self.directory.name), share_device_gateway=True)
         self.web = HostWeb(self.app, Path(self.directory.name), port=0)
         self.app.origin = self.web.origin
         self.web.start()
@@ -256,6 +325,37 @@ class WebTests(unittest.TestCase):
             with self.client.open(request) as response:
                 self.assertEqual(json.load(response), {"ok": True})
             report.assert_called_once_with({})
+
+    def test_internal_device_helper_requires_bearer_and_replies_over_private_host_bridge(self):
+        payload = {"request_id": "task-1", "device_id": "local", "operation": "windows",
+                   "arguments": {}, "timeout_ms": 1000,
+                   "connection_generation": 1, "executor_generation": 1}
+        helper_response = {"protocol_version": 1, "request_id": "task-1", "ok": True, "result": []}
+        self.app.loop = object()
+        self.app.desktop_control = SimpleNamespace(call_device_helper=AsyncMock(return_value=helper_response))
+
+        class Completed:
+            def __init__(self, coroutine):
+                self.value = asyncio.run(coroutine)
+
+            def result(self, timeout=None):
+                return self.value
+
+        route = self.web.origin + "/internal/application/device-helper"
+        body = json.dumps(payload).encode()
+        request = urllib.request.Request(route, body, {"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.client.open(request)
+        self.assertEqual(error.exception.code, 403)
+
+        request = urllib.request.Request(route, body, {
+            "Content-Type": "application/json", "Authorization": "Bearer " + self.app.internal_token,
+        })
+        with patch("voice_terminal.application.web.asyncio.run_coroutine_threadsafe",
+                   side_effect=lambda coroutine, _loop: Completed(coroutine)):
+            with self.client.open(request) as response:
+                self.assertEqual(json.load(response), {"ok": True, "result": helper_response})
+        self.app.desktop_control.call_device_helper.assert_awaited_once_with(payload)
 
 
 class FrontendReadinessTests(unittest.TestCase):
@@ -907,6 +1007,73 @@ class LaunchModeTests(unittest.TestCase):
         args = parse_args(["--desktop-managed", "--dev"])
         self.assertTrue(args.desktop_managed)
         self.assertTrue(args.dev)
+        shared = parse_args(["--desktop-managed", "--share-device-gateway"])
+        self.assertTrue(shared.share_device_gateway)
+
+    def test_device_pairing_console_is_formal_headless_only(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--desktop-managed", "--device-pairing-console"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--headless", "--diagnostic", "--device-pairing-console", "--share-device-gateway"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--headless", "--device-pairing-console"])
+        args = parse_args(["--headless", "--device-pairing-console", "--share-device-gateway"])
+        self.assertTrue(args.headless)
+        self.assertTrue(args.device_pairing_console)
+        self.assertTrue(args.share_device_gateway)
+
+    def test_device_pairing_console_accepts_only_bounded_supervisor_commands(self):
+        self.assertEqual(parse_device_pairing_console_command('{"operation":"status"}'),
+                         {"operation": "status"})
+        self.assertEqual(parse_device_pairing_console_command(
+            '{"operation":"open","ttl_seconds":120}'),
+            {"operation": "open", "ttl_seconds": 120})
+        self.assertEqual(parse_device_pairing_console_command(
+            '{"operation":"approve","request_id":"0123456789abcdef0123456789abcdef"}'),
+            {"operation": "approve", "request_id": "0123456789abcdef0123456789abcdef"})
+        invalid = (
+            '{"operation":"open","ttl_seconds":true}',
+            '{"operation":"status","device_id":"host-a"}',
+            '{"operation":"approve","request_id":"not-a-request"}',
+            '{"operation":"set_role","role":"shared_host"}',
+            "not-json",
+        )
+        for line in invalid:
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                parse_device_pairing_console_command(line)
+
+    def test_device_pairing_console_calls_existing_supervisor_path_and_exits(self):
+        async def scenario():
+            class ConsoleApp:
+                def __init__(self):
+                    self.exit_event = asyncio.Event()
+                    self.state = SimpleNamespace(snapshot=lambda: {
+                        "startup_complete": True, "voice_api_url": "http://127.0.0.1:18765",
+                        "device_gateway_enabled": True, "device_gateway_ready": True, "stopping": False,
+                    })
+                    self.calls = []
+
+                def device_pairing(self, payload):
+                    self.calls.append(payload)
+                    return {"window_open": False, "pending_requests": []}
+
+                def request_exit(self):
+                    self.exit_event.set()
+
+            app = ConsoleApp()
+            output = io.StringIO()
+            command_input = io.StringIO('{"operation":"status"}\n{"operation":"exit"}\n')
+            with patch("voice_terminal.application.launch.sys.stdin", command_input), \
+                    patch("voice_terminal.application.launch.sys.stdout", output):
+                await run_device_pairing_console(app)
+            self.assertEqual(app.calls, [{"operation": "status"}])
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(rows[0]["state"], "ready")
+            self.assertEqual(rows[1]["operation"], "status")
+            self.assertTrue(rows[1]["ok"])
+            self.assertTrue(app.exit_event.is_set())
+
+        asyncio.run(scenario())
 
 
 @unittest.skipUnless(os.name == "nt", "Windows lifecycle（Windows 生命周期）测试")

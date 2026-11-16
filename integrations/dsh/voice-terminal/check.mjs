@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const manifest = JSON.parse(await readFile(resolve(here, 'package.json'), 'utf8'))
 const declaration = JSON.parse(await readFile(resolve(here, 'components.json'), 'utf8'))
+const hostPatch = await readFile(resolve(here, 'host.patch.yml'), 'utf8')
 const components = new Map(declaration.components.map(item => [item.id, item]))
 if (declaration.schema_version !== 1 || components.size !== declaration.components.length) throw new Error('组件声明版本错误或标识重复')
 const visited = new Set()
@@ -14,6 +15,9 @@ function visit(id) {
   if (visited.has(id)) return
   const component = components.get(id)
   if (!component) throw new Error(`依赖未声明的组件：${id}`)
+  if (component.loader_id && component.id !== 'preset' && hostPatch.split(`id: ${component.loader_id}`).length - 1 !== 1) {
+    throw new Error(`宿主组合补丁必须且只能包含一次组件加载行：${component.loader_id}`)
+  }
   visiting.add(id)
   for (const dependency of component.depends_on) visit(dependency)
   visiting.delete(id)

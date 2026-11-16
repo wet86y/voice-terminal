@@ -201,7 +201,7 @@ def test_backup_restores_important_data_without_dependencies_or_cache(tmp_path):
     assert not (root / 'tmp/user-backup.old').exists()
 
 
-def test_backup_restores_both_local_voice_libraries(tmp_path):
+def test_backup_restores_shared_aniflive_voice_libraries(tmp_path):
     from tests.test_tts_voices import _create_voice
     from voice_terminal.local_files import backup_user_data
     from voice_terminal.tts.voices import ModelVoiceLibraries
@@ -210,7 +210,7 @@ def test_backup_restores_both_local_voice_libraries(tmp_path):
     root = tmp_path / '音色备份'
     libraries = ModelVoiceLibraries(root / 'data/tts')
     expected = {}
-    for model in ('voxcpm1', 'voxcpm2'):
+    for model in ('model-a', 'model-b'):
         library = libraries.for_model(model)
         asset, voice = _create_voice(library, text=f'{model}的参考转写。')
         selection = {'voice_id': voice['id'], 'revision': voice['revision']}
@@ -220,7 +220,7 @@ def test_backup_restores_both_local_voice_libraries(tmp_path):
     for _ in range(2):
         backup = backup_user_data(root)
         paths = {row['path'] for row in backup['files']}
-        assert all(f'tts/{model}/voices/index.json' in paths for model in expected)
+        assert 'tts/aniflive/voices/index.json' in paths
         restored = tmp_path / '恢复工作区'
         shutil.copytree(root / 'backups/user-data', restored, dirs_exist_ok=True)
         recovered = ModelVoiceLibraries(restored / 'tts')

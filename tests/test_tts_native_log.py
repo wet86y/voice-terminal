@@ -175,7 +175,7 @@ def test_started_runtime_identity_hashes_actual_binary(tmp_path, monkeypatch, ca
     assert "installed_version（安装版本）=fixed-runtime" in caplog.text
     assert "binary_matches_receipt（程序与收据一致）=True" in caplog.text
     assert "target_version（目标原生版本）=" in caplog.text
-    assert "binary_matches_target（程序与当前目标一致）=False" in caplog.text
+    assert "binary_matches_target（程序与当前目标一致）=None" in caplog.text
 
 
 def test_native_trace_is_off_by_default(tmp_path, monkeypatch):

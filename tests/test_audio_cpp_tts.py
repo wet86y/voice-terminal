@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from voice_terminal.config import AppConfig
+from voice_terminal.providers.aniflive_tts import AnifLiveTtsClient
 from voice_terminal.providers.audio_cpp_tts import (
     AudioCppTtsClient,
     AudioCppTtsError,
@@ -998,73 +999,41 @@ def test_server_close_terminates_only_owned_audio_cpp_process():
     asyncio.run(close_borrowed())
 
 
-def test_session_runtime_builds_local_backend_without_reading_minimax_key():
+def test_session_runtime_builds_aniflive_backend_without_reading_minimax_key():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         local_root = root / ".local"
-        model = local_root / "model.gguf"
-        voice = local_root / "reference.wav"
-        model.parent.mkdir(parents=True)
-        model.write_bytes(b"model")
-        voice.write_bytes(b"wav")
-        config_path = local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
-        config_path.parent.mkdir(parents=True)
-        config_path.write_text(json.dumps({
-            "host": "127.0.0.1",
-            "port": 18881,
-            "models": [{
-                "id": "voxcpm1-stream",
-                "path": str(model),
-                "default_voice_preset": {"voice_ref": str(voice)},
-            }],
-        }), encoding="utf-8")
         config = AppConfig.from_mapping(
-            {"tts": {"backend": "voxcpm1", "local_model": "voxcpm1", "sample_rate": 16000}},
-            base_dir=root,
+            {"tts": {"backend": "aniflive", "local_model": "test-model"}}, base_dir=root,
         )
         product = ProductSettingsStore(path=local_root / "config" / "product-settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=product, runtime_data_dir=local_root / "data")
 
         def unexpected_key_lookup(_environment_name):
-            raise AssertionError("VoxCPM1 模式不应读取 MiniMax API 密钥")
+            raise AssertionError("AnifLive（本地语音合成）模式不应读取 MiniMax API 密钥")
 
         runtime._api_key = unexpected_key_lookup
         remote, local = runtime._build_tts_clients()
         try:
             assert remote is None
-            assert isinstance(local, AudioCppTtsClient)
-            assert local.sample_rate == 16000
-            assert config.tts.backend == "voxcpm1"
-            assert runtime.product_settings.effective_config().tts.backend == "voxcpm1"
+            assert isinstance(local, AnifLiveTtsClient)
+            assert local.sample_rate == 32000
+            assert local.local_model == "test-model"
+            assert local.server.local == local_root.resolve()
+            assert config.tts.backend == "aniflive"
+            assert runtime.product_settings.effective_config().tts.backend == "aniflive"
         finally:
             asyncio.run(local.close())
 
 
-def test_packaged_runtime_uses_install_root_for_local_tts():
+def test_packaged_runtime_uses_install_root_for_aniflive_tts():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         program_root = root / "app"
         install_root = root / ".local"
         data_root = install_root / "data"
-        model = install_root / "models" / "voxcpm1.gguf"
-        voice = install_root / "cache" / "reference.wav"
-        model.parent.mkdir(parents=True)
-        voice.parent.mkdir(parents=True)
-        model.write_bytes(b"model")
-        voice.write_bytes(b"wav")
-        config_path = install_root / "config" / "audiocpp" / "server-tts-evaluation.json"
-        config_path.parent.mkdir(parents=True)
-        config_path.write_text(json.dumps({
-            "host": "127.0.0.1",
-            "port": 18881,
-            "models": [{
-                "id": "voxcpm1-stream",
-                "path": str(model),
-                "default_voice_preset": {"voice_ref": str(voice)},
-            }],
-        }), encoding="utf-8")
         config = AppConfig.from_mapping(
-            {"tts": {"backend": "voxcpm1", "sample_rate": 16000}},
+            {"tts": {"backend": "aniflive", "local_model": "test-model"}},
             base_dir=program_root,
         )
         paths = AppPaths(program_root=program_root, install_root=install_root, data_root=data_root)
@@ -1076,62 +1045,40 @@ def test_packaged_runtime_uses_install_root_for_local_tts():
         remote, local = runtime._build_tts_clients()
         try:
             assert remote is None
-            assert isinstance(local, AudioCppTtsClient)
-            assert local.server.config_path == config_path.resolve()
+            assert isinstance(local, AnifLiveTtsClient)
+            assert local.server.local == install_root.resolve()
+            assert local.server.program == program_root.resolve()
+            assert local.server.library.is_relative_to(data_root.resolve())
         finally:
             asyncio.run(local.close())
 
 
-def test_runtime_migrates_legacy_default_voice_before_rewriting_native_config():
+def test_runtime_uses_existing_aniflive_voice_selection_without_rewriting_it():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         local_root = root / ".local"
         data_root = local_root / "data"
-        legacy_voice = local_root / "cache" / "reports" / "audio-cpp-tts-evaluation" / "reference.wav"
-        legacy_voice.parent.mkdir(parents=True)
-        samples = struct.pack("<" + "h" * (16000 * 5), *[
-            int(4000 * ((index % 80) - 40) / 40) for index in range(16000 * 5)
-        ])
-        stream = io.BytesIO()
-        with wave.open(stream, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(16000)
-            handle.writeframes(samples)
-        legacy_voice.write_bytes(stream.getvalue())
-        native_config = local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
-        native_config.parent.mkdir(parents=True)
-        native_config.write_text(json.dumps({
-            "host": "127.0.0.1", "port": 18881,
-            "models": [{
-                "id": "voxcpm1-stream", "path": str(local_root / "models" / "model.gguf"),
-                "default_voice_preset": {
-                    "voice_ref": str(legacy_voice), "reference_text": "原配置中的真实参考转写文本。",
-                },
-            }],
-        }), encoding="utf-8")
-        config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1", "sample_rate": 16000}}, base_dir=root)
+        from tests.test_tts_voices import _wav_bytes
+        from voice_terminal.tts.voices import ModelVoiceLibraries
+        owner = ModelVoiceLibraries(data_root / "tts")
+        library = owner.for_model("test-model")
+        voice = library.register_default(_wav_bytes(sample_rate=16000, channels=1),
+                                        "原音色库中的真实参考转写文本。")
+        selection_before = library.active_selection
+        config = AppConfig.from_mapping(
+            {"tts": {"backend": "aniflive", "local_model": "test-model"}}, base_dir=root)
         store = ProductSettingsStore(path=data_root / "config" / "product-settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=store, runtime_data_dir=data_root)
         try:
             _remote, local = runtime._build_tts_clients()
-            voices = runtime.voice_library.for_model("voxcpm1").list_voices()
-            self_voice = voices[0]
-            assert len(voices) == 1
-            assert self_voice["source"] == "legacy"
-            assert self_voice["reference_text"] == "原配置中的真实参考转写文本。"
-            selections = store.settings_only()["tts"]["active_voice_by_model"]
-            assert selections["voxcpm1"] == {
-                "voice_id": self_voice["id"], "revision": 1,
-            }
-            assert store.settings_only()["tts"]["backend"] == "voxcpm1"
-            rewritten = json.loads(native_config.read_text(encoding="utf-8"))
-            assert all("default_voice_preset" not in model for model in rewritten["models"])
-            _remote, local_again = runtime._build_tts_clients()
-            assert len(runtime.voice_library.for_model("voxcpm1").list_voices()) == 1
-            assert len(runtime.voice_library.for_model("voxcpm2").list_voices()) == 1
+            assert isinstance(local, AnifLiveTtsClient)
+            assert local.voice_library.active_selection == selection_before
+            resolved = local.voice_library.resolve("test-model", selection_before)
+            assert resolved.reference_text == "原音色库中的真实参考转写文本。"
+            assert resolved.reference_path.is_file()
+            assert voice["revision"] == selection_before["revision"]
+            assert not (local_root / "config" / "audiocpp" / "server-tts-evaluation.json").exists()
             asyncio.run(local.close())
-            asyncio.run(local_again.close())
         finally:
             runtime.tts = None
 
@@ -1181,7 +1128,7 @@ def test_router_close_keeps_local_service_until_runtime_shutdown():
     async def scenario():
         remote = SimpleNamespace(close=AsyncMock())
         local = SimpleNamespace(close=AsyncMock())
-        router = TtsBackendRouter(remote=remote, local=local, backend="voxcpm1")
+        router = TtsBackendRouter(remote=remote, local=local, backend="aniflive")
         await router.close()
         local.close.assert_not_awaited()
         await router.shutdown()
@@ -1190,51 +1137,40 @@ def test_router_close_keeps_local_service_until_runtime_shutdown():
     asyncio.run(scenario())
 
 
-def test_local_tts_player_rate_follows_model_native_output():
-    """本地下行率必须等于模型原生率：48 kHz 原生降到 16 kHz 会丢掉 8 kHz 以上全部带宽。"""
-    from voice_terminal.config import LOCAL_TTS_NATIVE_RATE, local_tts_native_rate, resolve_tts_sample_rate
+def test_local_tts_player_rate_uses_aniflive_native_output():
+    """AnifLive（本地语音合成）固定使用 32 kHz，在线 MiniMax（在线语音）独立保留配置率。"""
+    from voice_terminal.config import local_tts_native_rate, resolve_tts_sample_rate
 
-    assert LOCAL_TTS_NATIVE_RATE == {"voxcpm1": 16000, "voxcpm2": 48000}
-    assert local_tts_native_rate("voxcpm2") == 48000
-    assert local_tts_native_rate("voxcpm1") == 16000
-    # 未知模型取最保守值，不能凭配置漂移到更低带宽。
-    assert local_tts_native_rate("unknown") == 16000
-
-    # 本地后端忽略配置值，在线后端沿用配置值。
-    assert resolve_tts_sample_rate("voxcpm1", "voxcpm2", 16000) == 48000
-    assert resolve_tts_sample_rate("voxcpm1", "voxcpm1", 48000) == 16000
-    assert resolve_tts_sample_rate("minimax", "voxcpm2", 32000) == 32000
+    assert local_tts_native_rate("test-model") == 32000
+    assert resolve_tts_sample_rate("aniflive", "test-model", 16000) == 32000
+    assert resolve_tts_sample_rate("minimax", "test-model", 48000) == 48000
 
 
-def test_local_tts_config_defaults_to_native_rate_per_model():
-    """启动配置：本地 VoxCPM2 缺省 48 kHz，VoxCPM1 缺省 16 kHz，在线缺省 32 kHz。"""
-    config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1"}}, base_dir=Path("."))
-    assert config.tts.sample_rate == 48000  # local_model 缺省 voxcpm2。
+def test_local_tts_config_defaults_to_aniflive_native_rate():
+    """启动配置：AnifLive（本地语音合成）固定 32 kHz，在线率单独保留。"""
+    config = AppConfig.from_mapping({"tts": {"backend": "aniflive"}}, base_dir=Path("."))
+    assert config.tts.sample_rate == 32000
     assert config.tts.online_sample_rate == 32000
 
     config = AppConfig.from_mapping(
-        {"tts": {"backend": "voxcpm1", "local_model": "voxcpm1"}}, base_dir=Path("."))
-    assert config.tts.sample_rate == 16000
-
-    config = AppConfig.from_mapping({"tts": {"backend": "minimax"}}, base_dir=Path("."))
-    assert config.tts.sample_rate == 32000
-
-    # 本地后端即使显式写低下行率，也不能把 48 kHz 原生砍掉。
-    config = AppConfig.from_mapping(
-        {"tts": {"backend": "voxcpm1", "local_model": "voxcpm2", "sample_rate": 16000}},
+        {"tts": {"backend": "aniflive", "local_model": "test-model", "sample_rate": 16000}},
         base_dir=Path("."))
-    assert config.tts.sample_rate == 48000
+    assert config.tts.sample_rate == 32000
     assert config.tts.online_sample_rate == 16000
+
+    config = AppConfig.from_mapping({"tts": {"backend": "minimax", "sample_rate": 48000}}, base_dir=Path("."))
+    assert config.tts.sample_rate == 48000
+    assert config.tts.online_sample_rate == 48000
 
 
 def test_router_exposes_playback_reserve_from_active_client():
     """本地起播储备为零时，路由仍必须保留独立的欠载恢复策略。"""
     local = SimpleNamespace(
-        playback_startup_buffer_ms=AudioCppTtsClient.playback_startup_buffer_ms,
-        playback_resume_buffer_ms=AudioCppTtsClient.playback_resume_buffer_ms,
+        playback_startup_buffer_ms=0,
+        playback_resume_buffer_ms=400,
     )
     remote = SimpleNamespace()
-    router = TtsBackendRouter(remote=remote, local=local, backend="voxcpm1")
+    router = TtsBackendRouter(remote=remote, local=local, backend="aniflive")
     assert router.playback_startup_buffer_ms == 0
     assert router.playback_resume_buffer_ms == 400
 

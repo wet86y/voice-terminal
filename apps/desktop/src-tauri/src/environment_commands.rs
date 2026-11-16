@@ -1,15 +1,32 @@
 //! Environment commands（环境命令）：原生配置语音服务、登记与检测显卡环境。
-use std::{path::PathBuf,sync::Arc};
-use serde_json::{Value,json};use tauri::{State,WebviewWindow};
-use voice_desktop_common::{runtime,workspace::{atomic_json,safe_path},resources};
-use super::{Desktop,ResourceManager};
-fn allowed(window:&WebviewWindow,desktop:&Desktop)->Result<(),String>{super::trusted(window,desktop)?;super::require_command(desktop.mode,super::DesktopCommand::FocusMain)}
-fn dependency_plan(context:&voice_desktop_common::LaunchContext,group:&str)->Result<Value,String>{
-    runtime::plan(context,group)
+use super::{Desktop, ResourceManager};
+use serde_json::{Value, json};
+use std::{path::PathBuf, sync::Arc};
+use tauri::{State, WebviewWindow};
+use voice_desktop_common::{
+    resources, runtime,
+    workspace::{atomic_json, safe_path},
+};
+fn allowed(window: &WebviewWindow, desktop: &Desktop) -> Result<(), String> {
+    super::trusted(window, desktop)?;
+    super::require_command(desktop.mode, super::DesktopCommand::FocusMain)
 }
-#[tauri::command(rename_all="snake_case")]
-pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
-    allowed(&window,&desktop)?;let context=manager.context();let source_id=resource_id.clone();
+fn dependency_plan(
+    context: &voice_desktop_common::LaunchContext,
+    group: &str,
+) -> Result<Value, String> {
+    runtime::plan(context, group)
+}
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resource_install_plan(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    resource_id: String,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    let context = manager.context();
+    let source_id = resource_id.clone();
     tauri::async_runtime::spawn_blocking(move||{
         if matches!(resource_id.as_str(),"voice-server"|runtime::CPU_RESOURCE|runtime::GPU_RESOURCE){return Ok(json!({"resource_id":resource_id,"title":if resource_id==runtime::GPU_RESOURCE{"GPU（图形处理器）运行依赖"}else if resource_id==runtime::CPU_RESOURCE{"CPU（中央处理器）运行依赖"}else{"Voice Server（语音服务）运行环境"},"model_bytes":0,"environment":runtime::plan(&context,if resource_id==runtime::GPU_RESOURCE{"gpu"}else{"cpu"})?,
             "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}}));}
@@ -35,30 +52,81 @@ pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Des
     }))
 }
 #[tauri::command]
-pub async fn voice_environment_status(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Value,String>{
-    allowed(&window,&desktop)?;let manager=manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move||{
-        let context=manager.context();let mut status=runtime::status(&context)?;
-        status["jobs"]=json!(manager.snapshots());status["gpu"]=resources::load(&context.data.join("config/gpu-environment.json")).unwrap_or(Value::Null);
-        if let Some(relative)=status["gpu"]["path"].as_str(){
-            let root=safe_path(&context.install,relative)?;
-            let unchanged=if status["gpu"]["validation_identity"].is_object(){runtime::validation_identity(&context.install,&root).is_ok_and(|identity|status["gpu"]["validation_identity"]==identity)}else{root.join("python.exe").is_file()};
-            if !unchanged{if let Some(models)=status["gpu"]["models"].as_object_mut(){for capability in models.values_mut(){capability["gpu_available"]=json!(false);capability["reason"]=json!("环境或模型文件已变化，请重新检测。");}}}
+pub async fn voice_environment_status(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let context = manager.context();
+        let mut status = runtime::status(&context)?;
+        status["jobs"] = json!(manager.snapshots());
+        status["gpu"] = resources::load(&context.data.join("config/gpu-environment.json"))
+            .unwrap_or(Value::Null);
+        if let Some(relative) = status["gpu"]["path"].as_str() {
+            let root = safe_path(&context.install, relative)?;
+            let unchanged = if status["gpu"]["validation_identity"].is_object() {
+                runtime::validation_identity(&context.install, &root)
+                    .is_ok_and(|identity| status["gpu"]["validation_identity"] == identity)
+            } else {
+                root.join("python.exe").is_file()
+            };
+            if !unchanged {
+                if let Some(models) = status["gpu"]["models"].as_object_mut() {
+                    for capability in models.values_mut() {
+                        capability["gpu_available"] = json!(false);
+                        capability["reason"] = json!("环境或模型文件已变化，请重新检测。");
+                    }
+                }
+            }
         }
         Ok(status)
-    }).await.map_err(|e|e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
-#[tauri::command(rename_all="snake_case")]
-pub async fn voice_environment_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,group:String)->Result<Value,String>{
-    allowed(&window,&desktop)?;let context=manager.context();tauri::async_runtime::spawn_blocking(move||dependency_plan(&context,&group)).await.map_err(|e|e.to_string())?
+#[tauri::command(rename_all = "snake_case")]
+pub async fn voice_environment_plan(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    group: String,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    let context = manager.context();
+    tauri::async_runtime::spawn_blocking(move || dependency_plan(&context, &group))
+        .await
+        .map_err(|e| e.to_string())?
 }
-#[tauri::command(rename_all="snake_case")]
-pub fn voice_environment_configure(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>,group:String)->Result<Value,String>{allowed(&window,&desktop)?;manager.inner().configure_runtime(group)}
+#[tauri::command(rename_all = "snake_case")]
+pub fn voice_environment_configure(
+    window: WebviewWindow,
+    desktop: State<Arc<Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+    group: String,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    manager.inner().configure_runtime(group)
+}
 #[tauri::command]
-pub fn voice_environment_import(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>)->Result<Value,String>{allowed(&window,&desktop)?;manager.inner().import_runtime()}
+pub fn voice_environment_import(
+    window: WebviewWindow,
+    desktop: State<Arc<Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    manager.inner().import_runtime()
+}
 #[tauri::command]
-pub async fn gpu_environment_register(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Value,String>{
-    allowed(&window,&desktop)?;let context=manager.context();
+pub async fn gpu_environment_register(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    let context = manager.context();
     tauri::async_runtime::spawn_blocking(move||{
         let selected=voice_desktop_common::native_ui::choose_folder("登记当前工作区 runtimes/python-gpu（显卡环境）文件夹")?.ok_or("已取消登记")?;
         let selected=voice_desktop_common::canonical_path(&selected)?;
@@ -72,10 +140,27 @@ pub async fn gpu_environment_register(window:WebviewWindow,desktop:State<'_,Arc<
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
-pub fn gpu_environment_probe(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>)->Result<Value,String>{allowed(&window,&desktop)?;manager.inner().probe_gpu()}
+pub fn gpu_environment_probe(
+    window: WebviewWindow,
+    desktop: State<Arc<Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    allowed(&window, &desktop)?;
+    manager.inner().probe_gpu()
+}
 #[tauri::command]
-pub fn environment_guide(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>)->Result<(),String>{
-    allowed(&window,&desktop)?;let context=manager.context();let path=context.data.join("docs/模型运行环境配置指南.md");
-    if !path.is_file(){std::fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;std::fs::copy(context.program.join("docs/模型运行环境配置指南.md"),&path).map_err(|e|e.to_string())?;}
+pub fn environment_guide(
+    window: WebviewWindow,
+    desktop: State<Arc<Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+) -> Result<(), String> {
+    allowed(&window, &desktop)?;
+    let context = manager.context();
+    let path = context.data.join("docs/模型运行环境配置指南.md");
+    if !path.is_file() {
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::copy(context.program.join("docs/模型运行环境配置指南.md"), &path)
+            .map_err(|e| e.to_string())?;
+    }
     voice_desktop_common::windows::open(&PathBuf::from(path))
 }

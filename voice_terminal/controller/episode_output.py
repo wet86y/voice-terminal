@@ -16,6 +16,7 @@ from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
 from ..quiet_hours import PassiveQuietSuppressed
+from ..devices.contracts import PlaybackOutcomeUnknown, PlaybackReplacementTicket, PlaybackReplacementResult
 
 
 logger = logging.getLogger(__name__)
@@ -52,8 +53,13 @@ class SpeechHandle:
                                        phase="FINALIZING", committed=True)
         self.reason = None
         self.snapshot = None
-        self.playback_transition = None  # playback_transition（本事务隔离的旧音过渡凭据）。
-        self.replacement_predecessor = None  # replacement_predecessor（后继关联的旧音过渡）。
+        self.playback_ticket: PlaybackReplacementTicket | None = None  # playback_ticket（只含纯数据的替换事务票据）。
+        self.playback_result: PlaybackReplacementResult | None = None  # playback_result（原设备的最终替换回执）。
+        self.playback_settlement_task: asyncio.Task | None = None  # playback_settlement_task（去重后的停止确认任务）。
+        self.playback_ticket_settlement_task: asyncio.Task | None = None  # playback_ticket_settlement_task（去重后的替换回执任务）。
+        self.playback_outcome_unknown = False  # playback_outcome_unknown（设备未确认结束，不能推断静音）。
+        self.playback_error = None  # playback_error（设备回执失败诊断）。
+        self.replacement_predecessor: PlaybackReplacementTicket | None = None  # replacement_predecessor（后继关联的纯数据票据）。
         self.text = ""
         self.delivered_prefix = None  # delivered_prefix（接播段已结算的固定前缀；普通替换沿用动态前沿）。
         self.task = None
@@ -397,6 +403,8 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             raise RuntimeError("所选 TTS provider 不可用。")
         # turn_id / speech_id（轮次与语音事务标识）随会话进入 provider，供日志串联。
         correlation = {"turn_id": ws.turn_id, "speech_id": getattr(h, "speech_id", None)}
+        if h is not None and getattr(client, "uses_client_tts", False):
+            correlation["playback_key"] = h.workspace.playback_key
         if h is not None and callable(getattr(client, "prepare_speech_controls", None)):
             from ..tts.controlled_session import ControlledTtsSession
             def factory(values, isolated):
@@ -502,12 +510,11 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             if self.loop and not self.loop.is_closed():
                 async def publish():
                     if self.handle is h and not h.reason:
-                        transition = getattr(h, "replacement_predecessor", None)
-                        if transition is not None:
-                            h.workspace.timings.update(transition.events)
+                        ticket = getattr(h, "replacement_predecessor", None)
+                        if ticket is not None:
                             await self._emit_handle_progress(h, "replacement_audio_started",
-                                old_playback_key=transition.old_key,
-                                transition_events=dict(transition.events))
+                                replacement_id=ticket.replacement_id,
+                                old_playback_key=ticket.old_key)
                         # Preserve the existing latency trace even if the
                         # additional observer event cannot be delivered.
                         await self.runtime.log("TTS_STARTED", identity=h.identity, turn_id=h.turn_id,
@@ -531,7 +538,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
                     controls=None, control_epoch=None, control_profile=None, _control_base=None,
                     _generation_advanced=False, _fresh_session=False, _continuation_parent=None,
-                    _replacement_transition=None, _expected_generation=None):
+                    _replacement_ticket=None, _expected_generation=None):
         if _expected_generation is not None and self.generation != _expected_generation:
             return None
         if self.runtime.gate(identity):
@@ -568,10 +575,11 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         if _continuation_parent is not None:
             identity = _continuation_parent.continuation_identity or identity
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
-        if _replacement_transition is not None:
-            if not self.player.bind_replacement(_replacement_transition, h.workspace.playback_key):
+        if _replacement_ticket is not None:
+            bind = getattr(self.player, "bind_replacement_transaction", None)
+            if not callable(bind) or not await bind(_replacement_ticket, h.workspace.playback_key):
                 return None
-            h.replacement_predecessor = _replacement_transition
+            h.replacement_predecessor = _replacement_ticket
         if _continuation_parent is not None:
             # 接播严格晚于旧段结算；普通替换的旧段可能还在异步结算，不能提前冻结。
             h.delivered_prefix = _continuation_parent.continuation_base
@@ -678,7 +686,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             await asyncio.sleep(0)
         except BaseException:
             # 音色准备或事件发布时取消，已登记的后继也必须撤销，不能留下空事务。
-            self.cancel(h.speech_id)
+            await self.cancel_confirmed(h.speech_id, "cancelled")
             raise
         return h
 
@@ -711,13 +719,15 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         )
         old_speech_id = old_candidate.speech_id if old_candidate else None
         replacement = None
-        prepare = getattr(self.player, "prepare_replacement", None)
-        if callable(prepare):
+        prepare = getattr(self.player, "prepare_replacement_transaction", None)
+        if old_candidate is not None and callable(prepare):
             options = getattr(self.runtime, "options", None)
-            replacement = prepare(old_candidate.workspace.playback_key if old_candidate else None,
-                                  max_ms=min(600, getattr(options, "replace_grace_ms", 600)))
+            replacement = await prepare(old_candidate.workspace.playback_key if old_candidate else None,
+                                        max_ms=min(600, getattr(options, "replace_grace_ms", 600)))
         # 撤销和启动降音量必须早于任何异步诊断、音色准备及服务端清理。
-        self.cancel_all("replaced", replacement=replacement)
+        await self.cancel_all_confirmed("replaced", replacement=replacement)
+        if replacement is not None and (old_candidate is None or old_candidate.playback_ticket is not replacement):
+            self._schedule_orphan_replacement_settlement(replacement)
         self.last_replacement = {
             "old_speech_id": old_speech_id,
             "new_speech_id": None,
@@ -736,7 +746,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                                   controls=controls, control_epoch=control_epoch,
                                   control_profile=control_profile, _control_base=control_base,
                                   _generation_advanced=True, _fresh_session=True,
-                                  _replacement_transition=replacement[0] if replacement else None,
+                                  _replacement_ticket=replacement,
                                   _expected_generation=replacement_generation)
         if handle is None or handle.reason or handle.workspace.generation != self.generation:
             return None
@@ -821,7 +831,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                             h, "TTS_RESUME_FAILED", "tts_resume_failed",
                             reason="playback_resume_failed",
                         )
-                        self.cancel(h.speech_id, "playback_resume_failed")
+                        self._schedule_confirmed_cancel(h, "playback_resume_failed")
                         return None
                     h.player_held = False
                 hold_started = h.workspace.timings.get("playback_hold_started")
@@ -876,7 +886,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         await h.finish()
         return h
 
-    def cancel_all(self, reason, *, replacement=None):
+    def cancel_all(self, reason, *, replacement=None, _stop_now=True, _abort_legacy=True):
         """Explicitly cancel the current output scope.
 
         This is deliberately not a semantic invalidation hook: transcript
@@ -892,7 +902,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             "input_unavailable", "stopped", "reset", "failed", "fatal_error", "scope_closed",
         }
         self._invalidate_revision_window()
-        if reason != "replaced":
+        if reason != "replaced" and _abort_legacy:
             abort = getattr(self.player, "abort_replacement", None)
             if callable(abort):
                 abort(reason)
@@ -930,16 +940,13 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                 h.speech_id, h.identity[0], h.identity[1], h.workspace.generation, reason,
             h.workspace.playback_started,
             )
-            if self.player:
-                if replacement is not None:
-                    transition, stopped = replacement
-                    if transition.old_key == h.workspace.playback_key:
-                        h.playback_transition = transition
-                    else:
-                        h.snapshot = stopped
-                else:
-                    h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
-            local_event = "local_playback_revoked" if h.playback_transition is not None else "local_playback_stopped"
+            ticket = replacement if isinstance(replacement, PlaybackReplacementTicket) else None
+            if self.player and ticket is not None and ticket.old_key == h.workspace.playback_key:
+                h.playback_ticket = ticket
+                h.snapshot = ticket.snapshot
+            elif self.player and _stop_now:
+                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            local_event = "local_playback_revoked" if h.playback_ticket is not None else "local_playback_stopped"
             h.workspace.timings[local_event] = time.monotonic()
             if self.loop and not self.loop.is_closed():
                 self.loop.call_soon_threadsafe(
@@ -949,7 +956,108 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                 )
             h.task.cancel()
 
-    def cancel(self, speech_id, reason="cancelled"):
+    async def _confirm_playback_stop(self, h):
+        """Wait for the fixed output device to confirm a stop and snapshot."""
+        if self.player is None:
+            return None
+        if h.playback_settlement_task is None:
+            stop = getattr(self.player, "stop_and_snapshot_confirmed", None)
+            if not callable(stop):
+                h.playback_outcome_unknown = True
+                h.playback_error = "confirmed_stop_unavailable"
+                return None
+            h.playback_settlement_task = asyncio.create_task(
+                stop(h.workspace.playback_key), name=f"playback-stop-{h.speech_id[:8]}")
+        try:
+            h.snapshot = await asyncio.shield(h.playback_settlement_task)
+            h.workspace.timings["local_playback_stopped"] = time.monotonic()
+            return h.snapshot
+        except PlaybackOutcomeUnknown as exc:
+            h.playback_outcome_unknown = True
+            h.playback_error = str(exc)[:200]
+            return None
+        except Exception as exc:  # 传输超时等失败同样不能解释为停止成功。
+            h.playback_outcome_unknown = True
+            h.playback_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            logger.warning("episode.playback_stop_unconfirmed speech_id=%s error=%s",
+                           h.speech_id, h.playback_error)
+            return None
+
+    async def _settle_replacement_ticket(self, h, *, abort_reason=None):
+        """Resolve a replacement by its public ID; never pass a player object across IPC."""
+        if h.playback_result is not None:
+            return h.playback_result
+        ticket = h.playback_ticket
+        if ticket is None or self.player is None:
+            return None
+        if h.playback_ticket_settlement_task is None:
+            method = (getattr(self.player, "abort_replacement_transaction", None) if abort_reason is not None
+                      else getattr(self.player, "wait_replacement_transaction", None))
+            if not callable(method):
+                h.playback_outcome_unknown = True
+                h.playback_error = "replacement_receipt_unavailable"
+                return None
+            async def resolve_ticket():
+                result = (await method(ticket, abort_reason) if abort_reason is not None
+                          else await method(ticket))
+                h.playback_result = result
+                h.snapshot = result.snapshot
+                h.workspace.timings["replacement_duration_ms"] = result.duration_ms
+                h.workspace.timings["replacement_device_started_at_us"] = result.started_device_time_us
+                h.workspace.timings["replacement_device_finished_at_us"] = result.finished_device_time_us
+                h.workspace.timings["replacement_events_device_time_us"] = dict(result.events_device_time_us)
+                h.workspace.timings["local_playback_stopped"] = time.monotonic()
+                return result
+            h.playback_ticket_settlement_task = asyncio.create_task(
+                resolve_ticket(), name=f"playback-replacement-{ticket.replacement_id[:8]}")
+        try:
+            return await asyncio.shield(h.playback_ticket_settlement_task)
+        except PlaybackOutcomeUnknown as exc:
+            h.playback_outcome_unknown = True
+            h.playback_error = str(exc)[:200]
+            return None
+        except Exception as exc:
+            h.playback_outcome_unknown = True
+            h.playback_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            logger.warning("episode.playback_replacement_unconfirmed speech_id=%s error=%s",
+                           h.speech_id, h.playback_error)
+            return None
+
+    def _schedule_orphan_replacement_settlement(self, ticket: PlaybackReplacementTicket) -> None:
+        """Drain a replacement ticket when no running speech handle owns its receipt."""
+        wait = getattr(self.player, "wait_replacement_transaction", None)
+        if not callable(wait):
+            return
+        async def settle():
+            try:
+                await wait(ticket)
+            except PlaybackOutcomeUnknown as exc:
+                logger.warning("episode.orphan_replacement_unconfirmed replacement_id=%s error=%s",
+                               ticket.replacement_id, str(exc)[:200])
+            except Exception as exc:
+                logger.warning("episode.orphan_replacement_failed replacement_id=%s error=%s",
+                               ticket.replacement_id, f"{type(exc).__name__}: {str(exc)[:160]}")
+        task = asyncio.create_task(settle(), name=f"playback-replacement-orphan-{ticket.replacement_id[:8]}")
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        self.controller._track(task)
+
+    async def cancel_all_confirmed(self, reason, *, replacement: PlaybackReplacementTicket | None = None):
+        """Cancel the current output and await device stop acceptance when required."""
+        items = ([self.handle] if self.handle else []) + list(self._pending)
+        active = [h for h in items if h is not None and h is self.handle and not h.task.done() and not h.reason]
+        self.cancel_all(reason, replacement=replacement, _stop_now=False, _abort_legacy=False)
+        for h in active:
+            if h.playback_ticket is not None:
+                if reason == "replaced":
+                    continue  # prepare_replace response already confirms revocation; fade settles independently.
+                if await self._settle_replacement_ticket(h, abort_reason=reason) is None:
+                    await self._confirm_playback_stop(h)
+            else:
+                await self._confirm_playback_stop(h)
+        return next((h.snapshot for h in active if h.snapshot is not None), None)
+
+    def cancel(self, speech_id, reason="cancelled", *, _stop_now=True, _abort_legacy=True):
         """Cancel exactly one queued or active speech item.
 
         Cancelling by ID prevents withdrawal of an old queued candidate from
@@ -971,12 +1079,12 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             h.continuation_signal.set()
             h.reason = reason
             abort = getattr(self.player, "abort_replacement", None)
-            if h is self.handle and callable(abort):
+            if h is self.handle and callable(abort) and _abort_legacy:
                 abort(reason)
             h.production_ready.set()
             h.playback_ready.set()
             if h is self.handle:
-                if self.player:
+                if self.player and _stop_now:
                     h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
                 h.workspace.timings["local_playback_stopped"] = time.monotonic()
                 if self.loop and not self.loop.is_closed():
@@ -988,6 +1096,36 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             h.task.cancel()
             return True
         return False
+
+    async def cancel_confirmed(self, speech_id, reason="cancelled"):
+        """Cancel one speech ID and wait for the output device stop receipt."""
+        items = ([self.handle] if self.handle else []) + list(self._pending)
+        target = next((h for h in items if h is not None and h.speech_id == speech_id
+                       and not h.task.done() and not h.reason), None)
+        accepted = self.cancel(speech_id, reason, _stop_now=False, _abort_legacy=False)
+        if not accepted or target is None:
+            return accepted
+        if target.playback_ticket is not None:
+            if await self._settle_replacement_ticket(target, abort_reason=reason) is None:
+                await self._confirm_playback_stop(target)
+        elif target is self.handle:
+            await self._confirm_playback_stop(target)
+        return True
+
+    def _schedule_confirmed_cancel(self, h, reason):
+        """Revoke synchronously, then collect the device receipt on the owner loop."""
+        accepted = self.cancel(h.speech_id, reason, _stop_now=False, _abort_legacy=False)
+        if not accepted or self.loop is None or self.loop.is_closed():
+            return accepted
+        async def settle():
+            if h.playback_ticket is not None:
+                if await self._settle_replacement_ticket(h, abort_reason=reason) is None:
+                    await self._confirm_playback_stop(h)
+            elif h is self.handle:
+                await self._confirm_playback_stop(h)
+        self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(
+            settle(), name=f"speech-cancel-receipt-{h.speech_id[:8]}")))
+        return accepted
 
     @staticmethod
     def _playback_completed_fact(h, snapshot):
@@ -1111,7 +1249,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             # PCM（原始音频采样）队列及设备尾部已经输出完毕。
             # 在交接前冻结播放快照，防止下一代输出覆盖上一句的送达事实。
             if not h.reason and h.snapshot is None and self.player is not None:
-                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+                await self._confirm_playback_stop(h)
                 h.workspace.timings["playback_snapshot_frozen"] = time.monotonic()
         except asyncio.CancelledError:
             h.reason = h.reason or "stopped"
@@ -1149,20 +1287,34 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                     await self._emit_handle_progress(h, "old_provider_cancelled", reason=h.reason)
                     if self.handle is h and self._tts_session is session:
                         self._tts_session = None
-            if h.playback_transition is not None and self.player:
-                h.snapshot = await self.player.wait_replacement(h.playback_transition)
-                h.workspace.timings.update(h.playback_transition.events)
-                h.workspace.timings["local_playback_stopped"] = h.playback_transition.finished_at
-                await self._emit_handle_progress(h, "replacement_transition_completed",
-                    reason=h.playback_transition.reason,
-                    transition_ms=round((h.playback_transition.finished_at - h.playback_transition.started_at) * 1000, 2),
-                    transition_events=dict(h.playback_transition.events))
-            if h.snapshot is None and self.player:
-                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
-            delivery = self._delivery_resolvers[h.speech_id].resolve(
-                h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms,
-                attenuated_range_ms=(h.playback_transition.attenuated_range_ms
-                                     if h.playback_transition is not None else None))
+            if h.playback_ticket is not None and h.playback_result is None:
+                result = await self._settle_replacement_ticket(
+                    h, abort_reason=h.reason if h.reason and h.reason != "replaced" else None)
+                if result is not None:
+                    await self._emit_handle_progress(h, "replacement_transition_completed",
+                        replacement_id=result.replacement_id,
+                        reason=result.reason,
+                        transition_ms=round(result.duration_ms, 2),
+                        transition_events_device_time_us=dict(result.events_device_time_us))
+            if h.snapshot is None and self.player and not h.playback_outcome_unknown:
+                await self._confirm_playback_stop(h)
+            if h.playback_outcome_unknown:
+                sent_text = h.text[:max(0, min(len(h.text), h.sent_chars))].strip() or h.text.strip()
+                delivery = {
+                    "status": "unknown",
+                    "heard_text": "",
+                    "uncertain_text": sent_text,
+                    "unheard_text": "",
+                    "precision": "unknown",
+                    "played_ms": getattr(h.snapshot, "output_estimated_ms", 0),
+                    "reason": "playback_stop_unconfirmed",
+                    "playback_error": h.playback_error,
+                }
+            else:
+                delivery = self._delivery_resolvers[h.speech_id].resolve(
+                    h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms,
+                    attenuated_range_ms=(h.playback_result.attenuated_range_ms
+                                         if h.playback_result is not None else None))
             delivery["termination"] = h.reason or "completed"
             if h.snapshot:
                 self.controller._add_playback_delivery_fields(delivery, h.snapshot)
@@ -1389,7 +1541,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
     async def close(self):
         self._playback_hold = False
         self._playback_release.set()
-        self.cancel_all("stopped")
+        await self.cancel_all_confirmed("stopped")
         self.refresh_speech_controls("session_closed")
         if self.tasks:
             await asyncio.gather(*list(self.tasks), return_exceptions=True)

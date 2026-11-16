@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from .aniflive_native import contained
+from .aniflive_native import contained, rename_with_windows_retry
 
 
 @contextmanager
@@ -70,7 +70,7 @@ def recover_dependencies(runtime: Path):
             if backup.exists():
                 if target.exists():
                     shutil.rmtree(target)
-                os.rename(backup, target)
+                rename_with_windows_retry(backup, target)
             elif not row['original'] and target.exists():
                 shutil.rmtree(target)
         elif backup.exists():

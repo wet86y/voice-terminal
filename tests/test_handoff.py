@@ -24,6 +24,7 @@ from voice_terminal.server.product import ProductSettingsStore, ProductSettingsE
 from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
+from voice_terminal.shadow_agent import request_shadow_action_definition
 
 
 def make_runtime(root: Path) -> SessionRuntime:
@@ -749,7 +750,7 @@ def test_main_loop_suppressed_output_normalizes_once_without_replaying_actions(t
                 yield {"type":"content","text":json.dumps({"speak":{"state":"speak","emotion":"calm","text":text},"actions":actions},ensure_ascii=False)}
                 yield {"type":"finish"}
         class Registry:
-            def action_definitions(self): return []
+            def action_definitions(self): return [request_shadow_action_definition()]
             def begin_turn(self, *_): pass
             def cancel_turn(self, *_): pass
         async def emit(*_): pass

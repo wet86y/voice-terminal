@@ -120,13 +120,23 @@ def test_capture_stops_own_stream_and_cancel_discards_pcm():
             control.stop.set()
             return self
         def __exit__(self, *_): closed.append(True)
-    with patch('sounddevice.RawInputStream', Stream), patch('voice_terminal.speaker.enrollment_capture.resolve_device', return_value=None):
+    with patch('sounddevice.RawInputStream', Stream), patch('voice_terminal.devices.local.resolve_device', return_value=None):
         captured = capture_segment(seconds=8, control=control)
         assert captured.duration_ms == 5100
         assert closed and control.closed.is_set()
         control.cancel.set()
         with pytest.raises(EnrollmentCaptureError, match='取消'):
             capture_segment(seconds=8, control=control)
+
+
+def test_local_timed_recording_rejects_unbounded_requests_before_opening_device():
+    from voice_terminal.devices.local import LocalAudioDevice
+    control = CaptureControl()
+    with patch('sounddevice.RawInputStream', side_effect=AssertionError('stream must not open')):
+        with pytest.raises(ValueError, match='设备边界'):
+            LocalAudioDevice().record_bounded(sample_rate=16000, channels=1, input_device=None,
+                seconds=16, block_ms=20, control=control)
+    assert control.closed.is_set()
 
 
 def test_capture_cancel_and_late_response_cannot_restore_enrollment():

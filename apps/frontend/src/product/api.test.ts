@@ -26,3 +26,20 @@ describe('Product API（产品接口）地址', () => {
     expect(apiBaseUrl()).toBe('http://127.0.0.1:43876')
   })
 })
+
+describe('主机配对接口回执', () => {
+  it('静态页面的 HTML 响应不能当作配对 JSON，也不向用户回显页面内容', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<!doctype html><title>管理页</title>', {
+      status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    })))
+    await expect(productApi.devicePairingStatus()).rejects.toThrow('主机配对接口尚未就绪')
+  })
+
+  it('配对操作收到损坏 JSON 时返回可理解的错误', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response('{broken', {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
+    await expect(productApi.openDevicePairing(120)).rejects.toThrow('主机配对接口返回了无效数据')
+    await expect(productApi.closeDevicePairing()).rejects.toThrow('主机配对接口返回了无效数据')
+  })
+})

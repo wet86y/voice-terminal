@@ -9,8 +9,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 sha2 = "0.10"
+sha1 = { version = "=0.11.0", optional = true } # sha1（WebSocket 协议接受摘要）。
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
+russh-sftp = { version = "=3.0.1", optional = true } # russh-sftp（独立 SSH 连接上的 SFTP 文件传输）。
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "fs", "macros"], optional = true }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"], optional = true } # futures-util（WebSocket 消息收发扩展）。
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"], optional = true } # tokio-tungstenite（Rust 异步 WebSocket，使用系统 TLS 根证书）。
+rand = { version = "=0.10.3", optional = true }
+ed25519-dalek = { version = "=3.0.0", optional = true }
+zeroize = "1"
 
 [build-dependencies]
 cc = "1"
@@ -18,7 +27,21 @@ cc = "1"
 [features]
 distribution = []
 qualification = ["distribution"]
+native-audio = [] # native-audio（启用固定 WebRTC AEC/VAD 与 Opus 编解码原生组件）。
+ssh-device = ["dep:russh", "dep:russh-sftp", "dep:tokio", "dep:futures-util", "dep:tokio-tungstenite", "dep:rand", "dep:ed25519-dalek", "dep:sha1"] # ssh-device（客户端 SSH 主机固定、设备认证、控制及媒体通道、SFTP 传输与在线语音合成）。
+ssh-device-test-support = ["ssh-device"] # ssh-device-test-support（仅测试使用的固定指纹 SSH 集成夹具接口）。
+
+# SSH（安全外壳协议）验收示例使用可选 SSH 依赖，只在启用对应能力时编译。
+[[example]]
+name = "device-ssh-check"
+path = "examples/device-ssh-check.rs"
+required-features = ["ssh-device"]
+
+[[example]]
+name = "device-product-ssh-check"
+path = "examples/device-product-ssh-check.rs"
+required-features = ["ssh-device"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_Audio", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls_Dialogs", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls_Dialogs", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Credentials"] }

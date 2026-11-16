@@ -529,7 +529,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             else frame.pcm
         )
         if processed != frame.pcm:
-            frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
+            frame = AudioFrame(processed, frame.start_sample, frame.captured_at, frame.clock_uncertainty_seconds)
         if getattr(self, "_input_resetting", False):
             return  # 原生音频处理等待期间可能开始重置。
         if not _wake_replay and await self._buffer_wake_frame(frame):
@@ -750,7 +750,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                     # interruption state so a concurrent LLM delta cannot
                     # enqueue stale TTS between the snapshot and cancellation.
                     self.turns.invalidate()
-                    snapshot = self._stop_playback_snapshot(ws.playback_key)
+                    snapshot = await self._confirmed_stop_snapshot(ws.playback_key)
                     split = self._resume_started if ws.hard_closed else None
                     await self._state_event(TerminalState.INTERRUPTING, listening=True, turn_id=ws.turn_id)
                     await self._record_interruption(
@@ -761,7 +761,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                     )
                     await self._cancel_turn(reason="interrupted", snapshot=snapshot)
                     if split is not None:
-                        self._recent = deque(AudioFrame(f.pcm[max(0, split - f.start_sample) * 2:], max(split, f.start_sample), f.captured_at)
+                        self._recent = deque(AudioFrame(f.pcm[max(0, split - f.start_sample) * 2:], max(split, f.start_sample), f.captured_at, f.clock_uncertainty_seconds)
                                              for f in self._recent if f.end_sample > split)
                     await self._new_turn(frame)
                 self._resume_started = None
@@ -844,7 +844,11 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         wake = getattr(self, "_wake_preparation", None)
         owns_playback = owns_playback or bool(wake is not None and not wake.cue_done.is_set())
         if self.player and not owns_playback:
-            self.player.block()
+            stop = getattr(self.player, "stop_and_snapshot_confirmed", None)
+            if callable(stop):
+                await stop(None)
+            else:
+                self.player.block()
         await self._detail("turn.started")
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=turn_id)
 
@@ -898,7 +902,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         # the stop-and-snapshot path when no passive hold is active.
         output = getattr(self, "output", None)
         if not bool(getattr(output, "playback_hold_active", False)):
-            self._stop_playback_snapshot(ws.playback_key)
+            await self._confirmed_stop_snapshot(ws.playback_key)
         self._capture_refinement_admission(ws)
         ws.resume()
         # A resumed same-turn segment is a new semantic speech segment.  Pick
@@ -1233,9 +1237,19 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 )
                 delivery["playback_precision"] = "device_time" if progress.get("device_output_time") is not None else "callback"
         if self.state.current.get("tts_status") == "DEGRADED":
-            snapshot = self._stop_playback_snapshot(ws.playback_key)
+            snapshot = await self._confirmed_stop_snapshot(ws.playback_key)
             resolver = self._delivery_resolvers.get(ws.turn_id)
-            if resolver is not None:
+            if self._last_playback_stop_unknown:
+                delivery = {
+                    "status": "unknown",
+                    "heard_text": "",
+                    "uncertain_text": response,
+                    "unheard_text": "",
+                    "precision": "unknown",
+                    "played_ms": 0,
+                    "reason": "playback_stop_unconfirmed",
+                }
+            elif resolver is not None:
                 delivery = resolver.resolve(snapshot or {"started": False}, response)
             else:
                 delivery = {
@@ -1296,7 +1310,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             self.speaker_policy.close_turn(ws.turn_id, completed=reason == "completed", reason=reason)
         if record and ws is not None and reason != "interrupted" and ws.turn_id not in self._interrupted_turns:
             if snapshot is None and self.player:
-                snapshot = self._stop_playback_snapshot(ws.playback_key)
+                snapshot = await self._confirmed_stop_snapshot(ws.playback_key)
             await self._record_interruption(
                 ws.turn_id,
                 snapshot,
@@ -1311,7 +1325,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             # Gate and snapshot the old playback before sending a network
             # cancellation.  A late audio callback then has no route into the
             # next generation.
-            self._stop_playback_snapshot(ws.playback_key if ws else None)
+            await self._confirmed_stop_snapshot(ws.playback_key if ws else None)
         active_tts = getattr(self, "_tts_session", None)
         keep_tts_session = False
         if active_tts is not None:

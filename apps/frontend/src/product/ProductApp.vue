@@ -11,7 +11,7 @@ import { useApplicationHost } from './application-host';
 import AppFrame from "../interface/AppFrame.vue";
 import SettingsFrame from "../interface/SettingsFrame.vue";
 import Workbench from "../interface/Workbench.vue";
-import type { SettingsSection } from "../interface/settings";
+import type { DesktopSettingsSection } from "../interface/settings";
 import { desktopPort } from "./desktop-port";
 import "./application.css";
 import WakeSettings from "./panels/WakeSettings.vue";
@@ -130,7 +130,8 @@ function openAnifLiveComponentCard() {
   expandAnifLiveTtsCard.value = true
   activeSettingsTab.value = 'compute'
 }
-function setSettingsTab(section: SettingsSection) {
+function setSettingsTab(section: DesktopSettingsSection) {
+  if (section === 'devices') return
   activeSettingsTab.value = section
   if (section !== 'compute') expandAnifLiveTtsCard.value = false
 }

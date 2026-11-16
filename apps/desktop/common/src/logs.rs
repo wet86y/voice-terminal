@@ -20,9 +20,14 @@ pub fn archive_logs(log_directory: &Path, destination: &Path) -> Result<PathBuf,
 
     // entries（归档条目）：只收集本目录内的常规日志文件，不跟随链接或其他目录。
     let mut entries = Vec::new();
-    for entry in fs::read_dir(&root).map_err(|error| format!("无法读取日志目录：{error}"))? {
+    for entry in fs::read_dir(&root).map_err(|error| format!("无法读取日志目录：{error}"))?
+    {
         let entry = entry.map_err(|error| format!("无法读取日志目录内容：{error}"))?;
-        if !entry.file_type().map_err(|error| error.to_string())?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
             continue;
         }
         let name = entry.file_name();
@@ -30,7 +35,11 @@ pub fn archive_logs(log_directory: &Path, destination: &Path) -> Result<PathBuf,
             continue;
         }
         let path = entry.path();
-        if path.canonicalize().map_err(|error| error.to_string())?.starts_with(&root) {
+        if path
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .starts_with(&root)
+        {
             entries.push((name, path));
         }
     }
@@ -41,7 +50,10 @@ pub fn archive_logs(log_directory: &Path, destination: &Path) -> Result<PathBuf,
     }
 
     // file_name（压缩包文件名）：使用 UTC（协调世界时）时间，冲突时递增编号。
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (archive_path, output) = create_archive_file(destination, timestamp)?;
     let result = write_archive(output, entries);
     if let Err(error) = result {
@@ -86,7 +98,12 @@ fn write_archive(output: File, entries: Vec<(std::ffi::OsString, PathBuf)>) -> R
             Err(_) => match File::open(&path) {
                 Ok(file) => (file, false),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("无法打开日志文件 {}：{error}", name.to_string_lossy())),
+                Err(error) => {
+                    return Err(format!(
+                        "无法打开日志文件 {}：{error}",
+                        name.to_string_lossy()
+                    ))
+                }
             },
         };
         if can_sync {
@@ -94,7 +111,8 @@ fn write_archive(output: File, entries: Vec<(std::ffi::OsString, PathBuf)>) -> R
             let _ = file.sync_all();
         }
         let length = file.metadata().map_err(|error| error.to_string())?.len();
-        file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
         let name = name.to_string_lossy().into_owned();
         archive
             .start_file(name, options)

@@ -7,14 +7,14 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdout, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use voice_desktop_common::LaunchContext;
 
@@ -24,8 +24,13 @@ static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
 // ready_import（待接续导入）：失败、取消、参考缺失及已派发任务均不自动重试。
 fn ready_import(task: &Value, id: &str, known: bool) -> bool {
-    !known && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        && task["task_id"] == id && task["status"] == "ready_to_convert"
+    !known
+        && id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && task["task_id"] == id
+        && task["status"] == "ready_to_convert"
 }
 
 // ServiceControl（服务控制）：返回是否存在需要恢复的服务，管理页下载不自动启动后台。
@@ -33,27 +38,27 @@ pub type ServiceControl = Arc<dyn Fn(bool) -> Result<bool, String> + Send + Sync
 
 #[derive(Clone)]
 struct JobSnapshot {
-    job_id: String, // job_id（任务标识）。
-    resource_id: String, // resource_id（资源标识）。
-    state: String, // state（任务状态）。
-    phase: String, // phase（任务阶段说明）。
+    job_id: String,                            // job_id（任务标识）。
+    resource_id: String,                       // resource_id（资源标识）。
+    state: String,                             // state（任务状态）。
+    phase: String,                             // phase（任务阶段说明）。
     progress_kind: String, // progress_kind（进度类型）：下载、校验、安装或等待。
-    attempt: u32, // attempt（资源处理轮次）：首次加两次自动恢复。
+    attempt: u32,          // attempt（资源处理轮次）：首次加两次自动恢复。
     parent_job_id: Option<String>, // parent_job_id（所属一键任务编号）。
-    completed_bytes: u64, // completed_bytes（已处理字节数）。
+    completed_bytes: u64,  // completed_bytes（已处理字节数）。
     total_bytes: Option<u64>, // total_bytes（总字节数）。
     download_completed_bytes: Option<u64>, // download_completed_bytes（资源下载已完成字节）。
     download_total_bytes: Option<u64>, // download_total_bytes（资源下载总字节）。
     verification_completed_bytes: Option<u64>, // verification_completed_bytes（摘要校验已处理字节）。
-    verification_total_bytes: Option<u64>, // verification_total_bytes（摘要校验总字节）。
-    failure_resource_id: Option<String>, // failure_resource_id（本轮实际失败的依赖组件）。
-    first_error: Option<String>, // first_error（本轮首次错误，自动恢复不能覆盖）。
-    error: Option<String>, // error（安全错误说明）。
-    can_cancel: bool, // can_cancel（当前是否可取消）。
-    installed_resources: Vec<String>, // installed_resources（本次安装资源编号）。
-    import_preview: Option<Value>, // import_preview（预校验通过的导入识别结果）。
-    created_at: u64, // created_at（任务创建时间，Unix 毫秒）。
-    revision: u64, // revision（任务状态修订号）：事件与补查快照使用同一顺序。
+    verification_total_bytes: Option<u64>,     // verification_total_bytes（摘要校验总字节）。
+    failure_resource_id: Option<String>,       // failure_resource_id（本轮实际失败的依赖组件）。
+    first_error: Option<String>,               // first_error（本轮首次错误，自动恢复不能覆盖）。
+    error: Option<String>,                     // error（安全错误说明）。
+    can_cancel: bool,                          // can_cancel（当前是否可取消）。
+    installed_resources: Vec<String>,          // installed_resources（本次安装资源编号）。
+    import_preview: Option<Value>,             // import_preview（预校验通过的导入识别结果）。
+    created_at: u64,                           // created_at（任务创建时间，Unix 毫秒）。
+    revision: u64,           // revision（任务状态修订号）：事件与补查快照使用同一顺序。
     recovery: Option<Value>, // recovery（共用恢复状态）：事件类别、处理结果和明确下一步。
 }
 
@@ -61,36 +66,50 @@ struct JobControl {
     snapshot: JobSnapshot,
     cancel: Arc<AtomicBool>, // cancel（受控线程取消信号）。
     child: Option<Arc<Mutex<ControlledProcess>>>, // child（仅用于可取消阶段的受控进程）。
-    last_event: Instant, // last_event（最近进度广播时刻）。
-    last_persist: Instant, // last_persist（最近状态持久化时刻）。
+    last_event: Instant,     // last_event（最近进度广播时刻）。
+    last_persist: Instant,   // last_persist（最近状态持久化时刻）。
 }
 
 struct ControlledProcess {
     child: Child,
-    #[cfg(windows)] job: voice_desktop_common::windows::Job, // job（进程树终止容器）。
+    #[cfg(windows)]
+    job: voice_desktop_common::windows::Job, // job（进程树终止容器）。
 }
 
 impl ControlledProcess {
     fn spawn(command: &mut std::process::Command) -> Result<Self, String> {
-        #[cfg(windows)] {
+        #[cfg(windows)]
+        {
             let job = voice_desktop_common::windows::Job::new()?;
             let child = job.spawn(command)?;
             Ok(Self { child, job })
         }
-        #[cfg(not(windows))] { command.spawn().map(|child| Self { child }).map_err(|error| error.to_string()) }
+        #[cfg(not(windows))]
+        {
+            command
+                .spawn()
+                .map(|child| Self { child })
+                .map_err(|error| error.to_string())
+        }
     }
 
     fn kill(&mut self) {
-        #[cfg(windows)] self.job.terminate();
+        #[cfg(windows)]
+        self.job.terminate();
         let _ = self.child.kill();
     }
 
-    fn wait(&mut self) -> std::io::Result<ExitStatus> { self.child.wait() }
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait()
+    }
 }
 
 enum JobError {
     Cancelled,
-    Failed { message: String, installed: Vec<String> },
+    Failed {
+        message: String,
+        installed: Vec<String>,
+    },
 }
 
 struct ProcessError {
@@ -107,39 +126,75 @@ pub struct ResourceManager {
     jobs: Mutex<HashMap<String, JobControl>>,
     jobs_changed: Condvar, // jobs_changed（资源任务状态变化通知）。
     jobs_path: PathBuf,
-    reviews: Mutex<HashMap<String,bool>>, // reviews（用户对导入内容的选择）。
+    reviews: Mutex<HashMap<String, bool>>, // reviews（用户对导入内容的选择）。
     activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
     tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
-    resetting: AtomicBool, // resetting（重置独占准入）。
-    batch_active: AtomicBool, // batch_active（一键维护中）：整批结束后才恢复服务。
+    resetting: AtomicBool,       // resetting（重置独占准入）。
+    batch_active: AtomicBool,    // batch_active（一键维护中）：整批结束后才恢复服务。
     accepting_jobs: AtomicBool, // accepting_jobs（接受新任务）：迁移排空前原子关闭，防止排空后再写旧工作区。
-    validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
+    validation_failures: Mutex<HashMap<String, String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
 }
 
 impl ResourceManager {
     /// import_dispatcher（导入后台接续）：仅执行用户已确认且已完成暂存的任务，不依赖设置页面。
     pub fn start_import_dispatcher(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(2));
-            let Some(manager) = weak.upgrade() else { break; };
-            if !manager.accepting_jobs.load(Ordering::Acquire) { continue; }
-            let Ok(root) = voice_desktop_common::workspace::safe_path(&manager.context.install, "cache/aniflive-tts/import-jobs") else { continue; };
-            let Ok(entries) = fs::read_dir(root) else { continue; };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(id) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
-                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { continue; }
-                let Ok(path) = voice_desktop_common::workspace::safe_path(&manager.context.install,
-                    &format!("cache/aniflive-tts/import-jobs/{id}.json")) else { continue; };
-                let Some(task) = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) else { continue; };
-                // 已创建的任务（包括失败或取消）由用户重试，不能后台循环重建。
-                let known = manager.jobs.lock().map(|jobs| jobs.contains_key(&format!("aniflive-import-{id}"))).unwrap_or(true);
-                if !ready_import(&task, id, known) { continue; }
-                if let Err(error) = manager.start_aniflive_import(id.to_owned()) {
-                    eprintln!("导入后台接续暂未启动：{error}");
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(2));
+                let Some(manager) = weak.upgrade() else {
+                    break;
+                };
+                if !manager.accepting_jobs.load(Ordering::Acquire) {
+                    continue;
+                }
+                let Ok(root) = voice_desktop_common::workspace::safe_path(
+                    &manager.context.install,
+                    "cache/aniflive-tts/import-jobs",
+                ) else {
+                    continue;
+                };
+                let Ok(entries) = fs::read_dir(root) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if id.len() != 32
+                        || !id
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    {
+                        continue;
+                    }
+                    let Ok(path) = voice_desktop_common::workspace::safe_path(
+                        &manager.context.install,
+                        &format!("cache/aniflive-tts/import-jobs/{id}.json"),
+                    ) else {
+                        continue;
+                    };
+                    let Some(task) = fs::read(path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    else {
+                        continue;
+                    };
+                    // 已创建的任务（包括失败或取消）由用户重试，不能后台循环重建。
+                    let known = manager
+                        .jobs
+                        .lock()
+                        .map(|jobs| jobs.contains_key(&format!("aniflive-import-{id}")))
+                        .unwrap_or(true);
+                    if !ready_import(&task, id, known) {
+                        continue;
+                    }
+                    if let Err(error) = manager.start_aniflive_import(id.to_owned()) {
+                        eprintln!("导入后台接续暂未启动：{error}");
+                    }
                 }
             }
         });
@@ -150,16 +205,26 @@ impl ResourceManager {
         app: AppHandle,
         service_control: ServiceControl,
     ) -> Result<Self, String> {
-        if let Err(error)=voice_desktop_common::resources::disable_unavailable_enhancements(&context){eprintln!("可选增强组件状态检查失败：{error}");}
-        let process_temp = voice_desktop_common::workspace::safe_path(&context.install, "tmp/process")?;
+        if let Err(error) =
+            voice_desktop_common::resources::disable_unavailable_enhancements(&context)
+        {
+            eprintln!("可选增强组件状态检查失败：{error}");
+        }
+        let process_temp =
+            voice_desktop_common::workspace::safe_path(&context.install, "tmp/process")?;
         fs::create_dir_all(&process_temp).map_err(|_| "资源临时目录不可用。")?;
         let state_dir = voice_desktop_common::workspace::safe_path(&context.data, "state")?;
         fs::create_dir_all(&state_dir).map_err(|_| "资源任务状态目录不可用。")?;
-        let jobs_path = voice_desktop_common::workspace::safe_path(&context.data, "state/resource-jobs.json")?;
+        let jobs_path =
+            voice_desktop_common::workspace::safe_path(&context.data, "state/resource-jobs.json")?;
         let mut jobs = Self::load_jobs(&jobs_path)?;
-        if !context.install.join("tmp/native-install.json").exists(){if let Some(job)=jobs.get_mut("component-recovery"){
-            job.snapshot.state="complete".into();job.snapshot.phase="上次组件事务问题已收尾".into();job.snapshot.recovery=None;
-        }}
+        if !context.install.join("tmp/native-install.json").exists() {
+            if let Some(job) = jobs.get_mut("component-recovery") {
+                job.snapshot.state = "complete".into();
+                job.snapshot.phase = "上次组件事务问题已收尾".into();
+                job.snapshot.recovery = None;
+            }
+        }
         let manager = Self {
             context,
             app,
@@ -175,9 +240,23 @@ impl ResourceManager {
             resetting: AtomicBool::new(false),
             batch_active: AtomicBool::new(false),
             accepting_jobs: AtomicBool::new(true),
-            validation_failures:Mutex::new(HashMap::new()),
+            validation_failures: Mutex::new(HashMap::new()),
         };
-        for job in manager.snapshots(){if job["state"]=="failed"&&job["recovery"]["state"]!="resolved"{if let (Some(id),Some(reason))=(job["failure_resource_id"].as_str().or_else(||job["resource_id"].as_str()),job["error"].as_str()){voice_desktop_common::component_reset::fault(&manager.context,id,reason)?;}}}
+        for job in manager.snapshots() {
+            if !is_system_feature_job(job["job_id"].as_str().unwrap_or_default())
+                && job["state"] == "failed"
+                && job["recovery"]["state"] != "resolved"
+            {
+                if let (Some(id), Some(reason)) = (
+                    job["failure_resource_id"]
+                        .as_str()
+                        .or_else(|| job["resource_id"].as_str()),
+                    job["error"].as_str(),
+                ) {
+                    voice_desktop_common::component_reset::fault(&manager.context, id, reason)?;
+                }
+            }
+        }
         manager.persist_jobs()?;
         Ok(manager)
     }
@@ -185,33 +264,143 @@ impl ResourceManager {
     /// Inventory（资源清单）：normalize the Python resource result for the frontend.
     pub fn inventory(&self) -> Result<Vec<Value>, String> {
         voice_desktop_common::compatibility::inventory_with(&self.context, |rows| {
-        if let Some(record)=voice_desktop_common::component_maintenance::load(&self.context)?{for issue in record["issues"].as_array().into_iter().flatten(){if issue["content_failure"]==true{if let (Some(id),Some(reason))=(issue["resource_id"].as_str(),issue["reason"].as_str()){voice_desktop_common::component_reset::fault(&self.context,id,reason)?;}}}}
-        voice_desktop_common::component_reset::apply(&self.context,rows)?;
-        let failures=self.validation_failures.lock().map_err(|_|"组件校验状态不可用。")?;
-        for row in rows.iter_mut(){if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
-            row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
-        }}
-        voice_desktop_common::resources::update_tts_readiness(&self.context,rows)?;
-        if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
-        Ok(())
+            if let Some(record) = voice_desktop_common::component_maintenance::load(&self.context)?
+            {
+                for issue in record["issues"].as_array().into_iter().flatten() {
+                    if issue["content_failure"] == true {
+                        if let (Some(id), Some(reason)) =
+                            (issue["resource_id"].as_str(), issue["reason"].as_str())
+                        {
+                            voice_desktop_common::component_reset::fault(
+                                &self.context,
+                                id,
+                                reason,
+                            )?;
+                        }
+                    }
+                }
+            }
+            voice_desktop_common::component_reset::apply(&self.context, rows)?;
+            let failures = self
+                .validation_failures
+                .lock()
+                .map_err(|_| "组件校验状态不可用。")?;
+            for row in rows.iter_mut() {
+                if let Some(reason) = row["resource_id"].as_str().and_then(|id| failures.get(id)) {
+                    row["can_start"] = json!(false);
+                    row["files_installed"] = json!(false);
+                    row["installation_state"] = json!("incomplete");
+                    row["error"] = json!(reason);
+                }
+            }
+            voice_desktop_common::resources::update_tts_readiness(&self.context, rows)?;
+            if rows
+                .iter()
+                .skip(1)
+                .any(|row| row["required"] != false && row["can_start"] != true)
+            {
+                if let Some(server) = rows.first_mut() {
+                    server["can_start"] = json!(false);
+                }
+            }
+            Ok(())
         })
     }
-    pub fn record_validation(&self,readiness:&Value){
-        if let Ok(mut failures)=self.validation_failures.lock(){failures.clear();
-            for row in readiness["missing"].as_array().into_iter().flatten().chain(readiness["invalid_resources"].as_array().into_iter().flatten()){
-                if let (Some(id),Some(reason))=(row["resource_id"].as_str(),row["reason"].as_str()){
-                    if reason.contains("完整摘要复核失败"){failures.insert(id.to_owned(),reason.to_owned());}
+    pub fn record_validation(&self, readiness: &Value) {
+        if let Ok(mut failures) = self.validation_failures.lock() {
+            failures.clear();
+            for row in readiness["missing"].as_array().into_iter().flatten().chain(
+                readiness["invalid_resources"]
+                    .as_array()
+                    .into_iter()
+                    .flatten(),
+            ) {
+                if let (Some(id), Some(reason)) =
+                    (row["resource_id"].as_str(), row["reason"].as_str())
+                {
+                    if reason.contains("完整摘要复核失败") {
+                        failures.insert(id.to_owned(), reason.to_owned());
+                    }
                 }
             }
         }
     }
 
-    pub fn context(&self)->LaunchContext {self.context.clone()}
-    fn reset_resource(self:&Arc<Self>,resource_id:String,token:String)->Result<Value,String>{
-        let plan=voice_desktop_common::component_reset::plan(&self.context,&resource_id)?;
-        if plan["token"]!=token&&voice_desktop_common::component_reset::pending(&self.context)?.is_none(){return Err("重置范围已变化，请重新确认。".into());}
-        {let jobs=self.jobs.lock().map_err(|_|"任务状态不可用")?;if jobs.values().any(|j|!terminal(&j.snapshot.state))||self.resetting.swap(true,Ordering::AcqRel){return Err("请等待当前组件任务完成。".into());}}
-        let job_id=format!("reset-{resource_id}");
+    pub fn context(&self) -> LaunchContext {
+        self.context.clone()
+    }
+
+    fn require_saved_shared_host(&self) -> Result<(), String> {
+        let snapshot = voice_desktop_common::device_config::inspect(&self.context.data);
+        voice_desktop_common::system_feature::require_shared_host(&snapshot)
+    }
+
+    /// open_ssh_server_status（读取 OpenSSH Server 状态）：只读且仅限已保存共享主机。
+    pub fn open_ssh_server_status(
+        &self,
+    ) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
+        self.require_saved_shared_host()?;
+        voice_desktop_common::system_feature::open_ssh_server_status()
+    }
+
+    /// enable_open_ssh_server（启动受管主机功能任务）：使用固定任务编号，不进入普通文件下载器。
+    pub fn enable_open_ssh_server(self: &Arc<Self>) -> Result<Value, String> {
+        self.require_saved_shared_host()?;
+        let job_id = voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID.to_owned();
+        self.start_job(
+            job_id.clone(),
+            voice_desktop_common::system_feature::OPENSSH_SERVER_ID.to_owned(),
+            "准备 OpenSSH Server 系统功能管理".into(),
+            false,
+            move |manager, id| {
+                manager
+                    .require_saved_shared_host()
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                manager.set_phase(&id, "核对系统状态并等待 Windows 管理员授权", false, 0, None);
+                manager
+                    .require_saved_shared_host()
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                let after = voice_desktop_common::system_feature::enable_open_ssh_server()
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                manager.set_phase(&id, "复核 OpenSSH Server 与 sshd 状态", false, 0, None);
+                manager
+                    .require_saved_shared_host()
+                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                if !after.ready {
+                    return Err(JobError::Failed {
+                        message: "管理任务结束后没有确认 sshd 正在运行；请刷新状态并检查 Windows 功能源及策略。".into(),
+                        installed: vec![],
+                    });
+                }
+                Ok(vec![])
+            },
+        )?;
+        Ok(json!({
+            "job_id": job_id,
+            "fields": {"job_id": "OpenSSH Server 受管系统功能任务编号"}
+        }))
+    }
+
+    fn reset_resource(
+        self: &Arc<Self>,
+        resource_id: String,
+        token: String,
+    ) -> Result<Value, String> {
+        let plan = voice_desktop_common::component_reset::plan(&self.context, &resource_id)?;
+        if plan["token"] != token
+            && voice_desktop_common::component_reset::pending(&self.context)?.is_none()
+        {
+            return Err("重置范围已变化，请重新确认。".into());
+        }
+        {
+            let jobs = self.jobs.lock().map_err(|_| "任务状态不可用")?;
+            if jobs.values().any(|j| !terminal(&j.snapshot.state))
+                || self.resetting.swap(true, Ordering::AcqRel)
+            {
+                return Err("请等待当前组件任务完成。".into());
+            }
+        }
+        let job_id = format!("reset-{resource_id}");
         let result=self.start_job(job_id.clone(),resource_id.clone(),"准备重置组件".into(),false,move|manager,id|{
             let result=(||{
                 let mut lease=manager.pause_service()?;
@@ -226,81 +415,249 @@ impl ResourceManager {
             manager.resetting.store(false,Ordering::Release);
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         });
-        if result.is_err(){self.resetting.store(false,Ordering::Release);}result?;Ok(json!({"job_id":job_id}))
+        if result.is_err() {
+            self.resetting.store(false, Ordering::Release);
+        }
+        result?;
+        Ok(json!({"job_id":job_id}))
     }
 
-    pub fn record_recovery_failure(&self,reason:&str)->Result<(),String>{
-        use voice_desktop_common::component_recovery::{self,Event};
-        if let Err(error)=voice_desktop_common::component_reset::transaction_fault(&self.context,reason){eprintln!("组件事务重置资格未能保存：{error}");}
-        let event=component_recovery::classify(reason);let routine=matches!(event,Event::FileBusy|Event::Space|Event::Permission);
-        let mut recovery=component_recovery::guidance(event,false);
-        if routine{recovery["next_action"]=json!("restart");recovery["message"]=json!(format!("{} 处理后请重新打开程序，启动时将自动恢复本次事务。",recovery["message"].as_str().unwrap_or("请解决当前问题。")));}
-        let snapshot=JobSnapshot{job_id:"component-recovery".into(),resource_id:"maintenance".into(),state:"failed".into(),phase:if routine{"组件事务等待占用或环境问题解除"}else if event==Event::Unknown{"组件事务恢复失败，可重试或重置已确认组件"}else{"组件事务需要全面完整性校验"}.into(),progress_kind:"waiting".into(),attempt:1,parent_job_id:None,
-            completed_bytes:0,total_bytes:None,download_completed_bytes:None,download_total_bytes:None,verification_completed_bytes:None,verification_total_bytes:None,failure_resource_id:None,first_error:Some(reason.into()),error:Some(reason.into()),can_cancel:false,installed_resources:vec![],import_preview:None,created_at:unix_millis(),revision:1,
-            recovery:Some(recovery)};
-        self.jobs.lock().map_err(|_|"资源任务状态不可用")?.insert(snapshot.job_id.clone(),JobControl{snapshot,cancel:Arc::new(AtomicBool::new(false)),child:None,last_event:Instant::now(),last_persist:Instant::now()});
+    pub fn record_recovery_failure(&self, reason: &str) -> Result<(), String> {
+        use voice_desktop_common::component_recovery::{self, Event};
+        if let Err(error) =
+            voice_desktop_common::component_reset::transaction_fault(&self.context, reason)
+        {
+            eprintln!("组件事务重置资格未能保存：{error}");
+        }
+        let event = component_recovery::classify(reason);
+        let routine = matches!(event, Event::FileBusy | Event::Space | Event::Permission);
+        let mut recovery = component_recovery::guidance(event, false);
+        if routine {
+            recovery["next_action"] = json!("restart");
+            recovery["message"] = json!(format!(
+                "{} 处理后请重新打开程序，启动时将自动恢复本次事务。",
+                recovery["message"].as_str().unwrap_or("请解决当前问题。")
+            ));
+        }
+        let snapshot = JobSnapshot {
+            job_id: "component-recovery".into(),
+            resource_id: "maintenance".into(),
+            state: "failed".into(),
+            phase: if routine {
+                "组件事务等待占用或环境问题解除"
+            } else if event == Event::Unknown {
+                "组件事务恢复失败，可重试或重置已确认组件"
+            } else {
+                "组件事务需要全面完整性校验"
+            }
+            .into(),
+            progress_kind: "waiting".into(),
+            attempt: 1,
+            parent_job_id: None,
+            completed_bytes: 0,
+            total_bytes: None,
+            download_completed_bytes: None,
+            download_total_bytes: None,
+            verification_completed_bytes: None,
+            verification_total_bytes: None,
+            failure_resource_id: None,
+            first_error: Some(reason.into()),
+            error: Some(reason.into()),
+            can_cancel: false,
+            installed_resources: vec![],
+            import_preview: None,
+            created_at: unix_millis(),
+            revision: 1,
+            recovery: Some(recovery),
+        };
+        self.jobs.lock().map_err(|_| "资源任务状态不可用")?.insert(
+            snapshot.job_id.clone(),
+            JobControl {
+                snapshot,
+                cancel: Arc::new(AtomicBool::new(false)),
+                child: None,
+                last_event: Instant::now(),
+                last_persist: Instant::now(),
+            },
+        );
         self.persist_jobs()
     }
     /// resume_maintenance（承接主动完整性维修）：管理页挂载后复用既有资源任务。
-    pub fn resume_maintenance(self:&Arc<Self>)->Result<(),String>{
-        if let Some(pending)=voice_desktop_common::component_reset::pending(&self.context)?{return self.reset_resource(pending["resource_id"].as_str().ok_or("重置记录缺少组件编号")?.into(),pending["token"].as_str().unwrap_or("").into()).map(|_|());}
-        let targets=voice_desktop_common::component_maintenance::pending_requests(&self.context)?;
-        if targets.is_empty(){return Ok(());}
-        self.start_job("repair-components".into(),"required-batch".into(),"修复完整性校验发现的组件问题".into(),true,move|manager,parent|{
-            let result=(||{
-                let mut installed=vec![];
-                let mut remaining=targets;
-                if remaining.iter().any(|request|request["resource_id"]==voice_desktop_common::runtime::CPU_RESOURCE){
-                    let gpu=remaining.iter().any(|request|request["resource_id"]==voice_desktop_common::runtime::CPU_RESOURCE&&request["runtime_profile"]=="cu128");
-                    remaining.retain(|request|request["resource_id"]!=voice_desktop_common::runtime::CPU_RESOURCE);
-                    let job=if gpu{manager.configure_runtime_child("gpu".into(),Some(parent.clone()))}else{manager.download_child(voice_desktop_common::runtime::CPU_RESOURCE.into(),Some(parent.clone()))}
-                        .map_err(|message|JobError::Failed{message,installed:vec![]})?;
-                    let dispatch_result=voice_desktop_common::component_maintenance::dispatched(&manager.context,voice_desktop_common::runtime::CPU_RESOURCE);
-                    manager.wait_required(&parent,&[job["job_id"].as_str().unwrap().to_owned()],&mut installed)?;
-                    dispatch_result.map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-                }
-                let mut children=vec![];let mut errors=vec![];
-                for request in remaining{
-                    if manager.cancelled(&parent){break;}
-                    let id=request["resource_id"].as_str().unwrap().to_owned();
-                    let job=if request["offline"]==true{manager.migrate_child(id.clone(),parent.clone())}else{manager.download_child(id.clone(),Some(parent.clone()))};
-                    match job{
-                        Ok(job)=>{
-                            children.push(job["job_id"].as_str().unwrap().to_owned());
-                            if let Err(error)=voice_desktop_common::component_maintenance::dispatched(&manager.context,&id){errors.push(error);}
-                        },
-                        Err(error)=>errors.push(format!("{id}（组件）：{error}")),
+    pub fn resume_maintenance(self: &Arc<Self>) -> Result<(), String> {
+        if let Some(pending) = voice_desktop_common::component_reset::pending(&self.context)? {
+            return self
+                .reset_resource(
+                    pending["resource_id"]
+                        .as_str()
+                        .ok_or("重置记录缺少组件编号")?
+                        .into(),
+                    pending["token"].as_str().unwrap_or("").into(),
+                )
+                .map(|_| ());
+        }
+        let targets = voice_desktop_common::component_maintenance::pending_requests(&self.context)?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+        self.start_job(
+            "repair-components".into(),
+            "required-batch".into(),
+            "修复完整性校验发现的组件问题".into(),
+            true,
+            move |manager, parent| {
+                let result = (|| {
+                    let mut installed = vec![];
+                    let mut remaining = targets;
+                    if remaining.iter().any(|request| {
+                        request["resource_id"] == voice_desktop_common::runtime::CPU_RESOURCE
+                    }) {
+                        let gpu = remaining.iter().any(|request| {
+                            request["resource_id"] == voice_desktop_common::runtime::CPU_RESOURCE
+                                && request["runtime_profile"] == "cu128"
+                        });
+                        remaining.retain(|request| {
+                            request["resource_id"] != voice_desktop_common::runtime::CPU_RESOURCE
+                        });
+                        let job = if gpu {
+                            manager.configure_runtime_child("gpu".into(), Some(parent.clone()))
+                        } else {
+                            manager.download_child(
+                                voice_desktop_common::runtime::CPU_RESOURCE.into(),
+                                Some(parent.clone()),
+                            )
+                        }
+                        .map_err(|message| JobError::Failed {
+                            message,
+                            installed: vec![],
+                        })?;
+                        let dispatch_result =
+                            voice_desktop_common::component_maintenance::dispatched(
+                                &manager.context,
+                                voice_desktop_common::runtime::CPU_RESOURCE,
+                            );
+                        manager.wait_required(
+                            &parent,
+                            &[job["job_id"].as_str().unwrap().to_owned()],
+                            &mut installed,
+                        )?;
+                        dispatch_result.map_err(|message| JobError::Failed {
+                            message,
+                            installed: installed.clone(),
+                        })?;
+                    }
+                    let mut children = vec![];
+                    let mut errors = vec![];
+                    for request in remaining {
+                        if manager.cancelled(&parent) {
+                            break;
+                        }
+                        let id = request["resource_id"].as_str().unwrap().to_owned();
+                        let job = if request["offline"] == true {
+                            manager.migrate_child(id.clone(), parent.clone())
+                        } else {
+                            manager.download_child(id.clone(), Some(parent.clone()))
+                        };
+                        match job {
+                            Ok(job) => {
+                                children.push(job["job_id"].as_str().unwrap().to_owned());
+                                if let Err(error) =
+                                    voice_desktop_common::component_maintenance::dispatched(
+                                        &manager.context,
+                                        &id,
+                                    )
+                                {
+                                    errors.push(error);
+                                }
+                            }
+                            Err(error) => errors.push(format!("{id}（组件）：{error}")),
+                        }
+                    }
+                    manager.wait_required(&parent, &children, &mut installed)?;
+                    if errors.is_empty() {
+                        Ok(installed)
+                    } else {
+                        Err(JobError::Failed {
+                            message: errors.join("；"),
+                            installed,
+                        })
+                    }
+                })();
+                manager.batch_active.store(false, Ordering::Release);
+                if manager.pending_service_resume().unwrap_or(false) {
+                    let mut lease =
+                        manager
+                            .pause_service()
+                            .map_err(|message| JobError::Failed {
+                                message,
+                                installed: vec![],
+                            })?;
+                    match manager.maybe_resume_service(&mut lease) {
+                        Ok(resumed) => {
+                            clear_resume_intent_if_resumed(&manager.resume_pending, resumed)
+                        }
+                        Err(message) => {
+                            return Err(JobError::Failed {
+                                message,
+                                installed: vec![],
+                            });
+                        }
                     }
                 }
-                manager.wait_required(&parent,&children,&mut installed)?;
-                if errors.is_empty(){Ok(installed)}else{Err(JobError::Failed{message:errors.join("；"),installed})}
-            })();
-            manager.batch_active.store(false,Ordering::Release);
-            if manager.pending_service_resume().unwrap_or(false){
-                let mut lease=manager.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
-                match manager.maybe_resume_service(&mut lease){Ok(resumed)=>clear_resume_intent_if_resumed(&manager.resume_pending,resumed),Err(message)=>return Err(JobError::Failed{message,installed:vec![]})}
-            }
-            result
-        })
+                result
+            },
+        )
     }
-    fn migrate_child(self:&Arc<Self>,resource_id:String,parent:String)->Result<Value,String>{
-        let job_id=format!("migration-{resource_id}");
-        self.start_child_job(job_id.clone(),resource_id.clone(),"准备随包离线兼容迁移".into(),true,Some(parent),move|manager,id|{
-            let cancel=manager.cancel_signal(&id)?;
-            let mut progress=|phase:&str,done:u64,total:u64|{
-                if phase.starts_with("正在启用"){let _=manager.begin_non_cancellable_phase(&id,phase,done,Some(total));}
-                else{manager.set_phase(&id,phase,true,done,Some(total));}
-            };
-            let _shared=if resource_id=="tts-audiocpp-runtime"{Some(acquire_environment_lock(&manager.tts_runtime,&cancel,&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:vec![]})?)}else{None};
-            manager.retry_download(&id,||voice_desktop_common::resources::upgrade_bundled_with_activation(&manager.context,&resource_id,cancel.clone(),&mut progress,
-                &mut|stage,relative|manager.activate_resource(&id,stage,relative))
-                .map_err(|message|JobError::Failed{message,installed:vec![]}))
-        })?;
+    fn migrate_child(
+        self: &Arc<Self>,
+        resource_id: String,
+        parent: String,
+    ) -> Result<Value, String> {
+        let job_id = format!("migration-{resource_id}");
+        self.start_child_job(
+            job_id.clone(),
+            resource_id.clone(),
+            "准备随包离线兼容迁移".into(),
+            true,
+            Some(parent),
+            move |manager, id| {
+                let cancel = manager.cancel_signal(&id)?;
+                let mut progress = |phase: &str, done: u64, total: u64| {
+                    if phase.starts_with("正在启用") {
+                        let _ = manager.begin_non_cancellable_phase(&id, phase, done, Some(total));
+                    } else {
+                        manager.set_phase(&id, phase, true, done, Some(total));
+                    }
+                };
+                let _shared = if resource_id == "tts-audiocpp-runtime" {
+                    Some(
+                        acquire_environment_lock(&manager.tts_runtime, &cancel, &mut progress)
+                            .map_err(|message| JobError::Failed {
+                                message,
+                                installed: vec![],
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                manager.retry_download(&id, || {
+                    voice_desktop_common::resources::upgrade_bundled_with_activation(
+                        &manager.context,
+                        &resource_id,
+                        cancel.clone(),
+                        &mut progress,
+                        &mut |stage, relative| manager.activate_resource(&id, stage, relative),
+                    )
+                    .map_err(|message| JobError::Failed {
+                        message,
+                        installed: vec![],
+                    })
+                })
+            },
+        )?;
         Ok(json!({"job_id":job_id}))
     }
-    pub fn probe_gpu(self:&Arc<Self>)->Result<Value,String>{
-        let job_id="gpu-check".to_string();
+    pub fn probe_gpu(self: &Arc<Self>) -> Result<Value, String> {
+        let job_id = "gpu-check".to_string();
         self.start_job(job_id.clone(),"gpu-environment".into(),"检测登记显卡环境".into(),true,move|manager,id|{
             let context=&manager.context;
             let path=context.data.join("config/gpu-environment.json");
@@ -361,49 +718,146 @@ impl ResourceManager {
             voice_desktop_common::workspace::atomic_json(&path,&registration).map_err(|message|JobError::Failed{message,installed:vec![]})?;
             lease.finish().map_err(|message|JobError::Failed{message,installed:vec!["gpu-environment".into()]})?;
             Ok(vec!["gpu-environment".into()])
-        })?;Ok(json!({"job_id":job_id}))
+        })?;
+        Ok(json!({"job_id":job_id}))
     }
-    pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
-    pub fn has_active_jobs(&self)->bool{self.jobs.lock().map(|jobs|jobs.values().any(|job|!terminal(&job.snapshot.state))).unwrap_or(true)}
-    pub fn configure_runtime(self:&Arc<Self>,group:String)->Result<Value,String>{
-        self.configure_runtime_child(group,None)
+    pub fn snapshots(&self) -> Vec<Value> {
+        let mut rows = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|job| event_value(&job.snapshot))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row["created_at"].as_u64().unwrap_or(0));
+        rows
     }
-    fn configure_runtime_child(self:&Arc<Self>,group:String,parent:Option<String>)->Result<Value,String>{
-        let job_id=format!("env-{group}");
-        let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
-        self.start_child_job(job_id.clone(),resource_id.into(),"正在配置语音环境".into(),true,parent,move|manager,id|{
-            let cancel=manager.cancel_signal(&id)?;
-            let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
-            let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            manager.retry_download(&id,||manager.prepare_environment(&id,&group,cancel.clone(),&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:vec![]}))
-        })?;Ok(json!({"job_id":job_id}))
+    pub fn has_active_jobs(&self) -> bool {
+        self.jobs
+            .lock()
+            .map(|jobs| jobs.values().any(|job| !terminal(&job.snapshot.state)))
+            .unwrap_or(true)
     }
-    pub fn import_runtime(self:&Arc<Self>)->Result<Value,String>{
+    pub fn configure_runtime(self: &Arc<Self>, group: String) -> Result<Value, String> {
+        self.configure_runtime_child(group, None)
+    }
+    fn configure_runtime_child(
+        self: &Arc<Self>,
+        group: String,
+        parent: Option<String>,
+    ) -> Result<Value, String> {
+        let job_id = format!("env-{group}");
+        let resource_id = if voice_desktop_common::runtime::gpu_requested(&group) {
+            voice_desktop_common::runtime::GPU_RESOURCE
+        } else {
+            "voice-server"
+        };
+        self.start_child_job(
+            job_id.clone(),
+            resource_id.into(),
+            "正在配置语音环境".into(),
+            true,
+            parent,
+            move |manager, id| {
+                let cancel = manager.cancel_signal(&id)?;
+                let mut progress = |phase: &str, done: u64, total: u64| {
+                    manager.set_phase(&id, phase, !phase.starts_with("启用"), done, Some(total))
+                };
+                let _environment =
+                    acquire_environment_lock(&manager.environment, &cancel, &mut progress)
+                        .map_err(|message| JobError::Failed {
+                            message,
+                            installed: vec![],
+                        })?;
+                manager.retry_download(&id, || {
+                    manager
+                        .prepare_environment(&id, &group, cancel.clone(), &mut progress)
+                        .map_err(|message| JobError::Failed {
+                            message,
+                            installed: vec![],
+                        })
+                })
+            },
+        )?;
+        Ok(json!({"job_id":job_id}))
+    }
+    pub fn import_runtime(self: &Arc<Self>) -> Result<Value, String> {
         self.import_runtime_profile("all".into())
     }
-    fn import_runtime_profile(self:&Arc<Self>,group:String)->Result<Value,String>{
-        let job_id=new_job_id("env-import");
-        let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
-        self.start_job(job_id.clone(),resource_id.into(),"选择语音环境目录".into(),true,move|manager,id|{
-            let source=voice_desktop_common::native_ui::choose_folder("选择已准备的程序私有 Python（后端环境）目录")
-                .map_err(|message|JobError::Failed{message,installed:vec![]})?.ok_or(JobError::Cancelled)?;
-            let cancel=manager.cancel_signal(&id)?;
-            let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
-            let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let result=voice_desktop_common::runtime::import_profile_with_activation(&manager.context,&source,&group,cancel.clone(),&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
-            result.and_then(|installed|{voice_desktop_common::compatibility::finish_deferred_settings(&manager.context,&cancel)?;Ok(installed)})
-                .map_err(|message|JobError::Failed{message,installed:vec![]})
-        })?;Ok(json!({"job_id":job_id}))
+    fn import_runtime_profile(self: &Arc<Self>, group: String) -> Result<Value, String> {
+        let job_id = new_job_id("env-import");
+        let resource_id = if voice_desktop_common::runtime::gpu_requested(&group) {
+            voice_desktop_common::runtime::GPU_RESOURCE
+        } else {
+            "voice-server"
+        };
+        self.start_job(
+            job_id.clone(),
+            resource_id.into(),
+            "选择语音环境目录".into(),
+            true,
+            move |manager, id| {
+                let source = voice_desktop_common::native_ui::choose_folder(
+                    "选择已准备的程序私有 Python（后端环境）目录",
+                )
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: vec![],
+                })?
+                .ok_or(JobError::Cancelled)?;
+                let cancel = manager.cancel_signal(&id)?;
+                let mut progress = |phase: &str, done: u64, total: u64| {
+                    manager.set_phase(&id, phase, !phase.starts_with("启用"), done, Some(total))
+                };
+                let _environment =
+                    acquire_environment_lock(&manager.environment, &cancel, &mut progress)
+                        .map_err(|message| JobError::Failed {
+                            message,
+                            installed: vec![],
+                        })?;
+                let result = voice_desktop_common::runtime::import_profile_with_activation(
+                    &manager.context,
+                    &source,
+                    &group,
+                    cancel.clone(),
+                    &mut progress,
+                    &mut |stage, relative| manager.activate_resource(&id, stage, relative),
+                );
+                result
+                    .and_then(|installed| {
+                        voice_desktop_common::compatibility::finish_deferred_settings(
+                            &manager.context,
+                            &cancel,
+                        )?;
+                        Ok(installed)
+                    })
+                    .map_err(|message| JobError::Failed {
+                        message,
+                        installed: vec![],
+                    })
+            },
+        )?;
+        Ok(json!({"job_id":job_id}))
     }
 
     /// Download（下载）：run a fixed plan, retaining a stable task ID for resuming files.
     pub fn download(self: &Arc<Self>, resource_id: String) -> Result<Value, String> {
-        self.download_child(resource_id,None)
+        self.download_child(resource_id, None)
     }
-    fn download_child(self:&Arc<Self>,resource_id:String,parent:Option<String>)->Result<Value,String>{
-        if matches!(resource_id.as_str(),"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){return self.configure_runtime_child("cpu".into(),parent);}
-        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{return self.configure_runtime_child("gpu".into(),parent);}
+    fn download_child(
+        self: &Arc<Self>,
+        resource_id: String,
+        parent: Option<String>,
+    ) -> Result<Value, String> {
+        if matches!(
+            resource_id.as_str(),
+            "voice-server" | voice_desktop_common::runtime::CPU_RESOURCE
+        ) {
+            return self.configure_runtime_child("cpu".into(), parent);
+        }
+        if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {
+            return self.configure_runtime_child("gpu".into(), parent);
+        }
         if !valid_resource_id(&resource_id) {
             return Err("资源编号格式无效。".into());
         }
@@ -414,118 +868,343 @@ impl ResourceManager {
             "正在准备资源下载".into(),
             true,
             parent,
-            move |manager, job_id| manager.retry_download(&job_id,||manager.run_download(&job_id, &resource_id)),
+            move |manager, job_id| {
+                manager.retry_download(&job_id, || manager.run_download(&job_id, &resource_id))
+            },
         )?;
         Ok(json!({ "job_id": job_id }))
     }
 
     /// download_required（一键下载）：原生端持有依赖顺序与取消状态，页面关闭不影响任务。
-    pub fn download_required(self:&Arc<Self>)->Result<Value,String>{
-        let id="dl-required".to_string();
-        let result=self.start_job(id.clone(),"required-batch".into(),"准备必要组件".into(),true,|manager,parent|{
-            let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||manager.run_required(&parent)))
-                .unwrap_or_else(|_|Err(JobError::Failed{message:"一键下载异常中断，可重试。".into(),installed:vec![]}));
-            manager.batch_active.store(false,Ordering::Release);
-            if manager.pending_service_resume().unwrap_or(false){
-              let mut lease=manager.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
-                match manager.maybe_resume_service(&mut lease){Ok(resumed)=>clear_resume_intent_if_resumed(&manager.resume_pending,resumed),Err(message)=>return Err(JobError::Failed{message,installed:vec![]})}
-            }
-            outcome
-        });
-        result?;Ok(json!({"job_id":id}))
+    pub fn download_required(self: &Arc<Self>) -> Result<Value, String> {
+        let id = "dl-required".to_string();
+        let result = self.start_job(
+            id.clone(),
+            "required-batch".into(),
+            "准备必要组件".into(),
+            true,
+            |manager, parent| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    manager.run_required(&parent)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(JobError::Failed {
+                        message: "一键下载异常中断，可重试。".into(),
+                        installed: vec![],
+                    })
+                });
+                manager.batch_active.store(false, Ordering::Release);
+                if manager.pending_service_resume().unwrap_or(false) {
+                    let mut lease =
+                        manager
+                            .pause_service()
+                            .map_err(|message| JobError::Failed {
+                                message,
+                                installed: vec![],
+                            })?;
+                    match manager.maybe_resume_service(&mut lease) {
+                        Ok(resumed) => {
+                            clear_resume_intent_if_resumed(&manager.resume_pending, resumed)
+                        }
+                        Err(message) => {
+                            return Err(JobError::Failed {
+                                message,
+                                installed: vec![],
+                            });
+                        }
+                    }
+                }
+                outcome
+            },
+        );
+        result?;
+        Ok(json!({"job_id":id}))
     }
 
-    fn run_required(self:&Arc<Self>,parent:&str)->Result<Vec<String>,JobError>{
-        let mut installed=vec![];
-        let cpu=self.configure_runtime_child("cpu".into(),Some(parent.into())).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-        let cpu_id=cpu["job_id"].as_str().unwrap().to_owned();
-        self.wait_required(parent,&[cpu_id],&mut installed)?;
-        let specs=voice_desktop_common::resources::specs(&self.context).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-        let mut children=vec![];let mut errors=vec![];
-        for item in specs.iter().filter(|item|include_in_required_batch(item)){
-            if self.cancelled(parent){break;}
-            let Some(resource)=item["resource_id"].as_str()else{continue;};
-            match self.download_child(resource.into(),Some(parent.into())){
-                Ok(value)=>{let child=value["job_id"].as_str().unwrap().to_owned();children.push(child);},
-                Err(error)=>errors.push(format!("{resource}（组件）：{error}")),
+    fn run_required(self: &Arc<Self>, parent: &str) -> Result<Vec<String>, JobError> {
+        let mut installed = vec![];
+        let cpu = self
+            .configure_runtime_child("cpu".into(), Some(parent.into()))
+            .map_err(|message| JobError::Failed {
+                message,
+                installed: vec![],
+            })?;
+        let cpu_id = cpu["job_id"].as_str().unwrap().to_owned();
+        self.wait_required(parent, &[cpu_id], &mut installed)?;
+        let specs = voice_desktop_common::resources::specs(&self.context).map_err(|message| {
+            JobError::Failed {
+                message,
+                installed: installed.clone(),
+            }
+        })?;
+        let mut children = vec![];
+        let mut errors = vec![];
+        for item in specs.iter().filter(|item| include_in_required_batch(item)) {
+            if self.cancelled(parent) {
+                break;
+            }
+            let Some(resource) = item["resource_id"].as_str() else {
+                continue;
+            };
+            match self.download_child(resource.into(), Some(parent.into())) {
+                Ok(value) => {
+                    let child = value["job_id"].as_str().unwrap().to_owned();
+                    children.push(child);
+                }
+                Err(error) => errors.push(format!("{resource}（组件）：{error}")),
             }
         }
-        if let Err(error)=self.wait_required(parent,&children,&mut installed){return Err(error);}
-        if errors.is_empty(){Ok(installed)}else{Err(JobError::Failed{message:errors.join("；"),installed})}
+        if let Err(error) = self.wait_required(parent, &children, &mut installed) {
+            return Err(error);
+        }
+        if errors.is_empty() {
+            Ok(installed)
+        } else {
+            Err(JobError::Failed {
+                message: errors.join("；"),
+                installed,
+            })
+        }
     }
 
-    fn wait_required(&self,parent:&str,children:&[String],installed:&mut Vec<String>)->Result<(),JobError>{
-        loop{
-            if self.cancelled(parent){for child in children{let _=self.cancel(child);} }
-            let rows={let jobs=self.jobs.lock().map_err(|_|JobError::Failed{message:"资源任务状态不可用。".into(),installed:installed.clone()})?;
-                children.iter().filter_map(|id|jobs.get(id).map(|job|job.snapshot.clone())).collect::<Vec<_>>()};
-            for row in &rows{for id in &row.installed_resources{if !installed.contains(id){installed.push(id.clone());}}}
-            let active=rows.iter().filter(|row|!terminal(&row.state)).collect::<Vec<_>>();
-            if active.is_empty(){
-                if self.cancelled(parent){return Err(JobError::Cancelled);}
-                let errors=rows.iter().filter(|row|row.state!="complete").map(|row|format!("{}（组件）：{}",row.resource_id,row.error.as_deref().unwrap_or("任务已取消，可重试"))).collect::<Vec<_>>();
-                return if errors.is_empty(){Ok(())}else{Err(JobError::Failed{message:errors.join("；"),installed:installed.clone()})};
+    fn wait_required(
+        &self,
+        parent: &str,
+        children: &[String],
+        installed: &mut Vec<String>,
+    ) -> Result<(), JobError> {
+        loop {
+            if self.cancelled(parent) {
+                for child in children {
+                    let _ = self.cancel(child);
+                }
             }
-            let phase=format!("一键下载：已完成 {} / {} 项；{}",rows.len()-active.len(),children.len(),active.first().map(|row|row.phase.as_str()).unwrap_or("正在处理资源"));
-            self.set_phase(parent,&phase,true,0,None);
-            self.update_job(parent,|row|row.installed_resources=installed.clone());
+            let rows = {
+                let jobs = self.jobs.lock().map_err(|_| JobError::Failed {
+                    message: "资源任务状态不可用。".into(),
+                    installed: installed.clone(),
+                })?;
+                children
+                    .iter()
+                    .filter_map(|id| jobs.get(id).map(|job| job.snapshot.clone()))
+                    .collect::<Vec<_>>()
+            };
+            for row in &rows {
+                for id in &row.installed_resources {
+                    if !installed.contains(id) {
+                        installed.push(id.clone());
+                    }
+                }
+            }
+            let active = rows
+                .iter()
+                .filter(|row| !terminal(&row.state))
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                if self.cancelled(parent) {
+                    return Err(JobError::Cancelled);
+                }
+                let errors = rows
+                    .iter()
+                    .filter(|row| row.state != "complete")
+                    .map(|row| {
+                        format!(
+                            "{}（组件）：{}",
+                            row.resource_id,
+                            row.error.as_deref().unwrap_or("任务已取消，可重试")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(JobError::Failed {
+                        message: errors.join("；"),
+                        installed: installed.clone(),
+                    })
+                };
+            }
+            let phase = format!(
+                "一键下载：已完成 {} / {} 项；{}",
+                rows.len() - active.len(),
+                children.len(),
+                active
+                    .first()
+                    .map(|row| row.phase.as_str())
+                    .unwrap_or("正在处理资源")
+            );
+            self.set_phase(parent, &phase, true, 0, None);
+            self.update_job(parent, |row| row.installed_resources = installed.clone());
             thread::sleep(Duration::from_millis(100));
         }
     }
 
     /// retry_download（任务内自动恢复）：最多三轮，只清理本任务拥有的错误候选。
-    fn retry_download<F>(&self,id:&str,mut operation:F)->Result<Vec<String>,JobError>
-    where F:FnMut()->Result<Vec<String>,JobError>{
-        let mut installed=vec![];
-        for attempt in 1..=3{
-            if self.cancelled(id){return Err(JobError::Cancelled);}
-            self.update_job(id,|row|{row.attempt=attempt;row.failure_resource_id=None;row.can_cancel=true;row.progress_kind="waiting".into();row.completed_bytes=0;row.total_bytes=None;
-                row.download_completed_bytes=None;row.download_total_bytes=None;row.verification_completed_bytes=None;row.verification_total_bytes=None;});
-            let recovered=if attempt>1&&self.context.install.join("tmp/native-install.json").exists(){self.recover_pending_transaction()}else{Ok(())};
-            let outcome=recovered.map_err(|message|JobError::Failed{message,installed:vec![]}).and_then(|_|voice_desktop_common::download::with_attempt(Some(attempt),&mut operation));
-            match outcome{
-                Ok(mut result)=>{installed.append(&mut result);installed.sort();installed.dedup();return Ok(installed);},
-                Err(JobError::Failed{message,installed:partial})=>{
-                    installed.extend(partial);
-                    self.update_job(id,|row|{if row.first_error.is_none(){row.first_error=Some(message.clone());}});
-                    let event=voice_desktop_common::component_recovery::classify(&message);
-                    if !voice_desktop_common::component_recovery::automatic(event,attempt){return Err(JobError::Failed{message,installed});}
-                    let guidance=voice_desktop_common::component_recovery::guidance(event,true);
-                    self.update_job(id,|row|row.recovery=Some(guidance));
-                    self.set_phase(id,&format!("{}；准备第 {} / 3 轮",if voice_desktop_common::component_recovery::local_rebuild(event){"核验本机材料并局部重建当前组件"}else{"等待后重试当前操作"},attempt+1),true,0,None);
-                    let resource=self.jobs.lock().ok().and_then(|rows|rows.get(id).map(|row|row.snapshot.resource_id.clone())).unwrap_or_default();
-                    if voice_desktop_common::component_recovery::local_rebuild(event){
-                        if let Err(error)=self.clear_failed_candidate(&resource){return Err(JobError::Failed{message:format!("{message}；局部重建准备失败：{error}"),installed});}
-                    }
-                    for _ in 0..if attempt==1{10}else{30}{if self.cancelled(id){return Err(JobError::Cancelled);}thread::sleep(Duration::from_millis(100));}
-                },
-                Err(error)=>return Err(error),
+    fn retry_download<F>(&self, id: &str, mut operation: F) -> Result<Vec<String>, JobError>
+    where
+        F: FnMut() -> Result<Vec<String>, JobError>,
+    {
+        let mut installed = vec![];
+        for attempt in 1..=3 {
+            if self.cancelled(id) {
+                return Err(JobError::Cancelled);
             }
-        }unreachable!()
+            self.update_job(id, |row| {
+                row.attempt = attempt;
+                row.failure_resource_id = None;
+                row.can_cancel = true;
+                row.progress_kind = "waiting".into();
+                row.completed_bytes = 0;
+                row.total_bytes = None;
+                row.download_completed_bytes = None;
+                row.download_total_bytes = None;
+                row.verification_completed_bytes = None;
+                row.verification_total_bytes = None;
+            });
+            let recovered = if attempt > 1
+                && self
+                    .context
+                    .install
+                    .join("tmp/native-install.json")
+                    .exists()
+            {
+                self.recover_pending_transaction()
+            } else {
+                Ok(())
+            };
+            let outcome = recovered
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: vec![],
+                })
+                .and_then(|_| {
+                    voice_desktop_common::download::with_attempt(Some(attempt), &mut operation)
+                });
+            match outcome {
+                Ok(mut result) => {
+                    installed.append(&mut result);
+                    installed.sort();
+                    installed.dedup();
+                    return Ok(installed);
+                }
+                Err(JobError::Failed {
+                    message,
+                    installed: partial,
+                }) => {
+                    installed.extend(partial);
+                    self.update_job(id, |row| {
+                        if row.first_error.is_none() {
+                            row.first_error = Some(message.clone());
+                        }
+                    });
+                    let event = voice_desktop_common::component_recovery::classify(&message);
+                    if !voice_desktop_common::component_recovery::automatic(event, attempt) {
+                        return Err(JobError::Failed { message, installed });
+                    }
+                    let guidance = voice_desktop_common::component_recovery::guidance(event, true);
+                    self.update_job(id, |row| row.recovery = Some(guidance));
+                    self.set_phase(
+                        id,
+                        &format!(
+                            "{}；准备第 {} / 3 轮",
+                            if voice_desktop_common::component_recovery::local_rebuild(event) {
+                                "核验本机材料并局部重建当前组件"
+                            } else {
+                                "等待后重试当前操作"
+                            },
+                            attempt + 1
+                        ),
+                        true,
+                        0,
+                        None,
+                    );
+                    let resource = self
+                        .jobs
+                        .lock()
+                        .ok()
+                        .and_then(|rows| rows.get(id).map(|row| row.snapshot.resource_id.clone()))
+                        .unwrap_or_default();
+                    if voice_desktop_common::component_recovery::local_rebuild(event) {
+                        if let Err(error) = self.clear_failed_candidate(&resource) {
+                            return Err(JobError::Failed {
+                                message: format!("{message}；局部重建准备失败：{error}"),
+                                installed,
+                            });
+                        }
+                    }
+                    for _ in 0..if attempt == 1 { 10 } else { 30 } {
+                        if self.cancelled(id) {
+                            return Err(JobError::Cancelled);
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
     }
 
-    fn clear_failed_candidate(&self,resource:&str)->Result<(),String>{
-        let mut relatives=vec![];
+    fn clear_failed_candidate(&self, resource: &str) -> Result<(), String> {
+        let mut relatives = vec![];
         // 未完成事务的旧内容与证据不能作为失败候选清理。
-        if self.context.install.join("tmp/native-install.json").exists(){return Err("组件启用事务尚未恢复，保留事务恢复记录，请执行全面完整性校验。".into());}
-        if ["voice-server",voice_desktop_common::runtime::CPU_RESOURCE,voice_desktop_common::runtime::GPU_RESOURCE].contains(&resource){relatives.push("tmp/voice-environment/stage".to_owned());}
-        else if valid_resource_id(resource){for suffix in ["extracted","model","candidate","unpacked"]{relatives.push(format!("tmp/resource-downloads/{resource}/{suffix}"));}}
-        for relative in relatives{let path=voice_desktop_common::workspace::safe_path(&self.context.install,&relative)?;voice_desktop_common::workspace::remove_owned(&path,&self.context.install)?;}
+        if self
+            .context
+            .install
+            .join("tmp/native-install.json")
+            .exists()
+        {
+            return Err("组件启用事务尚未恢复，保留事务恢复记录，请执行全面完整性校验。".into());
+        }
+        if [
+            "voice-server",
+            voice_desktop_common::runtime::CPU_RESOURCE,
+            voice_desktop_common::runtime::GPU_RESOURCE,
+        ]
+        .contains(&resource)
+        {
+            relatives.push("tmp/voice-environment/stage".to_owned());
+        } else if valid_resource_id(resource) {
+            for suffix in ["extracted", "model", "candidate", "unpacked"] {
+                relatives.push(format!("tmp/resource-downloads/{resource}/{suffix}"));
+            }
+        }
+        for relative in relatives {
+            let path =
+                voice_desktop_common::workspace::safe_path(&self.context.install, &relative)?;
+            voice_desktop_common::workspace::remove_owned(&path, &self.context.install)?;
+        }
         Ok(())
     }
-    fn recover_pending_transaction(&self)->Result<(),String>{
-        let mut lease=self.pause_service()?;
+    fn recover_pending_transaction(&self) -> Result<(), String> {
+        let mut lease = self.pause_service()?;
         self.remember_service_was_running(lease.was_running())?;
-        if let Err(error)=voice_desktop_common::resources::recover(&self.context){lease.keep_stopped();return Err(error);}
-        self.update_job("component-recovery",|row|{row.state="complete".into();row.phase="上次组件事务问题已恢复".into();row.error=None;row.recovery=None;});
-        let resumed=self.maybe_resume_service(&mut lease)?;clear_resume_intent_if_resumed(&self.resume_pending,resumed);Ok(())
+        if let Err(error) = voice_desktop_common::resources::recover(&self.context) {
+            lease.keep_stopped();
+            return Err(error);
+        }
+        self.update_job("component-recovery", |row| {
+            row.state = "complete".into();
+            row.phase = "上次组件事务问题已恢复".into();
+            row.error = None;
+            row.recovery = None;
+        });
+        let resumed = self.maybe_resume_service(&mut lease)?;
+        clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+        Ok(())
     }
 
     /// Import（导入）：open the native picker on a worker thread and install selected sources.
     pub fn import(self: &Arc<Self>, resource_id: Option<String>) -> Result<Value, String> {
-        if resource_id.as_deref()==Some("voice-server"){return self.import_runtime();}
-        if resource_id.as_deref()==Some(voice_desktop_common::runtime::CPU_RESOURCE){return self.import_runtime_profile("cpu".into());}
-        if resource_id.as_deref()==Some(voice_desktop_common::runtime::GPU_RESOURCE){return self.import_runtime_profile("gpu".into());}
+        if resource_id.as_deref() == Some("voice-server") {
+            return self.import_runtime();
+        }
+        if resource_id.as_deref() == Some(voice_desktop_common::runtime::CPU_RESOURCE) {
+            return self.import_runtime_profile("cpu".into());
+        }
+        if resource_id.as_deref() == Some(voice_desktop_common::runtime::GPU_RESOURCE) {
+            return self.import_runtime_profile("gpu".into());
+        }
         if let Some(id) = &resource_id {
             if !valid_resource_id(id) {
                 return Err("资源编号格式无效。".into());
@@ -545,34 +1224,55 @@ impl ResourceManager {
 
     /// AnifLive import（AnifLive 导入）：使用一份已暂存输入说明启动现有转换任务，保持唯一转换链路。
     pub fn start_aniflive_import(self: &Arc<Self>, task_id: String) -> Result<Value, String> {
-        if task_id.len() != 32 || !task_id.bytes().all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()) {
+        if task_id.len() != 32
+            || !task_id
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())
+        {
             return Err("AnifLive 导入任务编号无效。".into());
         }
         let stage_relative = format!("cache/aniflive-tts/import-staging/{task_id}");
         let job_id = format!("aniflive-import-{task_id}");
-        if self.jobs.lock().map_err(|_| "资源任务状态不可用。")?.get(&job_id)
-            .is_some_and(|job| !terminal(&job.snapshot.state) || job.snapshot.state == "complete") {
+        if self
+            .jobs
+            .lock()
+            .map_err(|_| "资源任务状态不可用。")?
+            .get(&job_id)
+            .is_some_and(|job| !terminal(&job.snapshot.state) || job.snapshot.state == "complete")
+        {
             return Ok(json!({ "job_id": job_id }));
         }
-        let stage = voice_desktop_common::workspace::safe_path(&self.context.install, &stage_relative)?;
+        let stage =
+            voice_desktop_common::workspace::safe_path(&self.context.install, &stage_relative)?;
         let spec = stage.join("aniflive-input.json");
         if !spec.is_file() || spec.is_symlink() {
             return Err("模型尚未完成暂存，或仍需补充参考录音与转写。".into());
         }
-        let manifest: Value = serde_json::from_slice(&fs::read(stage.join("import-manifest.json")).map_err(|_| "导入暂存清单不可用。")?)
-            .map_err(|_| "导入暂存清单格式无效。")?;
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(stage.join("import-manifest.json")).map_err(|_| "导入暂存清单不可用。")?,
+        )
+        .map_err(|_| "导入暂存清单格式无效。")?;
         if manifest["task_id"] != task_id || manifest["model_id"].as_str().is_none() {
             return Err("导入暂存清单与任务编号不匹配。".into());
         }
-        let input: Value = serde_json::from_slice(&fs::read(&spec).map_err(|_| "转换输入说明文件不可用。")?)
-            .map_err(|_| "转换输入说明文件格式无效。")?;
+        let input: Value =
+            serde_json::from_slice(&fs::read(&spec).map_err(|_| "转换输入说明文件不可用。")?)
+                .map_err(|_| "转换输入说明文件格式无效。")?;
         if input["import_id"] != task_id || input["model_id"] != manifest["model_id"] {
             return Err("转换输入说明与本次导入任务不匹配。".into());
         }
-        let model_id = input["model_id"].as_str().ok_or("导入模型编号缺失。")?.to_owned();
-        if model_id.len() > 50 || model_id.is_empty() || !model_id.bytes().enumerate().all(|(index, value)| {
-            value.is_ascii_lowercase() || value.is_ascii_digit() || (index > 0 && matches!(value, b'.' | b'_' | b'-'))
-        }) {
+        let model_id = input["model_id"]
+            .as_str()
+            .ok_or("导入模型编号缺失。")?
+            .to_owned();
+        if model_id.len() > 50
+            || model_id.is_empty()
+            || !model_id.bytes().enumerate().all(|(index, value)| {
+                value.is_ascii_lowercase()
+                    || value.is_ascii_digit()
+                    || (index > 0 && matches!(value, b'.' | b'_' | b'-'))
+            })
+        {
             return Err("导入模型编号超出受管资源编号范围。".into());
         }
         self.start_job(job_id.clone(), "tts-aniflive-import".into(), "等待 AnifLive 模型转换".into(), true,
@@ -710,47 +1410,77 @@ impl ResourceManager {
 
     /// OpenSource（打开来源）：read only the locally pinned URL from the packaged catalog.
     pub fn open_source(&self, resource_id: &str) -> Result<(), String> {
-        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{
+        if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {
             #[cfg(windows)]
-            return voice_desktop_common::windows::open_url("https://pytorch.org/get-started/locally/").map_err(|_|"无法打开 PyTorch（张量框架）官方来源。".into());
+            return voice_desktop_common::windows::open_url(
+                "https://pytorch.org/get-started/locally/",
+            )
+            .map_err(|_| "无法打开 PyTorch（张量框架）官方来源。".into());
             #[cfg(not(windows))]
             return Err("打开资源来源仅支持 Windows（操作系统）。".into());
         }
-        if matches!(resource_id,"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){
+        if matches!(
+            resource_id,
+            "voice-server" | voice_desktop_common::runtime::CPU_RESOURCE
+        ) {
             #[cfg(windows)]
-            return voice_desktop_common::windows::open_url("https://www.python.org/downloads/release/python-31210/").map_err(|_|"无法打开 Python（后端解释器）官方来源。".into());
+            return voice_desktop_common::windows::open_url(
+                "https://www.python.org/downloads/release/python-31210/",
+            )
+            .map_err(|_| "无法打开 Python（后端解释器）官方来源。".into());
             #[cfg(not(windows))]
             return Err("打开资源来源仅支持 Windows（操作系统）。".into());
         }
         if !valid_resource_id(resource_id) {
             return Err("资源编号格式无效。".into());
         }
-        if resource_id=="dsh"{
-            let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
-            if spec["origin"]=="npm_package"&&!voice_desktop_common::dsh::node_installed(){
-                #[cfg(windows)] return voice_desktop_common::windows::open_url(voice_desktop_common::download_sources::policy()["node_download_page"].as_str().unwrap());
+        if resource_id == "dsh" {
+            let spec = voice_desktop_common::resources::spec(&self.context, resource_id)?;
+            if spec["origin"] == "npm_package" && !voice_desktop_common::dsh::node_installed() {
+                #[cfg(windows)]
+                return voice_desktop_common::windows::open_url(
+                    voice_desktop_common::download_sources::policy()["node_download_page"]
+                        .as_str()
+                        .unwrap(),
+                );
             }
         }
         let catalog_path = self.context.program.join("config/resources/catalog.json");
         let bytes = fs::read(catalog_path).map_err(|_| "资源来源清单不可用。")?;
-        let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| "资源来源清单格式无效。")?;
-        let entries = catalog["resources"].as_array().ok_or("资源来源清单格式无效。")?;
-        let entry = entries.iter().find(|item| item["resource_id"].as_str() == Some(resource_id))
+        let catalog: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "资源来源清单格式无效。")?;
+        let entries = catalog["resources"]
+            .as_array()
+            .ok_or("资源来源清单格式无效。")?;
+        let entry = entries
+            .iter()
+            .find(|item| item["resource_id"].as_str() == Some(resource_id))
             .ok_or("未找到该资源的固定来源。")?;
-        let url_text = entry["source"]["page_url"].as_str()
-            .or_else(|| entry["source"]["url"].as_str()).ok_or("该资源没有网页来源。")?;
+        let url_text = entry["source"]["page_url"]
+            .as_str()
+            .or_else(|| entry["source"]["url"].as_str())
+            .ok_or("该资源没有网页来源。")?;
         let url: tauri::Url = url_text.parse().map_err(|_| "资源来源地址无效。")?;
         if url.scheme() != "https"
             || url.query().is_some()
             || url.fragment().is_some()
-            || !matches!(url.host_str(), Some("github.com" | "huggingface.co" | "modelscope.cn"))
+            || !matches!(
+                url.host_str(),
+                Some("github.com" | "huggingface.co" | "modelscope.cn")
+            )
         {
             return Err("资源来源地址不符合固定平台约束。".into());
         }
         #[cfg(windows)]
-        { voice_desktop_common::windows::open_url(url.as_str()).map_err(|_| "无法打开系统默认浏览器。".into()) }
+        {
+            voice_desktop_common::windows::open_url(url.as_str())
+                .map_err(|_| "无法打开系统默认浏览器。".into())
+        }
         #[cfg(not(windows))]
-        { let _ = url; Err("打开资源来源仅支持 Windows（操作系统）。".into()) }
+        {
+            let _ = url;
+            Err("打开资源来源仅支持 Windows（操作系统）。".into())
+        }
     }
 
     /// Cancel（取消）：reject cancellation once an installer enters its commit phase.
@@ -786,30 +1516,42 @@ impl ResourceManager {
         let mut events = Vec::new();
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
-            self.accepting_jobs.store(false,Ordering::Release);
+            self.accepting_jobs.store(false, Ordering::Release);
             for job in jobs.values_mut() {
-                if terminal(&job.snapshot.state) || !job.snapshot.can_cancel { continue; }
+                if terminal(&job.snapshot.state) || !job.snapshot.can_cancel {
+                    continue;
+                }
                 job.cancel.store(true, Ordering::Release);
                 job.snapshot.state = "cancelling".into();
                 job.snapshot.phase = "工作区切换前正在停止可取消阶段".into();
                 job.snapshot.can_cancel = false;
-                job.snapshot.revision=job.snapshot.revision.saturating_add(1);
-                if let Some(child) = job.child.clone() { children.push(child); }
+                job.snapshot.revision = job.snapshot.revision.saturating_add(1);
+                if let Some(child) = job.child.clone() {
+                    children.push(child);
+                }
                 events.push(event_value(&job.snapshot));
             }
             self.persist_locked(&jobs)?;
         }
         for child in children {
-            if let Ok(mut process) = child.lock() { process.kill(); }
+            if let Ok(mut process) = child.lock() {
+                process.kill();
+            }
         }
-        for event in events { let _ = self.app.emit(PROGRESS_EVENT, event); }
+        for event in events {
+            let _ = self.app.emit(PROGRESS_EVENT, event);
+        }
 
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
         while jobs.values().any(|job| !terminal(&job.snapshot.state)) {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { return Err("资源仍在原子安装，当前不能切换工作区。".into()); }
-            let (next, timeout) = self.jobs_changed.wait_timeout(jobs, remaining)
+            if remaining.is_zero() {
+                return Err("资源仍在原子安装，当前不能切换工作区。".into());
+            }
+            let (next, timeout) = self
+                .jobs_changed
+                .wait_timeout(jobs, remaining)
                 .map_err(|_| "资源任务状态不可用。")?;
             jobs = next;
             if timeout.timed_out() && jobs.values().any(|job| !terminal(&job.snapshot.state)) {
@@ -818,191 +1560,545 @@ impl ResourceManager {
         }
         drop(jobs);
         // 已排空资源提交后暂停现用服务；意图保留到交接成功或取消后的恢复完成。
-        let mut lease=self.pause_service()?;
-        let remembered=self.remember_service_was_running(lease.was_running());
-        lease.keep_stopped();remembered
+        let mut lease = self.pause_service()?;
+        let remembered = self.remember_service_was_running(lease.was_running());
+        lease.keep_stopped();
+        remembered
     }
 
-    pub fn resume_accepting_jobs(&self)->Result<(),String>{
-        self.accepting_jobs.store(true,Ordering::Release);
-        if self.pending_service_resume()?{
-            let mut lease=self.pause_service()?;
-            let resumed=self.maybe_resume_service(&mut lease)?;
-            clear_resume_intent_if_resumed(&self.resume_pending,resumed);
-            if resumed{self.finish_recovery(None);}
-        }Ok(())
+    pub fn resume_accepting_jobs(&self) -> Result<(), String> {
+        self.accepting_jobs.store(true, Ordering::Release);
+        if self.pending_service_resume()? {
+            let mut lease = self.pause_service()?;
+            let resumed = self.maybe_resume_service(&mut lease)?;
+            clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+            if resumed {
+                self.finish_recovery(None);
+            }
+        }
+        Ok(())
     }
 
-    fn run_download(self: &Arc<Self>, job_id: &str, resource_id: &str) -> Result<Vec<String>, JobError> {
-        if self.cancelled(job_id){return Err(JobError::Cancelled);}
-        let cancel=self.cancel_signal(job_id)?;
-        let mut progress=|phase:&str,done:u64,total:u64|{
-            if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
-            else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
+    fn run_download(
+        self: &Arc<Self>,
+        job_id: &str,
+        resource_id: &str,
+    ) -> Result<Vec<String>, JobError> {
+        if self.cancelled(job_id) {
+            return Err(JobError::Cancelled);
+        }
+        let cancel = self.cancel_signal(job_id)?;
+        let mut progress = |phase: &str, done: u64, total: u64| {
+            if phase.starts_with("启用") || phase.starts_with("正在启用") {
+                let _ = self.begin_non_cancellable_phase(job_id, phase, done, Some(total));
+            } else {
+                self.set_phase(
+                    job_id,
+                    phase,
+                    true,
+                    done,
+                    if total == 0 { None } else { Some(total) },
+                );
+            }
         };
         // dependency_group（依赖组）模型先核对共享环境登记，仅有依赖变更时配置增量，再下载模型文件。
-        let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
-            .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:vec![]}})?;
-        let item=voice_desktop_common::resources::spec(&self.context,resource_id)
-            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-        if item["preparation"]=="aniflive_runtime"{
-            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-            let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--program"),self.context.program.clone().into_os_string(),OsString::from("--prepare-runtime"),OsString::from("--native-ack")];
-            installed.extend(self.run_aniflive_task(job_id,&args,cancel)?);return Ok(installed);
+        let mut installed = self
+            .configure_resource_dependencies(job_id, resource_id, cancel.clone(), &mut progress)
+            .map_err(|message| {
+                self.update_job(job_id, |row| {
+                    row.failure_resource_id =
+                        Some(voice_desktop_common::runtime::CPU_RESOURCE.into())
+                });
+                JobError::Failed {
+                    message,
+                    installed: vec![],
+                }
+            })?;
+        let item = voice_desktop_common::resources::spec(&self.context, resource_id).map_err(
+            |message| JobError::Failed {
+                message,
+                installed: installed.clone(),
+            },
+        )?;
+        if item["preparation"] == "aniflive_runtime" {
+            let _shared = acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress)
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: installed.clone(),
+                })?;
+            let args = vec![
+                OsString::from("--root"),
+                self.context.install.clone().into_os_string(),
+                OsString::from("--program"),
+                self.context.program.clone().into_os_string(),
+                OsString::from("--prepare-runtime"),
+                OsString::from("--native-ack"),
+            ];
+            installed.extend(self.run_aniflive_task(job_id, &args, cancel)?);
+            return Ok(installed);
         }
-        if item["preparation"]=="aniflive_local_build"{
-            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-            let preset=item["model_id"].as_str().ok_or_else(||JobError::Failed{message:"本地模型缺少固定输入编号。".into(),installed:installed.clone()})?;
-            let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),
-                OsString::from("--program"),self.context.program.clone().into_os_string(),
-                OsString::from("--prepare-runtime"),OsString::from(if item["imported"]==true{"--registered-model"}else{"--preset"}),OsString::from(preset),
-                OsString::from("--convert"),OsString::from("--native-ack")];
-            installed.extend(self.run_aniflive_task(job_id,&args,cancel.clone())?);
+        if item["preparation"] == "aniflive_local_build" {
+            let _shared = acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress)
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: installed.clone(),
+                })?;
+            let preset = item["model_id"].as_str().ok_or_else(|| JobError::Failed {
+                message: "本地模型缺少固定输入编号。".into(),
+                installed: installed.clone(),
+            })?;
+            let args = vec![
+                OsString::from("--root"),
+                self.context.install.clone().into_os_string(),
+                OsString::from("--program"),
+                self.context.program.clone().into_os_string(),
+                OsString::from("--prepare-runtime"),
+                OsString::from(if item["imported"] == true {
+                    "--registered-model"
+                } else {
+                    "--preset"
+                }),
+                OsString::from(preset),
+                OsString::from("--convert"),
+                OsString::from("--native-ack"),
+            ];
+            installed.extend(self.run_aniflive_task(job_id, &args, cancel.clone())?);
             if item["imported"] != true {
                 // 独占暂停业务服务，由组件任务中的唯一写入者登记；结束后恢复原服务。
-                let mut lease = self.pause_service().map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
-                self.remember_service_was_running(lease.was_running()).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                let mut lease = self.pause_service().map_err(|message| JobError::Failed {
+                    message,
+                    installed: installed.clone(),
+                })?;
+                self.remember_service_was_running(lease.was_running())
+                    .map_err(|message| JobError::Failed {
+                        message,
+                        installed: installed.clone(),
+                    })?;
                 self.set_phase(job_id, "正在登记预设音色参考", true, 0, None);
-                let registration_args = vec![OsString::from("--root"), self.context.install.clone().into_os_string(),
-                    OsString::from("--data"), self.context.data.clone().into_os_string(), OsString::from("--model"), OsString::from(preset)];
-                let result = self.run_stream_script(job_id, &self.context.program.join("scripts/register-aniflive-references.py"), &registration_args,
-                    |phase, done, total| { self.set_phase(job_id, phase, true, done, if total == 0 { None } else { Some(total) }); Ok(()) });
-                let resumed = self.maybe_resume_service(&mut lease).map_err(|message| JobError::Failed { message, installed: installed.clone() })?;
+                let registration_args = vec![
+                    OsString::from("--root"),
+                    self.context.install.clone().into_os_string(),
+                    OsString::from("--data"),
+                    self.context.data.clone().into_os_string(),
+                    OsString::from("--model"),
+                    OsString::from(preset),
+                ];
+                let result = self.run_stream_script(
+                    job_id,
+                    &self
+                        .context
+                        .program
+                        .join("scripts/register-aniflive-references.py"),
+                    &registration_args,
+                    |phase, done, total| {
+                        self.set_phase(
+                            job_id,
+                            phase,
+                            true,
+                            done,
+                            if total == 0 { None } else { Some(total) },
+                        );
+                        Ok(())
+                    },
+                );
+                let resumed =
+                    self.maybe_resume_service(&mut lease)
+                        .map_err(|message| JobError::Failed {
+                            message,
+                            installed: installed.clone(),
+                        })?;
                 clear_resume_intent_if_resumed(&self.resume_pending, resumed);
-                result.map_err(|error| if error.cancelled { JobError::Cancelled } else { JobError::Failed {
-                    message: format!("模型已登记，但参考资料登记失败，可重试：{}", error.message), installed: installed.clone() } })?;
+                result.map_err(|error| {
+                    if error.cancelled {
+                        JobError::Cancelled
+                    } else {
+                        JobError::Failed {
+                            message: format!(
+                                "模型已登记，但参考资料登记失败，可重试：{}",
+                                error.message
+                            ),
+                            installed: installed.clone(),
+                        }
+                    }
+                })?;
             }
             return Ok(installed);
         }
-        if let Some(shared)=item["runtime_resource"].as_str().filter(|_| !matches!(resource_id,"tts-voxcpm1"|"tts-voxcpm2")){
-            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-            let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,shared,cancel.clone(),&mut progress,
-                &mut|stage,relative|self.activate_resource(job_id,stage,relative))
-                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+        if let Some(shared) = item["runtime_resource"]
+            .as_str()
+            .filter(|_| !matches!(resource_id, "tts-voxcpm1" | "tts-voxcpm2"))
+        {
+            let _shared = acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress)
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: installed.clone(),
+                })?;
+            let result = voice_desktop_common::resources::download_resource_with_activation(
+                &self.context,
+                shared,
+                cancel.clone(),
+                &mut progress,
+                &mut |stage, relative| self.activate_resource(job_id, stage, relative),
+            )
+            .map_err(|message| JobError::Failed {
+                message,
+                installed: installed.clone(),
+            })?;
             installed.extend(result);
         }
-        let _shared=if resource_id=="tts-audiocpp-runtime"{Some(acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
-            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?)}else{None};
-        let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,resource_id,cancel,&mut progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))
-            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-        installed.extend(result);Ok(installed)
+        let _shared = if resource_id == "tts-audiocpp-runtime" {
+            Some(
+                acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress).map_err(
+                    |message| JobError::Failed {
+                        message,
+                        installed: installed.clone(),
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let result = voice_desktop_common::resources::download_resource_with_activation(
+            &self.context,
+            resource_id,
+            cancel,
+            &mut progress,
+            &mut |stage, relative| self.activate_resource(job_id, stage, relative),
+        )
+        .map_err(|message| JobError::Failed {
+            message,
+            installed: installed.clone(),
+        })?;
+        installed.extend(result);
+        Ok(installed)
     }
 
-    fn run_aniflive_task(&self,job_id:&str,args:&[OsString],cancel:Arc<AtomicBool>)->Result<Vec<String>,JobError>{
-        if cancel.load(Ordering::Acquire){return Err(JobError::Cancelled);}
-        let mut lease=None;
-        let result=self.run_stream_script_with_ack(job_id,&self.context.program.join("scripts/install-aniflive.py"),args,
-            Some(("等待显卡构建","{\"continue\":true}".into())),|phase,done,total|{
-                if phase=="等待显卡构建"{let paused=self.pause_service()?;self.remember_service_was_running(paused.was_running())?;lease=Some(paused);}
-                if phase.starts_with("启用"){self.begin_non_cancellable_phase(job_id,phase,done,Some(total))?;}
-                else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
-                Ok(())
-            });
-        let cleanup_args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--cleanup-aliases")];
-        let cleanup=self.run_stream_script("",&self.context.program.join("scripts/install-aniflive.py"),&cleanup_args,|_,_,_|Ok(()));
-        if let Some(lease)=lease.as_mut(){
-            let resumed=self.maybe_resume_service(lease).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+    fn run_aniflive_task(
+        &self,
+        job_id: &str,
+        args: &[OsString],
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<String>, JobError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(JobError::Cancelled);
         }
-        cleanup.map_err(|error|JobError::Failed{message:format!("任务已退出，但临时盘符回收失败：{}",error.message),installed:vec![]})?;
-        let result=result.map_err(|error|if error.cancelled{JobError::Cancelled}else{JobError::Failed{message:error.message,installed:vec![]}})?;
-        if result["runtime_ready"]==true&&voice_desktop_common::resources::native_runtime_status(&self.context).is_ok_and(|row|row["can_start"]==true){return Ok(vec!["tts-aniflive-runtime".into()]);}
-        let model=result["model_id"].as_str().ok_or_else(||JobError::Failed{message:"模型任务未返回登记身份。".into(),installed:vec![]})?;
-        if !voice_desktop_common::resources::aniflive_model_ready(&self.context,model,false).unwrap_or(false){return Err(JobError::Failed{message:"模型登记与实际生成文件不一致。".into(),installed:vec![]});}
+        let mut lease = None;
+        let result = self.run_stream_script_with_ack(
+            job_id,
+            &self.context.program.join("scripts/install-aniflive.py"),
+            args,
+            Some(("等待显卡构建", "{\"continue\":true}".into())),
+            |phase, done, total| {
+                if phase == "等待显卡构建" {
+                    let paused = self.pause_service()?;
+                    self.remember_service_was_running(paused.was_running())?;
+                    lease = Some(paused);
+                }
+                if phase.starts_with("启用") {
+                    self.begin_non_cancellable_phase(job_id, phase, done, Some(total))?;
+                } else {
+                    self.set_phase(
+                        job_id,
+                        phase,
+                        true,
+                        done,
+                        if total == 0 { None } else { Some(total) },
+                    );
+                }
+                Ok(())
+            },
+        );
+        let cleanup_args = vec![
+            OsString::from("--root"),
+            self.context.install.clone().into_os_string(),
+            OsString::from("--cleanup-aliases"),
+        ];
+        let cleanup = self.run_stream_script(
+            "",
+            &self.context.program.join("scripts/install-aniflive.py"),
+            &cleanup_args,
+            |_, _, _| Ok(()),
+        );
+        if let Some(lease) = lease.as_mut() {
+            let resumed = self
+                .maybe_resume_service(lease)
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: vec![],
+                })?;
+            clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+        }
+        cleanup.map_err(|error| JobError::Failed {
+            message: format!("任务已退出，但临时盘符回收失败：{}", error.message),
+            installed: vec![],
+        })?;
+        let result = result.map_err(|error| {
+            if error.cancelled {
+                JobError::Cancelled
+            } else {
+                JobError::Failed {
+                    message: error.message,
+                    installed: vec![],
+                }
+            }
+        })?;
+        if result["runtime_ready"] == true
+            && voice_desktop_common::resources::native_runtime_status(&self.context)
+                .is_ok_and(|row| row["can_start"] == true)
+        {
+            return Ok(vec!["tts-aniflive-runtime".into()]);
+        }
+        let model = result["model_id"]
+            .as_str()
+            .ok_or_else(|| JobError::Failed {
+                message: "模型任务未返回登记身份。".into(),
+                installed: vec![],
+            })?;
+        if !voice_desktop_common::resources::aniflive_model_ready(&self.context, model, false)
+            .unwrap_or(false)
+        {
+            return Err(JobError::Failed {
+                message: "模型登记与实际生成文件不一致。".into(),
+                installed: vec![],
+            });
+        }
         Ok(vec![format!("tts-aniflive-{model}")])
     }
 
-    fn run_import(self: &Arc<Self>, job_id: &str, resource_id: Option<String>) -> Result<Vec<String>, JobError> {
-        let sources=voice_desktop_common::native_ui::choose_resource(resource_id.as_deref()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-        if sources.is_empty(){return Err(JobError::Cancelled);}
-        let mut installed=vec![];
-        let mut progress=|phase:&str,done:u64,total:u64|{
-            if phase.starts_with("正在启用")||phase.starts_with("启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
-            else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
+    fn run_import(
+        self: &Arc<Self>,
+        job_id: &str,
+        resource_id: Option<String>,
+    ) -> Result<Vec<String>, JobError> {
+        let sources = voice_desktop_common::native_ui::choose_resource(resource_id.as_deref())
+            .map_err(|message| JobError::Failed {
+                message,
+                installed: vec![],
+            })?;
+        if sources.is_empty() {
+            return Err(JobError::Cancelled);
+        }
+        let mut installed = vec![];
+        let mut progress = |phase: &str, done: u64, total: u64| {
+            if phase.starts_with("正在启用") || phase.starts_with("启用") {
+                let _ = self.begin_non_cancellable_phase(job_id, phase, done, Some(total));
+            } else {
+                self.set_phase(
+                    job_id,
+                    phase,
+                    true,
+                    done,
+                    if total == 0 { None } else { Some(total) },
+                );
+            }
         };
-        if let Some(id)=resource_id.as_deref(){
-            let dependencies=self.configure_resource_dependencies(job_id,id,self.cancel_signal(job_id)?,&mut progress)
-                .map_err(|message|{self.update_job(job_id,|row|row.failure_resource_id=Some(voice_desktop_common::runtime::CPU_RESOURCE.into()));JobError::Failed{message,installed:installed.clone()}})?;
+        if let Some(id) = resource_id.as_deref() {
+            let dependencies = self
+                .configure_resource_dependencies(
+                    job_id,
+                    id,
+                    self.cancel_signal(job_id)?,
+                    &mut progress,
+                )
+                .map_err(|message| {
+                    self.update_job(job_id, |row| {
+                        row.failure_resource_id =
+                            Some(voice_desktop_common::runtime::CPU_RESOURCE.into())
+                    });
+                    JobError::Failed {
+                        message,
+                        installed: installed.clone(),
+                    }
+                })?;
             installed.extend(dependencies);
         }
-        if resource_id.as_deref().is_some_and(|id|id.starts_with("tts-aniflive-")){
-            let cancel=self.cancel_signal(job_id)?;
-            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-            for source in sources{
-                let specification=source.join("aniflive-input.json");
-                if !specification.is_file(){return Err(JobError::Failed{message:"导入文件夹需要 aniflive-input.json（模型编号、名称、配对权重、参考录音、准确转写及语言）。".into(),installed});}
-                let args=vec![OsString::from("--root"),self.context.install.clone().into_os_string(),OsString::from("--program"),self.context.program.clone().into_os_string(),
-                    OsString::from("--prepare-runtime"),OsString::from("--input-spec"),specification.into_os_string(),OsString::from("--convert"),OsString::from("--native-ack")];
-                installed.extend(self.run_aniflive_task(job_id,&args,cancel.clone())?);
+        if resource_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("tts-aniflive-"))
+        {
+            let cancel = self.cancel_signal(job_id)?;
+            let _shared = acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress)
+                .map_err(|message| JobError::Failed {
+                    message,
+                    installed: installed.clone(),
+                })?;
+            for source in sources {
+                let specification = source.join("aniflive-input.json");
+                if !specification.is_file() {
+                    return Err(JobError::Failed{message:"导入文件夹需要 aniflive-input.json（模型编号、名称、配对权重、参考录音、准确转写及语言）。".into(),installed});
+                }
+                let args = vec![
+                    OsString::from("--root"),
+                    self.context.install.clone().into_os_string(),
+                    OsString::from("--program"),
+                    self.context.program.clone().into_os_string(),
+                    OsString::from("--prepare-runtime"),
+                    OsString::from("--input-spec"),
+                    specification.into_os_string(),
+                    OsString::from("--convert"),
+                    OsString::from("--native-ack"),
+                ];
+                installed.extend(self.run_aniflive_task(job_id, &args, cancel.clone())?);
             }
             return Ok(installed);
         }
         for source in sources {
-            let result=voice_desktop_common::resources::import_review_with_activation(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut progress,
-                &mut|items|self.review_import(job_id,items),&mut|stage,relative|self.activate_resource(job_id,stage,relative))
-                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            let result = voice_desktop_common::resources::import_review_with_activation(
+                &self.context,
+                &source,
+                resource_id.as_deref(),
+                self.cancel_signal(job_id)?,
+                &mut progress,
+                &mut |items| self.review_import(job_id, items),
+                &mut |stage, relative| self.activate_resource(job_id, stage, relative),
+            )
+            .map_err(|message| JobError::Failed {
+                message,
+                installed: installed.clone(),
+            })?;
             installed.extend(result);
         }
         Ok(installed)
     }
 
-    fn review_import(&self,job_id:&str,items:&[Value])->Result<(),String>{
-        self.update_job(job_id,|snapshot|{snapshot.state="waiting".into();snapshot.phase="整包校验通过，请确认识别结果".into();snapshot.import_preview=Some(json!(items));snapshot.can_cancel=true;});
+    fn review_import(&self, job_id: &str, items: &[Value]) -> Result<(), String> {
+        self.update_job(job_id, |snapshot| {
+            snapshot.state = "waiting".into();
+            snapshot.phase = "整包校验通过，请确认识别结果".into();
+            snapshot.import_preview = Some(json!(items));
+            snapshot.can_cancel = true;
+        });
         loop {
-            if self.cancelled(job_id){return Err("已取消导入".into());}
-            if let Some(accepted)=self.reviews.lock().map_err(|e|e.to_string())?.remove(job_id){
-                self.update_job(job_id,|snapshot|{snapshot.import_preview=None;snapshot.state="running".into();});
-                return if accepted{Ok(())}else{Err("已取消导入".into())};
+            if self.cancelled(job_id) {
+                return Err("已取消导入".into());
+            }
+            if let Some(accepted) = self
+                .reviews
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(job_id)
+            {
+                self.update_job(job_id, |snapshot| {
+                    snapshot.import_preview = None;
+                    snapshot.state = "running".into();
+                });
+                return if accepted {
+                    Ok(())
+                } else {
+                    Err("已取消导入".into())
+                };
             }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
-    pub fn confirm_import(&self,job_id:&str,accepted:bool)->Result<(),String>{
-        if !self.jobs.lock().map_err(|e|e.to_string())?.get(job_id).is_some_and(|job|job.snapshot.import_preview.is_some()) {return Err("此任务没有待确认导入内容".into());}
-        if !accepted{return self.cancel(job_id);}
-        self.reviews.lock().map_err(|e|e.to_string())?.insert(job_id.into(),true);Ok(())
+    pub fn confirm_import(&self, job_id: &str, accepted: bool) -> Result<(), String> {
+        if !self
+            .jobs
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(job_id)
+            .is_some_and(|job| job.snapshot.import_preview.is_some())
+        {
+            return Err("此任务没有待确认导入内容".into());
+        }
+        if !accepted {
+            return self.cancel(job_id);
+        }
+        self.reviews
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(job_id.into(), true);
+        Ok(())
     }
     fn cli_args(&self, command: &str, args: &[OsString]) -> Vec<OsString> {
         let mut tail = vec![OsString::from(command)];
-        tail.extend([OsString::from("--root"), self.context.install.clone().into_os_string(),
-            OsString::from("--program"), self.context.program.clone().into_os_string()]);
+        tail.extend([
+            OsString::from("--root"),
+            self.context.install.clone().into_os_string(),
+            OsString::from("--program"),
+            self.context.program.clone().into_os_string(),
+        ]);
         tail.extend(args.iter().cloned());
         tail
     }
 
-    fn run_stream_cli<F>(&self, job_id: Option<&str>, script_name: &str, args: &[OsString], on_progress: F) -> Result<Value, ProcessError>
-    where F: FnMut(&str, u64, u64) -> Result<(), String> {
+    fn run_stream_cli<F>(
+        &self,
+        job_id: Option<&str>,
+        script_name: &str,
+        args: &[OsString],
+        on_progress: F,
+    ) -> Result<Value, ProcessError>
+    where
+        F: FnMut(&str, u64, u64) -> Result<(), String>,
+    {
         let script = self.context.program.join("scripts").join(script_name);
         self.run_stream_script(job_id.unwrap_or(""), &script, args, on_progress)
     }
 
-    fn run_stream_script<F>(&self, job_id: &str, script: &Path, args: &[OsString], on_progress: F) -> Result<Value, ProcessError>
-    where F: FnMut(&str, u64, u64) -> Result<(), String> {
+    fn run_stream_script<F>(
+        &self,
+        job_id: &str,
+        script: &Path,
+        args: &[OsString],
+        on_progress: F,
+    ) -> Result<Value, ProcessError>
+    where
+        F: FnMut(&str, u64, u64) -> Result<(), String>,
+    {
         self.run_stream_script_with_ack(job_id, script, args, None, on_progress)
     }
 
-    fn run_stream_script_with_ack<F>(&self, job_id: &str, script: &Path, args: &[OsString], native_ack: Option<(&str, String)>, mut on_progress: F) -> Result<Value, ProcessError>
-    where F: FnMut(&str, u64, u64) -> Result<(), String> {
+    fn run_stream_script_with_ack<F>(
+        &self,
+        job_id: &str,
+        script: &Path,
+        args: &[OsString],
+        native_ack: Option<(&str, String)>,
+        mut on_progress: F,
+    ) -> Result<Value, ProcessError>
+    where
+        F: FnMut(&str, u64, u64) -> Result<(), String>,
+    {
         if !script.is_file() {
-            return Err(ProcessError { message: "资源管理脚本缺失。".into(), installed: vec![], cancelled: false });
+            return Err(ProcessError {
+                message: "资源管理脚本缺失。".into(),
+                installed: vec![],
+                cancelled: false,
+            });
         }
         let mut command = voice_desktop_common::process_host::python_command(&self.context.python);
         // -I（隔离模式）忽略 PYTHON* 环境变量；编码与缓存必须通过解释器参数明确指定。
-        command.arg("-I").arg("-B").arg("-X").arg("utf8")
-            .arg("-X").arg(format!("pycache_prefix={}",self.context.install.join("cache/python").display()))
-            .arg(script).args(args)
+        command
+            .arg("-I")
+            .arg("-B")
+            .arg("-X")
+            .arg("utf8")
+            .arg("-X")
+            .arg(format!(
+                "pycache_prefix={}",
+                self.context.install.join("cache/python").display()
+            ))
+            .arg(script)
+            .args(args)
             .current_dir(&self.context.data)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .stdin(if native_ack.is_some() { Stdio::piped() } else { Stdio::null() });
+            .stdin(if native_ack.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
         command.env_clear();
         self.context.configure_command(&mut command);
         // Windows（操作系统）隔离环境没有 USERNAME（用户名）时，PyTorch 无法推导默认缓存目录。
         // 始终使用受管项目缓存，避免导出时回退到平台不存在的 pwd（用户数据库）模块。
-        command.env("TORCHINDUCTOR_CACHE_DIR", self.context.install.join("cache/torchinductor"));
-        #[cfg(windows)] {
+        command.env(
+            "TORCHINDUCTOR_CACHE_DIR",
+            self.context.install.join("cache/torchinductor"),
+        );
+        #[cfg(windows)]
+        {
             // SystemRoot（Windows 系统目录变量）供 Python 的 Windows socket/asyncio 模块加载系统网络提供程序。
             if let Some(system_root) = std::env::var_os("SystemRoot") {
                 command.env("SystemRoot", system_root);
@@ -1011,65 +2107,126 @@ impl ResourceManager {
             command.creation_flags(0x08000000);
         }
         let mut child = ControlledProcess::spawn(&mut command).map_err(|_| ProcessError {
-            message: "无法建立受管资源进程。".into(), installed: vec![], cancelled: false,
+            message: "无法建立受管资源进程。".into(),
+            installed: vec![],
+            cancelled: false,
         })?;
         let stdout = child.child.stdout.take().ok_or_else(|| ProcessError {
-            message: "资源管理器输出不可用。".into(), installed: vec![], cancelled: false,
+            message: "资源管理器输出不可用。".into(),
+            installed: vec![],
+            cancelled: false,
         })?;
         let mut child_stdin = child.child.stdin.take();
         let child = Arc::new(Mutex::new(child));
         if !job_id.is_empty() {
             self.attach_child(job_id, child.clone());
             if self.cancelled(job_id) {
-                if let Ok(mut process) = child.lock() { process.kill(); }
+                if let Ok(mut process) = child.lock() {
+                    process.kill();
+                }
             }
         }
         let mut final_record = None;
-        let read_result = self.consume_stdout(job_id, stdout, &mut on_progress, &mut final_record,
-            native_ack.as_ref().map(|(phase, _)| *phase), native_ack.as_ref().map(|(_, value)| value.as_str()), &mut child_stdin);
+        let read_result = self.consume_stdout(
+            job_id,
+            stdout,
+            &mut on_progress,
+            &mut final_record,
+            native_ack.as_ref().map(|(phase, _)| *phase),
+            native_ack.as_ref().map(|(_, value)| value.as_str()),
+            &mut child_stdin,
+        );
         if read_result.is_err() {
-            if let Ok(mut process) = child.lock() { process.kill(); }
+            if let Ok(mut process) = child.lock() {
+                process.kill();
+            }
         }
-        let status = child.lock().map_err(|_| ProcessError {
-            message: "资源管理进程状态不可用。".into(), installed: vec![], cancelled: false,
-        })?.wait().map_err(|_| ProcessError {
-            message: "资源管理进程无法正常结束。".into(), installed: vec![], cancelled: false,
-        })?;
-        if !job_id.is_empty() { self.detach_child(job_id); }
+        let status = child
+            .lock()
+            .map_err(|_| ProcessError {
+                message: "资源管理进程状态不可用。".into(),
+                installed: vec![],
+                cancelled: false,
+            })?
+            .wait()
+            .map_err(|_| ProcessError {
+                message: "资源管理进程无法正常结束。".into(),
+                installed: vec![],
+                cancelled: false,
+            })?;
+        if !job_id.is_empty() {
+            self.detach_child(job_id);
+        }
         if let Err(message) = read_result {
             let cancelled = !job_id.is_empty() && self.cancelled(job_id);
-            return Err(ProcessError { message, installed: Vec::new(), cancelled });
+            return Err(ProcessError {
+                message,
+                installed: Vec::new(),
+                cancelled,
+            });
         }
         if !job_id.is_empty() && self.cancelled(job_id) {
-            return Err(ProcessError { message: "资源任务已取消。".into(), installed: Vec::new(), cancelled: true });
+            return Err(ProcessError {
+                message: "资源任务已取消。".into(),
+                installed: Vec::new(),
+                cancelled: true,
+            });
         }
         let Some(record) = final_record else {
-            return Err(ProcessError { message: if status.success() { "资源管理器没有返回结果。" } else { "资源管理操作失败。" }.into(), installed: vec![], cancelled: false });
+            return Err(ProcessError {
+                message: if status.success() {
+                    "资源管理器没有返回结果。"
+                } else {
+                    "资源管理操作失败。"
+                }
+                .into(),
+                installed: vec![],
+                cancelled: false,
+            });
         };
         response_result(record)
     }
 
-    fn consume_stdout<F>(&self, job_id: &str, stdout: ChildStdout, on_progress: &mut F, final_record: &mut Option<Value>,
-        ack_phase: Option<&str>, ack_json: Option<&str>, child_stdin: &mut Option<std::process::ChildStdin>) -> Result<(), String>
-    where F: FnMut(&str, u64, u64) -> Result<(), String> {
+    fn consume_stdout<F>(
+        &self,
+        job_id: &str,
+        stdout: ChildStdout,
+        on_progress: &mut F,
+        final_record: &mut Option<Value>,
+        ack_phase: Option<&str>,
+        ack_json: Option<&str>,
+        child_stdin: &mut Option<std::process::ChildStdin>,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&str, u64, u64) -> Result<(), String>,
+    {
         for line in BufReader::new(stdout).lines() {
             let line = line.map_err(|_| "资源管理器输出读取失败。".to_string())?;
-            let Ok(record) = serde_json::from_str::<Value>(&line) else { continue; };
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if let Some(phase) = record["phase"].as_str() {
                 let done = record["completed_bytes"].as_u64().unwrap_or(0);
                 let total = record["total_bytes"].as_u64().unwrap_or(0);
                 on_progress(phase, done, total)?;
                 if ack_phase == Some(phase) {
                     use std::io::Write;
-                    let writer = child_stdin.as_mut().ok_or_else(|| "DSH 安装器确认通道不可用。".to_string())?;
+                    let writer = child_stdin
+                        .as_mut()
+                        .ok_or_else(|| "DSH 安装器确认通道不可用。".to_string())?;
                     let ack = ack_json.ok_or_else(|| "DSH 安装器确认内容缺失。".to_string())?;
-                    writer.write_all(ack.as_bytes()).and_then(|_| writer.write_all(b"\n")).and_then(|_| writer.flush())
+                    writer
+                        .write_all(ack.as_bytes())
+                        .and_then(|_| writer.write_all(b"\n"))
+                        .and_then(|_| writer.flush())
                         .map_err(|_| "DSH 运行时切换确认失败。".to_string())?;
                     child_stdin.take();
                 }
                 continue;
             }
-            if record.get("ok").is_some() { *final_record = Some(record); }
+            if record.get("ok").is_some() {
+                *final_record = Some(record);
+            }
         }
         let _ = job_id;
         Ok(())
@@ -1080,261 +2237,678 @@ impl ResourceManager {
         ServiceLease::pause(&self.service_control, guard)
     }
 
-    fn remember_service_was_running(&self,was_running:bool)->Result<(),String>{
-        if was_running{*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?=true;}
+    fn remember_service_was_running(&self, was_running: bool) -> Result<(), String> {
+        if was_running {
+            *self
+                .resume_pending
+                .lock()
+                .map_err(|_| "服务恢复意图不可用。")? = true;
+        }
         Ok(())
     }
 
-    fn pending_service_resume(&self)->Result<bool,String>{Ok(*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?)}
+    fn pending_service_resume(&self) -> Result<bool, String> {
+        Ok(*self
+            .resume_pending
+            .lock()
+            .map_err(|_| "服务恢复意图不可用。")?)
+    }
 
-    fn recovery_environment_ready(&self)->Result<bool,String>{
+    fn recovery_environment_ready(&self) -> Result<bool, String> {
         // 恢复原来已运行的降级服务；其它未安装模型不能把组件更新卡在永久停机状态。
         // 候选在换入前已完整验证，实际模型加载和能力终态仍由新宿主核对。
         Ok(self.context.python.is_file())
     }
 
-    fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{
-        resume_service_if_ready(lease,&self.resume_pending,&self.accepting_jobs,&self.batch_active,||self.recovery_environment_ready())
+    fn maybe_resume_service(&self, lease: &mut ServiceLease<'_>) -> Result<bool, String> {
+        resume_service_if_ready(
+            lease,
+            &self.resume_pending,
+            &self.accepting_jobs,
+            &self.batch_active,
+            || self.recovery_environment_ready(),
+        )
     }
 
-    fn rollback_failed_activation(&self,lease:&mut ServiceLease<'_>,transaction:&mut voice_desktop_common::resources::PendingActivation,reason:&str)->String{
-        if let Err(error)=lease.stop_partial(){
+    fn rollback_failed_activation(
+        &self,
+        lease: &mut ServiceLease<'_>,
+        transaction: &mut voice_desktop_common::resources::PendingActivation,
+        reason: &str,
+    ) -> String {
+        if let Err(error) = lease.stop_partial() {
             lease.keep_stopped();
             return format!("{reason}；无法确认新服务已停止，资源回滚留待下次启动恢复：{error}");
         }
-        if let Err(error)=voice_desktop_common::resources::rollback_activation(&self.context,transaction){
+        if let Err(error) =
+            voice_desktop_common::resources::rollback_activation(&self.context, transaction)
+        {
             lease.keep_stopped();
             return format!("{reason}；恢复原组件失败：{error}");
         }
-        match self.maybe_resume_service(lease){
-            Ok(resumed)=>{
+        match self.maybe_resume_service(lease) {
+            Ok(resumed) => {
                 // prior-running intent（更新前正在运行的服务恢复意图）只有在旧状态恢复且服务确实重新启动后才能清除；
                 // 若后续 transaction commit（事务提交）失败，仍需保留它以重新启动回滚后的旧服务。
-                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                clear_resume_intent_if_resumed(&self.resume_pending, resumed);
                 reason.to_owned()
-            },
-            Err(error)=>format!("{reason}；原组件已恢复，但语音服务未恢复：{error}"),
+            }
+            Err(error) => format!("{reason}；原组件已恢复，但语音服务未恢复：{error}"),
         }
     }
 
-    fn settle_before_activation(&self,lease:&mut ServiceLease<'_>,reason:&str)->String{
-        match self.maybe_resume_service(lease){
-            Ok(resumed)=>{clear_resume_intent_if_resumed(&self.resume_pending,resumed);reason.to_owned()},
-            Err(error)=>format!("{reason}；语音服务未恢复：{error}")
+    fn settle_before_activation(&self, lease: &mut ServiceLease<'_>, reason: &str) -> String {
+        match self.maybe_resume_service(lease) {
+            Ok(resumed) => {
+                clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+                reason.to_owned()
+            }
+            Err(error) => format!("{reason}；语音服务未恢复：{error}"),
         }
     }
 
-    fn activate_resource(&self,job_id:&str,stage:&Path,relative:&str)->Result<(),String>{
-        let mut lease=self.pause_service()?;
-        if let Err(error)=self.remember_service_was_running(lease.was_running()){lease.keep_stopped();return Err(error);}
-        let cancel=match self.cancel_signal(job_id){Ok(value)=>value,Err(_)=>return Err(self.settle_before_activation(&mut lease,"资源任务已丢失"))};
-        if let Err(error)=voice_desktop_common::resources::check_cancel(&cancel){return Err(self.settle_before_activation(&mut lease,&error));}
-        let mut transaction=match voice_desktop_common::resources::begin_activation(&self.context,stage,relative){
-            Ok(value)=>value,Err(error)=>return Err(self.settle_before_activation(&mut lease,&error)),
+    fn activate_resource(&self, job_id: &str, stage: &Path, relative: &str) -> Result<(), String> {
+        let mut lease = self.pause_service()?;
+        if let Err(error) = self.remember_service_was_running(lease.was_running()) {
+            lease.keep_stopped();
+            return Err(error);
+        }
+        let cancel = match self.cancel_signal(job_id) {
+            Ok(value) => value,
+            Err(_) => return Err(self.settle_before_activation(&mut lease, "资源任务已丢失")),
         };
-        if relative=="runtimes/dsh" {
-            if let Err(error)=voice_desktop_common::resources::validate_dsh_activation(&self.context){
-                return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error));
+        if let Err(error) = voice_desktop_common::resources::check_cancel(&cancel) {
+            return Err(self.settle_before_activation(&mut lease, &error));
+        }
+        let mut transaction =
+            match voice_desktop_common::resources::begin_activation(&self.context, stage, relative)
+            {
+                Ok(value) => value,
+                Err(error) => return Err(self.settle_before_activation(&mut lease, &error)),
+            };
+        if relative == "runtimes/dsh" {
+            if let Err(error) =
+                voice_desktop_common::resources::validate_dsh_activation(&self.context)
+            {
+                return Err(self.rollback_failed_activation(&mut lease, &mut transaction, &error));
             }
         }
-        let pending=match self.pending_service_resume(){Ok(value)=>value,Err(error)=>return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error))};
-        let resumed=if pending {
-            match self.maybe_resume_service(&mut lease){
-                Ok(value)=>value,Err(error)=>return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error)),
+        let pending = match self.pending_service_resume() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.rollback_failed_activation(&mut lease, &mut transaction, &error));
             }
-        }else{lease.keep_stopped();false};
-        match voice_desktop_common::resources::commit_activation(&self.context,&mut transaction){
-            Ok(())=>{
-                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
-                self.publish_installed(job_id,relative);
+        };
+        let resumed = if pending {
+            match self.maybe_resume_service(&mut lease) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(self.rollback_failed_activation(
+                        &mut lease,
+                        &mut transaction,
+                        &error,
+                    ));
+                }
+            }
+        } else {
+            lease.keep_stopped();
+            false
+        };
+        match voice_desktop_common::resources::commit_activation(&self.context, &mut transaction) {
+            Ok(()) => {
+                clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+                self.publish_installed(job_id, relative);
                 Ok(())
-            },
-            Err(error) if transaction.is_committed()=>{
+            }
+            Err(error) if transaction.is_committed() => {
                 lease.keep_stopped();
-                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                clear_resume_intent_if_resumed(&self.resume_pending, resumed);
                 Err(format!("资源已提交并启用，但旧备份清理失败：{error}"))
             }
-            Err(error)=>Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error)),
+            Err(error) => {
+                Err(self.rollback_failed_activation(&mut lease, &mut transaction, &error))
+            }
         }
     }
 
-    fn publish_installed(&self,job_id:&str,relative:&str){
-        let resource_id=if relative=="runtimes/python"{Some("voice-server".to_string())}else if relative=="runtimes/dsh"{Some("dsh".to_string())}
-            else{voice_desktop_common::resources::specs(&self.context).ok().into_iter().flatten().find(|item|item["destination"].as_str().is_some_and(|path|relative==format!("models/{path}")))
-                .and_then(|item|item["resource_id"].as_str().map(str::to_owned))};
-        if let Some(id)=resource_id{
-            let mut resolved=vec![id.clone()];
-            if id=="voice-server"{
+    fn publish_installed(&self, job_id: &str, relative: &str) {
+        let resource_id = if relative == "runtimes/python" {
+            Some("voice-server".to_string())
+        } else if relative == "runtimes/dsh" {
+            Some("dsh".to_string())
+        } else {
+            voice_desktop_common::resources::specs(&self.context)
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|item| {
+                    item["destination"]
+                        .as_str()
+                        .is_some_and(|path| relative == format!("models/{path}"))
+                })
+                .and_then(|item| item["resource_id"].as_str().map(str::to_owned))
+        };
+        if let Some(id) = resource_id {
+            let mut resolved = vec![id.clone()];
+            if id == "voice-server" {
                 resolved.push(voice_desktop_common::runtime::CPU_RESOURCE.into());
-                if voice_desktop_common::runtime::status(&self.context).is_ok_and(|state|state["components"].as_array().into_iter().flatten().any(|row|row["resource_id"]==voice_desktop_common::runtime::GPU_RESOURCE&&row["can_start"]==true)){
+                if voice_desktop_common::runtime::status(&self.context).is_ok_and(|state| {
+                    state["components"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|row| {
+                            row["resource_id"] == voice_desktop_common::runtime::GPU_RESOURCE
+                                && row["can_start"] == true
+                        })
+                }) {
                     resolved.push(voice_desktop_common::runtime::GPU_RESOURCE.into());
                 }
             }
-            if let Err(error)=voice_desktop_common::component_maintenance::resolved(&self.context,&resolved){eprintln!("组件校验交接收尾失败：{error}");}
-            if let Ok(mut failures)=self.validation_failures.lock(){failures.remove(&id);}
-            self.update_job(job_id,|snapshot|{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}});
+            if let Err(error) =
+                voice_desktop_common::component_maintenance::resolved(&self.context, &resolved)
+            {
+                eprintln!("组件校验交接收尾失败：{error}");
+            }
+            if let Ok(mut failures) = self.validation_failures.lock() {
+                failures.remove(&id);
+            }
+            self.update_job(job_id, |snapshot| {
+                if !snapshot.installed_resources.contains(&id) {
+                    snapshot.installed_resources.push(id);
+                }
+            });
         }
     }
 
-    fn prepare_environment(&self,job_id:&str,group:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
+    fn prepare_environment(
+        &self,
+        job_id: &str,
+        group: &str,
+        cancel: Arc<AtomicBool>,
+        progress: &mut voice_desktop_common::resources::Progress<'_>,
+    ) -> Result<Vec<String>, String> {
         voice_desktop_common::resources::check_cancel(&cancel)?;
         // 共享环境统一由运行依赖入口按登记和已知故障判断复用，不为进程内缓存遍历文件树。
-        let repairing=self.jobs.lock().map_err(|_|"资源任务状态不可用")?.get(job_id).is_some_and(|job|job.snapshot.attempt>1&&job.snapshot.recovery.as_ref().is_some_and(|state|state["state"]=="repairing"));
-        let outcome=(||{
-        let result=if repairing{voice_desktop_common::runtime::repair_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}
-            else{voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))}?;
-        voice_desktop_common::compatibility::finish_deferred_settings(&self.context,&cancel)?;
-        voice_desktop_common::resources::check_cancel(&cancel)?;
-        Ok::<Vec<String>,String>(result)
+        let repairing = self
+            .jobs
+            .lock()
+            .map_err(|_| "资源任务状态不可用")?
+            .get(job_id)
+            .is_some_and(|job| {
+                job.snapshot.attempt > 1
+                    && job
+                        .snapshot
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|state| state["state"] == "repairing")
+            });
+        let outcome = (|| {
+            let result = if repairing {
+                voice_desktop_common::runtime::repair_with_activation(
+                    &self.context,
+                    group,
+                    cancel.clone(),
+                    progress,
+                    &mut |stage, relative| self.activate_resource(job_id, stage, relative),
+                )
+            } else {
+                voice_desktop_common::runtime::configure_with_activation(
+                    &self.context,
+                    group,
+                    cancel.clone(),
+                    progress,
+                    &mut |stage, relative| self.activate_resource(job_id, stage, relative),
+                )
+            }?;
+            voice_desktop_common::compatibility::finish_deferred_settings(&self.context, &cancel)?;
+            voice_desktop_common::resources::check_cancel(&cancel)?;
+            Ok::<Vec<String>, String>(result)
         })();
-        let report_path=self.context.install.join("cache/reports/runtime-update-latest.json");
-        if let Ok(mut report)=voice_desktop_common::resources::load(&report_path){
-            report["job_id"]=json!(job_id);
-            report["fields"]["job_id"]=json!("创建本轮运行环境操作的资源任务编号");
-            report["fields"]["phase"]=json!("任务最后到达的阶段");
-            if let Some(row)=self.jobs.lock().ok().and_then(|jobs|jobs.get(job_id).map(|job|job.snapshot.clone())){report["phase"]=json!(row.phase);}
-            if let Err(error)=&outcome{report["state"]=json!(if cancel.load(Ordering::Acquire){"cancelled"}else{"failed"});report["error"]=json!(error);}
-            if let Err(error)=voice_desktop_common::workspace::atomic_json(&report_path,&report){eprintln!("运行环境任务报告写入失败：{error}");}
+        let report_path = self
+            .context
+            .install
+            .join("cache/reports/runtime-update-latest.json");
+        if let Ok(mut report) = voice_desktop_common::resources::load(&report_path) {
+            report["job_id"] = json!(job_id);
+            report["fields"]["job_id"] = json!("创建本轮运行环境操作的资源任务编号");
+            report["fields"]["phase"] = json!("任务最后到达的阶段");
+            if let Some(row) = self
+                .jobs
+                .lock()
+                .ok()
+                .and_then(|jobs| jobs.get(job_id).map(|job| job.snapshot.clone()))
+            {
+                report["phase"] = json!(row.phase);
+            }
+            if let Err(error) = &outcome {
+                report["state"] = json!(if cancel.load(Ordering::Acquire) {
+                    "cancelled"
+                } else {
+                    "failed"
+                });
+                report["error"] = json!(error);
+            }
+            if let Err(error) = voice_desktop_common::workspace::atomic_json(&report_path, &report)
+            {
+                eprintln!("运行环境任务报告写入失败：{error}");
+            }
         }
         outcome
     }
 
-    fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
-    where F: FnOnce(Arc<ResourceManager>, String) -> Result<Vec<String>, JobError> + Send + 'static {
-        self.start_child_job(job_id,resource_id,phase,can_cancel,None,worker)
+    fn start_job<F>(
+        self: &Arc<Self>,
+        job_id: String,
+        resource_id: String,
+        phase: String,
+        can_cancel: bool,
+        worker: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Arc<ResourceManager>, String) -> Result<Vec<String>, JobError> + Send + 'static,
+    {
+        self.start_child_job(job_id, resource_id, phase, can_cancel, None, worker)
     }
 
     // start_child_job（任务准入）：在同一状态锁内预留批量任务，并只放行所属子任务。
-    fn start_child_job<F>(self:&Arc<Self>,job_id:String,resource_id:String,phase:String,can_cancel:bool,parent:Option<String>,worker:F)->Result<(),String>
-    where F:FnOnce(Arc<ResourceManager>,String)->Result<Vec<String>,JobError>+Send+'static{
-        if !job_id.starts_with("reset-")&&voice_desktop_common::component_reset::pending(&self.context)?.is_some(){return Err("已确认的组件重置尚未完成，请先继续重置。".into());}
-        if !job_id.starts_with("reset-")&&self.context.install.join("tmp/native-install.json").exists(){
-            if self.has_active_jobs(){return Err("组件正在完成启用，请稍候再试。".into());}
-            if let Err(error)=self.recover_pending_transaction(){let _=self.record_recovery_failure(&error);return Err(error);}
+    fn start_child_job<F>(
+        self: &Arc<Self>,
+        job_id: String,
+        resource_id: String,
+        phase: String,
+        can_cancel: bool,
+        parent: Option<String>,
+        worker: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Arc<ResourceManager>, String) -> Result<Vec<String>, JobError> + Send + 'static,
+    {
+        if !job_id.starts_with("reset-")
+            && voice_desktop_common::component_reset::pending(&self.context)?.is_some()
+        {
+            return Err("已确认的组件重置尚未完成，请先继续重置。".into());
+        }
+        if !job_id.starts_with("reset-")
+            && self
+                .context
+                .install
+                .join("tmp/native-install.json")
+                .exists()
+        {
+            if self.has_active_jobs() {
+                return Err("组件正在完成启用，请稍候再试。".into());
+            }
+            if let Err(error) = self.recover_pending_transaction() {
+                let _ = self.record_recovery_failure(&error);
+                return Err(error);
+            }
         }
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
-            if self.resetting.load(Ordering::Acquire)&&!job_id.starts_with("reset-"){return Err("组件正在重置，请等待完成。".into());}
-            if !self.accepting_jobs.load(Ordering::Acquire){return Err("工作区正在迁移、更新或退出，不能启动新的资源任务。".into());}
-            if jobs.get(&job_id).is_some_and(|job| !terminal(&job.snapshot.state)) {
-                if jobs[&job_id].snapshot.parent_job_id!=parent{return Err("此组件由其他资源任务处理中，请等待完成。".into());}
+            if self.resetting.load(Ordering::Acquire) && !job_id.starts_with("reset-") {
+                return Err("组件正在重置，请等待完成。".into());
+            }
+            if !self.accepting_jobs.load(Ordering::Acquire) {
+                return Err("工作区正在迁移、更新或退出，不能启动新的资源任务。".into());
+            }
+            if jobs
+                .get(&job_id)
+                .is_some_and(|job| !terminal(&job.snapshot.state))
+            {
+                if jobs[&job_id].snapshot.parent_job_id != parent {
+                    return Err("此组件由其他资源任务处理中，请等待完成。".into());
+                }
                 return Ok(());
             }
-            validate_batch_admission(&jobs,&resource_id,parent.as_deref())?;
-            if jobs.values().any(|job|job.snapshot.resource_id==resource_id&&!terminal(&job.snapshot.state)){
+            validate_batch_admission(&jobs, &resource_id, parent.as_deref())?;
+            if jobs.values().any(|job| {
+                job.snapshot.resource_id == resource_id && !terminal(&job.snapshot.state)
+            }) {
                 return Err("此组件已有下载或导入任务，请等待该任务完成。".into());
             }
-            let created_at=unix_millis().max(jobs.get(&job_id).map(|job|job.snapshot.created_at.saturating_add(1)).unwrap_or(0));
-            let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
-                completed_bytes: 0, total_bytes: None, download_completed_bytes:None,download_total_bytes:None,
-                verification_completed_bytes:None,verification_total_bytes:None,error: None, can_cancel, installed_resources: vec![],
-                import_preview: None, created_at, revision: 1, failure_resource_id:None,first_error:None, progress_kind:"waiting".into(),attempt:1,parent_job_id:parent,recovery:None };
+            let created_at = unix_millis().max(
+                jobs.get(&job_id)
+                    .map(|job| job.snapshot.created_at.saturating_add(1))
+                    .unwrap_or(0),
+            );
+            let snapshot = JobSnapshot {
+                job_id: job_id.clone(),
+                resource_id,
+                state: "queued".into(),
+                phase,
+                completed_bytes: 0,
+                total_bytes: None,
+                download_completed_bytes: None,
+                download_total_bytes: None,
+                verification_completed_bytes: None,
+                verification_total_bytes: None,
+                error: None,
+                can_cancel,
+                installed_resources: vec![],
+                import_preview: None,
+                created_at,
+                revision: 1,
+                failure_resource_id: None,
+                first_error: None,
+                progress_kind: "waiting".into(),
+                attempt: 1,
+                parent_job_id: parent,
+                recovery: None,
+            };
             // previous_run（旧任务历史）：同一组件手动重试前保留终态及首轮错误。
-            if let Some(previous)=jobs.get(&job_id).filter(|job|terminal(&job.snapshot.state)){
-                let mut historical=previous.snapshot.clone();historical.job_id=format!("history-{}-{}",job_id,historical.created_at);
-                jobs.insert(historical.job_id.clone(),JobControl{snapshot:historical,cancel:Arc::new(AtomicBool::new(false)),child:None,last_event:Instant::now(),last_persist:Instant::now()});
+            if let Some(previous) = jobs
+                .get(&job_id)
+                .filter(|job| terminal(&job.snapshot.state))
+            {
+                let mut historical = previous.snapshot.clone();
+                historical.job_id = format!("history-{}-{}", job_id, historical.created_at);
+                jobs.insert(
+                    historical.job_id.clone(),
+                    JobControl {
+                        snapshot: historical,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        child: None,
+                        last_event: Instant::now(),
+                        last_persist: Instant::now(),
+                    },
+                );
             }
-            jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None,
-                last_event:Instant::now(),last_persist:Instant::now() });
-            if let Err(error)=self.persist_locked(&jobs){jobs.remove(&job_id);return Err(error);}
-            if snapshot.resource_id=="required-batch"{self.batch_active.store(true,Ordering::Release);}
+            jobs.insert(
+                job_id.clone(),
+                JobControl {
+                    snapshot: snapshot.clone(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    child: None,
+                    last_event: Instant::now(),
+                    last_persist: Instant::now(),
+                },
+            );
+            if let Err(error) = self.persist_locked(&jobs) {
+                jobs.remove(&job_id);
+                return Err(error);
+            }
+            if snapshot.resource_id == "required-batch" {
+                self.batch_active.store(true, Ordering::Release);
+            }
             let _ = self.app.emit(PROGRESS_EVENT, event_value(&snapshot));
         }
         let manager = Arc::clone(self);
         let thread_id = job_id.clone();
-        thread::Builder::new().name(format!("resource-{thread_id}")).spawn(move || {
-            manager.set_phase(&thread_id, "正在运行资源任务", !thread_id.starts_with("reset-"), 0, None);
-            let outcome = if manager.cancelled(&thread_id) { Err(JobError::Cancelled) }
-                else { std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(Arc::clone(&manager), thread_id.clone())))
-                    .unwrap_or_else(|_| Err(JobError::Failed { message: "资源任务异常退出；未输出敏感诊断信息。".into(), installed: vec![] })) };
-            match outcome {
-                Ok(installed) => manager.finish_job(&thread_id, Ok(installed)),
-                Err(JobError::Failed{installed,..}) if installed.is_empty() && manager.cancelled(&thread_id) => manager.finish_job(&thread_id,Err(JobError::Cancelled)),
-                Err(error) => manager.finish_job(&thread_id, Err(error)),
-            }
-        }).map_err(|_| {
-            self.finish_job(&job_id, Err(JobError::Failed { message: "无法建立资源任务线程。".into(), installed: vec![] }));
-            "无法建立资源任务线程。".to_string()
-        })?;
+        thread::Builder::new()
+            .name(format!("resource-{thread_id}"))
+            .spawn(move || {
+                manager.set_phase(
+                    &thread_id,
+                    "正在运行资源任务",
+                    !thread_id.starts_with("reset-"),
+                    0,
+                    None,
+                );
+                let outcome = if manager.cancelled(&thread_id) {
+                    Err(JobError::Cancelled)
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker(Arc::clone(&manager), thread_id.clone())
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(JobError::Failed {
+                            message: "资源任务异常退出；未输出敏感诊断信息。".into(),
+                            installed: vec![],
+                        })
+                    })
+                };
+                match outcome {
+                    Ok(installed) => manager.finish_job(&thread_id, Ok(installed)),
+                    Err(JobError::Failed { installed, .. })
+                        if installed.is_empty() && manager.cancelled(&thread_id) =>
+                    {
+                        manager.finish_job(&thread_id, Err(JobError::Cancelled))
+                    }
+                    Err(error) => manager.finish_job(&thread_id, Err(error)),
+                }
+            })
+            .map_err(|_| {
+                self.finish_job(
+                    &job_id,
+                    Err(JobError::Failed {
+                        message: "无法建立资源任务线程。".into(),
+                        installed: vec![],
+                    }),
+                );
+                "无法建立资源任务线程。".to_string()
+            })?;
         Ok(())
     }
 
     fn finish_job(&self, job_id: &str, result: Result<Vec<String>, JobError>) {
-        if job_id.starts_with("reset-"){self.resetting.store(false,Ordering::Release);}
-        let maintenance_completed=job_id=="repair-components"&&result.is_ok();
-        if job_id=="dl-required"||job_id=="repair-components"{self.batch_active.store(false,Ordering::Release);}
+        let system_feature_job = is_system_feature_job(job_id);
+        if job_id.starts_with("reset-") {
+            self.resetting.store(false, Ordering::Release);
+        }
+        let maintenance_completed = job_id == "repair-components" && result.is_ok();
+        if job_id == "dl-required" || job_id == "repair-components" {
+            self.batch_active.store(false, Ordering::Release);
+        }
         let (state, phase, error, installed) = match result {
-            Ok(installed) => ("complete", if job_id.starts_with("reset-"){ "重置完成，等待下载或导入" }else{"资源处理完成"}, None, installed),
+            Ok(installed) => (
+                "complete",
+                if job_id.starts_with("reset-") {
+                    "重置完成，等待下载或导入"
+                } else {
+                    "资源处理完成"
+                },
+                None,
+                installed,
+            ),
             Err(JobError::Cancelled) => ("cancelled", "任务已取消；临时下载可供重试", None, vec![]),
-            Err(JobError::Failed { message, installed }) => ("failed", "资源处理失败", Some(message), installed),
+            Err(JobError::Failed { message, installed }) => {
+                ("failed", "资源处理失败", Some(message), installed)
+            }
         };
-        if let Ok(mut failures)=self.validation_failures.lock(){for id in &installed{failures.remove(id);}}
-        if !installed.is_empty(){if let Err(error)=voice_desktop_common::component_maintenance::resolved(&self.context,&installed){eprintln!("组件校验交接收尾失败：{error}");}}
-        if let Some(id)=self.jobs.lock().ok().and_then(|jobs|jobs.get(job_id).map(|job|job.snapshot.failure_resource_id.clone().unwrap_or_else(||job.snapshot.resource_id.clone()))){if let Some(reason)=error.as_deref(){if let Err(e)=voice_desktop_common::component_reset::fault(&self.context,&id,reason){eprintln!("重置资格保存失败：{e}");}}}
-        if !installed.is_empty(){if let Err(e)=voice_desktop_common::component_reset::clear(&self.context,&installed){eprintln!("重置资格清除失败：{e}");}}
-        let operation_error=error.clone();
-        let recovered_resources=installed.clone();
-        let guidance=error.as_deref().map(|message|voice_desktop_common::component_recovery::guidance(voice_desktop_common::component_recovery::classify(message),false));
+        if let Ok(mut failures) = self.validation_failures.lock() {
+            for id in &installed {
+                failures.remove(id);
+            }
+        }
+        if !installed.is_empty() {
+            if let Err(error) =
+                voice_desktop_common::component_maintenance::resolved(&self.context, &installed)
+            {
+                eprintln!("组件校验交接收尾失败：{error}");
+            }
+        }
+        if !system_feature_job {
+            if let Some(id) = self.jobs.lock().ok().and_then(|jobs| {
+                jobs.get(job_id).map(|job| {
+                    job.snapshot
+                        .failure_resource_id
+                        .clone()
+                        .unwrap_or_else(|| job.snapshot.resource_id.clone())
+                })
+            }) {
+                if let Some(reason) = error.as_deref() {
+                    if let Err(e) =
+                        voice_desktop_common::component_reset::fault(&self.context, &id, reason)
+                    {
+                        eprintln!("重置资格保存失败：{e}");
+                    }
+                }
+            }
+        }
+        if !installed.is_empty() {
+            if let Err(e) = voice_desktop_common::component_reset::clear(&self.context, &installed)
+            {
+                eprintln!("重置资格清除失败：{e}");
+            }
+        }
+        let operation_error = error.clone();
+        let recovered_resources = installed.clone();
+        let guidance = if system_feature_job {
+            None
+        } else {
+            error.as_deref().map(|message| {
+                voice_desktop_common::component_recovery::guidance(
+                    voice_desktop_common::component_recovery::classify(message),
+                    false,
+                )
+            })
+        };
         self.update_job(job_id, |snapshot| {
-            snapshot.state = state.into(); snapshot.phase = phase.into(); if snapshot.first_error.is_none(){snapshot.first_error=error.clone();} snapshot.error = error;
-            snapshot.can_cancel = false; for id in installed{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}}snapshot.import_preview=None;
-            snapshot.recovery=guidance;
+            snapshot.state = state.into();
+            snapshot.phase = phase.into();
+            if snapshot.first_error.is_none() {
+                snapshot.first_error = error.clone();
+            }
+            snapshot.error = error;
+            snapshot.can_cancel = false;
+            for id in installed {
+                if !snapshot.installed_resources.contains(&id) {
+                    snapshot.installed_resources.push(id);
+                }
+            }
+            snapshot.import_preview = None;
+            snapshot.recovery = guidance;
         });
-        if !recovered_resources.is_empty(){
-            let resolved=self.jobs.lock().ok().map(|jobs|jobs.iter().filter(|(id,job)|id.as_str()!=job_id&&job.snapshot.state=="failed"&&recovered_resources.contains(&job.snapshot.resource_id)).map(|(id,_)|id.clone()).collect::<Vec<_>>()).unwrap_or_default();
-            for id in resolved{self.update_job(&id,|snapshot|snapshot.recovery=Some(json!({"event":"recovered","state":"resolved","next_action":"none","message":"该组件已由后续任务恢复。","fields":{"event":"后续任务恢复完成","state":"故障已解决","next_action":"不需要继续处理","message":"用户可见恢复结果"}})));}
+        if !recovered_resources.is_empty() {
+            let resolved = self
+                .jobs
+                .lock()
+                .ok()
+                .map(|jobs| {
+                    jobs.iter()
+                        .filter(|(id, job)| {
+                            id.as_str() != job_id
+                                && job.snapshot.state == "failed"
+                                && recovered_resources.contains(&job.snapshot.resource_id)
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for id in resolved {
+                self.update_job(&id,|snapshot|snapshot.recovery=Some(json!({"event":"recovered","state":"resolved","next_action":"none","message":"该组件已由后续任务恢复。","fields":{"event":"后续任务恢复完成","state":"故障已解决","next_action":"不需要继续处理","message":"用户可见恢复结果"}})));
+            }
         }
         // 成功、失败及取消均重读实际组件；任务完成本身不代表兼容检查通过。
-        if let Err(error)=self.inventory(){eprintln!("兼容性组件重新盘点失败：{error}");}
-        self.finish_recovery(operation_error.as_deref());
+        if !system_feature_job {
+            if let Err(error) = self.inventory() {
+                eprintln!("兼容性组件重新盘点失败：{error}");
+            }
+            self.finish_recovery(operation_error.as_deref());
+        }
         // 初次交接为等待组件任务而暂缓启动；成功后接回原有轻量启动，不把用户留在管理页。
-        if maintenance_completed&&!self.has_active_jobs()&&self.accepting_jobs.load(Ordering::Acquire)
-            &&!voice_desktop_common::component_maintenance::pending_repairs(&self.context).unwrap_or(true){
-            if let Some(state)=self.app.try_state::<Arc<super::Desktop>>(){
-                if !state.stopping.load(Ordering::Acquire)&&!state.startup_skipped.load(Ordering::Acquire)&&!state.service_requested.swap(true,Ordering::AcqRel){
-                    if let Err(error)=super::initialization::auto_start(self.app.clone(),state.inner().clone()){*state.error.lock().unwrap()=Some(error);}
+        if maintenance_completed
+            && !self.has_active_jobs()
+            && self.accepting_jobs.load(Ordering::Acquire)
+            && !voice_desktop_common::component_maintenance::pending_repairs(&self.context)
+                .unwrap_or(true)
+        {
+            if let Some(state) = self.app.try_state::<Arc<super::Desktop>>() {
+                if !state.stopping.load(Ordering::Acquire)
+                    && !state.startup_skipped.load(Ordering::Acquire)
+                    && !state.service_requested.swap(true, Ordering::AcqRel)
+                {
+                    if let Err(error) =
+                        super::initialization::auto_start(self.app.clone(), state.inner().clone())
+                    {
+                        *state.error.lock().unwrap() = Some(error);
+                    }
                 }
             }
         }
     }
 
-    fn finish_recovery(&self,error:Option<&str>){
-        if self.pending_service_resume().unwrap_or(true){return;}
-        if let Some(state)=self.app.try_state::<Arc<super::Desktop>>(){
-            let mut recovery=state.recovery.lock().unwrap();
-            let snapshot=recovery.snapshot();
-            if snapshot["operation"]["state"]!="running" || snapshot["suspended"]==true{return;}
-            if recovery.result.as_ref().is_none_or(|(epoch,_)|*epoch!=state.service_epoch.load(Ordering::Acquire)){return;}
-            let error=error.or_else(||recovery.result.as_ref().filter(|(_,value)|value["core_available"]!=true)
-                .map(|_|"组件已启用，部分语音能力仍不可用，请继续补齐或恢复组件。"));
-            recovery.finish(error);drop(recovery);state.publish_recovery(&self.app);
+    fn finish_recovery(&self, error: Option<&str>) {
+        if self.pending_service_resume().unwrap_or(true) {
+            return;
+        }
+        if let Some(state) = self.app.try_state::<Arc<super::Desktop>>() {
+            let mut recovery = state.recovery.lock().unwrap();
+            let snapshot = recovery.snapshot();
+            if snapshot["operation"]["state"] != "running" || snapshot["suspended"] == true {
+                return;
+            }
+            if recovery
+                .result
+                .as_ref()
+                .is_none_or(|(epoch, _)| *epoch != state.service_epoch.load(Ordering::Acquire))
+            {
+                return;
+            }
+            let error = error.or_else(|| {
+                recovery
+                    .result
+                    .as_ref()
+                    .filter(|(_, value)| value["core_available"] != true)
+                    .map(|_| "组件已启用，部分语音能力仍不可用，请继续补齐或恢复组件。")
+            });
+            recovery.finish(error);
+            drop(recovery);
+            state.publish_recovery(&self.app);
         }
     }
 
-    fn set_phase(&self, job_id: &str, phase: &str, can_cancel: bool, done: u64, total: Option<u64>) {
+    fn set_phase(
+        &self,
+        job_id: &str,
+        phase: &str,
+        can_cancel: bool,
+        done: u64,
+        total: Option<u64>,
+    ) {
         self.update_job(job_id, |snapshot| {
-            if snapshot.state == "cancelling" { return; }
-            if !terminal(&snapshot.state) { snapshot.state = "running".into(); }
-            snapshot.phase = phase.into(); snapshot.can_cancel = can_cancel;
+            if snapshot.state == "cancelling" {
+                return;
+            }
+            if !terminal(&snapshot.state) {
+                snapshot.state = "running".into();
+            }
+            snapshot.phase = phase.into();
+            snapshot.can_cancel = can_cancel;
             snapshot.progress_kind = progress_kind(phase).into();
             if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX) {
-                snapshot.download_completed_bytes=Some(done);snapshot.download_total_bytes=total;
-                if snapshot.verification_total_bytes.is_none(){snapshot.verification_completed_bytes=Some(0);snapshot.verification_total_bytes=total;}
-            }else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){
-                snapshot.verification_completed_bytes=Some(done);snapshot.verification_total_bytes=total;
-                if snapshot.download_total_bytes.is_none(){snapshot.download_completed_bytes=Some(0);snapshot.download_total_bytes=total;}
-            }else{
-                snapshot.download_completed_bytes=None;snapshot.download_total_bytes=None;
-                snapshot.verification_completed_bytes=None;snapshot.verification_total_bytes=None;
-                snapshot.completed_bytes = done; snapshot.total_bytes = total;
+                snapshot.download_completed_bytes = Some(done);
+                snapshot.download_total_bytes = total;
+                if snapshot.verification_total_bytes.is_none() {
+                    snapshot.verification_completed_bytes = Some(0);
+                    snapshot.verification_total_bytes = total;
+                }
+            } else if phase
+                .starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX)
+            {
+                snapshot.verification_completed_bytes = Some(done);
+                snapshot.verification_total_bytes = total;
+                if snapshot.download_total_bytes.is_none() {
+                    snapshot.download_completed_bytes = Some(0);
+                    snapshot.download_total_bytes = total;
+                }
+            } else {
+                snapshot.download_completed_bytes = None;
+                snapshot.download_total_bytes = None;
+                snapshot.verification_completed_bytes = None;
+                snapshot.verification_total_bytes = None;
+                snapshot.completed_bytes = done;
+                snapshot.total_bytes = total;
             }
         });
     }
 
-    fn begin_non_cancellable_phase(&self, job_id: &str, phase: &str, done: u64, total: Option<u64>) -> Result<(), String> {
+    fn begin_non_cancellable_phase(
+        &self,
+        job_id: &str,
+        phase: &str,
+        done: u64,
+        total: Option<u64>,
+    ) -> Result<(), String> {
         let event = {
-            let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。".to_string())?;
-            let job = jobs.get_mut(job_id).ok_or_else(|| "找不到该资源任务。".to_string())?;
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| "资源任务状态不可用。".to_string())?;
+            let job = jobs
+                .get_mut(job_id)
+                .ok_or_else(|| "找不到该资源任务。".to_string())?;
             if job.cancel.load(Ordering::Acquire) || job.snapshot.state == "cancelling" {
                 return Err("资源任务已取消。".into());
             }
@@ -1344,10 +2918,13 @@ impl ResourceManager {
             job.snapshot.progress_kind = "install".into();
             job.snapshot.completed_bytes = done;
             job.snapshot.total_bytes = total;
-            job.snapshot.download_completed_bytes=None;job.snapshot.download_total_bytes=None;
-            job.snapshot.verification_completed_bytes=None;job.snapshot.verification_total_bytes=None;
+            job.snapshot.download_completed_bytes = None;
+            job.snapshot.download_total_bytes = None;
+            job.snapshot.verification_completed_bytes = None;
+            job.snapshot.verification_total_bytes = None;
             job.snapshot.revision = job.snapshot.revision.saturating_add(1);
-            job.last_event=Instant::now();job.last_persist=Instant::now();
+            job.last_event = Instant::now();
+            job.last_persist = Instant::now();
             let event = event_value(&job.snapshot);
             self.persist_locked(&jobs)?;
             event
@@ -1357,22 +2934,45 @@ impl ResourceManager {
     }
 
     fn update_job<F>(&self, job_id: &str, update: F)
-    where F: FnOnce(&mut JobSnapshot) {
+    where
+        F: FnOnce(&mut JobSnapshot),
+    {
         let event = {
-            let Ok(mut jobs) = self.jobs.lock() else { return; };
-            let Some(job) = jobs.get_mut(job_id) else { return; };
-            let previous_state=job.snapshot.state.clone();let previous_phase=job.snapshot.phase.clone();
-            let previous_installed=job.snapshot.installed_resources.clone();
+            let Ok(mut jobs) = self.jobs.lock() else {
+                return;
+            };
+            let Some(job) = jobs.get_mut(job_id) else {
+                return;
+            };
+            let previous_state = job.snapshot.state.clone();
+            let previous_phase = job.snapshot.phase.clone();
+            let previous_installed = job.snapshot.installed_resources.clone();
             update(&mut job.snapshot);
-            job.snapshot.revision=job.snapshot.revision.saturating_add(1);
-            let boundary=previous_state!=job.snapshot.state||previous_phase.split('（').next()!=job.snapshot.phase.split('（').next()||previous_installed!=job.snapshot.installed_resources;
-            let publish=boundary||terminal(&job.snapshot.state)||job.last_event.elapsed()>=Duration::from_millis(100);
-            let persist=boundary||terminal(&job.snapshot.state)||job.last_persist.elapsed()>=Duration::from_secs(1);
-            let value=if publish{job.last_event=Instant::now();Some(event_value(&job.snapshot))}else{None};
-            if persist{job.last_persist=Instant::now();let _=self.persist_locked(&jobs);}
+            job.snapshot.revision = job.snapshot.revision.saturating_add(1);
+            let boundary = previous_state != job.snapshot.state
+                || previous_phase.split('（').next() != job.snapshot.phase.split('（').next()
+                || previous_installed != job.snapshot.installed_resources;
+            let publish = boundary
+                || terminal(&job.snapshot.state)
+                || job.last_event.elapsed() >= Duration::from_millis(100);
+            let persist = boundary
+                || terminal(&job.snapshot.state)
+                || job.last_persist.elapsed() >= Duration::from_secs(1);
+            let value = if publish {
+                job.last_event = Instant::now();
+                Some(event_value(&job.snapshot))
+            } else {
+                None
+            };
+            if persist {
+                job.last_persist = Instant::now();
+                let _ = self.persist_locked(&jobs);
+            }
             value
         };
-        if let Some(event)=event{let _ = self.app.emit(PROGRESS_EVENT, event);}
+        if let Some(event) = event {
+            let _ = self.app.emit(PROGRESS_EVENT, event);
+        }
         self.jobs_changed.notify_all();
     }
 
@@ -1382,103 +2982,226 @@ impl ResourceManager {
     }
 
     fn persist_locked(&self, jobs: &HashMap<String, JobControl>) -> Result<(), String> {
-        let mut snapshots = jobs.values().map(|item| item.snapshot.clone()).collect::<Vec<_>>();
+        let mut snapshots = jobs
+            .values()
+            .map(|item| item.snapshot.clone())
+            .collect::<Vec<_>>();
         snapshots.sort_by_key(|item| item.created_at);
-        if snapshots.len() > MAX_PERSISTED_JOBS { snapshots.drain(0..snapshots.len() - MAX_PERSISTED_JOBS); }
-        let value = json!({ "schema": 1, "jobs": snapshots.iter().map(event_value).collect::<Vec<_>>() });
+        if snapshots.len() > MAX_PERSISTED_JOBS {
+            snapshots.drain(0..snapshots.len() - MAX_PERSISTED_JOBS);
+        }
+        let value =
+            json!({ "schema": 1, "jobs": snapshots.iter().map(event_value).collect::<Vec<_>>() });
         voice_desktop_common::workspace::atomic_json(&self.jobs_path, &value)
     }
 
     fn load_jobs(path: &Path) -> Result<HashMap<String, JobControl>, String> {
-        if !path.exists() { return Ok(HashMap::new()); }
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
         let bytes = fs::read(path).map_err(|_| "资源任务记录无法读取。")?;
         let root: Value = serde_json::from_slice(&bytes).map_err(|_| "资源任务记录格式无效。")?;
         let records = root["jobs"].as_array().ok_or("资源任务记录格式无效。")?;
         let mut jobs = HashMap::new();
         for value in records {
             let (Some(job_id), Some(resource_id), Some(mut state), Some(mut phase)) = (
-                value["job_id"].as_str(), value["resource_id"].as_str(), value["state"].as_str().map(str::to_owned), value["phase"].as_str().map(str::to_owned)) else { continue; };
+                value["job_id"].as_str(),
+                value["resource_id"].as_str(),
+                value["state"].as_str().map(str::to_owned),
+                value["phase"].as_str().map(str::to_owned),
+            ) else {
+                continue;
+            };
             let mut error = value["error"].as_str().map(str::to_owned);
-            let mut recovery=value.get("recovery").filter(|value|value.is_object()).cloned();
+            let mut recovery = value
+                .get("recovery")
+                .filter(|value| value.is_object())
+                .cloned();
             let can_cancel = false;
             if !terminal(&state) {
-                state = "failed".into(); phase = "应用退出时任务中断，可使用相同下载任务重试".into();
+                state = "failed".into();
+                phase = "应用退出时任务中断，可使用相同下载任务重试".into();
                 error = Some("上次运行期间任务中断；固定下载任务可重试。".into());
-                recovery=Some(voice_desktop_common::component_recovery::interrupted());
+                recovery = Some(voice_desktop_common::component_recovery::interrupted());
             }
-            if recovery.is_none()&&state=="failed"{if let Some(message)=error.as_deref(){recovery=Some(voice_desktop_common::component_recovery::guidance(voice_desktop_common::component_recovery::classify(message),false));}}
-            let installed_resources = value["installed_resources"].as_array().map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
-            let snapshot = JobSnapshot { job_id: job_id.into(), resource_id: resource_id.into(), state, phase,
-                completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0), total_bytes: value["total_bytes"].as_u64(),
-                download_completed_bytes:value["download_completed_bytes"].as_u64(),download_total_bytes:value["download_total_bytes"].as_u64(),
-                verification_completed_bytes:value["verification_completed_bytes"].as_u64(),verification_total_bytes:value["verification_total_bytes"].as_u64(),
-                failure_resource_id:value["failure_resource_id"].as_str().map(str::to_owned),first_error:value["first_error"].as_str().map(str::to_owned),error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1),
-                progress_kind:value["progress_kind"].as_str().unwrap_or("waiting").into(),attempt:value["attempt"].as_u64().unwrap_or(1) as u32,parent_job_id:value["parent_job_id"].as_str().map(str::to_owned),recovery };
-            jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None,
-                last_event:Instant::now(),last_persist:Instant::now() });
+            if recovery.is_none() && state == "failed" {
+                if let Some(message) = error.as_deref() {
+                    recovery = Some(voice_desktop_common::component_recovery::guidance(
+                        voice_desktop_common::component_recovery::classify(message),
+                        false,
+                    ));
+                }
+            }
+            let installed_resources = value["installed_resources"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let snapshot = JobSnapshot {
+                job_id: job_id.into(),
+                resource_id: resource_id.into(),
+                state,
+                phase,
+                completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0),
+                total_bytes: value["total_bytes"].as_u64(),
+                download_completed_bytes: value["download_completed_bytes"].as_u64(),
+                download_total_bytes: value["download_total_bytes"].as_u64(),
+                verification_completed_bytes: value["verification_completed_bytes"].as_u64(),
+                verification_total_bytes: value["verification_total_bytes"].as_u64(),
+                failure_resource_id: value["failure_resource_id"].as_str().map(str::to_owned),
+                first_error: value["first_error"].as_str().map(str::to_owned),
+                error,
+                can_cancel,
+                installed_resources,
+                import_preview: None,
+                created_at: value["created_at"].as_u64().unwrap_or(0),
+                revision: value["revision"].as_u64().unwrap_or(0).saturating_add(1),
+                progress_kind: value["progress_kind"].as_str().unwrap_or("waiting").into(),
+                attempt: value["attempt"].as_u64().unwrap_or(1) as u32,
+                parent_job_id: value["parent_job_id"].as_str().map(str::to_owned),
+                recovery,
+            };
+            jobs.insert(
+                snapshot.job_id.clone(),
+                JobControl {
+                    snapshot,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    child: None,
+                    last_event: Instant::now(),
+                    last_persist: Instant::now(),
+                },
+            );
         }
         Ok(jobs)
     }
 
     fn attach_child(&self, job_id: &str, child: Arc<Mutex<ControlledProcess>>) {
         if let Ok(mut jobs) = self.jobs.lock() {
-            if let Some(job) = jobs.get_mut(job_id) { job.child = Some(child); }
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.child = Some(child);
+            }
         }
     }
 
     fn detach_child(&self, job_id: &str) {
         if let Ok(mut jobs) = self.jobs.lock() {
-            if let Some(job) = jobs.get_mut(job_id) { job.child = None; }
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.child = None;
+            }
         }
     }
 
     fn cancel_signal(&self, job_id: &str) -> Result<Arc<AtomicBool>, JobError> {
-        let jobs = self.jobs.lock().map_err(|_| JobError::Failed { message: "资源任务状态不可用。".into(), installed: vec![] })?;
-        jobs.get(job_id).map(|job| job.cancel.clone()).ok_or_else(|| JobError::Failed { message: "找不到资源任务。".into(), installed: vec![] })
+        let jobs = self.jobs.lock().map_err(|_| JobError::Failed {
+            message: "资源任务状态不可用。".into(),
+            installed: vec![],
+        })?;
+        jobs.get(job_id)
+            .map(|job| job.cancel.clone())
+            .ok_or_else(|| JobError::Failed {
+                message: "找不到资源任务。".into(),
+                installed: vec![],
+            })
     }
 
     fn cancelled(&self, job_id: &str) -> bool {
-        self.jobs.lock().ok().and_then(|jobs| jobs.get(job_id).map(|job| job.cancel.load(Ordering::Acquire))).unwrap_or(false)
+        self.jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| {
+                jobs.get(job_id)
+                    .map(|job| job.cancel.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
     }
 
-    fn configure_resource_dependencies(&self,job_id:&str,resource_id:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
-        let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
-        if spec["preparation"].as_str().is_some_and(|value|value.starts_with("aniflive_"))&&!self.context.python.is_file(){
-            let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
-            return self.prepare_environment(job_id,"cpu",cancel,progress);
+    fn configure_resource_dependencies(
+        &self,
+        job_id: &str,
+        resource_id: &str,
+        cancel: Arc<AtomicBool>,
+        progress: &mut voice_desktop_common::resources::Progress<'_>,
+    ) -> Result<Vec<String>, String> {
+        let spec = voice_desktop_common::resources::spec(&self.context, resource_id)?;
+        if spec["preparation"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("aniflive_"))
+            && !self.context.python.is_file()
+        {
+            let _environment = acquire_environment_lock(&self.environment, &cancel, progress)?;
+            return self.prepare_environment(job_id, "cpu", cancel, progress);
         }
-        let Some(group)=spec["dependency_group"].as_str() else{return Ok(vec![])};
-        let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
-        let activation_job=job_id.to_owned();
-        self.prepare_environment(&activation_job,group,cancel,progress)
+        let Some(group) = spec["dependency_group"].as_str() else {
+            return Ok(vec![]);
+        };
+        let _environment = acquire_environment_lock(&self.environment, &cancel, progress)?;
+        let activation_job = job_id.to_owned();
+        self.prepare_environment(&activation_job, group, cancel, progress)
     }
 }
 
-fn clear_resume_intent_if_resumed(resume_pending:&Mutex<bool>,resumed:bool){
-    if resumed{if let Ok(mut pending)=resume_pending.lock(){*pending=false;}}
+fn clear_resume_intent_if_resumed(resume_pending: &Mutex<bool>, resumed: bool) {
+    if resumed {
+        if let Ok(mut pending) = resume_pending.lock() {
+            *pending = false;
+        }
+    }
 }
 
 // resume_service_if_ready（维护后恢复）：暂停准入时保留意图，恢复后只启动原先运行的服务。
-fn resume_service_if_ready(lease:&mut ServiceLease<'_>,pending:&Mutex<bool>,accepting:&AtomicBool,batch:&AtomicBool,ready:impl FnOnce()->Result<bool,String>)->Result<bool,String>{
-    if !accepting.load(Ordering::Acquire)||batch.load(Ordering::Acquire){lease.keep_stopped();return Ok(false);}
-    if !*pending.lock().map_err(|_|"服务恢复意图不可用。")?{lease.keep_stopped();return Ok(false);}
-    match ready(){
-        Ok(false)=>{lease.keep_stopped();return Ok(false);},
-        Err(error)=>{lease.keep_stopped();return Err(format!("无法确认运行环境可恢复，语音服务保持停止：{error}"));},
-        Ok(true)=>{},
+fn resume_service_if_ready(
+    lease: &mut ServiceLease<'_>,
+    pending: &Mutex<bool>,
+    accepting: &AtomicBool,
+    batch: &AtomicBool,
+    ready: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    if !accepting.load(Ordering::Acquire) || batch.load(Ordering::Acquire) {
+        lease.keep_stopped();
+        return Ok(false);
     }
-    lease.resume_service()?;Ok(true)
+    if !*pending.lock().map_err(|_| "服务恢复意图不可用。")? {
+        lease.keep_stopped();
+        return Ok(false);
+    }
+    match ready() {
+        Ok(false) => {
+            lease.keep_stopped();
+            return Ok(false);
+        }
+        Err(error) => {
+            lease.keep_stopped();
+            return Err(format!("无法确认运行环境可恢复，语音服务保持停止：{error}"));
+        }
+        Ok(true) => {}
+    }
+    lease.resume_service()?;
+    Ok(true)
 }
 
-fn acquire_environment_lock<'a>(environment:&'a Mutex<()>,cancel:&AtomicBool,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<MutexGuard<'a,()>,String>{
-    let mut reported_wait=false;
-    loop{
+fn acquire_environment_lock<'a>(
+    environment: &'a Mutex<()>,
+    cancel: &AtomicBool,
+    progress: &mut voice_desktop_common::resources::Progress<'_>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    let mut reported_wait = false;
+    loop {
         voice_desktop_common::resources::check_cancel(cancel)?;
-        match environment.try_lock(){
-            Ok(guard)=>return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(_))=>return Err("语音环境配置锁不可用。".into()),
-            Err(std::sync::TryLockError::WouldBlock)=>{
-                if !reported_wait{progress("等待语音运行环境专用更新锁",0,0);reported_wait=true;}
+        match environment.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("语音环境配置锁不可用。".into());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if !reported_wait {
+                    progress("等待语音运行环境专用更新锁", 0, 0);
+                    reported_wait = true;
+                }
                 thread::sleep(Duration::from_millis(50));
             }
         }
@@ -1495,34 +3218,61 @@ struct ServiceLease<'a> {
 impl<'a> ServiceLease<'a> {
     fn pause(control: &'a ServiceControl, guard: MutexGuard<'a, ()>) -> Result<Self, String> {
         let resume = control(false).map_err(|_| "无法暂停语音服务以安全激活资源。")?;
-        Ok(Self { control, _guard: guard, active: true, resume })
+        Ok(Self {
+            control,
+            _guard: guard,
+            active: true,
+            resume,
+        })
     }
 
-    fn was_running(&self)->bool{self.resume}
+    fn was_running(&self) -> bool {
+        self.resume
+    }
 
-    fn resume_service(&mut self)->Result<(),String>{
-        match (self.control)(true){
-            Ok(true)=>{self.active=false;Ok(())}
-            Ok(false)=>{self.active=false;Err("语音服务启动命令已返回，但服务入口未报告就绪。".into())}
-            Err(error)=>{self.active=false;Err(format!("语音服务未能恢复：{error}"))}
+    fn resume_service(&mut self) -> Result<(), String> {
+        match (self.control)(true) {
+            Ok(true) => {
+                self.active = false;
+                Ok(())
+            }
+            Ok(false) => {
+                self.active = false;
+                Err("语音服务启动命令已返回，但服务入口未报告就绪。".into())
+            }
+            Err(error) => {
+                self.active = false;
+                Err(format!("语音服务未能恢复：{error}"))
+            }
         }
     }
 
-    fn stop_partial(&mut self)->Result<(),String>{
-        (self.control)(false).map_err(|error|format!("无法停止恢复失败后可能残留的新服务：{error}"))?;
-        self.active=false;Ok(())
+    fn stop_partial(&mut self) -> Result<(), String> {
+        (self.control)(false)
+            .map_err(|error| format!("无法停止恢复失败后可能残留的新服务：{error}"))?;
+        self.active = false;
+        Ok(())
     }
 
-    fn keep_stopped(&mut self){self.active=false;}
+    fn keep_stopped(&mut self) {
+        self.active = false;
+    }
 
     fn finish(mut self) -> Result<(), String> {
-        if self.resume{self.resume_service()}else{self.keep_stopped();Ok(())}
+        if self.resume {
+            self.resume_service()
+        } else {
+            self.keep_stopped();
+            Ok(())
+        }
     }
 }
 
 impl Drop for ServiceLease<'_> {
     fn drop(&mut self) {
-        if self.active&&self.resume { let _ = (self.control)(true); }
+        if self.active && self.resume {
+            let _ = (self.control)(true);
+        }
     }
 }
 
@@ -1531,16 +3281,31 @@ fn response_result(record: Value) -> Result<Value, ProcessError> {
         return Ok(record.get("result").cloned().unwrap_or(Value::Null));
     }
     let error = &record["error"];
-    let installed = error["installed_resource_ids"].as_array()
+    let installed = error["installed_resource_ids"]
+        .as_array()
         .or_else(|| error["details"]["installed_resource_ids"].as_array())
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
-    let message = error["message"].as_str().filter(|value| value.len() <= 512)
-        .unwrap_or("资源操作失败；敏感诊断信息已省略。").to_owned();
-    Err(ProcessError { message, installed, cancelled: false })
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let message = error["message"]
+        .as_str()
+        .filter(|value| value.len() <= 512)
+        .unwrap_or("资源操作失败；敏感诊断信息已省略。")
+        .to_owned();
+    Err(ProcessError {
+        message,
+        installed,
+        cancelled: false,
+    })
 }
 
 fn event_value(snapshot: &JobSnapshot) -> Value {
-    let mut value=json!({
+    let mut value = json!({
         "job_id": snapshot.job_id,
         "resource_id": snapshot.resource_id,
         "state": snapshot.state,
@@ -1563,54 +3328,137 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "import_preview": snapshot.import_preview,
         "fields":{"progress_kind":"当前进度类型，下载与校验分别计数","attempt":"当前自动恢复轮次","recovery":"故障类别、自动恢复结果和明确下一步","parent_job_id":"所属一键任务编号","created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"其他阶段已处理字节数","total_bytes":"其他阶段总字节数","download_completed_bytes":"资源下载已完成字节数","download_total_bytes":"资源下载总字节数","verification_completed_bytes":"本地摘要校验已处理字节数","verification_total_bytes":"本地摘要校验总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
     });
-    value["operation"]=json!(if snapshot.job_id.starts_with("reset-")||snapshot.job_id.starts_with("history-reset-"){"reset"}else{"install"});
-    value["first_error"]=json!(snapshot.first_error);
-    value["failure_resource_id"]=json!(snapshot.failure_resource_id);
-    value["fields"]["failure_resource_id"]=json!("本轮实际失败的组件，依赖故障不能归给请求模型");
-    value["fields"]["first_error"]=json!("本轮任务首次错误，自动恢复不能覆盖");
-    value["fields"]["operation"]=json!("组件安装或用户确认的重置");
+    value["operation"] = json!(if is_system_feature_job(&snapshot.job_id) {
+        "system_feature"
+    } else if snapshot.job_id.starts_with("reset-") || snapshot.job_id.starts_with("history-reset-")
+    {
+        "reset"
+    } else {
+        "install"
+    });
+    value["first_error"] = json!(snapshot.first_error);
+    value["failure_resource_id"] = json!(snapshot.failure_resource_id);
+    value["fields"]["failure_resource_id"] = json!("本轮实际失败的组件，依赖故障不能归给请求模型");
+    value["fields"]["first_error"] = json!("本轮任务首次错误，自动恢复不能覆盖");
+    value["fields"]["operation"] = json!(if is_system_feature_job(&snapshot.job_id) {
+        "系统功能查询或启动任务"
+    } else {
+        "组件安装或用户确认的重置"
+    });
+    if is_system_feature_job(&snapshot.job_id) {
+        value["fields"]["resource_id"] = json!("Windows 系统功能编号");
+        value["fields"]["installed_resources"] =
+            json!("本任务不安装工作区组件；系统功能状态单独复核");
+        value["fields"]["recovery"] = json!("此任务不进入组件恢复事务");
+        value["fields"]["failure_resource_id"] = json!("本轮系统功能任务的固定失败目标");
+    }
     value
 }
 
-fn terminal(state: &str) -> bool { matches!(state, "complete" | "completed" | "failed" | "cancelled" | "canceled") }
+fn terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "complete" | "completed" | "failed" | "cancelled" | "canceled"
+    )
+}
 
-fn validate_batch_admission(jobs:&HashMap<String,JobControl>,resource:&str,parent:Option<&str>)->Result<(),String>{
-    let batch=jobs.values().find(|job|job.snapshot.resource_id=="required-batch"&&!terminal(&job.snapshot.state));
-    if resource=="required-batch"{
-        if jobs.values().any(|job|!terminal(&job.snapshot.state)){return Err("请等待当前资源任务完成后再一键下载。".into());}
-    }else if let Some(parent)=parent{
-        if !batch.is_some_and(|job|job.snapshot.job_id==parent&&!job.cancel.load(Ordering::Acquire)){
+fn is_system_feature_job(job_id: &str) -> bool {
+    job_id.starts_with("system-feature-")
+}
+
+fn validate_batch_admission(
+    jobs: &HashMap<String, JobControl>,
+    resource: &str,
+    parent: Option<&str>,
+) -> Result<(), String> {
+    let batch = jobs
+        .values()
+        .find(|job| job.snapshot.resource_id == "required-batch" && !terminal(&job.snapshot.state));
+    if resource == "required-batch" {
+        if jobs.values().any(|job| !terminal(&job.snapshot.state)) {
+            return Err("请等待当前资源任务完成后再一键下载。".into());
+        }
+    } else if let Some(parent) = parent {
+        if !batch
+            .is_some_and(|job| job.snapshot.job_id == parent && !job.cancel.load(Ordering::Acquire))
+        {
             return Err("所属一键任务已结束或取消，不再启动新组件。".into());
         }
-    }else if batch.is_some(){return Err("一键下载正在处理必要组件，请等待完成或取消后再操作。".into());}
+    } else if batch.is_some() {
+        return Err("一键下载正在处理必要组件，请等待完成或取消后再操作。".into());
+    }
     Ok(())
 }
 
-fn progress_kind(phase:&str)->&'static str{ // progress_kind（阶段投影）：字节只属于当前阶段。
-    if phase.starts_with("构建模型：")||phase.starts_with("构建推理引擎："){"build"}
-    else if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX){"download"}
-    else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){"verify"}
-    else if phase.contains("下载固定资源")||phase.contains("正在下载"){"download"}
-    else if phase.contains("等待")||phase.contains("来源")||phase.starts_with("一键下载：")||phase.starts_with("自动恢复"){"waiting"}
-    else if phase.contains("校验")||phase.contains("核验")||phase.contains("核对"){"verify"}
-    else if phase.contains("下载进度"){"download"}
-    else{"install"}
+fn progress_kind(phase: &str) -> &'static str {
+    // progress_kind（阶段投影）：字节只属于当前阶段。
+    if phase.starts_with("构建模型：") || phase.starts_with("构建推理引擎：") {
+        "build"
+    } else if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX) {
+        "download"
+    } else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX) {
+        "verify"
+    } else if phase.contains("下载固定资源") || phase.contains("正在下载") {
+        "download"
+    } else if phase.contains("等待")
+        || phase.contains("来源")
+        || phase.starts_with("一键下载：")
+        || phase.starts_with("自动恢复")
+    {
+        "waiting"
+    } else if phase.contains("校验") || phase.contains("核验") || phase.contains("核对") {
+        "verify"
+    } else if phase.contains("下载进度") {
+        "download"
+    } else {
+        "install"
+    }
 }
-fn include_in_required_batch(item:&Value)->bool{
-    item["required"]!=false||(item["selected_enhancement"]==true&&item["download_in_required_batch"]!=false)
+fn include_in_required_batch(item: &Value) -> bool {
+    item["required"] != false
+        || (item["selected_enhancement"] == true && item["download_in_required_batch"] != false)
 }
-pub(crate) fn retryable_failure(message:&str)->bool{ // retryable_failure（可自动恢复）：取消、永久配置与权限错误停止重试。
-    !["取消","空间不足","磁盘空间","目录权限","拒绝访问","Permission denied","os error 5","系统仍拒绝","系统错误码：5","缺少可信","清单无效","清单缺失","未锁定","来源必须","兼容显卡环境","无法暂停","恢复旧资源失败","恢复原组件失败","资源回滚留待"].iter().any(|reason|message.contains(reason))
+pub(crate) fn retryable_failure(message: &str) -> bool {
+    // retryable_failure（可自动恢复）：取消、永久配置与权限错误停止重试。
+    ![
+        "取消",
+        "空间不足",
+        "磁盘空间",
+        "目录权限",
+        "拒绝访问",
+        "Permission denied",
+        "os error 5",
+        "系统仍拒绝",
+        "系统错误码：5",
+        "缺少可信",
+        "清单无效",
+        "清单缺失",
+        "未锁定",
+        "来源必须",
+        "兼容显卡环境",
+        "无法暂停",
+        "恢复旧资源失败",
+        "恢复原组件失败",
+        "资源回滚留待",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
 }
 
 fn valid_resource_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 64 && value.bytes().enumerate().all(|(index, byte)| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
-    })
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
+        })
 }
 
 fn unix_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn new_job_id(prefix: &str) -> String {
@@ -1631,23 +3479,64 @@ fn localized_phase(value: &str) -> &'static str {
     }
 }
 
-fn command_allowed(window: &WebviewWindow, desktop: &State<'_, Arc<super::Desktop>>) -> Result<(), String> {
+fn command_allowed(
+    window: &WebviewWindow,
+    desktop: &State<'_, Arc<super::Desktop>>,
+) -> Result<(), String> {
     super::require_command(desktop.mode, super::DesktopCommand::FocusMain)?;
     super::trusted(window, desktop)
 }
 
 #[tauri::command]
-pub fn resource_jobs(window:WebviewWindow,desktop:State<'_,Arc<super::Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Vec<Value>,String>{
-    command_allowed(&window,&desktop)?;Ok(manager.snapshots())
+pub fn resource_jobs(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<Vec<Value>, String> {
+    command_allowed(&window, &desktop)?;
+    Ok(manager.snapshots())
+}
+
+/// resource_system_feature_status（读取系统功能状态）：显式管理页调用，角色不符时拒绝。
+#[tauri::command]
+pub async fn resource_system_feature_status(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.open_ssh_server_status())
+        .await
+        .map_err(|_| "OpenSSH Server 状态查询任务无法启动。".to_string())?
+}
+
+/// resource_system_feature_enable（启动系统功能任务）：只接受固定 OpenSSH Server 主机功能任务。
+#[tauri::command]
+pub async fn resource_system_feature_enable(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.enable_open_ssh_server())
+        .await
+        .map_err(|_| "OpenSSH Server 管理任务无法启动。".to_string())?
 }
 
 #[tauri::command]
-pub async fn aniflive_import_choose_folder(window: WebviewWindow, desktop: State<'_, Arc<super::Desktop>>) -> Result<Option<String>, String> {
+pub async fn aniflive_import_choose_folder(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+) -> Result<Option<String>, String> {
     command_allowed(&window, &desktop)?;
-    tauri::async_runtime::spawn_blocking(|| voice_desktop_common::native_ui::choose_folder("选择 GPT-SoVITS 模型包所在文件夹"))
-        .await
-        .map_err(|_| "模型文件夹选择器无法启动。".to_string())?
-        .map(|path| path.map(|value| value.to_string_lossy().into_owned()))
+    tauri::async_runtime::spawn_blocking(|| {
+        voice_desktop_common::native_ui::choose_folder("选择 GPT-SoVITS 模型包所在文件夹")
+    })
+    .await
+    .map_err(|_| "模型文件夹选择器无法启动。".to_string())?
+    .map(|path| path.map(|value| value.to_string_lossy().into_owned()))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1660,7 +3549,8 @@ pub async fn aniflive_import_start(
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || manager.start_aniflive_import(task_id))
-        .await.map_err(|_| "AnifLive 转换任务无法启动。".to_string())?
+        .await
+        .map_err(|_| "AnifLive 转换任务无法启动。".to_string())?
 }
 
 #[tauri::command]
@@ -1671,7 +3561,9 @@ pub async fn resource_inventory(
 ) -> Result<Vec<Value>, String> {
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.inventory()).await.map_err(|_| "资源清单读取任务失败。")?
+    tauri::async_runtime::spawn_blocking(move || manager.inventory())
+        .await
+        .map_err(|_| "资源清单读取任务失败。")?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1683,12 +3575,19 @@ pub async fn resource_download(
 ) -> Result<Value, String> {
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.download(resource_id)).await.map_err(|_| "资源下载任务无法启动。")?
+    tauri::async_runtime::spawn_blocking(move || manager.download(resource_id))
+        .await
+        .map_err(|_| "资源下载任务无法启动。")?
 }
 
 #[tauri::command]
-pub async fn resource_download_required(window:WebviewWindow,desktop:State<'_,Arc<super::Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Value,String>{
-    command_allowed(&window,&desktop)?;manager.inner().clone().download_required()
+pub async fn resource_download_required(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    manager.inner().clone().download_required()
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1700,7 +3599,9 @@ pub async fn resource_import(
 ) -> Result<Value, String> {
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.import(resource_id)).await.map_err(|_| "资源导入任务无法启动。")?
+    tauri::async_runtime::spawn_blocking(move || manager.import(resource_id))
+        .await
+        .map_err(|_| "资源导入任务无法启动。")?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1712,7 +3613,9 @@ pub async fn resource_open_source(
 ) -> Result<(), String> {
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.open_source(&resource_id)).await.map_err(|_| "打开资源来源任务失败。")?
+    tauri::async_runtime::spawn_blocking(move || manager.open_source(&resource_id))
+        .await
+        .map_err(|_| "打开资源来源任务失败。")?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1726,13 +3629,57 @@ pub async fn resource_cancel(
     manager.cancel(&job_id)
 }
 
-#[tauri::command(rename_all="snake_case")]
-pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,job_id:String,accepted:bool)->Result<(),String>{
-    super::trusted(&window,&desktop)?;manager.confirm_import(&job_id,accepted)
+#[tauri::command(rename_all = "snake_case")]
+pub fn resource_import_confirm(
+    window: WebviewWindow,
+    desktop: State<Arc<super::Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+    job_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    super::trusted(&window, &desktop)?;
+    manager.confirm_import(&job_id, accepted)
 }
 
 #[cfg(test)]
 mod service_tests {
+    #[test]
+    fn system_feature_job_uses_separate_type_and_chinese_field_meanings() {
+        let snapshot = super::JobSnapshot {
+            job_id: voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID.into(),
+            resource_id: voice_desktop_common::system_feature::OPENSSH_SERVER_ID.into(),
+            state: "running".into(),
+            phase: "等待 Windows 管理员授权".into(),
+            progress_kind: "waiting".into(),
+            attempt: 1,
+            parent_job_id: None,
+            completed_bytes: 0,
+            total_bytes: None,
+            download_completed_bytes: None,
+            download_total_bytes: None,
+            verification_completed_bytes: None,
+            verification_total_bytes: None,
+            failure_resource_id: None,
+            first_error: None,
+            error: None,
+            can_cancel: false,
+            installed_resources: vec![],
+            import_preview: None,
+            created_at: 1,
+            revision: 1,
+            recovery: None,
+        };
+        let value = super::event_value(&snapshot);
+        assert_eq!(value["operation"], "system_feature");
+        assert_eq!(value["fields"]["resource_id"], "Windows 系统功能编号");
+        assert_eq!(
+            value["fields"]["installed_resources"],
+            "本任务不安装工作区组件；系统功能状态单独复核"
+        );
+        assert!(super::is_system_feature_job(&snapshot.job_id));
+        assert!(!super::is_system_feature_job("dl-dsh"));
+    }
+
     #[test]
     fn unattended_import_dispatch_only_accepts_confirmed_unstarted_tasks() {
         let id = "a".repeat(32);
@@ -1740,163 +3687,308 @@ mod service_tests {
         assert!(super::ready_import(&task, &id, false));
         assert!(!super::ready_import(&task, &id, true));
         assert!(!super::ready_import(&task, &"b".repeat(32), false));
-        for status in ["staging", "pending_reference", "failed", "cancelled", "complete", "converting"] {
-            assert!(!super::ready_import(&serde_json::json!({"task_id": id, "status": status}), &id, false));
+        for status in [
+            "staging",
+            "pending_reference",
+            "failed",
+            "cancelled",
+            "complete",
+            "converting",
+        ] {
+            assert!(!super::ready_import(
+                &serde_json::json!({"task_id": id, "status": status}),
+                &id,
+                false
+            ));
         }
     }
     #[test]
-    fn restored_jobs_preserve_event_classification_and_action_after_restart(){
-        let root=std::env::temp_dir().join(format!("voice-recovery-jobs-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();let path=root.join("jobs.json");
+    fn restored_jobs_preserve_event_classification_and_action_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-recovery-jobs-{}",
+            voice_desktop_common::workspace::new_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("jobs.json");
         voice_desktop_common::workspace::atomic_json(&path,&json!({"jobs":[
             {"job_id":"network","resource_id":"model-a","state":"failed","phase":"下载失败","error":"下载失败：HTTP 503"},
             {"job_id":"content","resource_id":"model-b","state":"failed","phase":"未完成","error":"增量依赖实际加载失败：httpx"},
             {"job_id":"interrupted","resource_id":"model-c","state":"running","phase":"处理中"}
         ]})).unwrap();
-        let jobs=ResourceManager::load_jobs(&path).unwrap();
-        assert_eq!(jobs["network"].snapshot.recovery.as_ref().unwrap()["next_action"],"retry");
-        assert_eq!(jobs["content"].snapshot.recovery.as_ref().unwrap()["next_action"],"check_integrity");
-        assert_eq!(jobs["interrupted"].snapshot.recovery.as_ref().unwrap()["event"],"interrupted");
+        let jobs = ResourceManager::load_jobs(&path).unwrap();
+        assert_eq!(
+            jobs["network"].snapshot.recovery.as_ref().unwrap()["next_action"],
+            "retry"
+        );
+        assert_eq!(
+            jobs["content"].snapshot.recovery.as_ref().unwrap()["next_action"],
+            "check_integrity"
+        );
+        assert_eq!(
+            jobs["interrupted"].snapshot.recovery.as_ref().unwrap()["event"],
+            "interrupted"
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn source_and_speed_details_preserve_transfer_progress_kind(){
-        assert_eq!(super::progress_kind("构建推理引擎：已完成 3 / 9"),"build");
-        assert_eq!(super::progress_kind("下载固定资源（四路加速） · 8.20 MiB/秒（兆二进制字节每秒） · 来源：GitHub（代码托管平台）原站"),"download");
-        assert_eq!(super::progress_kind("来源测速：GitHub（代码托管平台）原站"),"waiting");
-        assert_eq!(super::progress_kind("校验下载文件"),"verify");
+    fn source_and_speed_details_preserve_transfer_progress_kind() {
+        assert_eq!(super::progress_kind("构建推理引擎：已完成 3 / 9"), "build");
+        assert_eq!(
+            super::progress_kind(
+                "下载固定资源（四路加速） · 8.20 MiB/秒（兆二进制字节每秒） · 来源：GitHub（代码托管平台）原站"
+            ),
+            "download"
+        );
+        assert_eq!(
+            super::progress_kind("来源测速：GitHub（代码托管平台）原站"),
+            "waiting"
+        );
+        assert_eq!(super::progress_kind("校验下载文件"), "verify");
     }
     #[test]
-    fn optional_audio_models_stay_out_of_initial_required_batch(){
-        for id in ["emotion2vec-plus-base","yamnet"]{
-            assert!(!super::include_in_required_batch(&serde_json::json!({"resource_id":id,"required":false,"selected_enhancement":true,"download_in_required_batch":false})));
+    fn optional_audio_models_stay_out_of_initial_required_batch() {
+        for id in ["emotion2vec-plus-base", "yamnet"] {
+            assert!(!super::include_in_required_batch(
+                &serde_json::json!({"resource_id":id,"required":false,"selected_enhancement":true,"download_in_required_batch":false})
+            ));
         }
-        assert!(super::include_in_required_batch(&serde_json::json!({"resource_id":"paraformer-offline","required":false,"selected_enhancement":true})));
-        assert!(super::include_in_required_batch(&serde_json::json!({"resource_id":"required-model","required":true,"selected_enhancement":false,"download_in_required_batch":false})));
+        assert!(super::include_in_required_batch(
+            &serde_json::json!({"resource_id":"paraformer-offline","required":false,"selected_enhancement":true})
+        ));
+        assert!(super::include_in_required_batch(
+            &serde_json::json!({"resource_id":"required-model","required":true,"selected_enhancement":false,"download_in_required_batch":false})
+        ));
     }
     use super::*;
 
     #[test]
-    fn required_batch_reserves_jobs_and_only_admits_its_own_children(){
-        let root=std::env::temp_dir().join(format!("voice-job-admission-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();
-        let path=root.join("jobs.json");
+    fn required_batch_reserves_jobs_and_only_admits_its_own_children() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-job-admission-{}",
+            voice_desktop_common::workspace::new_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("jobs.json");
         voice_desktop_common::workspace::atomic_json(&path,&json!({"schema":1,"jobs":[{"job_id":"dl-required","resource_id":"required-batch","state":"complete","phase":"已完成","created_at":100}]})).unwrap();
-        let mut jobs=ResourceManager::load_jobs(&path).unwrap();
-        jobs.get_mut("dl-required").unwrap().snapshot.state="running".into();
-        assert!(validate_batch_admission(&jobs,"model",None).is_err());
-        assert!(validate_batch_admission(&jobs,"required-batch",None).is_err());
-        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_ok());
-        assert!(validate_batch_admission(&jobs,"model",Some("other-batch")).is_err());
-        jobs["dl-required"].cancel.store(true,Ordering::Release);
-        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_err());
-        jobs.get_mut("dl-required").unwrap().snapshot.state="cancelled".into();
-        assert!(validate_batch_admission(&jobs,"model",None).is_ok());
-        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_err());
-        assert!(validate_batch_admission(&jobs,"required-batch",None).is_ok());
-        jobs.get_mut("dl-required").unwrap().snapshot.resource_id="model".into();jobs.get_mut("dl-required").unwrap().snapshot.state="running".into();
-        assert!(validate_batch_admission(&jobs,"required-batch",None).is_err());
+        let mut jobs = ResourceManager::load_jobs(&path).unwrap();
+        jobs.get_mut("dl-required").unwrap().snapshot.state = "running".into();
+        assert!(validate_batch_admission(&jobs, "model", None).is_err());
+        assert!(validate_batch_admission(&jobs, "required-batch", None).is_err());
+        assert!(validate_batch_admission(&jobs, "model", Some("dl-required")).is_ok());
+        assert!(validate_batch_admission(&jobs, "model", Some("other-batch")).is_err());
+        jobs["dl-required"].cancel.store(true, Ordering::Release);
+        assert!(validate_batch_admission(&jobs, "model", Some("dl-required")).is_err());
+        jobs.get_mut("dl-required").unwrap().snapshot.state = "cancelled".into();
+        assert!(validate_batch_admission(&jobs, "model", None).is_ok());
+        assert!(validate_batch_admission(&jobs, "model", Some("dl-required")).is_err());
+        assert!(validate_batch_admission(&jobs, "required-batch", None).is_ok());
+        jobs.get_mut("dl-required").unwrap().snapshot.resource_id = "model".into();
+        jobs.get_mut("dl-required").unwrap().snapshot.state = "running".into();
+        assert!(validate_batch_admission(&jobs, "required-batch", None).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn persisted_jobs_keep_revision_order_and_interrupted_tasks_become_terminal(){
-        let root=std::env::temp_dir().join(format!("voice-job-revision-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();let path=root.join("jobs.json");
+    fn persisted_jobs_keep_revision_order_and_interrupted_tasks_become_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-job-revision-{}",
+            voice_desktop_common::workspace::new_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("jobs.json");
         voice_desktop_common::workspace::atomic_json(&path,&json!({"schema":1,"jobs":[{
             "job_id":"dl-model","resource_id":"model","state":"running","phase":"正在下载","created_at":100,"revision":7,"completed_bytes":50,"total_bytes":100
         }]})).unwrap();
-        let jobs=ResourceManager::load_jobs(&path).unwrap();let event=event_value(&jobs["dl-model"].snapshot);
-        assert_eq!(event["state"],"failed");assert_eq!(event["revision"],8);assert_eq!(event["created_at"],100);assert_eq!(event["can_cancel"],false);
-        assert!(event["fields"]["revision"].as_str().unwrap().contains("修订号"));fs::remove_dir_all(root).unwrap();
+        let jobs = ResourceManager::load_jobs(&path).unwrap();
+        let event = event_value(&jobs["dl-model"].snapshot);
+        assert_eq!(event["state"], "failed");
+        assert_eq!(event["revision"], 8);
+        assert_eq!(event["created_at"], 100);
+        assert_eq!(event["can_cancel"], false);
+        assert!(
+            event["fields"]["revision"]
+                .as_str()
+                .unwrap()
+                .contains("修订号")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn control(running: bool) -> (ServiceControl, Arc<Mutex<Vec<bool>>>) {
-        let calls=Arc::new(Mutex::new(vec![]));let log=calls.clone();
-        let state=Arc::new(AtomicBool::new(running));
-        (Arc::new(move|start|{log.lock().unwrap().push(start);if start{state.store(true,Ordering::Release);Ok(true)}else{Ok(state.swap(false,Ordering::AcqRel))}}),calls)
+        let calls = Arc::new(Mutex::new(vec![]));
+        let log = calls.clone();
+        let state = Arc::new(AtomicBool::new(running));
+        (
+            Arc::new(move |start| {
+                log.lock().unwrap().push(start);
+                if start {
+                    state.store(true, Ordering::Release);
+                    Ok(true)
+                } else {
+                    Ok(state.swap(false, Ordering::AcqRel))
+                }
+            }),
+            calls,
+        )
     }
 
     #[test]
     fn component_management_does_not_start_service_after_install() {
-        let (control,calls)=control(false);let lock=Mutex::new(());
-        ServiceLease::pause(&control,lock.lock().unwrap()).unwrap().finish().unwrap();
-        assert_eq!(*calls.lock().unwrap(),vec![false]);
+        let (control, calls) = control(false);
+        let lock = Mutex::new(());
+        ServiceLease::pause(&control, lock.lock().unwrap())
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
     }
 
     #[test]
     fn activation_restores_running_service_exactly_once() {
-        let (control,calls)=control(true);let lock=Mutex::new(());
-        ServiceLease::pause(&control,lock.lock().unwrap()).unwrap().finish().unwrap();
-        assert_eq!(*calls.lock().unwrap(),vec![false,true]);
+        let (control, calls) = control(true);
+        let lock = Mutex::new(());
+        ServiceLease::pause(&control, lock.lock().unwrap())
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
     }
 
     #[test]
     fn cancelled_activation_restores_only_previously_running_service() {
-        for running in [false,true] {
-            let (control,calls)=control(running);let lock=Mutex::new(());
-            drop(ServiceLease::pause(&control,lock.lock().unwrap()).unwrap());
-            assert_eq!(*calls.lock().unwrap(),if running{vec![false,true]}else{vec![false]});
+        for running in [false, true] {
+            let (control, calls) = control(running);
+            let lock = Mutex::new(());
+            drop(ServiceLease::pause(&control, lock.lock().unwrap()).unwrap());
+            assert_eq!(
+                *calls.lock().unwrap(),
+                if running {
+                    vec![false, true]
+                } else {
+                    vec![false]
+                }
+            );
         }
     }
 
     #[test]
-    fn pending_update_keeps_previously_running_service_stopped(){
-        let (control,calls)=control(true);let lock=Mutex::new(());
-        let mut lease=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
-        assert!(lease.was_running());lease.keep_stopped();drop(lease);
-        assert_eq!(*calls.lock().unwrap(),vec![false]);
+    fn pending_update_keeps_previously_running_service_stopped() {
+        let (control, calls) = control(true);
+        let lock = Mutex::new(());
+        let mut lease = ServiceLease::pause(&control, lock.lock().unwrap()).unwrap();
+        assert!(lease.was_running());
+        lease.keep_stopped();
+        drop(lease);
+        assert_eq!(*calls.lock().unwrap(), vec![false]);
     }
 
     #[test]
-    fn cancelled_maintenance_preserves_resume_intent_without_starting_idle_services(){
-        for running in [false,true]{
-            let (control,calls)=control(running);let lock=Mutex::new(());let pending=Mutex::new(running);
-            let accepting=AtomicBool::new(false);let batch=AtomicBool::new(false);
-            let mut paused=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
-            assert!(!resume_service_if_ready(&mut paused,&pending,&accepting,&batch,||panic!("维护期间不能启动资源检查或服务")).unwrap());
-            drop(paused);assert_eq!(*pending.lock().unwrap(),running);
-            accepting.store(true,Ordering::Release);
-            let mut recovery=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
-            let resumed=resume_service_if_ready(&mut recovery,&pending,&accepting,&batch,||Ok(true)).unwrap();
-            clear_resume_intent_if_resumed(&pending,resumed);drop(recovery);
-            assert_eq!(resumed,running);assert!(!*pending.lock().unwrap());
-            assert_eq!(*calls.lock().unwrap(),if running{vec![false,false,true]}else{vec![false,false]});
+    fn cancelled_maintenance_preserves_resume_intent_without_starting_idle_services() {
+        for running in [false, true] {
+            let (control, calls) = control(running);
+            let lock = Mutex::new(());
+            let pending = Mutex::new(running);
+            let accepting = AtomicBool::new(false);
+            let batch = AtomicBool::new(false);
+            let mut paused = ServiceLease::pause(&control, lock.lock().unwrap()).unwrap();
+            assert!(
+                !resume_service_if_ready(&mut paused, &pending, &accepting, &batch, || panic!(
+                    "维护期间不能启动资源检查或服务"
+                ))
+                .unwrap()
+            );
+            drop(paused);
+            assert_eq!(*pending.lock().unwrap(), running);
+            accepting.store(true, Ordering::Release);
+            let mut recovery = ServiceLease::pause(&control, lock.lock().unwrap()).unwrap();
+            let resumed =
+                resume_service_if_ready(&mut recovery, &pending, &accepting, &batch, || Ok(true))
+                    .unwrap();
+            clear_resume_intent_if_resumed(&pending, resumed);
+            drop(recovery);
+            assert_eq!(resumed, running);
+            assert!(!*pending.lock().unwrap());
+            assert_eq!(
+                *calls.lock().unwrap(),
+                if running {
+                    vec![false, false, true]
+                } else {
+                    vec![false, false]
+                }
+            );
         }
     }
 
     #[test]
-    fn preparation_failure_clears_resume_intent_only_when_service_restarts(){
-        let pending=Mutex::new(true);
-        clear_resume_intent_if_resumed(&pending,false);assert!(*pending.lock().unwrap());
-        clear_resume_intent_if_resumed(&pending,true);assert!(!*pending.lock().unwrap());
+    fn preparation_failure_clears_resume_intent_only_when_service_restarts() {
+        let pending = Mutex::new(true);
+        clear_resume_intent_if_resumed(&pending, false);
+        assert!(*pending.lock().unwrap());
+        clear_resume_intent_if_resumed(&pending, true);
+        assert!(!*pending.lock().unwrap());
     }
 
     #[test]
-    fn environment_preparation_lock_serializes_and_wait_is_cancellable(){
-        let environment=Mutex::new(());let held=environment.lock().unwrap();
-        let waiting=Arc::new(AtomicBool::new(false));let cancel=Arc::new(AtomicBool::new(false));
-        std::thread::scope(|scope|{
-            let observed=waiting.clone();let cancel_waiter=cancel.clone();let gate=&environment;
-            let worker=scope.spawn(move||{
-                let mut progress=|phase:&str,_,_|{if phase.contains("等待"){observed.store(true,Ordering::Release);}};
-                let error=acquire_environment_lock(gate,&cancel_waiter,&mut progress).unwrap_err();
+    fn environment_preparation_lock_serializes_and_wait_is_cancellable() {
+        let environment = Mutex::new(());
+        let held = environment.lock().unwrap();
+        let waiting = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let observed = waiting.clone();
+            let cancel_waiter = cancel.clone();
+            let gate = &environment;
+            let worker = scope.spawn(move || {
+                let mut progress = |phase: &str, _, _| {
+                    if phase.contains("等待") {
+                        observed.store(true, Ordering::Release);
+                    }
+                };
+                let error =
+                    acquire_environment_lock(gate, &cancel_waiter, &mut progress).unwrap_err();
                 assert!(error.contains("取消"));
             });
-            for _ in 0..100{if waiting.load(Ordering::Acquire){break;}thread::sleep(Duration::from_millis(10));}
-            assert!(waiting.load(Ordering::Acquire),"第二个环境准备任务必须显示等待锁阶段");
-            cancel.store(true,Ordering::Release);worker.join().unwrap();
+            for _ in 0..100 {
+                if waiting.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                waiting.load(Ordering::Acquire),
+                "第二个环境准备任务必须显示等待锁阶段"
+            );
+            cancel.store(true, Ordering::Release);
+            worker.join().unwrap();
         });
         drop(held);
-        let mut progress=|_:&str,_,_|{};
-        assert!(acquire_environment_lock(&environment,&AtomicBool::new(false),&mut progress).is_ok());
+        let mut progress = |_: &str, _, _| {};
+        assert!(
+            acquire_environment_lock(&environment, &AtomicBool::new(false), &mut progress).is_ok()
+        );
     }
 }
 
 /// resource_reset_plan（读取组件重置范围）：不接受任意文件路径。
-#[tauri::command(rename_all="snake_case")]
-pub fn resource_reset_plan(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
- command_allowed(&window,&desktop)?;voice_desktop_common::component_reset::plan(&manager.context,&resource_id)
+#[tauri::command(rename_all = "snake_case")]
+pub fn resource_reset_plan(
+    window: WebviewWindow,
+    desktop: State<Arc<super::Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+    resource_id: String,
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    voice_desktop_common::component_reset::plan(&manager.context, &resource_id)
 }
 /// resource_reset（确认删除组件）：原生任务负责安全收尾。
-#[tauri::command(rename_all="snake_case")]
-pub fn resource_reset(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,resource_id:String,token:String)->Result<Value,String>{
- command_allowed(&window,&desktop)?;manager.inner().reset_resource(resource_id,token)
+#[tauri::command(rename_all = "snake_case")]
+pub fn resource_reset(
+    window: WebviewWindow,
+    desktop: State<Arc<super::Desktop>>,
+    manager: State<Arc<ResourceManager>>,
+    resource_id: String,
+    token: String,
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    manager.inner().reset_resource(resource_id, token)
 }

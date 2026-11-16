@@ -615,11 +615,13 @@ class SpeakerRuntimeMixin:
             raise ValueError("注册正在保存或已过期，请结束后重试")
         key = capture_id or uuid4().hex
         control = CaptureControl()
+        local_audio = getattr(self, "_local_audio", None)
+        recording_device = local_audio() if callable(local_audio) else None
         captures[key] = (owner, control)
         capture_task = asyncio.create_task(asyncio.to_thread(
             capture_segment, sample_rate=self.config.audio.sample_rate,
             channels=self.config.audio.channels, input_device=self.config.audio.input_device,
-            seconds=seconds, processor=self.audio_processor, control=control,
+            seconds=seconds, processor=self.audio_processor, control=control, recording_device=recording_device,
         ))
         try:
             captured = await asyncio.shield(capture_task)

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-ssh-identity-status"
+description = "Enables the device_ssh_identity_status command without any pre-configured scope."
+commands.allow = ["device_ssh_identity_status"]
+
+[[permission]]
+identifier = "deny-device-ssh-identity-status"
+description = "Denies the device_ssh_identity_status command without any pre-configured scope."
+commands.deny = ["device_ssh_identity_status"]

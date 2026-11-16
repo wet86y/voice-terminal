@@ -74,6 +74,61 @@ export class ProductApiError extends Error implements ProductApiErrorShape {
   }
 }
 
+/** DevicePairingRequest（待批准配对请求）：不向页面暴露公钥、随机数或配对码。 */
+export interface DevicePairingRequest {
+  request_id: string // request_id（待批准请求编号）。
+  device_id: string // device_id（申请设备编号）。
+  fingerprint: string // fingerprint（申请设备公钥 SHA-256 指纹）。
+  created_at_ms: number // created_at_ms（请求建立时间，Unix 毫秒）。
+  expires_at_ms: number // expires_at_ms（请求到期时间，Unix 毫秒）。
+}
+
+/** DeviceTrustSnapshot（设备信任快照）：不含私钥或完整公钥。 */
+export interface DeviceTrustSnapshot {
+  schema_version: number // schema_version（信任登记格式版本）。
+  state: 'missing' | 'valid' | 'invalid' // state（登记文件状态）。
+  devices: Array<{
+    device_id: string // device_id（稳定设备编号）。
+    fingerprint: string // fingerprint（设备公钥 SHA-256 指纹）。
+    state: 'trusted' | 'revoked' // state（可信或已撤销）。
+    trusted_at_ms: number // trusted_at_ms（主机批准时间，Unix 毫秒）。
+    revoked_at_ms: number | null // revoked_at_ms（主机撤销时间，Unix 毫秒）。
+  }> // devices（公开设备登记列表）。
+  error?: string // error（无法安全读取登记时的原因）。
+}
+
+/** DevicePairingStatus（主机配对状态）：配对码只在开启操作的单次回执出现。 */
+export interface DevicePairingStatus {
+  window_open: boolean // window_open（主机配对窗口是否开放）。
+  window_expires_at_ms: number | null // window_expires_at_ms（配对窗口到期时间，Unix 毫秒）。
+  failed_attempts_remaining: number // failed_attempts_remaining（配对窗口自动关闭前剩余错误码尝试次数）。
+  pending_requests: DevicePairingRequest[] // pending_requests（已验签但尚未批准的设备）。
+  trust: DeviceTrustSnapshot // trust（设备信任登记状态）。
+  fields: Record<string, string> // fields（字段中文说明）。
+}
+
+export interface DevicePairingOpenResult extends DevicePairingStatus {
+  pairing_code: string // pairing_code（仅此次开启配对窗口回传的一次性配对码）。
+}
+
+/** ProductDeviceSnapshot（核心设备快照）：本机管理页用于明确选择语音交互设备。 */
+export interface ProductDeviceSnapshot {
+  devices: Array<{
+    device_id: string // device_id（稳定设备编号；local 表示核心主机）。
+    name: string // name（设备显示名称）。
+    connected: boolean // connected（设备是否在线）。
+    connection_generation: number // connection_generation（设备连接代次）。
+    executor_generation: number // executor_generation（设备执行器代次）。
+    capabilities: string[] // capabilities（当前已登记的设备能力）。
+    error: string | null // error（设备错误摘要）。
+    interaction_active: boolean // interaction_active（是否持有语音交互租约）。
+  }> // devices（当前核心登记的设备列表）。
+  active_device_id: string | null // active_device_id（当前获准语音交互的设备编号）。
+  interaction_generation: number // interaction_generation（语音设备切换代次）。
+  capability_labels: Record<string, string> // capability_labels（能力编号的中文说明）。
+  fields: Record<string, string> // fields（字段中文说明）。
+}
+
 function apiBaseUrl() {
   const configuration = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
   if (configuration?.business_ready === false) throw new Error('应用宿主尚未允许业务请求。')
@@ -124,6 +179,19 @@ function jsonBody(value: unknown): RequestInit {
   return { method: 'PUT', body: JSON.stringify(value) }
 }
 
+/** readPairingResponse（配对回执校验）：静态管理页返回 HTML 时报告宿主未就绪，不回显页面正文或秘密。 */
+async function readPairingResponse<T extends DevicePairingStatus>(response: Response): Promise<T> {
+  if (!response.ok) throw await readError(response)
+  if (!response.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+    throw new ProductApiError('主机配对接口尚未就绪。请在完整工作区启动共享主机核心后重试。', response.status)
+  }
+  try {
+    return await response.json() as T
+  } catch {
+    throw new ProductApiError('主机配对接口返回了无效数据，请刷新主机状态后重试。', response.status)
+  }
+}
+
 export const productApi = {
   hotwords: () => request<{ settings: import('./hotwords').HotwordSettings; status: string }>('/api/v1/product/settings/hotwords'), // hotwords（读取热词）。
   saveHotwords: (value: import('./hotwords').HotwordSettings) => request<{ settings: import('./hotwords').HotwordSettings; message: string }>('/api/v1/product/settings/hotwords', jsonBody(value)), // saveHotwords（保存词表并预建索引）。
@@ -135,6 +203,43 @@ export const productApi = {
     if (!response.ok) throw await readError(response)
     return await response.json() as { result: string }
   },
+  /** devicePairingStatus（读取本地主机配对状态）：通过已验证桌面会话转发，不缓存秘密。 */
+  devicePairingStatus: async () => {
+    const response = await fetch('/api/v1/application/device-pairing', {
+      method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' },
+    })
+    return await readPairingResponse<DevicePairingStatus>(response)
+  },
+  /** openDevicePairing（开启主机配对窗口）：配对码仅由本次回执返回。 */
+  openDevicePairing: async (ttl_seconds: number) => {
+    const response = await fetch('/api/v1/application/device-pairing', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operation: 'open', ttl_seconds }),
+    })
+    return await readPairingResponse<DevicePairingOpenResult>(response)
+  },
+  /** closeDevicePairing（关闭主机配对窗口）：清除配对码和待批准请求。 */
+  closeDevicePairing: async () => devicePairingMutation({ operation: 'close' }),
+  /** approveDevicePairing（批准设备配对）：只有主机用户点击批准才会登记公钥。 */
+  approveDevicePairing: async (request_id: string) => devicePairingMutation({ operation: 'approve', request_id }),
+  /** rejectDevicePairing（拒绝设备配对）：删除待批准请求但不改动可信登记。 */
+  rejectDevicePairing: async (request_id: string) => devicePairingMutation({ operation: 'reject', request_id }),
+  /** revokeDeviceTrust（撤销设备信任）：仅撤销对应稳定设备编号。 */
+  revokeDeviceTrust: async (device_id: string) => devicePairingMutation({ operation: 'revoke', device_id }),
+  /** deviceSnapshot（读取核心设备）：只读状态，不暴露信任密钥或任务内容。 */
+  deviceSnapshot: () => request<ProductDeviceSnapshot>('/api/v1/devices'),
+  /** selectInteractionDevice（明确切换语音设备）：使用已显示的代次防止覆盖并发切换。 */
+  selectInteractionDevice: (device_id: string, expected_interaction_generation: number) => request<{
+    protocol_version: 1 // protocol_version（设备协议版本）。
+    result: 'active' | 'pending_media' // result（已切换或等待媒体设备就绪）。
+    device_id: string // device_id（用户明确选择的固定设备编号）。
+    interaction_generation: number // interaction_generation（主机授予的交互占用代次）。
+    fields: Record<string, string> // fields（字段中文说明）。
+  }>('/api/v1/devices/interaction', {
+    method: 'POST',
+    body: JSON.stringify({ device_id, expected_interaction_generation }),
+  }),
   /** createWakeTask（手动创建任务）：同源宿主校验桌面会话，内部凭据不进入前端。 */
   createWakeTask: async (value: {
     text: string
@@ -241,6 +346,15 @@ export const productApi = {
   hideModel: (id: string) => request<ProductSnapshot['models']>(`/api/v1/models/${encodeURIComponent(id)}/hide`, { method: 'POST' }),
   restoreModel: (id: string) => request<ProductSnapshot['models']>(`/api/v1/models/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
   applyAssignments: (assignments: Record<string, unknown>, confirmed: boolean) => request<Record<string, unknown>>('/api/v1/models/assignments/apply', { method: 'POST', body: JSON.stringify({ assignments, confirmed }) }),
+}
+
+async function devicePairingMutation(value: Record<string, unknown>): Promise<DevicePairingStatus> {
+  const response = await fetch('/api/v1/application/device-pairing', {
+    method: 'POST', credentials: 'same-origin', cache: 'no-store',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(value),
+  })
+  return await readPairingResponse<DevicePairingStatus>(response)
 }
 
 export { apiBaseUrl }

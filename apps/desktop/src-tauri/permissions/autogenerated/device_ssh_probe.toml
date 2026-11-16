@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-ssh-probe"
+description = "Enables the device_ssh_probe command without any pre-configured scope."
+commands.allow = ["device_ssh_probe"]
+
+[[permission]]
+identifier = "deny-device-ssh-probe"
+description = "Denies the device_ssh_probe command without any pre-configured scope."
+commands.deny = ["device_ssh_probe"]

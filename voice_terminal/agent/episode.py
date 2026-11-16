@@ -311,6 +311,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self._retry_system_check: dict | None = None  # 二等评估传输重试的原始场景和所有权。
         self._frozen_action_definitions: tuple[dict, ...] | None = None
         self._frozen_tool_catalog: tuple[dict, ...] | None = None
+        self._pending_output_cancellations: set[asyncio.Task] = set()
 
     def _ensure_runner(self) -> None:
         if self.closed or self.episode_id is None:
@@ -1087,9 +1088,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     self._system_check_turn_ids.discard(signal.system_check_id)
         running = self.active_recovery is not None
         if running:
-            cancel_output = getattr(self.output, "cancel_all", None)
-            if callable(cancel_output):
-                cancel_output("superseded_recovery")
+            self._schedule_output_cancel_confirmed("superseded_recovery")
         if not queued and not running:
             return
         try:
@@ -1108,7 +1107,48 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         except RuntimeError:
             pass
 
-    def _supersede_system_output_without_request_cancel(self, kind: str) -> None:
+    def _schedule_output_cancel_confirmed(self, reason: str) -> None:
+        """Schedule the stop receipt from synchronous event entry points."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cancel = getattr(self.output, "cancel_all", None)
+            if callable(cancel):
+                cancel(reason)
+            return
+        cancel = getattr(self.output, "cancel_all_confirmed", None)
+        if not callable(cancel):
+            cancel = getattr(self.output, "cancel_all", None)
+        if not callable(cancel):
+            return
+        result = cancel(reason)
+        if not inspect.isawaitable(result):
+            return
+        task = loop.create_task(result, name=f"output-stop-receipt-{reason[:20]}")
+        self._pending_output_cancellations.add(task)
+        task.add_done_callback(self._pending_output_cancellations.discard)
+
+    async def _await_pending_output_cancellations(self) -> None:
+        """Do not dispatch new speech while an earlier stop receipt is pending."""
+        while self._pending_output_cancellations:
+            pending = tuple(self._pending_output_cancellations)
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    logger.warning("agent.output_stop_receipt_failed error_type=%s error=%s",
+                                   type(result).__name__, str(result)[:200])
+
+    async def _cancel_speech_output_confirmed(self, speech_id: str | None, reason: str):
+        """Cancel one output while preserving a remote device receipt when available."""
+        cancel = getattr(self.output, "cancel_confirmed", None)
+        if not callable(cancel):
+            cancel = getattr(self.output, "cancel", None)
+        if not callable(cancel):
+            return None
+        result = cancel(speech_id, reason)
+        return await result if inspect.isawaitable(result) else result
+
+    async def _supersede_system_output_without_request_cancel(self, kind: str) -> None:
         """Invalidate only unplayed system-check output, never its LLM task."""
 
         context = self.active_dispatch_context
@@ -1126,9 +1166,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             workspace = getattr(candidate, "workspace", None)
             if bool(getattr(workspace, "playback_started", False)):
                 continue
-            cancel = getattr(self.output, "cancel", None)
-            if callable(cancel) and speech_id:
-                cancel(speech_id, "superseded_system_check")
+            if speech_id:
+                await self._cancel_speech_output_confirmed(speech_id, "superseded_system_check")
                 cancelled_output += 1
 
         if running or cancelled_output:
@@ -1885,7 +1924,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             # unstarted final_pending candidate; it never cancels an in-flight
             # request.  TTS and microphone activity never enter the semantic
             # scheduler mailbox.
-            self._supersede_system_output_without_request_cancel(kind)
+            await self._supersede_system_output_without_request_cancel(kind)
             superseded_windows = self.scheduler.pending_checkpoint_windows()
             superseded_generation = self.scheduler.generation
             superseded_turn_id = self.scheduler.anchor_turn_id
@@ -1973,6 +2012,24 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             self._pending_transcript_turn_id = turn_id
         self._wake(kind)
 
+    async def _cancel_output_confirmed(self, reason: str) -> None:
+        cancel = getattr(self.output, "cancel_all_confirmed", None)
+        if callable(cancel):
+            await cancel(reason)
+            return
+        # Compatibility for lightweight output adapters without the device port.
+        cancel = getattr(self.output, "cancel_all", None)
+        if callable(cancel):
+            result = cancel(reason)
+            if inspect.isawaitable(result):
+                await result
+            return
+        suspend = getattr(self.output, "suspend_pending", None)
+        if callable(suspend):
+            result = suspend()
+            if inspect.isawaitable(result):
+                await result
+
     async def speech_activity(self, speaking, *, interrupt_reason: str | None = None):
         """Update microphone activity without conflating it with interruption.
 
@@ -1997,7 +2054,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             # request deliberately keeps running; its later output is rejected
             # by the epoch check above.  Ordinary user-requested candidates are
             # still held and released by the existing speech lifecycle.
-            self._supersede_system_output_without_request_cancel("SPEECH_STARTED")
+            await self._supersede_system_output_without_request_cancel("SPEECH_STARTED")
         if speaking is True and not explicit_interrupt:
             hold = getattr(self.output, "hold_unplayed", None)
             if callable(hold):
@@ -2022,7 +2079,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             self.cancel_active_request(interrupt_reason)
             # The controller owns USER_INTERRUPTED.  This callback is invoked
             # after that boundary and only invalidates Agent-side work.
-            self.output.cancel_all(
+            await self._cancel_output_confirmed(
                 "interrupted" if interrupt_reason == "user_interrupted" else interrupt_reason
             )
             if speaking is True and self.voice_activation_task:
@@ -2071,6 +2128,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
 
     async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None):
         # 派发准备包含异步日志，需在首次让出前预留，避免切换误判为空闲。
+        await self._await_pending_output_cancellations()
         self._dispatch_starting = True
         try:
             return await self._start_dispatch_inner(kinds, recovery_signal=recovery_signal, candidate=candidate)
@@ -3746,9 +3804,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             if system_check and self._system_check_is_stale(dispatch_context):
                 await report_stale()
                 if admission.speech_handle is not None:
-                    cancel = getattr(self.output, "cancel", None)
-                    if callable(cancel):
-                        cancel(getattr(admission.speech_handle, "speech_id", None), "superseded_system_check")
+                    await self._cancel_speech_output_confirmed(
+                        getattr(admission.speech_handle, "speech_id", None), "superseded_system_check")
                 record_audit_outcome(
                     "system_check_stale",
                     content_chars=content_chars,
@@ -3853,9 +3910,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             if system_check and self._system_check_is_stale(dispatch_context):
                 await report_stale()
                 if admission.speech_handle is not None:
-                    cancel = getattr(self.output, "cancel", None)
-                    if callable(cancel):
-                        cancel(getattr(admission.speech_handle, "speech_id", None), "superseded_system_check")
+                    await self._cancel_speech_output_confirmed(
+                        getattr(admission.speech_handle, "speech_id", None), "superseded_system_check")
                 record_audit_outcome(
                     "system_check_stale",
                     content_chars=content_chars,
@@ -3956,9 +4012,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 # A legal prefix can start speaking before a later JSON error.
                 # Stop that provisional generation; the superseded output is
                 # intentionally never resumed.
-                cancel = getattr(self.output, "cancel", None)
-                if callable(cancel):
-                    cancel(getattr(admission.speech_handle, "speech_id", None), "cancelled")
+                await self._cancel_speech_output_confirmed(
+                    getattr(admission.speech_handle, "speech_id", None), "cancelled")
             queued = await self._queue_recovery(recovery_code, error_text,
                                                 identity=identity, turn_id=source_turn_id,
                                                 contract_feedback=({"type": "action_contract", "code": exc.code, "path": exc.path}
@@ -4000,9 +4055,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     await finish_streamed_speech()
                 except Exception:
                     pass
-                cancel = getattr(self.output, "cancel", None)
-                if callable(cancel):
-                    cancel(getattr(admission.speech_handle, "speech_id", None), "cancelled")
+                await self._cancel_speech_output_confirmed(
+                    getattr(admission.speech_handle, "speech_id", None), "cancelled")
             if terminal_kind == "response.incomplete" and reason == "max_output_tokens":
                 await self.log("RESPONSES_INCOMPLETE", identity=identity,
                                turn_id=source_turn_id, reason=reason,
@@ -4174,7 +4228,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         await self._stop_heartbeat_clock()
         self.recovery_queue.clear()
         self.active_dispatch_context = None
-        self.output.cancel_all(reason)
+        await self._await_pending_output_cancellations()
+        await self._cancel_output_confirmed(reason)
         current_task = asyncio.current_task()
         active_request = self.active_request
         if active_request and active_request is not current_task and not active_request.done():

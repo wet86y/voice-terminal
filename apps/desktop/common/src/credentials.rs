@@ -1,40 +1,60 @@
 //! Credentials（接口密钥）：复用 Python（业务后端）的 Windows（系统）凭据库与引用格式。
-use std::{collections::BTreeMap, fs, path::Path};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::{collections::BTreeMap, fs, path::Path};
+use zeroize::Zeroizing;
 
-const PROVIDERS: [(&str, &str); 2] = [("deepseek", "DEEPSEEK_API_KEY"), ("minimax", "MINIMAX_API_KEY")]; // PROVIDERS（固定服务及环境密钥名称）。
+const PROVIDERS: [(&str, &str); 2] = [
+    ("deepseek", "DEEPSEEK_API_KEY"),
+    ("minimax", "MINIMAX_API_KEY"),
+]; // PROVIDERS（固定服务及环境密钥名称）。
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialUpdate {
-    #[serde(default)] pub deepseek_api_key: String, // deepseek_api_key（语言模型接口密钥）：空白保留原值。
-    #[serde(default)] pub minimax_api_key: String, // minimax_api_key（语音合成接口密钥）：空白保留原值。
+    #[serde(default)]
+    pub deepseek_api_key: String, // deepseek_api_key（语言模型接口密钥）：空白保留原值。
+    #[serde(default)]
+    pub minimax_api_key: String, // minimax_api_key（语音合成接口密钥）：空白保留原值。
 }
 
-trait Vault { // Vault（系统凭据接口）：测试可替换，正式实现兼容 Python keyring（凭据库）。
+trait Vault {
+    // Vault（系统凭据接口）：测试可替换，正式实现兼容 Python keyring（凭据库）。
     fn get(&self, reference: &str) -> Result<Option<String>, String>;
     fn put(&self, reference: &str, secret: &str) -> Result<(), String>;
+    fn put_local(&self, reference: &str, secret: &str) -> Result<(), String> {
+        self.put(reference, secret)
+    }
     fn delete(&self, reference: &str) -> Result<(), String>;
 }
 
 fn registry(path: &Path) -> Result<Value, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({"schema_version":2,"fixed_credentials":{}})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"schema_version":2,"fixed_credentials":{}}))
+        }
         Err(_) => return Err("无法读取模型接口配置。".into()),
     };
-    let mut value: Value = serde_json::from_slice(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes))
-        .map_err(|_| "模型接口配置格式错误，请检查配置文件。")?;
+    let mut value: Value =
+        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
+            .map_err(|_| "模型接口配置格式错误，请检查配置文件。")?;
     if !value.is_object() || !matches!(value["schema_version"].as_u64(), Some(1 | 2)) {
         return Err("模型接口配置版本不受支持。".into());
     }
-    if value.get("fixed_credentials").is_none() { value["fixed_credentials"] = json!({}); }
-    if !value["fixed_credentials"].is_object() { return Err("固定服务凭据引用格式错误。".into()); }
+    if value.get("fixed_credentials").is_none() {
+        value["fixed_credentials"] = json!({});
+    }
+    if !value["fixed_credentials"].is_object() {
+        return Err("固定服务凭据引用格式错误。".into());
+    }
     Ok(value)
 }
 
-fn environment_keys(data: &Path, explicit: BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+fn environment_keys(
+    data: &Path,
+    explicit: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
     let mut values = explicit;
     let content = match fs::read_to_string(data.join(".env.local")) {
         Ok(content) => content,
@@ -44,116 +64,281 @@ fn environment_keys(data: &Path, explicit: BTreeMap<String, String>) -> Result<B
     // 与后端 load_env_file（环境配置读取）保持相同的引号、空值与优先级规则。
     for raw in content.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
-        let Some((name, value)) = line.split_once('=') else { continue; };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
         let name = name.trim();
-        if !PROVIDERS.iter().any(|(_, environment)| name == *environment) { continue; }
+        if !PROVIDERS
+            .iter()
+            .any(|(_, environment)| name == *environment)
+        {
+            continue;
+        }
         let value = value.trim();
-        let value = if value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\''))) { &value[1..value.len()-1] } else { value };
-        values.entry(name.to_string()).or_insert_with(|| value.to_string());
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        values
+            .entry(name.to_string())
+            .or_insert_with(|| value.to_string());
     }
     Ok(values)
 }
 
 fn legacy_reference<'a>(value: &'a Value, provider: &str) -> Option<&'a str> {
-    let slot = if provider == "deepseek" { "voice_llm_model_id" } else { "tts_profile_id" };
+    let slot = if provider == "deepseek" {
+        "voice_llm_model_id"
+    } else {
+        "tts_profile_id"
+    };
     let mut selected = value["assignments"][slot].as_str()?;
     if provider == "minimax" {
-        selected = value["tts_profiles"].as_array()?.iter().find(|row| row["id"].as_str() == Some(selected))?["model_id"].as_str()?;
+        selected = value["tts_profiles"]
+            .as_array()?
+            .iter()
+            .find(|row| row["id"].as_str() == Some(selected))?["model_id"]
+            .as_str()?;
     }
-    let model = value["models"].as_array()?.iter().find(|row| row["id"].as_str() == Some(selected))?;
-    let source = value["providers"].as_array()?.iter().find(|row| row["id"] == model["provider_id"] && row["protocol"].as_str() == Some(provider))?;
+    let model = value["models"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(selected))?;
+    let source = value["providers"].as_array()?.iter().find(|row| {
+        row["id"] == model["provider_id"] && row["protocol"].as_str() == Some(provider)
+    })?;
     source["credential_ref"].as_str()
 }
 
-fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) -> Result<Value,String> {
+fn snapshot(
+    value: &Value,
+    env: &BTreeMap<String, String>,
+    vault: &impl Vault,
+) -> Result<Value, String> {
     let mut providers = json!({});
     for (provider, environment) in PROVIDERS {
-        let configured = if let Some(reference) = value["fixed_credentials"][provider].as_str().filter(|s| !s.is_empty()) {
-            vault.get(reference)?.is_some_and(|secret| !secret.is_empty())
-        } else if env.get(environment).is_some_and(|secret| !secret.trim().is_empty()) {
+        let configured = if let Some(reference) = value["fixed_credentials"][provider]
+            .as_str()
+            .filter(|s| !s.is_empty())
+        {
+            vault
+                .get(reference)?
+                .is_some_and(|secret| !secret.is_empty())
+        } else if env
+            .get(environment)
+            .is_some_and(|secret| !secret.trim().is_empty())
+        {
             true
         } else if let Some(reference) = legacy_reference(value, provider) {
-            vault.get(reference)?.is_some_and(|secret| !secret.is_empty())
-        } else { false };
+            vault
+                .get(reference)?
+                .is_some_and(|secret| !secret.is_empty())
+        } else {
+            false
+        };
         providers[provider] = json!({"configured":configured});
     }
-    Ok(json!({"providers":providers,"vault_available":cfg!(windows),
-        "fields":{"providers":"固定服务配置状态","configured":"是否已有可读取的接口密钥","vault_available":"本机系统凭据存储是否可用"}}))
+    Ok(
+        json!({"providers":providers,"vault_available":cfg!(windows),
+        "fields":{"providers":"固定服务配置状态","configured":"是否已有可读取的接口密钥","vault_available":"本机系统凭据存储是否可用"}}),
+    )
 }
 
 pub fn ready(status: &Value) -> bool {
-    status["providers"][if status["inference_backend"]=="minimax" {"minimax"} else {"deepseek"}]["configured"] == true
-        && if status["tts_backend"] == "aniflive" {status["local_tts_ready"] == true} else {status["providers"]["minimax"]["configured"] == true}
+    status["providers"][if status["inference_backend"] == "minimax" {
+        "minimax"
+    } else {
+        "deepseek"
+    }]["configured"]
+        == true
+        && if status["tts_backend"] == "aniflive" {
+            status["local_tts_ready"] == true
+        } else {
+            status["providers"]["minimax"]["configured"] == true
+        }
 }
 
 /// status_for_context（工作区凭据状态）：本地模型可用时在线合成密钥可选。
-pub fn status_for_context(context:&crate::LaunchContext)->Result<Value,String>{
-    let mut result=status(&context.data)?;
-    let inventory=crate::resources::inventory(context)?;
-    result["local_tts_ready"]=json!(inventory.iter().any(|row|row["resource_id"]=="tts"&&row["selected_local_ready"]==true));
-    result["fields"]["local_tts_ready"]=json!("所选本地语音模型及共用运行程序已就绪");
+pub fn status_for_context(context: &crate::LaunchContext) -> Result<Value, String> {
+    let mut result = status(&context.data)?;
+    let inventory = crate::resources::inventory(context)?;
+    result["local_tts_ready"] = json!(inventory
+        .iter()
+        .any(|row| row["resource_id"] == "tts" && row["selected_local_ready"] == true));
+    result["fields"]["local_tts_ready"] = json!("所选本地语音模型及共用运行程序已就绪");
     Ok(result)
 }
 
 /// configured_tts_selection（持久化播放目标）：产品设置优先，旧工作区沿用本地配置。
-pub fn configured_tts_selection(data:&Path)->Value{
-    let mut selection=json!({"backend":"minimax","local_model":"minimax-female-shaonv-zh","fields":{"backend":"语音后端，minimax（在线接口）或 aniflive（本地引擎）","local_model":"持久化选择的 AnifLive（本地语音）模型"}});
-    if let Ok(config)=fs::read_to_string(data.join("config/local.yaml")){
-        let mut in_tts=false;
-        for raw in config.lines(){
-            let body=raw.trim().split('#').next().unwrap_or("").trim();
-            if body.is_empty(){continue;}
-            let indentation=raw.chars().take_while(|c|c.is_whitespace()).count();
-            if indentation==0{in_tts=body=="tts:";continue;}
-            if in_tts&&indentation==2{if let Some((key,value))=body.split_once(':'){
-                let value=value.trim().trim_matches(|c|c=='\''||c=='"');
-                if (key.trim()=="backend"&&matches!(value,"minimax"|"aniflive"|"voxcpm1"))||(key.trim()=="local_model"&&valid_tts_model(value))||(key.trim()=="local_model_revision"&&valid_tts_revision(value)){selection[key.trim()]=json!(value);}
-            }}
-        }
-    }
-    if let Ok(bytes)=fs::read(data.join("config/product-settings.json")){
-        if let Ok(settings)=serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)){
-            if settings["schema_version"].as_u64().is_some_and(|version|version>=11){
-                if settings["tts"].get("local_model").is_some(){selection["local_model_revision"]=Value::Null;}
-                for key in ["backend","local_model","local_model_revision"]{if let Some(value)=settings["tts"][key].as_str(){
-                    if (key=="backend"&&matches!(value,"minimax"|"aniflive"|"voxcpm1"))||(key=="local_model"&&valid_tts_model(value))||(key=="local_model_revision"&&valid_tts_revision(value)){selection[key]=json!(value);}
-                }}
+pub fn configured_tts_selection(data: &Path) -> Value {
+    let mut selection = json!({"backend":"minimax","local_model":"minimax-female-shaonv-zh","fields":{"backend":"语音后端，minimax（在线接口）或 aniflive（本地引擎）","local_model":"持久化选择的 AnifLive（本地语音）模型"}});
+    if let Ok(config) = fs::read_to_string(data.join("config/local.yaml")) {
+        let mut in_tts = false;
+        for raw in config.lines() {
+            let body = raw.trim().split('#').next().unwrap_or("").trim();
+            if body.is_empty() {
+                continue;
+            }
+            let indentation = raw.chars().take_while(|c| c.is_whitespace()).count();
+            if indentation == 0 {
+                in_tts = body == "tts:";
+                continue;
+            }
+            if in_tts && indentation == 2 {
+                if let Some((key, value)) = body.split_once(':') {
+                    let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+                    if (key.trim() == "backend"
+                        && matches!(value, "minimax" | "aniflive" | "voxcpm1"))
+                        || (key.trim() == "local_model" && valid_tts_model(value))
+                        || (key.trim() == "local_model_revision" && valid_tts_revision(value))
+                    {
+                        selection[key.trim()] = json!(value);
+                    }
+                }
             }
         }
     }
-    if selection["backend"]=="voxcpm1"{selection["backend"]=json!("aniflive");}
-    if matches!(selection["local_model"].as_str(),Some("voxcpm1"|"voxcpm2")){selection["local_model"]=json!("minimax-female-shaonv-zh");selection["local_model_revision"]=Value::Null;}
+    if let Ok(bytes) = fs::read(data.join("config/product-settings.json")) {
+        if let Ok(settings) = serde_json::from_slice::<Value>(
+            bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes),
+        ) {
+            if settings["schema_version"]
+                .as_u64()
+                .is_some_and(|version| version >= 11)
+            {
+                if settings["tts"].get("local_model").is_some() {
+                    selection["local_model_revision"] = Value::Null;
+                }
+                for key in ["backend", "local_model", "local_model_revision"] {
+                    if let Some(value) = settings["tts"][key].as_str() {
+                        if (key == "backend" && matches!(value, "minimax" | "aniflive" | "voxcpm1"))
+                            || (key == "local_model" && valid_tts_model(value))
+                            || (key == "local_model_revision" && valid_tts_revision(value))
+                        {
+                            selection[key] = json!(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if selection["backend"] == "voxcpm1" {
+        selection["backend"] = json!("aniflive");
+    }
+    if matches!(
+        selection["local_model"].as_str(),
+        Some("voxcpm1" | "voxcpm2")
+    ) {
+        selection["local_model"] = json!("minimax-female-shaonv-zh");
+        selection["local_model_revision"] = Value::Null;
+    }
     selection
 }
-pub(crate) fn valid_tts_model(value:&str)->bool{
-    let stem=value.split('.').next().unwrap_or("");
-    !value.is_empty()&&value.len()<=64&&!value.ends_with('.')&& !matches!(stem,"con"|"prn"|"aux"|"nul"|"com1"|"com2"|"com3"|"com4"|"com5"|"com6"|"com7"|"com8"|"com9"|"lpt1"|"lpt2"|"lpt3"|"lpt4"|"lpt5"|"lpt6"|"lpt7"|"lpt8"|"lpt9")&&value.bytes().all(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||matches!(c,b'.'|b'-'|b'_'))&&value.as_bytes()[0].is_ascii_alphanumeric()
+pub(crate) fn valid_tts_model(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or("");
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.ends_with('.')
+        && !matches!(
+            stem,
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
+        && value.bytes().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'-' | b'_')
+        })
+        && value.as_bytes()[0].is_ascii_alphanumeric()
 }
-fn valid_tts_revision(value:&str)->bool{value.len()==24&&value.bytes().all(|c|c.is_ascii_digit()||(b'a'..=b'f').contains(&c))}
+fn valid_tts_revision(value: &str) -> bool {
+    value.len() == 24
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
 /// configured_inference（启动时推理选择）：旧设置默认 DeepSeek（深度求索）。
-pub fn configured_inference(data:&Path)->Value{
-    let backend=fs::read(data.join("config/product-settings.json")).ok()
-        .and_then(|bytes|serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)).ok())
-        .filter(|value|value["schema_version"].as_u64().is_some_and(|version|version>=19))
-        .is_some_and(|value|value["inference"]["backend"]=="minimax");
+pub fn configured_inference(data: &Path) -> Value {
+    let backend = fs::read(data.join("config/product-settings.json"))
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<Value>(
+                bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes),
+            )
+            .ok()
+        })
+        .filter(|value| {
+            value["schema_version"]
+                .as_u64()
+                .is_some_and(|version| version >= 19)
+        })
+        .is_some_and(|value| value["inference"]["backend"] == "minimax");
     json!({"backend":if backend{"minimax"}else{"deepseek"}})
 }
-fn configured_tts_backend(data:&Path)->&'static str{if configured_tts_selection(data)["backend"]=="aniflive"{"aniflive"}else{"minimax"}}
-
-fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
-    environment_keys(data, PROVIDERS.iter().filter_map(|(_, name)| std::env::var(name).ok().map(|value| (name.to_string(),value))).collect())
+fn configured_tts_backend(data: &Path) -> &'static str {
+    if configured_tts_selection(data)["backend"] == "aniflive" {
+        "aniflive"
+    } else {
+        "minimax"
+    }
 }
 
-pub fn status(data: &Path) -> Result<Value,String> {
-    let mut result = snapshot(&registry(&data.join("config/model-registry.json"))?, &native_environment(data)?, &SystemVault)?;
+fn native_environment(data: &Path) -> Result<BTreeMap<String, String>, String> {
+    environment_keys(
+        data,
+        PROVIDERS
+            .iter()
+            .filter_map(|(_, name)| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| (name.to_string(), value))
+            })
+            .collect(),
+    )
+}
+
+pub fn status(data: &Path) -> Result<Value, String> {
+    let mut result = snapshot(
+        &registry(&data.join("config/model-registry.json"))?,
+        &native_environment(data)?,
+        &SystemVault,
+    )?;
     result["inference_backend"] = configured_inference(data)["backend"].clone();
     result["fields"]["inference_backend"] = json!("启动时主语音推理后端");
     result["tts_backend"] = json!(configured_tts_backend(data));
     result["tts_local_model"] = configured_tts_selection(data)["local_model"].clone();
     result["fields"]["tts_local_model"] = json!("持久化选择的本地语音模型");
-    result["fields"]["tts_backend"] = json!("TTS（语音合成）实际运行后端；aniflive 无需 MiniMax 接口密钥");
+    result["fields"]["tts_backend"] =
+        json!("TTS（语音合成）实际运行后端；aniflive 无需 MiniMax 接口密钥");
     Ok(result)
 }
 
@@ -166,12 +351,22 @@ fn contains_reference(value: &Value, reference: &str) -> bool {
     }
 }
 
-fn save_with(path: &Path, request: CredentialUpdate, vault: &impl Vault) -> Result<(),String> {
+fn save_with(path: &Path, request: CredentialUpdate, vault: &impl Vault) -> Result<(), String> {
     let mut value = registry(path)?;
     let previous = value["fixed_credentials"].clone();
-    let updates = [("deepseek", request.deepseek_api_key.trim()), ("minimax", request.minimax_api_key.trim())];
-    if updates.iter().all(|(_, secret)| secret.is_empty()) { return Err("请至少填写一个接口密钥。".into()); }
-    if updates.iter().any(|(_, secret)| secret.chars().count() > 4096 || secret.contains('\0')) { return Err("API Key（接口密钥）过长或包含无效字符。".into()); }
+    let updates = [
+        ("deepseek", request.deepseek_api_key.trim()),
+        ("minimax", request.minimax_api_key.trim()),
+    ];
+    if updates.iter().all(|(_, secret)| secret.is_empty()) {
+        return Err("请至少填写一个接口密钥。".into());
+    }
+    if updates
+        .iter()
+        .any(|(_, secret)| secret.chars().count() > 4096 || secret.contains('\0'))
+    {
+        return Err("API Key（接口密钥）过长或包含无效字符。".into());
+    }
     let mut staged = BTreeMap::new();
     let result = (|| {
         for (provider, secret) in updates.into_iter().filter(|(_, secret)| !secret.is_empty()) {
@@ -180,26 +375,123 @@ fn save_with(path: &Path, request: CredentialUpdate, vault: &impl Vault) -> Resu
             vault.put(&reference, secret)?;
             value["fixed_credentials"][provider] = json!(reference);
         }
-        crate::workspace::atomic_json(path, &value).map_err(|_| "接口密钥引用保存失败，原配置已保留。".to_string())
+        crate::workspace::atomic_json(path, &value)
+            .map_err(|_| "接口密钥引用保存失败，原配置已保留。".to_string())
     })();
     if result.is_err() {
-        for reference in staged.values() { let _ = vault.delete(reference); }
+        for reference in staged.values() {
+            let _ = vault.delete(reference);
+        }
     } else {
         for provider in staged.keys() {
             if let Some(reference) = previous[provider].as_str() {
-                if !contains_reference(&value, reference) { let _ = vault.delete(reference); }
+                if !contains_reference(&value, reference) {
+                    let _ = vault.delete(reference);
+                }
             }
         }
     }
     result
 }
 
-pub fn save(data: &Path, request: CredentialUpdate) -> Result<Value,String> {
-    save_with(&data.join("config/model-registry.json"), request, &SystemVault)?;
+pub fn save(data: &Path, request: CredentialUpdate) -> Result<Value, String> {
+    save_with(
+        &data.join("config/model-registry.json"),
+        request,
+        &SystemVault,
+    )?;
     let mut result = status(data)?;
     result["message"] = json!("接口密钥已保存，启动程序时生效。留空的服务保留已有密钥。");
     result["fields"]["message"] = json!("保存结果说明");
     Ok(result)
+}
+
+const DEVICE_KEY_REFERENCE_PREFIX: &str = "VoiceTerminal/device/"; // DEVICE_KEY_REFERENCE_PREFIX（产品设备身份凭据引用前缀）。
+const SSH_TRANSPORT_KEY_REFERENCE_PREFIX: &str = "VoiceTerminal/ssh-transport/"; // SSH_TRANSPORT_KEY_REFERENCE_PREFIX（SSH 登录传输密钥凭据引用前缀）。
+
+fn valid_device_key_reference(reference: &str) -> bool {
+    [DEVICE_KEY_REFERENCE_PREFIX, SSH_TRANSPORT_KEY_REFERENCE_PREFIX]
+        .iter()
+        .any(|prefix| {
+            reference.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        })
+}
+
+/// store_device_ssh_key（保存设备 SSH 私钥）：仅写入本机范围的 Windows 凭据库。
+pub fn store_device_ssh_key(reference: &str, private_key: &str) -> Result<(), String> {
+    if !valid_device_key_reference(reference)
+        || private_key.is_empty()
+        || private_key.len() > 64 * 1024
+    {
+        return Err("设备 SSH 凭据引用或私钥大小无效。".into());
+    }
+    SystemVault.put_local(reference, private_key)
+}
+
+/// load_device_ssh_key（读取设备 SSH 私钥）：私钥只返回给原生 SSH 连接模块。
+pub fn load_device_ssh_key(reference: &str) -> Result<Zeroizing<String>, String> {
+    if !valid_device_key_reference(reference) {
+        return Err("设备 SSH 凭据引用无效。".into());
+    }
+    let value = SystemVault
+        .get(reference)?
+        .ok_or_else(|| "系统凭据库中没有该设备的 SSH 私钥。".to_string())?;
+    let secret = Zeroizing::new(value);
+    if secret.is_empty() || secret.len() > 64 * 1024 {
+        return Err("系统凭据中的 SSH 私钥为空或超过大小上限。".into());
+    }
+    Ok(secret)
+}
+
+/// has_device_ssh_key（检查设备 SSH 私钥存在）：不返回私钥内容。
+pub fn has_device_ssh_key(reference: &str) -> Result<bool, String> {
+    if !valid_device_key_reference(reference) {
+        return Err("设备 SSH 凭据引用无效。".into());
+    }
+    let Some(value) = SystemVault.get(reference)? else {
+        return Ok(false);
+    };
+    let secret = Zeroizing::new(value);
+    Ok(!secret.is_empty() && secret.len() <= 64 * 1024)
+}
+
+/// delete_device_ssh_key（删除设备 SSH 私钥）：不删除其它凭据或用户文件。
+pub fn delete_device_ssh_key(reference: &str) -> Result<(), String> {
+    if !valid_device_key_reference(reference) {
+        return Err("设备 SSH 凭据引用无效。".into());
+    }
+    SystemVault.delete(reference)
+}
+
+fn load_provider_credential_with_vault(
+    data: &Path,
+    provider: &str,
+    vault: &impl Vault,
+) -> Result<Zeroizing<String>, String> {
+    if !PROVIDERS.iter().any(|(known, _)| *known == provider) {
+        return Err("请求的在线服务不受支持。".into());
+    }
+    let value = registry(&data.join("config/model-registry.json"))?;
+    let reference = value["fixed_credentials"][provider]
+        .as_str()
+        .filter(|reference| !reference.is_empty())
+        .or_else(|| legacy_reference(&value, provider))
+        .ok_or_else(|| "本机系统凭据库中没有该在线服务的接口密钥。".to_string())?;
+    let secret = vault
+        .get(reference)?
+        .ok_or_else(|| "本机系统凭据库中没有该在线服务的接口密钥。".to_string())?;
+    let secret = Zeroizing::new(secret);
+    if secret.trim().is_empty() || secret.len() > 4096 || secret.contains('\0') {
+        return Err("本机系统凭据中的接口密钥为空或无效，请重新保存。".into());
+    }
+    Ok(secret)
+}
+
+/// load_provider_credential（读取本机在线服务凭据）：只供原生客户端合成使用，不向界面或主机返回密钥。
+pub fn load_provider_credential(data: &Path, provider: &str) -> Result<Zeroizing<String>, String> {
+    load_provider_credential_with_vault(data, provider, &SystemVault)
 }
 
 struct SystemVault; // SystemVault（系统凭据存储）：仅密钥引用写入配置文件。
@@ -209,48 +501,105 @@ mod windows_vault {
     use super::*;
     use windows_sys::Win32::Security::Credentials::*;
     const SERVICE: &str = "Voice Terminal"; // SERVICE（凭据服务名称）：与 Python（业务后端）保持一致。
-    fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() }
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
     struct Credential(*mut CREDENTIALW); // Credential（系统读取缓冲区）：自动释放系统分配的内存。
-    impl Drop for Credential { fn drop(&mut self) { unsafe { CredFree(self.0.cast()); } } }
+    impl Drop for Credential {
+        fn drop(&mut self) {
+            unsafe {
+                CredFree(self.0.cast());
+            }
+        }
+    }
     fn read(target: &str, reference: &str) -> Result<Option<String>, String> {
         let mut pointer = std::ptr::null_mut();
         if unsafe { CredReadW(wide(target).as_ptr(), CRED_TYPE_GENERIC, 0, &mut pointer) } == 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(1168) { return Ok(None); }
+            if std::io::Error::last_os_error().raw_os_error() == Some(1168) {
+                return Ok(None);
+            }
             return Err("无法读取 Windows（系统）凭据，请检查当前用户的凭据存储。".into());
         }
         let owner = Credential(pointer);
         let row = unsafe { &*owner.0 };
-        if row.UserName.is_null() { return Ok(None); }
+        if row.UserName.is_null() {
+            return Ok(None);
+        }
         let mut size = 0;
-        unsafe { while *row.UserName.add(size) != 0 { size += 1; } }
-        if String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(row.UserName, size) }) != reference { return Ok(None); }
-        if row.CredentialBlobSize == 0 { return Ok(Some(String::new())); }
-        if row.CredentialBlob.is_null() { return Err("系统凭据内容无效，请重新填写接口密钥。".into()); }
-        let bytes = unsafe { std::slice::from_raw_parts(row.CredentialBlob, row.CredentialBlobSize as usize) };
+        unsafe {
+            while *row.UserName.add(size) != 0 {
+                size += 1;
+            }
+        }
+        if String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(row.UserName, size) })
+            != reference
+        {
+            return Ok(None);
+        }
+        if row.CredentialBlobSize == 0 {
+            return Ok(Some(String::new()));
+        }
+        if row.CredentialBlob.is_null() {
+            return Err("系统凭据内容无效，请重新填写接口密钥。".into());
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(row.CredentialBlob, row.CredentialBlobSize as usize)
+        };
         let decoded = if bytes.len() % 2 == 0 {
-            String::from_utf16(&bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0],pair[1]])).collect::<Vec<_>>()).ok()
-        } else { None };
-        decoded.or_else(|| String::from_utf8(bytes.to_vec()).ok()).map(Some).ok_or_else(|| "系统凭据编码无效，请重新填写接口密钥。".into())
+            String::from_utf16(
+                &bytes
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
+        } else {
+            None
+        };
+        decoded
+            .or_else(|| String::from_utf8(bytes.to_vec()).ok())
+            .map(Some)
+            .ok_or_else(|| "系统凭据编码无效，请重新填写接口密钥。".into())
+    }
+    fn write(reference: &str, secret: &str, persist: u32) -> Result<(), String> {
+        let mut target = wide(&format!("{reference}@{SERVICE}"));
+        let mut username = wide(reference);
+        let mut blob: Vec<u8> = secret.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let row = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            UserName: username.as_mut_ptr(),
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: persist,
+            ..Default::default()
+        };
+        let result = unsafe { CredWriteW(&row, 0) };
+        blob.fill(0);
+        if result == 0 {
+            return Err("Windows（系统）凭据保存失败，请检查当前用户的凭据存储。".into());
+        }
+        Ok(())
     }
     impl Vault for SystemVault {
-        fn get(&self, reference: &str) -> Result<Option<String>,String> {
+        fn get(&self, reference: &str) -> Result<Option<String>, String> {
             // Python keyring（凭据库）先读服务名，再读 reference@service（引用与服务组合名称）。
-            match read(SERVICE, reference)? { Some(secret) => Ok(Some(secret)), None => read(&format!("{reference}@{SERVICE}"),reference) }
+            match read(SERVICE, reference)? {
+                Some(secret) => Ok(Some(secret)),
+                None => read(&format!("{reference}@{SERVICE}"), reference),
+            }
         }
-        fn put(&self, reference: &str, secret: &str) -> Result<(),String> {
-            let mut target = wide(&format!("{reference}@{SERVICE}"));
-            let mut username = wide(reference);
-            let mut blob: Vec<u8> = secret.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            let row = CREDENTIALW { Type:CRED_TYPE_GENERIC, TargetName:target.as_mut_ptr(), UserName:username.as_mut_ptr(),
-                CredentialBlobSize:blob.len() as u32, CredentialBlob:blob.as_mut_ptr(), Persist:CRED_PERSIST_ENTERPRISE, ..Default::default() };
-            let result = unsafe { CredWriteW(&row,0) };
-            blob.fill(0);
-            if result == 0 { return Err("Windows（系统）凭据保存失败，请检查接口密钥长度及当前用户的凭据存储。".into()); }
-            Ok(())
+        fn put(&self, reference: &str, secret: &str) -> Result<(), String> {
+            write(reference, secret, CRED_PERSIST_ENTERPRISE)
         }
-        fn delete(&self, reference: &str) -> Result<(),String> {
+        fn put_local(&self, reference: &str, secret: &str) -> Result<(), String> {
+            write(reference, secret, CRED_PERSIST_LOCAL_MACHINE)
+        }
+        fn delete(&self, reference: &str) -> Result<(), String> {
             for target in [SERVICE.to_string(), format!("{reference}@{SERVICE}")] {
-                if read(&target, reference)?.is_some() && unsafe { CredDeleteW(wide(&target).as_ptr(),CRED_TYPE_GENERIC,0) } == 0 {
+                if read(&target, reference)?.is_some()
+                    && unsafe { CredDeleteW(wide(&target).as_ptr(), CRED_TYPE_GENERIC, 0) } == 0
+                {
                     return Err("旧系统凭据清理失败。".into());
                 }
             }
@@ -261,101 +610,300 @@ mod windows_vault {
 
 #[cfg(not(windows))]
 impl Vault for SystemVault {
-    fn get(&self, _: &str) -> Result<Option<String>,String> { Ok(None) }
-    fn put(&self, _: &str, _: &str) -> Result<(),String> { Err("当前系统不支持 Windows（系统）凭据存储。".into()) }
-    fn delete(&self, _: &str) -> Result<(),String> { Ok(()) }
+    fn get(&self, _: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn put(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("当前系统不支持 Windows（系统）凭据存储。".into())
+    }
+    fn put_local(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("当前系统不支持 Windows（系统）凭据存储。".into())
+    }
+    fn delete(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    #[derive(Default)] struct MemoryVault(RefCell<BTreeMap<String,String>>); // MemoryVault（内存凭据库）：验证事务，不触碰用户密钥。
+    #[derive(Default)]
+    struct MemoryVault(RefCell<BTreeMap<String, String>>); // MemoryVault（内存凭据库）：验证事务，不触碰用户密钥。
     impl Vault for MemoryVault {
-        fn get(&self, id:&str)->Result<Option<String>,String>{Ok(self.0.borrow().get(id).cloned())}
-        fn put(&self,id:&str,secret:&str)->Result<(),String>{self.0.borrow_mut().insert(id.into(),secret.into());Ok(())}
-        fn delete(&self,id:&str)->Result<(),String>{self.0.borrow_mut().remove(id);Ok(())}
+        fn get(&self, id: &str) -> Result<Option<String>, String> {
+            Ok(self.0.borrow().get(id).cloned())
+        }
+        fn put(&self, id: &str, secret: &str) -> Result<(), String> {
+            self.0.borrow_mut().insert(id.into(), secret.into());
+            Ok(())
+        }
+        fn delete(&self, id: &str) -> Result<(), String> {
+            self.0.borrow_mut().remove(id);
+            Ok(())
+        }
     }
-    #[test] fn saves_references_preserves_other_settings_and_blank_key() {
-        let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));
-        let path=root.join("config/model-registry.json"); let vault=MemoryVault::default();
-        crate::workspace::atomic_json(&path,&json!({"schema_version":2,"fixed_credentials":{},"user_setting":{"keep":true}})).unwrap();
-        save_with(&path,CredentialUpdate{deepseek_api_key:" test-language-secret ".into(),minimax_api_key:"test-speech-secret".into()},&vault).unwrap();
-        let first=registry(&path).unwrap(); let old=first["fixed_credentials"]["deepseek"].as_str().unwrap();
-        assert_eq!(first["user_setting"]["keep"],true);assert!(!fs::read_to_string(&path).unwrap().contains("test-language-secret"));
-        assert!(ready(&snapshot(&first,&BTreeMap::new(),&vault).unwrap()));
-        save_with(&path,CredentialUpdate{deepseek_api_key:"updated-secret".into(),minimax_api_key:"  ".into()},&vault).unwrap();
-        let second=registry(&path).unwrap();assert_eq!(first["fixed_credentials"]["minimax"],second["fixed_credentials"]["minimax"]);
-        assert!(vault.get(old).unwrap().is_none()); assert!(!snapshot(&second,&BTreeMap::new(),&vault).unwrap().to_string().contains("updated-secret"));
+    #[test]
+    fn device_ssh_credentials_accept_only_local_device_reference_shapes() {
+        assert!(valid_device_key_reference(
+            "VoiceTerminal/device/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(valid_device_key_reference(
+            "VoiceTerminal/ssh-transport/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        ));
+        assert!(!valid_device_key_reference("VoiceTerminal/device/../../model"));
+        assert!(!valid_device_key_reference("VoiceTerminal/model/0123456789abcdef"));
+        assert!(!valid_device_key_reference("VoiceTerminal/device/"));
+        assert!(!valid_device_key_reference("VoiceTerminal/ssh-transport/not-a-fingerprint"));
+    }
+
+    #[test]
+    fn saves_references_preserves_other_settings_and_blank_key() {
+        let root =
+            std::env::temp_dir().join(format!("voice-credentials-{}", crate::workspace::new_id()));
+        let path = root.join("config/model-registry.json");
+        let vault = MemoryVault::default();
+        crate::workspace::atomic_json(
+            &path,
+            &json!({"schema_version":2,"fixed_credentials":{},"user_setting":{"keep":true}}),
+        )
+        .unwrap();
+        save_with(
+            &path,
+            CredentialUpdate {
+                deepseek_api_key: " test-language-secret ".into(),
+                minimax_api_key: "test-speech-secret".into(),
+            },
+            &vault,
+        )
+        .unwrap();
+        let first = registry(&path).unwrap();
+        let old = first["fixed_credentials"]["deepseek"].as_str().unwrap();
+        assert_eq!(first["user_setting"]["keep"], true);
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("test-language-secret"));
+        assert!(ready(&snapshot(&first, &BTreeMap::new(), &vault).unwrap()));
+        save_with(
+            &path,
+            CredentialUpdate {
+                deepseek_api_key: "updated-secret".into(),
+                minimax_api_key: "  ".into(),
+            },
+            &vault,
+        )
+        .unwrap();
+        let second = registry(&path).unwrap();
+        assert_eq!(
+            first["fixed_credentials"]["minimax"],
+            second["fixed_credentials"]["minimax"]
+        );
+        assert!(vault.get(old).unwrap().is_none());
+        assert!(!snapshot(&second, &BTreeMap::new(), &vault)
+            .unwrap()
+            .to_string()
+            .contains("updated-secret"));
         fs::remove_dir_all(root).unwrap();
     }
-    #[test] fn rolls_back_new_vault_entries_if_reference_write_fails() {
-        let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));
-        let path=root.join("model-registry.json"); fs::create_dir_all(&root).unwrap();
-        fs::create_dir(path.with_extension(format!("{}.tmp",std::process::id()))).unwrap();
-        let vault=MemoryVault::default();assert!(save_with(&path,CredentialUpdate{deepseek_api_key:"test-secret".into(),..Default::default()},&vault).is_err());
-        assert!(vault.0.borrow().is_empty());assert!(!path.exists());fs::remove_dir_all(root).unwrap();
-    }
-    #[test] fn environment_keys_match_backend_priority_and_missing_reference_blocks_start() {
-        let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(".env.local"),"export DEEPSEEK_API_KEY='file-language'\nMINIMAX_API_KEY=\"file-speech\"\n").unwrap();
-        let env=environment_keys(&root,BTreeMap::from([("DEEPSEEK_API_KEY".into(),"process-language".into())])).unwrap();assert_eq!(env["DEEPSEEK_API_KEY"],"process-language");
-        let vault=MemoryVault::default();assert!(ready(&snapshot(&json!({}),&env,&vault).unwrap()));
-        assert!(!ready(&snapshot(&json!({"fixed_credentials":{"deepseek":"missing-reference"}}),&env,&vault).unwrap()));
-        let empty=environment_keys(&root,BTreeMap::from([("DEEPSEEK_API_KEY".into(),"".into())])).unwrap();assert!(!ready(&snapshot(&json!({}),&empty,&vault).unwrap()));
+
+    #[test]
+    fn native_provider_credential_loads_only_vault_value_from_fixed_reference() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-provider-credential-{}",
+            crate::workspace::new_id()
+        ));
+        let path = root.join("config/model-registry.json");
+        let vault = MemoryVault::default();
+        crate::workspace::atomic_json(
+            &path,
+            &json!({"schema_version":2,"fixed_credentials":{"minimax":"local-minimax-reference"}}),
+        )
+        .unwrap();
+        vault
+            .put("local-minimax-reference", "local-test-minimax-secret")
+            .unwrap();
+
+        let secret = load_provider_credential_with_vault(&root, "minimax", &vault).unwrap();
+
+        assert_eq!(secret.as_str(), "local-test-minimax-secret");
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("local-test-minimax-secret")
+        );
+        assert!(load_provider_credential_with_vault(&root, "unknown", &vault).is_err());
+        assert!(load_provider_credential_with_vault(&root, "deepseek", &vault).is_err());
         fs::remove_dir_all(root).unwrap();
     }
-    #[test] fn resolves_existing_managed_provider_credentials() {
-        let value=json!({"assignments":{"voice_llm_model_id":"language","tts_profile_id":"speech-profile"},"tts_profiles":[{"id":"speech-profile","model_id":"speech"}],
+
+    #[test]
+    fn native_provider_credential_preserves_legacy_reference_and_rejects_invalid_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-provider-legacy-{}",
+            crate::workspace::new_id()
+        ));
+        let path = root.join("config/model-registry.json");
+        let vault = MemoryVault::default();
+        crate::workspace::atomic_json(
+            &path,
+            &json!({"schema_version":2,
+                "assignments":{"tts_profile_id":"speech-profile"},
+                "tts_profiles":[{"id":"speech-profile","model_id":"speech-model"}],
+                "models":[{"id":"speech-model","provider_id":"speech-provider"}],
+                "providers":[{"id":"speech-provider","protocol":"minimax","credential_ref":"legacy-minimax-reference"}]}),
+        )
+        .unwrap();
+        vault
+            .put("legacy-minimax-reference", "legacy-test-secret")
+            .unwrap();
+        assert_eq!(
+            load_provider_credential_with_vault(&root, "minimax", &vault)
+                .unwrap()
+                .as_str(),
+            "legacy-test-secret",
+        );
+
+        vault.put("legacy-minimax-reference", "   ").unwrap();
+        assert!(load_provider_credential_with_vault(&root, "minimax", &vault).is_err());
+        vault
+            .put(
+                "legacy-minimax-reference",
+                &format!("{}x", "k".repeat(4096)),
+            )
+            .unwrap();
+        assert!(load_provider_credential_with_vault(&root, "minimax", &vault).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rolls_back_new_vault_entries_if_reference_write_fails() {
+        let root =
+            std::env::temp_dir().join(format!("voice-credentials-{}", crate::workspace::new_id()));
+        let path = root.join("model-registry.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(path.with_extension(format!("{}.tmp", std::process::id()))).unwrap();
+        let vault = MemoryVault::default();
+        assert!(save_with(
+            &path,
+            CredentialUpdate {
+                deepseek_api_key: "test-secret".into(),
+                ..Default::default()
+            },
+            &vault
+        )
+        .is_err());
+        assert!(vault.0.borrow().is_empty());
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn environment_keys_match_backend_priority_and_missing_reference_blocks_start() {
+        let root =
+            std::env::temp_dir().join(format!("voice-credentials-{}", crate::workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(".env.local"),
+            "export DEEPSEEK_API_KEY='file-language'\nMINIMAX_API_KEY=\"file-speech\"\n",
+        )
+        .unwrap();
+        let env = environment_keys(
+            &root,
+            BTreeMap::from([("DEEPSEEK_API_KEY".into(), "process-language".into())]),
+        )
+        .unwrap();
+        assert_eq!(env["DEEPSEEK_API_KEY"], "process-language");
+        let vault = MemoryVault::default();
+        assert!(ready(&snapshot(&json!({}), &env, &vault).unwrap()));
+        assert!(!ready(
+            &snapshot(
+                &json!({"fixed_credentials":{"deepseek":"missing-reference"}}),
+                &env,
+                &vault
+            )
+            .unwrap()
+        ));
+        let empty = environment_keys(
+            &root,
+            BTreeMap::from([("DEEPSEEK_API_KEY".into(), "".into())]),
+        )
+        .unwrap();
+        assert!(!ready(&snapshot(&json!({}), &empty, &vault).unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn resolves_existing_managed_provider_credentials() {
+        let value = json!({"assignments":{"voice_llm_model_id":"language","tts_profile_id":"speech-profile"},"tts_profiles":[{"id":"speech-profile","model_id":"speech"}],
             "models":[{"id":"language","provider_id":"language-provider"},{"id":"speech","provider_id":"speech-provider"}],
             "providers":[{"id":"language-provider","protocol":"deepseek","credential_ref":"language-reference"},{"id":"speech-provider","protocol":"minimax","credential_ref":"speech-reference"}]});
-        let vault=MemoryVault::default();vault.put("language-reference","test-language").unwrap();vault.put("speech-reference","test-speech").unwrap();
-        assert!(ready(&snapshot(&value,&BTreeMap::new(),&vault).unwrap()));
+        let vault = MemoryVault::default();
+        vault.put("language-reference", "test-language").unwrap();
+        vault.put("speech-reference", "test-speech").unwrap();
+        assert!(ready(&snapshot(&value, &BTreeMap::new(), &vault).unwrap()));
     }
-    #[test] fn local_voxcpm1_backend_does_not_require_minimax_credentials() {
-        let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));
+    #[test]
+    fn local_voxcpm1_backend_does_not_require_minimax_credentials() {
+        let root =
+            std::env::temp_dir().join(format!("voice-credentials-{}", crate::workspace::new_id()));
         fs::create_dir_all(root.join("config")).unwrap();
-        fs::write(root.join("config/local.yaml"),"tts:\n  backend: voxcpm1 # local backend\nllm:\n  provider: deepseek\n").unwrap();
-        let mut status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        fs::write(
+            root.join("config/local.yaml"),
+            "tts:\n  backend: voxcpm1 # local backend\nllm:\n  provider: deepseek\n",
+        )
+        .unwrap();
+        let mut status = json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(!ready(&status)); // 仅选择本地后端不能绕过文件就绪校验。
-        status["local_tts_ready"]=json!(true);
+        status["local_tts_ready"] = json!(true);
         assert!(ready(&status));
-        fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
-        let status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        fs::write(root.join("config/local.yaml"), "tts:\n  backend: minimax\n").unwrap();
+        let status = json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(!ready(&status));
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test] fn product_tts_choice_has_priority_over_legacy_yaml() {
-        let root=std::env::temp_dir().join(format!("voice-tts-choice-{}",crate::workspace::new_id()));
+    #[test]
+    fn product_tts_choice_has_priority_over_legacy_yaml() {
+        let root =
+            std::env::temp_dir().join(format!("voice-tts-choice-{}", crate::workspace::new_id()));
         fs::create_dir_all(root.join("config")).unwrap();
-        fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
+        fs::write(root.join("config/local.yaml"), "tts:\n  backend: minimax\n").unwrap();
         crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"minimax-female-shaonv-zh"}})).unwrap();
-        assert_eq!(configured_tts_backend(&root),"aniflive");
-        crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"minimax"}})).unwrap();
-        assert_eq!(configured_tts_backend(&root),"minimax");
+        assert_eq!(configured_tts_backend(&root), "aniflive");
+        crate::workspace::atomic_json(
+            &root.join("config/product-settings.json"),
+            &json!({"schema_version":14,"tts":{"backend":"minimax"}}),
+        )
+        .unwrap();
+        assert_eq!(configured_tts_backend(&root), "minimax");
         fs::remove_dir_all(root).unwrap();
     }
-    #[test] fn selected_inference_provider_alone_controls_startup_gate() {
-        let status=json!({"inference_backend":"minimax","tts_backend":"minimax","providers":{"deepseek":{"configured":false},"minimax":{"configured":true}}});
+    #[test]
+    fn selected_inference_provider_alone_controls_startup_gate() {
+        let status = json!({"inference_backend":"minimax","tts_backend":"minimax","providers":{"deepseek":{"configured":false},"minimax":{"configured":true}}});
         assert!(ready(&status));
-        let status=json!({"inference_backend":"deepseek","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        let status = json!({"inference_backend":"deepseek","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(ready(&status));
-        let status=json!({"inference_backend":"minimax","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        let status = json!({"inference_backend":"minimax","tts_backend":"aniflive","local_tts_ready":true,"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
         assert!(!ready(&status));
     }
     #[test]
     #[cfg(windows)]
-    #[ignore="手动验收：使用指定项目解释器验证原生与 Python（业务后端）凭据互通，随后删除临时凭据"]
+    #[ignore = "手动验收：使用指定项目解释器验证原生与 Python（业务后端）凭据互通，随后删除临时凭据"]
     fn native_credentials_interoperate_with_python_keyring() {
-        let python=std::env::var_os("VOICE_CREDENTIAL_TEST_PYTHON").expect("请提供 VOICE_CREDENTIAL_TEST_PYTHON（测试解释器路径）");
-        let reference=format!("credential-test-{}",crate::workspace::new_id());
-        SystemVault.put(&reference,"临时互通测试-secret").unwrap();
+        let python = std::env::var_os("VOICE_CREDENTIAL_TEST_PYTHON")
+            .expect("请提供 VOICE_CREDENTIAL_TEST_PYTHON（测试解释器路径）");
+        let reference = format!("credential-test-{}", crate::workspace::new_id());
+        SystemVault.put(&reference, "临时互通测试-secret").unwrap();
         let result=std::process::Command::new(python).args(["-B","-X","utf8","-c",
             "import sys; from keyring.backends.Windows import WinVaultKeyring; v=WinVaultKeyring(); r=sys.argv[1]; assert v.get_password('Voice Terminal',r)=='临时互通测试-secret'; v._set_password(r+'@Voice Terminal',r,'业务后端更新-secret')",&reference]).output();
-        let read=SystemVault.get(&reference);let cleanup=SystemVault.delete(&reference);
-        let output=result.unwrap();assert!(output.status.success(),"凭据互通验证失败，退出状态：{}",output.status);
-        assert_eq!(read.unwrap().as_deref(),Some("业务后端更新-secret"));cleanup.unwrap();
+        let read = SystemVault.get(&reference);
+        let cleanup = SystemVault.delete(&reference);
+        let output = result.unwrap();
+        assert!(
+            output.status.success(),
+            "凭据互通验证失败，退出状态：{}",
+            output.status
+        );
+        assert_eq!(read.unwrap().as_deref(), Some("业务后端更新-secret"));
+        cleanup.unwrap();
         assert!(SystemVault.get(&reference).unwrap().is_none());
     }
 }

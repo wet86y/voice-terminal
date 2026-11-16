@@ -1,4 +1,7 @@
 - insert:
+    - id: voice-terminal-device-control
+      name: '@voice-terminal/dsh-plugin/device-control'
+      config: {}
     - id: voice-terminal-shadow-bridge
       name: '@voice-terminal/dsh-plugin'
       config:

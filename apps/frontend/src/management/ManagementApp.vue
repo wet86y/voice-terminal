@@ -8,6 +8,7 @@ import { startupIcon } from '../runtime/startup-screen'
 import type { LocalComponentCategory, LocalComponentRow, LocalComponentsModel, ManagedResourceRow } from '../interface/local-components'
 import ResourceInstallDialog from '../product/panels/ResourceInstallDialog.vue'
 import WorkspaceSettings from '../product/panels/WorkspaceSettings.vue'
+import DeviceSettings from './DeviceSettings.vue'
 import { useWorkspaceResources } from '../product/useWorkspaceResources'
 import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type DesktopCredentialsPort, type DesktopWorkspacePort, type ResourceStatus } from '../product/desktop-port'
 
@@ -76,11 +77,12 @@ const starting = ref(false) // starting（已请求启动）：原生导航完�
 const logExportError = ref('') // logExportError（日志打包错误）。
 const logExportSuccess = ref(false) // logExportSuccess（日志包已保存）。
 const updatesRequired = computed(() => resources.resources.value.some(item => item.required !== false && item.update_available === true))
+const deviceRuntimeIssue = computed(() => resources.resources.value.find(item => item.resource_id === 'device-runtime' && item.can_start === false)?.error || '')
 const componentsReady = computed(() => resources.resources.value.length > 0
   && resources.resources.value.filter(item => item.required !== false).every(item => item.can_start && item.update_available !== true))
 const componentBlockMessage = computed(() => updatesRequired.value
   ? '有组件需更新并通过校验后才能启动语音服务。'
-  : '启动前组件校验未通过，请先下载或导入缺失组件。')
+  : deviceRuntimeIssue.value || '启动前组件校验未通过，请先下载或导入缺失组件。')
 const tasksBusy = computed(() => resources.startingResources.value.size > 0
   || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)))
 const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base', 'streaming-punctuation'])
@@ -322,6 +324,7 @@ function exportLogs() {
           </div>
           <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
         </template>
+        <DeviceSettings v-else-if="section === 'devices'" />
         <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
         <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>
       </article>

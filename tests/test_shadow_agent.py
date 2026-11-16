@@ -300,7 +300,7 @@ def test_main_tail_exposes_only_request_scoped_shadow_information():
 def test_main_action_passes_only_wake_and_projects_current_dispatch_input():
     async def scenario():
         class Registry:
-            def action_definitions(self): return []
+            def action_definitions(self): return [request_shadow_action_definition()]
             def begin_turn(self, _turn): return None
 
         async def emit(*_args): return None
@@ -327,6 +327,94 @@ def test_main_action_passes_only_wake_and_projects_current_dispatch_input():
         frame = ledger.shadow_context_snapshot().frames[-1]
         assert frame.kind == "current_dispatch_input"
         assert frame.content["transcript"] == "当前仍在说的查询原文"
+
+    asyncio.run(scenario())
+
+
+def test_system_output_supersede_waits_for_confirmed_device_stop():
+    async def scenario():
+        calls = []
+
+        class Output:
+            handle = SimpleNamespace(
+                speech_id="speech-system",
+                workspace=SimpleNamespace(playback_started=False),
+            )
+            _pending = []
+
+            async def cancel_confirmed(self, speech_id, reason):
+                calls.append((speech_id, reason))
+                return True
+
+            def cancel(self, *_args, **_kwargs):
+                raise AssertionError("system output must use the confirmed cancellation API")
+
+        class Registry:
+            def action_definitions(self): return []
+            def begin_turn(self, _turn): return None
+
+        async def emit(*_args): return None
+        async def log(*_args, **_kwargs): return None
+
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), Output(), emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        runtime._system_check_speeches["speech-system"] = {"system_check_id": "check-a"}
+        runtime.active_dispatch_context = {"owner_scope": "system_check"}
+        runtime.identity = lambda: ("conversation", "request")
+        runtime.log = log
+        runtime._identity_turns[("conversation", "request")] = "turn-a"
+
+        await runtime._supersede_system_output_without_request_cancel("USER_INPUT_FINALIZED")
+        await asyncio.sleep(0)
+        assert calls == [("speech-system", "superseded_system_check")]
+
+    asyncio.run(scenario())
+
+
+def test_recovery_supersede_barrier_waits_for_stop_receipt_before_dispatch():
+    async def scenario():
+        stop_started = asyncio.Event()
+        release_stop = asyncio.Event()
+        stop_finished = asyncio.Event()
+        dispatch_started = asyncio.Event()
+
+        class Output:
+            async def cancel_all_confirmed(self, reason):
+                assert reason == "superseded_recovery"
+                stop_started.set()
+                await release_stop.wait()
+                stop_finished.set()
+
+        runtime = object.__new__(AgentEpisodeRuntime)
+        runtime.output = Output()
+        runtime._pending_output_cancellations = set()
+        runtime.recovery_queue = []
+        runtime.active_recovery = object()
+        runtime._system_check_output_turn_ids = set()
+        runtime._system_check_turn_ids = set()
+        runtime._identity_turns = {}
+        runtime.last_turn_id = None
+        runtime.identity = lambda: ("conversation", "request")
+
+        async def log(*_args, **_kwargs): return None
+        runtime.log = log
+
+        async def dispatch_inner(*_args, **_kwargs):
+            dispatch_started.set()
+            return True
+
+        runtime._start_dispatch_inner = dispatch_inner
+        runtime._supersede_recovery_without_request_cancel("USER_INPUT_FINALIZED")
+        await stop_started.wait()
+        dispatch = asyncio.create_task(runtime._start_dispatch(set()))
+        await asyncio.sleep(0)
+        assert not dispatch_started.is_set()
+        release_stop.set()
+        assert await dispatch is True
+        assert stop_finished.is_set()
+        await asyncio.sleep(0)
 
     asyncio.run(scenario())
 

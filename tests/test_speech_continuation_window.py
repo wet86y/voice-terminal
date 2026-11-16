@@ -684,7 +684,7 @@ def test_continuation_retains_backend_voice_and_inference_steps_until_transfer()
             closed.append(True)
 
         local.close = close_local
-        router = TtsBackendRouter(remote=None, local=local, backend="voxcpm1")
+        router = TtsBackendRouter(remote=None, local=local, backend="aniflive")
         harness.output.tts = router
         try:
             first = await harness.first()
@@ -696,7 +696,7 @@ def test_continuation_retains_backend_voice_and_inference_steps_until_transfer()
             assert closed == []
             assert await revise(harness, runtime, SUFFIX_TEXT) is first
             second = await harness.wait_for_drain(timeout=HANDOFF_TIMEOUT_SECONDS)
-            assert second.tts_backend == "voxcpm1"
+            assert second.tts_backend == "aniflive"
             assert second.tts_voice_snapshot is frozen_voice
             assert second.tts_inference_steps == 12
             assert router.active_local_sessions == 1

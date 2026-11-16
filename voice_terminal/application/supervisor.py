@@ -34,13 +34,14 @@ PROBE_GRACE_SECONDS = 6.0
 
 class ApplicationHost:
     def __init__(self, root: Path, *, python: str = "", config: str = "config/local.yaml",
-                 no_worker=False, no_analysis=False, llm_provider="") -> None:
+                 no_worker=False, no_analysis=False, llm_provider="", share_device_gateway=False) -> None:
         self.root, self.config = root, config
         from ..paths import AppPaths
         self.paths = AppPaths.resolve(root)
         self.python_option = python
         self.no_worker, self.no_analysis = no_worker, no_analysis
         self.llm_provider = llm_provider
+        self.share_device_gateway = bool(share_device_gateway)  # share_device_gateway（是否为共享主机请求网关监听）。
         self.state = ApplicationState()
         self.internal_token = secrets.token_urlsafe(48)
         self.processes: dict[str, ManagedProcess] = {}
@@ -528,6 +529,77 @@ class ApplicationHost:
             future.cancel()
             raise RuntimeError("权限决定尚未确认，请等待请求状态刷新。")
 
+    def device_pairing(self, payload: dict) -> dict:
+        """device_pairing（转发本机配对管理）：仅供已校验桌面管理路由或受门禁的本机控制台调用。"""
+        if not isinstance(payload, dict) or payload.get("operation") not in {
+            "status", "open", "close", "approve", "reject", "revoke",
+        }:
+            raise ValueError("设备配对操作无效。")
+        if not self._shared_host_role_is_saved():
+            raise RuntimeError("请先在设备设置中保存共享主机角色，再管理设备配对。")
+        snapshot = self.state.snapshot()
+        voice_url = snapshot.get("voice_api_url")
+        if self.loop is None or snapshot.get("stopping") or not isinstance(voice_url, str) or not voice_url:
+            raise RuntimeError("语音核心尚未就绪，不能管理设备配对。")
+        parsed = urlsplit(voice_url)
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None
+                or parsed.username is not None or parsed.password is not None or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment):
+            raise RuntimeError("语音核心地址未通过回环安全校验。")
+        future = asyncio.run_coroutine_threadsafe(self.http(
+            voice_url.rstrip("/") + "/internal/application/device-pairing",
+            payload=payload, timeout=8), self.loop)
+        try:
+            return future.result(timeout=10)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError("设备配对状态未确认，请刷新后重试。")
+
+    def _shared_host_role_is_saved(self) -> bool:
+        """_shared_host_role_is_saved（本机共享角色门禁）：只接受有效且明确保存的设备配置。"""
+        if not self.share_device_gateway:
+            return False
+        path = self.paths.config / "device-runtime.json"
+        try:
+            config_directory = path.parent
+            if (config_directory.is_symlink()
+                    or bool(getattr(config_directory, "is_junction", lambda: False)())
+                    or not config_directory.resolve().is_relative_to(
+                        (self.paths.data_root or self.paths.program_root).resolve(),
+                    )):
+                return False
+            metadata = path.lstat()
+            if (path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+                    or not path.is_file() or metadata.st_size > 64 * 1024):
+                return False
+            raw = path.read_bytes()
+            if len(raw) > 64 * 1024:
+                return False
+
+            def unique_fields(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("重复配置字段")
+                    result[key] = value
+                return result
+
+            value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
+            return (
+                isinstance(value, dict)
+                and set(value) == {"schema_version", "device_id", "desired_role", "audio_mode", "host"}
+                and type(value.get("schema_version")) is int and value["schema_version"] == 2
+                and isinstance(value.get("device_id"), str)
+                and 1 <= len(value["device_id"]) <= 128
+                and value["device_id"].strip() == value["device_id"]
+                and not any(ord(char) < 32 or ord(char) == 127 for char in value["device_id"])
+                and value.get("desired_role") == "shared_host"
+                and value.get("audio_mode") in {"pcm", "opus_experimental"}
+                and value.get("host") is None
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return False
+
     async def probe(self, key) -> bool | None:
         if key == "asr":
             import websockets
@@ -552,6 +624,14 @@ class ApplicationHost:
             return all(data.get(lane, {}).get("status") == "READY" for lane in self.manifest["analysis_lanes"])
         if key == "voice":
             data = await self.http(self.state.value["voice_api_url"] + "/health")
+            gateway = data.get("device_gateway", {})
+            if not isinstance(gateway, dict):
+                gateway = {}
+            self.state.update(
+                device_gateway_enabled=gateway.get("enabled") is True,
+                device_gateway_ready=gateway.get("ready") is True,
+                device_gateway_error=str(gateway.get("error") or "")[:240],
+            )
             # HTTP readiness（接口就绪）与 core availability（核心能力可用）分别记录。
             services = data.get("services", {})
             names = {"audio": SERVICE_LABELS["audio"], "asr": SERVICE_LABELS["asr"],
@@ -611,7 +691,10 @@ class ApplicationHost:
         else:
             self.gpu_fallback_roles.discard(key)
         try:
-            process = self.spawn(key, python_command(interpreter, module, "--config", self.config, root=self.root))
+            arguments = ["--config", self.config]
+            if key == "voice" and self.share_device_gateway:
+                arguments.append("--device-gateway")
+            process = self.spawn(key, python_command(interpreter, module, *arguments, root=self.root))
         except OSError:
             if using_gpu and not force_cpu:
                 log.warning("显卡解释器无法建立进程，%s（组件）恢复中央处理器环境。", key)

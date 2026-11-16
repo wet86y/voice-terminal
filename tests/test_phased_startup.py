@@ -24,6 +24,41 @@ def runtime(tmp_path, monkeypatch):
     return SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / "data")
 
 
+def test_device_gateway_listener_is_opt_in_and_port_conflict_does_not_abort_core(monkeypatch):
+    from apps.server import main as server
+    listener = Mock()
+    bind = Mock(return_value=(listener, 18_765))
+    monkeypatch.setattr(server, "bind_loopback", bind)
+
+    disabled, error = server._bind_device_gateway_listener(False)
+    assert disabled is None and error is None
+    bind.assert_not_called()
+
+    bound, error = server._bind_device_gateway_listener(True)
+    assert bound is listener and error is None
+    bind.assert_called_once_with(18_765, host="127.0.0.1")
+
+    occupied = Mock()
+    bind.reset_mock()
+    bind.return_value = (occupied, 18_766)
+    bound, error = server._bind_device_gateway_listener(True)
+    assert bound is None and error == "设备回环网关端口已占用。"
+    occupied.close.assert_called_once_with()
+
+    bind.side_effect = OSError(10048, "occupied")
+    bound, error = server._bind_device_gateway_listener(True)
+    assert bound is None and error == "设备回环网关不可用：OSError"
+
+
+def test_health_payload_reports_device_gateway_readiness(runtime):
+    runtime._device_gateway_enabled = True
+    runtime._device_gateway_listener_socket = object()
+    runtime._device_gateway_bind_error = None
+    assert runtime.health_payload()["device_gateway"] == {
+        "enabled": True, "ready": True, "error": None,
+    }
+
+
 def test_light_lifespan_restores_credentials_before_early_dsh_without_model_loading(monkeypatch):
     from apps.server import main as server
     events = []
@@ -210,10 +245,11 @@ def test_exit_during_dsh_memory_wait_never_launches_process(runtime):
 def test_local_loader_does_not_connect_asr_or_create_session(runtime):
     fake_vad = SimpleNamespace(backend="onnx", device="cpu", load_error=None)
     fake_audio = Mock(enabled=False, status="DISABLED", error="")
+    fake_capture = Mock()
     async def run():
         with patch("voice_terminal.audio.levels.AudioLevelMeter"), \
-             patch("voice_terminal.server.websocket.AudioCapture"), \
-             patch("voice_terminal.server.websocket.AudioPreprocessor", return_value=fake_audio), \
+             patch("voice_terminal.devices.local.AudioCapture", return_value=fake_capture) as capture_factory, \
+             patch("voice_terminal.devices.local.AudioPreprocessor", return_value=fake_audio) as processor_factory, \
              patch("voice_terminal.server.websocket.FsmnVadDetector", return_value=fake_vad) as vad, \
              patch("voice_terminal.server.websocket.AsrWorkerClient") as asr, \
              patch.object(runtime, "_restore_or_persist_voice_identity"), \
@@ -221,6 +257,9 @@ def test_local_loader_does_not_connect_asr_or_create_session(runtime):
             await runtime.initialize_local()
             assert runtime._application_local_ready and not runtime._application_session_ready
             assert runtime.controller is None
+            capture_factory.assert_called_once()
+            processor_factory.assert_called_once()
+            assert runtime.capture is fake_capture and runtime.audio_processor is fake_audio
             asr.assert_not_called()
             vad.assert_called_once()
     asyncio.run(run())

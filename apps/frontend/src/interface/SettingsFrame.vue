@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { settingsSections } from "./settings";
+import { desktopSettingsSections, settingsSections, type DesktopSettingsSection } from "./settings";
 const props = defineProps<{
   section: string; // section（当前设置分区）。
   desktop?: boolean; // desktop（是否提供原生桌面操作）。
 }>();
 // activeSection（当前入口）：旧分区地址继续高亮合并后的页签。
 const activeSection = computed(() => props.section === 'silence' ? 'wake' : props.section === 'system' ? 'compute' : props.section);
+const visibleSections = computed(() => props.desktop
+  ? desktopSettingsSections
+  : settingsSections)
 const emit = defineEmits<{
-  section: [value: (typeof settingsSections)[number]["id"]];
+  section: [value: DesktopSettingsSection];
   back: []; // back（返回工作台）。
   logs: []; // logs（打开应用日志目录）。
   exit: []; // exit（退出桌面应用）。
@@ -33,7 +36,7 @@ const emit = defineEmits<{
         </header>
         <nav class="settings-tabs" aria-label="设置导航">
           <button
-            v-for="item in settingsSections"
+            v-for="item in visibleSections"
             :key="item.id"
             :title="item.label"
             :aria-label="item.label"

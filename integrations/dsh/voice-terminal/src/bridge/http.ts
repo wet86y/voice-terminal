@@ -4,6 +4,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { restoreVoiceContextFrames } from './image-history.js'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '../shared/services.js'
+import { bindingCallback } from './callbacks.js'
 /** HTTP component（本机接口组件）：现有 Bridge 2.0 路由与会话操作。 */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BRIDGE_PROTOCOL_VERSION, json, result, authorized, readBody, digest, assertEnvelope } from '../shared/protocol.js'
@@ -64,7 +65,14 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), pendingToolActivations: new Map(), actionSeq: 0, actionQueue: Promise.resolve(), assistantStreamRevision: 0, pendingThinkingDelta: '', queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
-          const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding); installScreenCaptureTool(agentCtx, binding); installImageCapabilityGuard(agentCtx, binding) }
+          const setup = async (agentCtx: Context) => {
+            await ctx.agentPresets.mount(agentCtx, preset.id)
+            installRootTools(agentCtx, binding)
+            installScreenCaptureTool(agentCtx, binding)
+            ctx.deviceControl.installAgentTools(agentCtx, binding, (callbackPath, payload, signal) =>
+              bindingCallback(binding, callbackPath, payload, signal))
+            installImageCapabilityGuard(agentCtx, binding)
+          }
           let handle: AgentHandle
           if (path === 'session.resume') {
             // A resumed voice session keeps its persisted Session settings; plugin defaults

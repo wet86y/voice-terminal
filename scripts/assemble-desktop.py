@@ -163,6 +163,23 @@ def collect_desktop_crt(program: Path) -> None:
 def collect_program(program: Path, desktop: Path, *, include_desktop: bool = True) -> None:
     """只收集程序与默认模板；开发依赖和个人配置不进入程序目录。"""
     program.mkdir(parents=True)
+    shutil.copy2(ROOT / "LICENSE", program / "LICENSE.txt")
+    native_audio_notices = ROOT / "licenses/native-audio"
+    required_native_notices = {
+        "README.md", "aec-audio-processing-LICENSE.txt", "webrtc-audio-processing-COPYING.txt",
+        "webrtc-audio-processing-AUTHORS.txt", "webrtc-LICENSE.txt", "webrtc-PATENTS.txt",
+        "abseil-LICENSE.txt", "meson-build-LICENSE.txt", "pffft-LICENSE.txt", "rnnoise-COPYING.txt",
+        "ooura-LICENSE.txt", "spl_sqrt_floor-LICENSE.txt", "webrtc_fft-LICENSE.txt", "webrtcvad-LICENSE.txt",
+        "libopus-COPYING.txt", "libopus-AUTHORS.txt",
+    }
+    actual_native_notices = {path.name for path in files(native_audio_notices)}
+    if not required_native_notices.issubset(actual_native_notices):
+        raise ValueError("原生音频静态依赖的许可证、作者或专利声明不完整。")
+    copy_tree(native_audio_notices, program / "licenses/native-audio")
+    opus_runtime = ROOT / ".local/build/audio/opus-shared-install/bin/opus.dll"
+    if not opus_runtime.is_file():
+        raise FileNotFoundError("缺少官方 libopus 1.6.1 共享库，请运行 scripts/prepare-libopus.ps1（固定 Opus 准备）。")
+    shutil.copy2(opus_runtime, program / "opus.dll")
     if include_desktop:
         shutil.copy2(desktop / "VoiceTerminalDesktop.exe", program / "VoiceTerminalDesktop.exe")
         collect_desktop_crt(program)
@@ -217,7 +234,7 @@ def root_files(output: Path, desktop: Path) -> list[dict]:
 
 双击 VoiceTerminal.exe（正式入口）启动。正式入口从自身位置解析工作区，使用 app（已发布本体）内的业务与静态界面，无须源码仓库。系统 WebView2（网页运行引擎）由安装器引导安装。关闭窗口隐藏到托盘；请通过应用或托盘的退出操作回收服务。
 
-首次安装和重装使用 VoiceTerminalSetup.exe（分发安装器）。安装器展开本体，并用随包官方种子权重离线安装CAM++（声纹嵌入模型），卸载旧WeSpeaker（旧声纹模型）资源及旧注册档案。既有CAM++档案、其他用户数据、工作区编号、其他模型和运行环境保留，模型总清单及组件登记同步更新；失败或未提交中断恢复旧内容。其他组件进入正式程序的组件管理页面完成下载、导入与配置。Verify-Package.ps1（本体校验）不依赖后端环境。新模型需重新录制主人声纹，既有筛选及主人打断设置偏好保留。
+首次安装和重装使用 VoiceTerminalSetup.exe（分发安装器）。安装器展开本体，并用随包官方种子权重离线安装CAM++（声纹嵌入模型），卸载旧WeSpeaker（旧声纹模型）资源及旧注册档案。既有CAM++档案、其他用户数据、工作区编号、其他模型和运行环境保留，模型总清单及组件登记同步更新；失败或未提交中断恢复旧内容。其他组件进入正式程序的组件管理页面完成下载、导入与配置。Verify-Package.ps1（本体校验）不依赖后端环境。项目许可证见 LICENSE.txt（项目许可证文本），AEC/VAD（回声消除/语音活动检测）静态依赖声明见 app/licenses/native-audio/（原生音频第三方许可证与专利目录）。新模型需重新录制主人声纹，既有筛选及主人打断设置偏好保留。
 
 portable.json（工作区布局）使用 schema=2（第二版）：app（程序本体）、runtimes/python（后端环境）、runtimes/dsh（代理宿主）、models（模型）、data（用户数据）、cache（缓存）、tmp（临时区）、backups（备份）。请整体移动工作区；移动后可直接双击正式入口，不使用系统用户目录定位记录。应用提供工作区切换与整体迁移。
 

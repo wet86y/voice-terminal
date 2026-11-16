@@ -90,6 +90,19 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(start).not.toHaveBeenCalled()
   })
 
+  it('设备配置无效或目标角色未就绪时显示具体原因并阻止启动', async () => {
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    inventory.push({ ...row('device-runtime', '设备运行角色'), required: true,
+      error: '已选择远端客户端角色，但受信连接尚未准备就绪。' })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.management-start').text()).toContain('受信连接尚未准备就绪')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    await wrapper.get('button[aria-label="返回工作台"]').trigger('click')
+    await flushPromises()
+    expect(start).not.toHaveBeenCalled()
+  })
+
   it('仅有 MiniMax 密钥时，启动前选择 MiniMax 即可通过推理与在线合成门禁', async () => {
     inventory = inventory.map(item => ({ ...item, can_start: true, files_installed: true, runtime_ready: true }))
     configured = { deepseek: false, minimax: true }

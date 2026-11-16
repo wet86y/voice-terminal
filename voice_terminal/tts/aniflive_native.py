@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import tempfile
+import time
 import zipfile
 
 UPSTREAM_COMMIT = "9bc349d3a71362b3bfdccbc630983809800954fd"
@@ -30,6 +31,19 @@ PREVIOUS_PATCHED_SHA256 = {3: {**PATCHED_SHA256, 'minimal_inference/export_onnx.
 def digest(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def rename_with_windows_retry(source: Path, target: Path) -> None:
+    """有界重试 Windows（操作系统）防护或索引进程的短暂目录占用。"""
+    for attempt in range(3):
+        try:
+            os.rename(source, target)
+            return
+        except OSError as error:
+            if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
+                    or attempt == 2):
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def contained(root: Path, path: Path) -> Path:
@@ -211,7 +225,7 @@ def prepare_source(archive: Path, local: Path, *, allow_upgrade=False, before_ac
         receipt["fields"]["inventory"] = "准备后的完整源码文件摘要；不包含派生字节码"
         (candidate / "windows-source-receipt.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
         target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(candidate, target)
+        rename_with_windows_retry(candidate, target)
         return receipt
     finally:
         if candidate.exists():
@@ -234,13 +248,13 @@ def _upgrade_source(archive: Path, local: Path, before_activate) -> dict:
             before_activate()
         stage = runtime/('.source-stage-'+scratch.name)
         backup = runtime/('.source-old-'+scratch.name)
-        os.rename(scratch/'runtimes/aniflive-tts/source', stage)
+        rename_with_windows_retry(scratch/'runtimes/aniflive-tts/source', stage)
         row = {'target':'source','stage':stage.name,'backup':backup.name,'original':True}
         journal = runtime/'dependency-transaction.json'
         try:
             atomic_json(journal, {'schema':1,'state':'prepared','items':[row]})
-            os.rename(runtime/'source', backup)
-            os.rename(stage, runtime/'source')
+            rename_with_windows_retry(runtime/'source', backup)
+            rename_with_windows_retry(stage, runtime/'source')
             atomic_json(journal, {'schema':1,'state':'committed','items':[row]})
         finally:
             recover_dependencies(runtime)

@@ -40,7 +40,7 @@ def test_hotwords_and_required_punctuation_migrate_without_resetting_other_setti
         "enabled": False, "threshold": .91, "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}}), encoding="utf-8")
     assert repair(program, data)["ready"]
     settings = json.loads((data / "config/product-settings.json").read_text(encoding="utf-8"))
-    assert settings["schema_version"] == 18
+    assert settings["schema_version"] == 20
     assert settings["tts"]["speech_control_enabled"] is True
     assert settings["hotwords"] == {"enabled": False, "stream_enabled": True, "threshold": .91,
                                       "entries": [{"word": "名称", "aliases": ["别名"], "blacklist": ["排除"]}]}
@@ -63,7 +63,7 @@ def test_invalid_settings_are_repaired_persisted_and_original_is_archived(tmp_pa
     value = json.loads(settings.read_text(encoding="utf-8"))
     assert _settings_validation_warning(value) is None
     apply_settings_to_config(load_config(program / "config/default.yaml"), value)
-    assert value["schema_version"] == 18
+    assert value["schema_version"] == 20
     assert value["tts"]["speech_control_enabled"] is True
     assert any(path.read_text(encoding="utf-8") == raw
                for path in (data / "archives").rglob("product-settings.json"))
@@ -78,7 +78,7 @@ def test_bad_yaml_profile_and_voice_are_isolated_with_old_active_session(tmp_pat
     profile = data / "speaker/campplus-zh-cn-common"
     profile.mkdir(parents=True)
     (profile / "registry.json").write_text("invalid", encoding="utf-8")
-    voice = data / "tts/voxcpm2/voices"
+    voice = data / "tts/aniflive/voices"
     voice.mkdir(parents=True)
     (voice / "index.json").write_text("invalid", encoding="utf-8")
     history = data / "history"
@@ -90,7 +90,7 @@ def test_bad_yaml_profile_and_voice_are_isolated_with_old_active_session(tmp_pat
     assert result["archived_items"] == 6
     archive = data / result["archive"]
     assert (archive / "speaker/campplus-zh-cn-common/registry.json").read_text() == "invalid"
-    assert (archive / "tts/voxcpm2/voices/index.json").read_text() == "invalid"
+    assert (archive / "tts/aniflive/voices/index.json").read_text() == "invalid"
     assert not profile.exists() and not voice.exists()
     assert not (history / "active-session.sqlite3").exists()
     assert (history / "ledger-keep.sqlite3").read_bytes() == b"history"
@@ -128,11 +128,11 @@ def test_voice_archive_interruption_cannot_keep_a_dangling_selection(tmp_path):
     program, data = workspace(tmp_path)
     selected = {"voice_id": "a" * 32, "revision": 1}
     (data / "config/product-settings.json").write_text(
-        json.dumps({"tts": {"active_voice_by_model": {"voxcpm2": selected}}}), encoding="utf-8")
+        json.dumps({"tts": {"active_voice_by_model": {"aniflive": selected}}}), encoding="utf-8")
     # 模拟音色目录已归档、设置尚未来得及清理就被中断。
     repair(program, data)
     value = json.loads((data / "config/product-settings.json").read_text(encoding="utf-8"))
-    assert value["tts"]["active_voice_by_model"]["voxcpm2"] is None
+    assert value["tts"]["active_voice_by_model"]["aniflive"] is None
 
 
 def test_session_archive_resumes_the_same_group_after_interruption(tmp_path, monkeypatch):
@@ -170,9 +170,8 @@ def test_invalid_resource_policy_is_defaulted_before_startup(tmp_path):
     assert ResourcePolicy.load(path).native_threads == {}
 
 
-def test_local_tts_rebuilds_default_voices_from_current_program_seed(tmp_path):
+def test_repair_migrates_legacy_tts_selection_without_recreating_voice_libraries(tmp_path):
     import shutil
-    from voice_terminal.tts.voices import VoiceLibrary
     program, data = workspace(tmp_path)
     source = Path(__file__).resolve().parents[1] / "config/resources/assets/tts"
     seed = program / "config/resources/assets/tts"
@@ -183,10 +182,14 @@ def test_local_tts_rebuilds_default_voices_from_current_program_seed(tmp_path):
         '{"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}}', encoding="utf-8")
     result = repair(program, data)
     assert result["ready"] is True
-    for model in ("voxcpm1", "voxcpm2"):
-        library = VoiceLibrary(data / f"tts/{model}/voices", model=model)
-        voice = library.resolve(model, library.active_selection)
-        assert voice.reference_path.is_file()
+    from voice_terminal.tts.settings import DEFAULT_LOCAL_MODEL
+    settings = json.loads((data / "config/product-settings.json").read_text(encoding="utf-8"))
+    assert settings["schema_version"] == 20
+    assert settings["tts"]["backend"] == "aniflive"
+    assert settings["tts"]["local_model"] == DEFAULT_LOCAL_MODEL
+    assert not (data / "tts/aniflive/voices/index.json").exists()
+    for name in ("default.wav", "default.json"):
+        assert (seed / name).is_file()
     assert repair(program, data)["archived_items"] == 0
 
 

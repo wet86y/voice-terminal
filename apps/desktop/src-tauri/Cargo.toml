@@ -12,6 +12,8 @@ path = "src/main.rs"
 custom-protocol = ["tauri/custom-protocol"]
 distribution = ["voice-desktop-common/distribution"]
 qualification = ["distribution", "voice-desktop-common/qualification"]
+native-audio = ["voice-desktop-common/native-audio"] # native-audio（Windows 产品的静态 CRT 原生 AEC/VAD 与 Opus 编解码）。
+ssh-device = ["voice-desktop-common/ssh-device", "dep:tokio"] # ssh-device（产品内置 SSH 设备连接，不依赖外部 ssh.exe）。
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -21,6 +23,13 @@ tauri = { version = "2", features = ["tray-icon", "dynamic-acl"] }
 tauri-plugin-single-instance = "2"
 serde_json = "1"
 voice-desktop-common = { path = "../common" }
+tokio = { version = "1", features = ["sync", "time"], optional = true } # tokio（SSH 媒体收发任务的有界异步通道）。
+
+[dev-dependencies]
+voice-desktop-common = { path = "../common", features = ["ssh-device-test-support"] } # voice-desktop-common（SSH（安全外壳协议）闭环集成测试支持，仅用于测试构建）。
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"] } # russh（固定指纹 SSH 回环测试服务）。
+rand = "=0.10.3" # rand（只为 SSH 回环测试生成临时 Ed25519 身份）。
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "process"] } # tokio（异步 SSH 与产品网关集成测试运行时）。
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

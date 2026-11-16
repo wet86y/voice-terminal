@@ -32,13 +32,7 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
         # the only shape that can tell the listener why it changed.
         replacement = decision.text.strip()
         if not replacement:
-            cancel = getattr(self.output, "cancel_all", None)
-            if callable(cancel):
-                cancel("cancelled")
-            else:
-                suspend = getattr(self.output, "suspend_pending", None)
-                if callable(suspend):
-                    suspend()
+            await self._cancel_output_confirmed("cancelled")
             await self.log("SPEAK_CANCELLED", identity=identity, turn_id=turn_id,
                            queue_status=queue_status)
             self.current_action = "wait"
@@ -47,9 +41,7 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
             if not callable(replace):
                 # Test/legacy outputs without the replacement primitive keep
                 # the pre-existing stop-only behaviour.
-                cancel = getattr(self.output, "cancel_all", None)
-                if callable(cancel):
-                    cancel("cancelled")
+                await self._cancel_output_confirmed("cancelled")
                 await self.log("SPEAK_CANCELLED", identity=identity, turn_id=turn_id,
                                queue_status=queue_status)
                 self.current_action = "wait"

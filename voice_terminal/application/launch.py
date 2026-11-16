@@ -7,8 +7,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -140,6 +142,125 @@ def _wait_for_frontend(app: ApplicationHost, process, *, timeout: float = 20) ->
     raise RuntimeError(f"开发界面未能就绪：{last_error}；请查看 application-dev.log（开发界面日志）。")
 
 
+def parse_device_pairing_console_command(line: str) -> dict:
+    """parse_device_pairing_console_command（解析主机本地配对命令）：仅接受现有 supervisor 操作。"""
+    if not isinstance(line, str) or len(line.encode("utf-8")) > 16_384:
+        raise ValueError("设备配对控制命令超过长度上限。")
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError("设备配对控制命令不是有效 JSON。") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("operation"), str):
+        raise ValueError("设备配对控制命令必须包含 operation（操作类型）。")
+    operation = payload["operation"]
+    expected = {
+        "exit": {"operation"},
+        "status": {"operation"},
+        "open": {"operation", "ttl_seconds"},
+        "close": {"operation"},
+        "approve": {"operation", "request_id"},
+        "reject": {"operation", "request_id"},
+        "revoke": {"operation", "device_id"},
+    }.get(operation)
+    if expected is None or set(payload) != expected:
+        raise ValueError("设备配对命令类型或字段不匹配。")
+    if operation == "open" and (type(payload["ttl_seconds"]) is not int or not 30 <= payload["ttl_seconds"] <= 600):
+        raise ValueError("配对窗口时长必须为 30 至 600 秒。")
+    if operation in {"approve", "reject"}:
+        request_id = payload["request_id"]
+        if (not isinstance(request_id, str) or len(request_id) != 32
+                or any(char not in "0123456789abcdef" for char in request_id)):
+            raise ValueError("待处理配对请求编号无效。")
+    if operation == "revoke":
+        device_id = payload["device_id"]
+        if (not isinstance(device_id, str) or not 1 <= len(device_id) <= 128
+                or device_id.strip() != device_id
+                or any(ord(char) < 32 or ord(char) == 127 for char in device_id)):
+            raise ValueError("待撤销设备编号无效。")
+    return payload
+
+
+async def run_device_pairing_console(app: ApplicationHost, *, startup_timeout: float = 180.0) -> None:
+    """run_device_pairing_console（无界面主机配对控制台）：仅经 supervisor 访问受管回环端点。"""
+    lines: queue.Queue[str] = queue.Queue(maxsize=4)
+
+    def read_input() -> None:
+        while True:
+            line = sys.stdin.readline(16_385)
+            try:
+                lines.put(line, timeout=1.0)
+            except queue.Full:
+                return
+            if not line:
+                return
+
+    input_thread = threading.Thread(target=read_input, name="device-pairing-console-input", daemon=True)
+    input_thread.start()
+    try:
+        try:
+            deadline = time.monotonic() + startup_timeout
+            while time.monotonic() < deadline:
+                snapshot = app.state.snapshot()
+                if app.exit_event.is_set() or snapshot.get("stopping"):
+                    raise RuntimeError("主机应用在设备配对控制台就绪前开始退出。")
+                if snapshot.get("startup_complete") and snapshot.get("voice_api_url"):
+                    if (snapshot.get("device_gateway_enabled") is not True
+                            or snapshot.get("device_gateway_ready") is not True):
+                        raise RuntimeError("共享设备网关未就绪；配对控制台未启动。")
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise RuntimeError("主机核心未能在时限内就绪；配对控制台未启动。")
+        except Exception as exc:
+            sys.stdout.write(json.dumps({
+                "ok": False, "error": str(exc)[:240],
+                "fields": {"ok": "控制台是否就绪", "error": "就绪失败原因"},
+            }, ensure_ascii=False, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+            raise
+
+        ready = {
+            "state": "ready",
+            "fields": {
+                "state": "无界面主机配对控制台状态",
+                "input": "每行一条 JSON（结构化数据）命令；只提供 status/open/close/approve/reject/revoke/exit",
+            },
+        }
+        sys.stdout.write(json.dumps(ready, ensure_ascii=False, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+        while not app.exit_event.is_set():
+            try:
+                line = lines.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+            if not line:
+                break
+            if len(line.encode("utf-8")) > 16_384:
+                sys.stdout.write(json.dumps({
+                    "ok": False, "error": "设备配对命令超过长度上限。",
+                    "fields": {"ok": "命令是否成功", "error": "拒绝超长命令的原因"},
+                }, ensure_ascii=False, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+                break
+            try:
+                payload = parse_device_pairing_console_command(line.strip())
+                if payload["operation"] == "exit":
+                    break
+                result = await asyncio.to_thread(app.device_pairing, payload)
+                response = {"ok": True, "operation": payload["operation"], "result": result,
+                            "fields": {"ok": "本次操作是否获得确认", "operation": "执行的配对管理操作",
+                                        "result": "受管 ApplicationSupervisor 返回的主机结果"}}
+            except (TypeError, ValueError, RuntimeError) as exc:
+                response = {"ok": False, "error": str(exc)[:240],
+                            "fields": {"ok": "本次操作是否获得确认", "error": "操作拒绝或失败原因"}}
+            sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+    finally:
+        app.request_exit()
+
+
 async def run(args, root):
     # 首帧由原生宿主写入私有管道；连续会话不会进入命令参数、环境、登记文件或日志。
     continuity = None
@@ -147,10 +268,13 @@ async def run(args, root):
         from .continuity import read_start
         continuity = await asyncio.to_thread(read_start, sys.stdin)
     app = ApplicationHost(root, python=args.python, config=args.config,
-        no_worker=args.no_worker, no_analysis=args.no_analysis, llm_provider=args.llm_provider)
+        no_worker=args.no_worker, no_analysis=args.no_analysis, llm_provider=args.llm_provider,
+        share_device_gateway=args.share_device_gateway)
     app.loop = asyncio.get_running_loop()
     app.dev = args.dev
     app.headless = args.headless
+    if args.device_pairing_console and not app._shared_host_role_is_saved():
+        raise RuntimeError("设备配对控制台要求本机已通过正式配置保存 shared_host（共享主机）角色。")
     if args.headless and os.environ.get("VOICE_APP_SHUTDOWN_EVENT"):
         async def stop_headless():
             # Shutdown event（正常退出事件）：无界面宿主复用受管服务的退出约定。
@@ -226,6 +350,7 @@ async def run(args, root):
     # registry（实例登记）字段：pid（进程标识）、created_at（进程创建时间）、url（受管界面地址）、instance_id（实例标识）。
     atomic_json(registry, {"pid": os.getpid(), "created_at": host_created_at,
         "url": app.frontend_origin, "instance_id": app.state.value["instance_id"]})
+    pairing_console_task = None
     try:
         if getattr(args, "desktop_managed", False):
             from .desktop import DesktopControl
@@ -239,14 +364,21 @@ async def run(args, root):
         if not args.diagnostic and not app.exit_event.is_set():
             app.enqueue(app.startup())
             app.enqueue(app.monitor())
+        if args.device_pairing_console:
+            pairing_console_task = asyncio.create_task(
+                run_device_pairing_console(app), name="device-pairing-console")
         reported_startup = False
         reported_runtime = None  # reported_runtime（最近向桌面上报的核心能力与整体状态）。
         reported_endpoints = -1  # reported_endpoints（已发送给桌面的端点版本）。
         while not app.exit_event.is_set():
             status = app.state.snapshot()
-            current_runtime = (status["core_available"], status["state"])
+            current_runtime = (status["core_available"], status["state"],
+                status["device_gateway_enabled"], status["device_gateway_ready"], status["device_gateway_error"])
             if desktop and status["startup_complete"] and current_runtime != reported_runtime:
-                desktop.send("runtime_status", core_available=status["core_available"], state=status["state"])
+                desktop.send("runtime_status", core_available=status["core_available"], state=status["state"],
+                    device_gateway_enabled=status["device_gateway_enabled"],
+                    device_gateway_ready=status["device_gateway_ready"],
+                    device_gateway_error=status["device_gateway_error"])
                 reported_runtime = current_runtime
             if desktop and status["endpoint_revision"] != reported_endpoints:
                 # 端点均由宿主核验过进程归属；私有管道只传不含令牌的来源。
@@ -256,6 +388,9 @@ async def run(args, root):
                 # startup-result（启动快照）字段带同一进程身份，供磁盘状态核对，不作为实时状态来源。
                 result = {"schema": 1, "instance_id": status["instance_id"], "state": status["state"],
                     "core_available": status["core_available"], "pid": os.getpid(),
+                    "device_gateway_enabled": status["device_gateway_enabled"],
+                    "device_gateway_ready": status["device_gateway_ready"],
+                    "device_gateway_error": status["device_gateway_error"],
                     "created_at": host_created_at, "url": app.frontend_origin, "checked_at": time.time()}
                 # startup-result（启动结果快照）是启动结束时的历史快照，不能视作实时运行状态。
                 atomic_json(app.paths.application_state.parent / "startup-result.json", result)
@@ -267,6 +402,19 @@ async def run(args, root):
             except asyncio.TimeoutError:
                 pass
     finally:
+        if pairing_console_task is not None:
+            if not pairing_console_task.done():
+                app.request_exit()
+                try:
+                    await asyncio.wait_for(pairing_console_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    pairing_console_task.cancel()
+                    await asyncio.gather(pairing_console_task, return_exceptions=True)
+            else:
+                try:
+                    pairing_console_task.result()
+                except Exception as exc:
+                    logging.error("设备配对控制台退出：%s", exc)
         await app.shutdown()
         if desktop:
             desktop.send("stopped")
@@ -286,6 +434,10 @@ def parse_args(argv=None):
     mode.add_argument("--desktop-managed", action="store_true", help="由桌面宿主建立窗口并管理本实例")
     mode.add_argument("--headless", action="store_true", help="仅启动后端，不创建桌面窗口、托盘或浏览器")
     parser.add_argument("--diagnostic", action="store_true", help="仅验证窗口与服务入口，不启动音频和模型")
+    parser.add_argument("--device-pairing-console", action="store_true",
+                        help="无界面主机本地配对管理；要求已保存的共享主机角色并使用 JSON 行命令")
+    parser.add_argument("--share-device-gateway", action="store_true",
+                        help="为已保存的 shared_host（共享主机）角色启用受保护的回环设备网关")
     parser.add_argument("--no-worker", action="store_true", help="不启动 ASR worker（语音识别工作进程）")
     parser.add_argument("--no-analysis", action="store_true", help="不启动 analysis worker（分析工作进程）")
     parser.add_argument("--dev", action="store_true", help="使用受管 Node.js 开发界面，仅桌面模式可用")
@@ -294,6 +446,12 @@ def parse_args(argv=None):
         parser.error("--dev（开发界面）只能与 --desktop-managed（桌面受管）一起使用")
     if args.diagnostic and not args.desktop_managed:
         parser.error("--diagnostic（桌面诊断）只能与 --desktop-managed（桌面受管）一起使用")
+    if args.device_pairing_console and (not args.headless or args.diagnostic or args.dev):
+        parser.error("--device-pairing-console（主机配对控制台）只能与正式 --headless（无界面）入口一起使用")
+    if args.device_pairing_console and not args.share_device_gateway:
+        parser.error("--device-pairing-console（主机配对控制台）要求同时启用 --share-device-gateway（共享设备网关）")
+    if args.share_device_gateway and not (args.desktop_managed or args.headless):
+        parser.error("--share-device-gateway（共享设备网关）必须由正式受管桌面或无界面入口启动")
     return args
 
 

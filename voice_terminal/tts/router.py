@@ -80,6 +80,9 @@ class TtsBackendRouter:
         if backend not in {"minimax", "aniflive"}:
             raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 aniflive。")
         client = self.local if backend == "aniflive" else self.remote
+        bind_client = getattr(client, "bind_speech_client", None)
+        if callable(bind_client):
+            client = bind_client()
         if backend == "aniflive":
             if self._local_switching:
                 raise RuntimeError("本地 TTS 模型正在切换，请等待切换完成后再发起播报。")

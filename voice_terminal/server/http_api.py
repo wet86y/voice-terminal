@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -10,18 +12,27 @@ import secrets
 import time
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 from uuid import uuid4
 
 from .. import __version__  # __version__（后端源码版本）：接口元数据与发布记录共用。
 from ..core.events import VoiceEvent, event
 from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..application.ports import validate_endpoint_url
+from ..devices.clock_sync import DeviceClockMapper
+from ..devices.media_protocol import (
+    MediaProtocolError, decode_client_tts_audio_frame, decode_frame,
+)
+from ..devices.pcm_stream import PcmInputStream
+from ..devices.remote_capture import RemoteAudioCapture
+from ..devices.remote_playback import RemotePlaybackOutbox, encode_playback_frame
+from ..devices.client_tts import RemoteClientTtsOutbox
 from ..speaker.enrollment import EnrollmentRejectedError
 from ..speaker.enrollment_capture import EnrollmentCaptureError
 from ..speaker.audit import audit as speaker_audit, parameter_snapshot
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
 from ..model_registry.vault import CredentialVaultUnavailable
+from ..devices.trust import DeviceTrustError
 from .product import (
     PRODUCT_MINIMAX_TTS_MODELS, ProductSettingsError, ProductSettingsStore,
     _threshold_to_sensitivity, sanitize_runtime_snapshot,
@@ -30,6 +41,19 @@ from .snapshot import ProtocolSequencer, snapshot_event
 from .runtime_operations import runtime_operation, runtime_operations
 
 logger = logging.getLogger(__name__)
+
+
+def device_file_subtask_id(request_id: str, suffix: str) -> str:
+    """device_file_subtask_id（文件子任务编号）：为重试固定到同一设备台账记录。"""
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8]
+    return f"{request_id[:105]}:{suffix}:{digest}"
+
+
+def device_file_transfer_id(connection: Any, request_id: str) -> str:
+    """device_file_transfer_id（文件传输编号）：绑定原请求和设备连接/执行器代次。"""
+    material = (f"{connection.device_id}\0{connection.connection_generation}\0"
+                f"{connection.executor_generation}\0{request_id}").encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:32]
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
@@ -42,6 +66,349 @@ except ImportError:  # pragma: no cover - optional during doctor/setup
     Request = Any  # type: ignore[assignment,misc]
     JSONResponse = Any  # type: ignore[assignment,misc]
     Response = Any  # type: ignore[assignment,misc]
+
+
+class LoopbackDeviceGatewayGuard:
+    """LoopbackDeviceGatewayGuard（回环网关路径白名单）：18765 只暴露登记的轻量端点。"""
+
+    def __init__(self, app: Any, *, gateway_port: int, allowed_paths: frozenset[str]) -> None:
+        self.app = app
+        self.gateway_port = gateway_port
+        self.allowed_paths = allowed_paths
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        server = scope.get("server")
+        if isinstance(server, (tuple, list)) and len(server) == 2 and server[1] == self.gateway_port:
+            if scope.get("type") != "http":
+                if scope.get("type") == "websocket":
+                    if scope.get("path") == "/v1/media" and scope.get("path") in self.allowed_paths:
+                        await self.app(scope, receive, send)
+                    else:
+                        await send({"type": "websocket.close", "code": 1008})
+                return
+            if scope.get("method") != "POST" or scope.get("path") not in self.allowed_paths:
+                response = JSONResponse({"detail": "设备回环网关路径未开放。"}, status_code=404)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+async def _device_gateway_json(request: Any, *, label: str, max_bytes: int = 4096) -> dict[str, Any]:
+    """_device_gateway_json（设备网关 JSON）：有界读取并拒绝重复字段。"""
+    try:
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None and int(declared_length) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"{label}超过大小上限。")
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(status_code=413, detail=f"{label}超过大小上限。")
+            chunks.append(chunk)
+        payload = json.loads(b"".join(chunks), object_pairs_hook=_unique_json_fields)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{label}不是有效且唯一字段的 JSON。") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail=f"{label}必须是 JSON 对象。")
+    return payload
+
+
+async def _device_gateway_payload(request: Any) -> dict[str, Any]:
+    """_device_gateway_payload（设备网关请求体）：仅接受版本字段。"""
+    payload = await _device_gateway_json(request, label="设备网关请求")
+    if (not isinstance(payload, dict) or set(payload) != {"protocol_version"}
+            or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1):
+        raise HTTPException(status_code=422, detail="设备网关协议版本或字段无效。")
+    return payload
+
+
+def _unique_json_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """_unique_json_fields（唯一 JSON 字段）：拒绝配对签名输入中的重复键。"""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("JSON 字段重复。")
+        value[key] = item
+    return value
+
+
+async def _device_gateway_challenge_payload(request: Any) -> dict[str, Any]:
+    """_device_gateway_challenge_payload（设备挑战请求）：绑定设备、方法与固定路径。"""
+    payload = await _device_gateway_json(request, label="设备签名挑战")
+    expected = {"protocol_version", "device_id", "method", "path"}
+    method, path = payload.get("method"), payload.get("path")
+    allowed_post_paths = {
+        "/v1/status", "/v1/devices", "/v1/session/open", "/v1/session/poll",
+        "/v1/session/complete", "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
+        "/v1/interaction/prepare", "/v1/interaction/abort",
+    }
+    if (set(payload) != expected or type(payload.get("protocol_version")) is not int
+            or payload.get("protocol_version") != 1
+            or not isinstance(payload.get("device_id"), str)
+            or not ((method == "POST" and path in allowed_post_paths)
+                    or (method == "GET" and path == "/v1/media"))):
+        raise HTTPException(status_code=422, detail="设备签名挑战字段或协议版本无效。")
+    return payload
+
+
+def _require_device_gateway_port(request: Any) -> None:
+    """_require_device_gateway_port（设备网关端口）：禁止业务端点暴露在普通 HTTP 端口。"""
+    server = request.scope.get("server")
+    if not isinstance(server, (tuple, list)) or len(server) != 2 or server[1] != 18_765:
+        raise HTTPException(status_code=404, detail="设备业务请求只允许通过受限 SSH 回环网关。")
+
+
+def _authorize_device_gateway_request(
+    runtime: Any, request: Any, payload: dict[str, Any], *, method: str = "POST",
+) -> None:
+    """_authorize_device_gateway_request（设备请求授权）：验证一次性挑战与受信 Ed25519 签名。"""
+    authenticator = getattr(runtime, "device_request_authenticator", None)
+    trust_store = getattr(runtime, "device_trust_store", None)
+    if (authenticator is None or trust_store is None or trust_store.state != "valid"):
+        raise HTTPException(status_code=503, detail="主机设备信任服务不可用。")
+    device_id = request.headers.get("x-voice-terminal-device-id", "")
+    core_session_id = request.headers.get("x-voice-terminal-core-session-id", "")
+    challenge = request.headers.get("x-voice-terminal-challenge", "")
+    timestamp_text = request.headers.get("x-voice-terminal-timestamp-ms", "")
+    signature_text = request.headers.get("x-voice-terminal-signature", "")
+    if (len(device_id) > 128 or len(core_session_id) > 64 or len(challenge) > 128
+            or len(timestamp_text) > 20 or len(signature_text) > 128):
+        raise HTTPException(status_code=401, detail="设备请求未获授权或挑战已过期。")
+    try:
+        timestamp_ms = int(timestamp_text, 10)
+        signature = base64.b64decode(signature_text.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError):
+        raise HTTPException(status_code=401, detail="设备请求未获授权或挑战已过期。")
+    if not authenticator.authorize_request(
+        method=method, path=request.url.path, device_id=device_id,
+        core_session_id=core_session_id, challenge=challenge,
+        timestamp_ms=timestamp_ms, signature=signature, payload=payload,
+    ):
+        raise HTTPException(status_code=401, detail="设备请求未获授权或挑战已过期。")
+
+
+def _device_media_open_payload(websocket: Any) -> dict[str, Any]:
+    """_device_media_open_payload（媒体握手载荷）：拒绝重复、超限和非规范查询字段。"""
+    raw_query = websocket.scope.get("query_string", b"")
+    if not isinstance(raw_query, bytes) or len(raw_query) > 2048:
+        raise HTTPException(status_code=413, detail="设备媒体握手字段过大。")
+    try:
+        query_text = raw_query.decode("ascii")
+        pairs = parse_qsl(query_text, keep_blank_values=True, strict_parsing=True, max_num_fields=9)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="设备媒体握手查询格式无效。") from exc
+    required = {
+        "protocol_version", "stream_id", "connection_generation",
+        "executor_generation", "interaction_generation",
+    }
+    codec_fields = {"uplink_codec", "downlink_codec", "encoder_pre_skip_samples"}
+    downlink_pre_skip_field = "downlink_encoder_pre_skip_samples"
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if key in values:
+            raise HTTPException(status_code=400, detail="设备媒体握手包含重复字段。")
+        values[key] = value
+    present_codec_fields = set(values) & codec_fields
+    if (not required.issubset(values)
+            or set(values) - required - codec_fields - {downlink_pre_skip_field}
+            or present_codec_fields not in (set(), codec_fields)
+            or (downlink_pre_skip_field in values and present_codec_fields != codec_fields)):
+        raise HTTPException(status_code=422, detail="设备媒体握手字段不符合协议版本 1。")
+    stream_id = values["stream_id"]
+    if (not stream_id or len(stream_id) > 128
+            or any(not (char.isascii() and (char.isalnum() or char in "._:-")) for char in stream_id)):
+        raise HTTPException(status_code=422, detail="设备媒体流编号无效。")
+
+    def positive_integer(name: str) -> int:
+        value = values[name]
+        if (not value or len(value) > 16 or not value.isascii() or not value.isdigit()
+                or str(int(value)) != value or int(value) < 1 or int(value) > (1 << 53) - 1):
+            raise HTTPException(status_code=422, detail=f"设备媒体握手字段 {name}（代次或版本）无效。")
+        return int(value)
+
+    payload = {
+        "protocol_version": positive_integer("protocol_version"),
+        "stream_id": stream_id,
+        "connection_generation": positive_integer("connection_generation"),
+        "executor_generation": positive_integer("executor_generation"),
+        "interaction_generation": positive_integer("interaction_generation"),
+    }
+    if present_codec_fields:
+        uplink_codec = values["uplink_codec"]
+        downlink_codec = values["downlink_codec"]
+        if uplink_codec not in {"pcm", "opus"} or downlink_codec not in {"pcm", "opus"}:
+            raise HTTPException(status_code=422, detail="设备媒体握手编解码模式无效。")
+        pre_skip_text = values["encoder_pre_skip_samples"]
+        if (not pre_skip_text or len(pre_skip_text) > 6 or not pre_skip_text.isascii()
+                or not pre_skip_text.isdigit() or str(int(pre_skip_text)) != pre_skip_text):
+            raise HTTPException(status_code=422, detail="Opus 编码预延迟字段无效。")
+        pre_skip = int(pre_skip_text)
+        if (not 0 <= pre_skip <= 320
+                or (uplink_codec == "pcm" and pre_skip != 0)
+                or (uplink_codec == "opus" and pre_skip == 0)):
+            raise HTTPException(status_code=422, detail="上行编码模式与预延迟样本数不匹配。")
+        downlink_pre_skip_text = values.get(downlink_pre_skip_field, "0")
+        if (not downlink_pre_skip_text or len(downlink_pre_skip_text) > 6
+                or not downlink_pre_skip_text.isascii() or not downlink_pre_skip_text.isdigit()
+                or str(int(downlink_pre_skip_text)) != downlink_pre_skip_text):
+            raise HTTPException(status_code=422, detail="下行 Opus 编码预延迟字段无效。")
+        downlink_pre_skip = int(downlink_pre_skip_text)
+        if (not 0 <= downlink_pre_skip <= 960
+                or (downlink_codec == "pcm" and downlink_pre_skip != 0)
+                or (downlink_codec == "opus" and downlink_pre_skip == 0)):
+            raise HTTPException(status_code=422, detail="下行编码模式与预延迟样本数不匹配。")
+        payload.update({
+            "uplink_codec": uplink_codec,
+            "downlink_codec": downlink_codec,
+            "encoder_pre_skip_samples": pre_skip,
+        })
+        if downlink_pre_skip_field in values:
+            payload[downlink_pre_skip_field] = downlink_pre_skip
+    if payload["protocol_version"] != 1:
+        raise HTTPException(status_code=422, detail="设备媒体协议版本不受支持。")
+    return payload
+
+
+def _device_media_clock_response(message: Any, *, sync_id: str) -> tuple[int, int]:
+    """_device_media_clock_response（时钟响应）：解析唯一字段并检查设备单调时钟。"""
+    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+        raise ValueError("设备时钟同步响应必须是 JSON 控制消息。")
+    encoded = message["text"].encode("utf-8")
+    if not 0 < len(encoded) <= 1024:
+        raise ValueError("设备时钟同步响应大小无效。")
+    payload = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
+    if (not isinstance(payload, dict)
+            or set(payload) != {"type", "protocol_version", "sync_id", "device_receive_us", "device_send_us"}
+            or payload.get("type") != "clock.sync.response"
+            or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+            or payload.get("sync_id") != sync_id
+            or type(payload.get("device_receive_us")) is not int
+            or type(payload.get("device_send_us")) is not int
+            or payload["device_receive_us"] < 0 or payload["device_send_us"] < payload["device_receive_us"]):
+        raise ValueError("设备时钟同步响应字段无效。")
+    return payload["device_receive_us"], payload["device_send_us"]
+
+
+def _device_media_playback_acceptance(
+    message: Any, *, lease: Any, core_session_id: str, stream_id: str,
+) -> tuple[int, bool]:
+    """_device_media_playback_acceptance（设备帧回执）：区分已入队与因原键停止而丢弃。"""
+    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+        raise ValueError("设备播放接纳回执必须是 JSON 控制消息。")
+    encoded = message["text"].encode("utf-8")
+    if not 0 < len(encoded) <= 1024:
+        raise ValueError("设备播放接纳回执超过控制消息上限。")
+    value = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
+    expected = {
+        "type", "protocol_version", "device_id", "delivery_device_id", "core_session_id",
+        "connection_generation", "executor_generation", "interaction_generation", "stream_id",
+        "sequence", "fields",
+    }
+    if (not isinstance(value, dict) or set(value) != expected
+            or value.get("type") not in {"playback.accepted", "playback.cancelled"}
+            or type(value.get("protocol_version")) is not int or value["protocol_version"] != 1
+            or value.get("device_id") != lease.device_id
+            or value.get("delivery_device_id") != lease.device_id
+            or value.get("core_session_id") != core_session_id
+            or type(value.get("connection_generation")) is not int
+            or value["connection_generation"] != lease.connection_generation
+            or type(value.get("executor_generation")) is not int
+            or value["executor_generation"] != lease.executor_generation
+            or type(value.get("interaction_generation")) is not int
+            or value["interaction_generation"] != lease.interaction_generation
+            or value.get("stream_id") != stream_id
+            or type(value.get("sequence")) is not int or value["sequence"] < 0
+            or value["sequence"] > (1 << 53) - 1
+            or not isinstance(value.get("fields"), dict)):
+        raise ValueError("设备播放接纳回执与固定媒体租约不匹配。")
+    return value["sequence"], value["type"] == "playback.cancelled"
+
+
+def _device_media_playback_progress(
+    message: Any, *, lease: Any, core_session_id: str, stream_id: str,
+) -> dict[str, Any]:
+    """_device_media_playback_progress（设备时钟快照）：只描述实际输出观察值。"""
+    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+        raise ValueError("设备播放快照必须是 JSON 控制消息。")
+    encoded = message["text"].encode("utf-8")
+    if not 0 < len(encoded) <= 4096:
+        raise ValueError("设备播放快照超过控制消息上限。")
+    value = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
+    expected = {
+        "type", "protocol_version", "device_id", "delivery_device_id", "core_session_id",
+        "connection_generation", "executor_generation", "interaction_generation", "stream_id",
+        "playback_key", "receipt_sequence", "sequence", "enqueued_ms", "played_ms",
+        "buffered_ms", "output_estimated_ms", "started", "device_time_us", "precision", "fields",
+    }
+    if (not isinstance(value, dict) or set(value) != expected
+            or value.get("type") != "playback.progress"
+            or type(value.get("protocol_version")) is not int or value["protocol_version"] != 1
+            or value.get("device_id") != lease.device_id
+            or value.get("delivery_device_id") != lease.device_id
+            or value.get("core_session_id") != core_session_id
+            or type(value.get("connection_generation")) is not int
+            or value["connection_generation"] != lease.connection_generation
+            or type(value.get("executor_generation")) is not int
+            or value["executor_generation"] != lease.executor_generation
+            or type(value.get("interaction_generation")) is not int
+            or value["interaction_generation"] != lease.interaction_generation
+            or value.get("stream_id") != stream_id
+            or not isinstance(value.get("playback_key"), str)
+            or not isinstance(value.get("precision"), str)
+            or value["precision"] not in {"callback", "device_time", "estimated", "unknown"}
+            or type(value.get("started")) is not bool
+            or not isinstance(value.get("fields"), dict)):
+        raise ValueError("设备播放快照身份、字段或精度无效。")
+    counters = (
+        "receipt_sequence", "sequence", "enqueued_ms", "played_ms", "buffered_ms",
+        "output_estimated_ms", "device_time_us",
+    )
+    for name in counters:
+        item = value[name]
+        if type(item) is not int or not 0 <= item <= (1 << 53) - 1:
+            raise ValueError(f"设备播放快照字段 {name}（进度数值）无效。")
+    if (value["receipt_sequence"] < 1 or value["played_ms"] > value["enqueued_ms"]
+            or value["output_estimated_ms"] > value["enqueued_ms"] or value["buffered_ms"] > 2_000):
+        raise ValueError("设备播放快照超出有效时序或队列范围。")
+    return {name: value[name] for name in expected if name != "fields"}
+
+
+async def _device_pairing_payload(request: Any) -> dict[str, Any]:
+    """_device_pairing_payload（有界配对申请）：限制正文、字段、版本及重复键。"""
+    try:
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None and int(declared_length) > 4096:
+            raise HTTPException(status_code=413, detail="配对申请超过大小上限。")
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 4096:
+                raise HTTPException(status_code=413, detail="配对申请超过大小上限。")
+            chunks.append(chunk)
+        payload = json.loads(b"".join(chunks), object_pairs_hook=_unique_json_fields)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="配对申请不是有效且唯一字段的 JSON。") from exc
+    expected = {"protocol_version", "device_id", "public_key", "pairing_code", "client_nonce", "signature"}
+    if (not isinstance(payload, dict) or set(payload) != expected
+            or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+            or not isinstance(payload.get("device_id"), str)
+            or not isinstance(payload.get("public_key"), str)
+            or not isinstance(payload.get("pairing_code"), str)
+            or not isinstance(payload.get("client_nonce"), str)
+            or not isinstance(payload.get("signature"), str)):
+        raise HTTPException(status_code=422, detail="配对申请字段或协议版本无效。")
+    try:
+        nonce = base64.b64decode(payload["client_nonce"].encode("ascii"), validate=True)
+        signature = base64.b64decode(payload["signature"].encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="配对签名材料编码无效。") from exc
+    return {**payload, "client_nonce_bytes": nonce, "signature_bytes": signature}
 
 
 def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
@@ -190,9 +557,717 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     except ImportError:  # pragma: no cover - FastAPI installs middleware with the app
         pass
 
+    # 18765（主机回环网关端口）复用此 ASGI（异步服务接口），但仅通过直连套接字提供显式允许的状态入口。
+    app.add_middleware(
+        LoopbackDeviceGatewayGuard,
+        gateway_port=18_765,
+        allowed_paths=frozenset({"/v1/challenge", "/v1/status", "/v1/devices", "/v1/pairing/request",
+                                 "/v1/session/open", "/v1/session/poll", "/v1/session/complete",
+                                 "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
+                                 "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/media"}),
+    )
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return runtime.health_payload()
+
+    @app.post("/v1/challenge")
+    async def device_gateway_challenge(request: Request) -> JSONResponse:
+        """device_gateway_challenge（一次性签名挑战）：只授权固定的只读网关路径。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_challenge_payload(request)
+        authenticator = getattr(runtime, "device_request_authenticator", None)
+        trust_store = getattr(runtime, "device_trust_store", None)
+        if authenticator is None or trust_store is None or trust_store.state != "valid":
+            raise HTTPException(status_code=503, detail="主机设备信任服务不可用。")
+        try:
+            challenge = authenticator.issue_challenge(
+                payload["device_id"], payload["method"], payload["path"],
+            )
+        except DeviceTrustError as exc:
+            raise HTTPException(status_code=422, detail="设备签名挑战字段无效。") from exc
+        return JSONResponse(challenge, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/status")
+    async def device_gateway_status(request: Request) -> JSONResponse:
+        """device_gateway_status（设备网关状态）：不返回会话、模型或用户数据。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_payload(request)
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        return JSONResponse(
+            {
+                "protocol_version": 1,
+                "ready": True,
+                "core_session_id": runtime.core_session_id,
+                "fields": {
+                    "protocol_version": "设备网关协议版本",
+                    "ready": "核心 HTTP（超文本传输协议）网关是否已就绪",
+                    "core_session_id": "本次权威核心运行编号",
+                },
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/v1/devices")
+    async def device_gateway_devices(request: Request) -> JSONResponse:
+        """device_gateway_devices（设备网关快照）：只返回设备编号、能力和租约状态。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_payload(request)
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        return JSONResponse(
+            {"protocol_version": 1, "ready": True, **device_snapshot()},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/v1/session/open")
+    async def device_gateway_session_open(request: Request) -> JSONResponse:
+        """device_gateway_session_open（注册远端任务通道）：不授予语音交互租约。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备会话注册")
+        if (set(payload) != {"protocol_version", "capabilities"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or not isinstance(payload.get("capabilities"), list)):
+            raise HTTPException(status_code=422, detail="远端设备会话注册字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            connection = await runtime.open_remote_device_session(device_id, payload["capabilities"])
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="远端设备能力或编号无效。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="远端设备任务通道暂不可用。") from exc
+        return JSONResponse({
+            "protocol_version": 1,
+            "result": "accepted",
+            "device_id": connection.device_id,
+            "core_session_id": runtime.core_session_id,
+            "connection_generation": connection.connection_generation,
+            "executor_generation": connection.executor_generation,
+            "capabilities": list(connection.capabilities),
+            "fields": {
+                "protocol_version": "设备任务通道协议版本",
+                "result": "会话注册结果",
+                "device_id": "固定远端设备编号",
+                "core_session_id": "当前权威核心运行编号",
+                "connection_generation": "主机授予的连接代次",
+                "executor_generation": "主机授予的设备执行器代次",
+                "capabilities": "本次已登记设备能力编号",
+            },
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/poll")
+    async def device_gateway_session_poll(request: Request) -> JSONResponse:
+        """device_gateway_session_poll（客户端拉取任务）：仅返回该设备的原目标任务。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备任务轮询")
+        if (set(payload) != {"protocol_version", "connection_generation", "executor_generation", "wait_ms"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or type(payload.get("connection_generation")) is not int or payload["connection_generation"] < 1
+                or type(payload.get("executor_generation")) is not int or payload["executor_generation"] < 1
+                or type(payload.get("wait_ms")) is not int or not 0 <= payload["wait_ms"] <= 5000):
+            raise HTTPException(status_code=422, detail="设备任务轮询字段或等待时限无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            task = await runtime.poll_remote_device_task(
+                device_id, payload["connection_generation"], payload["executor_generation"], payload["wait_ms"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="设备任务轮询参数无效。") from exc
+        except Exception as exc:
+            from ..devices.router import DeviceUnavailable
+            if isinstance(exc, DeviceUnavailable):
+                raise HTTPException(status_code=409, detail="远端设备会话已断开或代次已变化。") from exc
+            raise HTTPException(status_code=503, detail="远端设备任务通道暂不可用。") from exc
+        return JSONResponse({
+            "protocol_version": 1,
+            "result": "accepted",
+            "device_id": device_id,
+            "core_session_id": runtime.core_session_id,
+            "connection_generation": payload["connection_generation"],
+            "executor_generation": payload["executor_generation"],
+            "task": task.payload() if task is not None else None,
+            "fields": {
+                "protocol_version": "设备任务通道协议版本",
+                "result": "轮询结果",
+                "device_id": "固定轮询设备编号",
+                "core_session_id": "当前权威核心运行编号",
+                "connection_generation": "当前设备连接代次",
+                "executor_generation": "当前设备执行器代次",
+                "task": "原目标任务；为空时本轮没有待执行任务",
+            },
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/complete")
+    async def device_gateway_session_complete(request: Request) -> JSONResponse:
+        """device_gateway_session_complete（提交任务回执）：重复回执只确认原任务。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备任务回执", max_bytes=256 * 1024)
+        expected = {"protocol_version", "connection_generation", "executor_generation", "task_id",
+                    "sequence", "core_session_id", "succeeded", "result"}
+        if (set(payload) != expected or type(payload.get("protocol_version")) is not int
+                or payload["protocol_version"] != 1
+                or type(payload.get("connection_generation")) is not int or payload["connection_generation"] < 1
+                or type(payload.get("executor_generation")) is not int or payload["executor_generation"] < 1
+                or not valid_device_request_id(payload.get("task_id"))
+                or type(payload.get("sequence")) is not int or payload["sequence"] < 1
+                or not isinstance(payload.get("core_session_id"), str)
+                or type(payload.get("succeeded")) is not bool or "result" not in payload):
+            raise HTTPException(status_code=422, detail="设备任务回执字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            receipt = await runtime.complete_remote_device_task(
+                device_id=device_id,
+                connection_generation=payload["connection_generation"],
+                executor_generation=payload["executor_generation"],
+                task_id=payload["task_id"], sequence=payload["sequence"],
+                core_session_id=payload["core_session_id"], succeeded=payload["succeeded"],
+                result=payload["result"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="设备任务回执内容无效。") from exc
+        except Exception as exc:
+            from ..devices.router import DeviceUnavailable
+            if isinstance(exc, DeviceUnavailable):
+                raise HTTPException(status_code=409, detail="设备任务回执与原任务或代次不匹配。") from exc
+            raise HTTPException(status_code=503, detail="设备任务回执暂不可结算。") from exc
+        return JSONResponse({"protocol_version": 1, "result": receipt, "task_id": payload["task_id"],
+                             "fields": {"protocol_version": "设备任务通道协议版本",
+                                        "result": "原任务回执结算结果",
+                                        "task_id": "原持久设备任务编号"}},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/reconcile")
+    async def device_gateway_session_reconcile(request: Request) -> JSONResponse:
+        """device_gateway_session_reconcile（跨连接回执恢复）：只结算原未知任务，不派发副作用。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="跨连接原任务回执恢复", max_bytes=256 * 1024)
+        expected = {"protocol_version", "task_id", "core_session_id", "connection_generation",
+                    "executor_generation", "sequence", "succeeded", "result"}
+        if (set(payload) != expected or type(payload.get("protocol_version")) is not int
+                or payload["protocol_version"] != 1
+                or not valid_device_request_id(payload.get("task_id"))
+                or not isinstance(payload.get("core_session_id"), str)
+                or not payload["core_session_id"] or len(payload["core_session_id"]) > 128
+                or payload["core_session_id"] != payload["core_session_id"].strip()
+                or any(type(payload.get(name)) is not int or payload[name] < 1 for name in
+                       ("connection_generation", "executor_generation", "sequence"))
+                or type(payload.get("succeeded")) is not bool or "result" not in payload):
+            raise HTTPException(status_code=422, detail="跨连接原任务回执字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            result = await runtime.reconcile_remote_device_task_receipt(
+                device_id=device_id,
+                task_id=payload["task_id"],
+                core_session_id=payload["core_session_id"],
+                connection_generation=payload["connection_generation"],
+                executor_generation=payload["executor_generation"],
+                sequence=payload["sequence"],
+                succeeded=payload["succeeded"],
+                result=payload["result"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="跨连接原任务回执内容无效。") from exc
+        except Exception as exc:
+            from ..devices.router import DeviceUnavailable
+            if isinstance(exc, DeviceUnavailable):
+                raise HTTPException(status_code=409, detail="跨连接回执与原任务记录或设备代次不匹配。") from exc
+            raise HTTPException(status_code=503, detail="跨连接原任务回执暂不可结算。") from exc
+        return JSONResponse({"protocol_version":1,"task_id":payload["task_id"],"result":result,
+            "fields":{"protocol_version":"设备任务通道协议版本",
+                      "task_id":"原持久设备任务编号",
+                      "result":"原任务回执恢复结果；pending/unknown 时客户端保留本地回执"}},
+            headers={"Cache-Control":"no-store"})
+
+    @app.post("/v1/session/heartbeat")
+    async def device_gateway_session_heartbeat(request: Request) -> JSONResponse:
+        """device_gateway_session_heartbeat（长任务续租）：不领取任务、不变更设备或执行器代次。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备长任务续租")
+        if (set(payload) != {"protocol_version", "connection_generation", "executor_generation"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or type(payload.get("connection_generation")) is not int or payload["connection_generation"] < 1
+                or type(payload.get("executor_generation")) is not int or payload["executor_generation"] < 1):
+            raise HTTPException(status_code=422, detail="设备长任务续租字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            result = await runtime.heartbeat_remote_device_session(
+                device_id, payload["connection_generation"], payload["executor_generation"],
+            )
+        except Exception as exc:
+            from ..devices.router import DeviceUnavailable
+            if isinstance(exc, DeviceUnavailable):
+                raise HTTPException(status_code=409, detail="设备长任务续租对应会话已断开或代次已变化。") from exc
+            raise HTTPException(status_code=503, detail="设备长任务续租暂不可用。") from exc
+        return JSONResponse({"protocol_version": 1, "result": result, "device_id": device_id,
+            "connection_generation": payload["connection_generation"],
+            "executor_generation": payload["executor_generation"],
+            "fields": {"protocol_version": "设备任务通道协议版本", "result": "连接租约续租结果",
+                       "device_id": "固定设备编号", "connection_generation": "当前连接代次",
+                       "executor_generation": "当前执行器代次"}}, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/session/close")
+    async def device_gateway_session_close(request: Request) -> JSONResponse:
+        """device_gateway_session_close（关闭设备任务通道）：不重放或迁移在途任务。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备会话关闭")
+        if (set(payload) != {"protocol_version", "connection_generation", "executor_generation"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or type(payload.get("connection_generation")) is not int or payload["connection_generation"] < 1
+                or type(payload.get("executor_generation")) is not int or payload["executor_generation"] < 1):
+            raise HTTPException(status_code=422, detail="设备会话关闭字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        closed = await runtime.close_remote_device_session(device_id, payload["connection_generation"])
+        return JSONResponse({"protocol_version": 1, "result": "closed" if closed else "already_closed",
+                             "device_id": device_id,
+                             "fields": {"protocol_version": "设备任务通道协议版本",
+                                        "result": "关闭结果",
+                                        "device_id": "固定远端设备编号"}},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/interaction/prepare")
+    async def device_gateway_interaction_prepare(request: Request) -> JSONResponse:
+        """device_gateway_interaction_prepare（准备语音设备切换）：切换由用户显式请求。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="语音设备切换请求")
+        if (set(payload) != {"protocol_version", "expected_interaction_generation"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or type(payload.get("expected_interaction_generation")) is not int
+                or payload["expected_interaction_generation"] < 0):
+            raise HTTPException(status_code=422, detail="语音设备切换请求字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if getattr(runtime, "application_initializing", False) is True:
+            raise HTTPException(status_code=503, detail="语音核心仍在启动。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        try:
+            lease = await runtime.prepare_interaction_switch(
+                device_id, payload["expected_interaction_generation"],
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=409, detail="语音设备状态已变化或切换目标无效。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail="语音设备未就绪或另一个切换事务正在进行。") from exc
+        return JSONResponse({
+            "protocol_version": 1,
+            "result": "active" if runtime.device_registry.accepts(lease) else "pending_media",
+            "device_id": lease.device_id,
+            "core_session_id": runtime.core_session_id,
+            "connection_generation": lease.connection_generation,
+            "executor_generation": lease.executor_generation,
+            "interaction_generation": lease.interaction_generation,
+            "fields": {
+                "protocol_version": "语音切换协议版本",
+                "result": "已经活动或等待媒体设备就绪",
+                "device_id": "用户明确选择的语音设备编号",
+                "core_session_id": "权威核心运行编号",
+                "connection_generation": "目标设备连接代次",
+                "executor_generation": "目标设备执行器代次",
+                "interaction_generation": "主机准备授予的新语音占用代次",
+            },
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/interaction/abort")
+    async def device_gateway_interaction_abort(request: Request) -> JSONResponse:
+        """device_gateway_interaction_abort（放弃未完成切换）：不恢复旧占用权。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="语音设备切换撤销")
+        if (set(payload) != {"protocol_version", "interaction_generation"}
+                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+                or type(payload.get("interaction_generation")) is not int
+                or payload["interaction_generation"] < 1):
+            raise HTTPException(status_code=422, detail="语音设备切换撤销字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        lease = runtime.device_registry.pending
+        if (lease is None or lease.device_id != device_id
+                or lease.interaction_generation != payload["interaction_generation"]):
+            return JSONResponse({"protocol_version": 1, "result": "already_finished",
+                                 "interaction_generation": payload["interaction_generation"],
+                                 "fields": {"result": "该设备代次已经完成或失效",
+                                            "interaction_generation": "原待切换语音占用代次"}},
+                                headers={"Cache-Control": "no-store"})
+        aborted = await runtime.abort_interaction_switch(lease)
+        return JSONResponse({"protocol_version": 1,
+                             "result": "aborted" if aborted else "already_finished",
+                             "interaction_generation": payload["interaction_generation"],
+                             "fields": {"result": "切换已放弃；旧设备不会自动恢复",
+                                        "interaction_generation": "原待切换语音占用代次"}},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.websocket("/v1/media")
+    async def device_gateway_media(websocket: WebSocket) -> None:
+        """device_gateway_media（SSH 实时音频通道）：以一个认证会话承载上行及固定目标下行 PCM。"""
+        capture: RemoteAudioCapture | None = None
+        playback: RemotePlaybackOutbox | None = None
+        client_tts: RemoteClientTtsOutbox | None = None
+        lease = None
+        device_id = ""
+        try:
+            _require_device_gateway_port(websocket)
+            payload = _device_media_open_payload(websocket)
+            _authorize_device_gateway_request(runtime, websocket, payload, method="GET")
+            device_id = websocket.headers.get("x-voice-terminal-device-id", "")
+            core_session_id = websocket.headers.get("x-voice-terminal-core-session-id", "")
+            if (getattr(runtime, "application_initializing", False) is True
+                    or core_session_id != runtime.core_session_id):
+                raise HTTPException(status_code=409, detail="核心服务尚未就绪或运行代次已变化。")
+            connection = runtime.device_registry.connection(device_id)
+            expected_lease = next((candidate for candidate in (
+                runtime.device_registry.active, runtime.device_registry.pending,
+            ) if candidate is not None and candidate.device_id == device_id
+                and candidate.connection_generation == payload["connection_generation"]
+                and candidate.executor_generation == payload["executor_generation"]
+                and candidate.interaction_generation == payload["interaction_generation"]), None)
+            lease = expected_lease
+            if (connection is None or not connection.connected
+                    or "audio_stream" not in connection.capabilities
+                    or lease is None
+                    or not (runtime.device_registry.accepts(lease) or runtime.device_registry.pending == lease)
+                    or runtime.device_remote_sessions is None
+                    or not runtime.device_remote_sessions.is_connected(
+                        device_id, lease.connection_generation, lease.executor_generation,
+                    )):
+                raise HTTPException(status_code=409, detail="媒体连接没有当前远端语音交互租约。")
+        except HTTPException as exc:
+            logger.info("device.media_handshake_rejected status=%s", exc.status_code)
+            await websocket.close(code=1008)
+            return
+        except Exception:
+            logger.exception("device.media_handshake_failed")
+            await websocket.close(code=1008)
+            return
+
+        await websocket.accept()
+        mapper = DeviceClockMapper()
+        audio_meter = getattr(runtime, "audio_meter", None)
+        capture = RemoteAudioCapture(
+            PcmInputStream(
+                stream_id=payload["stream_id"], core_session_id=runtime.core_session_id,
+                lease=lease, registry=runtime.device_registry,
+                map_device_time=lambda device_time_us: mapper.map_time(
+                    device_time_us, now=time.monotonic(),
+                ),
+                audio_codec=payload.get("uplink_codec", "pcm"),
+                encoder_pre_skip_samples=payload.get("encoder_pre_skip_samples", 0),
+            ),
+            on_audio_frame=(
+                (lambda pcm: audio_meter.feed("input", pcm, 16_000, 1))
+                if audio_meter is not None else None
+            ),
+        )
+        playback = RemotePlaybackOutbox(
+            device_id=lease.device_id, core_session_id=runtime.core_session_id,
+            connection_generation=lease.connection_generation,
+            executor_generation=lease.executor_generation,
+            interaction_generation=lease.interaction_generation,
+            stream_id=payload["stream_id"],
+            downlink_codec=payload.get("downlink_codec", "pcm"),
+            downlink_encoder_pre_skip_samples=payload.get("downlink_encoder_pre_skip_samples", 0),
+        )
+        if "client_tts" in connection.capabilities:
+            client_tts = RemoteClientTtsOutbox(
+                lease=lease, core_session_id=runtime.core_session_id,
+                stream_id=payload["stream_id"],
+            )
+        try:
+            await runtime.select_remote_capture(capture, lease)
+            await runtime.attach_remote_playback_outbox(lease, playback)
+            if client_tts is not None:
+                await runtime.attach_remote_client_tts_outbox(lease, client_tts)
+            for _sample_index in range(5):
+                sync_id = uuid4().hex
+                host_send = time.monotonic()
+                await websocket.send_json({
+                    "type": "clock.sync.request",
+                    "protocol_version": 1,
+                    "sync_id": sync_id,
+                    "fields": {
+                        "type": "控制消息类型",
+                        "protocol_version": "设备媒体协议版本",
+                        "sync_id": "本次往返时钟测量编号",
+                    },
+                })
+                message = await asyncio.wait_for(websocket.receive(), timeout=3.0)
+                host_receive = time.monotonic()
+                device_receive_us, device_send_us = _device_media_clock_response(
+                    message, sync_id=sync_id,
+                )
+                mapper.observe(
+                    host_send=host_send, device_receive_us=device_receive_us,
+                    device_send_us=device_send_us, host_receive=host_receive,
+                )
+
+            await runtime.complete_remote_interaction_switch(capture, lease)
+            refresh_client_tts = getattr(runtime, "refresh_client_tts_service", None)
+            if callable(refresh_client_tts):
+                await refresh_client_tts()
+            estimate = mapper.estimate(now=time.monotonic())
+            media_ready = {
+                "type": "media.ready",
+                "protocol_version": 1,
+                "device_id": device_id,
+                "stream_id": payload["stream_id"],
+                "core_session_id": runtime.core_session_id,
+                "connection_generation": lease.connection_generation,
+                "executor_generation": lease.executor_generation,
+                "interaction_generation": lease.interaction_generation,
+                "sample_rate": 16_000,
+                "channels": 1,
+                "bits_per_sample": 16,
+                "uplink_codec": payload.get("uplink_codec", "pcm"),
+                "downlink_codec": payload.get("downlink_codec", "pcm"),
+                "client_tts_enabled": client_tts is not None,
+                "encoder_pre_skip_samples": payload.get("encoder_pre_skip_samples", 0),
+                "clock_uncertainty_us": int(round(estimate.uncertainty_seconds * 1_000_000)),
+                "capture_active": capture.running,
+                "fields": {
+                    "type": "控制消息类型",
+                    "protocol_version": "设备媒体协议版本",
+                    "device_id": "通过签名授权的固定设备编号",
+                    "stream_id": "本次连续音频流编号",
+                    "core_session_id": "权威核心运行编号",
+                    "connection_generation": "远端设备连接代次",
+                    "executor_generation": "远端设备执行器代次",
+                    "interaction_generation": "核心授予的活跃语音占用代次",
+                    "sample_rate": "输入采样率，每秒采样数",
+                    "channels": "输入声道数",
+                    "bits_per_sample": "每个采样的位数",
+                    "uplink_codec": "协商后的设备上行负载编码",
+                    "downlink_codec": "协商后的设备下行负载编码",
+                    "client_tts_enabled": "本设备是否提供本机凭据在线合成能力",
+                    "encoder_pre_skip_samples": "上行 Opus 编码器预延迟样本数",
+                    "downlink_encoder_pre_skip_samples": "下行 Opus 编码器预延迟样本数",
+                    "clock_uncertainty_us": "最近设备时钟映射误差估计，微秒",
+                    "capture_active": "核心当前是否已启动该设备采集",
+                },
+            }
+            if "downlink_encoder_pre_skip_samples" in payload:
+                media_ready["downlink_encoder_pre_skip_samples"] = payload["downlink_encoder_pre_skip_samples"]
+            await websocket.send_json(media_ready)
+
+            last_capture_active = capture.running
+            last_heartbeat = time.monotonic()
+            client_tts_task = asyncio.create_task(client_tts.next_control()) if client_tts is not None else None
+            while True:
+                if not runtime.device_registry.accepts(lease):
+                    raise MediaProtocolError("活跃语音租约已撤销。")
+                receive_task = asyncio.create_task(websocket.receive())
+                playback_task = asyncio.create_task(playback.next_frame())
+                wait_tasks = {receive_task, playback_task}
+                if client_tts_task is not None:
+                    wait_tasks.add(client_tts_task)
+                done, pending_tasks = await asyncio.wait(
+                    wait_tasks, timeout=0.25,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for pending_task in pending_tasks:
+                    if pending_task is not client_tts_task:
+                        pending_task.cancel()
+                cancelled_pending = [task for task in pending_tasks if task is not client_tts_task]
+                if cancelled_pending:
+                    await asyncio.gather(*cancelled_pending, return_exceptions=True)
+                if not done:
+                    if not runtime.device_registry.accepts(lease):
+                        raise MediaProtocolError("活跃语音租约已撤销。")
+                    capture_active = capture.running
+                    if capture_active != last_capture_active:
+                        await websocket.send_json({
+                            "type": "media.capture_state", "protocol_version": 1,
+                            "device_id": device_id, "stream_id": payload["stream_id"],
+                            "capture_active": capture_active,
+                            "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
+                                       "device_id": "固定远端设备编号", "stream_id": "当前连续流编号",
+                                       "capture_active": "主机是否已启动该设备的语音采集"},
+                        })
+                        last_capture_active = capture_active
+                    if time.monotonic() - last_heartbeat >= 10.0:
+                        await runtime.heartbeat_remote_device_session(
+                            device_id, lease.connection_generation, lease.executor_generation,
+                        )
+                        last_heartbeat = time.monotonic()
+                    continue
+                if receive_task in done:
+                    message = receive_task.result()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                else:
+                    message = None
+                if client_tts_task is not None and client_tts_task in done:
+                    control = client_tts_task.result()
+                    if control is None:
+                        raise MediaProtocolError("客户端合成控制队列已关闭。")
+                    await websocket.send_json(control)
+                    client_tts_task = asyncio.create_task(client_tts.next_control())
+                if playback_task in done:
+                    playback_frame = playback_task.result()
+                    if playback_frame is None:
+                        raise MediaProtocolError("下行播放队列已关闭。")
+                    await websocket.send_bytes(encode_playback_frame(playback_frame))
+                if message is None:
+                    capture_active = capture.running
+                    if capture_active != last_capture_active:
+                        await websocket.send_json({
+                            "type": "media.capture_state", "protocol_version": 1,
+                            "device_id": device_id, "stream_id": payload["stream_id"],
+                            "capture_active": capture_active,
+                            "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
+                                       "device_id": "固定远端设备编号", "stream_id": "当前连续流编号",
+                                       "capture_active": "主机是否已启动该设备的语音采集"},
+                        })
+                        last_capture_active = capture_active
+                    if time.monotonic() - last_heartbeat >= 10.0:
+                        await runtime.heartbeat_remote_device_session(
+                            device_id, lease.connection_generation, lease.executor_generation,
+                        )
+                        last_heartbeat = time.monotonic()
+                    continue
+                frame_bytes = message.get("bytes")
+                if frame_bytes is not None:
+                    if not isinstance(frame_bytes, bytes) or len(frame_bytes) > 4 + 4096 + 256 * 1024:
+                        raise MediaProtocolError("设备媒体二进制消息超过长度上限。")
+                    try:
+                        tts_frame = decode_client_tts_audio_frame(frame_bytes)
+                    except MediaProtocolError:
+                        capture.accept_frame(decode_frame(frame_bytes))
+                    else:
+                        if client_tts is None:
+                            raise MediaProtocolError("设备没有协商客户端在线合成能力。")
+                        await client_tts.accept_audio(tts_frame)
+                    continue
+                text_message = message.get("text")
+                if isinstance(text_message, str) and len(text_message.encode("utf-8")) <= 4096:
+                    control = json.loads(text_message, object_pairs_hook=_unique_json_fields)
+                    if (isinstance(control, dict)
+                            and isinstance(control.get("type"), str)
+                            and control["type"].startswith("media.tts.")):
+                        if client_tts is None:
+                            raise MediaProtocolError("设备没有协商客户端在线合成能力。")
+                        client_tts.accept_control(control)
+                        continue
+                    if isinstance(control, dict) and control.get("type") in {"playback.accepted", "playback.cancelled"}:
+                        sequence, cancelled = _device_media_playback_acceptance(
+                            message, lease=lease, core_session_id=runtime.core_session_id,
+                            stream_id=payload["stream_id"],
+                        )
+                        if playback is None or not playback.acknowledge(sequence, cancelled=cancelled):
+                            raise MediaProtocolError("设备播放帧回执重复、迟到或越序。")
+                        continue
+                    if isinstance(control, dict) and control.get("type") == "playback.progress":
+                        if playback is None:
+                            raise MediaProtocolError("媒体通道没有绑定远端播放队列。")
+                        progress = _device_media_playback_progress(
+                            message, lease=lease, core_session_id=runtime.core_session_id,
+                            stream_id=payload["stream_id"],
+                        )
+                        host_output_time, uncertainty = mapper.map_time(
+                            progress["device_time_us"], now=time.monotonic(),
+                        )
+                        progress["host_output_time"] = host_output_time
+                        progress["clock_uncertainty_us"] = int(round(uncertainty * 1_000_000))
+                        if not await runtime.record_remote_playback_progress(
+                            lease, payload["stream_id"], progress,
+                        ):
+                            raise MediaProtocolError("设备播放快照回执重复、迟到或采样进度倒退。")
+                        continue
+                    if (isinstance(control, dict)
+                            and set(control) == {"type", "protocol_version", "sequence"}
+                            and control.get("type") == "media.ping"
+                            and type(control.get("protocol_version")) is int
+                            and control["protocol_version"] == 1
+                            and type(control.get("sequence")) is int
+                            and control["sequence"] >= 0):
+                        await websocket.send_json({
+                            "type": "media.pong", "protocol_version": 1,
+                            "sequence": control["sequence"],
+                            "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
+                                       "sequence": "与请求对应的保活序号"},
+                        })
+                        continue
+                raise MediaProtocolError("设备媒体通道只接受符合协商编码的 PCM/Opus 二进制帧或有效保活消息。")
+        except WebSocketDisconnect:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("device.media_stream_closed device_id=%s reason=%s", device_id, str(exc)[:160])
+            try:
+                await websocket.close(code=1002 if isinstance(exc, (MediaProtocolError, ValueError)) else 1011)
+            except Exception:
+                pass
+        finally:
+            if "client_tts_task" in locals() and client_tts_task is not None and not client_tts_task.done():
+                client_tts_task.cancel()
+                await asyncio.gather(client_tts_task, return_exceptions=True)
+            if capture is not None and lease is not None:
+                try:
+                    if client_tts is not None:
+                        await runtime.detach_remote_client_tts_outbox(lease, client_tts)
+                    if playback is not None:
+                        await runtime.detach_remote_playback_outbox(lease, playback)
+                    await runtime.clear_remote_capture(capture, lease)
+                    await runtime.abort_interaction_switch(lease)
+                    refresh_client_tts = getattr(runtime, "refresh_client_tts_service", None)
+                    if callable(refresh_client_tts):
+                        await refresh_client_tts()
+                except Exception:
+                    logger.exception("device.media_capture_cleanup_failed device_id=%s", device_id)
+
+    @app.post("/v1/pairing/request")
+    async def device_gateway_pairing_request(request: Request) -> JSONResponse:
+        """device_gateway_pairing_request（SSH 配对申请）：只接受限时码和设备私钥签名。"""
+        server = request.scope.get("server")
+        if not isinstance(server, (tuple, list)) or len(server) != 2 or server[1] != 18_765:
+            raise HTTPException(status_code=404, detail="配对申请只允许通过受限设备回环网关。")
+        payload = await _device_pairing_payload(request)
+        manager = getattr(runtime, "device_pairing_manager", None)
+        trust_store = getattr(runtime, "device_trust_store", None)
+        if manager is None or trust_store is None or trust_store.state == "invalid":
+            raise HTTPException(status_code=503, detail="主机信任登记不可用，配对申请已拒绝。")
+        try:
+            pending = manager.submit_request(
+                payload["device_id"], payload["public_key"], payload["pairing_code"],
+                payload["client_nonce_bytes"], payload["signature_bytes"],
+            )
+        except (DeviceTrustError, ValueError) as exc:
+            raise HTTPException(status_code=403, detail="设备配对申请未获授权或配对窗口已关闭。") from exc
+        return JSONResponse(
+            {
+                "protocol_version": 1,
+                "request_id": pending.request_id,
+                "device_id": pending.device_id,
+                "fingerprint": pending.fingerprint,
+                "created_at_ms": pending.created_at_ms,
+                "expires_at_ms": pending.expires_at_ms,
+                "fields": {
+                    "protocol_version": "配对协议版本",
+                    "request_id": "待主机批准的申请编号",
+                    "device_id": "申请设备编号",
+                    "fingerprint": "申请设备公钥 SHA-256 指纹",
+                    "created_at_ms": "请求建立时间，Unix 毫秒",
+                    "expires_at_ms": "请求到期时间，Unix 毫秒",
+                },
+            },
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.middleware("http")
     async def startup_gate(request: Request, call_next):
@@ -256,6 +1331,65 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     raise HTTPException(status_code=422, detail="受管端点表包含无效地址。") from exc
         return await runtime.application_control(payload["action"], endpoint_table=endpoint_table,
                                                  capability=capability)
+
+    @app.post("/internal/application/device-pairing")
+    async def application_device_pairing(request: Request) -> JSONResponse:
+        """application_device_pairing（桌面宿主配对控制）：仅受管桌面进程可管理主机信任。"""
+        authorize_application(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="设备配对请求不是有效 JSON。") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("operation"), str):
+            raise HTTPException(status_code=422, detail="设备配对操作格式无效。")
+        operation = payload["operation"]
+        manager = getattr(runtime, "device_pairing_manager", None)
+        trust_store = getattr(runtime, "device_trust_store", None)
+        if manager is None or trust_store is None:
+            raise HTTPException(status_code=503, detail="设备配对存储尚未初始化。")
+        try:
+            if operation == "status" and set(payload) == {"operation"}:
+                result = manager.status()
+            elif operation == "open" and set(payload) == {"operation", "ttl_seconds"}:
+                ttl_seconds = payload["ttl_seconds"]
+                if type(ttl_seconds) is not int:
+                    raise HTTPException(status_code=422, detail="配对窗口时长必须是整数秒。")
+                code, expires_at_ms = manager.open_window(ttl_seconds=ttl_seconds)
+                result = {"pairing_code": code, "window_expires_at_ms": expires_at_ms, **manager.status()}
+            elif operation == "close" and set(payload) == {"operation"}:
+                manager.close_window()
+                result = manager.status()
+            elif operation in {"approve", "reject"} and set(payload) == {"operation", "request_id"}:
+                request_id = payload["request_id"]
+                if (not isinstance(request_id, str) or len(request_id) != 32
+                        or any(char not in "0123456789abcdef" for char in request_id)):
+                    raise HTTPException(status_code=422, detail="待批准请求编号无效。")
+                if operation == "approve":
+                    record = manager.approve(request_id)
+                    result = {"approved": True, "device_id": record.device_id,
+                              "fingerprint": record.fingerprint, **manager.status()}
+                else:
+                    if not manager.reject(request_id):
+                        raise HTTPException(status_code=404, detail="待批准请求不存在或已过期。")
+                    result = {"rejected": True, **manager.status()}
+            elif operation == "revoke" and set(payload) == {"operation", "device_id"}:
+                device_id = payload["device_id"]
+                if not isinstance(device_id, str) or not device_id:
+                    raise HTTPException(status_code=422, detail="设备编号无效。")
+                if not trust_store.revoke(device_id):
+                    raise HTTPException(status_code=404, detail="可信设备不存在。")
+                connection = runtime.device_registry.connection(device_id)
+                if (connection is not None and connection.connected
+                        and any(capability in connection.capabilities
+                                for capability in ("desktop_control", "file_transfer", "terminal_control"))):
+                    # 撤销信任后立即使对应受管通道失效；在途结果由路由结算为未知。
+                    await runtime.close_remote_device_session(device_id, connection.connection_generation)
+                result = {"revoked": True, **manager.status()}
+            else:
+                raise HTTPException(status_code=422, detail="设备配对操作或字段无效。")
+        except DeviceTrustError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)[:240]) from exc
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     def registry_or_404() -> ModelRegistryService:
         if model_registry is None:
@@ -338,6 +1472,79 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "models": models,
             "warnings": restore_warnings,
         }
+
+    def device_snapshot() -> dict[str, Any]:
+        """device_snapshot（设备状态快照）：界面与已授权代理使用同一来源。"""
+        registry = getattr(runtime, "device_registry", None)
+        if registry is None:
+            raise HTTPException(status_code=503, detail="设备管理器尚未就绪。")
+        snapshot, interaction_generation, active = registry.state_snapshot()
+        devices = [{"device_id": item.device_id, "name": "本机" if item.device_id == "local" else item.device_id,
+                    "connected": item.connected, "connection_generation": item.connection_generation,
+                    "executor_generation": item.executor_generation,
+                    "capabilities": sorted(set(item.capabilities)
+                                     | ({"desktop_control"} if item.device_id == "local"
+                                        and getattr(runtime, "_local_desktop_transport", None) is not None else set())
+                                     | ({"screen_capture"} if item.device_id == "local"
+                                        and runtime.history.screen_capture.available_for("local") else set())),
+                    "error": None, "interaction_active": bool(active and active.device_id == item.device_id)}
+                   for item in snapshot]
+        return {"devices": devices,
+                "active_device_id": active.device_id if active is not None else None,
+                "interaction_generation": interaction_generation,
+                "capability_labels": {
+                    "audio_stream": "语音音频流", "client_tts": "客户端在线语音合成",
+                    "desktop_control": "桌面观察与控制",
+                    "screen_capture": "屏幕捕获"},
+                "fields": {"active_device_id": "当前获主机授予语音交互租约的设备；空值表示未授予",
+                           "interaction_generation": "当前语音占用代次；切换时递增",
+                           "device_id": "设备编号；local 表示本机", "name": "设备名称",
+                           "connected": "设备是否连接", "connection_generation": "连接代次",
+                           "executor_generation": "执行器代次", "capabilities": "当前可用能力",
+                           "error": "设备错误；当前尚无错误记录", "capability_labels": "能力编号中文说明",
+                           "interaction_active": "是否为当前语音交互设备"}}
+
+    @app.get("/api/v1/devices")
+    async def get_devices() -> JSONResponse:
+        """get_devices（读取设备）：仅返回状态，不暴露配对信息或凭据。"""
+        return JSONResponse(device_snapshot(), headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/devices/interaction")
+    async def select_interaction_device(payload: dict[str, Any]) -> JSONResponse:
+        """select_interaction_device（手动切换语音设备）：准备后待目标设备完成媒体就绪。"""
+        expected = {"device_id", "expected_interaction_generation"}
+        if (set(payload) != expected or not isinstance(payload.get("device_id"), str)
+                or type(payload.get("expected_interaction_generation")) is not int
+                or payload["expected_interaction_generation"] < 0):
+            raise HTTPException(status_code=422, detail="语音设备切换请求字段无效。")
+        try:
+            lease = await runtime.prepare_interaction_switch(
+                payload["device_id"], payload["expected_interaction_generation"],
+            )
+            if lease.device_id == "local" and runtime.device_registry.pending == lease:
+                await runtime.complete_local_interaction_switch(lease)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="语音设备状态已变化，请刷新设备列表后重试。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail="目标设备未就绪或另一个切换事务正在进行。") from exc
+        return JSONResponse({
+            "protocol_version": 1,
+            "result": "active" if runtime.device_registry.accepts(lease) else "pending_media",
+            "device_id": lease.device_id,
+            "core_session_id": runtime.core_session_id,
+            "connection_generation": lease.connection_generation,
+            "executor_generation": lease.executor_generation,
+            "interaction_generation": lease.interaction_generation,
+            "fields": {
+                "protocol_version": "语音切换协议版本",
+                "result": "已经活动或等待目标媒体连接就绪",
+                "device_id": "用户明确选择的语音设备编号",
+                "core_session_id": "权威核心运行编号",
+                "connection_generation": "目标设备连接代次",
+                "executor_generation": "目标设备执行器代次",
+                "interaction_generation": "主机准备授予的新语音占用代次",
+            },
+        }, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/dsh/status")
     async def get_dsh_status() -> dict[str, object]:
@@ -426,6 +1633,543 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", "attachment": item},
                             headers={"Cache-Control": "no-store"})
 
+    @app.post("/api/internal/dsh-bridge/device.list")
+    async def dsh_device_list(request: Request) -> JSONResponse:
+        """device.list（设备列表）：仅向当前绑定且活跃的根代理返回设备状态。"""
+        payload, session = await dsh_callback_body(request)
+        activation_id = payload.get("activation_id")
+        if not isinstance(activation_id, str) or not activation_id or session.activation_id != activation_id:
+            raise HTTPException(status_code=409, detail="设备列表请求所属激活已失效。")
+        return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", **device_snapshot()},
+                            headers={"Cache-Control": "no-store"})
+
+    async def dsh_device_target(payload: dict[str, Any], session: DshShadowAgentSession, *,
+                               allow_omitted: bool = False, required_capability: str = "desktop_control"):
+        activation_id = payload.get("activation_id")
+        if not isinstance(activation_id, str) or not activation_id or session.activation_id != activation_id:
+            raise HTTPException(status_code=409, detail="设备请求所属 DSH 激活已失效。")
+        device_id = payload.get("device_id")
+        if allow_omitted and device_id is None:
+            device_id = "local"
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 128 or device_id != device_id.strip():
+            raise HTTPException(status_code=422, detail="设备编号无效。")
+        connection = runtime.device_registry.connection(device_id)
+        if connection is None or not connection.connected:
+            raise HTTPException(status_code=503, detail="固定目标设备未连接；不会改投本机。")
+        if device_id != "local":
+            if required_capability not in connection.capabilities:
+                raise HTTPException(status_code=403, detail="固定目标设备未声明所需的受管能力。")
+            if runtime.device_router is None or not await runtime.device_router.has_transport(device_id):
+                raise HTTPException(status_code=503, detail="固定目标设备没有有效的已认证执行通道；不会改投本机。")
+        return connection
+
+    def valid_device_request_id(value: Any) -> bool:
+        return (isinstance(value, str) and 1 <= len(value) <= 128 and value == value.strip()
+                and value[0].isalnum() and all(char.isalnum() or char in "._:-" for char in value))
+
+    @app.post("/api/internal/dsh-bridge/device.windows")
+    async def dsh_device_windows(request: Request) -> JSONResponse:
+        """device.windows（本机窗口清单）：只读取窗口身份，不读取窗口像素。"""
+        payload, session = await dsh_callback_body(request)
+        if set(payload) != {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
+                            "context_revision", "activation_id", "device_id"}:
+            raise HTTPException(status_code=422, detail="窗口清单请求字段无效。")
+        connection = await dsh_device_target(payload, session)
+        if not valid_device_request_id(payload.get("request_id")):
+            raise HTTPException(status_code=422, detail="窗口清单请求编号无效。")
+        try:
+            record = await runtime.execute_device_task(request_id=payload["request_id"],
+                device_id=connection.device_id, operation="windows", arguments={}, timeout_seconds=15.0)
+        except Exception as exc:
+            from ..devices.router import DeviceOutcomeUnknown
+            status = 504 if isinstance(exc, DeviceOutcomeUnknown) else 503
+            raise HTTPException(status_code=status, detail="固定目标设备窗口清单未取得可靠回执。") from exc
+        if record.status == "unknown":
+            raise HTTPException(status_code=504, detail="固定目标设备窗口清单结果未知；请查询原任务。")
+        if record.status != "succeeded" or not isinstance(record.result, list):
+            raise HTTPException(status_code=503, detail="固定目标设备窗口清单回执无效。")
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="窗口读取期间 DSH 激活已结束。")
+        return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted",
+            "device_id": connection.device_id, "connection_generation": connection.connection_generation,
+            "executor_generation": connection.executor_generation, "windows": record.result,
+            "fields":{"device_id":"固定执行设备编号","connection_generation":"设备连接代次",
+                "executor_generation":"设备执行器代次","windows":"固定目标设备的可见窗口与进程身份清单"}},
+            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.observe")
+    async def dsh_device_observe(request: Request) -> JSONResponse:
+        """device.observe（固定目标设备窗口观察）：读取 UI Automation（界面自动化）树并绑定设备代次。"""
+        payload, session = await dsh_callback_body(request)
+        required_fields = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
+                           "context_revision", "activation_id", "device_id", "window_id", "max_elements", "max_depth", "include_pixels"}
+        optional_generations = {"connection_generation", "executor_generation"}
+        if (not required_fields.issubset(payload) or set(payload) - required_fields - optional_generations
+                or ("connection_generation" in payload) != ("executor_generation" in payload)):
+            raise HTTPException(status_code=422, detail="设备观察请求字段无效。")
+        connection = await dsh_device_target(payload, session)
+        if ("connection_generation" in payload
+                and (payload["connection_generation"] != connection.connection_generation
+                     or payload["executor_generation"] != connection.executor_generation)):
+            raise HTTPException(status_code=409, detail="设备观察所属连接或执行器代次已失效。")
+        if not valid_device_request_id(payload.get("request_id")):
+            raise HTTPException(status_code=422, detail="设备观察请求编号无效。")
+        window_id, max_elements, max_depth, include_pixels = (
+            payload.get("window_id"), payload.get("max_elements"), payload.get("max_depth"), payload.get("include_pixels"))
+        if (type(window_id) is not int or window_id <= 0 or type(max_elements) is not int or not 1 <= max_elements <= 200
+                or type(max_depth) is not int or not 1 <= max_depth <= 16 or type(include_pixels) is not bool):
+            raise HTTPException(status_code=422, detail="窗口编号或观察范围无效。")
+        service = runtime.history.screen_capture
+        if not service.config.enabled:
+            raise HTTPException(status_code=503, detail="屏幕观察能力当前关闭。")
+        if connection.device_id == "local" and not service.available_for("local"):
+            raise HTTPException(status_code=503, detail="本机屏幕观察能力当前不可用。")
+        arguments = {"target":{"windowId":window_id},"maxElements":max_elements,"maxDepth":max_depth,
+                     "includePixels":include_pixels}
+        try:
+            record = await runtime.execute_device_task(request_id=payload["request_id"],
+                device_id=connection.device_id, operation="tree", arguments=arguments, timeout_seconds=20.0)
+        except Exception as exc:
+            from ..devices.router import DeviceOutcomeUnknown
+            status = 504 if isinstance(exc, DeviceOutcomeUnknown) else 503
+            raise HTTPException(status_code=status, detail="固定目标设备窗口观察未取得可靠回执。") from exc
+        if record.status == "unknown":
+            raise HTTPException(status_code=504, detail="固定目标设备观察结果未知；请查询原任务。")
+        value = record.result if record.status == "succeeded" else None
+        snapshot = value.get("snapshot") if isinstance(value, dict) else None
+        elements = value.get("elements") if isinstance(value, dict) else None
+        pixels = value.get("pixels") if isinstance(value, dict) else None
+        if not isinstance(snapshot, dict) or not isinstance(elements, list) or not isinstance(pixels, list):
+            raise HTTPException(status_code=503, detail="固定目标设备窗口观察回执无效。")
+        required_snapshot = {"windowId", "processId", "executablePath", "title", "className", "rect",
+                             "foreground", "treeHash", "shotHash", "elementCount"}
+        rect = snapshot.get("rect") if isinstance(snapshot, dict) else None
+        if (set(snapshot) != required_snapshot or type(snapshot.get("windowId")) is not int
+                or type(snapshot.get("processId")) is not int
+                or snapshot.get("executablePath") is not None and not isinstance(snapshot.get("executablePath"), str)
+                or not isinstance(snapshot.get("title"), str) or not isinstance(snapshot.get("className"), str)
+                or not isinstance(rect, dict) or set(rect) != {"x", "y", "width", "height"}
+                or any(type(rect.get(key)) is not int for key in ("x", "y", "width", "height"))
+                or type(snapshot.get("foreground")) is not bool or not isinstance(snapshot.get("treeHash"), str)
+                or not isinstance(snapshot.get("shotHash"), str) or type(snapshot.get("elementCount")) is not int):
+            raise HTTPException(status_code=503, detail="固定目标设备窗口身份快照无效。")
+        if (session.activation_id != payload["activation_id"]
+                or runtime.device_registry.connection(connection.device_id) != connection):
+            raise HTTPException(status_code=409, detail="观察期间 DSH 激活或设备代次已变化。")
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted","device_id":connection.device_id,
+            "connection_generation":connection.connection_generation,"executor_generation":connection.executor_generation,
+            "snapshot":snapshot,"elements":elements,"pixels":pixels,
+            "fields":{"device_id":"固定执行设备编号","connection_generation":"设备连接代次",
+                "executor_generation":"设备执行器代次","snapshot":"已核对进程身份及窗口内容摘要",
+                "elements":"有界界面自动化元素树","pixels":"有界元素中心像素提示"}},
+            headers={"Cache-Control":"no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.action")
+    async def dsh_device_action(request: Request) -> JSONResponse:
+        """device.action（已审批的固定目标设备动作）：固定原观察目标并进入持久设备任务台账。"""
+        payload, session = await dsh_callback_body(request)
+        expected = {"protocol_version","request_id","voice_session_id","dsh_session_id","epoch","context_revision",
+                    "activation_id","device_id","connection_generation","executor_generation","operation","arguments","timeout_ms"}
+        if set(payload) != expected:
+            raise HTTPException(status_code=422, detail="设备动作请求字段无效。")
+        connection = await dsh_device_target(payload, session)
+        if not valid_device_request_id(payload.get("request_id")):
+            raise HTTPException(status_code=422, detail="设备动作任务编号无效。")
+        operation, arguments, timeout_ms = payload.get("operation"), payload.get("arguments"), payload.get("timeout_ms")
+        allowed = {"click", "type", "scroll", "key", "move", "windowControl", "invokePattern", "multi_action"}
+        if (operation not in allowed or not isinstance(arguments, dict) or type(timeout_ms) is not int
+                or not 1 <= timeout_ms <= 600_000):
+            raise HTTPException(status_code=422, detail="设备动作名称、参数或时限无效。")
+        if (payload.get("connection_generation") != connection.connection_generation
+                or payload.get("executor_generation") != connection.executor_generation):
+            raise HTTPException(status_code=409, detail="设备动作观察所属代次已失效。")
+        try:
+            record = await runtime.execute_device_task(request_id=payload["request_id"],
+                device_id=connection.device_id, operation=operation, arguments=arguments,
+                timeout_seconds=min(600.0, timeout_ms / 1000 + 8))
+        except Exception as exc:
+            from ..devices.task_journal import TaskConflict
+            from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
+            if isinstance(exc, TaskConflict):
+                raise HTTPException(status_code=409, detail="设备动作任务编号已用于其他内容。") from exc
+            if isinstance(exc, DeviceOutcomeUnknown):
+                record = await runtime.query_device_task(payload["request_id"], connection.device_id)
+                if record is None:
+                    raise HTTPException(status_code=504, detail="设备动作结果未知；请查询原任务。") from exc
+            elif isinstance(exc, (DeviceUnavailable, RuntimeError)):
+                raise HTTPException(status_code=503, detail="设备动作尚未取得可靠回执。") from exc
+            else:
+                raise
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="动作返回期间 DSH 激活已结束；任务仍固定在原设备。")
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted","task":{
+            "request_id":record.request_id,"device_id":record.device_id,"operation":record.operation,
+            "status":record.status,"result":record.result},
+            "fields":{"task":"原设备动作任务台账结果；未知状态不得自动重做"}},
+            headers={"Cache-Control":"no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.task.query")
+    async def dsh_device_task_query(request: Request) -> JSONResponse:
+        """device.task.query（只读原任务查询）：不会重新派发桌面操作。"""
+        payload, session = await dsh_callback_body(request)
+        if set(payload) != {"protocol_version","request_id","voice_session_id","dsh_session_id","epoch",
+                            "context_revision","activation_id","device_id","task_id"}:
+            raise HTTPException(status_code=422, detail="设备任务查询字段无效。")
+        await dsh_device_target(payload, session)
+        task_id = payload.get("task_id")
+        if not valid_device_request_id(task_id):
+            raise HTTPException(status_code=422, detail="设备任务编号无效。")
+        try:
+            record = await runtime.query_device_task(task_id, payload["device_id"])
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="设备任务台账不可用。") from exc
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="任务查询期间 DSH 激活已结束。")
+        task = None if record is None else {"request_id":record.request_id,"device_id":record.device_id,
+            "operation":record.operation,"status":record.status,"result":record.result}
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted","task":task,
+            "fields":{"task":"原任务状态；查询不会重放操作"}},headers={"Cache-Control":"no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.terminal")
+    async def dsh_device_terminal(request: Request) -> JSONResponse:
+        """device.terminal（受限设备终端）：只派发固定命令配置，不提供 shell 或脚本入口。"""
+        payload, session = await dsh_callback_body(request)
+        base = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
+                "context_revision", "activation_id", "device_id", "action", "terminal_id"}
+        action = payload.get("action")
+        if not isinstance(action, str) or action not in {"create", "input", "output", "status", "cancel", "close"}:
+            raise HTTPException(status_code=422, detail="设备终端请求字段或操作无效。")
+        extra = {"input": {"command_id"}, "output": {"offset"}}.get(action, set())
+        if set(payload) != base | extra:
+            raise HTTPException(status_code=422, detail="设备终端请求字段或操作无效。")
+        connection = await dsh_device_target(payload, session, required_capability="terminal_control")
+        request_id, terminal_id = payload.get("request_id"), payload.get("terminal_id")
+        if not valid_device_request_id(request_id) or not valid_device_request_id(terminal_id):
+            raise HTTPException(status_code=422, detail="设备终端请求编号无效。")
+        if action == "input" and (not isinstance(payload.get("command_id"), str)
+                                   or payload["command_id"] not in {"hostname", "identity", "processes", "network"}):
+            raise HTTPException(status_code=422, detail="设备终端命令不在固定只读命令清单中。")
+        if action == "output" and (type(payload.get("offset")) is not int or payload["offset"] < 0):
+            raise HTTPException(status_code=422, detail="设备终端输出偏移无效。")
+        arguments = {"terminal_id": terminal_id}
+        if action == "input":
+            arguments["command_id"] = payload["command_id"]
+        elif action == "output":
+            arguments["offset"] = payload["offset"]
+        try:
+            record = await runtime.execute_device_task(request_id=request_id,
+                device_id=connection.device_id, operation=f"terminal.{action}", arguments=arguments,
+                timeout_seconds=45.0 if action == "input" else 15.0)
+        except Exception as exc:
+            from ..devices.task_journal import TaskConflict
+            from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
+            if isinstance(exc, TaskConflict):
+                raise HTTPException(status_code=409, detail="设备终端任务编号已用于其他内容。") from exc
+            if isinstance(exc, DeviceOutcomeUnknown):
+                record = await runtime.query_device_task(request_id, connection.device_id)
+                if record is None or record.status == "unknown":
+                    raise HTTPException(status_code=504, detail="设备终端任务结果未知；请查询原任务，不要重放。") from exc
+            elif isinstance(exc, (DeviceUnavailable, RuntimeError)):
+                raise HTTPException(status_code=503, detail="固定目标设备终端通道不可用；不会改投本机。") from exc
+            else:
+                raise
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="终端任务返回期间 DSH 激活已结束；任务仍固定在原设备。")
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+            "task":{"request_id":record.request_id,"device_id":record.device_id,"operation":record.operation,
+                "status":record.status,"result":record.result},
+            "fields":{"task":"固定设备上的终端会话或命令任务结果；未知状态不得重放"}},
+            headers={"Cache-Control":"no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.file")
+    async def dsh_device_file(request: Request) -> JSONResponse:
+        """device.file（设备文件）：目录、小/大文件读取与获批文件写入；远端大文件走独立 SFTP。"""
+        payload, session = await dsh_callback_body(request)
+        base = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
+                "context_revision", "activation_id", "device_id", "action", "path"}
+        action = payload.get("action")
+        if not isinstance(action, str) or action not in {"list", "read", "write"}:
+            raise HTTPException(status_code=422, detail="设备文件请求操作无效。")
+        extra = {"limit"} if action == "list" else {"max_bytes"} if action == "read" else {"attachment"}
+        if set(payload) != base | extra:
+            raise HTTPException(status_code=422, detail="设备文件请求字段无效。")
+        connection = await dsh_device_target(payload, session, required_capability="file_transfer")
+        request_id, path = payload.get("request_id"), payload.get("path")
+        if (not valid_device_request_id(request_id) or not isinstance(path, str) or not path
+                or len(path) > 2048 or any(ord(character) < 32 for character in path)):
+            raise HTTPException(status_code=422, detail="设备文件请求编号或目标路径无效。")
+        if action == "list":
+            if type(payload.get("limit")) is not int or not 1 <= payload["limit"] <= 200:
+                raise HTTPException(status_code=422, detail="设备目录清单上限必须为 1 至 200。")
+            arguments = {"path": path, "limit": payload["limit"]}
+        elif action == "read":
+            from ..devices.file_transfer import MAX_TRANSFER_BYTES
+            if type(payload.get("max_bytes")) is not int or not 1 <= payload["max_bytes"] <= MAX_TRANSFER_BYTES:
+                raise HTTPException(status_code=422, detail="设备文件读取上限必须为 1 至 4 GiB。")
+            arguments = {"path": path, "max_bytes": min(payload["max_bytes"], 128 * 1024)}
+        else:
+            attachment = payload.get("attachment")
+            if (not isinstance(attachment, dict) or set(attachment) != {"attachment_id", "name", "bytes"}
+                    or not isinstance(attachment.get("attachment_id"), str)
+                    or not isinstance(attachment.get("name"), str)
+                    or len(attachment["name"]) > 240
+                    or type(attachment.get("bytes")) is not int):
+                raise HTTPException(status_code=422, detail="DSH 文件附件引用字段无效。")
+            digest_value = attachment["attachment_id"].removeprefix("sha256:")
+            from ..devices.file_transfer import MAX_TRANSFER_BYTES
+            import re
+            if (not re.fullmatch(r"[0-9a-f]{64}", digest_value)
+                    or not 0 <= attachment["bytes"] <= MAX_TRANSFER_BYTES):
+                raise HTTPException(status_code=422, detail="DSH 文件附件长度或内容摘要无效。")
+            store = runtime.device_file_transfer_store
+            if store is None:
+                raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+            transfer_id = device_file_transfer_id(connection, request_id)
+            try:
+                ticket = await asyncio.to_thread(store.prepare_core_upload,
+                    device_id=connection.device_id, connection_generation=connection.connection_generation,
+                    executor_generation=connection.executor_generation, expected_bytes=attachment["bytes"],
+                    expected_sha256=digest_value, target_path=path, transfer_id=transfer_id)
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="设备文件暂存未能建立。") from exc
+            if session.activation_id != payload["activation_id"]:
+                raise HTTPException(status_code=409, detail="文件暂存建立期间 DSH 激活已结束。")
+            return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+                "task":{"request_id":request_id,"device_id":connection.device_id,"operation":"file.write",
+                    "status":"receiving","result":{"transfer_id":transfer_id,"bytes":attachment["bytes"],
+                        "sha256":digest_value,"name":attachment["name"],
+                        "path":path,
+                        "connection_generation":connection.connection_generation,
+                        "executor_generation":connection.executor_generation}},
+                "fields":{"task":"已审批的文件写入暂存票据；分块核验完成前不会派发到设备"}},
+                headers={"Cache-Control":"no-store"})
+
+        async def execute_file_task(task_request_id: str, operation: str, task_arguments: dict[str, Any],
+                                    timeout_seconds: float = 30.0):
+            try:
+                record = await runtime.execute_device_task(request_id=task_request_id,
+                    device_id=connection.device_id, operation=operation, arguments=task_arguments,
+                    timeout_seconds=timeout_seconds)
+                return record
+            except Exception as exc:
+                from ..devices.task_journal import TaskConflict
+                from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
+                if isinstance(exc, TaskConflict):
+                    raise HTTPException(status_code=409, detail="设备文件任务编号已用于其他内容。") from exc
+                if isinstance(exc, DeviceOutcomeUnknown):
+                    try:
+                        return await runtime.query_device_task(task_request_id, connection.device_id)
+                    except Exception:
+                        return None
+                if isinstance(exc, (DeviceUnavailable, RuntimeError)):
+                    raise HTTPException(status_code=503, detail="固定目标设备文件通道不可用；不会改投本机。") from exc
+                raise
+
+        if action == "list":
+            record = await execute_file_task(request_id, "file.list", arguments)
+            task_id = request_id
+            operation = "file.list"
+            result = None
+        else:
+            stat_id = device_file_subtask_id(request_id, "stat")
+            stat_record = await execute_file_task(stat_id, "file.stat", {"path": path})
+            if stat_record is None or stat_record.status != "succeeded" or not isinstance(stat_record.result, dict):
+                record = stat_record
+                task_id = stat_id
+                operation = "file.stat"
+                result = None
+            else:
+                stat = stat_record.result
+                size = stat.get("bytes")
+                if (stat.get("path") != path or not isinstance(stat.get("name"), str)
+                        or type(size) is not int or size < 0):
+                    raise HTTPException(status_code=502, detail="设备文件状态回执格式无效。")
+                if size > payload["max_bytes"]:
+                    return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+                        "task":{"request_id":request_id,"device_id":connection.device_id,"operation":"file.read",
+                            "status":"failed","result":{"error":"文件超过本次用户批准的字节上限。",
+                                "bytes":size,"max_bytes":payload["max_bytes"]}},
+                        "fields":{"task":"设备文件读取结果；文件大小超过审批上限时不读取内容"}},
+                        headers={"Cache-Control":"no-store"})
+                if size <= 128 * 1024:
+                    read_id = device_file_subtask_id(request_id, "read")
+                    record = await execute_file_task(read_id, "file.read", {"path":path,"max_bytes":max(1, size)})
+                    task_id = read_id
+                    operation = "file.read"
+                    result = None
+                else:
+                    store = runtime.device_file_transfer_store
+                    if store is None:
+                        raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+                    transfer_id = device_file_transfer_id(connection, request_id)
+                    try:
+                        if connection.device_id == "local":
+                            await asyncio.to_thread(store.prepare_local_upload,
+                                device_id=connection.device_id, connection_generation=connection.connection_generation,
+                                executor_generation=connection.executor_generation, expected_bytes=size,
+                                transfer_id=transfer_id)
+                            staged = await asyncio.to_thread(store.stage_local_file,
+                                transfer_id=transfer_id, device_id=connection.device_id,
+                                connection_generation=connection.connection_generation,
+                                executor_generation=connection.executor_generation, source_path=path)
+                        else:
+                            ticket = await asyncio.to_thread(store.prepare_device_upload,
+                                device_id=connection.device_id, connection_generation=connection.connection_generation,
+                                executor_generation=connection.executor_generation, expected_bytes=size,
+                                transfer_id=transfer_id)
+                            sftp_id = device_file_subtask_id(request_id, "sftp")
+                            record = await execute_file_task(sftp_id, "file.sftp.upload", {
+                                "local_path":path,"remote_path":ticket["sftp_path"],"transfer_id":transfer_id,
+                                "maximum_bytes":max(1,size)}, timeout_seconds=600.0)
+                            task_id, operation, result = sftp_id, "file.sftp.upload", None
+                            if record is None or record.status == "unknown":
+                                response_task = {"request_id":request_id,"device_id":connection.device_id,
+                                    "operation":"file.read","status":"unknown","result":None,
+                                    "source_task_id":sftp_id,"transfer_id":transfer_id}
+                                return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+                                    "task":response_task,"fields":{"task":"SFTP 原任务结果未知；查询 source_task_id，不得重放"}},
+                                    headers={"Cache-Control":"no-store"})
+                            if record.status != "succeeded" or not isinstance(record.result, dict):
+                                await asyncio.to_thread(store.close, transfer_id=transfer_id,
+                                    device_id=connection.device_id, connection_generation=connection.connection_generation,
+                                    executor_generation=connection.executor_generation)
+                                return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+                                    "task":{"request_id":request_id,"device_id":connection.device_id,"operation":"file.read",
+                                        "status":"failed","result":record.result if record is not None else None},
+                                    "fields":{"task":"固定设备 SFTP 读取失败；不会改投本机"}},
+                                    headers={"Cache-Control":"no-store"})
+                            receipt = record.result
+                            if (receipt.get("transfer_id") != transfer_id or receipt.get("path") != ticket["sftp_path"]
+                                    or receipt.get("bytes") != size or not isinstance(receipt.get("sha256"), str)):
+                                raise HTTPException(status_code=502, detail="远端 SFTP 原任务回执与暂存票据不匹配。")
+                            staged = await asyncio.to_thread(store.verify_device_upload,
+                                transfer_id=transfer_id, device_id=connection.device_id,
+                                connection_generation=connection.connection_generation,
+                                executor_generation=connection.executor_generation, expected_bytes=size,
+                                expected_sha256=receipt["sha256"])
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        raise HTTPException(status_code=503, detail="设备大文件暂存或摘要校验失败。") from exc
+                    result = {"path":path,"name":stat["name"],"bytes":staged["bytes"],
+                        "sha256":staged["sha256"],"transfer_id":transfer_id,"streamed":True,
+                        "connection_generation":connection.connection_generation,
+                        "executor_generation":connection.executor_generation}
+                    record = stat_record
+                    task_id, operation = stat_id, "file.read"
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="文件任务返回期间 DSH 激活已结束；任务仍固定在原设备。")
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+            "task":{"request_id":request_id,"device_id":connection.device_id,"operation":operation,
+                "status":record.status if record is not None else "unknown",
+                "result":record.result if result is None and record is not None else result,
+                **({"source_task_id":task_id} if record is None or record.status == "unknown" else {})},
+            "fields":{"task":"固定设备文件任务结果；未知状态必须按 source_task_id 查询且不得重放"}},
+            headers={"Cache-Control":"no-store"})
+
+    @app.post("/api/internal/dsh-bridge/device.file.transfer")
+    async def dsh_device_file_transfer(request: Request) -> JSONResponse:
+        """device.file.transfer（文件分块回调）：只为当前 DSH 激活读写票据对应的有界数据。"""
+        payload, session = await dsh_callback_body(request)
+        base = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
+                "context_revision", "activation_id", "device_id", "connection_generation",
+                "executor_generation", "parent_request_id", "transfer_id", "action"}
+        action = payload.get("action")
+        extras = {"read_chunk": {"offset", "limit"},
+            "upload_chunk": {"offset", "data_base64"}, "finish_upload": {"expected_bytes", "expected_sha256"},
+            "close": set()}
+        if not isinstance(action, str) or action not in extras or set(payload) != base | extras[action]:
+            raise HTTPException(status_code=422, detail="文件传输分块请求字段或操作无效。")
+        connection = await dsh_device_target(payload, session, required_capability="file_transfer")
+        if (not valid_device_request_id(payload.get("request_id"))
+                or not valid_device_request_id(payload.get("parent_request_id"))
+                or type(payload.get("connection_generation")) is not int
+                or payload["connection_generation"] != connection.connection_generation
+                or type(payload.get("executor_generation")) is not int
+                or payload["executor_generation"] != connection.executor_generation
+                or payload.get("transfer_id") != device_file_transfer_id(connection, payload["parent_request_id"])):
+            raise HTTPException(status_code=409, detail="文件传输票据与原请求、设备或代次不匹配。")
+        store = runtime.device_file_transfer_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+        key = {"transfer_id":payload["transfer_id"],"device_id":connection.device_id,
+               "connection_generation":connection.connection_generation,
+               "executor_generation":connection.executor_generation}
+        try:
+            if action == "read_chunk":
+                if type(payload["offset"]) is not int or type(payload["limit"]) is not int:
+                    raise ValueError("文件分块读取偏移或上限无效。")
+                result = await asyncio.to_thread(store.read_chunk, **key, offset=payload["offset"], limit=payload["limit"])
+            elif action == "upload_chunk":
+                if type(payload["offset"]) is not int or not isinstance(payload["data_base64"], str):
+                    raise ValueError("文件分块上传字段无效。")
+                result = await asyncio.to_thread(store.append_core_chunk, **key,
+                    offset=payload["offset"], data_base64=payload["data_base64"])
+            elif action == "finish_upload":
+                if type(payload["expected_bytes"]) is not int or not isinstance(payload["expected_sha256"], str):
+                    raise ValueError("附件完成摘要字段无效。")
+                finished = await asyncio.to_thread(store.finish_core_upload, **key,
+                    expected_bytes=payload["expected_bytes"], expected_sha256=payload["expected_sha256"])
+                if session.activation_id != payload["activation_id"]:
+                    raise HTTPException(status_code=409, detail="附件校验期间 DSH 激活已结束。")
+                source_task_id: str | None = None
+                if connection.device_id == "local":
+                    result = await asyncio.to_thread(store.commit_local_file, **key,
+                        target_path=finished["target_path"])
+                    status = "succeeded"
+                else:
+                    ticket = await asyncio.to_thread(store.device_download_ticket, **key)
+                    source_task_id = device_file_subtask_id(payload["parent_request_id"], "sftp")
+                    task_arguments = {"local_path":ticket["target_path"],"remote_path":ticket["sftp_path"],
+                        "transfer_id":payload["transfer_id"],"sha256":ticket["sha256"],
+                        "maximum_bytes":max(1,ticket["bytes"])}
+                    try:
+                        task_record = await runtime.execute_device_task(request_id=source_task_id,
+                            device_id=connection.device_id, operation="file.sftp.download",
+                            arguments=task_arguments, timeout_seconds=600.0)
+                    except Exception as exc:
+                        from ..devices.task_journal import TaskConflict
+                        from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
+                        if isinstance(exc, TaskConflict):
+                            raise HTTPException(status_code=409, detail="设备文件写入编号已绑定其他任务内容。") from exc
+                        if isinstance(exc, DeviceOutcomeUnknown):
+                            task_record = await runtime.query_device_task(source_task_id, connection.device_id)
+                        elif isinstance(exc, (DeviceUnavailable, RuntimeError)):
+                            raise HTTPException(status_code=503, detail="固定目标设备文件写入通道不可用；不会改投本机。") from exc
+                        else:
+                            raise
+                    if task_record is None or task_record.status == "unknown":
+                        status, result = "unknown", None
+                    elif task_record.status != "succeeded" or not isinstance(task_record.result, dict):
+                        status, result = "failed", task_record.result
+                    else:
+                        receipt = task_record.result
+                        if (receipt.get("transfer_id") != payload["transfer_id"]
+                                or receipt.get("path") != ticket["sftp_path"]
+                                or receipt.get("bytes") != ticket["bytes"]
+                                or receipt.get("sha256") != ticket["sha256"]):
+                            raise HTTPException(status_code=502, detail="设备 SFTP 写入回执与审批附件摘要不匹配。")
+                        status, result = "succeeded", {"path":ticket["target_path"],"bytes":ticket["bytes"],
+                            "sha256":ticket["sha256"],"transfer_id":payload["transfer_id"]}
+                if session.activation_id != payload["activation_id"]:
+                    raise HTTPException(status_code=409, detail="文件写入返回期间 DSH 激活已结束；请查询原任务。")
+                return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
+                    "task":{"request_id":payload["parent_request_id"],"device_id":connection.device_id,
+                        "operation":"file.write","status":status,"result":result,
+                        **({"source_task_id":source_task_id} if status == "unknown" and source_task_id else {})},
+                    "fields":{"task":"已审批文件写入原任务；未知状态须按 source_task_id 查询，不得重放"}},
+                    headers={"Cache-Control":"no-store"})
+            else:
+                result = {"closed": await asyncio.to_thread(store.close, **key)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="文件传输票据状态、代次或内容校验失败。") from exc
+        if session.activation_id != payload["activation_id"]:
+            raise HTTPException(status_code=409, detail="文件分块返回期间 DSH 激活已结束。")
+        return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted","transfer":result,
+            "fields":{"transfer":"固定设备、代次和原请求绑定的分块收据"}},headers={"Cache-Control":"no-store"})
+
     @app.post("/api/internal/dsh-bridge/screen.capture")
     async def dsh_screen_capture(request: Request) -> JSONResponse:
         """screen.capture（DSH 按需截屏）：限于当前有效激活，并复用唯一屏幕捕获服务。"""
@@ -436,14 +2180,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if session.activation_id != activation_id:
             raise HTTPException(status_code=409, detail="截图请求所属激活已失效，请等待当前任务状态刷新。")
         service = runtime.history.screen_capture
+        device_id = payload.get("device_id")
+        if device_id is not None and (not isinstance(device_id, str) or not device_id
+                                      or len(device_id) > 128 or device_id != device_id.strip()):
+            raise HTTPException(status_code=422, detail="截图目标设备编号无效。")
         if not service.config.enabled:
             raise HTTPException(status_code=409, detail="屏幕图像设置已关闭，无法捕获屏幕。")
-        if not service.available:
+        if not service.available_for(device_id):
             raise HTTPException(status_code=503, detail="屏幕捕获组件当前不可用。")
         generation = service.generation
         lease_generation = service.lease_generation("dsh", activation_id)
         try:
-            packet = await service.grab(source="dsh", scope=activation_id)
+            packet = await service.grab(source="dsh", scope=activation_id, device_id=device_id)
         except asyncio.TimeoutError as exc:
             raise HTTPException(status_code=504, detail="屏幕捕获超过 3 秒时限。") from exc
         except RuntimeError as exc:
@@ -1182,7 +2930,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.post("/api/v1/tts/operations/{operation_id}/cancel")
     async def cancel_tts_operation(operation_id: str):
         try:
-            return tts_voice_operations_or_503().cancel(operation_id)
+            return await tts_voice_operations_or_503().cancel_confirmed(operation_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="音色操作不存在或已过期。") from exc
 

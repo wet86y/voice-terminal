@@ -221,7 +221,9 @@ def test_delayed_detection_preserves_all_post_wake_frames_and_drains_live_captur
         assert [f.start_sample for f in context.frames] == [320, 640, 960, 1280]
         controller.health_release.set()
         await context.tasks[1]
-        controller.capture = SimpleNamespace(queue=asyncio.Queue())
+        capture_queue = asyncio.Queue()
+        controller.capture = SimpleNamespace(queue=capture_queue, pending_frame_count=capture_queue.qsize,
+                                             read_pending_frame=capture_queue.get_nowait)
         controller.capture.queue.put_nowait(AudioFrame(b"\0\0" * 320, 1920, .12))
         await controller._buffer_wake_frame(AudioFrame(b"\0\0" * 320, 1600, .1))
         assert [f.start_sample for f in controller.replayed] == [320, 640, 960, 1280, 1600, 1920]

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -1622,7 +1623,9 @@ class AudioCppTtsSession:
                 callback = self.audio_rejected_callback
                 if callable(callback):
                     try:
-                        callback()
+                        callback_result = callback()
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
                     except Exception:
                         logger.exception("audio_cpp_tts.reject_playback_failed")
                 logger.warning(

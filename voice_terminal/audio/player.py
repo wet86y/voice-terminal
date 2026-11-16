@@ -7,9 +7,11 @@ import logging
 import threading
 import time
 from typing import Any, Callable
+from uuid import uuid4
 
 from .devices import resolve_device
 from .replacement import ReplacementTransition
+from ..devices.contracts import PlaybackOutcomeUnknown, PlaybackReplacementResult, PlaybackReplacementTicket
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +30,14 @@ class PlaybackSnapshot:
     buffered_ms: int
     output_estimated_ms: int
     started: bool
-    captured_at: float
+    captured_at: float  # captured_at（设备单调时钟快照时刻，秒）。
     precision: str = "callback"
     device_output_time: float | None = None
+    device_time_us: int | None = None  # device_time_us（设备单调时钟快照时刻，微秒）。
+
+    def __post_init__(self):
+        if self.device_time_us is None:
+            object.__setattr__(self, "device_time_us", round(self.captured_at * 1_000_000))
 
     @property
     def remaining_ms(self) -> int:
@@ -46,6 +53,7 @@ class PlaybackSnapshot:
             "remaining_ms": self.remaining_ms,
             "started": self.started,
             "captured_at": self.captured_at,
+            "device_time_us": self.device_time_us,
             "precision": self.precision,
             "device_output_time": self.device_output_time,
         }
@@ -100,6 +108,7 @@ class PcmPlayer:
         self._render_points: deque[tuple[float, int]] = deque(maxlen=256)
         self._last_stop_snapshot: PlaybackSnapshot | None = None
         self._replacement: ReplacementTransition | None = None  # _replacement（独立旧音收尾及后继淡入）。
+        self._replacement_tickets: dict[str, ReplacementTransition] = {}  # _replacement_tickets（进程内过渡对象只由编号索引）。
         self._resolved_device: str | int | None = None
         self._last_callback_status: str | None = None
         self._first_rendered_at: float | None = None
@@ -110,6 +119,16 @@ class PcmPlayer:
         self._stream_resume_bytes = 0  # 欠载后恢复播放所需的连续音频储备。
         self._stream_waiting = False
         self._stream_complete = False
+        self._remote_enqueue_audio: Callable[[str, int, bytes], Any] | None = None  # _remote_enqueue_audio（异步固定设备 PCM 入队）。
+        self._remote_is_bound: Callable[[str], bool] | None = None  # _remote_is_bound（播放键是否已固定到远端）。
+        self._remote_progress_reader: Callable[[str], dict[str, Any] | None] | None = None  # _remote_progress_reader（远端只读输出快照）。
+        self._remote_buffered_reader: Callable[[str], int] | None = None  # _remote_buffered_reader（远端未接纳与设备缓冲时长）。
+        self._remote_output_waiter: Callable[[str, float], Any] | None = None  # _remote_output_waiter（等待实际设备输出结算）。
+        self._remote_finish_stream: Callable[[str], Any] | None = None  # _remote_finish_stream（标记远端流结束）。
+        self._remote_transactions: Callable[[str], Any] | None = None  # _remote_transactions（按固定设备取得播放事务接口）。
+        self._remote_ticket_transactions: dict[str, Any] = {}  # _remote_ticket_transactions（替换票据固定的远端接口）。
+        self._remote_active_key: str | None = None  # _remote_active_key（最近一次走远端输出的播放键）。
+        self._remote_started_keys: set[str] = set()  # _remote_started_keys（已通知控制器的远端起播键）。
         self._underrun_callbacks = 0  # underrun_callbacks（已起播后的欠载回调数）。
         self._underrun_ms = 0.0  # underrun_ms（已起播后因欠载静音的总毫秒）。
         self._underrun_episodes = 0  # underrun_episodes（欠载片段数：连续静音回调算一次）。
@@ -152,6 +171,65 @@ class PcmPlayer:
     def allow(self, key: str) -> None:
         self._allow(key, user_initiated=False)
 
+    def configure_remote_output(
+        self, *, enqueue: Callable[[str, int, bytes], Any],
+        is_bound: Callable[[str], bool], progress: Callable[[str], dict[str, Any] | None],
+        buffered_ms: Callable[[str], int], wait_until_complete: Callable[[str, float], Any],
+        finish_stream: Callable[[str], Any], transactions: Callable[[str], Any],
+    ) -> None:
+        """configure_remote_output（安装远端输出路由）：路由按播放键固定，不改变本机实现。"""
+        self._remote_enqueue_audio = enqueue
+        self._remote_is_bound = is_bound
+        self._remote_progress_reader = progress
+        self._remote_buffered_reader = buffered_ms
+        self._remote_output_waiter = wait_until_complete
+        self._remote_finish_stream = finish_stream
+        self._remote_transactions = transactions
+
+    async def enqueue_async(self, turn_id: str, pcm: bytes) -> None:
+        """enqueue_async（语音管线入队）：远端播放必须等待有界发送窗口背压。"""
+        if not pcm:
+            return
+        while True:
+            with self._queue_lock:
+                if self._gated and turn_id != self._allowed_key:
+                    return
+                held = self._held_key == turn_id or self._paused_key == turn_id
+            if not held:
+                break
+            await asyncio.sleep(0.01)
+        route = self._remote_enqueue_audio
+        if route is not None:
+            handled = await route(turn_id, self.sample_rate, bytes(pcm))
+            if handled:
+                self._remote_active_key = turn_id
+                with self._queue_lock:
+                    if self._active_turn != turn_id:
+                        self._clear_unlocked()
+                        self._active_turn = turn_id
+                return
+        self.enqueue(turn_id, pcm)
+
+    async def finish_stream_async(self, key: str) -> None:
+        """finish_stream_async（结束远端音频流）：完成标记之后才允许等待设备输出。"""
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            if self._remote_finish_stream is None:
+                raise PlaybackOutcomeUnknown("远端播放没有结束标记通道。", device_id=None,
+                                             operation="finish_stream")
+            await self._remote_finish_stream(key)
+            return
+        self.finish_stream(key)
+
+    def notify_remote_playback_started(self, key: str) -> None:
+        """notify_remote_playback_started（发布远端起播边界）：仅凭设备输出快照触发一次。"""
+        with self._queue_lock:
+            if key in self._remote_started_keys:
+                return
+            self._remote_started_keys.add(key)
+        callback = self.on_playback_started
+        if callback is not None:
+            callback(key)
+
     def allow_user_initiated(self, key: str) -> None:
         """allow_user_initiated（允许用户主动播放）：只为指定试听任务豁免被动静默策略。"""
         self._allow(key, user_initiated=True)
@@ -164,6 +242,8 @@ class PcmPlayer:
             self._clear_unlocked()
             self._gated = True
             self._allowed_key = key
+            if self._remote_active_key != key:
+                self._remote_active_key = None
             if user_initiated:
                 self._user_initiated_key = key
 
@@ -237,6 +317,8 @@ class PcmPlayer:
         """
         if not key:
             return False
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            return False
         with self._queue_lock:
             if self._started_for_turn == key:
                 return False
@@ -309,6 +391,8 @@ class PcmPlayer:
         """Release a held playback generation without resetting its queue."""
         if not key:
             return False
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            return False
         with self._queue_lock:
             if self._held_key == key:
                 self._held_key = None
@@ -323,6 +407,8 @@ class PcmPlayer:
     def pause(self, key: str) -> bool:
         """Pause an already audible generation without discarding queued PCM."""
         if not key:
+            return False
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
             return False
         with self._queue_lock:
             if self._active_turn != key:
@@ -342,6 +428,14 @@ class PcmPlayer:
         callback cannot enqueue audio between the snapshot and the gate.
         """
 
+        with self._queue_lock:
+            active = self._active_turn
+        remote_key = key or self._remote_active_key or active
+        if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
+            raise PlaybackOutcomeUnknown(
+                "固定远端设备的播放停止必须等待异步设备回执。",
+                operation="stop_and_snapshot",
+            )
         with self._queue_lock:
             transition = self._replacement
             if key is not None and transition is not None and key == transition.old_key:
@@ -363,17 +457,150 @@ class PcmPlayer:
             self._last_stop_snapshot = snapshot
             return snapshot
 
+    async def stop_and_snapshot_confirmed(self, key: str | None = None) -> PlaybackSnapshot:
+        """stop_and_snapshot_confirmed（等待设备停止回执）：本机即时执行，远端实现等待原设备回执。"""
+        with self._queue_lock:
+            active = self._active_turn
+        remote_key = key or self._remote_active_key or active
+        if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
+            transactions = self._remote_transactions(remote_key) if self._remote_transactions else None
+            if transactions is None:
+                raise PlaybackOutcomeUnknown("固定远端设备没有可用的播放事务通道。",
+                                             operation="stop_and_snapshot")
+            snapshot = await transactions.stop_and_snapshot_confirmed(remote_key)
+            with self._queue_lock:
+                if self._remote_active_key == remote_key:
+                    self._remote_active_key = None
+                if self._active_turn == remote_key:
+                    self._gated = True
+                    self._allowed_key = None
+            return snapshot
+        return self.stop_and_snapshot(key)
+
+    async def pause_confirmed(self, key: str) -> bool:
+        """pause_confirmed（等待固定远端设备确认暂停；本机沿用同步暂停契约）。"""
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            transactions = self._remote_transactions(key) if self._remote_transactions else None
+            if transactions is None:
+                raise PlaybackOutcomeUnknown("固定远端设备没有可用的播放事务通道。",
+                                             operation="pause")
+            return await transactions.pause_confirmed(key)
+        return self.pause(key)
+
+    async def resume_confirmed(self, key: str) -> bool:
+        """resume_confirmed（等待固定远端设备确认恢复；本机沿用同步恢复契约）。"""
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            transactions = self._remote_transactions(key) if self._remote_transactions else None
+            if transactions is None:
+                raise PlaybackOutcomeUnknown("固定远端设备没有可用的播放事务通道。",
+                                             operation="resume")
+            return await transactions.resume_confirmed(key)
+        return self.resume(key)
+
+    async def prepare_replacement_transaction(self, key: str | None, *, max_ms: int = 600) -> PlaybackReplacementTicket:
+        """prepare_replacement_transaction（受理替换事务）：公开编号和快照，不泄漏内存过渡对象。"""
+        with self._queue_lock:
+            active = self._active_turn
+        remote_key = key or self._remote_active_key or active
+        if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
+            transactions = self._remote_transactions(remote_key) if self._remote_transactions else None
+            if transactions is None:
+                raise PlaybackOutcomeUnknown("固定远端设备没有可用的播放事务通道。",
+                                             operation="prepare_replacement")
+            ticket = await transactions.prepare_replacement_transaction(remote_key, max_ms=max_ms)
+            self._remote_ticket_transactions[ticket.replacement_id] = transactions
+            return ticket
+        transition, snapshot = self.prepare_replacement(key, max_ms=max_ms)
+        replacement_id = uuid4().hex
+        with self._queue_lock:
+            self._replacement_tickets[replacement_id] = transition
+        return PlaybackReplacementTicket(replacement_id, transition.old_key, snapshot,
+                                         round(transition.started_at * 1_000_000))
+
+    @staticmethod
+    def _replacement_result(ticket, transition, snapshot) -> PlaybackReplacementResult:
+        """Create a wire-safe receipt using only the source device clock."""
+        return PlaybackReplacementResult(
+            ticket.replacement_id, snapshot, transition.reason,
+            round(transition.started_at * 1_000_000), round((transition.finished_at or time.monotonic()) * 1_000_000),
+            {key: round(value * 1_000_000) for key, value in transition.events.items()},
+            transition.attenuated_range_ms,
+        )
+
+    async def bind_replacement_transaction(self, ticket: PlaybackReplacementTicket, key: str) -> bool:
+        """bind_replacement_transaction（绑定后继事务）：按票据编号解析本地私有过渡对象。"""
+        transactions = self._remote_ticket_transactions.get(ticket.replacement_id)
+        if transactions is not None:
+            return await transactions.bind_replacement_transaction(ticket, key)
+        with self._queue_lock:
+            transition = self._replacement_tickets.get(ticket.replacement_id)
+        if transition is None:
+            return False
+        return self.bind_replacement(transition, key)
+
+    async def abort_replacement_transaction(self, ticket: PlaybackReplacementTicket, reason: str = "stopped") -> PlaybackReplacementResult:
+        """abort_replacement_transaction（撤销替换票据）：撤销后返回设备确认的结算快照。"""
+        transactions = self._remote_ticket_transactions.get(ticket.replacement_id)
+        if transactions is not None:
+            try:
+                return await transactions.abort_replacement_transaction(ticket, reason)
+            finally:
+                self._remote_ticket_transactions.pop(ticket.replacement_id, None)
+        with self._queue_lock:
+            transition = self._replacement_tickets.get(ticket.replacement_id)
+            if transition is None:
+                raise PlaybackOutcomeUnknown("替换票据不存在或已过期，不能确认播放结算。")
+            if self._replacement is transition:
+                self._abort_replacement_unlocked(reason)
+            else:
+                transition.finish(reason, time.monotonic())
+        snapshot = await self.wait_replacement(transition)
+        if transition.finished_at is None or transition.reason is None:
+            raise PlaybackOutcomeUnknown("替换过渡撤销后仍未取得结束回执。")
+        result = self._replacement_result(ticket, transition, snapshot)
+        with self._queue_lock:
+            self._replacement_tickets.pop(ticket.replacement_id, None)
+        return result
+
+    async def wait_replacement_transaction(self, ticket: PlaybackReplacementTicket) -> PlaybackReplacementResult:
+        """wait_replacement_transaction（等待替换结算）：回执始终关联原事务编号。"""
+        transactions = self._remote_ticket_transactions.get(ticket.replacement_id)
+        if transactions is not None:
+            try:
+                return await transactions.wait_replacement_transaction(ticket)
+            finally:
+                self._remote_ticket_transactions.pop(ticket.replacement_id, None)
+        with self._queue_lock:
+            transition = self._replacement_tickets.get(ticket.replacement_id)
+        if transition is None:
+            raise PlaybackOutcomeUnknown("替换票据不存在或已过期，不能确认播放结算。")
+        snapshot = await self.wait_replacement(transition)
+        if transition.finished_at is None or transition.reason is None:
+            raise PlaybackOutcomeUnknown("替换过渡结束状态尚未确认。")
+        result = self._replacement_result(ticket, transition, snapshot)
+        with self._queue_lock:
+            self._replacement_tickets.pop(ticket.replacement_id, None)
+        return result
+
     @property
     def last_stop_snapshot(self) -> PlaybackSnapshot | None:
         with self._queue_lock:
             return self._last_stop_snapshot
 
     def has_started(self, key: str) -> bool:
+        if self._remote_is_bound is not None and self._remote_is_bound(key):
+            progress = self._remote_progress_reader(key) if self._remote_progress_reader else None
+            return bool(progress and progress.get("started") is True)
         with self._queue_lock:
             return self._started_for_turn == key
 
     @property
     def buffered_ms(self) -> int:
+        with self._queue_lock:
+            active = self._active_turn or self._remote_active_key
+        if (active is not None and self._remote_is_bound is not None
+                and self._remote_is_bound(active) and self._remote_buffered_reader is not None):
+            return max(0, int(self._remote_buffered_reader(active)))
         bytes_per_second = self.sample_rate * self.channels * 2
         with self._queue_lock:
             buffered_bytes = self._buffered_bytes
@@ -406,6 +633,20 @@ class PcmPlayer:
         playback backend.  A key mismatch returns an empty snapshot so a
         previous turn cannot be mistaken for the current one.
         """
+
+        with self._queue_lock:
+            active = self._active_turn
+        remote_key = key or self._remote_active_key or active
+        if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
+            remote = self._remote_progress_reader(remote_key) if self._remote_progress_reader else None
+            if remote is None:
+                return {
+                    "key": remote_key, "enqueued_ms": 0, "played_ms": 0, "buffered_ms": 0,
+                    "started": False, "output_estimated_ms": 0, "device_output_time": None,
+                    "precision": "unknown",
+                }
+            return {**remote, "key": remote_key,
+                    "device_output_time": remote.get("host_output_time")}
 
         bytes_per_second = self.sample_rate * self.channels * 2
         with self._queue_lock:
@@ -483,6 +724,13 @@ class PcmPlayer:
 
     def output_position_at(self, captured_at: float) -> int | None:
         """Estimate the callback-consumed position at a monotonic timestamp."""
+
+        with self._queue_lock:
+            active = self._active_turn
+        if active is not None and self._remote_is_bound is not None and self._remote_is_bound(active):
+            # Remote device timestamps are mapped by the media gateway.  The
+            # local callback history is not evidence for a remote output key.
+            return None
 
         with self._queue_lock:
             if not self._render_points:
@@ -762,6 +1010,15 @@ class PcmPlayer:
 
     async def wait_until_output_complete(self, timeout_seconds: float = 10.0) -> None:
         """Wait for callback data and configured device tail to be output."""
+        with self._queue_lock:
+            active = self._active_turn
+        remote_key = self._remote_active_key or active
+        if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
+            if self._remote_output_waiter is None:
+                raise PlaybackOutcomeUnknown("固定远端设备没有输出结算通道。",
+                                             operation="wait_until_output_complete")
+            await self._remote_output_waiter(remote_key, timeout_seconds)
+            return
         # Keep ``wait_until_empty`` as the compatibility seam used by older
         # providers/tests, then account for the hardware tail when one is
         # configured.  The queue becoming empty alone is still not treated as

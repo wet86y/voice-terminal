@@ -12,6 +12,7 @@
 ## 架构
 
 - [系统架构与生命周期](architecture/architecture.md)
+- [分布式设备运行架构与开发进度](architecture/distributed-device-runtime.md)
 - [项目进程管理与系统显示身份](architecture/process-management.md)
 - [兼容性组件与更新交接](architecture/compatibility-component.md)
 - [Bridge 2.0（第二版桥接协议）](architecture/bridge-2.0-protocol.md)

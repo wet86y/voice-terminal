@@ -42,7 +42,7 @@ def test_status_exposes_only_active_online_backend():
                 assert status.status_code == 200
                 assert status.json()["backend"] == "minimax"
                 assert status.json()["worker"] == {"state": "stopped"}
-                assert {row["id"] for row in status.json()["models"]} == {"minimax-female-shaonv-zh", "tangyuge-v2pp-d78cf598"}
+                assert status.json()["models"] == []  # 未安装本地模型包时不虚构旧固定模型清单。
                 snapshot = await client.get("/api/v1/product/snapshot")
                 assert snapshot.status_code == 200
                 assert snapshot.json()["runtime"]["tts_worker"] == {"state": "stopped"}

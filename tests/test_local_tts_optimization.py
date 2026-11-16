@@ -222,19 +222,18 @@ def test_remote_retry_creates_fresh_session_instead_of_returning_failed_one():
     asyncio.run(scenario())
 
 
-def test_formal_local_retry_freezes_voice_steps_and_transaction_lease(tmp_path):
+def test_formal_local_retry_freezes_voice_revision_and_transaction_lease(tmp_path):
     async def scenario():
         from voice_terminal.tts.voices import ModelVoiceLibraries
         from tests.test_tts_voices import _wav_bytes, _create_voice
+        from voice_terminal.providers.aniflive_tts import AnifLiveTtsClient
         output, _, _, _ = _sentence_output_harness()
-        client = _fake_client(lambda request: _response())
-        del client.resolve_voice  # 使用正式解析方法，替代协议夹具的固定音色。
-        libraries = client.voice_library = ModelVoiceLibraries(tmp_path)
-        library = libraries.for_model("voxcpm1")
+        libraries = ModelVoiceLibraries(tmp_path)
+        library = libraries.for_model("test-model")
         library.register_default(_wav_bytes(), "默认转写。")
         asset, voice = _create_voice(library)
         library.activate({"voice_id": voice["id"], "revision": 1})
-        client.active_voice_provider = lambda model: libraries.for_model(model).active_selection
+        client = AnifLiveTtsClient(model_id="test-model", voice_library=library)
         output.tts = client
         output.handle = None
         finished = asyncio.Event()
@@ -243,14 +242,13 @@ def test_formal_local_retry_freezes_voice_steps_and_transaction_lease(tmp_path):
         output._run = run
         handle = await output.begin(("episode", "frozen"), "frozen-turn")
         original = output._new_tts_session(handle.workspace)
-        assert original.turn_id == "frozen-turn" and original.speech_id == handle.speech_id
+        assert original.turn_id == "frozen-turn"
         library.update_voice(voice["id"], 1, {**voice, "name": "热更新名称"})
-        client.inference_steps_by_model["voxcpm1"] = 15
         await original.close()
         retried = output._new_tts_session(handle.workspace, fresh=True)
-        assert retried.turn_id == "frozen-turn" and retried.speech_id == handle.speech_id
+        assert retried.turn_id == "frozen-turn"
         assert retried.voice_snapshot.revision == 1
-        assert retried._inference_steps == 10
+        assert retried.voice_snapshot.reference_text == voice["reference_text"]
         await retried.close()
         library.delete_voice(voice["id"])
         library.collect_garbage(max_age_seconds=-1)

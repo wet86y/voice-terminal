@@ -9,3 +9,10 @@ export const settingsSections = [
   { id: "workspace", label: "关于", hint: "应用更新与工作区", description: "应用更新与工作区迁移", icon: "⌂" },
 ] as const;
 export type SettingsSection = (typeof settingsSections)[number]["id"];
+
+/** desktopSettingsSections（桌面管理分区）：仅正式管理界面提供设备角色维护。 */
+export const desktopSettingsSections = [
+  ...settingsSections,
+  { id: "devices", label: "设备与角色", hint: "本机、共享主机与远端连接", description: "管理设备身份、主机信任和 SSH 连接", icon: "⌘" },
+] as const;
+export type DesktopSettingsSection = (typeof desktopSettingsSections)[number]["id"];

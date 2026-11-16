@@ -6,33 +6,57 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub mod download;
-pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
 pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
-pub mod native_ui;
-pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志。
-pub mod workspace;
-pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
-pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
-mod runtime_delta; // runtime_delta（依赖文件增量）：保持未变化文件，支持卸载与崩溃回滚。
-pub mod resources; // resources（原生资源管理）：不依赖业务后端。
-pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
-pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
-pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
-pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
 pub mod compatibility; // compatibility（兼容性组件）：版本化规则、安装迁移与即时组件盘点。
-pub mod component_reset; // component_reset（原生组件重置）。
 pub mod component_maintenance; // component_maintenance（组件校验交接）：分发器检查，本体组件列表修复。
 pub mod component_recovery; // component_recovery（组件共用恢复）：分类重试、局部重建和全面校验导流。
+pub mod component_reset; // component_reset（原生组件重置）。
 mod component_upgrade; // component_upgrade（组件兼容迁移）：由本体资源任务复用随包资源并处置旧版资料。
+pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
+pub mod device_audio; // device_audio（原生音频端点）：读取 WASAPI 默认端点格式，不采集或播放。
+pub mod device_config; // device_config（设备配置）：独立格式及保留原件的兼容校验。
+#[cfg(feature = "ssh-device")]
+pub mod device_receipts; // device_receipts（设备任务回执）：断线后保留结果并按原编号恢复结算。
+#[cfg(feature = "ssh-device")]
+pub mod client_tts; // client_tts（无 Python 客户端 MiniMax 双向流式语音合成）。
+pub mod device_files; // device_files（设备文件任务）：安全目录清单和受限小文件读取。
+pub mod device_helper; // device_helper（设备桌面辅助进程）：受管管道与生命周期。
+pub mod device_protocol; // device_protocol（设备音频协议）：原生侧有界二进制封装。
+pub mod device_terminal; // device_terminal（设备终端）：会话化、只读命令任务与增量输出。
+pub mod device_worker; // device_worker（设备工作进程）：不加载解释器的有界控制入口。
+pub mod download;
+pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
+pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
+pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
+pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志。
+#[cfg(all(windows, feature = "native-audio"))]
+pub mod native_aec; // native_aec（原生 WebRTC AEC）：固定 1.0.1 对应源码与 C ABI。
+#[cfg(all(windows, feature = "native-audio"))]
+pub mod native_opus; // native_opus（固定 libopus 1.6.1 编解码器）：原始 PCM 帧与 Opus 流适配。
+#[cfg(all(windows, feature = "native-audio"))]
+pub mod native_audio_processing; // native_audio_processing（采集、AEC、降噪与近端 VAD 汇接）。
+pub mod native_ui;
+#[cfg(windows)]
+pub mod native_vad; // native_vad（原生 WebRTC VAD）：静态链接固定 C 源码，不加载 Python。
+pub mod process_host;
+pub mod resources; // resources（原生资源管理）：不依赖业务后端。
+pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
+pub mod system_feature; // system_feature（系统功能）：共享主机专用的 Windows 能力查询与受管任务。
+mod runtime_delta; // runtime_delta（依赖文件增量）：保持未变化文件，支持卸载与崩溃回滚。
 pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
-pub mod process_host; // process_host（项目工作进程）：统一系统身份并复用现有解释器运行库。
+#[cfg(feature = "ssh-device")]
+pub mod ssh_device; // ssh_device（固定主机指纹的原生 SSH 业务通道）。
+pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
+pub mod wasapi_capture; // wasapi_capture（WASAPI 采集流）：事件驱动默认麦克风及 PCM 帧转换。
+pub mod wasapi_render; // wasapi_render（WASAPI 播放流）：共享模式默认扬声器与有界 PCM 储备。
+pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
+pub mod workspace; // process_host（项目工作进程）：统一系统身份并复用现有解释器运行库。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LaunchChannel {
-    Product, // Product（统一正式程序）：工作区由可执行文件位置确定。
-    Development, // Development（历史开发标签）：仅用于兼容旧记录。
+    Product,      // Product（统一正式程序）：工作区由可执行文件位置确定。
+    Development,  // Development（历史开发标签）：仅用于兼容旧记录。
     Distribution, // Distribution（历史分发标签）：仅用于兼容旧记录。
 }
 
@@ -41,7 +65,11 @@ impl LaunchChannel {
         Self::Product
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Product => "product", Self::Development => "development", Self::Distribution => "distribution" }
+        match self {
+            Self::Product => "product",
+            Self::Development => "development",
+            Self::Distribution => "distribution",
+        }
     }
 }
 
@@ -71,17 +99,17 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 #[derive(Debug, Clone)]
 pub struct LaunchContext {
     pub channel: LaunchChannel, // channel（启动渠道）：与调试／优化构建级别分离。
-    pub workspace_id: String, // workspace_id（工作区稳定编号）。
-    pub install: PathBuf,          // install（应用解压根目录）。
-    pub program: PathBuf,          // program（当前程序包／源码目录）。
-    pub data: PathBuf,             // data（独立用户数据目录）。
-    pub python: PathBuf,           // python（明确的后端解释器）。
-    pub models: Option<PathBuf>,   // models（只读模型目录）。
+    pub workspace_id: String,   // workspace_id（工作区稳定编号）。
+    pub install: PathBuf,       // install（应用解压根目录）。
+    pub program: PathBuf,       // program（当前程序包／源码目录）。
+    pub data: PathBuf,          // data（独立用户数据目录）。
+    pub python: PathBuf,        // python（明确的后端解释器）。
+    pub models: Option<PathBuf>, // models（只读模型目录）。
     pub webview2: Option<PathBuf>, // webview2（固定网页渲染引擎）。
-    pub dsh: Option<PathBuf>,      // dsh（代理宿主的完整运行产物）。
-    pub node: Option<PathBuf>,     // node（宿主清单内的脚本解释器）。
-    pub dev: bool,                 // dev（前端开发服务器模式）。
-    pub diagnostic: bool,          // diagnostic（不启动业务的入口诊断模式）。
+    pub dsh: Option<PathBuf>,   // dsh（代理宿主的完整运行产物）。
+    pub node: Option<PathBuf>,  // node（宿主清单内的脚本解释器）。
+    pub dev: bool,              // dev（前端开发服务器模式）。
+    pub diagnostic: bool,       // diagnostic（不启动业务的入口诊断模式）。
 }
 
 pub fn canonical_path(path: &Path) -> Result<PathBuf, String> {
@@ -170,7 +198,10 @@ impl LaunchContext {
             || selection.python != "runtimes/python/python.exe"
             || selection.models != "models"
             || selection.dsh.as_deref() != Some("runtimes/dsh")
-            || !matches!(selection.webview2.as_deref(), None | Some("runtimes/webview2"))
+            || !matches!(
+                selection.webview2.as_deref(),
+                None | Some("runtimes/webview2")
+            )
         {
             return Err("需要 schema=2（第二版）固定便携配置，请先执行布局迁移。".into());
         }
@@ -183,17 +214,31 @@ impl LaunchContext {
         let python = workspace::safe_path(&install, &selection.python)?;
         let models = Some(install.join(&selection.models));
         let webview2 = None; // 所有正式实例统一使用系统 Evergreen（自动更新网页引擎）。
-        let runtime = workspace::safe_path(&install,selection.dsh.as_ref().unwrap())?;
-        let metadata_path = workspace::safe_path(&runtime,"runtime.json")?;
+        let runtime = workspace::safe_path(&install, selection.dsh.as_ref().unwrap())?;
+        let metadata_path = workspace::safe_path(&runtime, "runtime.json")?;
         // node（宿主入口候选）不决定组件就绪；登记读取或解析异常由组件盘点与完整性维修报告。
         // 路径安全检查仍须成功，不能因允许损坏登记而读取目录联接之外的文件。
-        let node = read_json::<serde_json::Value>(&metadata_path).ok().and_then(|metadata| {
-            if metadata["source_kind"]=="npm_package" { dsh::target(&program).ok().and_then(|spec|dsh::discover(&spec,false).ok().map(|v|v.0)) } else {metadata["node"].as_str().or(metadata["executable"].as_str()).and_then(|relative| component(&runtime, relative).ok())}
-        });
+        let node = read_json::<serde_json::Value>(&metadata_path)
+            .ok()
+            .and_then(|metadata| {
+                if metadata["source_kind"] == "npm_package" {
+                    dsh::target(&program)
+                        .ok()
+                        .and_then(|spec| dsh::discover(&spec, false).ok().map(|v| v.0))
+                } else {
+                    metadata["node"]
+                        .as_str()
+                        .or(metadata["executable"].as_str())
+                        .and_then(|relative| component(&runtime, relative).ok())
+                }
+            });
         let identity: serde_json::Value = read_json(&install.join("portable.json"))?;
         let context = Self {
             channel: LaunchChannel::current(),
-            workspace_id: identity["workspace_id"].as_str().ok_or("工作区缺少稳定编号")?.to_string(),
+            workspace_id: identity["workspace_id"]
+                .as_str()
+                .ok_or("工作区缺少稳定编号")?
+                .to_string(),
             install,
             program,
             data,
@@ -215,7 +260,7 @@ impl LaunchContext {
     }
 
     fn from_argument_list(args: &[String]) -> Result<Self, String> {
-        Self::from_executable(&std::env::current_exe().map_err(|e|e.to_string())?, args)
+        Self::from_executable(&std::env::current_exe().map_err(|e| e.to_string())?, args)
     }
 
     // from_executable（统一入口解析）：只允许根入口或 app（程序本体）内的宿主。
@@ -226,44 +271,101 @@ impl LaunchContext {
                 .and_then(|i| args.get(i + 1))
                 .cloned()
         };
-        if args.iter().any(|arg|["--root","--install","--data-dir","--python","--models","--webview2","--ui-preview"].contains(&arg.as_str())) {
-            return Err("正式入口不接受外部路径覆盖；调试请使用 --dev 和 --source-root（源码目录）。".into());
+        if args.iter().any(|arg| {
+            [
+                "--root",
+                "--install",
+                "--data-dir",
+                "--python",
+                "--models",
+                "--webview2",
+                "--ui-preview",
+            ]
+            .contains(&arg.as_str())
+        }) {
+            return Err(
+                "正式入口不接受外部路径覆盖；调试请使用 --dev 和 --source-root（源码目录）。"
+                    .into(),
+            );
         }
-        let mut seen=std::collections::HashSet::new();let mut i=0;
-        while i<args.len(){let arg=&args[i];if !seen.insert(arg){return Err(format!("启动参数重复：{arg}"));}
-            match arg.as_str(){"--dev"|"--diagnostic"|"--exit"=>{},"--source-root"|"--startup-handoff"|"--workspace-handoff"=>{i+=1;if args.get(i).is_none_or(|value|value.starts_with("--")){return Err(format!("启动参数缺少值：{arg}"));}},_=>return Err(format!("不支持的正式启动参数：{arg}"))}i+=1;
+        let mut seen = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if !seen.insert(arg) {
+                return Err(format!("启动参数重复：{arg}"));
+            }
+            match arg.as_str() {
+                "--dev" | "--diagnostic" | "--exit" => {}
+                "--source-root" | "--startup-handoff" | "--workspace-handoff" => {
+                    i += 1;
+                    if args.get(i).is_none_or(|value| value.starts_with("--")) {
+                        return Err(format!("启动参数缺少值：{arg}"));
+                    }
+                }
+                _ => return Err(format!("不支持的正式启动参数：{arg}")),
+            }
+            i += 1;
         }
-        let parent=executable.parent().ok_or("无法定位正式程序目录")?;
-        let root=if parent.join("portable.json").is_file(){parent}
-            else if parent.file_name().is_some_and(|name|name=="app")&&parent.parent().is_some_and(|root|root.join("portable.json").is_file()){
-                parent.parent().unwrap()
-            }else{return Err("正式程序旁缺少 portable.json（工作区布局）；请使用分发安装器重装。".into());};
-        if let Some(journal)=value("--workspace-handoff"){
-            let path=Path::new(&journal);let locator=workspace::Locator::for_task(path)?;
-            if locator.handoff_root(path)?!=canonical_path(root)?{return Err("工作区交接目标与正式入口位置不一致。".into());}
-        }else if workspace::pending_task(root)?.is_some(){return Err("存在未完成工作区事务，请通过工作区根目录正式入口恢复。".into());}
-        let mut context=Self::portable(root)?;
-        context.dev=args.iter().any(|arg|arg=="--dev");
-        context.diagnostic=args.iter().any(|arg|arg=="--diagnostic");
-        let source=value("--source-root");
-        if context.dev!=source.is_some(){return Err("--dev（源码热更新）与 --source-root（源码目录）必须同时提供。".into());}
-        if let Some(source)=source {
-            let source=canonical_path(Path::new(&source))?;
-            if !source.join("pyproject.toml").is_file()||!source.join("apps/desktop/Cargo.toml").is_file(){return Err("显式调试目录不是有效源码项目。".into());}
-            context.program=source;
+        let parent = executable.parent().ok_or("无法定位正式程序目录")?;
+        let root = if parent.join("portable.json").is_file() {
+            parent
+        } else if parent.file_name().is_some_and(|name| name == "app")
+            && parent
+                .parent()
+                .is_some_and(|root| root.join("portable.json").is_file())
+        {
+            parent.parent().unwrap()
+        } else {
+            return Err(
+                "正式程序旁缺少 portable.json（工作区布局）；请使用分发安装器重装。".into(),
+            );
+        };
+        if let Some(journal) = value("--workspace-handoff") {
+            let path = Path::new(&journal);
+            let locator = workspace::Locator::for_task(path)?;
+            if locator.handoff_root(path)? != canonical_path(root)? {
+                return Err("工作区交接目标与正式入口位置不一致。".into());
+            }
+        } else if workspace::pending_task(root)?.is_some() {
+            return Err("存在未完成工作区事务，请通过工作区根目录正式入口恢复。".into());
+        }
+        let mut context = Self::portable(root)?;
+        context.dev = args.iter().any(|arg| arg == "--dev");
+        context.diagnostic = args.iter().any(|arg| arg == "--diagnostic");
+        let source = value("--source-root");
+        if context.dev != source.is_some() {
+            return Err("--dev（源码热更新）与 --source-root（源码目录）必须同时提供。".into());
+        }
+        if let Some(source) = source {
+            let source = canonical_path(Path::new(&source))?;
+            if !source.join("pyproject.toml").is_file()
+                || !source.join("apps/desktop/Cargo.toml").is_file()
+            {
+                return Err("显式调试目录不是有效源码项目。".into());
+            }
+            context.program = source;
             context.validate()?;
         }
         Ok(context)
     }
 
-    pub fn installed_program(&self)->PathBuf {self.install.join("app")} // installed_program（正式资源清单目录）。
+    pub fn installed_program(&self) -> PathBuf {
+        self.install.join("app")
+    } // installed_program（正式资源清单目录）。
 
     /// refreshed_components（重读组件路径）：首次安装和替换组件后不沿用进程启动时的空路径。
-    pub fn refreshed_components(&self)->Result<Self,String>{
-        let mut current=Self::portable(&self.install)?;
-        if current.workspace_id!=self.workspace_id{return Err("工作区身份已变化，请重新打开正式入口。".into());}
-        current.program=self.program.clone();current.dev=self.dev;current.diagnostic=self.diagnostic;current.channel=self.channel;
-        current.validate()?;Ok(current)
+    pub fn refreshed_components(&self) -> Result<Self, String> {
+        let mut current = Self::portable(&self.install)?;
+        if current.workspace_id != self.workspace_id {
+            return Err("工作区身份已变化，请重新打开正式入口。".into());
+        }
+        current.program = self.program.clone();
+        current.dev = self.dev;
+        current.diagnostic = self.diagnostic;
+        current.channel = self.channel;
+        current.validate()?;
+        Ok(current)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -300,7 +402,9 @@ impl LaunchContext {
         let mut values = BTreeMap::new();
         values.insert("VOICE_LAUNCH_CHANNEL".into(), self.channel.label().into());
         values.insert("VOICE_WORKSPACE_ID".into(), self.workspace_id.clone());
-        if self.dev {values.insert("VOICE_SOURCE_DEBUG".into(), "1".into());}
+        if self.dev {
+            values.insert("VOICE_SOURCE_DEBUG".into(), "1".into());
+        }
         for (name, path) in [
             ("VOICE_INSTALL_ROOT", &self.install),
             ("VOICE_PROGRAM_ROOT", &self.program),
@@ -321,18 +425,38 @@ impl LaunchContext {
         values.insert("PYTHONUTF8".into(), "1".into());
         values.insert("PYTHONNOUSERSITE".into(), "1".into());
         if let Some(host) = process_host::current_host() {
-            values.insert("VOICE_PROCESS_HOST".into(), host.to_string_lossy().into_owned());
+            values.insert(
+                "VOICE_PROCESS_HOST".into(),
+                host.to_string_lossy().into_owned(),
+            );
         }
-        values.insert("VOICE_RESOURCE_POLICY".into(),self.data.join("config/runtime-resources.json").to_string_lossy().into_owned());
-        for (name, folder) in [("TEMP", "tmp/process"), ("TMP", "tmp/process"),
-            ("HF_HOME", "cache/huggingface"), ("MODELSCOPE_CACHE", "cache/modelscope"),
-            ("TORCH_HOME", "cache/torch"), ("PIP_CACHE_DIR", "cache/pip"),
-            ("CUDA_CACHE_PATH", "cache/cuda"), ("TORCH_EXTENSIONS_DIR", "cache/torch/extensions"),
-            ("MPLCONFIGDIR", "cache/matplotlib"), ("XDG_CACHE_HOME", "cache"),
+        values.insert(
+            "VOICE_RESOURCE_POLICY".into(),
+            self.data
+                .join("config/runtime-resources.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (name, folder) in [
+            ("TEMP", "tmp/process"),
+            ("TMP", "tmp/process"),
+            ("HF_HOME", "cache/huggingface"),
+            ("MODELSCOPE_CACHE", "cache/modelscope"),
+            ("TORCH_HOME", "cache/torch"),
+            ("PIP_CACHE_DIR", "cache/pip"),
+            ("CUDA_CACHE_PATH", "cache/cuda"),
+            ("TORCH_EXTENSIONS_DIR", "cache/torch/extensions"),
+            ("MPLCONFIGDIR", "cache/matplotlib"),
+            ("XDG_CACHE_HOME", "cache"),
             ("PIP_CONFIG_FILE", "data/config/pip.ini"),
-            ("npm_config_cache", "cache/npm"), ("npm_config_store_dir", "cache/pnpm/store"),
-            ("npm_config_userconfig", "data/config/npmrc")] {
-            values.insert(name.into(), self.install.join(folder).to_string_lossy().into_owned());
+            ("npm_config_cache", "cache/npm"),
+            ("npm_config_store_dir", "cache/pnpm/store"),
+            ("npm_config_userconfig", "data/config/npmrc"),
+        ] {
+            values.insert(
+                name.into(),
+                self.install.join(folder).to_string_lossy().into_owned(),
+            );
         }
         values.insert(
             "PYTHONPYCACHEPREFIX".into(),
@@ -348,8 +472,16 @@ impl LaunchContext {
     pub fn configure_command(&self, command: &mut std::process::Command) {
         for (name, _) in std::env::vars_os() {
             let key = name.to_string_lossy().to_ascii_uppercase();
-            if key.starts_with("VOICE_") || ["PYTHONPATH", "PYTHONHOME", "WEBVIEW2_USER_DATA_FOLDER",
-                "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", "PYTHONPYCACHEPREFIX"].contains(&key.as_str()) {
+            if key.starts_with("VOICE_")
+                || [
+                    "PYTHONPATH",
+                    "PYTHONHOME",
+                    "WEBVIEW2_USER_DATA_FOLDER",
+                    "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+                    "PYTHONPYCACHEPREFIX",
+                ]
+                .contains(&key.as_str())
+            {
                 command.env_remove(name);
             }
         }
@@ -417,9 +549,7 @@ pub mod windows {
         Foundation::{CloseHandle, HANDLE},
         System::{Com::CoTaskMemFree, JobObjects::*},
         UI::{
-            Shell::{
-                ShellExecuteW, SHGetKnownFolderPath, FOLDERID_LocalAppData, KF_FLAG_DEFAULT,
-            },
+            Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, ShellExecuteW, KF_FLAG_DEFAULT},
             WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, SW_SHOWNORMAL},
         },
     };
@@ -429,9 +559,9 @@ pub mod windows {
     const MAX_HELPER_URL_BYTES: usize = 128 * 1024;
 
     struct ExternalUrlLaunchPlan {
-        executable: PathBuf, // executable（辅助程序路径）：当前桌面程序自身。
+        executable: PathBuf,      // executable（辅助程序路径）：当前桌面程序自身。
         arguments: Vec<OsString>, // arguments（命令行参数）：只包含固定内部开关，不包含网址或令牌。
-        payload: Vec<u8>, // payload（标准输入内容）：UTF-8 编码的网址。
+        payload: Vec<u8>,         // payload（标准输入内容）：UTF-8 编码的网址。
         environment: Vec<(OsString, OsString)>, // environment（子进程环境）：过滤工作区私有变量后的环境块。
         current_dir: PathBuf, // current_dir（当前目录）：Windows 用户临时目录，不属于工作区。
     }
@@ -455,7 +585,8 @@ pub mod windows {
     // open_url（打开网页）：先以隔离环境启动同一桌面程序的短寿命辅助进程，再交给 Windows 默认浏览器。
     pub fn open_url(url: &str) -> Result<(), String> {
         let environment: Vec<_> = env::vars_os().collect();
-        let executable = env::current_exe().map_err(|error| format!("无法定位网址辅助进程：{error}"))?;
+        let executable =
+            env::current_exe().map_err(|error| format!("无法定位网址辅助进程：{error}"))?;
         let current_dir = safe_external_temp_directory(&environment)?;
         let plan = external_url_launch_plan(url, executable, current_dir, &environment)?;
 
@@ -506,7 +637,8 @@ pub mod windows {
             return Some(Err("网址辅助进程不接受额外命令行参数。".into()));
         }
         Some(dispatch_helper_url(&mut std::io::stdin().lock(), |url| {
-            shell_open(OsStr::new(url)).map_err(|code| format!("系统 URL handler（网址处理程序）错误码：{code}"))
+            shell_open(OsStr::new(url))
+                .map_err(|code| format!("系统 URL handler（网址处理程序）错误码：{code}"))
         }))
     }
 
@@ -575,7 +707,9 @@ pub mod windows {
                 let retained: Vec<PathBuf> = env::split_paths(value)
                     .filter(|entry| {
                         !entry.as_os_str().is_empty()
-                            && !workspace_roots.iter().any(|root| path_is_within(entry, root))
+                            && !workspace_roots
+                                .iter()
+                                .any(|root| path_is_within(entry, root))
                     })
                     .collect();
                 if let Ok(path) = env::join_paths(retained) {
@@ -630,7 +764,10 @@ pub mod windows {
                 || key.starts_with("HF_")
                 || key.starts_with("TORCH_")
                 || key.starts_with("CUDA_")
-                || matches!(key.as_str(), "TEMP" | "TMP" | "MODELSCOPE_CACHE" | "MPLCONFIGDIR" | "XDG_CACHE_HOME");
+                || matches!(
+                    key.as_str(),
+                    "TEMP" | "TMP" | "MODELSCOPE_CACHE" | "MPLCONFIGDIR" | "XDG_CACHE_HOME"
+                );
             if !private_path {
                 continue;
             }
@@ -677,10 +814,14 @@ pub mod windows {
     fn safe_external_temp_directory(inherited: &[(OsString, OsString)]) -> Result<PathBuf, String> {
         let local_app_data = std::thread::spawn(known_folder_local_app_data)
             .join()
-            .map_err(|_| "无法查询 Windows 用户 LocalAppData（本地应用数据目录）。".to_string())??;
+            .map_err(|_| {
+                "无法查询 Windows 用户 LocalAppData（本地应用数据目录）。".to_string()
+            })??;
         let temp = local_app_data.join("Temp");
         if !temp.is_dir() {
-            return Err("Windows 用户 LocalAppData（本地应用数据目录）缺少 Temp（临时目录）。".into());
+            return Err(
+                "Windows 用户 LocalAppData（本地应用数据目录）缺少 Temp（临时目录）。".into(),
+            );
         }
         let resolved_temp = temp
             .canonicalize()
@@ -698,7 +839,10 @@ pub mod windows {
         let mut roots = Vec::new();
         for (name, value) in inherited {
             let key = name.to_string_lossy().to_ascii_uppercase();
-            if !matches!(key.as_str(), "VOICE_INSTALL_ROOT" | "VOICE_PROGRAM_ROOT" | "VOICE_DATA_DIR") {
+            if !matches!(
+                key.as_str(),
+                "VOICE_INSTALL_ROOT" | "VOICE_PROGRAM_ROOT" | "VOICE_DATA_DIR"
+            ) {
                 continue;
             }
             let path = PathBuf::from(value);
@@ -715,9 +859,16 @@ pub mod windows {
 
     fn known_folder_local_app_data() -> Result<PathBuf, String> {
         // CoInitializeEx（COM 组件对象模型初始化）在专用线程运行，避免与桌面 UI 线程的 COM 模式冲突。
-        let initialized = unsafe { windows_sys::Win32::System::Com::CoInitializeEx(ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
+        let initialized = unsafe {
+            windows_sys::Win32::System::Com::CoInitializeEx(
+                ptr::null(),
+                windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32,
+            )
+        };
         if initialized < 0 {
-            return Err(format!("无法初始化 Windows known-folder（已知目录）查询：{initialized}"));
+            return Err(format!(
+                "无法初始化 Windows known-folder（已知目录）查询：{initialized}"
+            ));
         }
         let mut path = ptr::null_mut();
         let result = unsafe {
@@ -729,7 +880,9 @@ pub mod windows {
             )
         };
         let resolved = if result < 0 || path.is_null() {
-            Err(format!("无法定位 Windows 用户 LocalAppData（本地应用数据目录）：{result}"))
+            Err(format!(
+                "无法定位 Windows 用户 LocalAppData（本地应用数据目录）：{result}"
+            ))
         } else {
             let mut length = 0;
             unsafe {
@@ -771,7 +924,10 @@ pub mod windows {
             Ok(())
         }
     }
-    pub struct Job(HANDLE, std::sync::Mutex<Vec<crate::process_host::StartGate>>);
+    pub struct Job(
+        HANDLE,
+        std::sync::Mutex<Vec<crate::process_host::StartGate>>,
+    );
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
     impl Job {
@@ -815,8 +971,11 @@ pub mod windows {
             let mut child = command.spawn().map_err(|error| error.to_string())?;
             use std::os::windows::io::AsRawHandle;
             let result = self.assign(child.as_raw_handle()).and_then(|_| {
-                if let Some(gate) = &gate { gate.release()?; }
-                else { resume_suspended_child(child.id())?; }
+                if let Some(gate) = &gate {
+                    gate.release()?;
+                } else {
+                    resume_suspended_child(child.id())?;
+                }
                 Ok(())
             });
             if let Err(error) = result {
@@ -826,7 +985,10 @@ pub mod windows {
             }
             // 命名事件保持到所属作业关闭，避免父进程过早关闭句柄导致尚未启动的子进程无法打开门闩。
             if let Some(gate) = gate {
-                self.1.lock().unwrap_or_else(|error| error.into_inner()).push(gate);
+                self.1
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(gate);
             }
             Ok(child)
         }
@@ -848,12 +1010,22 @@ pub mod windows {
     fn resume_suspended_child(pid: u32) -> Result<(), String> {
         use windows_sys::Win32::{
             Foundation::INVALID_HANDLE_VALUE,
-            System::{Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32, TH32CS_SNAPTHREAD},
-                Threading::{GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME}},
+            System::{
+                Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                    THREADENTRY32,
+                },
+                Threading::{
+                    GetProcessIdOfThread, OpenThread, ResumeThread,
+                    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+                },
+            },
         };
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if snapshot == INVALID_HANDLE_VALUE { return Err(std::io::Error::last_os_error().to_string()); }
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
             let mut row: THREADENTRY32 = std::mem::zeroed();
             row.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
             let mut found = None;
@@ -861,23 +1033,36 @@ pub mod windows {
             let mut more = Thread32First(snapshot, &mut row);
             while more != 0 {
                 if row.th32OwnerProcessID == pid {
-                    if found.is_some() { ambiguous = true; break; }
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
                     found = Some(row.th32ThreadID);
                 }
                 more = Thread32Next(snapshot, &mut row);
             }
             CloseHandle(snapshot);
-            if ambiguous { return Err("挂起工作进程初始线程不唯一，拒绝恢复未知线程。".into()); }
+            if ambiguous {
+                return Err("挂起工作进程初始线程不唯一，拒绝恢复未知线程。".into());
+            }
             let thread_id = found.ok_or("无法定位挂起工作进程的初始线程。")?;
-            let thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, 0, thread_id);
-            if thread.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+            let thread = OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                thread_id,
+            );
+            if thread.is_null() {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
             if GetProcessIdOfThread(thread) != pid {
                 CloseHandle(thread);
                 return Err("工作进程初始线程的归属已变化。".into());
             }
             let previous = ResumeThread(thread);
             CloseHandle(thread);
-            if previous != 1 { return Err("工作进程初始线程的挂起状态异常。".into()); }
+            if previous != 1 {
+                return Err("工作进程初始线程的挂起状态异常。".into());
+            }
             Ok(())
         }
     }
@@ -905,9 +1090,18 @@ pub mod windows {
         fn sensitive_url_is_payload_only_and_never_a_helper_argument() {
             let url = "https://127.0.0.1:43127/?session_token=do-not-put-on-command-line";
             let inherited = vec![
-                (OsString::from("VOICE_INSTALL_ROOT"), OsString::from(r"D:\QA Workspace")),
-                (OsString::from("PATH"), OsString::from(r"D:\QA Workspace\runtimes\python;C:\Windows\System32")),
-                (OsString::from("APPDATA"), OsString::from(r"C:\Users\qa\AppData\Roaming")),
+                (
+                    OsString::from("VOICE_INSTALL_ROOT"),
+                    OsString::from(r"D:\QA Workspace"),
+                ),
+                (
+                    OsString::from("PATH"),
+                    OsString::from(r"D:\QA Workspace\runtimes\python;C:\Windows\System32"),
+                ),
+                (
+                    OsString::from("APPDATA"),
+                    OsString::from(r"C:\Users\qa\AppData\Roaming"),
+                ),
             ];
             let plan = external_url_launch_plan(
                 url,
@@ -917,7 +1111,10 @@ pub mod windows {
             )
             .unwrap();
             assert_eq!(plan.arguments, [OsString::from(URL_HELPER_SWITCH)]);
-            assert!(!plan.arguments.iter().any(|argument| argument.to_string_lossy().contains("session_token")));
+            assert!(!plan
+                .arguments
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("session_token")));
             assert_eq!(String::from_utf8(plan.payload).unwrap(), url);
         }
 
@@ -925,35 +1122,91 @@ pub mod windows {
         fn browser_environment_removes_private_paths_and_uses_known_safe_temp() {
             let safe_temp = PathBuf::from(r"C:\Users\qa\AppData\Local\Temp");
             let inherited = vec![
-                (OsString::from("VOICE_LAUNCH_CHANNEL"), OsString::from("development")),
-                (OsString::from("VOICE_INSTALL_ROOT"), OsString::from(r"D:\QA Workspace")),
+                (
+                    OsString::from("VOICE_LAUNCH_CHANNEL"),
+                    OsString::from("development"),
+                ),
+                (
+                    OsString::from("VOICE_INSTALL_ROOT"),
+                    OsString::from(r"D:\QA Workspace"),
+                ),
                 (OsString::from("PYTHONUTF8"), OsString::from("1")),
-                (OsString::from("PYTHONHOME"), OsString::from(r"D:\QA Workspace\runtimes\python")),
-                (OsString::from("NODE_OPTIONS"), OsString::from("--require private.js")),
-                (OsString::from("npm_config_cache"), OsString::from(r"D:\QA Workspace\cache\npm")),
-                (OsString::from("WEBVIEW2_USER_DATA_FOLDER"), OsString::from(r"D:\QA Workspace\data\webview2")),
-                (OsString::from("HF_HOME"), OsString::from(r"D:\QA Workspace\cache\hf")),
-                (OsString::from("TEMP"), OsString::from(r"D:\QA Workspace\tmp\process")),
-                (OsString::from("TMP"), OsString::from(r"D:\QA Workspace\tmp\process")),
-                (OsString::from("PATH"), OsString::from(r"D:\QA Workspace\runtimes\python;C:\Windows\System32")),
+                (
+                    OsString::from("PYTHONHOME"),
+                    OsString::from(r"D:\QA Workspace\runtimes\python"),
+                ),
+                (
+                    OsString::from("NODE_OPTIONS"),
+                    OsString::from("--require private.js"),
+                ),
+                (
+                    OsString::from("npm_config_cache"),
+                    OsString::from(r"D:\QA Workspace\cache\npm"),
+                ),
+                (
+                    OsString::from("WEBVIEW2_USER_DATA_FOLDER"),
+                    OsString::from(r"D:\QA Workspace\data\webview2"),
+                ),
+                (
+                    OsString::from("HF_HOME"),
+                    OsString::from(r"D:\QA Workspace\cache\hf"),
+                ),
+                (
+                    OsString::from("TEMP"),
+                    OsString::from(r"D:\QA Workspace\tmp\process"),
+                ),
+                (
+                    OsString::from("TMP"),
+                    OsString::from(r"D:\QA Workspace\tmp\process"),
+                ),
+                (
+                    OsString::from("PATH"),
+                    OsString::from(r"D:\QA Workspace\runtimes\python;C:\Windows\System32"),
+                ),
                 (OsString::from("SystemRoot"), OsString::from(r"C:\Windows")),
-                (OsString::from("APPDATA"), OsString::from(r"C:\Users\qa\AppData\Roaming")),
+                (
+                    OsString::from("APPDATA"),
+                    OsString::from(r"C:\Users\qa\AppData\Roaming"),
+                ),
             ];
             let filtered = external_browser_environment(&inherited, &safe_temp);
             let as_map: BTreeMap<_, _> = filtered
                 .iter()
-                .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), value.to_string_lossy().into_owned()))
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().to_ascii_uppercase(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
                 .collect();
             for key in [
-                "VOICE_LAUNCH_CHANNEL", "VOICE_INSTALL_ROOT", "PYTHONUTF8", "PYTHONHOME",
-                "NODE_OPTIONS", "NPM_CONFIG_CACHE", "WEBVIEW2_USER_DATA_FOLDER", "HF_HOME",
+                "VOICE_LAUNCH_CHANNEL",
+                "VOICE_INSTALL_ROOT",
+                "PYTHONUTF8",
+                "PYTHONHOME",
+                "NODE_OPTIONS",
+                "NPM_CONFIG_CACHE",
+                "WEBVIEW2_USER_DATA_FOLDER",
+                "HF_HOME",
             ] {
                 assert!(!as_map.contains_key(key), "private key leaked: {key}");
             }
-            assert_eq!(as_map.get("TEMP").map(String::as_str), Some(r"C:\Users\qa\AppData\Local\Temp"));
-            assert_eq!(as_map.get("TMP").map(String::as_str), Some(r"C:\Users\qa\AppData\Local\Temp"));
-            assert_eq!(as_map.get("SYSTEMROOT").map(String::as_str), Some(r"C:\Windows"));
-            assert_eq!(as_map.get("APPDATA").map(String::as_str), Some(r"C:\Users\qa\AppData\Roaming"));
+            assert_eq!(
+                as_map.get("TEMP").map(String::as_str),
+                Some(r"C:\Users\qa\AppData\Local\Temp")
+            );
+            assert_eq!(
+                as_map.get("TMP").map(String::as_str),
+                Some(r"C:\Users\qa\AppData\Local\Temp")
+            );
+            assert_eq!(
+                as_map.get("SYSTEMROOT").map(String::as_str),
+                Some(r"C:\Windows")
+            );
+            assert_eq!(
+                as_map.get("APPDATA").map(String::as_str),
+                Some(r"C:\Users\qa\AppData\Roaming")
+            );
             let path = as_map.get("PATH").unwrap();
             assert!(!path.to_ascii_uppercase().contains("QA WORKSPACE"));
             assert!(path.contains(r"C:\Windows\System32"));
@@ -974,9 +1227,18 @@ pub mod windows {
         #[test]
         fn browser_helper_uses_real_local_app_data_temp_not_workspace_temp() {
             let inherited = vec![
-                (OsString::from("VOICE_INSTALL_ROOT"), OsString::from(r"D:\QA Workspace")),
-                (OsString::from("TEMP"), OsString::from(r"D:\QA Workspace\tmp\process")),
-                (OsString::from("TMP"), OsString::from(r"D:\QA Workspace\tmp\process")),
+                (
+                    OsString::from("VOICE_INSTALL_ROOT"),
+                    OsString::from(r"D:\QA Workspace"),
+                ),
+                (
+                    OsString::from("TEMP"),
+                    OsString::from(r"D:\QA Workspace\tmp\process"),
+                ),
+                (
+                    OsString::from("TMP"),
+                    OsString::from(r"D:\QA Workspace\tmp\process"),
+                ),
             ];
             let temp = safe_external_temp_directory(&inherited).unwrap();
             assert_eq!(temp.file_name(), Some(OsStr::new("Temp")));
@@ -992,7 +1254,10 @@ pub mod windows {
             let inherited = vec![
                 (OsString::from("TEMP"), temp.as_os_str().to_owned()),
                 (OsString::from("TMP"), temp.as_os_str().to_owned()),
-                (OsString::from("PYTHONPYCACHEPREFIX"), temp.join("python-cache").into_os_string()),
+                (
+                    OsString::from("PYTHONPYCACHEPREFIX"),
+                    temp.join("python-cache").into_os_string(),
+                ),
             ];
             assert_eq!(safe_external_temp_directory(&inherited).unwrap(), temp);
         }
@@ -1014,61 +1279,166 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_component_install_refreshes_paths_without_losing_source_debug_settings(){
-        let root=std::env::temp_dir().join(format!("voice-context-首次安装-{}",workspace::new_id()));let install=root.join("工作区");workspace::initialize(&install).unwrap();
-        for path in [root.join("config"),root.join("scripts"),install.join("app/config"),install.join("app/scripts")]{fs::create_dir_all(path).unwrap();}
-        for path in [root.join("config/default.yaml"),root.join("scripts/backend-entry.py"),install.join("app/config/default.yaml"),install.join("app/scripts/backend-entry.py")]{fs::write(path,b"fixture").unwrap();}
-        let mut original=LaunchContext::portable(&install).unwrap();assert!(original.node.is_none());
-        original.program=canonical_path(&root).unwrap();original.dev=true;original.diagnostic=true;
-        let dsh=install.join("runtimes/dsh");fs::create_dir_all(&dsh).unwrap();fs::write(dsh.join("DeepSeek Harness.exe"),b"not executed").unwrap();
+    fn first_component_install_refreshes_paths_without_losing_source_debug_settings() {
+        let root =
+            std::env::temp_dir().join(format!("voice-context-首次安装-{}", workspace::new_id()));
+        let install = root.join("工作区");
+        workspace::initialize(&install).unwrap();
+        for path in [
+            root.join("config"),
+            root.join("scripts"),
+            install.join("app/config"),
+            install.join("app/scripts"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        for path in [
+            root.join("config/default.yaml"),
+            root.join("scripts/backend-entry.py"),
+            install.join("app/config/default.yaml"),
+            install.join("app/scripts/backend-entry.py"),
+        ] {
+            fs::write(path, b"fixture").unwrap();
+        }
+        let mut original = LaunchContext::portable(&install).unwrap();
+        assert!(original.node.is_none());
+        original.program = canonical_path(&root).unwrap();
+        original.dev = true;
+        original.diagnostic = true;
+        let dsh = install.join("runtimes/dsh");
+        fs::create_dir_all(&dsh).unwrap();
+        fs::write(dsh.join("DeepSeek Harness.exe"), b"not executed").unwrap();
         workspace::atomic_json(&dsh.join("runtime.json"),&serde_json::json!({"source_kind":"official_desktop","executable":"DeepSeek Harness.exe"})).unwrap();
-        let current=original.refreshed_components().unwrap();assert_eq!(current.node,Some(canonical_path(&dsh.join("DeepSeek Harness.exe")).unwrap()));
-        assert_eq!(current.workspace_id,original.workspace_id);assert_eq!(current.program,original.program);assert!(current.dev&&current.diagnostic);assert!(original.node.is_none());fs::remove_dir_all(root).unwrap();
+        let current = original.refreshed_components().unwrap();
+        assert_eq!(
+            current.node,
+            Some(canonical_path(&dsh.join("DeepSeek Harness.exe")).unwrap())
+        );
+        assert_eq!(current.workspace_id, original.workspace_id);
+        assert_eq!(current.program, original.program);
+        assert!(current.dev && current.diagnostic);
+        assert!(original.node.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn pending_task_skips_terminal_marker_and_finds_new_active_migration() {
-        let root = std::env::temp_dir().join(format!("voice-pending-migration-{}", workspace::new_id()));
+        let root =
+            std::env::temp_dir().join(format!("voice-pending-migration-{}", workspace::new_id()));
         fs::create_dir(&root).unwrap();
         let old_target = root.join("old-target");
         let new_target = root.join("new-target");
-        for path in [root.join("tmp"), root.join("data/state"), old_target.join("tmp"), new_target.join("tmp")] {
+        for path in [
+            root.join("tmp"),
+            root.join("data/state"),
+            old_target.join("tmp"),
+            new_target.join("tmp"),
+        ] {
             fs::create_dir_all(path).unwrap();
         }
-        workspace::atomic_json(&root.join("tmp/workspace-task.json"), &serde_json::json!({
-            "target_root": old_target,
-            "fields": {"target_root": "旧迁移目标"}
-        })).unwrap();
-        workspace::atomic_json(&old_target.join("tmp/workspace-task.json"), &serde_json::json!({
-            "state": "completed",
-            "helper_pid": 0,
-            "fields": {"state": "事务阶段"}
-        })).unwrap();
-        workspace::atomic_json(&root.join("data/state/workspace-task.json"), &serde_json::json!({
-            "target_root": new_target,
-            "fields": {"target_root": "当前迁移目标"}
-        })).unwrap();
+        workspace::atomic_json(
+            &root.join("tmp/workspace-task.json"),
+            &serde_json::json!({
+                "target_root": old_target,
+                "fields": {"target_root": "旧迁移目标"}
+            }),
+        )
+        .unwrap();
+        workspace::atomic_json(
+            &old_target.join("tmp/workspace-task.json"),
+            &serde_json::json!({
+                "state": "completed",
+                "helper_pid": 0,
+                "fields": {"state": "事务阶段"}
+            }),
+        )
+        .unwrap();
+        workspace::atomic_json(
+            &root.join("data/state/workspace-task.json"),
+            &serde_json::json!({
+                "target_root": new_target,
+                "fields": {"target_root": "当前迁移目标"}
+            }),
+        )
+        .unwrap();
         let new_journal = new_target.join("tmp/workspace-task.json");
-        workspace::atomic_json(&new_journal, &serde_json::json!({
-            "state": "copying",
-            "helper_pid": 0,
-            "fields": {"state": "事务阶段"}
-        })).unwrap();
+        workspace::atomic_json(
+            &new_journal,
+            &serde_json::json!({
+                "state": "copying",
+                "helper_pid": 0,
+                "fields": {"state": "事务阶段"}
+            }),
+        )
+        .unwrap();
 
         assert_eq!(workspace::pending_task(&root).unwrap(), Some(new_journal));
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn explicit_source_debug_shares_formal_workspace_and_resources(){
-        let root=std::env::temp_dir().join(format!("voice-source-中文 空格-{}",workspace::new_id()));let install=root.join(".local");
-        for parent in [root.join("apps/desktop"),root.join("config"),root.join("scripts"),install.join("app/config"),install.join("app/scripts"),install.join("runtimes/webview2")]{fs::create_dir_all(parent).unwrap();}
-        for path in [root.join("pyproject.toml"),root.join("apps/desktop/Cargo.toml"),root.join("config/default.yaml"),root.join("scripts/backend-entry.py"),install.join("app/config/default.yaml"),install.join("app/scripts/backend-entry.py"),install.join("runtimes/webview2/preserved.bin")]{fs::write(path,b"fixture").unwrap();}
+    fn explicit_source_debug_shares_formal_workspace_and_resources() {
+        let root =
+            std::env::temp_dir().join(format!("voice-source-中文 空格-{}", workspace::new_id()));
+        let install = root.join(".local");
+        for parent in [
+            root.join("apps/desktop"),
+            root.join("config"),
+            root.join("scripts"),
+            install.join("app/config"),
+            install.join("app/scripts"),
+            install.join("runtimes/webview2"),
+        ] {
+            fs::create_dir_all(parent).unwrap();
+        }
+        for path in [
+            root.join("pyproject.toml"),
+            root.join("apps/desktop/Cargo.toml"),
+            root.join("config/default.yaml"),
+            root.join("scripts/backend-entry.py"),
+            install.join("app/config/default.yaml"),
+            install.join("app/scripts/backend-entry.py"),
+            install.join("runtimes/webview2/preserved.bin"),
+        ] {
+            fs::write(path, b"fixture").unwrap();
+        }
         fs::write(install.join("portable.json"),serde_json::to_vec(&serde_json::json!({"schema":2,"app":"app","python":"runtimes/python/python.exe","models":"models","dsh":"runtimes/dsh","webview2":"runtimes/webview2","data_dir":"data"})).unwrap()).unwrap();
-        let exe=install.join("VoiceTerminal.exe");let normal=LaunchContext::from_executable(&exe,&[]).unwrap();let debug=LaunchContext::from_executable(&exe,&["--dev".into(),"--source-root".into(),root.to_str().unwrap().into()]).unwrap();
-        assert_eq!(normal.program,canonical_path(&install.join("app")).unwrap());assert_eq!(debug.program,canonical_path(&root).unwrap());assert_eq!(normal.install,debug.install);assert_eq!(normal.data,debug.data);assert_eq!(normal.python,debug.python);assert_eq!(normal.models,debug.models);assert_eq!(normal.workspace_id,debug.workspace_id);assert_eq!(debug.installed_program(),normal.program);assert!(debug.dev);assert!(normal.webview2.is_none());assert!(install.join("runtimes/webview2/preserved.bin").is_file());
-        assert!(LaunchContext::from_executable(&exe,&["--dev".into()]).is_err());assert!(LaunchContext::from_executable(&exe,&["--source-root".into()]).is_err());assert!(LaunchContext::from_executable(&exe,&["--data-dir".into(),root.to_str().unwrap().into()]).is_err());
-        assert!(LaunchContext::from_executable(&root.join("nested/VoiceTerminal.exe"),&[]).is_err());fs::remove_dir_all(root).unwrap();
+        let exe = install.join("VoiceTerminal.exe");
+        let normal = LaunchContext::from_executable(&exe, &[]).unwrap();
+        let debug = LaunchContext::from_executable(
+            &exe,
+            &[
+                "--dev".into(),
+                "--source-root".into(),
+                root.to_str().unwrap().into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            normal.program,
+            canonical_path(&install.join("app")).unwrap()
+        );
+        assert_eq!(debug.program, canonical_path(&root).unwrap());
+        assert_eq!(normal.install, debug.install);
+        assert_eq!(normal.data, debug.data);
+        assert_eq!(normal.python, debug.python);
+        assert_eq!(normal.models, debug.models);
+        assert_eq!(normal.workspace_id, debug.workspace_id);
+        assert_eq!(debug.installed_program(), normal.program);
+        assert!(debug.dev);
+        assert!(normal.webview2.is_none());
+        assert!(install.join("runtimes/webview2/preserved.bin").is_file());
+        assert!(LaunchContext::from_executable(&exe, &["--dev".into()]).is_err());
+        assert!(LaunchContext::from_executable(&exe, &["--source-root".into()]).is_err());
+        assert!(LaunchContext::from_executable(
+            &exe,
+            &["--data-dir".into(), root.to_str().unwrap().into()]
+        )
+        .is_err());
+        assert!(
+            LaunchContext::from_executable(&root.join("nested/VoiceTerminal.exe"), &[]).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn pending_update_never_initializes_business_data() {

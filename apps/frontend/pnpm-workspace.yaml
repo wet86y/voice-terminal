@@ -1,0 +1,2 @@
+allowBuilds: # allowBuilds（允许经锁定审查的依赖执行安装构建脚本）。
+  esbuild: true # esbuild（Vite 前端构建所需的本地二进制准备脚本）。

@@ -13,12 +13,15 @@
 
 | Component（组件） | Use（用途） | License and retained notice（适用许可及保留声明） |
 | --- | --- | --- |
+| [dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)（远端桌面控制插件） | 设备控制观察缓存派生源码；设备执行工具尚未接入。 | MIT；保留 [上游许可证](licenses/dsh-windows-remote-ssh-MIT.txt)，固定提交、原件摘要及修改记录见 [上游锁](config/dsh/remote-ssh-upstream.lock.json)。构建 DSH（代理执行宿主）功能包时复制该许可证。 |
 | tiktoken（分词器）词表 | 固定摘要的 o200k_base（分词词表）随程序交付，避免首次运行下载。 | MIT；保留 [词表许可证](config/resources/assets/tokenizers/LICENSE) 和原始文件；来源及摘要见 `config/download-sources.json`（下载来源配置）。 |
 | [DesktopUpdateKit](https://github.com/wet86y/DesktopUpdateKit) | 固定版本的 Windows 本机 WinHTTP（Windows 网络通信接口）传输层，用于资源下载、取消、续传和摘要校验。应用更新仍由 Voice Terminal（语音终端）的工作区安装事务处理。 | MIT；见 [许可证文本](licenses/DesktopUpdateKit-MIT.txt)。上游修订记录见 [config/update-kit.lock.json](config/update-kit.lock.json)（更新组件锁）。 |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp/tree/v0.9.1)（退役的原生语音组件） | 旧兼容源码补丁保留在 `config/resources/patches/audiocpp-quality.patch`（源码补丁文件）；当前桌面程序不再使用 audio.cpp（旧语音框架）作为运行后端，`config/resources/assets/audiocpp/`（旧组件资源目录）不进入正式程序包。 | Apache-2.0；见 [许可证文本](licenses/audio.cpp-Apache-2.0.txt)。固定来源及修订见 `config/resources/catalog.json`（资源目录）和 `scripts/prepare-audiocpp-patch.py`（补丁准备脚本）；补丁生成的上游文件仍保留其来源许可。 |
 | [ASR-Hotword](https://github.com/HaujetZhao/asr-hotword)（语音识别热词处理） | 复制进仓库的识别后处理源码。 | MIT；保留 [许可证文本](voice_terminal/vendor/asr_hotword/LICENSE) 和 [来源说明](voice_terminal/vendor/asr_hotword/UPSTREAM.md)。 |
 | [AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)（可选本地语音引擎） | 本项目提供独立适配器和兼容补丁器；用户安装该可选组件时，正式程序按固定提交获取上游源码，在本机打补丁并构建模型包。桌面程序包不包含完整上游源码归档、已生成模型包或推理引擎，但补丁器含少量上游代码锚点。 | 分项许可、补丁目标、固定提交及 `Required Notice`（必须保留的版权声明）见本文件“AnifLive-TTS（本地语音引擎）”一节；上游 PolyForm Noncommercial 1.0.0（非商业用途许可证）文本及本地副本见 [许可证文本](licenses/AnifLive-TTS-PolyForm-Noncommercial-1.0.0.txt)。该路径不表示此许可证文本已被组装进正式程序包；依赖和模型仍各循其许可证。 |
 | DSH（代理执行宿主）的 npm（JavaScript 包管理器）、Python（后端解释器）及捆绑工具依赖 | DSH 独立控制台和运行时载荷。 | 完整包级清单与许可说明见 [config/dsh/licenses/THIRD_PARTY_NOTICES.md](config/dsh/licenses/THIRD_PARTY_NOTICES.md)；程序包按现有 DSH 配置保留其上游许可证与声明文件。 |
+| [libopus 1.6.1](https://www.opus-codec.org/)（Opus 音频编解码库） | 远端设备音频实验压缩档的原生编码/解码基础；源码归档与逐文件源码树摘要固定在 `config/native-audio-sources.lock.json`（原生音频源码锁）。 | BSD-3-Clause 风格许可并含专利声明；随包保留 `licenses/native-audio/libopus-COPYING.txt`（许可证及专利声明）和 `libopus-AUTHORS.txt`（作者列表）。质量验收前仍标记为实验档。 |
+| WebRTC Audio Processing（WebRTC 音频处理）、Abseil C++（Abseil C++ 工具库）、WebRTC VAD（WebRTC 语音活动检测）及其嵌入式信号处理依赖 | 固定 AEC（回声消除）静态库和 vendored（纳入版本控制）的 VAD 源码；版本、摘要与上游许可证路径见 `config/native-audio-sources.lock.json`。 | 保留逐项上游许可证、作者及专利声明；仓库副本位于 [licenses/native-audio/](licenses/native-audio/README.md)，正式程序包复制到 `app/licenses/native-audio/`。 |
 | Cargo（Rust 包管理器）和 npm（JavaScript 包管理器）依赖 | 桌面宿主、安装器和前端构建。 | 固定版本记录于 [apps/desktop/Cargo.lock](apps/desktop/Cargo.lock)（Rust 依赖锁）和 [package-lock.json](package-lock.json)（npm 依赖锁）；每项依赖继续适用其上游许可证。 |
 
 上表列明主要源码组件和分发依赖；各依赖的完整版本仍以相应锁文件和组件清单为准。第三方组件目录内的原始许可证、版权和 NOTICE（第三方声明）优先于本表概括。
@@ -44,6 +47,6 @@ PolyForm Noncommercial 1.0.0 仅许可符合该许可证定义的非商业用途
 
 ## 正式程序包与本地文档
 
-本次许可证整理仅修改源码仓库内的文档和许可证文本副本，没有修改正式程序包。当前桌面程序组装器不会把根目录 `LICENSE`（项目许可证）、本文件或根目录 `licenses/`（第三方许可证文件目录）复制到应用目录；因此这些说明可在源码仓库查阅，不应被描述为已随正式程序包交付。组件管理页另行安装的第三方组件仍按各自清单和组件目录保留许可证与声明。
+桌面程序组装器会把根目录 `LICENSE`（项目许可证）复制为 `app/LICENSE.txt`，把 `licenses/native-audio/`（原生音频第三方许可证与专利声明）复制到 `app/licenses/native-audio/`，并将固定 libopus 共享库 `opus.dll`（动态链接库）作为正式程序和轻量客户端运行载荷收录。它不会把整个仓库 `licenses/`、本文件或未随包安装的其他组件声明一并复制；DSH、模型、运行环境及独立组件仍按各自组件清单保留许可证和声明。
 
-这也表示本次文档更新没有解决正式程序包的许可证交付问题。正式程序包内含项目的补丁器代码及其中少量上游代码片段，但当前组装规则没有把这里列出的上游许可证与范围说明带入应用目录；发布时不能把“源码仓库已有声明”视作接收程序包者已取得相同声明。应按最终交付方式另行确认相关许可证文本或允许的许可证链接如何提供给接收者。
+本次更新让新增静态链接的 AEC/VAD 组件与实验用 libopus 原生组件在正式程序包内带有所需上游声明。其他可能随未来功能加入的第三方代码仍须在其进入程序包前更新许可清单和组装闭包；不能把“源码仓库已有声明”视为所有声明均已交付。

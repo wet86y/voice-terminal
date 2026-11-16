@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-ssh-identity-delete"
+description = "Enables the device_ssh_identity_delete command without any pre-configured scope."
+commands.allow = ["device_ssh_identity_delete"]
+
+[[permission]]
+identifier = "deny-device-ssh-identity-delete"
+description = "Denies the device_ssh_identity_delete command without any pre-configured scope."
+commands.deny = ["device_ssh_identity_delete"]

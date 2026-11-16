@@ -1,0 +1,39 @@
+{
+  "protocol_version": 1,
+  "result": "accepted",
+  "device_id": "device-a",
+  "core_session_id": "playback-core",
+  "connection_generation": 1,
+  "executor_generation": 1,
+  "task": {
+    "request_id": "request-1",
+    "device_id": "device-a",
+    "core_session_id": "playback-core",
+    "task_id": "request-1",
+    "connection_generation": 1,
+    "executor_generation": 1,
+    "sequence": 1,
+    "operation": "playback.stop_and_snapshot",
+    "arguments": {"playback_key": "speech-key"},
+    "fields": {
+      "request_id": "核心控制请求编号",
+      "device_id": "固定执行设备编号",
+      "core_session_id": "权威核心运行编号",
+      "task_id": "持久设备任务编号",
+      "connection_generation": "设备连接代次",
+      "executor_generation": "设备执行器代次",
+      "sequence": "本次连接内的任务序号",
+      "operation": "桌面设备操作编号",
+      "arguments": "经大小及 JSON 校验的桌面操作参数"
+    }
+  },
+  "fields": {
+    "protocol_version": "设备任务通道协议版本",
+    "result": "轮询结果",
+    "device_id": "固定轮询设备编号",
+    "core_session_id": "当前权威核心运行编号",
+    "connection_generation": "当前设备连接代次",
+    "executor_generation": "当前设备执行器代次",
+    "task": "原目标任务；为空时本轮没有待执行任务"
+  }
+}

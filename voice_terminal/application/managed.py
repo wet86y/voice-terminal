@@ -111,7 +111,8 @@ async def wait_for_shutdown() -> None:
 
 def run_uvicorn(app, *, on_shutdown=None, sock=None, **options) -> None:
     import uvicorn
-    if sock is None and not os.environ.get("VOICE_APP_SHUTDOWN_EVENT"):
+    sockets = None if sock is None else list(sock) if isinstance(sock, (list, tuple)) else [sock]
+    if sockets is None and not os.environ.get("VOICE_APP_SHUTDOWN_EVENT"):
         uvicorn.run(app, **options)
         return
     async def run():
@@ -123,7 +124,7 @@ def run_uvicorn(app, *, on_shutdown=None, sock=None, **options) -> None:
             server.should_exit = True
         watcher = asyncio.create_task(stop())
         try:
-            await server.serve(sockets=[sock] if sock is not None else None)
+            await server.serve(sockets=sockets)
         finally:
             watcher.cancel()
             await asyncio.gather(watcher, return_exceptions=True)

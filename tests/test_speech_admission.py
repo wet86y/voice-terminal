@@ -122,6 +122,7 @@ def _output_harness(scheduling, admission_lead_ms):
         def enqueue(self, key, pcm):
             self.enqueued.append((key, pcm))
 
+
         def progress(self, key):
             return {
                 "key": key, "enqueued_ms": 0, "played_ms": self.played_ms,

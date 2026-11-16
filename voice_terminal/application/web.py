@@ -1,6 +1,7 @@
 """Host HTTP surface（宿主网页接口）：会话受限的桌面入口和启动诊断。"""
 from __future__ import annotations
 
+import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -220,6 +221,17 @@ class HostWeb:
                         self.data(owner.application.state.snapshot())
                     elif path == "/api/v1/application/events":
                         self.events()
+                    elif path == "/api/v1/application/device-pairing":
+                        try:
+                            self.data(owner.application.device_pairing({"operation": "status"}))
+                        except HTTPError as exc:
+                            try:
+                                detail = json.loads(exc.read(16384)).get("detail", "设备配对状态不可用。")
+                            except (ValueError, AttributeError):
+                                detail = "设备配对状态不可用。"
+                            self.data({"detail": detail}, exc.code if exc.code in {403, 409, 503} else 503)
+                        except Exception:
+                            self.data({"detail": "设备配对状态未能确认。"}, 503)
                     else:
                         self.data({"error": "接口不存在"}, 404)
                     return
@@ -316,7 +328,7 @@ class HostWeb:
 
             def do_POST(self):
                 path = urlsplit(self.path).path
-                internal = path == "/internal/application/report"
+                internal = path in {"/internal/application/report", "/internal/application/device-helper"}
                 if not self.allowed(mutation=not internal, internal=internal):
                     self.data({"error": "不允许的应用操作"}, 403)
                     return
@@ -325,7 +337,8 @@ class HostWeb:
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 16384:
+                    limit = 300 * 1024 if path == "/internal/application/device-helper" else 16384
+                    if not 0 < size <= limit:
                         raise ValueError()
                     payload = json.loads(self.rfile.read(size))
                     if not isinstance(payload, dict):
@@ -334,7 +347,29 @@ class HostWeb:
                     self.data({"error": "请求内容无效"}, 400)
                     return
                 if internal:
-                    self.data({"ok": owner.application.report(payload)})
+                    if path == "/internal/application/report":
+                        self.data({"ok": owner.application.report(payload)})
+                    else:
+                        control = getattr(owner.application, "desktop_control", None)
+                        loop = owner.application.loop
+                        if control is None or loop is None:
+                            self.data({"error": "桌面设备控制通道不可用，操作结果未知。"}, 503)
+                            return
+                        timeout_ms = payload.get("timeout_ms")
+                        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 600_000:
+                            self.data({"error": "桌面设备请求时限无效。"}, 422)
+                            return
+                        future = asyncio.run_coroutine_threadsafe(control.call_device_helper(payload), loop)
+                        try:
+                            result = future.result(timeout=timeout_ms / 1000 + 7)
+                            self.data({"ok": True, "result": result})
+                        except TimeoutError:
+                            future.cancel()
+                            self.data({"error": "桌面设备操作回执超时，结果未知。"}, 504)
+                        except (TypeError, ValueError) as exc:
+                            self.data({"error": str(exc)[:240]}, 422)
+                        except Exception:
+                            self.data({"error": "桌面设备操作未能取得可信回执；执行结果未知。"}, 503)
                 elif path == "/api/v1/application/exit":
                     owner.application.request_exit()
                     self.data({"ok": True}, 202)
@@ -349,6 +384,20 @@ class HostWeb:
                         self.data({"detail": detail}, exc.code if exc.code in {400, 403, 409, 422, 503} else 503)
                     except Exception:
                         self.data({"detail": "权限决定未确认，请等待请求状态刷新。"}, 503)
+                elif path == "/api/v1/application/device-pairing":
+                    try:
+                        result = owner.application.device_pairing(payload)
+                        self.data(result, 200)
+                    except HTTPError as exc:
+                        try:
+                            detail = json.loads(exc.read(16384)).get("detail", "设备配对操作未确认。")
+                        except (ValueError, AttributeError):
+                            detail = "设备配对操作未确认。"
+                        self.data({"detail": detail}, exc.code if exc.code in {403, 404, 409, 422, 503} else 503)
+                    except (TypeError, ValueError) as exc:
+                        self.data({"detail": str(exc)[:240]}, 422)
+                    except Exception:
+                        self.data({"detail": "设备配对操作未能确认，请刷新状态后重试。"}, 503)
                 elif path == "/api/v1/application/wake-tasks":
                     try:
                         self.data(owner.application.create_wake_task(payload), 201)

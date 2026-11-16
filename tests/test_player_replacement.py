@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from voice_terminal.audio.player import PcmPlayer
+from voice_terminal.devices.contracts import PlaybackOutcomeUnknown
 from voice_terminal.agent.options import AgentOptions
 from voice_terminal.tts.alignment import DeliveryResolver
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput
@@ -33,6 +34,56 @@ def render(player, clock, milliseconds=20):
     player._callback(out, frames, None, None)
     clock.now += milliseconds / 1000
     return np.frombuffer(out, dtype="<i2").reshape(-1, player.channels)
+
+
+def transaction_harness(monkeypatch):
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr("voice_terminal.audio.player.time.monotonic", lambda: clock.now)
+    player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+    player.allow("old")
+    player.enqueue("old", np.full(1020, 10000, dtype="<i2").tobytes())
+    player._callback(bytearray(40), 20, None, None)
+    return player, clock
+
+
+def test_replacement_ticket_is_pure_data_and_waits_for_device_settlement(monkeypatch):
+    player, clock = transaction_harness(monkeypatch)
+
+    async def scenario():
+        ticket = await player.prepare_replacement_transaction("old")
+        wire = ticket.to_dict()
+        assert ticket.old_key == "old"
+        assert wire["replacement_id"] == ticket.replacement_id
+        assert wire["snapshot"]["playback_key"] == "old"
+        assert isinstance(wire["snapshot"]["device_time_us"], int)
+        assert "captured_at" not in wire["snapshot"]
+        assert not any(type(value).__name__ == "ReplacementTransition" for value in vars(ticket).values())
+        assert await player.bind_replacement_transaction(ticket, "new")
+        player.allow("new")
+        player.enqueue("new", b"\x01\x00" * 200)
+        for _ in range(30):
+            render(player, clock)
+        result = await player.wait_replacement_transaction(ticket)
+        assert result.replacement_id == ticket.replacement_id
+        assert result.reason in {"early_handoff", "envelope_complete", "source_exhausted", "deadline", "no_remaining_audio"}
+        assert result.finished_device_time_us >= result.started_device_time_us
+        assert "old_audio_silenced" in result.events_device_time_us
+
+    asyncio.run(scenario())
+
+
+def test_aborted_replacement_returns_receipt_and_expired_ticket_is_unknown(monkeypatch):
+    player, _ = transaction_harness(monkeypatch)
+
+    async def scenario():
+        ticket = await player.prepare_replacement_transaction("old")
+        result = await player.abort_replacement_transaction(ticket, "cancelled")
+        assert result.replacement_id == ticket.replacement_id
+        assert result.reason == "cancelled"
+        with pytest.raises(PlaybackOutcomeUnknown):
+            await player.wait_replacement_transaction(ticket)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("rate,channels", [(16000, 1), (24000, 2), (32000, 1), (48000, 2)])

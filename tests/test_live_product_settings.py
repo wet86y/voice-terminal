@@ -345,7 +345,7 @@ def test_loading_settings_apply_at_session_initialization_without_listening(runt
             build.assert_not_called()
             # 实际 initialize_session（会话调度器初始化）完成路径必须补应用设置。
             with patch("voice_terminal.server.websocket.AsrWorkerClient", return_value=SimpleNamespace(connect=AsyncMock(), health=AsyncMock())), \
-                 patch("voice_terminal.server.websocket.PcmPlayer", return_value=Mock()), \
+                 patch("voice_terminal.devices.local.PcmPlayer", return_value=Mock()), \
                  patch("voice_terminal.server.websocket.EpisodeController", return_value=Mock(initialize=AsyncMock())), \
                  patch.object(runtime, "_api_key", return_value=""):
                 await runtime.initialize_session()

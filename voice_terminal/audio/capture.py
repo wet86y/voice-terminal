@@ -207,6 +207,14 @@ class AudioCapture:
     async def read_frame(self) -> AudioFrame:
         return await self.queue.get()
 
+    def pending_frame_count(self) -> int:
+        """pending_frame_count（待处理帧数）：供唤醒回放限定本轮读取量。"""
+        return self.queue.qsize()
+
+    def read_pending_frame(self) -> AudioFrame:
+        """read_pending_frame（非阻塞读帧）：队列为空时抛出 QueueEmpty（队列为空）。"""
+        return self.queue.get_nowait()
+
     def preroll(self, milliseconds: int) -> bytes:
         byte_count = self.sample_rate * self.channels * 2 * milliseconds // 1000
         return self.ring_buffer.read(byte_count)

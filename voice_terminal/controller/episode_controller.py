@@ -1012,7 +1012,7 @@ class EpisodeController(RealtimeController):
         start_sample = self._owner_barge_start_sample if self._owner_barge_start_sample is not None else frame.start_sample
         self._recent = deque(
             AudioFrame(f.pcm[max(0, start_sample - f.start_sample) * 2:],
-                       max(start_sample, f.start_sample), f.captured_at)
+                       max(start_sample, f.start_sample), f.captured_at, f.clock_uncertainty_seconds)
             for f in self._recent if f.end_sample > start_sample
         )
         logger.info("speaker.barge_authorized candidate_id=%s speech_id=%s score=%s elapsed_ms=%.1f",
@@ -1027,7 +1027,11 @@ class EpisodeController(RealtimeController):
         self._owner_barge_expired = False
         self.barge_in_gate.reset()
         self.turns.invalidate()
-        playback = self._stop_playback_snapshot(handle.workspace.playback_key)
+        output = getattr(self, "output", None)
+        if output is not None and callable(getattr(output, "cancel_all_confirmed", None)):
+            playback = await output.cancel_all_confirmed("interrupted")
+        else:
+            playback = await self._confirmed_stop_snapshot(handle.workspace.playback_key)
         await self._state_event(TerminalState.INTERRUPTING, listening=True, turn_id=handle.turn_id)
         await self.episode.speech_activity(True, interrupt_reason="user_interrupted")
         await self._cancel_turn(reason="interrupted", snapshot=playback)
@@ -1047,17 +1051,24 @@ class EpisodeController(RealtimeController):
             return
         if policy == "stop_and_listen":
             await self.episode.log("AEC_FAILED", policy=policy, status=status, error=error)
-            self.output.cancel_all("input_unavailable")
+            await self.output.cancel_all_confirmed("input_unavailable")
             self.barge_in_gate.reset()
             return
         task = self._aec_recovery_task
         if task is not None and not task.done():
             return
+        confirmed_pause = getattr(self.player, "pause_confirmed", None)
         pause = getattr(self.player, "pause", None)
-        if not callable(pause) or not pause(handle.workspace.playback_key):
+        try:
+            paused = (bool(await confirmed_pause(handle.workspace.playback_key))
+                      if callable(confirmed_pause)
+                      else bool(pause and pause(handle.workspace.playback_key)))
+        except Exception:
+            paused = False
+        if not paused:
             await self.episode.log("AEC_FAILED", policy="stop_and_listen", status=status,
-                                   error="unable_to_pause_playback")
-            self.output.cancel_all("input_unavailable")
+                                   error="pause_unconfirmed")
+            await self.output.cancel_all_confirmed("input_unavailable")
             return
         await self.episode.log("AEC_RECOVERING", policy=policy, status=status, error=error)
         self._aec_recovery_task = asyncio.create_task(
@@ -1075,7 +1086,16 @@ class EpisodeController(RealtimeController):
                 deadline = time.monotonic() + 0.75
                 while time.monotonic() < deadline and not self._barge_in_protected_available():
                     await asyncio.sleep(0.02)
-                if self._barge_in_protected_available() and self.player and self.player.resume(playback_key):
+                resumed = False
+                if self._barge_in_protected_available() and self.player:
+                    confirmed_resume = getattr(self.player, "resume_confirmed", None)
+                    try:
+                        resumed = (bool(await confirmed_resume(playback_key))
+                                   if callable(confirmed_resume)
+                                   else bool(self.player.resume(playback_key)))
+                    except Exception:
+                        resumed = False
+                if resumed:
                     self.barge_in_gate.reset()
                     await self.episode.log("AEC_RECOVERED", recovery_ms=getattr(processor, "last_recovery_ms", None),
                                            recovery_count=getattr(processor, "recovery_count", None))
@@ -1083,7 +1103,7 @@ class EpisodeController(RealtimeController):
             await self.episode.log("AEC_FAILED", policy="stop_and_listen",
                                    status=getattr(processor, "status", "FAILED"),
                                    error=getattr(processor, "error", "recovery_timeout"))
-            self.output.cancel_all("input_unavailable")
+            await self.output.cancel_all_confirmed("input_unavailable")
             self.barge_in_gate.reset()
         finally:
             self._aec_recovery_task = None
@@ -1654,7 +1674,7 @@ class EpisodeController(RealtimeController):
     async def _handle_asr_disconnect(self):
         self._cancel_tts_hold_fallback()
         await self.episode.speech_activity(None, interrupt_reason="input_unavailable")
-        self.output.cancel_all("input_unavailable")
+        await self.output.cancel_all_confirmed("input_unavailable")
         await super()._handle_asr_disconnect()
 
     async def _error(self, code, message, *, recoverable, turn_id=None):

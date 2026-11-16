@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-import time
 from typing import Any
 
 try:
@@ -27,7 +26,9 @@ try:
 except ImportError:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
-from ..audio.devices import AudioDeviceError, resolve_device
+from ..audio.devices import AudioDeviceError
+from ..devices.contracts import TimedRecordingPort
+from ..devices.local import LocalAudioDevice
 
 #: Shortest and longest acceptable enrollment segment.
 MIN_SEGMENT_SECONDS = 5.0
@@ -161,68 +162,36 @@ def voiced_ranges_for_windows(pcm: bytes, *, windows: list[tuple[int, int]],
 def capture_segment(*, sample_rate: int = 16000, channels: int = 1,
                     input_device: str | int | None = None,
                     seconds: float = 8.0, processor: Any = None,
-                    block_ms: int = 20, control: CaptureControl | None = None) -> CapturedSegment:
+                    block_ms: int = 20, control: CaptureControl | None = None,
+                    recording_device: TimedRecordingPort | None = None) -> CapturedSegment:
     """Record one bounded enrollment segment from the runtime input device."""
     if np is None:
         raise EnrollmentCaptureError("numpy 不可用", code="SPEAKER_CAPTURE_UNAVAILABLE")
-    try:
-        import sounddevice as sd  # type: ignore
-    except ImportError as exc:
-        raise EnrollmentCaptureError("缺少 sounddevice，请先运行安装脚本。",
-                                     code="SPEAKER_CAPTURE_UNAVAILABLE") from exc
-
     duration = max(_HARD_MIN_SECONDS, min(_HARD_MAX_SECONDS, float(seconds)))
+    control = control or CaptureControl()
+    recording_device = recording_device or LocalAudioDevice()
     try:
-        device = resolve_device(input_device, input_device=True)
+        raw, callback_error = recording_device.record_bounded(sample_rate=sample_rate, channels=channels,
+            input_device=input_device, seconds=duration, block_ms=block_ms, control=control)
+    except TimeoutError as exc:
+        raise EnrollmentCaptureError(str(exc), code="SPEAKER_CAPTURE_DEVICE") from exc
     except AudioDeviceError as exc:
         raise EnrollmentCaptureError(str(exc), code="SPEAKER_CAPTURE_DEVICE") from exc
-
-    frames = int(round(duration * sample_rate))
-    blocksize = max(1, sample_rate * block_ms // 1000)
-    control = control or CaptureControl()
-    chunks: list[bytes] = []
-    received = 0
-    complete = threading.Event()
-    callback_error = ""
-    def receive(indata: Any, _frames: int, _time: Any, status: Any) -> None:
-        nonlocal received, callback_error
-        if control.cancel.is_set() or control.stop.is_set():
-            complete.set()
-            return
-        if status:
-            callback_error = str(status)
-        remaining = frames * channels * 2 - received
-        chunk = bytes(indata)[:max(0, remaining)]
-        if chunk:
-            chunks.append(chunk)
-            received += len(chunk)
-            control.duration_ms = received * 1000 // (sample_rate * channels * 2)
-        if received >= frames * channels * 2:
-            complete.set()
-    try:
-        with sd.RawInputStream(samplerate=sample_rate, channels=channels, blocksize=blocksize,
-                               dtype="int16", device=device, callback=receive):
-            deadline = time.monotonic() + duration + 2
-            while not complete.wait(0.01):
-                if control.cancel.is_set() or control.stop.is_set():
-                    break
-                if time.monotonic() >= deadline:
-                    raise EnrollmentCaptureError("麦克风采集超时，请检查输入设备。")
     except Exception as exc:  # pragma: no cover - hardware dependent
         if isinstance(exc, EnrollmentCaptureError):
             raise
-        raise EnrollmentCaptureError(f"麦克风采集失败：{exc}",
-                                     code="SPEAKER_CAPTURE_DEVICE") from exc
+        if isinstance(exc, RuntimeError) and "sounddevice" in str(exc):
+            raise EnrollmentCaptureError("缺少 sounddevice，请先运行安装脚本。",
+                                         code="SPEAKER_CAPTURE_UNAVAILABLE") from exc
+        raise EnrollmentCaptureError(f"麦克风采集失败：{exc}", code="SPEAKER_CAPTURE_DEVICE") from exc
     finally:
         control.closed.set()
     if control.cancel.is_set():
-        chunks.clear()
         raise EnrollmentCaptureError("本次采集已取消", code="SPEAKER_CAPTURE_CANCELLED")
     if callback_error:
         raise EnrollmentCaptureError(f"采集出现丢帧：{callback_error}，请重录。")
 
-    samples = np.frombuffer(b"".join(chunks), dtype=np.int16)
-    chunks.clear()
+    samples = np.frombuffer(raw, dtype=np.int16)
     if channels > 1:
         samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
     samples = np.ascontiguousarray(samples.reshape(-1))

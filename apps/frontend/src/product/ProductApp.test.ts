@@ -786,7 +786,8 @@ describe('正式界面的真实控件交互', () => {
     } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(13)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(14)
+    expect(wrapper.find('[data-component="tts-aniflive"]').exists()).toBe(true)
     expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(0)
     expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
@@ -972,7 +973,7 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(13)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(14)
     expect(wrapper.find('[data-component="analysis-runtime"]').exists()).toBe(false)
     expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(0)
     expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
@@ -983,7 +984,8 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.find('.retry-action').exists()).toBe(false)
     expect(wrapper.get('[data-component="minimax"] .local-component-action').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('[data-component="minimax"] .local-component-action').text()).toBe('详情')
-    for (const row of wrapper.findAll('.local-component-card[data-component]').filter(row => !['voxcpm', 'minimax'].includes(row.attributes('data-component') ?? ''))) {
+    expect(wrapper.get('[data-component="tts-aniflive"]').classes()).toContain('disabled')
+    for (const row of wrapper.findAll('.local-component-card[data-component]').filter(row => !['voxcpm', 'minimax', 'tts-aniflive'].includes(row.attributes('data-component') ?? ''))) {
       expect(row.classes()).toContain('loading')
       expect(row.get('.local-state').text()).toBe('启动中')
       expect(row.get('.local-component-action').text()).toBe('详情')

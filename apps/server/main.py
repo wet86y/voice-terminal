@@ -39,6 +39,20 @@ if __name__ == "__main__":
     worker_imports_ready("voice")
 
 
+def _bind_device_gateway_listener(enabled: bool):
+    """_bind_device_gateway_listener（仅按明确共享角色请求绑定设备回环网关）。"""
+    if not enabled:
+        return None, None
+    try:
+        candidate, candidate_port = bind_loopback(18_765, host="127.0.0.1")
+        if candidate_port == 18_765:
+            return candidate, None
+        candidate.close()
+        return None, "设备回环网关端口已占用。"
+    except OSError as exc:
+        return None, f"设备回环网关不可用：{type(exc).__name__}"
+
+
 def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | int]:
     """Small, non-secret identity payload for logs and ``/health``.
 
@@ -75,7 +89,8 @@ def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | i
 
 def build_application(config_path: Path | None = None, *, bind_listener: bool = False,
                       preferred_host: str | None = None,
-                      preferred_port: int | None = None) -> tuple[object, SessionRuntime]:
+                      preferred_port: int | None = None,
+                      enable_device_gateway: bool = False) -> tuple[object, SessionRuntime]:
     root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
@@ -95,6 +110,8 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
     )
     config = product_settings.effective_config()
     bound_socket = None
+    device_gateway_socket = None
+    device_gateway_bind_error = None
     if bind_listener:
         # listener（监听套接字）先于 SessionRuntime（会话运行时）和模型初始化绑定，防止端口探测后再绑定的竞态。
         bound_socket, actual_port = bind_loopback(
@@ -103,12 +120,18 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
         )
         config = replace(config, server=replace(config.server, host="127.0.0.1", port=actual_port))
         report_endpoint("voice", endpoint_url("voice", actual_port))
+        device_gateway_socket, device_gateway_bind_error = _bind_device_gateway_listener(enable_device_gateway)
     runtime = SessionRuntime(
         config,
         product_settings=product_settings,
         speaker_worker_config_path=effective_config,
     )
     runtime._application_listener_socket = bound_socket
+    runtime._device_gateway_listener_socket = device_gateway_socket
+    runtime._device_gateway_bind_error = device_gateway_bind_error
+    runtime._device_gateway_enabled = bool(enable_device_gateway)
+    if device_gateway_bind_error:
+        logging.getLogger(__name__).warning("device_gateway.disabled reason=%s", device_gateway_bind_error)
     runtime.build_info = _runtime_build_info(root, effective_config)
     model_registry = ModelRegistryService(
         config=config,
@@ -176,6 +199,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None, help="本地 YAML 配置路径")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--device-gateway", action="store_true",
+                        help="仅在 shared_host（共享主机）模式下监听受保护的回环设备网关")
     args = parser.parse_args()
 
     root = project_root(Path(__file__))
@@ -185,16 +210,20 @@ def main() -> None:
         configure_logging(paths.logs / "voice-server.log")
     with startup_stage("创建语音服务与读取有效配置"):
         app, runtime = build_application(args.config, bind_listener=True,
-            preferred_host=args.host, preferred_port=args.port)
+            preferred_host=args.host, preferred_port=args.port,
+            enable_device_gateway=args.device_gateway)
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
     bound_socket = runtime._application_listener_socket
+    device_gateway_socket = runtime._device_gateway_listener_socket
+    sockets = [sock for sock in (bound_socket, device_gateway_socket) if sock is not None]
     try:
-        run_uvicorn(app, sock=bound_socket, host=runtime.config.server.host,
+        run_uvicorn(app, sock=sockets, host=runtime.config.server.host,
             port=runtime.config.server.port, log_level="info", timeout_graceful_shutdown=10,
+            ws_max_size=270_336,  # ws_max_size（服务端接收的单条 WebSocket 消息上限，覆盖设备帧头与负载）。
             on_shutdown=runtime.begin_application_shutdown)
     finally:
-        if bound_socket is not None:
-            bound_socket.close()
+        for listener in sockets:
+            listener.close()
 
 
 if __name__ == "__main__":

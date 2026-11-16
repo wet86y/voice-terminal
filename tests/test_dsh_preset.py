@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+import shutil
+import tempfile
 
 import yaml
 
@@ -44,10 +46,40 @@ class DshPresetTests(unittest.TestCase):
         self.assertEqual(manifest["exports"]["."], "./lib/bridge/plugin.js")
         self.assertEqual(manifest["exports"]["./wake-tasks"], "./lib/wake-tasks/plugin.js")
         self.assertEqual(manifest["dsh"]["client"]["platform"], "web")
-        self.assertEqual({component["id"] for component in declaration["components"]}, {"bridge", "wake-tasks", "client", "preset", "shared"})
+        self.assertEqual({component["id"] for component in declaration["components"]}, {"bridge", "wake-tasks", "client", "preset", "shared", "device-control"})
         rules = (self.root / "config/dsh/shadow-agent.rules.md").read_text(encoding="utf-8")
         self.assertIn("子代理", rules)
         self.assertIn("普通 assistant 正文", rules)
+
+    def test_built_desktop_profile_contains_the_packaged_native_helper(self) -> None:
+        import json
+        from voice_terminal.dsh.profile import build_profile
+
+        bundle = self.root / "integrations/dsh/voice-terminal"
+        manifest = json.loads((bundle / "package.json").read_text(encoding="utf-8"))
+        self.assertIn("native/win32/device-helper.ps1", manifest["files"])
+        helper_source = bundle / "native/win32/device-helper.ps1"
+
+        with tempfile.TemporaryDirectory(prefix="dsh-profile-helper-") as temporary:
+            root = Path(temporary)
+            program = root / "program"
+            source_bundle = root / "bundles/voice-terminal"
+            destination = program / "config/dsh/profile"
+            source_bundle.mkdir(parents=True)
+            (program / "config/dsh").mkdir(parents=True)
+            shutil.copy2(bundle / "package.json", source_bundle / "package.json")
+            target_helper = source_bundle / "native/win32/device-helper.ps1"
+            target_helper.parent.mkdir(parents=True)
+            shutil.copy2(helper_source, target_helper)
+            shutil.copy2(
+                self.root / "config/dsh/web-profile.patch.yml",
+                program / "config/dsh/web-profile.patch.yml",
+            )
+
+            build_profile(program, root / "bundles", destination)
+
+            installed_helper = destination / "node_modules/@voice-terminal/dsh-plugin/native/win32/device-helper.ps1"
+            self.assertEqual(installed_helper.read_bytes(), helper_source.read_bytes())
 
     def test_web_patch_selects_shadow_and_disables_session_upload(self) -> None:
         patch = yaml.safe_load((self.root / "config" / "dsh" / "web-profile.patch.yml").read_text(encoding="utf-8"))

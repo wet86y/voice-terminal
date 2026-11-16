@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-system-feature-enable"
+description = "Enables the resource_system_feature_enable command without any pre-configured scope."
+commands.allow = ["resource_system_feature_enable"]
+
+[[permission]]
+identifier = "deny-resource-system-feature-enable"
+description = "Denies the resource_system_feature_enable command without any pre-configured scope."
+commands.deny = ["resource_system_feature_enable"]

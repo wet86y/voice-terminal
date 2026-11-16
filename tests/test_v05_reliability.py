@@ -249,7 +249,9 @@ class BargeInCompletionGuardTests(unittest.IsolatedAsyncioTestCase):
         controller.aec_failure_policy = "stop_and_listen"
         controller.audio_processor = SimpleNamespace(status="DEGRADED", error="reference stalled")
         controller._aec_recovery_task = None
-        controller.output.cancel_all = lambda reason: cancelled.append(reason)
+        async def cancel_all_confirmed(reason):
+            cancelled.append(reason)
+        controller.output.cancel_all_confirmed = cancel_all_confirmed
         controller.episode = SimpleNamespace(closed=False, log=log)
         controller.barge_in_gate = SimpleNamespace(reset=lambda: resets.append(True))
 
@@ -257,6 +259,82 @@ class BargeInCompletionGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cancelled, ["input_unavailable"])
         self.assertEqual(resets, [True])
+        self.assertEqual([kind for kind, _payload in traces], ["AEC_FAILED"])
+
+    async def test_aec_recovery_waits_for_remote_playback_pause_and_resume_receipts(self) -> None:
+        controller = object.__new__(EpisodeController)
+        calls = []
+        traces = []
+
+        class RemotePlayer:
+            async def pause_confirmed(self, key):
+                calls.append(("pause", key))
+                return True
+
+            async def resume_confirmed(self, key):
+                calls.append(("resume", key))
+                return True
+
+            def pause(self, _key):
+                raise AssertionError("remote recovery must await the confirmed pause path")
+
+            def resume(self, _key):
+                raise AssertionError("remote recovery must await the confirmed resume path")
+
+        async def log(kind, **payload):
+            traces.append((kind, payload))
+
+        async def cancel_all(reason):
+            calls.append(("cancel", reason))
+
+        controller.player = RemotePlayer()
+        controller.audio_processor = SimpleNamespace(
+            status="DEGRADED", error="reference stalled", recover=lambda: True,
+            last_recovery_ms=3, recovery_count=1,
+        )
+        controller.episode = SimpleNamespace(log=log)
+        controller.output = SimpleNamespace(cancel_all_confirmed=cancel_all)
+        controller._aec_recovery_task = None
+        controller._barge_in_protected_available = lambda: True
+        controller.barge_in_gate = SimpleNamespace(reset=lambda: calls.append(("gate_reset",)))
+        handle = SimpleNamespace(workspace=SimpleNamespace(playback_key="remote-speech"))
+
+        await controller._handle_aec_unavailable(handle)
+        await controller._aec_recovery_task
+
+        self.assertEqual(calls, [
+            ("pause", "remote-speech"), ("resume", "remote-speech"), ("gate_reset",),
+        ])
+        self.assertEqual([kind for kind, _payload in traces], ["AEC_RECOVERING", "AEC_RECOVERED"])
+
+    async def test_aec_recovery_treats_unknown_remote_pause_as_stop_required(self) -> None:
+        controller = object.__new__(EpisodeController)
+        calls = []
+        traces = []
+
+        class RemotePlayer:
+            async def pause_confirmed(self, _key):
+                raise RuntimeError("pause acknowledgment unknown")
+
+            def pause(self, _key):
+                raise AssertionError("uncertain remote pause must not fall back to local state")
+
+        async def log(kind, **payload):
+            traces.append((kind, payload))
+
+        async def cancel_all(reason):
+            calls.append(reason)
+
+        controller.player = RemotePlayer()
+        controller.audio_processor = SimpleNamespace(status="DEGRADED", error="reference stalled")
+        controller.episode = SimpleNamespace(log=log)
+        controller.output = SimpleNamespace(cancel_all_confirmed=cancel_all)
+        controller._aec_recovery_task = None
+        handle = SimpleNamespace(workspace=SimpleNamespace(playback_key="remote-speech"))
+
+        await controller._handle_aec_unavailable(handle)
+
+        self.assertEqual(calls, ["input_unavailable"])
         self.assertEqual([kind for kind, _payload in traces], ["AEC_FAILED"])
 
 

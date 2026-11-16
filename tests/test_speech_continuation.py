@@ -9,6 +9,7 @@ from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.streamed_speech import StreamedSpeechAdmissionState, queue_streamed_speech
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput
+from voice_terminal.devices.contracts import PlaybackOutcomeUnknown
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -208,6 +209,30 @@ def test_new_speak_is_rejected_until_actual_pcm_playback_completes():
             await asyncio.wait_for(asyncio.shield(second.task), HANDOFF_TIMEOUT_SECONDS)
         finally:
             await harness.close()
+    asyncio.run(scenario())
+
+
+def test_unconfirmed_remote_stop_is_recorded_as_unknown_delivery():
+    async def scenario():
+        harness = ContinuationHarness()
+
+        async def stop_without_receipt(_key=None):
+            raise PlaybackOutcomeUnknown("设备停止回执超时")
+
+        try:
+            handle = await harness.first()
+            harness.render(20)
+            harness.player.stop_and_snapshot_confirmed = stop_without_receipt
+            assert await harness.output.cancel_confirmed(handle.speech_id, "interrupted")
+            await asyncio.gather(handle.task, return_exceptions=True)
+            delivery = harness.records[-1]["delivery"]
+            assert delivery["status"] == "unknown"
+            assert delivery["heard_text"] == ""
+            assert delivery["uncertain_text"] == FIRST_TEXT
+            assert delivery["reason"] == "playback_stop_unconfirmed"
+        finally:
+            await harness.close()
+
     asyncio.run(scenario())
 
 

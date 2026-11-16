@@ -3,12 +3,21 @@
   "description": "组件职责声明：英文标识仅用于代码，中文说明用于维护。安装单位始终为一个功能包。",
   "components": [
     {
+      "id": "device-control",
+      "description": "设备控制：为已绑定根代理提供设备清单、窗口观察和动作工具；通过统一设备路由固定本机或远端目标，复核连接与执行器代次、沿用一次性审批并查询原任务。真实远端交互验收仍待完成。",
+      "entry": "src/device-control/plugin.ts",
+      "loader_id": "voice-terminal-device-control",
+      "depends_on": ["shared"],
+      "runtime_entry": "lib/device-control/plugin.js"
+    },
+    {
       "id": "bridge",
       "description": "桥接：会话绑定、上下文门禁、工具回执、观察与设置。",
       "entry": "src/bridge/plugin.ts",
       "loader_id": "voice-terminal-shadow-bridge",
       "depends_on": [
-        "shared"
+        "shared",
+        "device-control"
       ],
       "runtime_entry": "lib/bridge/plugin.js"
     },

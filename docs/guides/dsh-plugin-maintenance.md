@@ -11,6 +11,7 @@
 | 组件 | 源码入口，相对于插件目录 | 负责内容 | 生命周期所有者 |
 | --- | --- | --- | --- |
 | `bridge`（桥接） | `src/bridge/plugin.ts` | 会话绑定、上下文合并与门禁、8 个根代理工具（含按需截屏）、回执、观察、工作区及模型设置 | 桥接插件上下文及绑定的根代理 |
+| `device-control`（设备控制） | `src/device-control/plugin.ts` | 独立加载服务；在当前绑定根代理上安装 `device_list`（设备列表），观察复核源码已纳入包；设备动作与远端执行后端尚待实现 | 设备控制加载器与当前桥接绑定 |
 | `wake-tasks`（项目唤醒任务） | `src/wake-tasks/plugin.ts` | 8 个任务及语音事件工具、任务接口、持久化、旧项目任务迁移、定时投递 | 任务插件上下文及任务服务 |
 | `client`（浏览器界面） | `src/client/index.ts` | 设置页、消息渲染、语言资源和界面插槽 | 浏览器插件上下文及服务期间注册 |
 | `preset`（代理预设） | `preset/shadow-agent/agent.cordis.yml` | 官方工具、压缩、子代理及工作流的完整组合 | 官方代理预设注册器 |
@@ -19,6 +20,8 @@
 ```mermaid
 graph LR
   B[bridge 桥接] --> S[shared 共享契约]
+  B --> D[device-control 设备控制]
+  D --> S
   W[wake-tasks 项目唤醒任务] --> S
   C[client 浏览器界面] --> S
   P[preset 代理预设] --> O[官方能力组合]
@@ -26,16 +29,17 @@ graph LR
 
 桥接与任务组件没有互相导入。共有鉴权、回环地址约束和传输实现只维护一份；任务组件通过公开语音接口取得当前语音会话。浏览器只使用共享类型和设置契约，不导入宿主运行实现。组件依赖必须先声明，构建检查会拒绝未声明依赖、循环依赖和缺失入口。
 
-一次安装只登记一个功能包。`host.patch.yml`（宿主组合补丁）保持两个独立加载行：根包入口加载桥接，`./wake-tasks`（任务子入口）加载任务组件。构建再合入 `preset-shadow-agent`（预设加载行）。只有根包声明 `dsh.client`（浏览器模块元数据），避免任务子入口重复注册设置页。
+一次安装只登记一个功能包。`host.patch.yml`（宿主组合补丁）保持三个独立加载行：`./device-control`（设备控制子入口）先提供根代理工具服务，根包入口随后加载桥接，`./wake-tasks`（任务子入口）加载任务组件。构建再合入 `preset-shadow-agent`（预设加载行）。只有根包声明 `dsh.client`（浏览器模块元数据），避免任务子入口重复注册设置页。
 
 ## 必须保持的兼容契约
 
 | 契约 | 保留值及维护要求 |
 | --- | --- |
-| 加载行 | `voice-terminal-shadow-bridge`（桥接行）、`voice-terminal-wake-tasks`（任务行）、`preset-shadow-agent`（预设行）；包名变化不能改变行标识 |
+| 加载行 | `voice-terminal-device-control`（设备控制行）、`voice-terminal-shadow-bridge`（桥接行）、`voice-terminal-wake-tasks`（任务行）、`preset-shadow-agent`（预设行）；包名变化不能改变行标识 |
 | 设置命名空间 | `voice-terminal-shadow-bridge`（桥接设置）；保留已有工作区、模型、推理强度和恢复提示 |
 | 消息来源 | `plugin:voice-terminal-shadow-bridge`（桥接消息来源）；语音端和客户端依赖此值 |
 | 预设标识 | `shadow-agent`（影子代理预设）；保持原有官方默认工具、压缩、子代理及工作流能力 |
+| 包导出 | `./device-control`（设备控制加载入口）；构建收据必须记录并核验该运行路径 |
 | 网络接口 | `/api/voice-terminal-shadow/v1`（桥接接口）、`/api/voice-terminal-wake/v1`（任务接口）、`/api/internal/dsh-bridge/`（语音回调前缀，含 `screen.capture`（DSH 按需截屏）） |
 | 任务存储 | `storages/voice-terminal-wake-tasks.json`（项目任务文件）；`schema_version: 1`（存储格式版本）、`tasks`（任务记录）、`deleted_task_ids`（删除确认标识） |
 | 会话映射 | `.local/build/dsh/session-mappings.json`（语音与 DSH 会话映射）；`schema_version: 2`（映射格式版本） |
@@ -43,7 +47,7 @@ graph LR
 | 激活与上下文 | `activation_id`（激活标识）、`context_revision`（上下文版本）；过期调用必须保持拒绝，不能用新激活替代旧请求水位 |
 | 实时运行轨迹 | `shadow.activity`（内部活动回调）的 `action_seq`（动作序号）在激活内递增，思考、工具和运行状态串行发送；`activity`（实时活动正文）只使用绑定根代理的公开实时流及工具事件，字段与拒收规则见 [桥接活动协议](../architecture/bridge-2.0-protocol.md) |
 
-8 个根代理工具为 `capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）、`finish_shadow_no_action`（终态无需动作）。均只安装到已绑定的根代理，子代理不能通过伪造会话标识调用。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。
+桥接组件保留 8 个根代理工具：`capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）、`finish_shadow_no_action`（终态无需动作）。设备控制组件另安装 `device_list`（设备列表），都只允许当前绑定的根代理调用；子代理不能通过伪造会话标识绕过授权。远端 `device_control`（设备动作）工具与动作后端仍未实现。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。
 
 8 个任务工具为 `schedule_wake`（简易创建）、`cancel_wake`（取消）、`read_wake_reference`（按需读取冻结参考）、`publish_voice_event`（发布语音事件）、`wake_task_create`（创建）、`wake_task_list`（查询）、`wake_task_update`（更新）、`wake_task_delete`（删除）。保留完整任务标识、历史、删除确认、写入失败恢复及重启恢复。
 

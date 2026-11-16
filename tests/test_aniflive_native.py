@@ -94,6 +94,31 @@ def test_wrong_archive_does_not_change_existing_files(tmp_path):
     assert not local.exists()
 
 
+def test_source_rename_retries_only_transient_windows_file_locks(tmp_path, monkeypatch):
+    candidate, target = tmp_path / "candidate", tmp_path / "target"
+    candidate.mkdir()
+    (candidate / "source.txt").write_text("verified", encoding="utf-8")
+    rename = native.os.rename
+    calls, delays = [], []
+
+    def transiently_locked(source, destination):
+        calls.append((source, destination))
+        if len(calls) < 3:
+            error = PermissionError("temporary Windows file lock")
+            error.winerror = 5
+            raise error
+        return rename(source, destination)
+
+    monkeypatch.setattr(native.os, "name", "nt")
+    monkeypatch.setattr(native.os, "rename", transiently_locked)
+    monkeypatch.setattr(native.time, "sleep", delays.append)
+    native.rename_with_windows_retry(candidate, target)
+
+    assert len(calls) == 3
+    assert delays == [0.05, 0.1]
+    assert (target / "source.txt").read_text(encoding="utf-8") == "verified"
+
+
 @pytest.mark.parametrize('activation_fails', [False, True])
 def test_known_source_upgrade_checks_prior_and_restores_if_activation_fails(tmp_path, monkeypatch, activation_fails):
     archive, local = archive_fixture(tmp_path, monkeypatch)

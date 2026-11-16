@@ -109,15 +109,24 @@ def test_prewarm_drains_a_private_completed_segment_and_never_reuses_it():
 def test_cold_reference_preparation_does_not_consume_inference_prewarm_budget(monkeypatch):
     from voice_terminal.providers.aniflive_tts import AnifLiveTtsSession
     original = AnifLiveTtsSession.start
+    cold_started = asyncio.Event()
+    cold_resume = asyncio.Event()
     async def cold_start(session):
-        await asyncio.sleep(.05)  # 模拟模型／多情绪参考准备，超过静默推理预算。
+        cold_started.set()
+        await cold_resume.wait()  # 模拟冷态准备；由测试确认其超出推理预热预算。
         await original(session)
     monkeypatch.setattr(AnifLiveTtsSession, 'start', cold_start)
     async def run():
-        client = SpeechService().client(prewarm_timeout_seconds=.025)
+        client = SpeechService().client(prewarm_timeout_seconds=.2)
+        prewarm = asyncio.create_task(client.prewarm())
         try:
-            assert (await client.prewarm())['status'] == 'READY'
+            await cold_started.wait()
+            await asyncio.sleep(.25)  # 让推理预热期限先结束，冷态准备仍应继续。
+            assert not prewarm.done()
+            cold_resume.set()
+            assert (await prewarm)['status'] == 'READY'
         finally:
+            cold_resume.set()
             await client.close()
     asyncio.run(run())
 

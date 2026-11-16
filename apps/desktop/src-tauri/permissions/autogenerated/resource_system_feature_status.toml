@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-system-feature-status"
+description = "Enables the resource_system_feature_status command without any pre-configured scope."
+commands.allow = ["resource_system_feature_status"]
+
+[[permission]]
+identifier = "deny-resource-system-feature-status"
+description = "Denies the resource_system_feature_status command without any pre-configured scope."
+commands.deny = ["resource_system_feature_status"]
