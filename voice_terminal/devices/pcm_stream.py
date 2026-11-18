@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Callable
 
 from ..controller.turn_workspace import AudioFrame
-from .media_protocol import MediaFrame, MediaProtocolError
+from .media_protocol import AudioProcessingStatus, MediaFrame, MediaProtocolError
 from .opus_codec import OpusDecoder
 from .registry import DeviceRegistry, InteractionLease
 
@@ -36,10 +37,12 @@ class PcmInputStream:
         self._opus_decoder = OpusDecoder(16_000) if audio_codec == "opus" else None
         self._opus_pre_skip_remaining = encoder_pre_skip_samples
         self._opus_buffer = bytearray()
+        self._opus_processing_chunks: deque[tuple[AudioProcessingStatus, int]] = deque()
         self._opus_stream_start_sample: int | None = None
         self._opus_stream_start_host_time: float | None = None
         self._opus_output_samples = 0
         self._opus_uncertainty: float | None = None
+        self._last_reverse_generation: int | None = None  # _last_reverse_generation（拒绝旧设备播放参考状态回退）。
         self._next_sequence = 0
         self._next_sample: int | None = None
         self._last_device_time: int | None = None
@@ -54,6 +57,7 @@ class PcmInputStream:
             self._opus_decoder.close()
             self._opus_decoder = None
         self._opus_buffer.clear()
+        self._opus_processing_chunks.clear()
 
     def accept(self, frame: MediaFrame) -> AudioFrame | None:
         """accept（接纳帧）：PCM 即时返回；Opus 先剔除编码预延迟并累计有效样本。"""
@@ -73,6 +77,12 @@ class PcmInputStream:
                 raise MediaProtocolError("音频流编号或帧序号不连续。")
             if frame.audio_codec != self.audio_codec:
                 raise MediaProtocolError("音频帧编解码模式与签名媒体握手不一致。")
+            if not isinstance(frame.audio_processing, AudioProcessingStatus):
+                raise MediaProtocolError("音频帧缺少设备前处理状态。")
+            processing = AudioProcessingStatus.from_wire(frame.audio_processing.to_wire())
+            if (self._last_reverse_generation is not None
+                    and processing.reverse_generation < self._last_reverse_generation):
+                raise MediaProtocolError("设备播放反向参考代次倒退，拒绝迟到处理状态。")
             if (type(frame.start_sample) is not int or frame.start_sample < 0
                     or type(frame.sample_count) is not int or not 0 < frame.sample_count <= 320
                     or type(frame.device_time_us) is not int or frame.device_time_us < 0
@@ -110,9 +120,22 @@ class PcmInputStream:
             self._last_device_time = frame.device_time_us
             self._last_host_time = float(host_time)
             self.clock_uncertainty_seconds = float(uncertainty) if uncertainty is not None else None
+            self._last_reverse_generation = processing.reverse_generation
+            processing_identity = (
+                self.lease.device_id,
+                self.lease.connection_generation,
+                self.lease.executor_generation,
+                self.lease.interaction_generation,
+                self.stream_id,
+            )
             if self._opus_decoder is None:
-                return AudioFrame(frame.payload, frame.start_sample, float(host_time), self.clock_uncertainty_seconds)
+                return AudioFrame(
+                    frame.payload, frame.start_sample, float(host_time), self.clock_uncertainty_seconds,
+                    processing, processing_identity,
+                )
             decoded = self._opus_decoder.decode(frame.payload)
+            if not isinstance(decoded, bytes) or len(decoded) % 2:
+                raise MediaProtocolError("Opus 解码器返回了不完整的 PCM 采样。")
             if self._opus_stream_start_sample is None:
                 self._opus_stream_start_sample = frame.start_sample
                 self._opus_stream_start_host_time = float(host_time)
@@ -121,6 +144,9 @@ class PcmInputStream:
                 decoded = decoded[skipped * 2:]
                 self._opus_pre_skip_remaining -= skipped
             self._opus_buffer.extend(decoded)
+            decoded_samples = len(decoded) // 2
+            if decoded_samples:
+                self._opus_processing_chunks.append((processing, decoded_samples))
             self._opus_uncertainty = float(uncertainty) if uncertainty is not None else self._opus_uncertainty
             output_bytes = 320 * 2
             if len(self._opus_buffer) < output_bytes:
@@ -130,7 +156,48 @@ class PcmInputStream:
             start_sample = self._opus_stream_start_sample + self._opus_output_samples
             captured_at = self._opus_stream_start_host_time + self._opus_output_samples / 16_000
             self._opus_output_samples += 320
-            return AudioFrame(pcm, start_sample, captured_at, self._opus_uncertainty)
+            output_processing = self._consume_opus_processing(320)
+            return AudioFrame(
+                pcm, start_sample, captured_at, self._opus_uncertainty,
+                output_processing, processing_identity,
+            )
         except Exception:
             self.close()
             raise
+
+    def _consume_opus_processing(self, sample_count: int) -> AudioProcessingStatus:
+        """_consume_opus_processing（按解码样本位置合并状态）：代次变更时打断保护采用最保守值。"""
+        remaining = sample_count
+        statuses: list[AudioProcessingStatus] = []
+        while remaining > 0 and self._opus_processing_chunks:
+            status, available = self._opus_processing_chunks[0]
+            consumed = min(remaining, available)
+            statuses.append(status)
+            remaining -= consumed
+            if consumed == available:
+                self._opus_processing_chunks.popleft()
+            else:
+                self._opus_processing_chunks[0] = (status, available - consumed)
+        if remaining or not statuses:
+            raise MediaProtocolError("Opus 解码输出没有对应的前处理状态。")
+
+        severity = {"ready": 0, "degraded": 1, "error": 2, "unavailable": 3}
+        state = max((item.state for item in statuses), key=lambda value: severity[value])
+        if any(item.near_end_voice is True for item in statuses):
+            near_end_voice: bool | None = True
+        elif all(item.near_end_voice is False for item in statuses):
+            near_end_voice = False
+        else:
+            near_end_voice = None
+        reverse_generation = statuses[-1].reverse_generation
+        same_reference = all(item.reverse_generation == reverse_generation for item in statuses)
+        protected = (state == "ready" and same_reference
+                     and all(item.protected_interruption_available for item in statuses))
+        error = next((item.error for item in statuses if item.error is not None), None)
+        if state == "ready" and (near_end_voice is None or error is not None):
+            state = "degraded"
+            protected = False
+        if state != "ready":
+            near_end_voice = None
+            protected = False
+        return AudioProcessingStatus(state, near_end_voice, protected, reverse_generation, error)

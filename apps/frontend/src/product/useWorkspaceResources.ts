@@ -1,4 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import { nativeDeviceApi, type RemoteManagementOperation } from './native-device-api'
 import {
   desktopPort,
   APP_UPDATE_EVENT,
@@ -34,6 +36,10 @@ export interface ResourceDownloadBundlePlan {
 /** useWorkspaceResources（工作区与资源控制器）：原生操作不依赖 Voice（语音服务）接口。 */
 export function useWorkspaceResources() {
   const port = desktopPort() as DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopUpdatePort
+  const remoteMode = ref(typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.remote_mode === true)
+  let targetResolved = remoteMode.value || !locateNativeInvoker()
+  let targetResolution: Promise<boolean> | null = null
+  const remoteResourceNotice = '远程服务端组件状态暂不可用。本机资源操作已停用，以免修改客户端组件。'
   const workspace = ref<WorkspaceInfo | null>(null)
   const resources = ref<ResourceStatus[]>([])
   const resourceJobs = ref<ResourceJob[]>([])
@@ -56,7 +62,7 @@ export function useWorkspaceResources() {
   const startingResources = ref(new Set<string>())
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
-  const pendingResetPlan = ref<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string } | null>(null) // pendingResetPlan（一次删除范围确认）。
+  const pendingResetPlan = ref<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string; plan_request_id?: string } | null>(null) // pendingResetPlan（服务端一次性删除范围确认）。
   const pendingDownloadPlan = ref<ResourceInstallPlan | null>(null)
   const pendingDownloadBundlePlan = ref<ResourceDownloadBundlePlan | null>(null) // pendingDownloadBundlePlan（分类下载确认草稿）。
   const preparingDownloadBundle = ref(false) // preparingDownloadBundle（正在并行读取分类资源计划）。
@@ -75,8 +81,66 @@ export function useWorkspaceResources() {
   let eventRevision = 0 // eventRevision（页面事件代次）：兼容没有任务修订号的测试接口。
   const receivedEvents = new Map<string, number>()
 
+  async function resolveRemoteMode(): Promise<boolean> {
+    if (targetResolved) return remoteMode.value
+    if (!locateNativeInvoker()) {
+      targetResolved = true
+      return remoteMode.value
+    }
+    if (!targetResolution) {
+      targetResolution = nativeDeviceApi.deviceConfigStatus().then(status => {
+        remoteMode.value = status.runtime.mode === 'remote'
+        targetResolved = true
+        return remoteMode.value
+      }).catch(error => {
+        // 无法确认操作目标时，拒绝本机资源写入。
+        remoteMode.value = true
+        targetResolved = true
+        resourceError.value = error instanceof Error ? error.message : '无法确认资源管理目标。'
+        return true
+      }).finally(() => { targetResolution = null })
+    }
+    return targetResolution
+  }
+
+  function localResourceTargetAllowed(): boolean {
+    if (!port.available) return false
+    if (!targetResolved) {
+      void resolveRemoteMode()
+      resourceError.value = '正在确认资源管理目标，请稍后重试。'
+      return false
+    }
+    if (remoteMode.value) {
+      resourceError.value = remoteResourceNotice
+      workspaceError.value = remoteResourceNotice
+      return false
+    }
+    return true
+  }
+
+  function resourceTargetAllowed(): boolean {
+    if (!port.available) return false
+    if (!targetResolved) {
+      void resolveRemoteMode()
+      resourceError.value = '正在确认资源管理目标，请稍后重试。'
+      return false
+    }
+    return true
+  }
+
+  async function remoteResourceOperation<T>(operation: RemoteManagementOperation, argumentsValue: Record<string, unknown> = {}): Promise<T> {
+    const result = await nativeDeviceApi.remoteManagementRequest(operation, argumentsValue)
+    if (result.status < 200 || result.status >= 300) {
+      const body = result.body as Record<string, unknown>
+      const message = typeof body.message === 'string' ? body.message
+        : typeof body.error === 'string' ? body.error : `服务端资源操作失败（${result.status}）。`
+      throw new Error(message)
+    }
+    return result.body as unknown as T
+  }
+
   // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
-  const canManage = computed(() => port.available && workspace.value?.can_manage)
+  const canManage = computed(() => port.available && !remoteMode.value && workspace.value?.can_manage)
   const resourcesCanManage = computed(() => port.available)
   const activeWorkspaceJob = computed(() => [...workspaceJobs.value].reverse().find(job => !TERMINAL_JOB_STATES.has(job.state)))
   const latestWorkspaceJob = computed(() => workspaceJobs.value.at(-1) ?? null)
@@ -111,10 +175,13 @@ export function useWorkspaceResources() {
     if (!port.available || snapshotRequest) return snapshotRequest ?? Promise.resolve()
     const startedAt = eventRevision
     const request = (async () => {
+      if (!resourceTargetAllowed()) return
       try {
-        const jobs = typeof port.resourceJobSnapshots === 'function'
-          ? await port.resourceJobSnapshots()
-          : typeof port.environmentStatus === 'function' ? (await port.environmentStatus()).jobs ?? [] : []
+        const jobs = remoteMode.value
+          ? await remoteResourceOperation<ResourceJob[]>('resource.jobs')
+          : typeof port.resourceJobSnapshots === 'function'
+            ? await port.resourceJobSnapshots()
+            : typeof port.environmentStatus === 'function' ? (await port.environmentStatus()).jobs ?? [] : []
         if (!mounted) return
         // 清除旧页面曾恢复的归档，避免其失败提示覆盖已经完成的当前任务。
         resourceJobs.value = resourceJobs.value.filter(job => !job.job_id.startsWith('history-'))
@@ -164,6 +231,7 @@ export function useWorkspaceResources() {
 
   async function refreshWorkspace() {
     if (!port.available) return
+    if (!localResourceTargetAllowed()) return
     try {
       workspace.value = await port.workspaceInfo()
       if (!appUpdate.value.current_version) appUpdate.value.current_version = workspace.value.version
@@ -179,11 +247,14 @@ export function useWorkspaceResources() {
     if (inventoryRefreshRequest) return inventoryRefreshRequest
     inventoryRefreshing.value = true
     const request = (async () => {
+      if (!resourceTargetAllowed()) return
       let checkedRevision: number
       do {
         checkedRevision = inventoryRevision
         try {
-          const inventory = await port.resourceInventory()
+          const inventory = remoteMode.value
+            ? await remoteResourceOperation<ResourceStatus[]>('resource.inventory')
+            : await port.resourceInventory()
           if (!mounted) return
           // 请求途中组件完成启用时，丢弃旧结果并在同一等待链中重新读取。
           if (checkedRevision === inventoryRevision) {
@@ -221,6 +292,7 @@ export function useWorkspaceResources() {
 
   async function subscribe() {
     if (!port.available) return
+    if (!resourceTargetAllowed()) return
     let resourceUnlisten: (() => void) | undefined
     let workspaceUnlisten: (() => void) | undefined
     let updateUnlisten: (() => void) | undefined
@@ -264,9 +336,20 @@ export function useWorkspaceResources() {
     if (!port.available) return
     loading.value = true
     window.addEventListener('focus', refreshOnFocus)
-    unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined),
-      Promise.resolve().then(() => port.integrityStatus()).then(value => { if (mounted) integrity.value = value }).catch(error => { if (mounted) integrity.value.error = String(error) })]
-    void Promise.all(unlistenRequests).finally(() => { loading.value = false; schedulePoll() })
+    void (async () => {
+      const remote = await resolveRemoteMode()
+      if (remote) {
+        workspaceError.value = remoteResourceNotice
+        unlistenRequests = [subscribe(), refreshJobSnapshots(), refreshInventory()]
+        await Promise.all(unlistenRequests)
+        schedulePoll()
+        return
+      }
+      unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined),
+        Promise.resolve().then(() => port.integrityStatus()).then(value => { if (mounted) integrity.value = value }).catch(error => { if (mounted) integrity.value.error = String(error) })]
+      await Promise.all(unlistenRequests)
+      schedulePoll()
+    })().finally(() => { loading.value = false })
   })
 
   onBeforeUnmount(() => {
@@ -306,17 +389,18 @@ export function useWorkspaceResources() {
   }
 
   async function downloadIntegrity() {
-    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    if (!port.available || remoteMode.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     try { integrity.value = await port.downloadIntegrity() }
     catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error) } }
   }
   async function checkIntegrity() {
-    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    if (!port.available || remoteMode.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     try { integrity.value = await port.checkIntegrity() }
     catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error), installer_ready: false } }
   }
   async function requestIntegrity() {
     // 组件故障入口复用现有全面校验；不传入组件编号，不从错误事件自动启动维护。
+    if (remoteMode.value) return
     if (integrity.value.installer_ready) await checkIntegrity()
     else await downloadIntegrity()
   }
@@ -328,6 +412,7 @@ export function useWorkspaceResources() {
   }
 
   async function chooseWorkspace() {
+    if (!localResourceTargetAllowed()) return null
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
     workspaceError.value = ''
     try {
@@ -339,6 +424,7 @@ export function useWorkspaceResources() {
   }
 
   async function linkWorkspace(targetRoot: string) {
+    if (!localResourceTargetAllowed()) return
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     workspaceOperationStarting.value = true
     workspaceError.value = ''
@@ -355,6 +441,7 @@ export function useWorkspaceResources() {
   }
 
   async function migrateWorkspace(targetRoot: string) {
+    if (!localResourceTargetAllowed()) return
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     workspaceOperationStarting.value = true
     workspaceError.value = ''
@@ -371,12 +458,17 @@ export function useWorkspaceResources() {
   }
 
   async function downloadResource(resourceId: string) {
+    if (!resourceTargetAllowed()) return
     if (!resourcesCanManage.value || startingResources.value.has(resourceId)
       || resourceJobs.value.some(job => job.resource_id === resourceId && !TERMINAL_JOB_STATES.has(job.state))
       || pendingDownloadPlan.value?.resource_id === resourceId) return
     startingResources.value = new Set(startingResources.value).add(resourceId)
     resourceError.value = ''
-    try { pendingDownloadPlan.value = await port.resourceInstallPlan(resourceId) }
+    try {
+      pendingDownloadPlan.value = remoteMode.value
+        ? await remoteResourceOperation<ResourceInstallPlan>('resource.install.plan', { resource_id: resourceId })
+        : await port.resourceInstallPlan(resourceId)
+    }
     catch (error) { resourceError.value = String(error) }
     finally {
       const next = new Set(startingResources.value)
@@ -392,6 +484,7 @@ export function useWorkspaceResources() {
   }
 
   async function prepareDownloadBundle(entries: LocalDownloadItem[], title: string) {
+    if (!resourceTargetAllowed()) return
     if (!resourcesCanManage.value || pendingDownloadPlan.value || pendingDownloadBundlePlan.value || preparingDownloadBundle.value) return
     preparingDownloadBundle.value = true
     const ids = [...new Set(entries.flatMap(item => item.id ? [item.id] : []))].filter(id => {
@@ -406,7 +499,9 @@ export function useWorkspaceResources() {
     startingResources.value = new Set([...startingResources.value, ...loadingKeys])
     resourceError.value = ''
     try {
-      const plans = await Promise.all(ids.map(id => port.resourceInstallPlan(id)))
+      const plans = await Promise.all(ids.map(id => remoteMode.value
+        ? remoteResourceOperation<ResourceInstallPlan>('resource.install.plan', { resource_id: id })
+        : port.resourceInstallPlan(id)))
       pendingDownloadBundlePlan.value = { title, plans, entries }
     } catch (error) {
       resourceError.value = error instanceof Error ? error.message : '无法读取分类下载计划。'
@@ -430,41 +525,89 @@ export function useWorkspaceResources() {
   }
 
   async function confirmReset() {
+    if (!resourceTargetAllowed()) return
     const plan = pendingResetPlan.value
     if (!plan) return
     pendingResetPlan.value = null
     try {
-      const result = await port.resetResource(plan.resource_id, plan.token)
+      const result = remoteMode.value
+        ? await remoteResourceOperation<{ job_id: string }>('resource.reset', {
+          plan_request_id: plan.plan_request_id,
+          resource_id: plan.resource_id,
+          token: plan.token,
+          confirmed: true,
+        })
+        : await port.resetResource(plan.resource_id, plan.token)
       upsertResourceJob({ job_id: result.job_id, resource_id: plan.resource_id, state: 'queued', phase: '准备重置组件', can_cancel: false })
       void refreshJobSnapshots()
       schedulePoll(ACTIVE_REFRESH_MS)
     } catch (error) { resourceError.value = String(error) }
   }
   async function requestReset(resourceId: string) {
-    try { pendingResetPlan.value = await port.resourceResetPlan(resourceId) }
+    if (!resourceTargetAllowed()) return
+    try {
+      pendingResetPlan.value = remoteMode.value
+        ? await remoteResourceOperation<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string; plan_request_id?: string }>(
+          'resource.reset.plan', { resource_id: resourceId },
+        )
+        : await port.resourceResetPlan(resourceId)
+    }
     catch (error) { resourceError.value = String(error) }
   }
   async function importResource(resourceId?: string) {
+    if (!resourceTargetAllowed()) return
     const rows = resources.value.flatMap(row => [row, ...(row.runtime_components ?? [])])
     if (resourceId && rows.find(row => row.resource_id === resourceId)?.reset_available) {
-      try { pendingResetPlan.value = await port.resourceResetPlan(resourceId) }
-      catch (error) { resourceError.value = String(error) }
+      await requestReset(resourceId)
+      return
+    }
+    if (remoteMode.value && resourceId?.startsWith('tts-aniflive-') && resourceId !== 'tts-aniflive-runtime') {
+      resourceError.value = '远程设备的 AnifLive 模型仅支持服务端从在线网址导入；客户端模型目录上传暂不支持。'
+      return
+    }
+    if (remoteMode.value) {
+      await startResourceJob(resourceId ?? 'batch', 'import', resourceId)
+      return
+    }
+    const directImports = new Set(['voice-server', 'voice-runtime-cpu', 'voice-runtime-gpu'])
+    if (resourceId && directImports.has(resourceId)) {
+      await startResourceJob(resourceId, 'import', resourceId)
+      return
+    }
+    if (port.chooseImportSources && port.startImportSources) {
+      try {
+        const selection = await port.chooseImportSources(resourceId)
+        if (selection.cancelled || !selection.selection_id) return
+        await startResourceJob(resourceId ?? 'batch', 'import', resourceId, selection.selection_id)
+      } catch (error) {
+        resourceError.value = error instanceof Error ? error.message : '资源来源选择失败。'
+      }
       return
     }
     await startResourceJob(resourceId ?? 'batch', 'import', resourceId)
   }
 
-  async function startResourceJob(resourceKey: string, operation: 'download' | 'import' | 'required', resourceId?: string) {
+  async function startResourceJob(resourceKey: string, operation: 'download' | 'import' | 'required', resourceId?: string, selectionId?: string) {
+    if (!resourceTargetAllowed()) return
     if (!resourcesCanManage.value || startingResources.value.has(resourceKey)
       || resourceJobs.value.some(job => job.resource_id === resourceKey && !TERMINAL_JOB_STATES.has(job.state))) return
     startingResources.value = new Set(startingResources.value).add(resourceKey)
     resourceError.value = ''
     try {
-      const result = operation === 'required'
-        ? await port.downloadRequiredResources?.() ?? (() => { throw new Error('当前宿主不支持一键下载，请更新程序。') })()
-        : operation === 'download'
-        ? await port.downloadResource(resourceKey)
-        : await port.importResource(resourceId)
+      const result = remoteMode.value
+        ? operation === 'required'
+          ? await remoteResourceOperation<{ job_id: string }>('resource.install.required')
+          : operation === 'download'
+            ? await remoteResourceOperation<{ job_id: string }>('resource.install.start', { resource_id: resourceKey })
+            : await nativeDeviceApi.startRemoteResourceImport(resourceId)
+        : operation === 'required'
+          ? await port.downloadRequiredResources?.() ?? (() => { throw new Error('当前宿主不支持一键下载，请更新程序。') })()
+          : operation === 'download'
+            ? await port.downloadResource(resourceKey)
+            : selectionId && port.startImportSources
+              ? await port.startImportSources(selectionId)
+              : await port.importResource(resourceId)
+      if (('cancelled' in result && result.cancelled) || !result.job_id) return
       if (!resourceJobs.value.some(job => job.job_id === result.job_id)) {
         upsertResourceJob({
           job_id: result.job_id,
@@ -487,6 +630,11 @@ export function useWorkspaceResources() {
   }
 
   async function openResourceSource(resourceId: string) {
+    if (await resolveRemoteMode()) {
+      resourceError.value = '远程模式暂不支持从客户端打开服务端组件来源链接。'
+      return
+    }
+    if (!localResourceTargetAllowed()) return
     try {
       await port.openResourceSource(resourceId)
     } catch (error) {
@@ -495,11 +643,15 @@ export function useWorkspaceResources() {
   }
 
   async function cancelJob(jobId: string) {
+    if (!resourceTargetAllowed()) return
     const resourceJob = resourceJobs.value.find(job => job.job_id === jobId)
     const workspaceJob = workspaceJobs.value.find(job => job.job_id === jobId)
     if ((!resourceJob && !workspaceJob) || resourceJob?.can_cancel === false || workspaceJob?.can_cancel === false) return
     try {
-      await port.cancelResource(jobId)
+      if (remoteMode.value) {
+        if (jobId.startsWith('remote-import-')) await nativeDeviceApi.cancelRemoteResourceImport(jobId)
+        else await remoteResourceOperation('resource.job.cancel', { job_id: jobId })
+      } else await port.cancelResource(jobId)
     } catch (error) {
       const message = error instanceof Error ? error.message : '取消任务失败。'
       if (resourceJob) upsertResourceJob({ ...resourceJob, error: message })
@@ -508,14 +660,22 @@ export function useWorkspaceResources() {
   }
 
   async function confirmImport(accepted: boolean) {
+    if (!resourceTargetAllowed()) return
     if (!pendingImport.value) return
-    try { await port.confirmImport(pendingImport.value.job_id, accepted) }
+    try {
+      if (remoteMode.value) await remoteResourceOperation('resource.import.confirm', {
+        job_id: pendingImport.value.job_id,
+        accepted,
+      })
+      else await port.confirmImport(pendingImport.value.job_id, accepted)
+    }
     catch (failure) { resourceError.value = String(failure) }
   }
   return {
+    remoteMode,
     pendingImport,
     confirmImport,
-    portAvailable: port.available,
+    portAvailable: computed(() => port.available),
     workspace,
     resources,
     resourceJobs,

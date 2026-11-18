@@ -10,6 +10,13 @@ export interface ProductApplicationConfig {
   voice_ws_url: string
 }
 
+/** isBundledRemoteProductPage（内置远程产品页）：只识别 Tauri 包内根路径或 index.html 静态入口，不能把本机服务网址当作内置入口。 */
+export function isBundledRemoteProductPage(location: Pick<Location, 'protocol' | 'hostname' | 'pathname'>): boolean {
+  return (location.pathname === '/' || location.pathname === '/index.html')
+    && (location.protocol === 'tauri:' && location.hostname === 'localhost'
+      || location.protocol === 'http:' && location.hostname === 'tauri.localhost')
+}
+
 /** readProductApplicationConfig（读取并验证产品配置）：不会提供本地默认地址。 */
 export function readProductApplicationConfig(value: unknown): ProductApplicationConfig {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {

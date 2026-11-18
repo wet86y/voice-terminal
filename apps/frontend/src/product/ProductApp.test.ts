@@ -511,6 +511,81 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.get('.application-presentation').attributes('data-motion')).toBe('exiting')
   })
 
+  it('正式产品设置中的设备入口打开两模式连接设置', async () => {
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
+      workspaceInfo: async () => ({ can_manage: true }),
+      resourceInventory: async () => [],
+      environmentStatus: async () => ({ jobs: [] }),
+      listen: async () => () => undefined,
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    await wrapper.get('.compact-settings-button').trigger('click')
+    const devices = wrapper.get('button[aria-label="设备与角色"]')
+    await devices.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('.settings-panel-devices').text()).toContain('设备连接')
+    expect(wrapper.get('.settings-panel-devices').text()).toContain('本地运行')
+    expect(wrapper.get('.settings-panel-devices').text()).toContain('远程配对')
+  })
+
+  it('语音与音色中的本地模型导入跳转会展开 AnifLive 组件卡', async () => {
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    await wrapper.get('.compact-settings-button').trigger('click')
+    await wrapper.get('button[aria-label="语音与音色"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+    await flushPromises()
+
+    await wrapper.get('.tts-model-link button').trigger('click')
+    await flushPromises()
+
+    const compute = wrapper.getComponent(ComputeSettings)
+    const components = wrapper.findComponent({ name: 'LocalComponents' })
+    expect(compute.props('expandAnifLiveTts')).toBe(true)
+    expect(components.props('expandAnifLiveTts')).toBe(true)
+    expect(components.get('[data-category="tts"] .local-category-toggle').attributes('aria-expanded')).toBe('true')
+  })
+
+  it('远程产品页禁用只能在服务端本机访问的 DSH 回环控制台入口', async () => {
+    application.snapshot.value = { remote_mode: true, management_connected: true, startup_complete: true,
+      state: 'running', components: [] } as unknown as ApplicationSnapshot
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    const workbench = wrapper.findComponent(Workbench)
+    expect(workbench.props('consoleEnabled')).toBe(false)
+    expect(workbench.props('consoleLabel')).toBe('仅服务端本机可打开')
+    expect(wrapper.get('.remote-host-banner').text()).toContain('管理通道已连接')
+    expect(wrapper.get('.remote-host-banner').text()).toContain('服务端语音实时通道已断开')
+  })
+
+  it('管理通道在线但语音实时套接字断开时禁用语音操作并保留设置草稿', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    window.__VOICE_APPLICATION__!.remote_mode = true
+    window.__VOICE_APPLICATION__!.management_connected = true
+    window.__VOICE_APPLICATION__!.remote_business_ready = true
+    application.snapshot.value = { remote_mode: true, management_connected: true, remote_business_ready: true,
+      startup_complete: true, core_available: true, core_phase: 'ready', state: 'running', components: [] } as unknown as ApplicationSnapshot
+    application.corePhase.value = 'ready'
+    application.businessReady.value = true
+    value.voice.connection.value = 'offline'
+    value.wakeForm.keywords = ['保留的业务设置草稿']
+
+    expect(value.connected.value).toBe(true)
+    expect(value.managementConnected.value).toBe(true)
+    expect(value.voiceConnected.value).toBe(false)
+    expect(value.workbenchModel.value.disabled).toBe(true)
+    expect(value.runtimeAction()).toBe(false)
+    expect(value.resetSession()).toBe(false)
+    expect(value.setReasoningMode('deep')).toBe(false)
+    expect(value.wakeForm.keywords).toEqual(['保留的业务设置草稿'])
+  })
+
   it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {
     const { value } = liveControls()
     allowBusinessReady(value)
@@ -692,6 +767,86 @@ describe('正式界面的真实控件交互', () => {
     expect(saveEnhancement).not.toHaveBeenCalled()
     await card.get('[role="switch"]').setValue(false)
     expect(saveEnhancement).toHaveBeenCalledWith('dual_pass')
+  })
+
+  it('组件导入先由本机选择来源，再消费原生短期票据启动任务', async () => {
+    const chooseSources = vi.fn(async () => ({ cancelled: false, selection_id: 'is-test-1', count: 1 }))
+    const startSources = vi.fn(async () => ({ job_id: 'import-source-test' }))
+    const legacyImport = vi.fn(async () => ({ job_id: 'legacy-import' }))
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
+      integrityStatus: async () => ({ state: 'idle', current_version: '', installer_ready: false, fields: {} }),
+      workspaceInfo: async () => ({ root: 'D:/测试', data_dir: 'D:/测试/data', version: '1.0', can_manage: true }),
+      resourceInventory: async () => [],
+      resourceJobSnapshots: async () => [],
+      listen: async () => () => undefined,
+      chooseImportSources: chooseSources,
+      startImportSources: startSources,
+      importResource: legacyImport,
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    let resources!: ReturnType<typeof useWorkspaceResources>
+    const wrapper = render({ setup() {
+      resources = useWorkspaceResources()
+      return () => h('div')
+    } })
+    await flushPromises()
+    await resources.importResource('paraformer-offline')
+    await flushPromises()
+    expect(chooseSources).toHaveBeenCalledWith('paraformer-offline')
+    expect(startSources).toHaveBeenCalledWith('is-test-1')
+    expect(legacyImport).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('远程配对模式通过独立管理和文件通道操作服务端资源，不调用客户端本机资源接口', async () => {
+    const inventoryRead = vi.fn(async () => [])
+    const workspaceRead = vi.fn(async () => ({ root: 'D:/客户端', data_dir: 'D:/客户端/data', version: '1.0', can_manage: true }))
+    const localImport = vi.fn(async () => ({ job_id: 'client-local-import' }))
+    const openSource = vi.fn(async () => {})
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
+      resourceInventory: inventoryRead,
+      workspaceInfo: workspaceRead,
+      importResource: localImport,
+      openResourceSource: openSource,
+      listen: async () => () => undefined,
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'device_config_status') return { runtime: { mode: 'remote' },
+        device_config: { mode: 'remote', paired_host: { host_id: 'server-a' } }, fields: {} }
+      if (command === 'device_ssh_management_request') return {
+        request_id: String(args?.request_id ?? ''), target_host_id: 'server-a', session_generation: 1,
+        session_kind: 'management',
+        operation: (args?.operation as string) ?? '', status: 200, body: [], fields: {},
+      }
+      if (command === 'device_ssh_import_start') return { cancelled: true, fields: {} }
+      return undefined
+    })
+    window.__TAURI_INTERNALS__ = {
+      invoke: invoke as unknown as NonNullable<Window['__TAURI_INTERNALS__']>['invoke'],
+    }
+    let resources!: ReturnType<typeof useWorkspaceResources>
+    const wrapper = render({ setup() {
+      resources = useWorkspaceResources()
+      return () => h('div')
+    } })
+    await flushPromises()
+    expect(resources.resourcesCanManage.value).toBe(true)
+    expect(resources.canManage.value).toBe(false)
+    expect(resources.workspaceError.value).toContain('远程服务端组件状态暂不可用')
+    await resources.openResourceSource('paraformer-offline')
+    expect(openSource).not.toHaveBeenCalled()
+    expect(resources.resourceError.value).toContain('远程模式暂不支持从客户端打开服务端组件来源链接')
+    await resources.importResource('paraformer-offline')
+    await flushPromises()
+    expect(inventoryRead).not.toHaveBeenCalled()
+    expect(workspaceRead).not.toHaveBeenCalled()
+    expect(localImport).not.toHaveBeenCalled()
+    expect(invoke).toHaveBeenCalledWith('device_ssh_import_start', { resource_id: 'paraformer-offline' })
+    expect(invoke.mock.calls.some(([command, args]) => command === 'device_ssh_management_request'
+      && (args as Record<string, unknown>)?.operation === 'resource.inventory')).toBe(true)
+    wrapper.unmount()
+    Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
   })
 
   it('运行中的组件页把随包更新显示为必需更新操作，并复用既有下载计划', async () => {
@@ -1303,6 +1458,15 @@ describe('正式界面的真实控件交互', () => {
     expect(value.lastError.value).toContain('只能由 Voice Terminal 桌面应用打开')
     expect(launch).not.toHaveBeenCalled()
     expect(openTab).not.toHaveBeenCalled()
+  })
+
+  it('远程客户端禁用服务端回环控制台入口并阻止请求本机地址', async () => {
+    application.snapshot.value = { remote_mode: true, management_connected: true } as ApplicationSnapshot
+    const launch = vi.spyOn(productApi, 'launchDsh')
+    const value = await adapter()
+    await value.openDshConsole()
+    expect(launch).not.toHaveBeenCalled()
+    expect(value.lastError.value).toContain('请在服务端本机打开 DSH')
   })
 
   it('宿主晚于页面就绪时更新控制台状态，迟到的启动快照不能覆盖它', async () => {

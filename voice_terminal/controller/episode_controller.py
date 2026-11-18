@@ -883,6 +883,31 @@ class EpisodeController(RealtimeController):
             protected = self._barge_in_protected_available()
             if not protected:
                 self._clear_owner_barge_candidate()
+                if getattr(frame, "processing_identity", None) is not None:
+                    # The remote device owns both the microphone path and its
+                    # AEC playback reference.  Recovering this host's local
+                    # processor cannot make the remote frame safe for barge-in;
+                    # suppress this candidate and leave audible playback alone.
+                    self.barge_in_gate.reset()
+                    remote_processing = getattr(frame, "audio_processing", None)
+                    remote_status = getattr(remote_processing, "state", "unavailable")
+                    remote_error = getattr(remote_processing, "error", None)
+                    remote_marker = (
+                        "remote_aec_unavailable", frame.processing_identity,
+                        remote_status, getattr(remote_processing, "reverse_generation", None),
+                    )
+                    if getattr(self, "owner_only_barge_in", False):
+                        if self._barge_trace_state != remote_marker:
+                            await self.episode.log("SPEAKER_BARGE_SUPPRESSED", reason="remote_aec_unavailable",
+                                                   status=remote_status, error=remote_error)
+                    else:
+                        if self._barge_trace_state != remote_marker:
+                            await self.episode.log(
+                                "AEC_BARGE_IN_SUPPRESSED", policy="continue_without_barge_in",
+                                status=remote_status, error=remote_error,
+                            )
+                    self._barge_trace_state = remote_marker
+                    return None
                 if getattr(self, "owner_only_barge_in", False):
                     self.barge_in_gate.reset()
                     await self.episode.log("SPEAKER_BARGE_SUPPRESSED", reason="aec_unavailable")
@@ -892,6 +917,8 @@ class EpisodeController(RealtimeController):
                 # AEC-unavailable audio is neither trustworthy user speech nor
                 # eligible raw-VAD fallback.
                 return None
+            if self._barge_trace_state and self._barge_trace_state[0] == "remote_aec_unavailable":
+                self._barge_trace_state = None
             decision = self.barge_in_gate.feed(activity, now=frame.captured_at,
                                                near_voice=self._near_voice_activity(),
                                                protected_available=protected)

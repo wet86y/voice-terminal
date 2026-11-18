@@ -1,4 +1,4 @@
-"""SSH 回环媒体 WebSocket 的签名握手、时钟映射和 PCM 入队回归。"""
+"""SSH 回环媒体 WebSocket（签名媒体套接字）时钟、PCM 下行及客户端 TTS 直放回归。"""
 from __future__ import annotations
 
 import asyncio
@@ -22,11 +22,15 @@ from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.devices.capture_router import SelectableCapturePort
 from voice_terminal.devices.client_tts import RemoteClientTtsSession
 from voice_terminal.devices.media_protocol import (
-    ClientTtsAudioFrame, MediaFrame, encode_client_tts_audio_frame, encode_frame,
+    MediaFrame, MediaProtocolError, create_tts_control, encode_frame,
 )
-from voice_terminal.devices.opus_codec import OpusDecoder, OpusEncoder, find_opus_library
-from voice_terminal.devices.remote_playback import decode_playback_frame
-from voice_terminal.devices.trust import device_request_proof_message
+from voice_terminal.devices.opus_codec import OpusEncoder, find_opus_library
+from voice_terminal.devices.remote_playback import RemotePlaybackOutbox, decode_playback_frame
+from voice_terminal.devices.trust import (
+    DeviceRequestAuthenticator,
+    DeviceTrustStore,
+    device_request_proof_message,
+)
 from voice_terminal.model_registry.service import ModelRegistryService
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.http_api import _device_media_playback_acceptance
@@ -51,7 +55,7 @@ def test_media_endpoint_releases_cancelled_frame_without_claiming_playback() -> 
         executor_generation=3, interaction_generation=4,
     )
     message = {"text": json.dumps({
-        "type": "playback.cancelled", "protocol_version": 1,
+        "type": "playback.cancelled", "protocol_version": 2,
         "device_id": "client-media", "delivery_device_id": "client-media",
         "core_session_id": "core-media", "connection_generation": 2,
         "executor_generation": 3, "interaction_generation": 4,
@@ -107,6 +111,18 @@ def _ssh_public_key(private_key: Ed25519PrivateKey) -> str:
     return f"ssh-ed25519 {base64.b64encode(blob).decode('ascii')} media-test"
 
 
+def _simulate_native_trust_write(runtime: SessionRuntime, device_id: str, public_key: str) -> None:
+    """_simulate_native_trust_write（隔离测试中模拟原生层唯一信任写入者）。"""
+    data_dir = runtime._runtime_data_dir
+    assert data_dir is not None
+    DeviceTrustStore(data_dir).approve(device_id, public_key)
+    trust_view = DeviceTrustStore(data_dir, read_only=True)
+    runtime.device_trust_store = trust_view
+    runtime.device_request_authenticator = DeviceRequestAuthenticator(
+        trust_view, core_session_id=runtime.core_session_id,
+    )
+
+
 async def _signed_gateway_post(app, private_key, device_id: str, path: str, payload: dict):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18765") as client:
@@ -132,7 +148,7 @@ async def _signed_gateway_post(app, private_key, device_id: str, path: str, payl
 
 
 @pytest.mark.parametrize("downlink_codec", ["pcm", "opus"])
-def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
+def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
     tmp_path: Path, caplog, monkeypatch, downlink_codec: str,
 ) -> None:
     async def scenario() -> None:
@@ -166,6 +182,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
 
         accepted_pcm: list[bytes] = []
         playback_progress: list[dict] = []
+        client_tts_progress: list[tuple[str, dict]] = []
         runtime.audio_meter = type("Meter", (), {
             "feed": lambda _self, _direction, pcm, _rate, _channels: accepted_pcm.append(pcm),
         })()
@@ -191,6 +208,13 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
             return await record_playback_progress(lease, stream_id, receipt)
 
         runtime.record_remote_playback_progress = record_progress
+        record_client_tts_progress = runtime.record_client_tts_output_progress
+
+        async def record_client_progress(lease, stream_id: str, playback_key: str, receipt: dict) -> bool:
+            client_tts_progress.append((playback_key, dict(receipt)))
+            return await record_client_tts_progress(lease, stream_id, playback_key, receipt)
+
+        runtime.record_client_tts_output_progress = record_client_progress
 
         player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
         player.configure_remote_output(
@@ -206,7 +230,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
         player.allow("speech-media-1")
 
         private_key = Ed25519PrivateKey.generate()
-        runtime.device_trust_store.approve("client-media", _ssh_public_key(private_key))
+        _simulate_native_trust_write(runtime, "client-media", _ssh_public_key(private_key))
         connection = await runtime.open_remote_device_session("client-media", ["audio_stream", "client_tts"])
         expected_generation = runtime.device_registry.generation
         stale = await _signed_gateway_post(app, private_key, "client-media", "/v1/interaction/prepare", {
@@ -233,7 +257,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
                 downlink_pre_skip = encoder.lookahead_samples
 
         handshake = {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "stream_id": "stream-media-1",
             "connection_generation": connection.connection_generation,
             "executor_generation": connection.executor_generation,
@@ -269,7 +293,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
             (b"x-voice-terminal-signature", base64.b64encode(private_key.sign(proof))),
         ]
         query = (
-            "protocol_version=1&stream_id=stream-media-1"
+            "protocol_version=2&stream_id=stream-media-1"
             f"&connection_generation={connection.connection_generation}"
             f"&executor_generation={connection.executor_generation}"
             f"&interaction_generation={lease_generation}"
@@ -277,7 +301,6 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
             f"&downlink_encoder_pre_skip_samples={downlink_pre_skip}"
         ).encode("ascii")
         frame_pcm = b"\x01\x00" * 320
-        downlink_pcm = b"\x03\x00" * 320
         frame = MediaFrame(
             stream_id="stream-media-1", sequence=0, start_sample=0, sample_count=320,
             device_time_us=1_060_000, payload=frame_pcm, device_id="client-media",
@@ -307,7 +330,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
                 receipt_sequence += 1
                 enqueued_ms = acknowledged_samples * 1_000 // playback_frame.sample_rate
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "playback.accepted", "protocol_version": 1,
+                    "type": "playback.accepted", "protocol_version": 2,
                     "device_id": "client-media", "delivery_device_id": "client-media",
                     "core_session_id": runtime.core_session_id,
                     "connection_generation": connection.connection_generation,
@@ -317,7 +340,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
                     "fields": {"sequence": "已加入本机播放队列的帧序号"},
                 })})
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "playback.progress", "protocol_version": 1,
+                    "type": "playback.progress", "protocol_version": 2,
                     "device_id": "client-media", "delivery_device_id": "client-media",
                     "core_session_id": runtime.core_session_id,
                     "connection_generation": connection.connection_generation,
@@ -345,7 +368,7 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
                 )
                 device_receive_us = 1_000_000 + sample_index * 10_000
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "clock.sync.response", "protocol_version": 1,
+                    "type": "clock.sync.response", "protocol_version": 2,
                     "sync_id": body["sync_id"],
                     "device_receive_us": device_receive_us,
                     "device_send_us": device_receive_us,
@@ -359,66 +382,65 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
                 session = RemoteClientTtsSession(
                     runtime=runtime, lease=lease, outbox=tts_outbox,
                     playback_key="speech-media-1", model="speech-2.8-hd", voice_id="voice-a",
-                    sample_rate=16_000, emotion="calm",
+                    sample_rate=16_000, emotion="calm", credential="media-endpoint-test-key",
                 )
-                await session.start()
-
-                async def relay_to_player() -> None:
-                    async for pcm in session.audio_chunks():
-                        await player.enqueue_async("speech-media-1", pcm)
-                    await player.finish_stream_async("speech-media-1")
-                    await player.wait_until_output_complete(timeout_seconds=1.0)
-                    await session.close()
-                    await incoming.put({"type": "websocket.disconnect", "code": 1000})
 
                 async def drive_client_tts() -> None:
-                    relay_task = asyncio.create_task(relay_to_player())
+                    await session.start()
                     await session.send_text("你好。")
                     await session.flush()
-                    await relay_task
+                    output = await session.wait_until_output_complete()
+                    assert output["played_samples"] == 1_600
+                    assert player.progress("speech-media-1")["output_estimated_ms"] == 100
+                    assert player.has_started("speech-media-1")
+                    await session.close()
 
                 playback_task = asyncio.create_task(drive_client_tts())
                 await incoming.put({"type": "websocket.receive", "bytes": encode_frame(frame)})
+            elif body.get("type") == "media.tts.authorize":
+                receipt = create_tts_control("media.tts.authorization_accepted", {
+                    "device_id": "client-media", "core_session_id": runtime.core_session_id,
+                    "connection_generation": connection.connection_generation,
+                    "executor_generation": connection.executor_generation,
+                    "interaction_generation": lease_generation, "stream_id": "stream-media-1",
+                }, authorization_id=body["authorization_id"], playback_key=body["playback_key"])
+                await incoming.put({"type": "websocket.receive", "text": json.dumps(receipt)})
             elif body.get("type") == "media.tts.request":
-                lease = runtime.device_registry.active
-                assert lease is not None
+                identity = {
+                    "device_id": "client-media", "core_session_id": runtime.core_session_id,
+                    "connection_generation": connection.connection_generation,
+                    "executor_generation": connection.executor_generation,
+                    "interaction_generation": lease_generation, "stream_id": "stream-media-1",
+                }
+                authorization_id = body["authorization_id"]
+                playback_key = body["playback_key"]
                 request_id = body["request_id"]
-                task_id = body["task_id"]
+                segment_index = body["segment_index"]
 
-                def client_status(kind: str, **extra) -> dict:
-                    value = {
-                        "type": kind, "protocol_version": 1,
-                        "device_id": "client-media", "core_session_id": runtime.core_session_id,
-                        "connection_generation": connection.connection_generation,
-                        "executor_generation": connection.executor_generation,
-                        "interaction_generation": lease_generation,
-                        "stream_id": "stream-media-1", "task_id": task_id,
-                        "request_id": request_id, **extra,
-                    }
-                    value["fields"] = {key: "设备媒体协议字段说明"
-                                       for key in value if key != "fields"}
-                    return value
+                async def client_receipt(kind: str, **extra) -> None:
+                    value = create_tts_control(kind, identity, authorization_id=authorization_id,
+                                                playback_key=playback_key, request_id=request_id,
+                                                segment_index=segment_index, **extra)
+                    await incoming.put({"type": "websocket.receive", "text": json.dumps(value)})
 
-                tts_pcm = b"\x03\x00" * 320
-                tts_frame = ClientTtsAudioFrame(
-                    device_id="client-media", core_session_id=runtime.core_session_id,
-                    connection_generation=connection.connection_generation,
-                    executor_generation=connection.executor_generation,
-                    interaction_generation=lease_generation, stream_id="stream-media-1",
-                    task_id=task_id, request_id=request_id, sequence=0, start_sample=0,
-                    sample_count=320, sample_rate=16_000, device_time_us=2_000_000,
-                    payload=tts_pcm,
-                )
-                await incoming.put({"type": "websocket.receive", "text": json.dumps(
-                    client_status("media.tts.started"),
-                )})
-                await incoming.put({"type": "websocket.receive", "bytes": encode_client_tts_audio_frame(tts_frame)})
-                await incoming.put({"type": "websocket.receive", "text": json.dumps(
-                    client_status("media.tts.segment_finished", text_chars=3, end_sample=320),
-                )})
-                await incoming.put({"type": "websocket.receive", "text": json.dumps(
-                    client_status("media.tts.completed", total_samples=320),
-                )})
+                await client_receipt("media.tts.accepted", accepted=True)
+                await client_receipt("media.tts.started")
+                await client_receipt("media.tts.segment_finished", text_chars=3,
+                                     start_sample=0, end_sample=1_600)
+                await client_receipt("media.tts.output_progress", progress_sequence=1,
+                                     generated_samples=1_600, accepted_samples=1_600,
+                                     played_samples=800, buffered_samples=800,
+                                     output_complete=False, device_time_us=2_000_000)
+                await client_receipt("media.tts.output_progress", progress_sequence=2,
+                                     generated_samples=1_600, accepted_samples=1_600,
+                                     played_samples=1_600, buffered_samples=0,
+                                     output_complete=True, device_time_us=2_100_000)
+                await client_receipt("media.tts.completed", total_samples=1_600,
+                                     playback_end_sample=1_600, accepted_samples=1_600,
+                                     played_samples=1_600, buffered_samples=0,
+                                     output_complete=True, device_time_us=2_110_000)
+            elif body.get("type") == "media.tts.authorization_revoked":
+                await incoming.put({"type": "websocket.disconnect", "code": 1000})
 
         scope = {
             "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
@@ -426,9 +448,15 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
             "query_string": query, "headers": headers, "server": ("127.0.0.1", 18_765),
             "client": ("127.0.0.1", 49152), "subprotocols": [], "state": {},
         }
-        await app(scope, receive, send)
+        try:
+            await asyncio.wait_for(app(scope, receive, send), timeout=15.0)
+        except asyncio.TimeoutError:
+            for pending in asyncio.all_tasks():
+                if pending is not asyncio.current_task() and not pending.done():
+                    pending.print_stack()
+            raise
         assert playback_task is not None, (sent, caplog.text)
-        await playback_task
+        await asyncio.wait_for(playback_task, timeout=15.0)
 
         sent_json = [json.loads(item["text"]) for item in sent
                      if item.get("type") == "websocket.send" and isinstance(item.get("text"), str)]
@@ -442,45 +470,29 @@ def test_signed_media_websocket_maps_device_clock_and_queues_tts_audio(
         assert ready["client_tts_enabled"] is True
         assert ready["downlink_encoder_pre_skip_samples"] == downlink_pre_skip
         assert accepted_pcm == [frame_pcm]
-        playback_frames = [decode_playback_frame(encoded) for encoded in sent_binary]
-        assert len(playback_frames) == (1 if downlink_codec == "pcm" else 2)
-        expected_output_samples = 320 if downlink_codec == "pcm" else 960
-        assert sum(frame.sample_count for frame in playback_frames) == expected_output_samples
-        assert [frame.start_sample for frame in playback_frames] == [
-            sum(item.sample_count for item in playback_frames[:index]) for index in range(len(playback_frames))
-        ]
-        assert all(frame.playback_key == "speech-media-1" for frame in playback_frames)
-        assert all(frame.delivery_device_id == "client-media" for frame in playback_frames)
-        assert all(frame.interaction_generation == lease_generation for frame in playback_frames)
-        assert all(frame.audio_codec == downlink_codec for frame in playback_frames)
-        if downlink_codec == "pcm":
-            assert playback_frames[0].payload == downlink_pcm
-        else:
-            assert all(frame.sample_rate == 48_000 for frame in playback_frames)
-            with OpusDecoder(48_000, library_path=find_opus_library()) as decoder:
-                decoded_samples = sum(len(decoder.decode(frame.payload)) // 2 for frame in playback_frames)
-            assert decoded_samples - downlink_pre_skip >= sum(frame.sample_count for frame in playback_frames)
-        assert len(playback_progress) == len(playback_frames)
-        assert all(item["playback_key"] == "speech-media-1" for item in playback_progress)
-        assert playback_progress[-1]["enqueued_ms"] == 20
-        assert playback_progress[-1]["played_ms"] == 20
-        assert playback_progress[-1]["buffered_ms"] == 0
-        assert player.progress("speech-media-1")["output_estimated_ms"] == 20
-        assert player.has_started("speech-media-1")
-        assert playback_progress[0]["host_output_time"] > 0
-        assert playback_progress[0]["precision"] == "device_time"
+        assert sent_binary == [], "客户端直放合成 PCM 不得经媒体通道回传主机"
+        assert playback_progress == [], "客户端直放不得生成主机 PCM 下行帧回执"
+        assert len(client_tts_progress) >= 2
+        assert all(key == "speech-media-1" for key, _receipt in client_tts_progress)
+        final_progress = client_tts_progress[-1][1]
+        assert final_progress["sample_rate"] == 16_000
+        assert final_progress["accepted_samples"] == 1_600
+        assert final_progress["played_samples"] == 1_600
+        assert final_progress["buffered_samples"] == 0
+        assert final_progress["output_complete"] is True
         assert runtime._remote_playback_outboxes == {}
         assert runtime._remote_client_tts_outboxes == {}
-        assert capture_route.active_device_id is None
+        assert capture_route.active_device_id == "local"
         assert runtime.device_registry.active is not None
-        assert runtime.device_registry.active.device_id == "client-media"
+        assert runtime.device_registry.active.device_id == "local"
+        assert runtime.state.listening is True
         finished = await _signed_gateway_post(app, private_key, "client-media", "/v1/interaction/abort", {
             "protocol_version": 1,
             "interaction_generation": lease_generation,
         })
         assert finished.status_code == 200
         assert finished.json()["result"] == "already_finished"
-        assert runtime.device_registry.active.device_id == "client-media"
+        assert runtime.device_registry.active.device_id == "local"
         await runtime.device_remote_sessions.close_all()
 
     asyncio.run(scenario())
@@ -598,7 +610,175 @@ def test_runtime_switches_between_remote_devices_without_reusing_the_old_stream(
         assert accepted_b.start_sample == 0
         assert capture_route.read_pending_frame().captured_at == accepted_b.captured_at
 
+        assert await runtime.recover_local_after_remote_media_loss(lease_a) is False
+        assert runtime.device_registry.active == lease_b
         await capture_b.stop()
+        assert await runtime.recover_local_after_remote_media_loss(lease_b) is True
+        assert runtime.device_registry.active is not None
+        assert runtime.device_registry.active.device_id == "local"
+        assert capture_route.active_device_id == "local"
+        assert runtime.state.listening is True
+
+        await capture_route.stop()
+        await runtime.device_remote_sessions.close_all()
+
+    asyncio.run(scenario())
+
+
+def test_remote_session_disconnect_recovers_local_and_rejects_old_lease_frames(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from voice_terminal.devices.pcm_stream import PcmInputStream
+        from voice_terminal.devices.remote_capture import RemoteAudioCapture, RemoteAudioCaptureError
+
+        config = AppConfig(
+            model_dir=tmp_path / "models",
+            persona=PersonaConfig(directory=tmp_path / "config" / "persona"),
+        )
+        settings = ProductSettingsStore(path=tmp_path / "config" / "product-settings.json", config=config)
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".local")
+        capture_route = SelectableCapturePort(_LocalCapture())
+        runtime._capture_router = capture_route
+        await capture_route.start()
+
+        class _ListeningController:
+            async def stop_listening(self) -> None:
+                runtime.state.listening = False
+                await capture_route.stop()
+
+            async def start_listening(self) -> None:
+                await capture_route.start()
+                runtime.state.listening = True
+
+        runtime.controller = _ListeningController()
+        runtime.state.listening = True
+        connection = await runtime.open_remote_device_session("client-disconnect", ["audio_stream"])
+        lease = await runtime.prepare_interaction_switch(
+            "client-disconnect", runtime.device_registry.generation,
+        )
+        stream = PcmInputStream(
+            stream_id="stream-disconnect", core_session_id=runtime.core_session_id,
+            lease=lease, registry=runtime.device_registry,
+            map_device_time=lambda value: (40.0 + value / 1_000_000, 0.001),
+        )
+        capture = RemoteAudioCapture(stream)
+        await runtime.select_remote_capture(capture, lease)
+        await capture.start()
+        await runtime.complete_remote_interaction_switch(capture, lease)
+        playback = RemotePlaybackOutbox(
+            device_id=lease.device_id, core_session_id=runtime.core_session_id,
+            connection_generation=lease.connection_generation,
+            executor_generation=lease.executor_generation,
+            interaction_generation=lease.interaction_generation,
+            stream_id="stream-disconnect",
+        )
+        await runtime.attach_remote_playback_outbox(lease, playback)
+
+        assert await runtime.close_remote_device_session(
+            "client-disconnect", connection.connection_generation,
+        ) is True
+        active = runtime.device_registry.active
+        assert active is not None and active.device_id == "local"
+        assert runtime.device_registry.accepts(lease) is False
+        assert capture_route.active_device_id == "local"
+        assert runtime.state.listening is True
+        assert capture.running is False
+        assert playback.closed is True
+        assert runtime._remote_playback_outboxes == {}
+        assert await runtime.recover_local_after_remote_media_loss(lease) is True
+
+        late_stream = PcmInputStream(
+            stream_id="stream-late", core_session_id=runtime.core_session_id,
+            lease=lease, registry=runtime.device_registry,
+            map_device_time=lambda value: (50.0 + value / 1_000_000, 0.001),
+        )
+        late_frame = MediaFrame(
+            stream_id="stream-late", sequence=0, start_sample=0, sample_count=320,
+            device_time_us=1_000_000, payload=b"\x01\x00" * 320,
+            device_id=lease.device_id, core_session_id=runtime.core_session_id,
+            connection_generation=lease.connection_generation,
+            executor_generation=lease.executor_generation,
+            interaction_generation=lease.interaction_generation,
+        )
+        with pytest.raises(MediaProtocolError, match="交互设备租约已失效"):
+            late_stream.accept(late_frame)
+        with pytest.raises(RemoteAudioCaptureError, match="已停止"):
+            capture.accept_frame(late_frame)
+
+        reconnected = await runtime.open_remote_device_session(
+            "client-disconnect", ["audio_stream"],
+        )
+        replaced_lease = await runtime.prepare_interaction_switch(
+            "client-disconnect", runtime.device_registry.generation,
+        )
+        replaced_stream = PcmInputStream(
+            stream_id="stream-replaced", core_session_id=runtime.core_session_id,
+            lease=replaced_lease, registry=runtime.device_registry,
+            map_device_time=lambda value: (60.0 + value / 1_000_000, 0.001),
+        )
+        replaced_capture = RemoteAudioCapture(replaced_stream)
+        await runtime.select_remote_capture(replaced_capture, replaced_lease)
+        await replaced_capture.start()
+        await runtime.complete_remote_interaction_switch(replaced_capture, replaced_lease)
+
+        replacement = await runtime.open_remote_device_session(
+            "client-disconnect", ["audio_stream"],
+        )
+        active = runtime.device_registry.active
+        assert replacement.connection_generation > reconnected.connection_generation
+        assert active is not None and active.device_id == "local"
+        assert runtime.device_registry.accepts(replaced_lease) is False
+        assert replaced_capture.running is False
+        assert runtime.state.listening is True
+
+        await capture_route.stop()
+        await runtime.device_remote_sessions.close_all()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("was_listening", [True, False])
+def test_failed_remote_handoff_restores_only_existing_listening_intent(
+    tmp_path: Path, was_listening: bool,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            model_dir=tmp_path / "models",
+            persona=PersonaConfig(directory=tmp_path / "config" / "persona"),
+        )
+        settings = ProductSettingsStore(path=tmp_path / "config" / "product-settings.json", config=config)
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".local")
+        capture_route = SelectableCapturePort(_LocalCapture())
+        runtime._capture_router = capture_route
+
+        class _ListeningController:
+            async def stop_listening(self) -> None:
+                runtime.state.listening = False
+                await capture_route.stop()
+
+            async def start_listening(self) -> None:
+                await capture_route.start()
+                runtime.state.listening = True
+
+        runtime.controller = _ListeningController()
+        if was_listening:
+            await capture_route.start()
+            runtime.state.listening = True
+        await runtime.open_remote_device_session("client-handoff-failure", ["audio_stream"])
+
+        failed_lease = await runtime.prepare_interaction_switch(
+            "client-handoff-failure", runtime.device_registry.generation,
+        )
+        assert runtime.state.listening is False
+        await runtime.abort_interaction_switch(failed_lease)
+        assert runtime.device_registry.active is None
+        assert runtime.state.listening is False
+        assert await runtime.recover_local_after_remote_media_loss(failed_lease) is True
+
+        active = runtime.device_registry.active
+        assert active is not None and active.device_id == "local"
+        assert runtime.state.listening is was_listening
+        assert capture_route.active_device_id == "local"
+        assert capture_route.running is was_listening
         await capture_route.stop()
         await runtime.device_remote_sessions.close_all()
 

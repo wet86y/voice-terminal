@@ -93,6 +93,44 @@ pub fn choose_files() -> Result<Vec<PathBuf>, String> {
         Err("文件选择仅支持 Windows（操作系统）。".into())
     }
 }
+
+/// choose_tts_asset（选择语音参考音频）：只允许选择一个原生本地音频文件。
+pub fn choose_tts_asset() -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::Controls::Dialogs::{
+            GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OPENFILENAMEW,
+        };
+        let mut name = vec![0u16; 32768];
+        let filter: Vec<u16> =
+            "参考音频 (*.wav;*.mp3;*.flac;*.ogg)\0*.wav;*.mp3;*.flac;*.ogg\0所有文件\0*.*\0\0"
+                .encode_utf16()
+                .collect();
+        let title = wide("选择本机参考音频");
+        let mut info: OPENFILENAMEW = std::mem::zeroed();
+        info.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        info.lpstrFile = name.as_mut_ptr();
+        info.nMaxFile = name.len() as u32;
+        info.lpstrFilter = filter.as_ptr();
+        info.lpstrTitle = title.as_ptr();
+        info.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        if GetOpenFileNameW(&mut info) == 0 {
+            return Ok(None);
+        }
+        let end = name
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(name.len());
+        if end == 0 {
+            return Err("原生音频选择器没有返回文件路径。".into());
+        }
+        Ok(Some(PathBuf::from(String::from_utf16_lossy(&name[..end]))))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("语音参考音频选择仅支持 Windows（操作系统）。".into())
+    }
+}
 /// choose_resource（按组件选择导入来源）：批量选择压缩包，单模型选择文件夹。
 pub fn choose_resource(resource_id: Option<&str>) -> Result<Vec<PathBuf>, String> {
     match resource_id {

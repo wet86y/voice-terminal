@@ -384,6 +384,7 @@ def test_remote_output_waiter_does_not_finish_while_network_frames_are_unacknowl
         runtime = object.__new__(SessionRuntime)
         runtime._remote_playback_bindings = {"speech-pending": ("device-a", outbox)}
         runtime._remote_playback_finished = {"speech-pending"}
+        runtime._remote_client_tts_progress = {}  # _remote_client_tts_progress（客户端直放时钟快照）。
         runtime.device_registry = SimpleNamespace(connection=lambda _device: SimpleNamespace(
             connected=True, connection_generation=2, executor_generation=3,
         ))
@@ -414,6 +415,7 @@ def test_empty_remote_playback_finishes_without_receipt_and_releases_binding() -
         runtime._remote_playback_lock = asyncio.Lock()
         runtime._remote_playback_bindings = {"speech-empty": ("device-a", outbox)}
         runtime._remote_playback_finished = set()
+        runtime._remote_client_tts_progress = {}  # _remote_client_tts_progress（客户端直放时钟快照）。
         runtime._remote_playback_progress = {}
         runtime.device_registry = SimpleNamespace(connection=lambda _device: SimpleNamespace(
             connected=True, connection_generation=2, executor_generation=3,
@@ -465,6 +467,7 @@ def test_remote_output_waiter_requires_a_drained_device_clock_snapshot() -> None
         runtime = object.__new__(SessionRuntime)
         runtime._remote_playback_bindings = {"speech-a": ("device-a", outbox)}
         runtime._remote_playback_finished = {"speech-a"}
+        runtime._remote_client_tts_progress = {}  # _remote_client_tts_progress（客户端直放时钟快照）。
         runtime.device_registry = SimpleNamespace(connection=lambda _device: connection)
         runtime._remote_playback_progress = {"speech-a": {
             "enqueued_ms": 20, "played_ms": 20, "buffered_ms": 0,

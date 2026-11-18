@@ -275,21 +275,59 @@ pub fn serve_with_helper_path(
             || request.max_ms.is_some()
             || request.reason.is_some();
         let playback_control_invalid = match request.operation.as_str() {
-            "playback_enqueue" => request.playback_key.as_deref().is_some_and(|key| !valid_identifier(key))
-                || request.replacement_id.is_some() || request.max_ms.is_some() || request.reason.is_some(),
-            "playback_prepare_replacement" => !request.playback_key.as_deref().is_some_and(valid_identifier)
-                || !request.replacement_id.as_deref().is_some_and(valid_identifier)
-                || request.max_ms.is_none_or(|value| !(1..=600).contains(&value))
-                || request.reason.is_some(),
-            "playback_bind_replacement" => !request.playback_key.as_deref().is_some_and(valid_identifier)
-                || !request.replacement_id.as_deref().is_some_and(valid_identifier)
-                || request.max_ms.is_some() || request.reason.is_some(),
-            "playback_abort_replacement" => !request.replacement_id.as_deref().is_some_and(valid_identifier)
-                || !request.reason.as_deref().is_some_and(valid_identifier)
-                || request.playback_key.is_some() || request.max_ms.is_some(),
-            "playback_replacement_status" | "playback_wait_replacement" =>
-                !request.replacement_id.as_deref().is_some_and(valid_identifier)
-                    || request.playback_key.is_some() || request.max_ms.is_some() || request.reason.is_some(),
+            "playback_enqueue" => {
+                request
+                    .playback_key
+                    .as_deref()
+                    .is_some_and(|key| !valid_identifier(key))
+                    || request.replacement_id.is_some()
+                    || request.max_ms.is_some()
+                    || request.reason.is_some()
+            }
+            "playback_prepare_replacement" => {
+                !request
+                    .playback_key
+                    .as_deref()
+                    .is_some_and(valid_identifier)
+                    || !request
+                        .replacement_id
+                        .as_deref()
+                        .is_some_and(valid_identifier)
+                    || request
+                        .max_ms
+                        .is_none_or(|value| !(1..=600).contains(&value))
+                    || request.reason.is_some()
+            }
+            "playback_bind_replacement" => {
+                !request
+                    .playback_key
+                    .as_deref()
+                    .is_some_and(valid_identifier)
+                    || !request
+                        .replacement_id
+                        .as_deref()
+                        .is_some_and(valid_identifier)
+                    || request.max_ms.is_some()
+                    || request.reason.is_some()
+            }
+            "playback_abort_replacement" => {
+                !request
+                    .replacement_id
+                    .as_deref()
+                    .is_some_and(valid_identifier)
+                    || !request.reason.as_deref().is_some_and(valid_identifier)
+                    || request.playback_key.is_some()
+                    || request.max_ms.is_some()
+            }
+            "playback_replacement_status" | "playback_wait_replacement" => {
+                !request
+                    .replacement_id
+                    .as_deref()
+                    .is_some_and(valid_identifier)
+                    || request.playback_key.is_some()
+                    || request.max_ms.is_some()
+                    || request.reason.is_some()
+            }
             _ => playback_fields_present,
         };
         let helper_fields_present = request.helper_request_id.is_some()
@@ -327,7 +365,11 @@ pub fn serve_with_helper_path(
         } else {
             media_present
         };
-        if capture_wait_invalid || playback_media_invalid || playback_control_invalid || helper_payload_invalid {
+        if capture_wait_invalid
+            || playback_media_invalid
+            || playback_control_invalid
+            || helper_payload_invalid
+        {
             return Err(if capture_wait_invalid {
                 "采集帧等待时间只允许在 1 至 250 毫秒之间"
             } else {
@@ -571,14 +613,18 @@ pub fn serve_with_helper_path(
             }
             "clock_now" => match crate::wasapi_capture::monotonic_device_time_us() {
                 Ok(device_time_us) => (
-                    true, "ready", false,
+                    true,
+                    "ready",
+                    false,
                     Some(serde_json::json!({
                         "device_time_us":device_time_us,
                         "fields":{"device_time_us":"与 WASAPI 包时间戳同源的设备单调 QPC 时钟，微秒"}
                     })),
                 ),
                 Err(error) => (
-                    false, "unavailable", false,
+                    false,
+                    "unavailable",
+                    false,
                     Some(serde_json::json!({"error":error,
                         "fields":{"error":"设备单调时钟读取失败原因"}})),
                 ),
@@ -611,8 +657,14 @@ pub fn serve_with_helper_path(
             "capture_start" => {
                 let processing_status = audio_processing.start_capture();
                 if capture_stream.is_some() {
-                    let capture_status = if capture_stream.as_ref()
-                        .is_some_and(|stream| stream.is_reconnecting()) { "reconnecting" } else { "ready" };
+                    let capture_status = if capture_stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.is_reconnecting())
+                    {
+                        "reconnecting"
+                    } else {
+                        "ready"
+                    };
                     (
                         true,
                         "ready",
@@ -690,8 +742,10 @@ pub fn serve_with_helper_path(
                             true,
                             "ready",
                             false,
-                            Some(serde_json::json!({"frame":null,"capture_status":if stream.is_reconnecting(){"reconnecting"}else{"ready"},
-                                "fields":{"capture_status":"采集流当前状态：ready（就绪）或 reconnecting（正在重建默认设备）"}})),
+                            Some(
+                                serde_json::json!({"frame":null,"capture_status":if stream.is_reconnecting(){"reconnecting"}else{"ready"},
+                                "fields":{"capture_status":"采集流当前状态：ready（就绪）或 reconnecting（正在重建默认设备）"}}),
+                            ),
                         ),
                         Err(error) => {
                             capture_stream.take();
@@ -784,12 +838,10 @@ pub fn serve_with_helper_path(
                                 true,
                                 "ready",
                                 false,
-                                Some(
-                                    serde_json::json!({"playing": true,
+                                Some(serde_json::json!({"playing": true,
                                         "previous_playback_result": if previous_result_unknown {"unknown"} else {"none"},
                                         "audio_processing":audio_processing.status,
-                                        "fields":{"previous_playback_result":"旧默认端点已失效时结果保持未知；新流不重放旧音频"}}),
-                                ),
+                                        "fields":{"previous_playback_result":"旧默认端点已失效时结果保持未知；新流不重放旧音频"}})),
                             )
                         }
                         Err(error) => (
@@ -817,8 +869,10 @@ pub fn serve_with_helper_path(
                         true,
                         "ready",
                         false,
-                        Some(serde_json::json!({"playing":true,"paused":stream.is_paused(),
-                            "fields":{"playing":"播放端点是否仍被保留","paused":"设备线程已确认的暂停状态"}})),
+                        Some(
+                            serde_json::json!({"playing":true,"paused":stream.is_paused(),
+                            "fields":{"playing":"播放端点是否仍被保留","paused":"设备线程已确认的暂停状态"}}),
+                        ),
                     ),
                     Err(error) => (
                         false,
@@ -842,8 +896,10 @@ pub fn serve_with_helper_path(
                         true,
                         "ready",
                         false,
-                        Some(serde_json::json!({"playing":true,"paused":stream.is_paused(),
-                            "fields":{"playing":"播放端点是否仍被保留","paused":"设备线程已确认的暂停状态"}})),
+                        Some(
+                            serde_json::json!({"playing":true,"paused":stream.is_paused(),
+                            "fields":{"playing":"播放端点是否仍被保留","paused":"设备线程已确认的暂停状态"}}),
+                        ),
                     ),
                     Err(error) => (
                         false,
@@ -915,8 +971,10 @@ pub fn serve_with_helper_path(
                             true,
                             "ready",
                             false,
-                            Some(serde_json::json!({"replacement":replacement,"snapshot":snapshot,
-                                "fields":{"replacement":"按替换编号保存的设备端淡化状态","snapshot":"替换准备时的设备输出快照"}})),
+                            Some(
+                                serde_json::json!({"replacement":replacement,"snapshot":snapshot,
+                                "fields":{"replacement":"按替换编号保存的设备端淡化状态","snapshot":"替换准备时的设备输出快照"}}),
+                            ),
                         ),
                         Err(error) => (
                             false,
@@ -1000,36 +1058,38 @@ pub fn serve_with_helper_path(
                 },
             },
             #[cfg(windows)]
-            "playback_replacement_status" | "playback_wait_replacement" => match render_stream.as_ref() {
-                None => (
-                    false,
-                    "unavailable",
-                    false,
-                    Some(serde_json::json!({"error":"默认扬声器尚未启动"})),
-                ),
-                Some(stream) => match stream.replacement_status(
-                    request.replacement_id.as_deref().unwrap_or_default(),
-                ) {
-                    Ok(Some(replacement)) => (
-                        true,
-                        "ready",
+            "playback_replacement_status" | "playback_wait_replacement" => {
+                match render_stream.as_ref() {
+                    None => (
                         false,
-                        Some(serde_json::json!({"replacement":replacement})),
+                        "unavailable",
+                        false,
+                        Some(serde_json::json!({"error":"默认扬声器尚未启动"})),
                     ),
-                    Ok(None) => (
-                        false,
-                        "unknown",
-                        false,
-                        Some(serde_json::json!({"error":"替换编号没有可查询的设备端记录"})),
-                    ),
-                    Err(error) => (
-                        false,
-                        "unknown",
-                        false,
-                        Some(serde_json::json!({"error":error})),
-                    ),
-                },
-            },
+                    Some(stream) => match stream
+                        .replacement_status(request.replacement_id.as_deref().unwrap_or_default())
+                    {
+                        Ok(Some(replacement)) => (
+                            true,
+                            "ready",
+                            false,
+                            Some(serde_json::json!({"replacement":replacement})),
+                        ),
+                        Ok(None) => (
+                            false,
+                            "unknown",
+                            false,
+                            Some(serde_json::json!({"error":"替换编号没有可查询的设备端记录"})),
+                        ),
+                        Err(error) => (
+                            false,
+                            "unknown",
+                            false,
+                            Some(serde_json::json!({"error":error})),
+                        ),
+                    },
+                }
+            }
             #[cfg(windows)]
             "playback_snapshot" => match render_stream.as_ref() {
                 None => (
@@ -1098,10 +1158,16 @@ pub fn serve_with_helper_path(
                 },
             },
             #[cfg(not(windows))]
-            "playback_start" | "playback_enqueue" | "playback_snapshot"
-            | "playback_pause" | "playback_resume" | "playback_prepare_replacement"
-            | "playback_bind_replacement" | "playback_abort_replacement"
-            | "playback_replacement_status" | "playback_wait_replacement" => (
+            "playback_start"
+            | "playback_enqueue"
+            | "playback_snapshot"
+            | "playback_pause"
+            | "playback_resume"
+            | "playback_prepare_replacement"
+            | "playback_bind_replacement"
+            | "playback_abort_replacement"
+            | "playback_replacement_status"
+            | "playback_wait_replacement" => (
                 false,
                 "unsupported",
                 false,
@@ -1294,8 +1360,8 @@ impl ManagedWorker {
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
         self.exchange_with_payload(
-            operation, token, wait_ms, None, None, None, None, None, None,
-            None, None, None, None, timeout,
+            operation, token, wait_ms, None, None, None, None, None, None, None, None, None, None,
+            timeout,
         )
     }
 
@@ -1497,12 +1563,18 @@ impl ManagedWorker {
         if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
             && response.get("state").and_then(serde_json::Value::as_str) == Some("ready")
         {
-            return response.get("data").and_then(|data| data.get("device_time_us"))
+            return response
+                .get("data")
+                .and_then(|data| data.get("device_time_us"))
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| "设备时钟回执缺少单调时间戳".to_owned());
         }
-        Err(response.get("data").and_then(|data| data.get("error"))
-            .and_then(serde_json::Value::as_str).unwrap_or("设备单调时钟不可用").to_owned())
+        Err(response
+            .get("data")
+            .and_then(|data| data.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("设备单调时钟不可用")
+            .to_owned())
     }
 
     /// capture_start（显式启动采集）：打开系统默认麦克风并建立有界 PCM 帧队列。
@@ -1662,9 +1734,19 @@ impl ManagedWorker {
             return Err("播放替换编号、旧播放键或收尾上限无效".into());
         }
         self.exchange_with_payload(
-            "playback_prepare_replacement", None, None, None, None,
-            None, None, None, None,
-            Some(old_playback_key), Some(replacement_id), Some(max_ms), None,
+            "playback_prepare_replacement",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(old_playback_key),
+            Some(replacement_id),
+            Some(max_ms),
+            None,
             std::time::Duration::from_secs(3),
         )
     }
@@ -1679,9 +1761,19 @@ impl ManagedWorker {
             return Err("播放替换编号或后继播放键无效".into());
         }
         self.exchange_with_payload(
-            "playback_bind_replacement", None, None, None, None,
-            None, None, None, None,
-            Some(successor_playback_key), Some(replacement_id), None, None,
+            "playback_bind_replacement",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(successor_playback_key),
+            Some(replacement_id),
+            None,
+            None,
             std::time::Duration::from_secs(3),
         )
     }
@@ -1696,9 +1788,19 @@ impl ManagedWorker {
             return Err("播放替换编号或撤销原因无效".into());
         }
         self.exchange_with_payload(
-            "playback_abort_replacement", None, None, None, None,
-            None, None, None, None,
-            None, Some(replacement_id), None, Some(reason),
+            "playback_abort_replacement",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(replacement_id),
+            None,
+            Some(reason),
             std::time::Duration::from_secs(3),
         )
     }
@@ -1712,9 +1814,19 @@ impl ManagedWorker {
             return Err("播放替换编号无效".into());
         }
         self.exchange_with_payload(
-            "playback_replacement_status", None, None, None, None,
-            None, None, None, None,
-            None, Some(replacement_id), None, None,
+            "playback_replacement_status",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(replacement_id),
+            None,
+            None,
             std::time::Duration::from_secs(3),
         )
     }
@@ -1759,7 +1871,10 @@ impl ManagedWorker {
         if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
             && response.get("state").and_then(serde_json::Value::as_str) == Some("ready")
         {
-            let data = response.get("data").cloned().ok_or("播放暂停/恢复回执缺少数据")?;
+            let data = response
+                .get("data")
+                .cloned()
+                .ok_or("播放暂停/恢复回执缺少数据")?;
             if data.get("playing").and_then(serde_json::Value::as_bool) != Some(true)
                 || data.get("paused").and_then(serde_json::Value::as_bool) != Some(expected_paused)
             {
@@ -2104,7 +2219,10 @@ mod tests {
             .map(|_| serde_json::from_slice(&read_frame(&mut reader).unwrap().unwrap()).unwrap())
             .collect();
         for response in &responses[1..7] {
-            assert!(matches!(response["state"].as_str(), Some("unavailable" | "unsupported")));
+            assert!(matches!(
+                response["state"].as_str(),
+                Some("unavailable" | "unsupported")
+            ));
             assert_eq!(response["ok"], false);
         }
     }

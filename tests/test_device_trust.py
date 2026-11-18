@@ -120,6 +120,49 @@ class DeviceTrustStoreTests(unittest.TestCase):
             store.approve("desktop-a", ssh_public_key(Ed25519PrivateKey.generate()))
         self.assertEqual(path.read_bytes(), original)
 
+    def test_production_read_only_view_refreshes_native_changes_and_cannot_write(self) -> None:
+        writer = DeviceTrustStore(self.root)
+        reader = DeviceTrustStore(self.root, read_only=True)
+        key = ssh_public_key(Ed25519PrivateKey.generate())
+        writer.approve("desktop-a", key, trusted_at_ms=100)
+        self.assertEqual(reader.trusted_key("desktop-a"), parse_ed25519_public_key(key)[0])
+        self.assertEqual(reader.snapshot()["state"], "valid")
+        with self.assertRaises(DeviceTrustError):
+            reader.approve("desktop-b", ssh_public_key(Ed25519PrivateKey.generate()))
+        writer.revoke("desktop-a", revoked_at_ms=200)
+        self.assertIsNone(reader.trusted_key("desktop-a"))
+        self.assertEqual(reader.snapshot()["devices"][0]["state"], "revoked")
+
+    def test_read_only_view_revokes_cached_key_after_external_store_removal_or_corruption(self) -> None:
+        for failure in ("removed", "corrupted"):
+            with self.subTest(failure=failure):
+                root = self.root / failure
+                writer = DeviceTrustStore(root)
+                reader = DeviceTrustStore(root, read_only=True)
+                private_key = Ed25519PrivateKey.generate()
+                public_key = ssh_public_key(private_key)
+                writer.approve("desktop-a", public_key, trusted_at_ms=100)
+                message = b"voice-terminal-device-channel-v1\x00desktop-a\x00nonce"
+                signature = private_key.sign(message)
+                path = root / "state" / "device-trust.json"
+                original = path.read_bytes()
+
+                self.assertTrue(reader.verify_signature("desktop-a", message, signature))
+                if failure == "removed":
+                    path.unlink()
+                else:
+                    path.write_bytes(b'{"schema_version":1,"devices":[]} trailing')
+
+                self.assertFalse(reader.verify_signature("desktop-a", message, signature))
+                self.assertIsNone(reader.trusted_key("desktop-a"))
+                self.assertEqual(reader.state, "invalid")
+                self.assertEqual(reader.snapshot()["devices"], [])
+
+                # 原生层修复并恢复原内容后，必须重新严格解析，不可沿用空的失效快照。
+                path.write_bytes(original)
+                self.assertTrue(reader.verify_signature("desktop-a", message, signature))
+                self.assertEqual(reader.state, "valid")
+
     def test_malformed_public_keys_and_duplicate_json_fields_are_rejected(self) -> None:
         for key in ("ssh-rsa AAAA", "ssh-ed25519 invalid-base64", "ssh-ed25519 AAAA bad"):
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -154,6 +197,8 @@ class DevicePairingManagerTests(unittest.TestCase):
 
     def test_approval_is_explicit_and_only_public_identity_is_persisted(self) -> None:
         code, expires_at = self.manager.open_window(ttl_seconds=30, now_ms=10_000)
+        self.assertEqual(len(code), 6)
+        self.assertTrue(code.isascii() and code.isdigit())
         self.assertEqual(expires_at, 40_000)
         private_key = Ed25519PrivateKey.generate()
         pending = self.submit(self.manager, private_key, "desktop-a", code)
@@ -171,10 +216,16 @@ class DevicePairingManagerTests(unittest.TestCase):
         self.assertNotIn(code, serialized)
         self.assertNotIn("private", serialized)
 
+    def test_product_trust_view_rejects_python_pairing_window_creation(self) -> None:
+        store = DeviceTrustStore(self.root, read_only=True)
+        manager = DevicePairingManager(store)
+        with self.assertRaises(DeviceTrustError):
+            manager.open_window(now_ms=10_000)
+
     def test_wrong_code_and_invalid_signature_are_rejected(self) -> None:
         code, _expires_at = self.manager.open_window(now_ms=10_000)
         private_key = Ed25519PrivateKey.generate()
-        wrong_code = "99999999" if code != "99999999" else "88888888"
+        wrong_code = "999999" if code != "999999" else "888888"
         with self.assertRaises(DeviceTrustError):
             self.submit(self.manager, private_key, "desktop-a", wrong_code)
         self.assertEqual(self.manager.status(now_ms=10_000)["failed_attempts_remaining"], 9)
@@ -190,7 +241,7 @@ class DevicePairingManagerTests(unittest.TestCase):
 
     def test_pairing_window_closes_after_ten_signed_wrong_code_attempts(self) -> None:
         code, _expires_at = self.manager.open_window(now_ms=10_000)
-        wrong_code = "99999999" if code != "99999999" else "88888888"
+        wrong_code = "999999" if code != "999999" else "888888"
         private_key = Ed25519PrivateKey.generate()
         for index in range(DevicePairingManager.MAX_INVALID_CODE_ATTEMPTS):
             with self.subTest(index=index), self.assertRaises(DeviceTrustError):
@@ -300,9 +351,25 @@ class DeviceRequestAuthenticatorTests(unittest.TestCase):
 
     def test_challenge_cannot_be_issued_for_unlisted_or_wrong_media_method(self) -> None:
         for method, path in (("GET", "/v1/status"), ("POST", "/api/v1/settings"),
-                             ("POST", "/v1/media")):
+                             ("POST", "/v1/media"), ("POST", "/v1/file-transfer.extra")):
             with self.subTest(method=method, path=path), self.assertRaises(DeviceTrustError):
                 self.auth.issue_challenge("desktop-a", method, path, now_ms=10_000, now_monotonic=1.0)
+
+    def test_file_transfer_challenge_is_fixed_to_the_exact_post_route(self) -> None:
+        challenge = self.auth.issue_challenge(
+            "desktop-a", "POST", "/v1/file-transfer", now_ms=10_000, now_monotonic=1.0,
+        )
+        self.assertEqual(challenge["protocol_version"], 1)
+        self.assertTrue(self.auth.authorize_request(
+            method="POST", path="/v1/file-transfer", device_id="desktop-a",
+            core_session_id=self.auth.core_session_id, challenge=challenge["challenge"],
+            timestamp_ms=10_000, signature=self.private_key.sign(device_request_proof_message(
+                method="POST", path="/v1/file-transfer", device_id="desktop-a",
+                core_session_id=self.auth.core_session_id, challenge=challenge["challenge"],
+                timestamp_ms=10_000, payload={"protocol_version": 1, "action": "begin"},
+            )), payload={"protocol_version": 1, "action": "begin"},
+            now_ms=10_001, now_monotonic=1.1,
+        ))
 
     def test_media_upgrade_signature_is_bound_to_get_path_and_handshake_payload(self) -> None:
         payload = {

@@ -2,8 +2,8 @@
 mod app_icon;
 mod integrity_commands;
 use integrity_commands::{
-    MaintenanceAction, app_integrity_check, app_integrity_download, app_integrity_status,
-    maintenance_payload,
+    app_integrity_check, app_integrity_download, app_integrity_status, maintenance_payload,
+    MaintenanceAction,
 };
 #[cfg(feature = "ssh-device")]
 mod client_tts_relay;
@@ -12,6 +12,11 @@ mod environment_commands;
 mod initialization;
 #[cfg(feature = "qualification")]
 mod qualification;
+mod remote_import;
+#[cfg(feature = "ssh-device")]
+mod remote_management;
+#[cfg(feature = "ssh-device")]
+mod remote_services;
 mod resource_commands;
 mod runtime_recovery;
 use credential_commands::{
@@ -27,10 +32,11 @@ use initialization::{
     desktop_cancel_init, desktop_initialize, desktop_manage, desktop_start_service,
 };
 use resource_commands::{
-    ResourceManager, aniflive_import_choose_folder, aniflive_import_start, resource_cancel,
-    resource_download, resource_download_required, resource_import, resource_import_confirm,
-    resource_inventory, resource_jobs, resource_open_source, resource_reset, resource_reset_plan,
-    resource_system_feature_enable, resource_system_feature_status,
+    aniflive_import_choose_folder, aniflive_import_start, resource_cancel, resource_download,
+    resource_download_required, resource_import, resource_import_choose_sources,
+    resource_import_confirm, resource_import_start, resource_inventory, resource_jobs,
+    resource_open_source, resource_reset, resource_reset_plan, resource_system_feature_access,
+    resource_system_feature_enable, resource_system_feature_status, ResourceManager,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -41,21 +47,21 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
 use tauri::{
-    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
+    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use voice_desktop_common::{
-    LaunchContext,
     windows::Job,
     workspace::{self, Locator},
+    LaunchContext,
 };
 
 const APP_UPDATE_PROGRESS_EVENT: &str = "desktop://app-update-progress";
@@ -102,18 +108,32 @@ struct Service {
 
 #[cfg(feature = "ssh-device")]
 struct RemoteDeviceTaskChannel {
-    stop: Arc<AtomicBool>,    // stop（停止标记）：只在当前设备通道退出时读取。
-    running: Arc<AtomicBool>, // running（轮询任务是否仍在运行）。
+    stop: Arc<AtomicBool>,      // stop（停止标记）：只在当前设备通道退出时读取。
+    running: Arc<AtomicBool>,   // running（轮询任务是否仍在运行）。
+    device_id: String,          // device_id（本机登记到服务端的稳定设备编号）。
+    connection_generation: u64, // connection_generation（主机授予的管理连接代次）。
+    executor_generation: u64,   // executor_generation（主机授予的客户端执行器代次）。
     task: tauri::async_runtime::JoinHandle<()>, // task（受管异步轮询任务）。
 }
 
 #[cfg(feature = "ssh-device")]
 struct RemoteDeviceMediaChannel {
-    stop: Arc<AtomicBool>,    // stop（停止媒体发送与接收的信号）。
-    running: Arc<AtomicBool>, // running（媒体通道是否仍在运行）。
-    device_id: String,        // device_id（当前选为语音设备的本机编号）。
-    stream_id: String,        // stream_id（当前连续音频流编号）。
+    stop: Arc<AtomicBool>,       // stop（停止媒体发送与接收的信号）。
+    running: Arc<AtomicBool>,    // running（媒体通道是否仍在运行）。
+    device_id: String,           // device_id（当前选为语音设备的本机编号）。
+    stream_id: String,           // stream_id（当前连续音频流编号）。
+    connection_generation: u64,  // connection_generation（主机登记的设备连接代次）。
+    executor_generation: u64,    // executor_generation（主机登记的设备执行器代次）。
+    interaction_generation: u64, // interaction_generation（主机授予的语音交互代次）。
     task: tauri::async_runtime::JoinHandle<()>, // task（采集、WebSocket 收发及资源回收任务）。
+}
+
+#[cfg(feature = "ssh-device")]
+struct RemoteVoiceForwarder {
+    url: String, // url（仅本机回环、带随机路径票据的服务端语音 WebSocket 地址）。
+    running: Arc<AtomicBool>, // running（转发 listener 是否仍在运行）。
+    stop: tokio::sync::watch::Sender<bool>, // stop（停止本机 listener 与所有连接的信号）。
+    task: tauri::async_runtime::JoinHandle<()>, // task（固定 SSH control 桥接 listener）。
 }
 
 #[cfg(feature = "ssh-device")]
@@ -148,6 +168,14 @@ struct PlaybackSnapshotView {
     output_estimated_ms: u64, // output_estimated_ms（按设备时钟估计的输出位置）。
     started: bool,            // started（设备输出时钟是否已推进）。
     device_time_us: u64,      // device_time_us（WASAPI 对应的 QPC 时刻，微秒）。
+}
+
+#[cfg(feature = "ssh-device")]
+#[derive(Clone, Copy)]
+struct ClientTtsPlaybackLedger {
+    sample_rate: u32,                   // sample_rate（固定播放事务的 PCM 采样率）。
+    accepted_samples: u64,              // accepted_samples（该事务已加入原生播放器的累计样本数）。
+    baseline: PlaybackSnapshotBaseline, // baseline（首次入队前采集的设备时钟基线）。
 }
 
 #[cfg(feature = "ssh-device")]
@@ -358,7 +386,7 @@ fn frontend_capability(
     let mut capability = if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-system-feature-status","allow-resource-system-feature-enable","allow-resource-system-feature-access","allow-device-discovery-search","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-choose-sources","allow-resource-import-start","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
     };
     if mode == FrontendMode::Product {
         if let Some(permissions) = capability["permissions"].as_array_mut() {
@@ -379,12 +407,21 @@ fn frontend_capability(
             permissions.push(serde_json::json!("allow-device-worker-playback-stop"));
             #[cfg(feature = "ssh-device")]
             for permission in [
+                "allow-device-pairing-window-open",
+                "allow-device-pairing-window-close",
+                "allow-device-pairing-window-status",
+                "allow-device-pairing-connect",
                 "allow-device-ssh-probe",
                 "allow-device-ssh-identity-create",
                 "allow-device-ssh-identity-status",
                 "allow-device-ssh-identity-delete",
                 "allow-device-ssh-connect",
                 "allow-device-ssh-request",
+                "allow-device-ssh-management-request",
+                "allow-device-ssh-import-start",
+                "allow-device-ssh-import-cancel",
+                "allow-device-ssh-tts-asset-import",
+                "allow-device-ssh-tts-asset-audio",
                 "allow-device-ssh-pairing-request",
                 "allow-device-ssh-transport-identity-import",
                 "allow-device-ssh-transport-identity-status",
@@ -393,6 +430,7 @@ fn frontend_capability(
                 "allow-device-ssh-status",
                 "allow-device-ssh-task-channel",
                 "allow-device-ssh-media-channel",
+                "allow-device-ssh-voice-forwarder",
             ] {
                 permissions.push(serde_json::json!(permission));
             }
@@ -430,6 +468,27 @@ struct Desktop {
     #[cfg(feature = "ssh-device")]
     ssh_device: voice_desktop_common::ssh_device::SshDeviceManager, // ssh_device（SSH 设备管理器）：私钥仅由原生层读取。
     #[cfg(feature = "ssh-device")]
+    pairing_window: Mutex<
+        Option<
+            Arc<std::sync::Mutex<Option<voice_desktop_common::device_pairing::PairingCodeWindow>>>,
+        >,
+    >, // pairing_window（本机内存 OPAQUE 配对窗口，可原子关闭）。
+    #[cfg(feature = "ssh-device")]
+    pairing_listener:
+        tokio::sync::Mutex<Option<voice_desktop_common::device_pairing::PairingListener>>, // pairing_listener（受限局域网配对监听器）。
+    #[cfg(feature = "ssh-device")]
+    discovery_publication:
+        Mutex<Option<voice_desktop_common::device_discovery::DiscoveryPublication>>, // discovery_publication（当前 mDNS 公告租约）。
+    #[cfg(feature = "ssh-device")]
+    remote_services: Mutex<Option<Arc<remote_services::RemoteServices>>>, // remote_services（广播开启期间的原生管理与文件回环服务）。
+    #[cfg(feature = "ssh-device")]
+    remote_import_transfers: Mutex<HashMap<String, Arc<AtomicBool>>>, // remote_import_transfers（客户端当前 FILE 上传及取消信号）。
+    #[cfg(feature = "ssh-device")]
+    discovery_targets: Mutex<
+        std::collections::HashMap<String, voice_desktop_common::device_discovery::DiscoveredDevice>,
+    >, // discovery_targets（最近一次 mDNS 搜索结果，原生连接会回查此表）。
+    discovery_search_expires_at_ms: AtomicU64, // discovery_search_expires_at_ms（最近一次发现结果的有限有效期）。
+    #[cfg(feature = "ssh-device")]
     device_terminal: voice_desktop_common::device_terminal::DeviceTerminalManager, // device_terminal（设备终端）：受限命令任务与增量输出。
     #[cfg(feature = "ssh-device")]
     remote_task_channel: Mutex<Option<RemoteDeviceTaskChannel>>, // remote_task_channel（当前远端设备任务通道）。
@@ -443,6 +502,8 @@ struct Desktop {
     remote_media_channel_starting: AtomicBool, // remote_media_channel_starting（防止并行切换语音媒体流）。
     #[cfg(feature = "ssh-device")]
     remote_media_channel_error: Mutex<Option<String>>, // remote_media_channel_error（最近一次音频通道错误）。
+    #[cfg(feature = "ssh-device")]
+    remote_voice_forwarder: Mutex<Option<RemoteVoiceForwarder>>, // remote_voice_forwarder（本机 loopback 上受随机票据保护的语音事件 WebSocket 转发）。
     #[cfg(feature = "ssh-device")]
     remote_playback_control: tokio::sync::Mutex<RemotePlaybackControlState>, // remote_playback_control（任务通道与媒体流共用的播放控制状态）。
     #[cfg(feature = "ssh-device")]
@@ -637,30 +698,13 @@ impl Desktop {
             }
             #[cfg(feature = "ssh-device")]
             {
-                let media = state
-                    .remote_media_channel
-                    .lock()
-                    .ok()
-                    .and_then(|mut slot| slot.take());
-                if let Some(channel) = media {
-                    channel.stop.store(true, Ordering::Release);
-                    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                        Duration::from_secs(3),
-                        channel.task,
-                    ));
+                if let Ok(transfers) = state.remote_import_transfers.lock() {
+                    for cancel in transfers.values() {
+                        cancel.store(true, Ordering::Release);
+                    }
                 }
-                let task = state
-                    .remote_task_channel
-                    .lock()
-                    .ok()
-                    .and_then(|mut slot| slot.take());
-                if let Some(channel) = task {
-                    channel.stop.store(true, Ordering::Release);
-                    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                        Duration::from_secs(3),
-                        channel.task,
-                    ));
-                }
+                // 同一受控交接负责撤销 mDNS（局域网公告）、配对窗口、管理/文件入口、媒体与任务通道、SSH（安全外壳协议）及本机设备工作进程。
+                let _ = tauri::async_runtime::block_on(stop_remote_device_runtime(&state));
             }
             let _ = state.stop_service();
             if let Ok(mut worker) = state.device_worker.lock() {
@@ -686,6 +730,11 @@ fn boot_page_url(url: &tauri::Url) -> bool {
             || (url.scheme() == "http"
                 && url.host_str() == Some("tauri.localhost")
                 && url.port().is_none()))
+}
+
+/// remote_static_product_page_url（识别内置远程产品页）：接受受控 Tauri 根路径和 index.html。
+fn remote_static_product_page_url(url: &tauri::Url) -> bool {
+    boot_page_url(url) && matches!(url.path(), "/" | "/index.html")
 }
 
 // request_service_start（首次主页面加载后请求服务）：刷新及业务导航不会再次启动。
@@ -1084,18 +1133,91 @@ fn device_runtime_status(state: &Desktop, data_root: &Path) -> serde_json::Value
     );
     let remote_client_ready =
         remote_client_selected && remote_client_connected && !service_alive && !core_ready;
+    let (actual_mode, switch_phase, runtime_error) = mode_runtime_projection(
+        snapshot.mode,
+        actual_role,
+        service_alive,
+        state.error.lock().ok().and_then(|error| error.clone()),
+        snapshot.error.clone(),
+    );
+    #[cfg(feature = "ssh-device")]
+    let broadcast_actual = state
+        .discovery_publication
+        .lock()
+        .ok()
+        .is_some_and(|publication| publication.is_some())
+        && state.remote_services.lock().ok().is_some_and(|services| {
+            services
+                .as_ref()
+                .is_some_and(|current| current.is_running())
+        });
+    #[cfg(not(feature = "ssh-device"))]
+    let broadcast_actual = false;
+    let revision = state.service_epoch.load(Ordering::Acquire);
     serde_json::json!({"config_state":snapshot.config_state,"device_id":snapshot.device_id,
+        "mode":snapshot.mode,"broadcast_enabled":snapshot.broadcast_enabled,
+        "expected_mode":snapshot.mode,"actual_mode":actual_mode,"switch_phase":switch_phase,
+        "broadcast_requested":snapshot.broadcast_enabled,
+        "broadcast_actual":broadcast_actual,
+        "revision":revision,
         "desired_role":snapshot.desired_role,"audio_mode":snapshot.audio_mode,"actual_role":actual_role,
         "core_ready":core_ready,"device_gateway":gateway,
         "remote_client_connected":remote_client_connected,
         "config_accepted":voice_desktop_common::device_config::startup_block_reason(&snapshot).is_none() || remote_client_ready,
-        "error":snapshot.error,
+        "error":runtime_error,
         "fields":{"config_state":"设备配置当前状态","device_id":"本机设备编号；缺少配置时为单机临时标识",
-            "desired_role":"用户选择的目标运行角色","audio_mode":"设备音频传输模式",
+            "mode":"用户选择的本地运行或远程配对模式","broadcast_enabled":"本机广播开关保存状态",
+            "expected_mode":"已保存的目标运行模式","actual_mode":"当前真实运行模式；尚未就绪时为空",
+            "switch_phase":"运行模式切换状态：ready（已就绪）、waiting_for_remote（等待服务端）、starting_local（正在启动）、stopped（未运行）或 failed（切换/启动失败）",
+            "broadcast_requested":"保存的局域网广播意图","broadcast_actual":"原生 mDNS 局域网公告当前是否已发布",
+            "revision":"运行模式状态修订号，用于拒绝过期状态回写",
+            "desired_role":"兼容设备角色投影","audio_mode":"兼容音频传输字段",
             "actual_role":"根据本机核心、共享网关或远端已认证 SSH 会话确认的实际角色",
             "core_ready":"当前业务核心能力是否已就绪","device_gateway":"共享设备网关启用及监听状态",
             "remote_client_connected":"本机远端客户端角色是否持有已认证的固定主机连接",
-            "config_accepted":"配置格式有效且当前支持该角色的核心启动","error":"需要在管理界面处理的配置或准备问题"}})
+            "config_accepted":"配置格式有效且当前支持该角色的核心启动","error":"最近一次运行模式切换、服务启动或配置错误；失败时保留当前实际模式"}})
+}
+
+fn mode_runtime_projection(
+    expected_mode: Option<voice_desktop_common::device_config::RunMode>,
+    actual_role: &str,
+    service_alive: bool,
+    runtime_error: Option<String>,
+    config_error: Option<String>,
+) -> (Option<&'static str>, &'static str, Option<String>) {
+    let actual_mode = match actual_role {
+        "standalone" | "shared_host" => Some("local"),
+        "remote_client" => Some("remote"),
+        _ => None,
+    };
+    let error = runtime_error.or(config_error);
+    let switch_phase = if error.is_some() {
+        "failed"
+    } else if actual_mode.is_some_and(|value| {
+        Some(value)
+            == expected_mode.map(|mode| match mode {
+                voice_desktop_common::device_config::RunMode::Local => "local",
+                voice_desktop_common::device_config::RunMode::Remote => "remote",
+            })
+    }) {
+        "ready"
+    } else if expected_mode == Some(voice_desktop_common::device_config::RunMode::Remote) {
+        "waiting_for_remote"
+    } else if service_alive {
+        "starting_local"
+    } else {
+        "stopped"
+    };
+    (actual_mode, switch_phase, error)
+}
+
+/// desktop_status_ready（桌面预检就绪状态）：remote_static_product_page（受控远程静态入口）无需等待本地服务来源。
+fn desktop_status_ready(
+    mode: FrontendMode,               // mode（当前桌面窗口的入口模式）。
+    origin_ready: bool,               // origin_ready（本机受控产品服务来源是否已建立）。
+    remote_static_product_page: bool, // remote_static_product_page（已核验的远程静态产品页是否已加载）。
+) -> bool {
+    origin_ready || (mode == FrontendMode::Product && remote_static_product_page)
 }
 
 #[tauri::command]
@@ -1105,15 +1227,29 @@ fn desktop_status(
 ) -> Result<serde_json::Value, String> {
     require_command(state.mode, DesktopCommand::Status)?;
     trusted(&window, &state)?;
-    if let Ok(url) = window.url() {
+    let current_url = window.url().ok();
+    if let Some(url) = current_url.as_ref() {
         if state.is_settled_frontend_url(&url) {
             state.launch_token.lock().unwrap().take();
         }
     }
+    let remote_static_product_page = state.mode == FrontendMode::Product
+        && current_url
+            .as_ref()
+            .is_some_and(remote_static_product_page_url)
+        && state.context().is_some_and(|context| {
+            voice_desktop_common::device_config::inspect(&context.data).mode
+                == Some(voice_desktop_common::device_config::RunMode::Remote)
+        });
+    let ready = desktop_status_ready(
+        state.mode,
+        state.origin.lock().unwrap().is_some(),
+        remote_static_product_page,
+    );
     // ready（是否就绪）、error（错误信息）、frontend_mode（前端模式）、development（是否显式源码调试）。
     let runtime_recovery = state.recovery.lock().unwrap().snapshot();
     Ok(serde_json::json!({
-        "ready": state.origin.lock().unwrap().is_some(),
+        "ready": ready,
         "startup_skipped": state.startup_skipped.load(Ordering::Acquire),
         "runtime_recovery": runtime_recovery, // runtime_recovery（运行期热更新状态，不含私有会话）。
         "error": *state.error.lock().unwrap(),
@@ -1126,7 +1262,7 @@ fn desktop_status(
         "initialization":*state.initialization.lock().unwrap(),
         "runtime":state.context().and_then(|context|voice_desktop_common::runtime::status(&context).ok()),
         "device_runtime":state.context().map(|context|device_runtime_status(state.inner().as_ref(),&context.data)),
-        "fields":{"role":"product（正式程序）或 ui-preview（隔离演示）","frontend_mode":"被授权的界面入口","development":"是否显式源码调试","ready":"界面业务来源已建立","startup_skipped":"已选择跳过加载画面","runtime_recovery":"当前窗口的组件热更新与业务恢复","error":"启动失败原因","workspace_ready":"正式工作区已解析","workspace_busy":"正在切换或迁移","initialization_failed":"初始化失败标识","initialization":"启动阶段与进度","runtime":"本地语音环境状态","device_runtime":"设备配置、期望角色和实际核心角色"}
+        "fields":{"role":"product（正式程序）或 ui-preview（隔离演示）","frontend_mode":"被授权的界面入口","development":"是否显式源码调试","ready":"受控远程静态入口已加载，或本机产品服务来源已建立","startup_skipped":"已选择跳过加载画面","runtime_recovery":"当前窗口的组件热更新与业务恢复","error":"启动失败原因","workspace_ready":"正式工作区已解析","workspace_busy":"正在切换或迁移","initialization_failed":"初始化失败标识","initialization":"启动阶段与进度","runtime":"本地语音环境状态","device_runtime":"设备配置、期望及实际模式、切换阶段与运行错误"}
     }))
 }
 
@@ -1499,9 +1635,9 @@ fn device_config_status(
     Ok(
         serde_json::json!({"runtime":snapshot,"device_config":config,"device_runtime":device_runtime,
         "local_core_available":context.python.is_file(),
-        "fields":{"runtime":"设备配置状态与期望角色","device_config":"已保存的非私密设备与主机公开身份",
+        "fields":{"runtime":"设备配置状态、模式与广播意图","device_config":"已保存的非私密设备与主机公开身份",
             "local_core_available":"本机核心解释器入口是否存在；模型及其他组件仍由正式启动流程验证",
-            "device_runtime":"当前核心实际角色与共享网关就绪状态"}}),
+            "device_runtime":"期望模式、实际角色、切换阶段、广播实际状态与错误摘要"}}),
     )
 }
 
@@ -1509,6 +1645,7 @@ fn device_config_status(
 #[tauri::command]
 async fn device_config_save(
     window: WebviewWindow,
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Desktop>>,
     config: voice_desktop_common::device_config::DeviceConfig, // config（设备角色、音频档及已确认主机身份）。
     preserve_invalid: Option<bool>, // preserve_invalid（明确确认后归档未知或损坏原件再修复）。
@@ -1520,27 +1657,924 @@ async fn device_config_save(
     if state.stopping.load(Ordering::Acquire) || state.workspace_busy.load(Ordering::Acquire) {
         return Err("应用退出或工作区切换期间不能保存设备配置。".into());
     }
-    #[cfg(feature = "ssh-device")]
-    {
-        if state.ssh_device.connected().await {
-            state.remote_client_connected.store(true, Ordering::Release);
-            return Err("保存设备身份或角色前，请先断开当前 SSH 主机连接。".into());
-        }
-        state
-            .remote_client_connected
-            .store(false, Ordering::Release);
-    }
     let context = state.context().ok_or("缺少正式工作区")?;
     voice_desktop_common::device_config::require_role_runtime(
         config.desired_role,
         context.python.is_file(),
     )?;
-    let snapshot = voice_desktop_common::device_config::save_with_recovery(
+    let old_config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+        voice_desktop_common::device_config::LoadResult::Valid(previous) => Some(previous),
+        voice_desktop_common::device_config::LoadResult::Missing => None,
+        voice_desktop_common::device_config::LoadResult::Invalid(error)
+            if preserve_invalid.unwrap_or(false) =>
+        {
+            let _ = error;
+            None
+        }
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => {
+            return Err(format!("已有设备配置无效且原件已保留：{error}"));
+        }
+    };
+    let runtime_change = old_config.as_ref().is_none_or(|previous| {
+        previous.mode != config.mode
+            || previous.broadcast_enabled != config.broadcast_enabled
+            || previous.host != config.host
+    });
+    if config.mode == voice_desktop_common::device_config::RunMode::Local
+        && config.broadcast_enabled
+    {
+        let status = tauri::async_runtime::spawn_blocking(
+            voice_desktop_common::system_feature::open_ssh_server_status,
+        )
+        .await
+        .map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
+        if !status.ready {
+            return Err(
+                "本机微软 SSH 服务尚未就绪；请先点击“检查 SSH 服务”，确认服务状态后再开启广播。"
+                    .into(),
+            );
+        }
+        if status.account_is_entra || status.account_ssh_username.is_none() {
+            return Err(
+                "当前 Windows 账户没有可用的受管 OpenSSH 登录名；没有使用邮箱或用户目录名。".into(),
+            );
+        }
+        if !status.project_access_valid || !status.pairing_access_valid {
+            tauri::async_runtime::spawn_blocking(|| {
+                voice_desktop_common::system_feature::set_device_broadcast_access(true)
+            })
+            .await
+            .map_err(|_| "局域网受限防火墙准备任务无法启动。".to_string())??;
+        }
+    }
+    if runtime_change {
+        if state.service_starting.load(Ordering::Acquire) {
+            return Err("正在启动或检查语音服务，请等待完成后切换运行模式。".into());
+        }
+        if app
+            .try_state::<Arc<ResourceManager>>()
+            .is_some_and(|manager| manager.has_active_jobs())
+        {
+            return Err("组件任务尚未结束，请等待任务完成后切换运行模式。".into());
+        }
+        stop_remote_device_runtime(&state).await?;
+        {
+            let _transition = state
+                .service_transition
+                .lock()
+                .map_err(|_| "服务交接锁不可用。")?;
+            state.stop_service()?;
+        }
+    }
+    let snapshot = match voice_desktop_common::device_config::save_with_recovery(
         &context.data,
         &config,
         preserve_invalid.unwrap_or(false),
-    )?;
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if runtime_change
+                && old_config.as_ref().is_some_and(|previous| {
+                    previous.mode == voice_desktop_common::device_config::RunMode::Local
+                })
+            {
+                let _ = start_service(app.clone(), state.inner().clone());
+            }
+            return Err(error);
+        }
+    };
+    if runtime_change {
+        state
+            .remote_client_connected
+            .store(false, Ordering::Release);
+        *state.error.lock().map_err(|_| "运行模式错误状态不可用。")? = None;
+        match start_service(app.clone(), state.inner().clone()) {
+            Ok(()) => {
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote {
+                    *state
+                        .initialization
+                        .lock()
+                        .map_err(|_| "启动状态不可用。")? = serde_json::json!({
+                        "phase":"远程配对模式已启动，等待搜索并连接服务端",
+                        "can_cancel":false,"failed":false,
+                        "fields":{"phase":"客户端不启动本机推理核心，等待发现和连接服务端","can_cancel":"当前模式持续可用","failed":"初始化失败标记"}
+                    });
+                }
+            }
+            Err(error) => {
+                if let Some(previous) = old_config {
+                    let restore =
+                        voice_desktop_common::device_config::save(&context.data, &previous);
+                    if restore.is_ok()
+                        && previous.mode == voice_desktop_common::device_config::RunMode::Local
+                    {
+                        let _ = start_service(app.clone(), state.inner().clone());
+                    }
+                    *state.error.lock().map_err(|_| "运行模式错误状态不可用。")? =
+                        Some(error.clone());
+                    return Err(format!(
+                        "目标模式启动失败：{error}；{}",
+                        if restore.is_ok() {
+                            "已恢复先前配置"
+                        } else {
+                            "先前配置恢复失败，请检查设备状态"
+                        }
+                    ));
+                }
+                *state.error.lock().map_err(|_| "运行模式错误状态不可用。")? = Some(error.clone());
+                return Err(format!("目标模式启动失败：{error}"));
+            }
+        }
+    }
+    #[cfg(feature = "ssh-device")]
+    if config.mode == voice_desktop_common::device_config::RunMode::Local
+        && config.broadcast_enabled
+    {
+        if let Err(error) = sync_local_discovery(state.inner().clone()).await {
+            *state.error.lock().map_err(|_| "运行状态错误不可用。")? = Some(error.clone());
+            return Err(format!(
+                "本地运行模式已保存，但局域网广播尚未实际发布：{error}"
+            ));
+        }
+    } else if old_config
+        .as_ref()
+        .is_some_and(|previous| previous.broadcast_enabled)
+    {
+        let disable = tauri::async_runtime::spawn_blocking(|| {
+            voice_desktop_common::system_feature::set_device_broadcast_access(false)
+        })
+        .await
+        .map_err(|_| "局域网规则关闭任务无法启动。".to_string())?;
+        if let Err(error) = disable {
+            *state.error.lock().map_err(|_| "运行状态错误不可用。")? = Some(error.clone());
+            return Err(format!("目标运行模式已保存，应用已停止接受远程连接，但本轮创建的防火墙规则未能全部关闭：{error}"));
+        }
+    }
     serde_json::to_value(snapshot).map_err(|_| "设备配置结果编码失败。".into())
+}
+
+/// device_discovery_search（搜索局域网服务端）：只读 mDNS 发现，不排除同机不同工作区。
+#[tauri::command]
+async fn device_discovery_search(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    timeout_ms: Option<u64>, // timeout_ms（搜索等待时长，毫秒；原生层限制不超过十秒）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能搜索局域网设备。".into());
+    }
+    let context = state.context().ok_or("缺少正式工作区")?;
+    match voice_desktop_common::device_config::load_from_root(&context.data) {
+        voice_desktop_common::device_config::LoadResult::Valid(config)
+            if config.mode == voice_desktop_common::device_config::RunMode::Remote => {}
+        voice_desktop_common::device_config::LoadResult::Missing if !context.python.is_file() => {}
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        _ => return Err("请先切换到“远程配对”模式，再搜索局域网服务端。".into()),
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        let timeout =
+            std::time::Duration::from_millis(timeout_ms.unwrap_or(3_000).clamp(1_000, 10_000));
+        let desktop = state.inner().clone();
+        let devices = tauri::async_runtime::spawn_blocking(move || {
+            voice_desktop_common::device_discovery::search(timeout)
+        })
+        .await
+        .map_err(|_| "局域网设备搜索任务无法启动。".to_string())??;
+        let mut targets = desktop
+            .discovery_targets
+            .lock()
+            .map_err(|_| "发现设备缓存不可用。")?;
+        *targets = devices
+            .iter()
+            .cloned()
+            .map(|device| (device.host_id.clone(), device))
+            .collect();
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "系统时间无效，无法固定发现结果时限。")?
+            .as_millis()
+            .saturating_add(120_000)
+            .min(u128::from(u64::MAX)) as u64;
+        desktop
+            .discovery_search_expires_at_ms
+            .store(expires_at_ms, Ordering::Release);
+        Ok(serde_json::json!({
+            "protocol_version":voice_desktop_common::device_discovery::DISCOVERY_PROTOCOL_VERSION,
+            "devices":devices,
+            "fields":{"protocol_version":"固定 mDNS 发现协议版本","devices":"搜索到的服务端身份、配对入口、能力及局域网地址记录"}
+        }))
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = timeout_ms;
+        Err("当前程序包未包含局域网设备发现能力。".into())
+    }
+}
+
+/// device_pairing_window_open（开启本机六位码窗口）：配对码只回传一次，不写入日志或状态。
+#[tauri::command]
+async fn device_pairing_window_open(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能开启设备配对窗口。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config) => config,
+            voice_desktop_common::device_config::LoadResult::Missing => {
+                return Err("请先保存本地运行模式和广播开关。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        if config.mode != voice_desktop_common::device_config::RunMode::Local
+            || !config.broadcast_enabled
+        {
+            return Err("配对窗口只在本地运行且已开启广播时可用。".into());
+        }
+        let status = tauri::async_runtime::spawn_blocking(
+            voice_desktop_common::system_feature::open_ssh_server_status,
+        )
+        .await
+        .map_err(|_| "SSH 服务只读检查任务无法启动。".to_string())??;
+        if !status.ready || !status.project_access_valid || !status.pairing_access_valid {
+            return Err("微软 SSH 服务或本程序受限局域网规则尚未就绪；请先检查 SSH 服务并重新保存广播设置。".into());
+        }
+        if !state
+            .remote_services
+            .lock()
+            .map_err(|_| "远程原生服务状态不可用。")?
+            .as_ref()
+            .is_some_and(|services| services.is_running())
+        {
+            return Err("原生管理和文件服务尚未实际就绪；请关闭后重新开启广播再重试。".into());
+        }
+        if status.account_is_entra || status.account_sid.as_deref().is_none_or(str::is_empty) {
+            return Err("当前 Windows 账户无法用于受限 OpenSSH 登录；没有自动更换账户。".into());
+        }
+        let username = status
+            .account_ssh_username
+            .clone()
+            .ok_or("无法从当前账户 SID 解析受支持的 OpenSSH 登录名；没有使用邮箱或用户目录名。")?;
+        let host_identity = tauri::async_runtime::spawn_blocking(
+            voice_desktop_common::system_feature::open_ssh_server_identity,
+        )
+        .await
+        .map_err(|_| "读取微软 SSH 主机身份任务无法启动。".to_string())??;
+        let mut old_listener = state.pairing_listener.lock().await.take();
+        if let Some(listener) = old_listener.take() {
+            listener.stop().await;
+        }
+        *state
+            .pairing_window
+            .lock()
+            .map_err(|_| "配对窗口状态不可用。")? = None;
+        let (code_window, opened) =
+            voice_desktop_common::device_pairing::PairingCodeWindow::open()?;
+        let window_slot = Arc::new(std::sync::Mutex::new(Some(code_window)));
+        let addresses = status
+            .local_lan_addresses
+            .iter()
+            .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+            .collect::<Vec<_>>();
+        let display_name = format!(
+            "Voice Terminal {}",
+            config
+                .device_id
+                .chars()
+                .rev()
+                .take(6)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+        let server_info = voice_desktop_common::device_pairing::PairingServerInfo {
+            host_id: config.device_id.clone(),
+            display_name,
+            username,
+            ssh_port: status.effective_port.ok_or("微软 SSH 有效端口尚未验证。")?,
+            host_public_key: host_identity.public_key,
+            host_key_sha256: host_identity.fingerprint_sha256,
+            protocol_version: 1,
+            fields: [
+                ("host_id".into(), "稳定服务端设备编号".into()),
+                ("display_name".into(), "服务端显示名称".into()),
+                (
+                    "username".into(),
+                    "由当前 Windows 账户 SID 解析的 OpenSSH 登录名".into(),
+                ),
+                ("ssh_port".into(), "微软 OpenSSH Server 实际端口".into()),
+                (
+                    "host_public_key".into(),
+                    "微软 OpenSSH Ed25519 主机公钥".into(),
+                ),
+                ("host_key_sha256".into(), "主机公钥 SHA-256 指纹".into()),
+                (
+                    "protocol_version".into(),
+                    "固定 SSH 设备桥接协议版本".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let data_root = context.data.clone();
+        let workspace_id = context.workspace_id.clone();
+        let owner_sid = status
+            .account_sid
+            .clone()
+            .ok_or("当前 Windows 账户 SID 不可用。")?;
+        let build = voice_desktop_common::resources::load(&context.program.join("release.json"))?
+            .get("build")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("正式程序缺少有效构建编号。")?
+            .to_owned();
+        let executable =
+            std::env::current_exe().map_err(|error| format!("无法定位正式程序：{error}"))?;
+        let scopes = status.local_lan_scopes.clone();
+        let register: Arc<
+            dyn Fn(&voice_desktop_common::device_pairing::PairingIdentity) -> Result<(), String>
+                + Send
+                + Sync,
+        > = Arc::new(move |identity| {
+            let mut trust = voice_desktop_common::device_trust::DeviceTrustStore::open(&data_root)?;
+            let snapshot = trust.snapshot();
+            if snapshot.state == "invalid" {
+                return Err("服务端设备信任文件无效且已保留；产品授权保持拒绝。".into());
+            }
+            let old_record = snapshot
+                .devices
+                .iter()
+                .find(|record| record.device_id == identity.device_id && record.state == "trusted");
+            if old_record.is_some_and(|record| record.public_key != identity.public_key) {
+                return Err(
+                    "该设备编号已经绑定另一把公钥；请先在服务端撤销旧信任再重新配对。".into(),
+                );
+            }
+            voice_desktop_common::system_feature::install_project_device_key(
+                &identity.public_key,
+                &workspace_id,
+                &identity.device_id,
+                &build,
+                &executable,
+                &owner_sid,
+                &scopes,
+            )?;
+            if old_record.is_none() {
+                if let Err(error) = trust.approve(&identity.device_id, &identity.public_key) {
+                    let _ = voice_desktop_common::system_feature::remove_project_device_key(
+                        &workspace_id,
+                        &identity.device_id,
+                        &build,
+                        &executable,
+                        &owner_sid,
+                    );
+                    return Err(error);
+                }
+            }
+            Ok(())
+        });
+        let listener = voice_desktop_common::device_pairing::start_pairing_listener(
+            &addresses,
+            window_slot.clone(),
+            server_info,
+            register,
+        )
+        .await?;
+        let expires_in_seconds = opened.expires_in_seconds;
+        let pairing_code = opened.pairing_code;
+        *state
+            .pairing_window
+            .lock()
+            .map_err(|_| "配对窗口状态不可用。")? = Some(window_slot);
+        *state.pairing_listener.lock().await = Some(listener);
+        Ok(
+            serde_json::json!({"pairing_code":pairing_code,"expires_in_seconds":expires_in_seconds,
+            "fields":{"pairing_code":"只在本次开启结果返回的六位一次性配对码","expires_in_seconds":"配对窗口有效秒数"}}),
+        )
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        Err("当前程序未包含原生六位码配对能力。".into())
+    }
+}
+
+/// device_pairing_window_close（关闭本机配对窗口）：关闭码、监听器和等待中的尝试。
+#[tauri::command]
+async fn device_pairing_window_close(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+) -> Result<(), String> {
+    trusted(&window, &state)?;
+    #[cfg(feature = "ssh-device")]
+    {
+        *state
+            .pairing_window
+            .lock()
+            .map_err(|_| "配对窗口状态不可用。")? = None;
+        if let Some(listener) = state.pairing_listener.lock().await.take() {
+            listener.stop().await;
+        }
+    }
+    Ok(())
+}
+
+/// device_pairing_window_status（读取配对窗口状态）：不返回配对码、密钥或认证尝试材料。
+#[tauri::command]
+fn device_pairing_window_status(
+    window: WebviewWindow,
+    state: tauri::State<Arc<Desktop>>,
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    #[cfg(feature = "ssh-device")]
+    {
+        let slot = state
+            .pairing_window
+            .lock()
+            .map_err(|_| "配对窗口状态不可用。")?
+            .clone();
+        let (open, expires_in_ms) = if let Some(slot) = slot {
+            let window = slot.lock().map_err(|_| "配对窗口状态不可用。")?;
+            let open = window
+                .as_ref()
+                .is_some_and(voice_desktop_common::device_pairing::PairingCodeWindow::is_open);
+            let expires = window
+                .as_ref()
+                .map(voice_desktop_common::device_pairing::PairingCodeWindow::expires_in_ms)
+                .unwrap_or(0);
+            (open, expires)
+        } else {
+            (false, 0)
+        };
+        Ok(
+            serde_json::json!({"open":open,"expires_in_ms":expires_in_ms,
+            "fields":{"open":"本机六位码窗口是否仍能接受配对","expires_in_ms":"配对窗口剩余有效毫秒数；不包含配对码"}}),
+        )
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        Ok(
+            serde_json::json!({"open":false,"expires_in_ms":0,"fields":{"open":"当前不支持配对","expires_in_ms":"剩余有效时间"}}),
+        )
+    }
+}
+
+/// device_pairing_connect（用已发现服务端和六位码配对）：不接受手工地址、用户或主机指纹。
+#[tauri::command]
+async fn device_pairing_connect(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Desktop>>,
+    host_id: String,      // host_id（本次原生 mDNS 搜索返回的服务端编号）。
+    pairing_code: String, // pairing_code（用户从服务端本机获取的六位一次性码）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能进行设备配对。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        if pairing_code.len() != 6 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("配对码必须为六位数字。".into());
+        }
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let previous = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote =>
+            {
+                Some(config)
+            }
+            voice_desktop_common::device_config::LoadResult::Valid(_) => {
+                return Err("请先切换到远程配对模式。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Missing => None,
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        if app
+            .try_state::<Arc<ResourceManager>>()
+            .is_some_and(|manager| manager.has_active_jobs())
+        {
+            return Err("组件任务正在运行，暂不能切换到远程配对。".into());
+        }
+        if state.ssh_device.connected().await {
+            return Err("当前已经连接到服务端；请先断开当前连接，再配对另一台设备。".into());
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "系统时间无效，无法检查发现结果有效期。")?
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if now_ms > state.discovery_search_expires_at_ms.load(Ordering::Acquire) {
+            return Err("设备搜索结果已过期；请重新搜索后再连接。".into());
+        }
+        let target = state
+            .discovery_targets
+            .lock()
+            .map_err(|_| "发现设备缓存不可用。")?
+            .get(&host_id)
+            .cloned()
+            .ok_or("所选服务端不属于最近一次原生设备搜索结果；请重新搜索。")?;
+        if !target.compatible || target.state == "unavailable" {
+            return Err("服务端协议版本不兼容或当前不可用；请更新服务端或重新搜索。".into());
+        }
+        let device_id = previous
+            .as_ref()
+            .map(|config| config.device_id.clone())
+            .unwrap_or_else(|| format!("remote-{}", voice_desktop_common::workspace::new_id()));
+        let identity = match voice_desktop_common::ssh_device::device_identity_status(&device_id)? {
+            Some(identity) => identity,
+            None => voice_desktop_common::ssh_device::create_device_identity(&device_id)?,
+        };
+        let mut addresses = target
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+            .filter(|address| {
+                voice_desktop_common::device_discovery::is_private_lan_address(*address)
+            })
+            .collect::<Vec<_>>();
+        addresses.sort();
+        addresses.dedup();
+        addresses.truncate(16);
+        if addresses.is_empty() {
+            return Err("服务端没有可用的私有局域网地址；没有尝试其他网络地址。".into());
+        }
+        let device_for_signature = device_id.clone();
+        let (server, connected_address) =
+            voice_desktop_common::device_pairing::connect_pairing_with_address(
+                &addresses,
+                target.pairing_port,
+                &pairing_code,
+                &device_id,
+                &identity.public_key,
+                move |challenge| {
+                    voice_desktop_common::ssh_device::sign_device_pairing_challenge(
+                        &device_for_signature,
+                        challenge,
+                    )
+                },
+            )
+            .await?;
+        if server.host_id != target.host_id || server.ssh_port != target.ssh_port {
+            return Err("配对回执的服务端编号或 SSH 端口与刚才发现的设备不一致。".into());
+        }
+        let mut config = previous.unwrap_or(voice_desktop_common::device_config::DeviceConfig {
+            schema_version: voice_desktop_common::device_config::SCHEMA_VERSION,
+            device_id: device_id.clone(),
+            mode: voice_desktop_common::device_config::RunMode::Remote,
+            broadcast_enabled: false,
+            client_online_tts_local: true,
+            audio_compression: false,
+            reconnect_suspended_reason: None,
+            desired_role: voice_desktop_common::device_config::Role::RemoteClient,
+            audio_mode: voice_desktop_common::device_config::AudioMode::Pcm,
+            host: None,
+        });
+        config.host = Some(voice_desktop_common::device_config::HostTrust {
+            host_id: Some(server.host_id.clone()),
+            display_name: Some(server.display_name.clone()),
+            addresses: addresses.iter().map(ToString::to_string).collect(),
+            address: connected_address.to_string(),
+            port: server.ssh_port,
+            username: server.username,
+            host_key_sha256: server.host_key_sha256,
+            credential_ref: identity.credential_ref.clone(),
+            transport_credential_ref: None,
+        });
+        config.reconnect_suspended_reason = None;
+        voice_desktop_common::device_config::save(&context.data, &config)?;
+        let mut connection_error = None;
+        if !state.remote_client_connected.load(Ordering::Acquire) {
+            let host = config.host.as_ref().ok_or("配对后缺少已验证服务端身份。")?;
+            let ssh_target = voice_desktop_common::ssh_device::SshDeviceTarget {
+                address: host.address.clone(),
+                port: host.port,
+                username: host.username.clone(),
+                host_key_sha256: host.host_key_sha256.clone(),
+                gateway_port: voice_desktop_common::ssh_device::DEFAULT_GATEWAY_PORT,
+            };
+            if let Err(error) = state
+                .ssh_device
+                .connect(
+                    &identity.credential_ref,
+                    None,
+                    &device_id,
+                    ssh_target,
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+            {
+                connection_error = Some(error);
+            }
+        }
+        let connected = connection_error.is_none();
+        state
+            .remote_client_connected
+            .store(connected, Ordering::Release);
+        Ok(
+            serde_json::json!({"state":"paired","device_id":device_id,"host_id":target.host_id,
+            "display_name":target.display_name,"ssh_port":target.ssh_port,"address":connected_address.to_string(),
+            "connected":connected,"connection_error":connection_error,
+            "fields":{"state":"六位码配对结果","device_id":"本机稳定设备编号","host_id":"已固定服务端设备编号",
+                "display_name":"配对服务端名称","ssh_port":"已验证微软 SSH 服务端口","address":"此次选中的局域网地址",
+                "connected":"SSH 桥接当前是否已认证","connection_error":"配对完成后 SSH 连接失败的非敏感原因"}}),
+        )
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (app, host_id, pairing_code);
+        Err("当前产品未包含原生六位码配对能力。".into())
+    }
+}
+
+/// sync_local_discovery（同步本地广播公告）：只在正式本地广播配置和受限网络规则就绪时发布。
+#[cfg(feature = "ssh-device")]
+async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能发布局域网服务。".into());
+    }
+    let context = state.context().ok_or("缺少正式工作区")?;
+    let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+        voice_desktop_common::device_config::LoadResult::Valid(config) => config,
+        voice_desktop_common::device_config::LoadResult::Missing => {
+            if let Some(publication) = state
+                .discovery_publication
+                .lock()
+                .map_err(|_| "局域网公告状态不可用。")?
+                .take()
+            {
+                publication.stop()?;
+            }
+            stop_local_remote_services(&state).await?;
+            return Ok(());
+        }
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+    };
+    if config.mode != voice_desktop_common::device_config::RunMode::Local
+        || !config.broadcast_enabled
+    {
+        if let Some(publication) = state
+            .discovery_publication
+            .lock()
+            .map_err(|_| "局域网公告状态不可用。")?
+            .take()
+        {
+            publication.stop()?;
+        }
+        stop_local_remote_services(&state).await?;
+        return Ok(());
+    }
+    let gateway_ready = state
+        .device_gateway_status
+        .lock()
+        .map(|snapshot| snapshot["ready"] == true)
+        .unwrap_or(false);
+    let state_name = if gateway_ready { "ready" } else { "starting" };
+    let remote_services_active = state
+        .remote_services
+        .lock()
+        .map_err(|_| "远程原生服务状态不可用。")?
+        .as_ref()
+        .is_some_and(|services| services.is_running());
+    if remote_services_active
+        && state
+            .discovery_publication
+            .lock()
+            .map_err(|_| "局域网公告状态不可用。")?
+            .as_ref()
+            .is_some_and(|publication| publication.state_name() == state_name)
+    {
+        return Ok(());
+    }
+    let status = tauri::async_runtime::spawn_blocking(
+        voice_desktop_common::system_feature::open_ssh_server_status,
+    )
+    .await
+    .map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
+    if !status.ready || !status.project_access_valid || !status.pairing_access_valid {
+        return Err("微软 SSH 服务及本程序精确局域网规则尚未就绪；当前没有发布 mDNS 公告。".into());
+    }
+    if status.account_is_entra || status.account_ssh_username.is_none() {
+        return Err(
+            "当前 Windows 账户没有可用的微软 OpenSSH 登录名；本地业务仍可使用，但未发布远程服务。"
+                .into(),
+        );
+    }
+    let addresses = status
+        .local_lan_addresses
+        .iter()
+        .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .filter(|address| voice_desktop_common::device_discovery::is_private_lan_address(*address))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("没有符合当前局域网范围的有效地址；未启动远程服务或发布设备公告。".into());
+    }
+    let remote_services = state
+        .remote_services
+        .lock()
+        .map_err(|_| "远程原生服务状态不可用。")?
+        .clone()
+        .ok_or("远程原生服务控制器尚未初始化。")?;
+    remote_services.start(&context.data, &config.device_id)?;
+    let token = config
+        .device_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    if token.is_empty() {
+        return Err("本机设备编号不能用于局域网服务名称。".into());
+    }
+    let host_id = config.device_id.clone();
+    let display_name = format!(
+        "Voice Terminal {}",
+        host_id
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    );
+    let hostname = format!("voice-terminal-{token}.local.");
+    let publication = tauri::async_runtime::spawn_blocking(move || {
+        voice_desktop_common::device_discovery::publish(
+            &host_id,
+            &display_name,
+            &hostname,
+            &addresses,
+            voice_desktop_common::device_pairing::DEFAULT_PAIRING_PORT,
+            status.effective_port.unwrap_or(22),
+            state_name,
+            &["remote_management", "device_tasks", "audio"],
+        )
+    })
+    .await
+    .map_err(|_| "mDNS 公告准备任务无法启动。".to_string())?;
+    let publication = match publication {
+        Ok(publication) => publication,
+        Err(error) => {
+            let _ = remote_services.stop();
+            return Err(error);
+        }
+    };
+    let mut slot = state
+        .discovery_publication
+        .lock()
+        .map_err(|_| "局域网公告状态不可用。")?;
+    if let Some(previous) = slot.take() {
+        previous.stop()?;
+    }
+    *slot = Some(publication);
+    Ok(())
+}
+
+/// stop_local_remote_services（关闭本机项目远程入口）：仅关闭项目监听器和配对窗口，不停止系统 SSH 服务。
+#[cfg(feature = "ssh-device")]
+async fn stop_local_remote_services(state: &Arc<Desktop>) -> Result<(), String> {
+    *state
+        .pairing_window
+        .lock()
+        .map_err(|_| "配对窗口状态不可用。")? = None;
+    if let Some(listener) = state.pairing_listener.lock().await.take() {
+        listener.stop().await;
+    }
+    if let Some(services) = state
+        .remote_services
+        .lock()
+        .map_err(|_| "远程原生服务状态不可用。")?
+        .as_ref()
+        .cloned()
+    {
+        services.stop()?;
+    }
+    Ok(())
+}
+
+/// stop_remote_device_runtime（停止本机远端角色）：先停止媒体、任务和 SSH，再回收设备工作进程。
+async fn stop_remote_device_runtime(state: &Arc<Desktop>) -> Result<(), String> {
+    #[cfg(feature = "ssh-device")]
+    {
+        state.device_terminal.shutdown();
+        if let Ok(transfers) = state.remote_import_transfers.lock() {
+            for cancel in transfers.values() {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        stop_local_remote_services(state).await?;
+        if let Some(publication) = state
+            .discovery_publication
+            .lock()
+            .map_err(|_| "局域网公告状态不可用。")?
+            .take()
+        {
+            publication.stop()?;
+        }
+        stop_remote_voice_forwarder(state).await?;
+        stop_remote_media_channel(state).await?;
+        stop_remote_device_task_channel(state).await?;
+        state.ssh_device.disconnect().await?;
+    }
+    state
+        .remote_client_connected
+        .store(false, Ordering::Release);
+    let mut worker = state
+        .device_worker
+        .lock()
+        .map_err(|_| "设备工作进程状态不可用。")?;
+    if let Some(worker) = worker.as_mut() {
+        worker.shutdown()?;
+    }
+    *worker = None;
+    Ok(())
+}
+
+/// apply_saved_device_runtime（协调已保存运行模式）：供单实例启动参数复用同一停止与启动流程。
+async fn apply_saved_device_runtime(
+    app: tauri::AppHandle,
+    state: Arc<Desktop>,
+) -> Result<(), String> {
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能切换设备运行模式。".into());
+    }
+    let context = state.context().ok_or("缺少正式工作区")?;
+    let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+        voice_desktop_common::device_config::LoadResult::Valid(config) => config,
+        voice_desktop_common::device_config::LoadResult::Missing => {
+            return Err("设备运行配置尚未保存；未执行模式切换。".into());
+        }
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => {
+            return Err(format!("设备运行配置无效：{error}"));
+        }
+    };
+    voice_desktop_common::device_config::require_role_runtime(
+        config.desired_role,
+        context.python.is_file(),
+    )?;
+    if app
+        .try_state::<Arc<ResourceManager>>()
+        .is_some_and(|manager| manager.has_active_jobs())
+    {
+        return Err("组件任务尚未结束，请等待任务完成后切换运行模式。".into());
+    }
+    stop_remote_device_runtime(&state).await?;
+    {
+        let _transition = state
+            .service_transition
+            .lock()
+            .map_err(|_| "服务交接锁不可用。")?;
+        state.stop_service()?;
+    }
+    state
+        .remote_client_connected
+        .store(false, Ordering::Release);
+    *state.error.lock().map_err(|_| "运行模式错误状态不可用。")? = None;
+    start_service(app, state.clone())?;
+    #[cfg(feature = "ssh-device")]
+    if config.mode == voice_desktop_common::device_config::RunMode::Local
+        && config.broadcast_enabled
+    {
+        let status = tauri::async_runtime::spawn_blocking(
+            voice_desktop_common::system_feature::open_ssh_server_status,
+        )
+        .await
+        .map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
+        if !status.ready {
+            return Err("本地语音已启动，但微软 SSH 服务未就绪；请在设备设置中点击“检查 SSH 服务”后重试广播。".into());
+        }
+        if !status.project_access_valid || !status.pairing_access_valid {
+            tauri::async_runtime::spawn_blocking(|| {
+                voice_desktop_common::system_feature::set_device_broadcast_access(true)
+            })
+            .await
+            .map_err(|_| "局域网受限防火墙准备任务无法启动。".to_string())??;
+        }
+        sync_local_discovery(state.clone()).await?;
+    } else if config.mode == voice_desktop_common::device_config::RunMode::Remote
+        || !config.broadcast_enabled
+    {
+        let status = tauri::async_runtime::spawn_blocking(
+            voice_desktop_common::system_feature::open_ssh_server_status,
+        )
+        .await
+        .map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
+        if status.project_access_enabled || status.pairing_access_enabled {
+            tauri::async_runtime::spawn_blocking(|| {
+                voice_desktop_common::system_feature::set_device_broadcast_access(false)
+            })
+            .await
+            .map_err(|_| "局域网项目规则关闭任务无法启动。".to_string())??;
+        }
+    }
+    Ok(())
 }
 
 /// device_ssh_probe（读取 SSH 主机指纹候选）：不认证、不执行命令、不自动信任。
@@ -1903,6 +2937,1084 @@ async fn device_ssh_request(
     }
 }
 
+/// device_ssh_management_request（提交远程业务操作）：固定目标、操作枚举和管理会话代次。
+#[cfg(feature = "ssh-device")]
+/// remote_business_operation_allowed（检查远程业务操作是否位于固定白名单中）。
+fn remote_business_operation_allowed(operation: &str) -> bool {
+    const ALLOWED_OPERATIONS: &[&str] = &[
+        "management.status",
+        "resource.inventory",
+        "resource.jobs",
+        "resource.job.read",
+        "resource.job.cancel",
+        "resource.job.start",
+        "resource.import.source.reserve",
+        "resource.import.source.commit",
+        "resource.import.source.abort",
+        "resource.import.confirm",
+        "resource.install.plan",
+        "resource.install.start",
+        "resource.install.required",
+        "resource.reset.plan",
+        "resource.reset",
+        "system.ssh.status",
+        "system.ssh.enable",
+        "product.devices.select",
+        "settings.screen_capture.save",
+        "product.snapshot",
+        "product.devices",
+        "product.compute_status",
+        "product.compute_status.refresh",
+        "product.dsh_status",
+        "dsh.approval.decide",
+        "product.wake_tasks",
+        "wake_task.create",
+        "wake_task.update",
+        "wake_task.delete",
+        "wake_task.cancel",
+        "settings.hotwords.read",
+        "settings.hotwords.save",
+        "settings.wake.save",
+        "settings.silence.save",
+        "settings.quiet_hours.save",
+        "settings.shadow.save",
+        "settings.approvals.save",
+        "settings.persona.save",
+        "settings.custom_instructions.save",
+        "settings.speaker.save",
+        "settings.compute.save",
+        "settings.audio_enhancements.save",
+        "settings.tts.save",
+        "settings.inference.save",
+        "models.registry.read",
+        "models.scan",
+        "models.validate",
+        "models.providers.add",
+        "models.assignments.apply",
+        "models.credentials.read",
+        "models.credentials.save",
+        "provider.usage",
+        "model.update",
+        "model.delete",
+        "model.hide",
+        "model.restore",
+        "voice.command",
+        "hotwords.import",
+        "hotwords.preview",
+        "tts.minimax.voice_name",
+        "tts.operation.preview",
+        "tts.operation.minimax_preview",
+        "tts.operation.play",
+        "tts.operation.transcribe",
+        "tts.operation.read",
+        "tts.operation.cancel",
+        "tts.voices.read",
+        "tts.voices.create",
+        "tts.voices.update",
+        "tts.voices.delete",
+        "tts.voices.select",
+        "tts.voices.restore_default",
+        "tts.voices.default_reference",
+        "tts.assets.clip",
+        "tts.assets.audio.read",
+        "tts.aniflive.references.import",
+        "tts.voices.capabilities",
+        "tts.aniflive.model.rename",
+        "tts.aniflive.import.pending",
+        "tts.aniflive.import.scan",
+        "tts.aniflive.import.start",
+        "tts.aniflive.import.read",
+        "tts.aniflive.import.reference",
+        "tts.status",
+        "speaker.status",
+        "speaker.profile",
+        "speaker.enrollment.start",
+        "speaker.enrollment.segment",
+        "speaker.enrollment.capture",
+        "speaker.enrollment.capture_stop",
+        "speaker.enrollment.commit",
+        "speaker.enrollment.delete",
+        "speaker.test.capture",
+        "speaker.test.capture_stop",
+        "speaker.test.run",
+        "speaker.template.delete",
+        "speaker.template.update",
+    ];
+    ALLOWED_OPERATIONS.contains(&operation)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn device_ssh_management_request(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    operation: String,            // operation（服务端固定业务操作编号）。
+    arguments: serde_json::Value, // arguments（与操作编号对应的 JSON 参数）。
+    request_id: Option<String>, // request_id（可重试业务沿用的稳定请求编号；缺省时由原生层生成）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前窗口或应用状态不允许远程业务操作。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        if !remote_business_operation_allowed(&operation) {
+            return Err("远程业务操作不在客户端原生白名单中。".into());
+        }
+        if !arguments.is_object()
+            || serde_json::to_vec(&arguments)
+                .map_err(|_| "远程业务参数无法编码。")?
+                .len()
+                > 512 * 1024
+        {
+            return Err("远程业务参数必须是小于 512 KiB 的 JSON 对象。".into());
+        }
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote =>
+            {
+                config
+            }
+            voice_desktop_common::device_config::LoadResult::Valid(_) => {
+                return Err("只有远程配对模式可以提交服务端业务操作。".into());
+            }
+            voice_desktop_common::device_config::LoadResult::Missing => {
+                return Err("尚未保存远程配对设备配置。".into());
+            }
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        let host = config.host.ok_or("远程配置缺少配对服务端身份。")?;
+        let host_id = host.host_id.ok_or("配对服务端身份缺少稳定设备编号。")?;
+        if !state.ssh_device.connected().await {
+            return Err("SSH 服务端连接已断开，请重新连接后重试。".into());
+        }
+        let request_id = match request_id {
+            Some(value)
+                if voice_desktop_common::device_management_contract::valid_request_id(&value) =>
+            {
+                value
+            }
+            Some(_) => return Err("远程管理请求编号必须是 32 位小写十六进制值。".into()),
+            None => rand::random::<[u8; 16]>()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        };
+        // 管理状态与资源任务走独立原生服务；业务设置仍调用核心现有处理器。
+        if operation == "management.status"
+            || operation.starts_with("resource.")
+            || operation.starts_with("system.ssh.")
+        {
+            let response = state
+                .ssh_device
+                .management_request(
+                    &request_id,
+                    &host_id,
+                    &operation,
+                    arguments,
+                    Duration::from_secs(60),
+                )
+                .await?;
+            return Ok(serde_json::json!({
+                "request_id": response.request_id,
+                "target_host_id": response.target_host_id,
+                "session_generation": response.session_generation,
+                "session_kind": "management",
+                "operation": response.operation,
+                "status": response.status,
+                "body": response.body,
+                "fields": {
+                    "request_id": "服务端确认的原操作编号",
+                    "target_host_id": "本次操作所属的配对服务端",
+                    "session_generation": "独立管理服务授予的会话代次，不依赖语音核心或任务通道",
+                    "session_kind": "本次回执所属会话类型；management 表示原生管理通道",
+                    "operation": "本次服务端业务操作编号",
+                    "status": "服务端固定操作回执的原状态码",
+                    "body": "服务端原生管理服务返回的结果或明确错误",
+                }
+            }));
+        }
+        let (connection_generation, executor_generation) = {
+            let channel = state
+                .remote_task_channel
+                .lock()
+                .map_err(|_| "远程管理会话状态不可用。")?;
+            let channel = channel
+                .as_ref()
+                .filter(|channel| channel.running.load(Ordering::Acquire))
+                .ok_or("服务端业务操作需要就绪的任务通道。")?;
+            (channel.connection_generation, channel.executor_generation)
+        };
+        let request = serde_json::json!({
+            "protocol_version": 1,
+            "request_id": request_id,
+            "target_host_id": host_id,
+            "session_generation": connection_generation,
+            "operation": operation,
+            "arguments": arguments,
+            "fields": {
+                "protocol_version": "兼容业务代理协议版本",
+                "request_id": "本次远程业务操作的唯一编号",
+                "target_host_id": "目标服务端稳定设备编号",
+                "session_generation": "本次核心任务连接代次；只用于依赖核心的业务代理",
+                "operation": "固定服务端业务操作编号",
+                "arguments": "与固定操作对应的类型化参数",
+            }
+        });
+        let gateway = state
+            .ssh_device
+            .post_json("/v1/management", &request, Duration::from_secs(60))
+            .await?;
+        if gateway.status != 200 {
+            return Ok(serde_json::json!({
+                "status": gateway.status,
+                "body": gateway.body,
+                "fields": {"status": "核心业务管理代理状态码", "body": "服务端核心网关返回的明确错误"},
+            }));
+        }
+        let body = gateway.body;
+        if body["protocol_version"] != 1
+            || body["request_id"] != request_id
+            || body["target_host_id"] != host_id
+            || body["session_generation"] != connection_generation
+            || body["operation"] != operation
+            || body["status"]
+                .as_u64()
+                .is_none_or(|status| !(100..=599).contains(&status))
+            || !body["fields"].is_object()
+        {
+            return Err("服务端核心业务回执与目标、操作或任务代次不匹配。".into());
+        }
+        Ok(serde_json::json!({
+            "request_id": request_id,
+            "target_host_id": host_id,
+            "session_generation": connection_generation,
+            "session_kind": "task",
+            "connection_generation": connection_generation,
+            "executor_generation": executor_generation,
+            "operation": operation,
+            "status": body["status"],
+            "body": body["body"],
+            "fields": {
+                "request_id": "服务端确认的原操作编号",
+                "target_host_id": "本次操作所属的配对服务端",
+                "session_generation": "本次核心业务操作绑定的任务通道连接代次",
+                "session_kind": "本次回执所属会话类型；task 表示核心任务通道",
+                "connection_generation": "核心任务通道连接代次，与管理会话代次分开",
+                "executor_generation": "客户端执行器代次，不作为服务端业务目标",
+                "operation": "本次服务端业务操作编号",
+                "status": "服务端现有业务处理器的 HTTP 状态码",
+                "body": "服务端现有业务处理器返回的正文或校验错误",
+            }
+        }))
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (operation, arguments, request_id);
+        Err("当前产品构建未包含 SSH 远程业务管理能力。".into())
+    }
+}
+
+#[cfg(feature = "ssh-device")]
+async fn remote_core_management_request(
+    state: &Arc<Desktop>,
+    target_host_id: &str,
+    request_id: &str,
+    connection_generation: u64,
+    operation: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !voice_desktop_common::device_management_contract::valid_request_id(request_id)
+        || !voice_desktop_common::device_management_contract::valid_host_id(target_host_id)
+        || !matches!(
+            operation,
+            "tts.assets.import.prepare"
+                | "tts.assets.import.commit"
+                | "tts.assets.import.abort"
+                | "tts.assets.audio.read"
+        )
+    {
+        return Err("远程 TTS 文件操作编号、服务端目标或固定操作无效。".into());
+    }
+    {
+        let channel = state
+            .remote_task_channel
+            .lock()
+            .map_err(|_| "远程任务通道状态不可用。")?;
+        let channel = channel
+            .as_ref()
+            .filter(|channel| channel.running.load(Ordering::Acquire))
+            .ok_or("远程 TTS 资产操作需要就绪的服务端任务通道。")?;
+        if channel.connection_generation != connection_generation {
+            return Err("远程 TTS 资产请求连接代次已变化，请重新连接服务端。".into());
+        }
+    }
+    let request = serde_json::json!({
+        "protocol_version": 1,
+        "request_id": request_id,
+        "target_host_id": target_host_id,
+        "session_generation": connection_generation,
+        "operation": operation,
+        "arguments": arguments,
+        "fields": {
+            "protocol_version": "设备网关协议版本",
+            "request_id": "本次远程 TTS 文件业务操作编号",
+            "target_host_id": "固定配对服务端设备编号",
+            "session_generation": "当前任务通道连接代次",
+            "operation": "服务端固定 TTS 文件操作枚举",
+            "arguments": "与固定操作对应的类型化参数",
+        },
+    });
+    let response = state
+        .ssh_device
+        .post_json("/v1/management", &request, Duration::from_secs(60))
+        .await?;
+    if response.status != 200 {
+        return Err(format!(
+            "服务端 TTS 资产管理网关返回 HTTP {}。",
+            response.status
+        ));
+    }
+    let envelope = response.body;
+    let status = envelope
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or("服务端 TTS 资产操作缺少有效状态码。")?;
+    if envelope
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(request_id)
+        || envelope
+            .get("target_host_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(target_host_id)
+        || envelope
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation)
+        || envelope
+            .get("session_generation")
+            .and_then(serde_json::Value::as_u64)
+            != Some(connection_generation)
+    {
+        return Err("服务端 TTS 资产回执与原始目标、操作或连接代次不匹配。".into());
+    }
+    let body = envelope
+        .get("body")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if !(200..300).contains(&status) {
+        return Err(body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| body.get("message").and_then(serde_json::Value::as_str))
+            .or_else(|| body.get("error").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("服务端 TTS 资产操作失败（HTTP {status}）。")));
+    }
+    Ok(body)
+}
+
+/// validate_tts_asset_upload_receipt（校验 TTS 上传回执）：校验原传输编号、长度与小写摘要。
+#[cfg(feature = "ssh-device")]
+fn validate_tts_asset_upload_receipt(
+    receipt: voice_desktop_common::ssh_device::SftpTransferReceipt,
+    transfer_id: &str,
+    expected_bytes: u64,
+) -> Result<voice_desktop_common::ssh_device::SftpTransferReceipt, String> {
+    let valid_sha256 = receipt.sha256.len() == 64
+        && receipt
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if receipt.path == format!("transfer:{transfer_id}")
+        && receipt.bytes == expected_bytes
+        && valid_sha256
+    {
+        Ok(receipt)
+    } else {
+        Err("服务端 TTS 文件完整性回执与原文件票据不匹配。".into())
+    }
+}
+
+/// recover_tts_asset_upload_receipt（恢复上传回执）：只接受原票据重新认证返回的完整摘要。
+#[cfg(feature = "ssh-device")]
+async fn recover_tts_asset_upload_receipt<F, Fut>(
+    transfer_id: &str,
+    expected_bytes: u64,
+    first_error: &str,
+    retry_upload: F,
+) -> Result<voice_desktop_common::ssh_device::SftpTransferReceipt, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<voice_desktop_common::ssh_device::SftpTransferReceipt, String>,
+    >,
+{
+    let receipt = retry_upload().await.map_err(|_| {
+        format!(
+            "TTS 文件上传回执不明确，无法从原传输票据取得已核验摘要；原票据已保留，可重试恢复。首次上传错误：{first_error}"
+        )
+    })?;
+    validate_tts_asset_upload_receipt(receipt, transfer_id, expected_bytes).map_err(|_| {
+        "TTS 文件上传回执不明确，返回内容未能绑定原传输票据；原票据已保留，可重试恢复。".into()
+    })
+}
+
+/// recover_tts_asset_import_commit（恢复 TTS 提交回执）：以同一 request_id（请求编号）重放一次幂等提交。
+#[cfg(feature = "ssh-device")]
+async fn recover_tts_asset_import_commit<F, Fut>(
+    first_result: Result<serde_json::Value, String>,
+    retry_commit: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    match first_result {
+        Ok(result) => Ok(result),
+        Err(first_error) => retry_commit().await.map_err(|retry_error| {
+            format!(
+                "TTS 音频提交未获得成功回执；程序已使用原传输票据和请求编号重试一次。请先刷新服务端音色列表确认结果，再决定是否重新导入。首次结果：{first_error}；重试结果：{retry_error}"
+            )
+        }),
+    }
+}
+
+/// device_ssh_tts_asset_import（客户端原生选择并导入 TTS 参考音频）：绝对路径只留在本机原生进程。
+#[tauri::command(rename_all = "snake_case")]
+async fn device_ssh_tts_asset_import(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    model_id: String, // model_id（服务端固定 TTS 音色库编号）。
+    purpose: String,  // purpose（asset、source 或 source_and_asset 固定导入用途）。
+) -> Result<serde_json::Value, String> {
+    #[cfg(feature = "ssh-device")]
+    {
+        trusted(&window, &state)?;
+        if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+            return Err("当前窗口或应用状态不允许远程 TTS 文件导入。".into());
+        }
+        if model_id.is_empty()
+            || model_id.len() > 64
+            || !model_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !matches!(purpose.as_str(), "asset" | "source" | "source_and_asset")
+        {
+            return Err("服务端 TTS 音色库或固定导入用途无效。".into());
+        }
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote =>
+            {
+                config
+            }
+            voice_desktop_common::device_config::LoadResult::Valid(_) => {
+                return Err("请先切换到远程配对模式。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Missing => {
+                return Err("尚未保存远程配对配置。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        if !state.ssh_device.connected().await {
+            return Err("服务端连接已断开；音频文件未选择或上传。".into());
+        }
+        let (connection_generation, executor_generation) = {
+            let channel = state
+                .remote_task_channel
+                .lock()
+                .map_err(|_| "远程任务通道状态不可用。")?;
+            let channel = channel
+                .as_ref()
+                .filter(|channel| channel.running.load(Ordering::Acquire))
+                .ok_or("TTS 文件导入需要就绪的服务端文件传输通道。")?;
+            (channel.connection_generation, channel.executor_generation)
+        };
+        let selected =
+            tauri::async_runtime::spawn_blocking(voice_desktop_common::native_ui::choose_tts_asset)
+                .await
+                .map_err(|_| "客户端本机音频选择器无法启动。")??;
+        let Some(local_path) = selected else {
+            return Ok(
+                serde_json::json!({"cancelled":true,"fields":{"cancelled":"用户取消客户端本机参考音频选择"}}),
+            );
+        };
+        voice_desktop_common::device_file_channel::reject_reparse_chain(&local_path)?;
+        let metadata = std::fs::symlink_metadata(&local_path)
+            .map_err(|_| "客户端所选音频文件不可访问。".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("客户端 TTS 参考音频必须是普通本地文件，不能是链接或特殊文件。".into());
+        }
+        const MAX_TTS_ASSET_BYTES: u64 = 20 * 1024 * 1024; // MAX_TTS_ASSET_BYTES（沿用服务端参考音频 20 MiB 上限）。
+        let expected_bytes = metadata.len();
+        if expected_bytes == 0 || expected_bytes > MAX_TTS_ASSET_BYTES {
+            return Err("客户端 TTS 参考音频必须为 1 至 20 MiB。".into());
+        }
+        let filename = local_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 240 && !name.chars().any(char::is_control)
+            })
+            .ok_or("客户端 TTS 参考音频文件名无效。")?
+            .to_owned();
+        let extension = local_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "wav" | "mp3" | "flac" | "ogg") {
+            return Err("客户端参考音频只支持 WAV、MP3、FLAC 或 OGG 文件。".into());
+        }
+        let parent_request_id = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let target_host_id = config
+            .host
+            .as_ref()
+            .and_then(|host| host.host_id.as_deref())
+            .ok_or("远程配置缺少配对服务端编号。")?
+            .to_owned();
+        let prepared = remote_core_management_request(
+            state.inner(),
+            &target_host_id,
+            &parent_request_id,
+            connection_generation,
+            "tts.assets.import.prepare",
+            serde_json::json!({
+                "model_id":model_id,
+                "purpose":purpose,
+                "filename":filename,
+                "expected_bytes":expected_bytes,
+                "parent_request_id":parent_request_id,
+            }),
+        )
+        .await?;
+        let transfer_id = prepared
+            .get("transfer_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                voice_desktop_common::device_management_contract::valid_request_id(value)
+            })
+            .ok_or("服务端没有签发有效 TTS 文件传输编号。")?
+            .to_owned();
+        if prepared
+            .get("parent_request_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(parent_request_id.as_str())
+            || prepared
+                .get("connection_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(connection_generation)
+            || prepared
+                .get("executor_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(executor_generation)
+            || prepared
+                .get("expected_bytes")
+                .and_then(serde_json::Value::as_u64)
+                != Some(expected_bytes)
+        {
+            return Err("服务端 TTS 文件票据与原请求、代次或文件大小不匹配。".into());
+        }
+        let upload = state
+            .ssh_device
+            .device_file_upload(
+                &local_path,
+                &transfer_id,
+                &parent_request_id,
+                connection_generation,
+                executor_generation,
+                MAX_TTS_ASSET_BYTES,
+                Duration::from_secs(300),
+            )
+            .await;
+        let upload = match upload {
+            Ok(receipt) => {
+                validate_tts_asset_upload_receipt(receipt, &transfer_id, expected_bytes)?
+            }
+            Err(upload_error) => {
+                recover_tts_asset_upload_receipt(
+                    &transfer_id,
+                    expected_bytes,
+                    &upload_error,
+                    || {
+                        state.ssh_device.device_file_upload(
+                            &local_path,
+                            &transfer_id,
+                            &parent_request_id,
+                            connection_generation,
+                            executor_generation,
+                            MAX_TTS_ASSET_BYTES,
+                            Duration::from_secs(300),
+                        )
+                    },
+                )
+                .await?
+            }
+        };
+        let commit_request_id = tts_asset_commit_request_id(&transfer_id);
+        let arguments = serde_json::json!({
+            "model_id":model_id,
+            "purpose":purpose,
+            "filename":filename,
+            "expected_bytes":upload.bytes,
+            "expected_sha256":upload.sha256,
+            "parent_request_id":parent_request_id,
+            "transfer_id":transfer_id,
+        });
+        if !arguments.is_object() {
+            return Err("TTS 文件提交参数无法编码。".into());
+        }
+        let first_commit = remote_core_management_request(
+            state.inner(),
+            &target_host_id,
+            &commit_request_id,
+            connection_generation,
+            "tts.assets.import.commit",
+            arguments.clone(),
+        )
+        .await;
+        recover_tts_asset_import_commit(first_commit, || async {
+            remote_core_management_request(
+                state.inner(),
+                &target_host_id,
+                &commit_request_id,
+                connection_generation,
+                "tts.assets.import.commit",
+                arguments,
+            )
+            .await
+        })
+        .await
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (window, state, model_id, purpose);
+        Err("当前程序未包含固定 SSH TTS 文件导入能力。".into())
+    }
+}
+
+/// validate_remote_tts_audio_payload（检查服务端音频预览）：校验大小、编码类型和摘要后才交给前端。
+#[cfg(feature = "ssh-device")]
+fn validate_remote_tts_audio_payload(body: serde_json::Value) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    const MAX_BYTES: usize = 1024 * 1024; // MAX_BYTES（远程试听原始音频最大长度：1 MiB）。
+    const MAX_BASE64_BYTES: usize = MAX_BYTES.div_ceil(3) * 4; // MAX_BASE64_BYTES（Base64 编码后的最大长度）。
+
+    let encoded = body
+        .get("data_base64")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_BASE64_BYTES)
+        .ok_or("服务端 TTS 音频预览缺少受限字节内容。")?;
+    let media_type = body
+        .get("media_type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "audio/wav" | "audio/mpeg" | "audio/flac" | "audio/ogg" | "audio/webm"
+            )
+        })
+        .ok_or("服务端 TTS 音频预览媒体类型无效。")?;
+    let declared_bytes = body
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("服务端 TTS 音频预览缺少有效长度。")?;
+    let declared_sha256 = body
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or("服务端 TTS 音频预览摘要无效。")?;
+    let fields = body
+        .get("fields")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("服务端 TTS 音频预览缺少字段说明。")?;
+    if fields.is_empty() || fields.values().any(|value| !value.is_string()) {
+        return Err("服务端 TTS 音频预览字段说明无效。".into());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "服务端 TTS 音频预览的 Base64 内容无效。")?;
+    if decoded.is_empty()
+        || decoded.len() > MAX_BYTES
+        || decoded.len() != declared_bytes
+        || base64::engine::general_purpose::STANDARD.encode(&decoded) != encoded
+    {
+        return Err("服务端 TTS 音频预览长度或规范编码不匹配。".into());
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&decoded);
+    let actual_sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_sha256 != declared_sha256 {
+        return Err("服务端 TTS 音频预览 SHA-256 摘要不匹配。".into());
+    }
+    let _ = media_type;
+    Ok(body)
+}
+
+/// device_ssh_tts_asset_audio（读取服务端 TTS 音频预览）：仅返回受限、经摘要校验的内存数据。
+#[tauri::command(rename_all = "snake_case")]
+async fn device_ssh_tts_asset_audio(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    model_id: String, // model_id（服务端固定 TTS 音色库编号）。
+    asset_id: String, // asset_id（服务端已登记的音频资产编号）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前窗口或应用状态不允许读取远程 TTS 音频。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        if model_id.is_empty()
+            || model_id.len() > 128
+            || !model_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+            || asset_id.len() != 32
+            || !asset_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("远程 TTS 音色库或音频资产编号无效。".into());
+        }
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote =>
+            {
+                config
+            }
+            voice_desktop_common::device_config::LoadResult::Valid(_) => {
+                return Err("请先切换到远程配对模式。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Missing => {
+                return Err("尚未保存远程配对配置。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        let target_host_id = config
+            .host
+            .as_ref()
+            .and_then(|host| host.host_id.as_deref())
+            .ok_or("远程配置缺少配对服务端编号。")?;
+        let connection_generation = {
+            let channel = state
+                .remote_task_channel
+                .lock()
+                .map_err(|_| "远程任务通道状态不可用。")?;
+            channel
+                .as_ref()
+                .filter(|channel| channel.running.load(Ordering::Acquire))
+                .map(|channel| channel.connection_generation)
+                .ok_or("读取服务端 TTS 音频需要就绪的管理和任务连接。")?
+        };
+        let request_id = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let body = remote_core_management_request(
+            state.inner(),
+            target_host_id,
+            &request_id,
+            connection_generation,
+            "tts.assets.audio.read",
+            serde_json::json!({"value":{"model_id":model_id,"asset_id":asset_id}}),
+        )
+        .await?;
+        {
+            let channel = state
+                .remote_task_channel
+                .lock()
+                .map_err(|_| "远程任务通道状态不可用。")?;
+            if !channel.as_ref().is_some_and(|channel| {
+                channel.running.load(Ordering::Acquire)
+                    && channel.connection_generation == connection_generation
+            }) {
+                return Err("音频预览读取完成前连接已切换，已丢弃过期结果。".into());
+            }
+        }
+        validate_remote_tts_audio_payload(body)
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (model_id, asset_id);
+        Err("当前程序未包含固定 SSH TTS 音频预览能力。".into())
+    }
+}
+
+#[cfg(feature = "ssh-device")]
+fn tts_asset_commit_request_id(transfer_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("tts-asset-commit:{transfer_id}").as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// device_ssh_import_start（从本机选择来源并上传到服务端）：路径只留在客户端原生进程。
+#[tauri::command(rename_all = "snake_case")]
+async fn device_ssh_import_start(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<Desktop>>,
+    resource_id: Option<String>, // resource_id（服务端目标组件编号；空值表示批量导入）。
+) -> Result<serde_json::Value, String> {
+    #[cfg(feature = "ssh-device")]
+    {
+        trusted(&window, &state)?;
+        if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+            return Err("当前窗口或应用状态不允许远程资源导入。".into());
+        }
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote =>
+            {
+                config
+            }
+            voice_desktop_common::device_config::LoadResult::Valid(_) => {
+                return Err("请先切换到远程配对模式。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Missing => {
+                return Err("尚未保存远程配对配置。".into())
+            }
+            voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        };
+        if !state.ssh_device.connected().await {
+            return Err("服务端连接已断开；文件未选择或上传。".into());
+        }
+        if resource_id.as_ref().is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || !id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+                })
+        }) {
+            return Err("服务端组件编号无效。".into());
+        }
+        if resource_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("tts-aniflive-") && id != "tts-aniflive-runtime")
+        {
+            return Err(
+                "远程设备的 AnifLive 模型仅支持服务端从在线网址导入；客户端模型目录上传暂不支持。"
+                    .into(),
+            );
+        }
+        let selection_resource = resource_id.clone();
+        let sources = tauri::async_runtime::spawn_blocking(move || {
+            voice_desktop_common::native_ui::choose_resource(selection_resource.as_deref())
+        })
+        .await
+        .map_err(|_| "客户端资源来源选择器无法启动。")??;
+        if sources.is_empty() {
+            return Ok(
+                serde_json::json!({"cancelled":true,"fields":{"cancelled":"用户取消客户端本机文件或文件夹选择"}}),
+            );
+        }
+        let request_id = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let host_id = config
+            .host
+            .as_ref()
+            .and_then(|host| host.host_id.as_deref())
+            .ok_or("远程配置缺少配对服务端编号。")?
+            .to_owned();
+        let reservation = state
+            .ssh_device
+            .management_request(
+                &request_id,
+                &host_id,
+                "resource.import.source.reserve",
+                serde_json::json!({"resource_id":resource_id.clone()}),
+                Duration::from_secs(60),
+            )
+            .await?;
+        if reservation.status != 201 {
+            return Err(reservation.body["message"]
+                .as_str()
+                .or_else(|| reservation.body["error"].as_str())
+                .unwrap_or("服务端未能预留受管导入来源。")
+                .to_owned());
+        }
+        let source_id = reservation.body["source_id"]
+            .as_str()
+            .filter(|value| voice_desktop_common::remote_import_contract::valid_source_id(value))
+            .ok_or("服务端来源预留回执缺少有效编号。")?
+            .to_owned();
+        let transfer_id = format!("remote-import-{request_id}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let transfer_capacity_full = {
+            let mut transfers = state
+                .remote_import_transfers
+                .lock()
+                .map_err(|_| "文件传输状态不可用。")?;
+            if transfers.len() >= 16 {
+                true
+            } else {
+                transfers.insert(transfer_id.clone(), cancel.clone());
+                false
+            }
+        };
+        if transfer_capacity_full {
+            let _ = state
+                .ssh_device
+                .management_request(
+                    &rand::random::<[u8; 16]>()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                    &host_id,
+                    "resource.import.source.abort",
+                    serde_json::json!({"source_id":source_id}),
+                    Duration::from_secs(20),
+                )
+                .await;
+            return Err("同时进行的客户端远程导入已达上限。".into());
+        }
+        let desktop = state.inner().clone();
+        let transfer_app = app.clone();
+        let transfer_host_id = host_id.clone();
+        let transfer_request_id = request_id.clone();
+        let transfer_source_id = source_id.clone();
+        let transfer_resource_id = resource_id.clone().unwrap_or_else(|| "batch".into());
+        let response_transfer_id = transfer_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let progress_id = transfer_id.clone();
+            let progress_resource = transfer_resource_id.clone();
+            let progress_app = transfer_app.clone();
+            let transfer_result = desktop.ssh_device.upload_remote_import(
+            &transfer_source_id, &transfer_request_id, &sources, &cancel,
+            move |progress| {
+                let _ = progress_app.emit("desktop://resource-progress", serde_json::json!({
+                    "job_id":progress_id,
+                    "resource_id":progress_resource,
+                    "state":"running",
+                    "phase":format!("正在上传第 {} / {} 个文件（{} / {} 字节）", progress.files_completed + 1, progress.total_files, progress.transferred_bytes, progress.total_bytes),
+                    "completed_bytes":progress.transferred_bytes,
+                    "total_bytes":progress.total_bytes,
+                    "can_cancel":true,
+                    "fields":{"job_id":"客户端本次远程文件传输编号","resource_id":"服务端目标资源编号","state":"文件传输状态","phase":"服务端确认的有界分块上传进度","completed_bytes":"服务端确认接收的原始字节数","total_bytes":"已校验客户端来源清单的总字节数","can_cancel":"文件传输是否可取消"}
+                }));
+            },
+        ).await;
+            match transfer_result {
+                Ok(receipt) => {
+                    let _ = transfer_app.emit("desktop://resource-progress", serde_json::json!({
+                    "job_id":transfer_id,
+                    "resource_id":transfer_resource_id,
+                    "state":"complete",
+                    "phase":"文件已在服务端通过长度与 SHA-256 校验并提交导入任务",
+                    "completed_bytes":receipt.total_bytes,
+                    "total_bytes":receipt.total_bytes,
+                    "can_cancel":false,
+                    "fields":{"job_id":"客户端本次远程文件传输编号","resource_id":"服务端目标资源编号","state":"服务端文件通道完成状态","phase":"服务端完成摘要复核并接受后续原有导入任务","completed_bytes":"服务端复核通过的实际原始字节数","total_bytes":"本次上传原始字节数","can_cancel":"文件传输已完成"}
+                }));
+                    if let Some(job_id) = receipt.result["job_id"].as_str() {
+                        let _ = transfer_app.emit("desktop://resource-progress", serde_json::json!({
+                        "job_id":job_id,
+                        "resource_id":receipt.result["resource_id"].as_str().unwrap_or(&transfer_resource_id),
+                        "state":receipt.result["state"].as_str().unwrap_or("queued"),
+                        "phase":receipt.result["phase"].as_str().unwrap_or("已提交服务端资源导入任务"),
+                        "can_cancel":true,
+                        "fields":{"job_id":"服务端正式资源导入任务编号","resource_id":"服务端导入的资源编号","state":"服务端任务状态","phase":"服务端原有导入处理阶段","can_cancel":"是否可取消服务端导入任务"}
+                    }));
+                    }
+                }
+                Err(error) => {
+                    let _ = desktop
+                        .ssh_device
+                        .management_request(
+                            &rand::random::<[u8; 16]>()
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>(),
+                            &transfer_host_id,
+                            "resource.import.source.abort",
+                            serde_json::json!({"source_id":transfer_source_id}),
+                            Duration::from_secs(20),
+                        )
+                        .await;
+                    let _ = transfer_app.emit("desktop://resource-progress", serde_json::json!({
+                    "job_id":transfer_id,
+                    "resource_id":transfer_resource_id,
+                    "state":if cancel.load(Ordering::Acquire){"cancelled"}else{"failed"},
+                    "phase":"客户端来源上传未完成",
+                    "error":error,
+                    "can_cancel":false,
+                    "fields":{"job_id":"客户端本次远程文件传输编号","resource_id":"服务端目标资源编号","state":"上传失败或取消","phase":"尚未提交服务端正式导入任务","error":"受限错误原因，不包含客户端或服务端绝对路径","can_cancel":"传输已终止"}
+                }));
+                }
+            }
+            if let Ok(mut transfers) = desktop.remote_import_transfers.lock() {
+                transfers.remove(&transfer_id);
+            }
+        });
+        Ok(serde_json::json!({
+            "job_id":response_transfer_id,
+            "resource_id":resource_id.unwrap_or_else(|| "batch".into()),
+            "state":"queued",
+            "phase":"等待客户端受管 FILE 上传",
+            "can_cancel":true,
+            "fields":{"job_id":"本次客户端远程文件传输任务编号","resource_id":"服务端目标组件编号；batch 表示批量导入","state":"文件上传任务状态","phase":"来源已在客户端选择并在服务端预留","can_cancel":"上传期间可请求取消"}
+        }))
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (window, app, state, resource_id);
+        Err("当前产品构建未包含 SSH 远程文件通道。".into())
+    }
+}
+
+/// device_ssh_import_cancel（取消客户端远程文件传输）：按本机原生任务编号设置传输停止信号。
+#[tauri::command(rename_all = "snake_case")]
+fn device_ssh_import_cancel(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    job_id: String, // job_id（本机原生签发的 remote-import 传输任务编号）。
+) -> Result<(), String> {
+    #[cfg(feature = "ssh-device")]
+    {
+        trusted(&window, &state)?;
+        if !job_id.starts_with("remote-import-") || job_id.len() != "remote-import-".len() + 32 {
+            return Err("客户端远程文件传输编号无效。".into());
+        }
+        let transfers = state
+            .remote_import_transfers
+            .lock()
+            .map_err(|_| "文件传输状态不可用。")?;
+        let cancel = transfers
+            .get(&job_id)
+            .ok_or("文件传输已结束或编号不存在。")?;
+        cancel.store(true, Ordering::Release);
+        Ok(())
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = (window, state, job_id);
+        Err("当前产品构建未包含 SSH 远程文件通道。".into())
+    }
+}
+
 /// device_ssh_disconnect（断开 SSH 连接）：不重放连接中断的业务请求。
 #[tauri::command]
 async fn device_ssh_disconnect(
@@ -1915,6 +4027,7 @@ async fn device_ssh_disconnect(
     }
     #[cfg(feature = "ssh-device")]
     {
+        let voice_forwarder_stopped = stop_remote_voice_forwarder(state.inner()).await?;
         let media_channel_stopped = stop_remote_media_channel(state.inner()).await?;
         let task_channel_stopped = stop_remote_device_task_channel(state.inner()).await?;
         let disconnect_result = state.ssh_device.disconnect().await;
@@ -1924,8 +4037,10 @@ async fn device_ssh_disconnect(
         let disconnected = disconnect_result?;
         Ok(
             serde_json::json!({"state":"disconnected","disconnected":disconnected,
+            "voice_forwarder_stopped":voice_forwarder_stopped,
             "media_channel_stopped":media_channel_stopped,"task_channel_stopped":task_channel_stopped,
             "fields":{"state":"原生 SSH 设备连接状态","disconnected":"本次是否释放了连接",
+                "voice_forwarder_stopped":"断开前是否关闭服务端语音 WebSocket 的本机回环转发",
                 "media_channel_stopped":"断开前是否关闭了独立语音媒体连接",
                 "task_channel_stopped":"断开前是否停止受管远端桌面任务通道"}}),
         )
@@ -2094,7 +4209,7 @@ async fn execute_remote_device_task(
             let arguments = task
                 .arguments
                 .as_object()
-                .ok_or("SFTP 文件任务参数必须是对象。")?;
+                .ok_or("固定文件通道任务参数必须是对象。")?;
             let read_string = |key: &str| {
                 arguments
                     .get(key)
@@ -2104,26 +4219,29 @@ async fn execute_remote_device_task(
                             && value.len() <= 4096
                             && !value.chars().any(char::is_control)
                     })
-                    .ok_or_else(|| format!("SFTP 文件任务的 {key} 字段无效。"))
+                    .ok_or_else(|| format!("固定文件通道任务的 {key} 字段无效。"))
             };
             let transfer_id = read_string("transfer_id")?;
-            let remote_path = read_string("remote_path")?;
+            let parent_request_id = read_string("parent_request_id")?;
             let maximum_bytes = arguments
                 .get("maximum_bytes")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|value| (1..=4 * 1024 * 1024 * 1024).contains(value))
-                .ok_or("SFTP 文件任务大小上限无效。")?;
+                .ok_or("固定文件通道任务大小上限无效。")?;
+            let generations = (task.connection_generation, task.executor_generation);
             let receipt = if task.operation == "file.sftp.upload" {
                 if arguments.len() != 4 || !arguments.contains_key("local_path") {
-                    return Err("SFTP 上传任务字段无效。".into());
+                    return Err("固定文件通道上传任务字段无效。".into());
                 }
                 let local_path = std::path::PathBuf::from(read_string("local_path")?);
                 state
                     .ssh_device
-                    .sftp_upload_file(
+                    .device_file_upload(
                         &local_path,
-                        remote_path,
                         transfer_id,
+                        parent_request_id,
+                        generations.0,
+                        generations.1,
                         maximum_bytes,
                         std::time::Duration::from_secs(480),
                     )
@@ -2133,16 +4251,18 @@ async fn execute_remote_device_task(
                     || !arguments.contains_key("local_path")
                     || !arguments.contains_key("sha256")
                 {
-                    return Err("SFTP 下载任务字段无效。".into());
+                    return Err("固定文件通道下载任务字段无效。".into());
                 }
                 let local_path = std::path::PathBuf::from(read_string("local_path")?);
                 let sha256 = read_string("sha256")?;
                 state
                     .ssh_device
-                    .sftp_download_file(
-                        remote_path,
+                    .device_file_download(
                         &local_path,
                         transfer_id,
+                        parent_request_id,
+                        generations.0,
+                        generations.1,
                         sha256,
                         maximum_bytes,
                         std::time::Duration::from_secs(480),
@@ -2152,7 +4272,7 @@ async fn execute_remote_device_task(
             return Ok(voice_desktop_common::ssh_device::RemoteDeviceTaskResult {
                 succeeded: true,
                 result: serde_json::json!({"path":receipt.path,"bytes":receipt.bytes,"sha256":receipt.sha256,
-                    "transfer_id":transfer_id,"fields":{"path":"固定 SFTP 暂存文件路径","bytes":"已复核的原始字节数",
+                    "transfer_id":transfer_id,"fields":{"path":"固定传输编号，不含远端文件系统路径","bytes":"已复核的原始字节数",
                         "sha256":"已复核的原始字节摘要","transfer_id":"不可重用的原传输编号"}}),
             });
         }
@@ -2568,18 +4688,14 @@ fn remote_replacement_result_value(
         .finished_output_estimated_ms
         .filter(|value| *value >= baseline.output_estimated_ms)
         .ok_or("替换结算缺少旧音结束时的设备输出估计")?;
-    snapshot_value["played_ms"] = serde_json::json!(
-        snapshot_value["played_ms"]
-            .as_u64()
-            .unwrap_or(0)
-            .min(enqueued_ms)
-    );
+    snapshot_value["played_ms"] = serde_json::json!(snapshot_value["played_ms"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(enqueued_ms));
     snapshot_value["buffered_ms"] = serde_json::json!(0);
-    snapshot_value["output_estimated_ms"] = serde_json::json!(
-        finished_output_estimated_ms
-            .saturating_sub(baseline.output_estimated_ms)
-            .min(enqueued_ms)
-    );
+    snapshot_value["output_estimated_ms"] = serde_json::json!(finished_output_estimated_ms
+        .saturating_sub(baseline.output_estimated_ms)
+        .min(enqueued_ms));
     snapshot_value["device_time_us"] = serde_json::json!(finished_device_time_us);
     let snapshot = snapshot_value;
     let attenuated_start_ms = u64::from(progress.attenuated_range_ms[0])
@@ -3268,8 +5384,16 @@ fn encode_worker_media_packet(
         .get("device_time_us")
         .and_then(serde_json::Value::as_u64)
         .ok_or("设备采集帧缺少 QPC 时钟")?;
+    let audio_processing: voice_desktop_common::device_protocol::AudioProcessingMetadata =
+        serde_json::from_value(
+            frame
+                .get("audio_processing")
+                .cloned()
+                .ok_or("设备采集帧缺少 audio_processing（设备前处理状态）")?,
+        )
+        .map_err(|_| "设备采集帧的 audio_processing（设备前处理状态）字段无效")?;
     let header = voice_desktop_common::device_protocol::MediaHeader {
-        protocol_version: 1,
+        protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
         device_id: device_id.to_owned(),
         core_session_id: core_session_id.to_owned(),
         connection_generation,
@@ -3282,6 +5406,7 @@ fn encode_worker_media_packet(
         device_time_us,
         audio_codec,
         discontinuity_before: false,
+        audio_processing,
     };
     voice_desktop_common::device_protocol::encode_frame(&header, &payload)
 }
@@ -3436,7 +5561,7 @@ fn encode_worker_media_frame_with_codec(
     audio_codec: voice_desktop_common::device_protocol::AudioCodec,
     mut opus_encoder: Option<&mut voice_desktop_common::native_opus::OpusEncoder>,
 ) -> Result<Vec<u8>, String> {
-    let (sequence, start_sample, device_time_us, pcm) = decode_worker_capture_pcm(frame)?;
+    let (_, _, _, pcm) = decode_worker_capture_pcm(frame)?;
     let payload = match (audio_codec, opus_encoder.as_deref_mut()) {
         (voice_desktop_common::device_protocol::AudioCodec::Pcm, None) => pcm,
         (voice_desktop_common::device_protocol::AudioCodec::Pcm, Some(_)) => {
@@ -3453,22 +5578,17 @@ fn encode_worker_media_frame_with_codec(
             return Err("Opus 媒体帧缺少该流的有状态编码器。".into());
         }
     };
-    let header = voice_desktop_common::device_protocol::MediaHeader {
-        protocol_version: 1,
-        device_id: device_id.to_owned(),
-        core_session_id: core_session_id.to_owned(),
+    encode_worker_media_packet(
+        device_id,
+        core_session_id,
+        stream_id,
         connection_generation,
         executor_generation,
         interaction_generation,
-        stream_id: stream_id.to_owned(),
-        sequence,
-        start_sample,
-        sample_count: 320,
-        device_time_us,
+        frame,
         audio_codec,
-        discontinuity_before: false,
-    };
-    voice_desktop_common::device_protocol::encode_frame(&header, &payload)
+        payload,
+    )
 }
 
 #[cfg(feature = "ssh-device")]
@@ -3496,6 +5616,225 @@ fn decode_worker_playback_snapshot(
         started,
         device_time_us: counter("device_time_us")?,
     })
+}
+
+#[cfg(feature = "ssh-device")]
+async fn ensure_client_tts_playback_ledger(
+    state: Arc<Desktop>,
+    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
+    playback_key: &str,
+    sample_rate: u32,
+) -> Result<(), String> {
+    if !matches!(sample_rate, 16_000 | 24_000 | 32_000 | 48_000)
+        || playback_key.is_empty()
+        || playback_key.len() > 128
+        || playback_key.trim() != playback_key
+        || playback_key.contains('\0')
+    {
+        return Err("客户端直放播放键或采样率无效。".into());
+    }
+    if ledger
+        .lock()
+        .map_err(|_| "客户端直放播放台账不可用。")?
+        .contains_key(playback_key)
+    {
+        let rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
+        if rows
+            .get(playback_key)
+            .is_some_and(|entry| entry.sample_rate != sample_rate)
+        {
+            return Err("同一客户端播放键不能切换 PCM 采样率。".into());
+        }
+        return Ok(());
+    }
+    let value = device_worker_action(state.clone(), |worker| worker.playback_snapshot()).await?;
+    let snapshot = decode_client_tts_playback_snapshot(&value)?;
+    let baseline = PlaybackSnapshotBaseline {
+        enqueued_ms: snapshot.enqueued_ms,
+        played_ms: snapshot.played_ms,
+        output_estimated_ms: snapshot.output_estimated_ms,
+        isolated: snapshot.buffered_ms == 0 && snapshot.enqueued_ms == snapshot.played_ms,
+    };
+    let mut rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
+    if rows.len() >= MAX_REMOTE_PLAYBACK_KEYS {
+        return Err("客户端直放播放台账已达本媒体连接的固定容量。".into());
+    }
+    rows.entry(playback_key.to_owned())
+        .or_insert(ClientTtsPlaybackLedger {
+            sample_rate,
+            accepted_samples: 0,
+            baseline,
+        });
+    Ok(())
+}
+
+#[cfg(feature = "ssh-device")]
+async fn client_tts_device_progress(
+    state: Arc<Desktop>,
+    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
+    playback_key: String,
+    sample_rate: u32,
+) -> Result<voice_desktop_common::device_protocol::ClientTtsPlaybackProgress, String> {
+    ensure_client_tts_playback_ledger(state.clone(), ledger.clone(), &playback_key, sample_rate)
+        .await?;
+    let value = device_worker_action(state, |worker| worker.playback_snapshot()).await?;
+    let snapshot = decode_client_tts_playback_snapshot(&value)?;
+    let entry = ledger
+        .lock()
+        .map_err(|_| "客户端直放播放台账不可用。")?
+        .get(&playback_key)
+        .copied()
+        .ok_or("客户端直放播放键已经清除。")?;
+    let output_ms = snapshot
+        .output_estimated_ms
+        .saturating_sub(entry.baseline.output_estimated_ms);
+    let played_samples = ((u128::from(output_ms) * u128::from(entry.sample_rate)) / 1_000)
+        .min(u128::from(entry.accepted_samples)) as u64;
+    let buffered_samples =
+        ((u128::from(snapshot.buffered_ms) * u128::from(entry.sample_rate)) / 1_000).min(
+            u128::from(entry.accepted_samples.saturating_sub(played_samples)),
+        ) as u64;
+    let device_clock_advanced = snapshot.device_time_us > 0
+        && snapshot.output_estimated_ms > entry.baseline.output_estimated_ms;
+    let output_complete = entry.accepted_samples > 0
+        && played_samples >= entry.accepted_samples
+        && buffered_samples == 0
+        && entry.baseline.isolated
+        && snapshot.started
+        && device_clock_advanced;
+    let progress = voice_desktop_common::device_protocol::ClientTtsPlaybackProgress {
+        playback_key,
+        accepted_samples: entry.accepted_samples,
+        played_samples,
+        buffered_samples,
+        output_complete,
+        device_time_us: snapshot.device_time_us,
+    };
+    progress.validate().map_err(str::to_owned)?;
+    Ok(progress)
+}
+
+#[cfg(feature = "ssh-device")]
+fn decode_client_tts_playback_snapshot(
+    value: &serde_json::Value,
+) -> Result<PlaybackSnapshotView, String> {
+    if value.get("playing").and_then(serde_json::Value::as_bool) == Some(false)
+        && value.get("snapshot").is_none()
+    {
+        return Ok(PlaybackSnapshotView {
+            enqueued_ms: 0,
+            played_ms: 0,
+            buffered_ms: 0,
+            output_estimated_ms: 0,
+            started: false,
+            device_time_us: 0,
+        });
+    }
+    decode_worker_playback_snapshot(value)
+}
+
+#[cfg(feature = "ssh-device")]
+fn client_tts_playback_callbacks(
+    state: Arc<Desktop>,
+    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
+    playback_started: Arc<AtomicBool>,
+) -> client_tts_relay::DirectPlaybackCallbacks {
+    let enqueue_state = state.clone();
+    let enqueue_ledger = ledger.clone();
+    let enqueue_started = playback_started.clone();
+    let enqueue_pcm = Arc::new(
+        move |playback_key: String, sample_rate: u32, pcm: Vec<u8>| {
+            let state = enqueue_state.clone();
+            let ledger = enqueue_ledger.clone();
+            let started = enqueue_started.clone();
+            Box::pin(async move {
+                if pcm.is_empty() || pcm.len() % 2 != 0 {
+                    return Err("客户端直放拒绝空或不完整 PCM。".into());
+                }
+                ensure_client_tts_playback_ledger(
+                    state.clone(),
+                    ledger.clone(),
+                    &playback_key,
+                    sample_rate,
+                )
+                .await?;
+                if !started.swap(true, Ordering::AcqRel) {
+                    if let Err(error) =
+                        device_worker_action(state.clone(), |worker| worker.playback_start()).await
+                    {
+                        started.store(false, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+                let sample_count =
+                    u64::try_from(pcm.len() / 2).map_err(|_| "客户端直放样本数溢出。")?;
+                let enqueue_key = playback_key.clone();
+                device_worker_action(state, move |worker| {
+                    worker
+                        .playback_enqueue_for_key(&enqueue_key, sample_rate, &pcm)
+                        .map(|_| ())
+                })
+                .await?;
+                let mut rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
+                let entry = rows
+                    .get_mut(&playback_key)
+                    .ok_or("客户端直放播放键已经清除。")?;
+                entry.accepted_samples = entry
+                    .accepted_samples
+                    .checked_add(sample_count)
+                    .ok_or("客户端直放播放键累计样本数溢出。")?;
+                Ok(())
+            }) as client_tts_relay::PlaybackFuture<()>
+        },
+    );
+
+    let progress_state = state.clone();
+    let progress_ledger = ledger.clone();
+    let progress = Arc::new(move |playback_key: String, sample_rate: u32| {
+        let state = progress_state.clone();
+        let ledger = progress_ledger.clone();
+        Box::pin(async move {
+            client_tts_device_progress(state, ledger, playback_key, sample_rate).await
+        })
+            as client_tts_relay::PlaybackFuture<
+                voice_desktop_common::device_protocol::ClientTtsPlaybackProgress,
+            >
+    });
+
+    let stop_state = state;
+    let stop_ledger = ledger;
+    let stop_started = playback_started;
+    let stop_and_snapshot = Arc::new(move |playback_key: String| {
+        let state = stop_state.clone();
+        let ledger = stop_ledger.clone();
+        let started = stop_started.clone();
+        Box::pin(async move {
+            let sample_rate = ledger
+                .lock()
+                .map_err(|_| "客户端直放播放台账不可用。")?
+                .get(&playback_key)
+                .map(|entry| entry.sample_rate)
+                .ok_or("客户端取消引用了未知播放键。")?;
+            let progress =
+                client_tts_device_progress(state.clone(), ledger, playback_key, sample_rate)
+                    .await?;
+            device_worker_action(state.clone(), |worker| worker.playback_stop()).await?;
+            started.store(false, Ordering::Release);
+            state
+                .remote_playback_stop_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            Ok(progress)
+        })
+            as client_tts_relay::PlaybackFuture<
+                voice_desktop_common::device_protocol::ClientTtsPlaybackProgress,
+            >
+    });
+
+    client_tts_relay::DirectPlaybackCallbacks {
+        enqueue_pcm,
+        progress,
+        stop_and_snapshot,
+    }
 }
 
 #[cfg(feature = "ssh-device")]
@@ -3553,7 +5892,7 @@ fn remote_playback_progress_value(
     snapshot: PlaybackSnapshotView,
 ) -> serde_json::Value {
     serde_json::json!({
-        "type":"playback.progress", "protocol_version":1,
+        "type":"playback.progress", "protocol_version":voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
         "device_id":device_id, "delivery_device_id":device_id,
         "core_session_id":core_session_id,
         "connection_generation":connection_generation,
@@ -3715,7 +6054,7 @@ fn cancel_remote_playback_frame(
 ) -> RemotePlaybackFrameOutcome {
     *next_playback_sequence = next_playback_sequence.saturating_add(1);
     let message = serde_json::json!({
-        "type":"playback.cancelled", "protocol_version":1,
+        "type":"playback.cancelled", "protocol_version":voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
         "device_id":header.device_id, "delivery_device_id":header.delivery_device_id,
         "core_session_id":header.core_session_id,
         "connection_generation":header.connection_generation,
@@ -3930,7 +6269,7 @@ where
     }
     *next_playback_sequence = next_playback_sequence.saturating_add(1);
     let message = serde_json::json!({
-        "type":"playback.accepted", "protocol_version":1,
+        "type":"playback.accepted", "protocol_version":voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
         "device_id":header.device_id, "delivery_device_id":header.delivery_device_id,
         "core_session_id":header.core_session_id,
         "connection_generation":header.connection_generation,
@@ -4082,11 +6421,22 @@ async fn run_remote_media_channel(
         interaction_generation,
         stream_id: stream_id.clone(),
     };
+    let mut client_tts_authorizations = client_tts_relay::ClientTtsAuthorizationStore::default();
     let mut client_tts_seen = HashSet::new(); // client_tts_seen（去重已接纳的客户端合成请求编号）。
+    let client_tts_playback_ledger =
+        Arc::new(Mutex::new(HashMap::<String, ClientTtsPlaybackLedger>::new()));
+    let client_tts_playback_started = Arc::new(AtomicBool::new(false));
+    let client_tts_playback = client_tts_playback_callbacks(
+        state.clone(),
+        client_tts_playback_ledger.clone(),
+        client_tts_playback_started.clone(),
+    );
     let mut client_tts_cancellations: HashMap<
         String,
         (
             String,
+            String,
+            u64,
             voice_desktop_common::client_tts::MiniMaxTtsCancellation,
         ),
     > = HashMap::new();
@@ -4250,8 +6600,8 @@ async fn run_remote_media_channel(
                         }
                     }
                 }
-                Ok(MediaReadEvent::Message(SshMediaMessage::Text(text))) => {
-                    let message = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(MediaReadEvent::Message(SshMediaMessage::Text(mut text))) => {
+                    let mut message = match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(value) => value,
                         Err(_) => {
                             outcome = Err("主机媒体控制消息不是有效 JSON。".into());
@@ -4300,6 +6650,68 @@ async fn run_remote_media_channel(
                             }
                         }
                         Some("media.pong") => {}
+                        Some("media.tts.authorize") => {
+                            let authorization =
+                                client_tts_relay::parse_authorization(&mut message, &tts_identity);
+                            voice_desktop_common::client_tts::zeroize_temporary_secret_buffer(
+                                &mut text,
+                            );
+                            let authorization = match authorization {
+                                Ok(authorization) => authorization,
+                                Err(error) => {
+                                    outcome = Err(error);
+                                    break;
+                                }
+                            };
+                            let authorization_id = authorization.authorization_id.clone();
+                            let playback_key = authorization.playback_key.clone();
+                            if let Err(error) = client_tts_authorizations.authorize(authorization) {
+                                outcome = Err(error);
+                                break;
+                            }
+                            if let Err(error) = client_tts_relay::send_authorization_accepted(
+                                &write_sender,
+                                &tts_identity,
+                                &authorization_id,
+                                &playback_key,
+                            )
+                            .await
+                            {
+                                outcome = Err(error);
+                                break;
+                            }
+                        }
+                        Some("media.tts.authorization_revoked") => {
+                            let (authorization_id, playback_key) =
+                                match client_tts_relay::parse_revocation(&message, &tts_identity) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        outcome = Err(error);
+                                        break;
+                                    }
+                                };
+                            match client_tts_authorizations.revoke(&authorization_id, &playback_key)
+                            {
+                                Ok(Some(revoked_key)) => {
+                                    for (active_authorization, active_key, _, cancellation) in
+                                        client_tts_cancellations.values()
+                                    {
+                                        if active_authorization == &authorization_id
+                                            && active_key == &revoked_key
+                                        {
+                                            cancellation.request_cancel();
+                                        }
+                                    }
+                                    let _ =
+                                        (client_tts_playback.stop_and_snapshot)(revoked_key).await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    outcome = Err(error);
+                                    break;
+                                }
+                            }
+                        }
                         Some("media.tts.request") => {
                             let parsed =
                                 match client_tts_relay::parse_request(&message, &tts_identity) {
@@ -4310,7 +6722,10 @@ async fn run_remote_media_channel(
                                     }
                                 };
                             let request_id = parsed.request_id.clone();
-                            let task_id = parsed.request.task_id.clone();
+                            let authorization_id = parsed.authorization_id.clone();
+                            let playback_key = parsed.playback_key.clone();
+                            let segment_index = parsed.segment_index;
+                            let failure_request = parsed.clone();
                             if client_tts_seen.len() >= client_tts_relay::MAX_SEEN_REQUESTS
                                 || !client_tts_seen.insert(request_id.clone())
                             {
@@ -4322,42 +6737,39 @@ async fn run_remote_media_channel(
                                 let _ = client_tts_relay::send_start_failure(
                                     &write_sender,
                                     &tts_identity,
-                                    &task_id,
-                                    &request_id,
+                                    &parsed,
                                     "客户端合成并发数已达上限。",
                                 )
                                 .await;
                                 continue;
                             }
-                            let Some(context) = state.context() else {
-                                let _ = client_tts_relay::send_start_failure(
-                                    &write_sender,
-                                    &tts_identity,
-                                    &task_id,
-                                    &request_id,
-                                    "客户端本地工作区不可用。",
-                                )
-                                .await;
-                                continue;
-                            };
                             match client_tts_relay::start_request(
                                 parsed,
-                                &context.data,
                                 tts_identity.clone(),
+                                &mut client_tts_authorizations,
+                                client_tts_playback.clone(),
                                 write_sender.clone(),
                                 client_tts_finished_sender.clone(),
-                            ) {
+                            )
+                            .await
+                            {
                                 Ok((cancellation, task)) => {
-                                    client_tts_cancellations
-                                        .insert(request_id.clone(), (task_id, cancellation));
+                                    client_tts_cancellations.insert(
+                                        request_id.clone(),
+                                        (
+                                            authorization_id,
+                                            playback_key,
+                                            segment_index,
+                                            cancellation,
+                                        ),
+                                    );
                                     client_tts_tasks.insert(request_id, task);
                                 }
                                 Err(_) => {
                                     let _ = client_tts_relay::send_start_failure(
                                         &write_sender,
                                         &tts_identity,
-                                        &task_id,
-                                        &request_id,
+                                        &failure_request,
                                         "客户端 MiniMax 合成任务未能启动。",
                                     )
                                     .await;
@@ -4365,7 +6777,7 @@ async fn run_remote_media_channel(
                             }
                         }
                         Some("media.tts.cancel") => {
-                            let (task_id, request_id) =
+                            let parsed =
                                 match client_tts_relay::parse_cancel(&message, &tts_identity) {
                                     Ok(parsed) => parsed,
                                     Err(error) => {
@@ -4373,14 +6785,25 @@ async fn run_remote_media_channel(
                                         break;
                                     }
                                 };
-                            if let Some((active_task_id, cancellation)) =
-                                client_tts_cancellations.get(&request_id)
+                            let request_id = parsed.request_id.clone();
+                            if let Some((
+                                authorization_id,
+                                playback_key,
+                                segment_index,
+                                cancellation,
+                            )) = client_tts_cancellations.get(&request_id)
                             {
-                                if active_task_id != &task_id {
+                                if authorization_id != &parsed.authorization_id
+                                    || playback_key != &parsed.playback_key
+                                    || segment_index != &parsed.segment_index
+                                {
                                     outcome = Err("客户端取消请求的播放任务编号不匹配。".into());
                                     break;
                                 }
                                 cancellation.request_cancel();
+                                let _ =
+                                    (client_tts_playback.stop_and_snapshot)(playback_key.clone())
+                                        .await;
                             }
                         }
                         _ => {
@@ -4550,7 +6973,7 @@ async fn run_remote_media_channel(
             }
         }
     }
-    for (_, cancellation) in client_tts_cancellations.values() {
+    for (_, _, _, cancellation) in client_tts_cancellations.values() {
         cancellation.request_cancel();
     }
     for (_, mut task) in client_tts_tasks.drain() {
@@ -4562,6 +6985,11 @@ async fn run_remote_media_channel(
             let _ = task.await;
         }
     }
+    client_tts_authorizations.clear();
+    if let Ok(mut ledger) = client_tts_playback_ledger.lock() {
+        ledger.clear();
+    }
+    client_tts_playback_started.store(false, Ordering::Release);
     let _ = write_sender.send(MediaWriteCommand::Close).await;
     drop(write_sender);
     let mut reader_task = reader_task;
@@ -4613,6 +7041,21 @@ async fn stop_remote_media_channel(state: &Arc<Desktop>) -> Result<bool, String>
 }
 
 #[cfg(feature = "ssh-device")]
+async fn stop_remote_voice_forwarder(state: &Arc<Desktop>) -> Result<bool, String> {
+    let forwarder = state
+        .remote_voice_forwarder
+        .lock()
+        .map_err(|_| "远程语音 WebSocket 转发状态不可用。")?
+        .take();
+    let Some(forwarder) = forwarder else {
+        return Ok(false);
+    };
+    let _ = forwarder.stop.send(true);
+    forwarder.task.await.map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[cfg(feature = "ssh-device")]
 async fn stop_remote_device_task_channel(state: &Arc<Desktop>) -> Result<bool, String> {
     let channel = state
         .remote_task_channel
@@ -4625,6 +7068,15 @@ async fn stop_remote_device_task_channel(state: &Arc<Desktop>) -> Result<bool, S
     channel.stop.store(true, Ordering::Release);
     channel.task.await.map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+/// remote_client_tts_playback_enabled（远端客户端原生直放能力）：不依赖客户端供应商凭据。
+#[cfg(feature = "ssh-device")]
+fn remote_client_tts_playback_enabled(
+    config: &voice_desktop_common::device_config::DeviceConfig, // config（客户端设备配置，读取本地合成播放开关）。
+) -> bool {
+    // Windows（视窗操作系统）构建包含远程媒体工作器使用的原生 PCM/WASAPI 播放器。
+    config.client_online_tts_local && cfg!(windows)
 }
 
 /// device_ssh_task_channel（远端桌面任务通道）：仅启动本机受管辅助执行，不载入 Python。
@@ -4650,6 +7102,12 @@ async fn device_ssh_task_channel(
                 let running = channel
                     .as_ref()
                     .is_some_and(|channel| channel.running.load(Ordering::Acquire));
+                let device_id = channel.as_ref().map(|channel| channel.device_id.clone());
+                let connection_generation = channel
+                    .as_ref()
+                    .map(|channel| channel.connection_generation);
+                let executor_generation =
+                    channel.as_ref().map(|channel| channel.executor_generation);
                 let error = desktop
                     .remote_task_channel_error
                     .lock()
@@ -4657,7 +7115,10 @@ async fn device_ssh_task_channel(
                     .clone();
                 return Ok(
                     serde_json::json!({"state":if running{"running"}else if error.is_some(){"error"}else{"stopped"},
-                    "error":error,"fields":{"state":"受管远端桌面任务通道状态","error":"最近一次通道错误"}}),
+                    "device_id":device_id,"connection_generation":connection_generation,"executor_generation":executor_generation,
+                    "error":error,"fields":{"state":"受管远端桌面任务通道状态","device_id":"当前已登记的客户端设备编号",
+                        "connection_generation":"主机授予的设备连接代次","executor_generation":"主机授予的客户端执行器代次",
+                        "error":"最近一次通道错误"}}),
                 );
             }
             "stop" => {
@@ -4717,10 +7178,8 @@ async fn device_ssh_task_channel(
         if desktop_ready {
             capabilities.push("desktop_control".to_owned());
         }
-        // 只公告客户端本机是否有 MiniMax（语音合成）凭据，不读取或发送密钥给共享主机。
-        if voice_desktop_common::credentials::load_provider_credential(&context.data, "minimax")
-            .is_ok()
-        {
+        // client_tts（客户端原生直放能力）由开关和原生播放器支持决定；供应商凭据由服务端在线语音设置提供。
+        if remote_client_tts_playback_enabled(&config) {
             capabilities.push("client_tts".to_owned());
         }
         capabilities.sort();
@@ -4781,6 +7240,9 @@ async fn device_ssh_task_channel(
             .map_err(|error| error.to_string())? = Some(RemoteDeviceTaskChannel {
             stop,
             running,
+            device_id: config.device_id.clone(),
+            connection_generation,
+            executor_generation,
             task: loop_handle,
         });
         Ok(
@@ -4808,6 +7270,7 @@ async fn abort_remote_interaction_switch(state: &Arc<Desktop>, generation: u64) 
 }
 
 /// device_ssh_media_channel（远端语音媒体通道）：显式准备交互租约后开启独立 SSH WebSocket。
+#[cfg(feature = "ssh-device")]
 #[tauri::command]
 async fn device_ssh_media_channel(
     window: WebviewWindow,
@@ -4830,6 +7293,10 @@ async fn device_ssh_media_channel(
                 .is_some_and(|channel| channel.running.load(Ordering::Acquire));
             let device_id = slot.as_ref().map(|channel| channel.device_id.clone());
             let stream_id = slot.as_ref().map(|channel| channel.stream_id.clone());
+            let connection_generation = slot.as_ref().map(|channel| channel.connection_generation);
+            let executor_generation = slot.as_ref().map(|channel| channel.executor_generation);
+            let interaction_generation =
+                slot.as_ref().map(|channel| channel.interaction_generation);
             let error = desktop
                 .remote_media_channel_error
                 .lock()
@@ -4837,9 +7304,12 @@ async fn device_ssh_media_channel(
                 .clone();
             return Ok(
                 serde_json::json!({"state":if running{"running"}else if error.is_some(){"error"}else{"stopped"},
-                "device_id":device_id,"stream_id":stream_id,"error":error,
+                "device_id":device_id,"stream_id":stream_id,"connection_generation":connection_generation,
+                "executor_generation":executor_generation,"interaction_generation":interaction_generation,"error":error,
                 "fields":{"state":"受管远端语音媒体通道状态","device_id":"当前远端语音设备编号",
-                    "stream_id":"当前连续音频流编号","error":"最近一次媒体通道错误"}}),
+                    "stream_id":"当前连续音频流编号","connection_generation":"主机授予的设备连接代次",
+                    "executor_generation":"主机授予的设备执行器代次","interaction_generation":"主机授予的语音交互代次",
+                    "error":"最近一次媒体通道错误"}}),
             );
         }
         "stop" => {
@@ -5104,6 +7574,9 @@ async fn device_ssh_media_channel(
         running,
         device_id: device_id.clone(),
         stream_id: stream_id.clone(),
+        connection_generation,
+        executor_generation,
+        interaction_generation,
         task: task_handle,
     });
     *desktop
@@ -5122,6 +7595,171 @@ async fn device_ssh_media_channel(
     )
 }
 
+#[cfg(not(feature = "ssh-device"))]
+#[tauri::command]
+async fn device_ssh_media_channel(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    action: String, // action（start、status 或 stop）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    let _ = action;
+    Err("当前产品构建未包含 SSH 远端语音媒体通道能力。".into())
+}
+
+/// device_ssh_voice_forwarder（本机回环转发服务端语音事件）：随机路径仅在已配对客户端内存中返回。
+#[cfg(feature = "ssh-device")]
+#[tauri::command]
+async fn device_ssh_voice_forwarder(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    action: String, // action（start、status 或 stop）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前窗口或应用状态不能管理远程语音转发。".into());
+    }
+    let desktop = state.inner().clone();
+    match action.as_str() {
+        "status" => {
+            let slot = desktop
+                .remote_voice_forwarder
+                .lock()
+                .map_err(|_| "远程语音转发状态不可用。")?;
+            let running = slot
+                .as_ref()
+                .is_some_and(|forwarder| forwarder.running.load(Ordering::Acquire));
+            let url = slot
+                .as_ref()
+                .filter(|forwarder| forwarder.running.load(Ordering::Acquire))
+                .map(|forwarder| forwarder.url.clone());
+            return Ok(serde_json::json!({
+                "state":if running {"running"} else {"stopped"},
+                "url":url,
+                "fields":{"state":"服务端语音 WebSocket 本机回环转发状态",
+                    "url":"仅当前已配对客户端内存可见、带随机路径票据的本机地址"}
+            }));
+        }
+        "stop" => {
+            let stopped = stop_remote_voice_forwarder(&desktop).await?;
+            return Ok(serde_json::json!({"state":"stopped","stopped":stopped,
+                "fields":{"state":"服务端语音 WebSocket 本机回环转发状态",
+                    "stopped":"本次是否关闭了本机转发 listener 与活动 SSH 桥接"}}));
+        }
+        "start" => {}
+        _ => return Err("语音转发操作必须为 start、status 或 stop。".into()),
+    }
+    if !desktop.ssh_device.connected().await {
+        return Err("请先连接并认证共享主机。".into());
+    }
+    let context = desktop.context().ok_or("缺少正式工作区")?;
+    let _config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+        voice_desktop_common::device_config::LoadResult::Valid(config)
+            if config.mode == voice_desktop_common::device_config::RunMode::Remote
+                && config
+                    .host
+                    .as_ref()
+                    .is_some_and(|host| host.host_id.is_some()) =>
+        {
+            config
+        }
+        voice_desktop_common::device_config::LoadResult::Valid(_) => {
+            return Err("语音转发只允许已配对的远程客户端模式。".into());
+        }
+        voice_desktop_common::device_config::LoadResult::Missing => {
+            return Err("尚未保存远程配对配置。".into())
+        }
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+    };
+    {
+        let mut slot = desktop
+            .remote_voice_forwarder
+            .lock()
+            .map_err(|_| "远程语音转发状态不可用。")?;
+        if let Some(forwarder) = slot
+            .as_ref()
+            .filter(|forwarder| forwarder.running.load(Ordering::Acquire))
+        {
+            return Ok(
+                serde_json::json!({"state":"running","url":forwarder.url.clone(),
+                "fields":{"state":"服务端语音 WebSocket 本机回环转发状态",
+                    "url":"仅当前已配对客户端内存可见、带随机路径票据的本机地址"}}),
+            );
+        }
+        if slot.is_some() {
+            slot.take();
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("无法建立本机语音 WebSocket 回环 listener：{error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "无法配置本机语音 WebSocket 回环 listener。")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|error| format!("无法接管本机语音 WebSocket 回环 listener：{error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| "无法读取本机语音 WebSocket 回环地址。")?;
+        if !address.ip().is_loopback() {
+            return Err("语音 WebSocket 转发意外绑定到非回环地址。".into());
+        }
+        let token = rand::random::<[u8; 32]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let url = format!("ws://{address}/{token}/ws");
+        let (stop, mut stop_receiver) = tokio::sync::watch::channel(false);
+        let task_state = desktop.clone();
+        let listener_token = token;
+        let running = Arc::new(AtomicBool::new(true));
+        let task_running = running.clone();
+        let task = tauri::async_runtime::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(2));
+            loop {
+                tokio::select! {
+                    changed = stop_receiver.changed() => {
+                        if changed.is_err() || *stop_receiver.borrow() { break; }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, peer)) = accepted else { continue };
+                        if !peer.ip().is_loopback() { continue; }
+                        let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
+                        let task_state = task_state.clone();
+                        let token = listener_token.clone();
+                        let stop = stop_receiver.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _slot = slot;
+                            let _ = task_state.ssh_device.relay_voice_websocket(stream, &token, stop).await;
+                        });
+                    }
+                }
+            }
+            task_running.store(false, Ordering::Release);
+        });
+        *slot = Some(RemoteVoiceForwarder {
+            url: url.clone(),
+            running,
+            stop,
+            task,
+        });
+        Ok(serde_json::json!({"state":"running","url":url,
+            "fields":{"state":"服务端语音 WebSocket 本机回环转发状态",
+                "url":"仅当前已配对客户端内存可见、带随机路径票据的本机地址"}}))
+    }
+}
+
+#[cfg(not(feature = "ssh-device"))]
+#[tauri::command]
+async fn device_ssh_voice_forwarder(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    action: String, // action（start、status 或 stop）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    let _ = action;
+    Err("当前产品构建未包含 SSH 语音 WebSocket 转发能力。".into())
+}
+
 // desktop_page_ready（真实页面就绪）：界面挂载后确认；迁移不使用缓存启动状态。
 #[tauri::command]
 fn desktop_page_ready(
@@ -5132,10 +7770,16 @@ fn desktop_page_ready(
     require_command(state.mode, DesktopCommand::FocusMain)?;
     let url = window.url().map_err(|e| e.to_string())?;
     let management = url.path() == "/management.html" && boot_page_url(&url);
-    if !management && !(state.is_settled_frontend_url(&url) && state.allows_frontend_url(&url)) {
+    let context = state.context().ok_or("缺少正式工作区")?;
+    let remote_static_product = remote_static_product_page_url(&url)
+        && voice_desktop_common::device_config::inspect(&context.data).mode
+            == Some(voice_desktop_common::device_config::RunMode::Remote);
+    if !management
+        && !remote_static_product
+        && !(state.is_settled_frontend_url(&url) && state.allows_frontend_url(&url))
+    {
         return Err("页面尚未进入管理界面或产品界面。".into());
     }
-    let context = state.context().ok_or("缺少正式工作区")?;
     workspace::atomic_json(
         &context.data.join("state/workspace-ready.json"),
         &serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"role":"product","ready":true,"management_ready":management,"development":context.dev,"fields":{"schema":"页面就绪记录格式","pid":"桌面进程编号","workspace_id":"工作区编号","role":"product（正式程序）","ready":"界面已真实挂载","management_ready":"组件管理页已挂载","development":"显式源码调试"}}),
@@ -5280,8 +7924,27 @@ fn workspace_info(
 fn require_workspace(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     trusted(window, state)?;
     require_command(state.mode, DesktopCommand::FocusMain)?;
+    require_local_device_target(state)?;
     if state.stopping.load(Ordering::Acquire) {
         return Err("应用正在退出。".into());
+    }
+    Ok(())
+}
+
+/// require_local_device_target（本机目标门禁）：远程配对窗口不得借本机工作区接口修改客户端。
+fn require_local_device_target(state: &Desktop) -> Result<(), String> {
+    let context = state.context().ok_or("缺少工作区上下文。")?;
+    require_local_device_root(&context.data)
+}
+
+/// require_local_device_root（设备数据目录本地模式门禁）：未知配置拒绝本机变更。
+fn require_local_device_root(data_root: &Path) -> Result<(), String> {
+    let snapshot = voice_desktop_common::device_config::inspect(data_root);
+    if let Some(error) = snapshot.error {
+        return Err(error);
+    }
+    if snapshot.mode == Some(voice_desktop_common::device_config::RunMode::Remote) {
+        return Err("此操作只针对本机运行设备；远程配对时请通过服务端管理操作。".into());
     }
     Ok(())
 }
@@ -6013,6 +8676,23 @@ fn start_service_for(
         *state.context.lock().unwrap() = Some(context.clone());
         *state.error.lock().unwrap() = None;
         let device_snapshot = voice_desktop_common::device_config::inspect(&context.data);
+        if product_startup_kind(device_snapshot.mode) == ProductStartupKind::RemoteClient {
+            if resource_recovery {
+                return Err("当前处于远程配对模式；资源任务不能启动本机语音核心。".into());
+            }
+            state
+                .remote_client_connected
+                .store(false, Ordering::Release);
+            // origin（静态产品页来源）：让桌面预检确认远程产品资产就绪，无需启动本地 Python 核心。
+            *state.origin.lock().unwrap() = Some("http://tauri.localhost".into());
+            *state.initialization.lock().unwrap() = serde_json::json!({
+                "phase":"远程配对模式已启动，等待搜索并连接服务端",
+                "can_cancel":false,"failed":false,
+                "fields":{"phase":"客户端不启动本机推理核心，等待发现和连接服务端","can_cancel":"当前模式持续可用","failed":"初始化失败标记"}
+            });
+            initialization::manage(&app, &state)?;
+            return Ok(());
+        }
         if let Some(reason) =
             voice_desktop_common::device_config::startup_block_reason(&device_snapshot)
         {
@@ -6126,6 +8806,13 @@ fn start_service_for(
         let context = state.context().ok_or("产品服务缺少桌面启动上下文。")?;
         command = voice_desktop_common::process_host::python_command(&context.python);
         context.configure_command(&mut command);
+        if let voice_desktop_common::device_config::LoadResult::Valid(device_config) =
+            voice_desktop_common::device_config::load_from_root(&context.data)
+        {
+            if device_config.mode == voice_desktop_common::device_config::RunMode::Local {
+                command.env("VOICE_TERMINAL_HOST_ID", &device_config.device_id);
+            }
+        }
         command
             .args(["-X", "utf8", "-X"])
             .arg(format!(
@@ -6145,9 +8832,7 @@ fn start_service_for(
         if context.dev {
             command.arg("--dev");
         }
-        if voice_desktop_common::device_config::inspect(&context.data).desired_role
-            == Some(voice_desktop_common::device_config::Role::SharedHost)
-        {
+        if voice_desktop_common::device_config::inspect(&context.data).broadcast_enabled {
             command.arg("--share-device-gateway");
         }
         if context.diagnostic {
@@ -6328,6 +9013,16 @@ fn start_service_for(
                         "enabled":message["device_gateway_enabled"].as_bool().unwrap_or(false),
                         "ready":message["device_gateway_ready"].as_bool().unwrap_or(false),
                         "error":message["device_gateway_error"].as_str().unwrap_or("")});
+                    #[cfg(feature = "ssh-device")]
+                    {
+                        let discovery_state = read_state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = sync_local_discovery(discovery_state.clone()).await
+                            {
+                                *discovery_state.error.lock().unwrap() = Some(error);
+                            }
+                        });
+                    }
                 }
                 Some("runtime_status") => {
                     read_state.recovery.lock().unwrap().current_core =
@@ -6336,6 +9031,16 @@ fn start_service_for(
                         "enabled":message["device_gateway_enabled"].as_bool().unwrap_or(false),
                         "ready":message["device_gateway_ready"].as_bool().unwrap_or(false),
                         "error":message["device_gateway_error"].as_str().unwrap_or("")});
+                    #[cfg(feature = "ssh-device")]
+                    {
+                        let discovery_state = read_state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = sync_local_discovery(discovery_state.clone()).await
+                            {
+                                *discovery_state.error.lock().unwrap() = Some(error);
+                            }
+                        });
+                    }
                 }
                 Some("exit_requested") => read_state.shutdown(&read_app),
                 Some("logs_flushed") | Some("logs_flush_failed") => {
@@ -6527,6 +9232,11 @@ fn create_window(
     build_state: Arc<Desktop>,
     management: bool,
 ) -> Result<WebviewWindow, String> {
+    let remote_product = management
+        && build_state.context().is_some_and(|context| {
+            voice_desktop_common::device_config::inspect(&context.data).mode
+                == Some(voice_desktop_common::device_config::RunMode::Remote)
+        });
     let repair_handoff = management
         && build_state.context().is_some_and(|context| {
             context.install.join("tmp/native-install.json").exists()
@@ -6540,7 +9250,11 @@ fn create_window(
         app,
         if pending { "startup" } else { "main" },
         WebviewUrl::App(if management {
-            "management.html".into()
+            if remote_product {
+                "index.html".into()
+            } else {
+                "management.html".into()
+            }
         } else {
             "startup.html".into()
         }),
@@ -6636,6 +9350,118 @@ fn cleanup_initialization_cache(path: &Path) {
 fn locator_for_check(args: &[String]) -> Result<Locator, String> {
     Locator::from_args(args)
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductStartupKind {
+    LocalCore,
+    RemoteClient,
+} // ProductStartupKind（正式程序启动路径：本地核心或远程客户端）。
+
+/// product_startup_kind（选择正式程序服务路径）：远程客户端不经过本地核心启动门禁。
+fn product_startup_kind(
+    mode: Option<voice_desktop_common::device_config::RunMode>,
+) -> ProductStartupKind {
+    if mode == Some(voice_desktop_common::device_config::RunMode::Remote) {
+        ProductStartupKind::RemoteClient
+    } else {
+        ProductStartupKind::LocalCore
+    }
+}
+
+/// launch_mode_arguments（校验并读取模式参数）：重复、缺值和非法组合在写入配置前拒绝。
+fn launch_mode_arguments(args: &[String]) -> Result<(Option<&str>, Option<&str>), String> {
+    let mut requested_mode = None;
+    let mut requested_broadcast = None;
+    for (index, arg) in args.iter().enumerate() {
+        let target = match arg.as_str() {
+            "--mode" => &mut requested_mode,
+            "--broadcast" => &mut requested_broadcast,
+            _ => continue,
+        };
+        if target.is_some() {
+            return Err(format!("启动参数重复：{arg}"));
+        }
+        let selected = args
+            .get(index + 1)
+            .filter(|value| !value.starts_with("--"))
+            .map(String::as_str)
+            .ok_or_else(|| format!("启动参数缺少值：{arg}"))?;
+        match arg.as_str() {
+            "--mode" if !matches!(selected, "local" | "remote") => {
+                return Err(
+                    "--mode（运行模式）仅接受 local（本地运行）或 remote（远程配对）。".into(),
+                );
+            }
+            "--broadcast" if !matches!(selected, "on" | "off") => {
+                return Err("--broadcast（局域网广播）仅接受 on（开启）或 off（关闭）。".into());
+            }
+            _ => *target = Some(selected),
+        }
+    }
+    if requested_mode == Some("remote") && requested_broadcast == Some("on") {
+        return Err(
+            "--mode remote（远程配对）不能与 --broadcast on（开启本机广播）同时使用。".into(),
+        );
+    }
+    Ok((requested_mode, requested_broadcast))
+}
+
+/// apply_launch_mode_override（应用正式启动模式覆盖）：只在参数明确请求时保存到设备配置。
+fn apply_launch_mode_override(data_root: &Path, args: &[String]) -> Result<(), String> {
+    let (requested_mode, requested_broadcast) = launch_mode_arguments(args)?;
+    if requested_mode.is_none() && requested_broadcast.is_none() {
+        return Ok(());
+    }
+
+    use voice_desktop_common::device_config::{
+        self, AudioMode, DeviceConfig, LoadResult, Role, RunMode,
+    };
+    let mut config = match device_config::load_from_root(data_root) {
+        LoadResult::Valid(config) => config,
+        LoadResult::Invalid(error) => return Err(format!("无法安全应用启动模式：{error}")),
+        LoadResult::Missing => DeviceConfig {
+            schema_version: device_config::SCHEMA_VERSION,
+            device_id: format!("device-{}", voice_desktop_common::workspace::new_id()),
+            mode: RunMode::Local,
+            broadcast_enabled: false,
+            client_online_tts_local: true,
+            audio_compression: false,
+            reconnect_suspended_reason: None,
+            desired_role: Role::Standalone,
+            audio_mode: AudioMode::Pcm,
+            host: None,
+        },
+    };
+    if let Some(mode) = requested_mode {
+        config.mode = match mode {
+            "local" => RunMode::Local,
+            "remote" => RunMode::Remote,
+            _ => return Err("--mode（运行模式）参数无效。".into()),
+        };
+    }
+    if let Some(broadcast) = requested_broadcast {
+        config.broadcast_enabled = match broadcast {
+            "on" => true,
+            "off" => false,
+            _ => return Err("--broadcast（局域网广播）参数无效。".into()),
+        };
+    }
+    if config.mode == RunMode::Remote && requested_broadcast == Some("on") {
+        return Err("远程配对模式不能同时开启本机广播。".into());
+    }
+    if config.mode == RunMode::Remote {
+        config.broadcast_enabled = false;
+    }
+    config.desired_role = match config.mode {
+        RunMode::Remote => Role::RemoteClient,
+        RunMode::Local if config.broadcast_enabled => Role::SharedHost,
+        RunMode::Local => Role::Standalone,
+    };
+    config.schema_version = device_config::SCHEMA_VERSION;
+    device_config::save(data_root, &config)?;
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let preview_count = args
@@ -6653,6 +9479,8 @@ fn run() -> Result<(), String> {
         (None, FrontendMode::UiPreview, program, data, None)
     } else {
         let context = LaunchContext::from_args()?;
+        voice_desktop_common::compatibility::migrate_device_runtime_config(&context.data)?;
+        apply_launch_mode_override(&context.data, &args)?;
         context.prepare_webview_access()?;
         for (name, value) in context.environment() {
             std::env::set_var(name, value);
@@ -6698,6 +9526,19 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "ssh-device")]
         ssh_device: voice_desktop_common::ssh_device::SshDeviceManager::default(),
         #[cfg(feature = "ssh-device")]
+        pairing_window: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        pairing_listener: tokio::sync::Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        discovery_publication: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        remote_services: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        remote_import_transfers: Mutex::new(HashMap::new()),
+        #[cfg(feature = "ssh-device")]
+        discovery_targets: Mutex::new(std::collections::HashMap::new()),
+        discovery_search_expires_at_ms: AtomicU64::new(0),
+        #[cfg(feature = "ssh-device")]
         device_terminal: voice_desktop_common::device_terminal::DeviceTerminalManager::default(),
         #[cfg(feature = "ssh-device")]
         remote_task_channel: Mutex::new(None),
@@ -6711,6 +9552,8 @@ fn run() -> Result<(), String> {
         remote_media_channel_starting: AtomicBool::new(false),
         #[cfg(feature = "ssh-device")]
         remote_media_channel_error: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        remote_voice_forwarder: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         remote_playback_control: tokio::sync::Mutex::new(RemotePlaybackControlState::default()),
         #[cfg(feature = "ssh-device")]
@@ -6771,6 +9614,29 @@ fn run() -> Result<(), String> {
                 && arguments.iter().any(|value| value == "--qualification-exit")
             {
                 instance_state.shutdown(app);
+            } else if arguments.iter().any(|value| matches!(value.as_str(), "--mode" | "--broadcast"))
+                && instance_state.mode == FrontendMode::Product
+            {
+                show(app);
+                let persisted = instance_state.context().ok_or_else(|| "缺少正式工作区".to_string())
+                    .and_then(|context| apply_launch_mode_override(&context.data, &arguments));
+                if let Err(error) = persisted {
+                    *instance_state.error.lock().unwrap() = Some(error.clone());
+                    let _ = app.emit("desktop://device-runtime-error", serde_json::json!({
+                        "error":error,"fields":{"error":"同实例启动参数拒绝原因"}
+                    }));
+                    return;
+                }
+                let state = instance_state.clone();
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = apply_saved_device_runtime(handle.clone(), state.clone()).await {
+                        *state.error.lock().unwrap() = Some(error.clone());
+                        let _ = handle.emit("desktop://device-runtime-error", serde_json::json!({
+                            "error":error,"fields":{"error":"启动参数运行模式切换失败原因"}
+                        }));
+                    }
+                });
             } else if instance_state.mode==FrontendMode::Product&&arguments.iter().any(|value|value=="--dev")!=instance_state.development {
                 if let Some(context)=instance_state.context(){let _=workspace::atomic_json(&context.data.join("state/instance-conflict.json"),&serde_json::json!({"pid":std::process::id(),"existing_development":instance_state.development,"requested_development":arguments.iter().any(|value|value=="--dev"),"fields":{"pid":"已有正式进程编号","existing_development":"当前显式调试模式","requested_development":"请求的显式调试模式"}}));}
                 std::thread::spawn(||voice_desktop_common::windows::error("当前工作区已运行另一种业务模式，请退出已有实例后重新启动。"));
@@ -6781,12 +9647,12 @@ fn run() -> Result<(), String> {
         }))
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
-        desktop_status,desktop_page_ready,device_config_status,device_config_save,device_worker_start,device_worker_status,device_worker_audio_devices,device_worker_desktop_helper_health,
+        desktop_status,desktop_page_ready,device_config_status,device_config_save,device_discovery_search,device_pairing_window_open,device_pairing_window_close,device_pairing_window_status,device_pairing_connect,device_worker_start,device_worker_status,device_worker_audio_devices,device_worker_desktop_helper_health,
             device_worker_capture_start,device_worker_capture_next,device_worker_capture_stop,
         device_worker_playback_start,device_worker_playback_enqueue,device_worker_playback_snapshot,device_worker_playback_stop,
             device_ssh_probe,device_ssh_identity_create,device_ssh_identity_status,device_ssh_identity_delete,
             device_ssh_transport_identity_import,device_ssh_transport_identity_status,device_ssh_transport_identity_delete,
-            device_ssh_connect,device_ssh_pairing_request,device_ssh_request,device_ssh_disconnect,device_ssh_status,device_ssh_task_channel,device_ssh_media_channel,
+            device_ssh_connect,device_ssh_pairing_request,device_ssh_request,device_ssh_management_request,device_ssh_import_start,device_ssh_import_cancel,device_ssh_tts_asset_import,device_ssh_tts_asset_audio,device_ssh_disconnect,device_ssh_status,device_ssh_task_channel,device_ssh_media_channel,device_ssh_voice_forwarder,
             publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
             skip_startup,
             export_logs,
@@ -6797,7 +9663,7 @@ fn run() -> Result<(), String> {
             model_credentials_status,model_credentials_save,inference_selection_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
             workspace_info,workspace_choose,workspace_link,workspace_migrate,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
-            resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_download,resource_download_required,resource_import,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
+            resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_system_feature_access,resource_download,resource_download_required,resource_import,resource_import_choose_sources,resource_import_start,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
             aniflive_import_choose_folder,aniflive_import_start
         ])
         .setup(move |app| {
@@ -6904,6 +9770,17 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 fn main() {
+    #[cfg(feature = "ssh-device")]
+    if let Some(result) = voice_desktop_common::device_bridge::dispatch() {
+        let code = match result {
+            Ok(()) => 0,
+            Err(message) => {
+                eprintln!("SSH 设备桥接拒绝请求：{message}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if let Some(result) = voice_desktop_common::device_worker::dispatch() {
         let code = match result {
             Ok(()) => 0,
@@ -6949,27 +9826,450 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ssh-device")]
+    use super::recover_tts_asset_import_commit;
+    #[cfg(feature = "ssh-device")]
+    use super::recover_tts_asset_upload_receipt;
+    #[cfg(feature = "ssh-device")]
+    use super::remote_business_operation_allowed;
+    #[cfg(feature = "ssh-device")]
+    use super::remote_client_tts_playback_enabled;
+    #[cfg(feature = "ssh-device")]
+    use super::validate_remote_tts_audio_payload;
     use super::{
-        DesktopCommand, FrontendMode, command_allowed, console_url, floating_capability,
-        floating_page_url_allowed, floating_publisher_capability, frontend_capability,
-        frontend_entry_url, instance_identifier, preview_entry_url_allowed,
-        preview_page_url_allowed, product_entry_url_allowed, product_page_url_allowed,
-        request_service_start, require_command, ui_preview_context, valid_instance_id,
-        valid_launch_token,
+        apply_launch_mode_override, command_allowed, console_url, desktop_status_ready,
+        floating_capability, floating_page_url_allowed, floating_publisher_capability,
+        frontend_capability, frontend_entry_url, instance_identifier, launch_mode_arguments,
+        mode_runtime_projection, preview_entry_url_allowed, preview_page_url_allowed,
+        product_entry_url_allowed, product_page_url_allowed, product_startup_kind,
+        remote_static_product_page_url, request_service_start, require_command,
+        require_local_device_root, ui_preview_context, valid_instance_id, valid_launch_token,
+        DesktopCommand, FrontendMode, ProductStartupKind,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(feature = "ssh-device")]
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(feature = "ssh-device")]
     use std::{path::PathBuf, time::Duration};
     use tauri::webview::PageLoadEvent;
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn dsh_approval_decision_is_a_fixed_remote_business_operation() {
+        assert!(remote_business_operation_allowed("dsh.approval.decide"));
+        assert!(!remote_business_operation_allowed("dsh.approval.execute"));
+        assert!(!remote_business_operation_allowed(
+            "dsh.approval.decide?url=anything"
+        ));
+    }
+
+    #[test]
+    fn launch_mode_override_rejects_broadcast_on_remote_without_mutating_saved_config() {
+        use voice_desktop_common::device_config::{
+            self, AudioMode, DeviceConfig, LoadResult, Role, RunMode,
+        };
+        let root = isolated_launch_mode_root();
+        let remote = DeviceConfig {
+            schema_version: device_config::SCHEMA_VERSION,
+            device_id: "device-launch-test".into(),
+            mode: RunMode::Remote,
+            broadcast_enabled: false,
+            client_online_tts_local: true,
+            audio_compression: false,
+            reconnect_suspended_reason: None,
+            desired_role: Role::RemoteClient,
+            audio_mode: AudioMode::Pcm,
+            host: None,
+        };
+        device_config::save(&root, &remote).unwrap();
+
+        assert!(apply_launch_mode_override(&root, &["--broadcast".into(), "on".into()],).is_err());
+        assert!(
+            matches!(device_config::load_from_root(&root), LoadResult::Valid(value) if value == remote)
+        );
+
+        assert!(apply_launch_mode_override(
+            &root,
+            &[
+                "--mode".into(),
+                "local".into(),
+                "--mode".into(),
+                "remote".into()
+            ],
+        )
+        .is_err());
+        assert!(
+            apply_launch_mode_override(&root, &["--broadcast".into(), "maybe".into()]).is_err()
+        );
+        assert!(
+            matches!(device_config::load_from_root(&root), LoadResult::Valid(value) if value == remote)
+        );
+
+        apply_launch_mode_override(
+            &root,
+            &[
+                "--mode".into(),
+                "local".into(),
+                "--broadcast".into(),
+                "on".into(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            matches!(device_config::load_from_root(&root), LoadResult::Valid(value)
+            if value.mode == RunMode::Local && value.broadcast_enabled && value.desired_role == Role::SharedHost)
+        );
+
+        assert!(apply_launch_mode_override(
+            &root,
+            &[
+                "--mode".into(),
+                "remote".into(),
+                "--broadcast".into(),
+                "on".into()
+            ],
+        )
+        .is_err());
+        assert!(
+            matches!(device_config::load_from_root(&root), LoadResult::Valid(value)
+            if value.mode == RunMode::Local && value.broadcast_enabled)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn isolated_launch_mode_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "voice-launch-mode-{}-{}",
+            std::process::id(),
+            voice_desktop_common::workspace::new_id(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn native_local_resource_gate_rejects_remote_config_and_allows_local_default() {
+        use voice_desktop_common::device_config::{self, AudioMode, DeviceConfig, Role, RunMode};
+        let root = isolated_launch_mode_root();
+        assert!(
+            require_local_device_root(&root).is_ok(),
+            "missing config uses the documented local default"
+        );
+
+        let remote = DeviceConfig {
+            schema_version: device_config::SCHEMA_VERSION,
+            device_id: "device-remote-gate".into(),
+            mode: RunMode::Remote,
+            broadcast_enabled: false,
+            client_online_tts_local: true,
+            audio_compression: false,
+            reconnect_suspended_reason: None,
+            desired_role: Role::RemoteClient,
+            audio_mode: AudioMode::Pcm,
+            host: None,
+        };
+        device_config::save(&root, &remote).unwrap();
+        assert!(require_local_device_root(&root)
+            .unwrap_err()
+            .contains("只针对本机运行设备"));
+
+        let mut local = remote;
+        local.mode = RunMode::Local;
+        local.desired_role = Role::Standalone;
+        device_config::save(&root, &local).unwrap();
+        assert!(require_local_device_root(&root).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_launch_from_an_empty_data_workspace_selects_the_client_path_without_local_components()
+    {
+        use voice_desktop_common::device_config::{self, LoadResult, Role, RunMode};
+
+        let root = isolated_launch_mode_root();
+        apply_launch_mode_override(&root, &["--mode".into(), "remote".into()]).unwrap();
+
+        let config = match device_config::load_from_root(&root) {
+            LoadResult::Valid(config) => config,
+            other => panic!("远程启动参数应在隔离空数据目录保存有效配置：{other:?}"),
+        };
+        assert_eq!(config.mode, RunMode::Remote);
+        assert!(!config.broadcast_enabled);
+        assert_eq!(config.desired_role, Role::RemoteClient);
+        assert_eq!(
+            product_startup_kind(Some(config.mode)),
+            ProductStartupKind::RemoteClient
+        );
+        assert!(!root.join("python").exists());
+        assert!(!root.join("models").exists());
+        assert!(!root.join("credentials").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_launch_with_broadcast_off_selects_the_local_core_path_consistently() {
+        use voice_desktop_common::device_config::{self, LoadResult, Role, RunMode};
+
+        let root = isolated_launch_mode_root();
+        apply_launch_mode_override(
+            &root,
+            &[
+                "--mode".into(),
+                "local".into(),
+                "--broadcast".into(),
+                "off".into(),
+            ],
+        )
+        .unwrap();
+
+        let config = match device_config::load_from_root(&root) {
+            LoadResult::Valid(config) => config,
+            other => panic!("本地关闭广播参数应保存有效配置：{other:?}"),
+        };
+        assert_eq!(config.mode, RunMode::Local);
+        assert!(!config.broadcast_enabled);
+        assert_eq!(config.desired_role, Role::Standalone);
+        assert_eq!(
+            product_startup_kind(Some(config.mode)),
+            ProductStartupKind::LocalCore
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_mode_switch_keeps_the_runtime_error_and_the_observed_actual_mode() {
+        use voice_desktop_common::device_config::RunMode;
+
+        let (actual_mode, phase, error) = mode_runtime_projection(
+            Some(RunMode::Remote),
+            "standalone",
+            true,
+            Some("远程客户端服务启动失败：模拟启动错误。".into()),
+            None,
+        );
+        assert_eq!(actual_mode, Some("local"));
+        assert_eq!(phase, "failed");
+        assert_eq!(
+            error.as_deref(),
+            Some("远程客户端服务启动失败：模拟启动错误。")
+        );
+    }
+
+    #[test]
+    fn remote_mode_waits_for_a_host_without_claiming_an_actual_mode() {
+        use voice_desktop_common::device_config::RunMode;
+
+        let (actual_mode, phase, error) =
+            mode_runtime_projection(Some(RunMode::Remote), "none", false, None, None);
+        assert_eq!(actual_mode, None);
+        assert_eq!(phase, "waiting_for_remote");
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn remote_static_product_entry_passes_preflight_before_local_service_origin_exists() {
+        assert!(desktop_status_ready(FrontendMode::Product, false, true,));
+        assert!(!desktop_status_ready(FrontendMode::Product, false, false,));
+        assert!(!desktop_status_ready(FrontendMode::UiPreview, false, true,));
+        assert!(desktop_status_ready(FrontendMode::UiPreview, true, false,));
+    }
+
+    #[test]
+    fn bundled_remote_product_url_accepts_the_tauri_root_and_index_paths_only() {
+        let tauri_root = tauri::Url::parse("tauri://localhost/").unwrap();
+        let tauri_index = tauri::Url::parse("tauri://localhost/index.html").unwrap();
+        let management = tauri::Url::parse("tauri://localhost/management.html").unwrap();
+        let external = tauri::Url::parse("http://127.0.0.1/index.html").unwrap();
+
+        assert!(remote_static_product_page_url(&tauri_root));
+        assert!(remote_static_product_page_url(&tauri_index));
+        assert!(!remote_static_product_page_url(&management));
+        assert!(!remote_static_product_page_url(&external));
+    }
+
+    #[test]
+    fn mode_argument_parser_rejects_duplicate_values_before_any_config_write() {
+        assert!(launch_mode_arguments(&[
+            "--mode".into(),
+            "local".into(),
+            "--mode".into(),
+            "remote".into(),
+        ])
+        .is_err());
+        assert!(launch_mode_arguments(&[
+            "--mode".into(),
+            "remote".into(),
+            "--broadcast".into(),
+            "on".into(),
+        ])
+        .is_err());
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn client_tts_capability_uses_playback_setting_not_supplier_credentials() {
+        use voice_desktop_common::device_config::{
+            AudioMode, DeviceConfig, Role, RunMode, SCHEMA_VERSION,
+        };
+
+        let mut config = DeviceConfig {
+            schema_version: SCHEMA_VERSION,
+            device_id: "device-client-tts".into(),
+            mode: RunMode::Remote,
+            broadcast_enabled: false,
+            client_online_tts_local: true,
+            audio_compression: false,
+            reconnect_suspended_reason: None,
+            desired_role: Role::RemoteClient,
+            audio_mode: AudioMode::Pcm,
+            host: None,
+        };
+
+        // 此判断只接受设备配置，不读取客户端本机凭据库；服务端另行检查自己的在线语音凭据。
+        assert_eq!(remote_client_tts_playback_enabled(&config), cfg!(windows));
+        config.client_online_tts_local = false;
+        assert!(!remote_client_tts_playback_enabled(&config));
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn remote_tts_audio_preview_is_bounded_and_digest_verified() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let bytes = b"RIFF-remote-tts-preview";
+        let digest = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let valid = serde_json::json!({
+            "data_base64":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "media_type":"audio/wav",
+            "bytes":bytes.len(),
+            "sha256":digest,
+            "fields":{"data_base64":"Base64 音频数据","media_type":"媒体类型"},
+        });
+        assert_eq!(
+            validate_remote_tts_audio_payload(valid.clone()).unwrap(),
+            valid
+        );
+
+        let mut invalid_digest = valid.clone();
+        invalid_digest["sha256"] = serde_json::json!("0".repeat(64));
+        assert!(validate_remote_tts_audio_payload(invalid_digest).is_err());
+
+        let mut invalid_media_type = valid.clone();
+        invalid_media_type["media_type"] = serde_json::json!("text/html");
+        assert!(validate_remote_tts_audio_payload(invalid_media_type).is_err());
+
+        let oversized = vec![0_u8; 1024 * 1024 + 1];
+        let oversized_payload = serde_json::json!({
+            "data_base64":base64::engine::general_purpose::STANDARD.encode(&oversized),
+            "media_type":"audio/wav", "bytes":oversized.len(), "sha256":"0".repeat(64),
+            "fields":{"data_base64":"Base64 音频数据"},
+        });
+        assert!(validate_remote_tts_audio_payload(oversized_payload).is_err());
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[tokio::test]
+    async fn tts_upload_recovery_requires_a_matching_authenticated_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use voice_desktop_common::ssh_device::SftpTransferReceipt;
+
+        let transfer_id = "a".repeat(32);
+        let expected_bytes = 123;
+        let retry_calls = AtomicUsize::new(0);
+        let recovered = recover_tts_asset_upload_receipt(
+            &transfer_id,
+            expected_bytes,
+            "初次上传回执丢失",
+            || {
+                retry_calls.fetch_add(1, Ordering::AcqRel);
+                async {
+                    Ok(SftpTransferReceipt {
+                        path: format!("transfer:{transfer_id}"),
+                        bytes: expected_bytes,
+                        sha256: "b".repeat(64),
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry_calls.load(Ordering::Acquire), 1);
+        assert_eq!(recovered.path, format!("transfer:{transfer_id}"));
+        assert_eq!(recovered.sha256, "b".repeat(64));
+
+        let ambiguous = recover_tts_asset_upload_receipt(
+            &transfer_id,
+            expected_bytes,
+            "初次上传回执丢失",
+            || async { Err("文件服务暂不可用。".into()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(ambiguous.contains("原票据已保留"));
+
+        let invalid_receipt = recover_tts_asset_upload_receipt(
+            &transfer_id,
+            expected_bytes,
+            "初次上传回执丢失",
+            || async {
+                Ok(SftpTransferReceipt {
+                    path: format!("transfer:{}", "c".repeat(32)),
+                    bytes: expected_bytes,
+                    sha256: "B".repeat(64),
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(invalid_receipt.contains("原票据已保留"));
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[tokio::test]
+    async fn tts_commit_recovery_replays_the_same_idempotent_result_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let retry_calls = AtomicUsize::new(0);
+        let committed = serde_json::json!({"asset":{"asset_id":"asset-1"}});
+        let recovered =
+            recover_tts_asset_import_commit(Err("首次提交响应连接中断".into()), || {
+                retry_calls.fetch_add(1, Ordering::AcqRel);
+                let committed = committed.clone();
+                async move { Ok(committed) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry_calls.load(Ordering::Acquire), 1);
+        assert_eq!(recovered, committed);
+
+        let confirmed = recover_tts_asset_import_commit(Ok(committed.clone()), || async {
+            panic!("known successful commit must not be replayed")
+        })
+        .await
+        .unwrap();
+        assert_eq!(confirmed, committed);
+
+        let unresolved = recover_tts_asset_import_commit(Err("首次响应未知".into()), || async {
+            Err("同一请求重试仍未确认".into())
+        })
+        .await
+        .unwrap_err();
+        assert!(unresolved.contains("原传输票据和请求编号重试一次"));
+        assert!(unresolved.contains("首次结果"));
+        assert!(unresolved.contains("重试结果"));
+    }
 
     #[cfg(all(feature = "ssh-device", feature = "native-audio"))]
     #[test]
     fn remote_capture_opus_encoder_preserves_twenty_millisecond_frame_metadata() {
         use super::encode_worker_media_frame_with_codec;
         use voice_desktop_common::{
-            device_protocol::{AudioCodec, decode_frame},
+            device_protocol::{decode_frame, AudioCodec},
             native_opus::{OpusDecoder, OpusEncoder},
         };
 
@@ -6990,6 +10290,14 @@ mod tests {
                 "device_time_us":(sequence + 1) * 20_000,
                 "discontinuity_before":false,
                 "pcm_le_bytes":pcm_le_bytes,
+                "audio_processing":{
+                    "state":"ready", "near_end_voice":false,
+                    "protected_interruption_available":true, "reverse_generation":4, "error":null,
+                    "fields":{"state":"AEC、降噪与 VAD 健康状态",
+                        "near_end_voice":"近端 VAD 判断汇总",
+                        "protected_interruption_available":"是否允许受保护打断",
+                        "reverse_generation":"播放参考格式代次", "error":"前处理故障摘要"}
+                },
             })
         };
 
@@ -7014,24 +10322,88 @@ mod tests {
             assert_eq!(header.sequence, sequence);
             assert_eq!(header.start_sample, sequence * 320);
             assert_eq!(header.sample_count, 320);
+            assert_eq!(header.audio_processing.reverse_generation, 4);
+            assert_eq!(header.audio_processing.near_end_voice.0, Some(false));
             assert!(!packet.is_empty() && packet.len() <= 1275);
             assert_eq!(decoder.decode(packet).unwrap().len(), 320);
         }
 
-        assert!(
-            encode_worker_media_frame_with_codec(
-                "device-a",
-                "core-a",
-                "media-a",
-                2,
-                3,
-                4,
-                &make_frame(8),
-                AudioCodec::Opus,
-                None,
-            )
-            .is_err()
-        );
+        assert!(encode_worker_media_frame_with_codec(
+            "device-a",
+            "core-a",
+            "media-a",
+            2,
+            3,
+            4,
+            &make_frame(8),
+            AudioCodec::Opus,
+            None,
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn remote_capture_media_encoder_requires_valid_same_frame_processing_metadata() {
+        use super::encode_worker_media_frame;
+        use voice_desktop_common::device_protocol::{decode_frame, AudioCodec};
+
+        let frame = |processing: serde_json::Value| {
+            serde_json::json!({
+                "sequence":0, "start_sample":0, "device_time_us":20_000,
+                "discontinuity_before":false, "pcm_le_bytes":vec![0_u8; 640],
+                "audio_processing":processing,
+            })
+        };
+        let healthy = serde_json::json!({
+            "state":"ready", "near_end_voice":true, "protected_interruption_available":true,
+            "reverse_generation":7, "error":null,
+            "fields":{"state":"AEC 与降噪健康状态", "near_end_voice":"近端语音结论",
+                "protected_interruption_available":"受保护打断资格",
+                "reverse_generation":"反向参考代次", "error":"前处理错误摘要"}
+        });
+        let bytes =
+            encode_worker_media_frame("device-a", "core-a", "stream-a", 1, 2, 3, &frame(healthy))
+                .unwrap();
+        let (header, _) = decode_frame(&bytes).unwrap();
+        assert_eq!(header.audio_codec, AudioCodec::Pcm);
+        assert_eq!(header.audio_processing.reverse_generation, 7);
+        assert_eq!(header.audio_processing.near_end_voice.0, Some(true));
+
+        let missing_field = serde_json::json!({
+            "state":"ready", "protected_interruption_available":true,
+            "reverse_generation":7, "error":null,
+            "fields":{"state":"AEC 状态", "near_end_voice":"近端语音",
+                "protected_interruption_available":"打断保护", "reverse_generation":"参考代次",
+                "error":"故障摘要"}
+        });
+        assert!(encode_worker_media_frame(
+            "device-a",
+            "core-a",
+            "stream-a",
+            1,
+            2,
+            3,
+            &frame(missing_field),
+        )
+        .is_err());
+        let invalid_health = serde_json::json!({
+            "state":"degraded", "near_end_voice":null, "protected_interruption_available":true,
+            "reverse_generation":7, "error":"处理器降级",
+            "fields":{"state":"AEC 状态", "near_end_voice":"近端语音",
+                "protected_interruption_available":"打断保护", "reverse_generation":"参考代次",
+                "error":"故障摘要"}
+        });
+        assert!(encode_worker_media_frame(
+            "device-a",
+            "core-a",
+            "stream-a",
+            1,
+            2,
+            3,
+            &frame(invalid_health),
+        )
+        .is_err());
     }
 
     #[cfg(all(feature = "ssh-device", feature = "native-audio"))]
@@ -7097,6 +10469,13 @@ mod tests {
             playback_worker_test_responses: std::sync::Mutex::new(responses.into()),
             playback_worker_test_operations: std::sync::Mutex::new(Vec::new()),
             ssh_device,
+            pairing_window: std::sync::Mutex::new(None),
+            pairing_listener: tokio::sync::Mutex::new(None),
+            discovery_publication: std::sync::Mutex::new(None),
+            remote_services: std::sync::Mutex::new(None),
+            remote_import_transfers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            discovery_targets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            discovery_search_expires_at_ms: std::sync::atomic::AtomicU64::new(0),
             device_terminal: voice_desktop_common::device_terminal::DeviceTerminalManager::default(
             ),
             remote_task_channel: std::sync::Mutex::new(None),
@@ -7105,6 +10484,7 @@ mod tests {
             remote_media_channel: std::sync::Mutex::new(None),
             remote_media_channel_starting: AtomicBool::new(false),
             remote_media_channel_error: std::sync::Mutex::new(None),
+            remote_voice_forwarder: std::sync::Mutex::new(None),
             remote_playback_control: tokio::sync::Mutex::new(
                 super::RemotePlaybackControlState::default(),
             ),
@@ -7152,7 +10532,12 @@ mod tests {
     #[cfg(feature = "ssh-device")]
     #[derive(Clone)]
     struct TauriTestForwardSshServer {
-        gateway: std::net::SocketAddr, // gateway（测试时由 SSH direct-tcpip 转发到的本机产品网关）。
+        gateway: std::net::SocketAddr, // gateway（测试时固定 exec 桥接连接的回环产品网关）。
+        channels: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<russh::ChannelId, russh::Channel<russh::server::Msg>>,
+            >,
+        >, // channels（只暂存已接受的测试 SSH 会话通道）。
     }
 
     #[cfg(feature = "ssh-device")]
@@ -7168,6 +10553,18 @@ mod tests {
     impl russh::server::Handler for TauriTestForwardSshServer {
         type Error = russh::Error;
 
+        async fn channel_open_session(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let channel_id = channel.id();
+            self.channels.lock().await.insert(channel_id, channel);
+            reply.accept().await;
+            Ok(())
+        }
+
         async fn auth_publickey(
             &mut self,
             _user: &str,
@@ -7176,23 +10573,32 @@ mod tests {
             Ok(russh::server::Auth::Accept)
         }
 
-        async fn channel_open_direct_tcpip(
+        async fn exec_request(
             &mut self,
-            channel: russh::Channel<russh::server::Msg>,
-            host_to_connect: &str,
-            port_to_connect: u32,
-            _originator_address: &str,
-            _originator_port: u32,
-            reply: russh::server::ChannelOpenHandle,
-            _session: &mut russh::server::Session,
+            channel_id: russh::ChannelId,
+            command: &[u8],
+            session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
-            if host_to_connect != "127.0.0.1" || port_to_connect != u32::from(self.gateway.port()) {
+            if command != b"voice-terminal-v1-control" && command != b"voice-terminal-v1-media" {
+                self.channels.lock().await.remove(&channel_id);
+                let _ = session.channel_failure(channel_id);
                 return Ok(());
             }
-            let mut target = tokio::net::TcpStream::connect(self.gateway).await?;
-            reply.accept().await;
+            let Some(channel) = self.channels.lock().await.remove(&channel_id) else {
+                let _ = session.channel_failure(channel_id);
+                return Ok(());
+            };
+            let target = match tokio::net::TcpStream::connect(self.gateway).await {
+                Ok(target) => target,
+                Err(_) => {
+                    let _ = session.channel_failure(channel_id);
+                    return Ok(());
+                }
+            };
+            let _ = session.channel_success(channel_id);
             tokio::spawn(async move {
                 let mut channel = channel.into_stream();
+                let mut target = target;
                 let _ = tokio::io::copy_bidirectional(&mut channel, &mut target).await;
             });
             Ok(())
@@ -7229,7 +10635,10 @@ mod tests {
             let task = tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
                 let address = listener.local_addr()?;
-                let mut server = TauriTestForwardSshServer { gateway };
+                let mut server = TauriTestForwardSshServer {
+                    gateway,
+                    channels: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                };
                 let running =
                     russh::server::Server::run_on_socket(&mut server, host_config, &listener);
                 let handle = running.handle();
@@ -7289,8 +10698,8 @@ mod tests {
                 port
             }
 
-            // 产品 API（应用程序接口）将受保护网关固定监听在 18765 端口。
-            let gateway_port = voice_desktop_common::ssh_device::DEFAULT_GATEWAY_PORT;
+            // 集成测试为每个独立 Python 网关分配回环临时端口，避免并行测试互相抢占 18765。
+            let gateway_port = available_port().await;
             let control_port = available_port().await;
             let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../..")
@@ -7304,16 +10713,22 @@ mod tests {
                 .current_dir(&repository)
                 .env("VOICE_DEVICE_E2E_ID", "test-device")
                 .env("VOICE_DEVICE_E2E_PUBLIC_KEY", public_key)
+                .env("VOICE_TERMINAL_HOST_ID", "test-host")
                 .env("VOICE_DEVICE_E2E_GATEWAY_PORT", gateway_port.to_string())
                 .env("VOICE_DEVICE_E2E_CONTROL_PORT", control_port.to_string())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("本机 Python 产品网关集成夹具应启动");
             for _ in 0..200 {
                 if let Some(status) = child.try_wait().expect("读取 Python 产品网关状态失败")
                 {
-                    panic!("Python 产品网关集成夹具提前退出：{status}");
+                    use std::io::Read;
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    panic!("Python 产品网关集成夹具提前退出：{status}；{stderr}");
                 }
                 let gateway_ready = TcpStream::connect(("127.0.0.1", gateway_port))
                     .await
@@ -7435,6 +10850,32 @@ mod tests {
             assert_eq!(lease.device_id, "test-device");
             assert_eq!(lease.connection_generation, 1);
             assert_eq!(lease.executor_generation, 1);
+
+            let management_request_id = "a".repeat(32);
+            let management = manager.post_json("/v1/management", &serde_json::json!({
+                "protocol_version":1,
+                "request_id":management_request_id,
+                "target_host_id":"test-host",
+                "session_generation":lease.connection_generation,
+                "operation":"product.snapshot",
+                "arguments":{},
+                "fields":{
+                    "protocol_version":"远程管理协议版本",
+                    "request_id":"唯一操作编号",
+                    "target_host_id":"目标服务端设备编号",
+                    "session_generation":"当前管理会话代次",
+                    "operation":"固定业务操作编号",
+                    "arguments":"类型化操作参数",
+                },
+            }), Duration::from_secs(10)).await
+                .expect("固定 SSH 通道应把远程产品读取送到服务端业务处理器");
+            assert_eq!(management.status, 200);
+            assert_eq!(management.body["request_id"], "a".repeat(32));
+            assert_eq!(management.body["target_host_id"], "test-host");
+            assert_eq!(management.body["session_generation"], lease.connection_generation);
+            assert_eq!(management.body["operation"], "product.snapshot");
+            assert_eq!(management.body["status"], 200);
+            assert!(management.body["body"]["settings"].is_object());
 
             let mut events = std::collections::BTreeMap::new();
             events.insert("cancel_accepted".into(), 9_000_000);
@@ -7633,13 +11074,11 @@ mod tests {
                 ));
             let receipt_journal = DeviceTaskReceiptJournal::new(journal_root.clone());
             receipt_journal.record(&task, &outcome).unwrap();
-            assert!(
-                desktop
-                    .ssh_device
-                    .close_remote_device_session(&first_lease, Duration::from_secs(5),)
-                    .await
-                    .unwrap()
-            );
+            assert!(desktop
+                .ssh_device
+                .close_remote_device_session(&first_lease, Duration::from_secs(5),)
+                .await
+                .unwrap());
 
             let unknown = loop {
                 let (status, body) = gateway
@@ -7685,12 +11124,10 @@ mod tests {
                 )
                 .await
                 .expect("Tauri 客户端应只把持久回执结算到原任务");
-            assert!(
-                receipt_journal
-                    .pending_for_device("test-device")
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(receipt_journal
+                .pending_for_device("test-device")
+                .unwrap()
+                .is_empty());
 
             let (status, settled) = gateway
                 .request("GET", "/__test__/receipt-reconciliation-status")
@@ -7869,7 +11306,7 @@ mod tests {
 
     #[test]
     fn startup_only_admits_the_controlled_swapped_resource_transaction() {
-        use super::{ServiceStartKind, pending_start_transaction};
+        use super::{pending_start_transaction, ServiceStartKind};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../.local/tmp")
             .join(format!(
@@ -8009,19 +11446,15 @@ mod tests {
                     "启动前密钥命令缺少权限：{command}"
                 );
             }
-            assert!(
-                authority
-                    .resolve_access(command, "foreign", "foreign", &tauri::ipc::Origin::Local)
-                    .is_none()
-            );
+            assert!(authority
+                .resolve_access(command, "foreign", "foreign", &tauri::ipc::Origin::Local)
+                .is_none());
             let origin = tauri::ipc::Origin::Remote {
                 url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap(),
             }; // origin（尚未授权的业务页面来源）。
-            assert!(
-                authority
-                    .resolve_access(command, "main", "main", &origin)
-                    .is_none()
-            );
+            assert!(authority
+                .resolve_access(command, "main", "main", &origin)
+                .is_none());
         }
     }
 
@@ -8047,6 +11480,11 @@ mod tests {
                 "device_worker_playback_stop",
                 "device_config_status",
                 "device_config_save",
+                "device_discovery_search",
+                "device_pairing_window_open",
+                "device_pairing_window_close",
+                "device_pairing_window_status",
+                "device_pairing_connect",
                 "device_ssh_probe",
                 "device_ssh_identity_create",
                 "device_ssh_identity_status",
@@ -8057,15 +11495,33 @@ mod tests {
                 "device_ssh_connect",
                 "device_ssh_pairing_request",
                 "device_ssh_request",
+                "device_ssh_management_request",
+                "device_ssh_import_start",
+                "device_ssh_import_cancel",
+                "device_ssh_tts_asset_import",
+                "device_ssh_tts_asset_audio",
                 "device_ssh_disconnect",
                 "device_ssh_status",
                 "device_ssh_task_channel",
                 "device_ssh_media_channel",
+                "device_ssh_voice_forwarder",
             ] {
                 let startup_access = authority
                     .resolve_access(command, "startup", "startup", &tauri::ipc::Origin::Local)
                     .is_some();
-                assert_eq!(startup_access, command != "device_ssh_pairing_request");
+                let startup_expected = !matches!(
+                    command,
+                    "device_ssh_pairing_request"
+                        | "device_ssh_import_start"
+                        | "device_ssh_import_cancel"
+                        | "device_ssh_tts_asset_import"
+                        | "device_ssh_tts_asset_audio"
+                        | "device_ssh_voice_forwarder"
+                );
+                assert_eq!(
+                    startup_access, startup_expected,
+                    "启动页权限与产品页专属操作分离：{command}"
+                );
                 let owned = tauri::ipc::Origin::Remote {
                     url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap(),
                 };
@@ -8086,11 +11542,9 @@ mod tests {
                 let foreign = tauri::ipc::Origin::Remote {
                     url: tauri::Url::parse("http://127.0.0.1:45002/").unwrap(),
                 };
-                assert!(
-                    authority
-                        .resolve_access(command, "main", "main", &foreign)
-                        .is_none()
-                );
+                assert!(authority
+                    .resolve_access(command, "main", "main", &foreign)
+                    .is_none());
             }
         }
     }
@@ -8133,20 +11587,16 @@ mod tests {
                         .is_some(),
                     mode == FrontendMode::Product
                 );
-                assert!(
-                    authority
-                        .resolve_access(command, "startup", "startup", &owned)
-                        .is_none()
-                );
+                assert!(authority
+                    .resolve_access(command, "startup", "startup", &owned)
+                    .is_none());
                 for address in ["http://127.0.0.1:45002/", "https://example.com/"] {
                     let foreign = tauri::ipc::Origin::Remote {
                         url: tauri::Url::parse(address).unwrap(),
                     }; // foreign（其他实例或外部页面）。
-                    assert!(
-                        authority
-                            .resolve_access(command, "main", "main", &foreign)
-                            .is_none()
-                    );
+                    assert!(authority
+                        .resolve_access(command, "main", "main", &foreign)
+                        .is_none());
                 }
             }
         }
@@ -8195,21 +11645,15 @@ mod tests {
                 "其他来源不应拥有悬浮窗权限：{command}"
             );
         }
-        assert!(
-            authority
-                .resolve_access("publish_floating_model", "main", "main", &origin)
-                .is_some()
-        );
-        assert!(
-            authority
-                .resolve_access("publish_floating_model", "floating", "floating", &origin)
-                .is_none()
-        );
-        assert!(
-            authority
-                .resolve_access("exit_application", "floating", "floating", &origin)
-                .is_none()
-        );
+        assert!(authority
+            .resolve_access("publish_floating_model", "main", "main", &origin)
+            .is_some());
+        assert!(authority
+            .resolve_access("publish_floating_model", "floating", "floating", &origin)
+            .is_none());
+        assert!(authority
+            .resolve_access("exit_application", "floating", "floating", &origin)
+            .is_none());
     }
 
     #[test]
@@ -8475,8 +11919,8 @@ mod tests {
     #[test]
     fn remote_playback_worker_adapter_starts_snapshots_and_queues_in_order() {
         use super::{
-            MAX_REMOTE_PLAYBACK_KEYS, PlaybackSnapshotBaseline, PlaybackSnapshotView,
-            RemotePlaybackControlState, enqueue_remote_playback_to_worker,
+            enqueue_remote_playback_to_worker, PlaybackSnapshotBaseline, PlaybackSnapshotView,
+            RemotePlaybackControlState, MAX_REMOTE_PLAYBACK_KEYS,
         };
         use std::collections::HashMap;
         use std::sync::atomic::AtomicUsize;
@@ -8484,7 +11928,7 @@ mod tests {
         use voice_desktop_common::device_protocol::PlaybackMediaHeader;
 
         let header = |sequence, start_sample| PlaybackMediaHeader {
-            protocol_version: 1,
+            protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
             direction: "playback".into(),
             device_id: "device-a".into(),
             delivery_device_id: "device-a".into(),
@@ -8616,17 +12060,17 @@ mod tests {
     #[test]
     fn remote_playback_frame_injected_endpoint_queues_and_emits_receipts() {
         use super::{
+            process_remote_playback_frame_for_lease, remote_playback_progress_value,
             PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            RemotePlaybackFrameOutcome, process_remote_playback_frame_for_lease,
-            remote_playback_progress_value,
+            RemotePlaybackFrameOutcome,
         };
         use std::collections::HashMap;
         use std::sync::atomic::AtomicUsize;
         use std::sync::{Arc, Mutex};
-        use voice_desktop_common::device_protocol::{PlaybackMediaHeader, encode_playback_frame};
+        use voice_desktop_common::device_protocol::{encode_playback_frame, PlaybackMediaHeader};
 
         let header = PlaybackMediaHeader {
-            protocol_version: 1,
+            protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
             direction: "playback".into(),
             device_id: "device-a".into(),
             delivery_device_id: "device-a".into(),
@@ -8779,44 +12223,42 @@ mod tests {
         let start_count = forbidden_calls.clone();
         let snapshot_count = forbidden_calls.clone();
         let enqueue_count = forbidden_calls.clone();
-        assert!(
-            runtime
-                .block_on(process_remote_playback_frame_for_lease(
-                    &next_bytes,
-                    "device-a",
-                    "core-a",
-                    "media-a",
-                    2,
-                    3,
-                    4,
-                    &mut next_sequence,
-                    &mut sample_positions,
-                    &mut latest_sequences,
-                    &mut control,
-                    &mut baselines,
-                    &mut started,
-                    move || async move {
-                        start_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    },
-                    move || async move {
-                        snapshot_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(PlaybackSnapshotView {
-                            enqueued_ms: 20,
-                            played_ms: 20,
-                            buffered_ms: 0,
-                            output_estimated_ms: 20,
-                            started: true,
-                            device_time_us: 9_020_000,
-                        })
-                    },
-                    move |_playback_key, _sample_rate, _pcm| async move {
-                        enqueue_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    },
-                ))
-                .is_err()
-        );
+        assert!(runtime
+            .block_on(process_remote_playback_frame_for_lease(
+                &next_bytes,
+                "device-a",
+                "core-a",
+                "media-a",
+                2,
+                3,
+                4,
+                &mut next_sequence,
+                &mut sample_positions,
+                &mut latest_sequences,
+                &mut control,
+                &mut baselines,
+                &mut started,
+                move || async move {
+                    start_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+                move || async move {
+                    snapshot_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(PlaybackSnapshotView {
+                        enqueued_ms: 20,
+                        played_ms: 20,
+                        buffered_ms: 0,
+                        output_estimated_ms: 20,
+                        started: true,
+                        device_time_us: 9_020_000,
+                    })
+                },
+                move |_playback_key, _sample_rate, _pcm| async move {
+                    enqueue_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            ))
+            .is_err());
         assert_eq!(forbidden_calls.load(Ordering::Acquire), 0);
 
         control.control_uncertain = false;
@@ -8827,44 +12269,42 @@ mod tests {
         let start_count = discontinuity_calls.clone();
         let snapshot_count = discontinuity_calls.clone();
         let enqueue_count = discontinuity_calls.clone();
-        assert!(
-            runtime
-                .block_on(process_remote_playback_frame_for_lease(
-                    &discontinuous_bytes,
-                    "device-a",
-                    "core-a",
-                    "media-a",
-                    2,
-                    3,
-                    4,
-                    &mut next_sequence,
-                    &mut sample_positions,
-                    &mut latest_sequences,
-                    &mut control,
-                    &mut baselines,
-                    &mut started,
-                    move || async move {
-                        start_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    },
-                    move || async move {
-                        snapshot_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(PlaybackSnapshotView {
-                            enqueued_ms: 20,
-                            played_ms: 20,
-                            buffered_ms: 0,
-                            output_estimated_ms: 20,
-                            started: true,
-                            device_time_us: 9_020_000,
-                        })
-                    },
-                    move |_playback_key, _sample_rate, _pcm| async move {
-                        enqueue_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    },
-                ))
-                .is_err()
-        );
+        assert!(runtime
+            .block_on(process_remote_playback_frame_for_lease(
+                &discontinuous_bytes,
+                "device-a",
+                "core-a",
+                "media-a",
+                2,
+                3,
+                4,
+                &mut next_sequence,
+                &mut sample_positions,
+                &mut latest_sequences,
+                &mut control,
+                &mut baselines,
+                &mut started,
+                move || async move {
+                    start_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+                move || async move {
+                    snapshot_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(PlaybackSnapshotView {
+                        enqueued_ms: 20,
+                        played_ms: 20,
+                        buffered_ms: 0,
+                        output_estimated_ms: 20,
+                        started: true,
+                        device_time_us: 9_020_000,
+                    })
+                },
+                move |_playback_key, _sample_rate, _pcm| async move {
+                    enqueue_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            ))
+            .is_err());
         assert_eq!(discontinuity_calls.load(Ordering::Acquire), 0);
         assert_eq!(next_sequence, 1);
     }
@@ -8873,18 +12313,18 @@ mod tests {
     #[test]
     fn remote_replacement_drops_old_and_unbound_frames_then_accepts_the_fixed_successor() {
         use super::{
+            process_remote_playback_frame_for_lease, remember_remote_replaced_key,
             PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
             RemotePlaybackFrameOutcome, RemoteReplacementBinding,
-            process_remote_playback_frame_for_lease, remember_remote_replaced_key,
         };
         use std::collections::HashMap;
         use std::sync::atomic::AtomicUsize;
         use std::sync::{Arc, Mutex};
-        use voice_desktop_common::device_protocol::{PlaybackMediaHeader, encode_playback_frame};
+        use voice_desktop_common::device_protocol::{encode_playback_frame, PlaybackMediaHeader};
 
         let make_frame = |key: &str, sequence: u64, start_sample: u64| {
             let header = PlaybackMediaHeader {
-                protocol_version: 1,
+                protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
                 direction: "playback".into(),
                 device_id: "device-a".into(),
                 delivery_device_id: "device-a".into(),
@@ -9073,9 +12513,9 @@ mod tests {
     #[test]
     fn remote_replacement_tasks_execute_once_and_reuse_the_settled_receipt() {
         use super::{
-            PlaybackSnapshotBaseline, RemotePlaybackControlState,
             execute_remote_playback_replacement_bind, execute_remote_playback_replacement_prepare,
-            execute_remote_playback_replacement_wait,
+            execute_remote_playback_replacement_wait, PlaybackSnapshotBaseline,
+            RemotePlaybackControlState,
         };
         use std::collections::HashMap;
         use voice_desktop_common::{
@@ -9248,8 +12688,8 @@ mod tests {
     #[test]
     fn remote_replacement_result_matches_the_strict_python_wire_shape() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            remote_replacement_result_value,
+            remote_replacement_result_value, PlaybackSnapshotBaseline, PlaybackSnapshotView,
+            RemotePlaybackControlState,
         };
         use std::collections::HashMap;
         use voice_desktop_common::wasapi_render::PlaybackReplacementProgress;
@@ -9321,10 +12761,10 @@ mod tests {
     #[test]
     fn remote_media_playback_frame_is_bound_to_lease_and_global_sequence() {
         use super::decode_remote_playback_frame_for_lease;
-        use voice_desktop_common::device_protocol::{PlaybackMediaHeader, encode_playback_frame};
+        use voice_desktop_common::device_protocol::{encode_playback_frame, PlaybackMediaHeader};
 
         let header = PlaybackMediaHeader {
-            protocol_version: 1,
+            protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
             direction: "playback".into(),
             device_id: "device-a".into(),
             delivery_device_id: "device-a".into(),
@@ -9354,52 +12794,46 @@ mod tests {
         wrong_target.device_id = "device-b".into();
         wrong_target.delivery_device_id = "device-b".into();
         let bytes = encode_playback_frame(&wrong_target, &pcm).unwrap();
-        assert!(
-            decode_remote_playback_frame_for_lease(
-                &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
-            )
-            .is_err()
-        );
+        assert!(decode_remote_playback_frame_for_lease(
+            &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
+        )
+        .is_err());
 
         let mut wrong_generation = header.clone();
         wrong_generation.executor_generation += 1;
         let bytes = encode_playback_frame(&wrong_generation, &pcm).unwrap();
-        assert!(
-            decode_remote_playback_frame_for_lease(
-                &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
-            )
-            .is_err()
-        );
+        assert!(decode_remote_playback_frame_for_lease(
+            &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
+        )
+        .is_err());
 
         let mut out_of_sequence = header.clone();
         out_of_sequence.sequence = 1;
         let bytes = encode_playback_frame(&out_of_sequence, &pcm).unwrap();
-        assert!(
-            decode_remote_playback_frame_for_lease(
-                &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
-            )
-            .is_err()
-        );
+        assert!(decode_remote_playback_frame_for_lease(
+            &bytes, "device-a", "core-a", "media-a", 2, 3, 4, 0,
+        )
+        .is_err());
     }
 
     #[cfg(feature = "ssh-device")]
     #[test]
     fn remote_playback_rejects_opus_that_was_not_negotiated() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            process_remote_playback_frame_for_lease,
+            process_remote_playback_frame_for_lease, PlaybackSnapshotBaseline,
+            PlaybackSnapshotView, RemotePlaybackControlState,
         };
         use std::collections::HashMap;
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
         use voice_desktop_common::device_protocol::{
-            AudioCodec, PlaybackMediaHeader, encode_playback_frame,
+            encode_playback_frame, AudioCodec, PlaybackMediaHeader,
         };
 
         let header = PlaybackMediaHeader {
-            protocol_version: 1,
+            protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
             direction: "playback".into(),
             device_id: "device-a".into(),
             delivery_device_id: "device-a".into(),
@@ -9487,13 +12921,13 @@ mod tests {
     #[test]
     fn remote_playback_decodes_opus_per_key_drops_pre_skip_once_and_advances_cancelled_frames() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            RemotePlaybackFrameOutcome, process_remote_playback_frame_for_lease,
+            process_remote_playback_frame_for_lease, PlaybackSnapshotBaseline,
+            PlaybackSnapshotView, RemotePlaybackControlState, RemotePlaybackFrameOutcome,
         };
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         use voice_desktop_common::{
-            device_protocol::{AudioCodec, PlaybackMediaHeader, encode_playback_frame},
+            device_protocol::{encode_playback_frame, AudioCodec, PlaybackMediaHeader},
             native_opus::{OpusDecoder, OpusEncoder},
         };
 
@@ -9525,7 +12959,7 @@ mod tests {
 
         let header = |sequence, start_sample, sample_count, payload: &[u8]| {
             let header = PlaybackMediaHeader {
-                protocol_version: 1,
+                protocol_version: voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
                 direction: "playback".into(),
                 device_id: "device-a".into(),
                 delivery_device_id: "device-a".into(),
@@ -9660,8 +13094,8 @@ mod tests {
     #[test]
     fn remote_playback_tracking_prunes_terminal_maps_and_bounds_tombstones() {
         use super::{
-            PlaybackSnapshotBaseline, RemotePlaybackControlState, prune_remote_playback_tracking,
-            remember_remote_stopped_key,
+            prune_remote_playback_tracking, remember_remote_stopped_key, PlaybackSnapshotBaseline,
+            RemotePlaybackControlState,
         };
         use std::collections::HashMap;
 
@@ -9740,8 +13174,8 @@ mod tests {
     #[cfg(feature = "ssh-device")]
     #[test]
     fn remote_playback_pause_resume_is_idempotent_and_quarantines_unknown() {
-        use super::{RemotePlaybackControlState, execute_remote_playback_transition};
-        use std::sync::{Arc, atomic::AtomicUsize};
+        use super::{execute_remote_playback_transition, RemotePlaybackControlState};
+        use std::sync::{atomic::AtomicUsize, Arc};
         use voice_desktop_common::ssh_device::RemoteDeviceTask;
 
         let task = RemoteDeviceTask {
@@ -9815,20 +13249,18 @@ mod tests {
 
         let untouched = Arc::new(AtomicUsize::new(0));
         let callback_count = untouched.clone();
-        assert!(
-            runtime
-                .block_on(execute_remote_playback_transition(
-                    &mut control,
-                    &task,
-                    "speech-a".into(),
-                    false,
-                    move || async move {
-                        callback_count.fetch_add(1, Ordering::AcqRel);
-                        Ok(())
-                    },
-                ))
-                .is_err()
-        );
+        assert!(runtime
+            .block_on(execute_remote_playback_transition(
+                &mut control,
+                &task,
+                "speech-a".into(),
+                false,
+                move || async move {
+                    callback_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                },
+            ))
+            .is_err());
         assert_eq!(untouched.load(Ordering::Acquire), 0);
     }
 
@@ -9836,8 +13268,8 @@ mod tests {
     #[test]
     fn remote_stop_task_stops_only_the_current_matching_playback_key() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            execute_remote_playback_stop,
+            execute_remote_playback_stop, PlaybackSnapshotBaseline, PlaybackSnapshotView,
+            RemotePlaybackControlState,
         };
         use voice_desktop_common::ssh_device::RemoteDeviceTask;
         let task = RemoteDeviceTask {
@@ -9909,8 +13341,8 @@ mod tests {
     #[test]
     fn remote_stop_task_rejects_a_different_key_without_stopping_output() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            execute_remote_playback_stop,
+            execute_remote_playback_stop, PlaybackSnapshotBaseline, PlaybackSnapshotView,
+            RemotePlaybackControlState,
         };
         use voice_desktop_common::ssh_device::RemoteDeviceTask;
         let task = RemoteDeviceTask {
@@ -9979,8 +13411,8 @@ mod tests {
     #[test]
     fn remote_stop_uncertain_result_quarantines_late_audio_frames() {
         use super::{
-            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
-            execute_remote_playback_stop,
+            execute_remote_playback_stop, PlaybackSnapshotBaseline, PlaybackSnapshotView,
+            RemotePlaybackControlState,
         };
         use voice_desktop_common::ssh_device::RemoteDeviceTask;
         let task = RemoteDeviceTask {

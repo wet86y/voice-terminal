@@ -7,6 +7,8 @@ use std::{
 };
 
 pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
+#[cfg(feature = "ssh-device")]
+pub mod client_tts; // client_tts（无 Python 客户端 MiniMax 双向流式语音合成）。
 pub mod compatibility; // compatibility（兼容性组件）：版本化规则、安装迁移与即时组件盘点。
 pub mod component_maintenance; // component_maintenance（组件校验交接）：分发器检查，本体组件列表修复。
 pub mod component_recovery; // component_recovery（组件共用恢复）：分类重试、局部重建和全面校验导流。
@@ -14,15 +16,23 @@ pub mod component_reset; // component_reset（原生组件重置）。
 mod component_upgrade; // component_upgrade（组件兼容迁移）：由本体资源任务复用随包资源并处置旧版资料。
 pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
 pub mod device_audio; // device_audio（原生音频端点）：读取 WASAPI 默认端点格式，不采集或播放。
+#[cfg(feature = "ssh-device")]
+pub mod device_bridge; // device_bridge（SSH 强制命令早期入口，只访问固定回环业务网关）。
 pub mod device_config; // device_config（设备配置）：独立格式及保留原件的兼容校验。
 #[cfg(feature = "ssh-device")]
-pub mod device_receipts; // device_receipts（设备任务回执）：断线后保留结果并按原编号恢复结算。
-#[cfg(feature = "ssh-device")]
-pub mod client_tts; // client_tts（无 Python 客户端 MiniMax 双向流式语音合成）。
+pub mod device_discovery; // device_discovery（局域网 mDNS 发现）：公告固定能力和服务身份，不公布密钥。
+pub mod device_file_channel; // device_file_channel（独立 SSH FILE 通道）：有界分块、摘要和强制命令前导校验。
 pub mod device_files; // device_files（设备文件任务）：安全目录清单和受限小文件读取。
 pub mod device_helper; // device_helper（设备桌面辅助进程）：受管管道与生命周期。
+pub mod device_management_contract; // device_management_contract（设备管理契约）：独立会话、固定操作请求和字段说明。
+#[cfg(feature = "ssh-device")]
+pub mod device_pairing; // device_pairing（原生 OPAQUE 六位码配对）：不在网络传送明文配对码。
 pub mod device_protocol; // device_protocol（设备音频协议）：原生侧有界二进制封装。
+#[cfg(feature = "ssh-device")]
+pub mod device_receipts; // device_receipts（设备任务回执）：断线后保留结果并按原编号恢复结算。
 pub mod device_terminal; // device_terminal（设备终端）：会话化、只读命令任务与增量输出。
+#[cfg(feature = "ssh-device")]
+pub mod device_trust; // device_trust（原生设备信任唯一写入者，兼容 Python 只读格式）。
 pub mod device_worker; // device_worker（设备工作进程）：不加载解释器的有界控制入口。
 pub mod download;
 pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
@@ -32,20 +42,21 @@ pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志�
 #[cfg(all(windows, feature = "native-audio"))]
 pub mod native_aec; // native_aec（原生 WebRTC AEC）：固定 1.0.1 对应源码与 C ABI。
 #[cfg(all(windows, feature = "native-audio"))]
-pub mod native_opus; // native_opus（固定 libopus 1.6.1 编解码器）：原始 PCM 帧与 Opus 流适配。
-#[cfg(all(windows, feature = "native-audio"))]
 pub mod native_audio_processing; // native_audio_processing（采集、AEC、降噪与近端 VAD 汇接）。
+#[cfg(all(windows, feature = "native-audio"))]
+pub mod native_opus; // native_opus（固定 libopus 1.6.1 编解码器）：原始 PCM 帧与 Opus 流适配。
 pub mod native_ui;
 #[cfg(windows)]
 pub mod native_vad; // native_vad（原生 WebRTC VAD）：静态链接固定 C 源码，不加载 Python。
 pub mod process_host;
+pub mod remote_import_contract; // remote_import_contract（远程导入契约）：服务端暂存编号、相对路径清单及摘要边界。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
-pub mod system_feature; // system_feature（系统功能）：共享主机专用的 Windows 能力查询与受管任务。
 mod runtime_delta; // runtime_delta（依赖文件增量）：保持未变化文件，支持卸载与崩溃回滚。
 pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
 #[cfg(feature = "ssh-device")]
 pub mod ssh_device; // ssh_device（固定主机指纹的原生 SSH 业务通道）。
+pub mod system_feature; // system_feature（系统功能）：共享主机专用的 Windows 能力查询与受管任务。
 pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
 pub mod wasapi_capture; // wasapi_capture（WASAPI 采集流）：事件驱动默认麦克风及 PCM 帧转换。
 pub mod wasapi_render; // wasapi_render（WASAPI 播放流）：共享模式默认扬声器与有界 PCM 储备。
@@ -297,6 +308,27 @@ impl LaunchContext {
             }
             match arg.as_str() {
                 "--dev" | "--diagnostic" | "--exit" => {}
+                "--mode" | "--broadcast" => {
+                    i += 1;
+                    let selected = args
+                        .get(i)
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or_else(|| format!("启动参数缺少值：{arg}"))?;
+                    match arg.as_str() {
+                        "--mode" if !matches!(selected.as_str(), "local" | "remote") => {
+                            return Err(
+                                "--mode（运行模式）仅接受 local（本地运行）或 remote（远程配对）。"
+                                    .into(),
+                            )
+                        }
+                        "--broadcast" if !matches!(selected.as_str(), "on" | "off") => {
+                            return Err(
+                                "--broadcast（局域网广播）仅接受 on（开启）或 off（关闭）。".into(),
+                            )
+                        }
+                        _ => {}
+                    }
+                }
                 "--source-root" | "--startup-handoff" | "--workspace-handoff" => {
                     i += 1;
                     if args.get(i).is_none_or(|value| value.starts_with("--")) {
@@ -306,6 +338,14 @@ impl LaunchContext {
                 _ => return Err(format!("不支持的正式启动参数：{arg}")),
             }
             i += 1;
+        }
+        let selected_mode = value("--mode");
+        let selected_broadcast = value("--broadcast");
+        if selected_broadcast.as_deref() == Some("on") && selected_mode.as_deref() == Some("remote")
+        {
+            return Err(
+                "--mode remote（远程配对）不能与 --broadcast on（开启本机广播）同时使用。".into(),
+            );
         }
         let parent = executable.parent().ok_or("无法定位正式程序目录")?;
         let root = if parent.join("portable.json").is_file() {
@@ -1429,6 +1469,49 @@ mod tests {
         assert!(normal.webview2.is_none());
         assert!(install.join("runtimes/webview2/preserved.bin").is_file());
         assert!(LaunchContext::from_executable(&exe, &["--dev".into()]).is_err());
+        assert!(LaunchContext::from_executable(
+            &exe,
+            &[
+                "--mode".into(),
+                "local".into(),
+                "--broadcast".into(),
+                "on".into()
+            ],
+        )
+        .is_ok());
+        assert!(LaunchContext::from_executable(
+            &exe,
+            &[
+                "--mode".into(),
+                "remote".into(),
+                "--broadcast".into(),
+                "on".into()
+            ],
+        )
+        .is_err());
+        assert!(LaunchContext::from_executable(
+            &exe,
+            &[
+                "--mode".into(),
+                "remote".into(),
+                "--broadcast".into(),
+                "off".into()
+            ],
+        )
+        .is_ok());
+        assert!(LaunchContext::from_executable(
+            &exe,
+            &[
+                "--mode".into(),
+                "local".into(),
+                "--mode".into(),
+                "remote".into()
+            ],
+        )
+        .is_err());
+        assert!(
+            LaunchContext::from_executable(&exe, &["--broadcast".into(), "maybe".into()],).is_err()
+        );
         assert!(LaunchContext::from_executable(&exe, &["--source-root".into()]).is_err());
         assert!(LaunchContext::from_executable(
             &exe,

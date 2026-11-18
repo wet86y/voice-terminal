@@ -7,7 +7,8 @@ use voice_desktop_common::credentials::{self, CredentialUpdate};
 
 fn allowed(window: &WebviewWindow, desktop: &Desktop) -> Result<(), String> {
     super::trusted(window, desktop)?;
-    super::require_command(desktop.mode, super::DesktopCommand::FocusMain)
+    super::require_command(desktop.mode, super::DesktopCommand::FocusMain)?;
+    super::require_local_device_target(desktop)
 }
 #[tauri::command]
 pub async fn audio_enhancements_settings(

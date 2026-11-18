@@ -1,4 +1,4 @@
-"""Client-aware MiniMax TTS（按当前语音设备选择本机凭据合成）。"""
+"""Client-aware MiniMax TTS（由服务端授权客户端原生直接合成）。"""
 from __future__ import annotations
 
 from typing import Any
@@ -8,7 +8,7 @@ from ..tts.capabilities import TtsCapabilities
 
 
 class ClientAwareMiniMaxTtsClient:
-    """ClientAwareMiniMaxTtsClient（优先使用活跃客户端凭据，缺少能力时使用主机后端）。"""
+    """ClientAwareMiniMaxTtsClient（服务端权威持有 MiniMax 凭据并授权客户端直放）。"""
 
     supports_speech_controls = True  # supports_speech_controls（原生支持语速、音量与情绪）。
 
@@ -83,12 +83,26 @@ class ClientAwareMiniMaxTtsClient:
         active = self.runtime.active_remote_client_tts_outbox()
         if active is None:
             if self.fallback is None:
-                raise RuntimeError("当前没有具备客户端凭据的活跃语音设备，也没有主机 MiniMax 凭据。")
+                raise RuntimeError("当前没有在线客户端，且没有服务端 MiniMax 凭据。")
             return self.fallback
         lease, outbox = active
+        credential = self._server_credential()
+        if not credential:
+            raise RuntimeError("服务端没有 MiniMax 凭据，不能授权客户端直放。")
         return _BoundClientTtsClient(
             runtime=self.runtime, lease=lease, outbox=outbox, config=self.config,
+            credential=credential,
         )
+
+    def _server_credential(self) -> str:
+        """_server_credential（读取服务端运行时凭据）：仅在活跃远端语音事务开始时调用。"""
+        getter = getattr(self.runtime, "_api_key", None)
+        if callable(getter):
+            value = getter(self.config.api_key_env)
+            return value if isinstance(value, str) else ""
+        client = getattr(self.fallback, "client", None)
+        value = getattr(client, "api_key", "")
+        return value if isinstance(value, str) else ""
 
     async def close(self) -> None:
         """close（关闭 provider）：事务会话由原语音所有者单独收尾。"""
@@ -102,8 +116,9 @@ class _BoundClientTtsClient:
     uses_client_tts = True  # uses_client_tts（必须将播放键传入客户端合成会话）。
     supports_speech_controls = True  # supports_speech_controls（支持原生控制值）。
     transport = "websocket_bidi"  # transport（客户端 MiniMax 双向合成通道）。
-    scheduling = "direct"  # scheduling（按 PCM 回传直接播放）。
-    effective_scheduling = "direct"  # effective_scheduling（实际调度策略）。
+    scheduling = "direct"  # scheduling（把受授权文本直接送到客户端播放器事务）。
+    effective_scheduling = "direct"  # effective_scheduling（实际客户端原生直放策略）。
+    direct_playback = True  # direct_playback（PCM 只在客户端合成并进入设备播放器）。
     playback_startup_buffer_ms = 0  # playback_startup_buffer_ms（无额外起播储备）。
     playback_resume_buffer_ms = 0  # playback_resume_buffer_ms（无额外恢复储备）。
     sentence_prefetch_ms = 3000  # sentence_prefetch_ms（短句调度配置兼容字段）。
@@ -112,11 +127,12 @@ class _BoundClientTtsClient:
     first_clause_timeout_ms = 400  # first_clause_timeout_ms（首句调度兼容字段）。
     capabilities = TtsCapabilities(cancellation=True)  # capabilities（客户端取消由媒体回执确认）。
 
-    def __init__(self, *, runtime: Any, lease: Any, outbox: Any, config: Any) -> None:
+    def __init__(self, *, runtime: Any, lease: Any, outbox: Any, config: Any, credential: str) -> None:
         self.runtime = runtime  # runtime（核心播放事务绑定入口）。
         self.lease = lease  # lease（固定连接、执行器与语音占用代次）。
         self.outbox = outbox  # outbox（固定媒体租约的双向合成队列）。
         self.config = config  # config（provider 固定参数）。
+        self._credential = credential  # _credential（服务端供应商凭据，只用于临时授权消息）。
         self.sample_rate = int(getattr(config, "online_sample_rate", None) or config.sample_rate)
 
     async def prepare_speech_controls(self, controls, *, detach_active: bool = False) -> None:
@@ -150,9 +166,12 @@ class _BoundClientTtsClient:
             selected_emotion = None
         speed = float(getattr(controls, "speed", 1.0))
         volume = float(getattr(controls, "volume", 1.0))
+        credential = self._credential
+        self._credential = ""
         return RemoteClientTtsSession(
             runtime=self.runtime, lease=self.lease, outbox=self.outbox,
-            playback_key=playback_key, model=self.config.model, voice_id=self.config.voice_id,
+            playback_key=playback_key, credential=credential,
+            model=self.config.model, voice_id=self.config.voice_id,
             sample_rate=self.sample_rate, emotion=selected_emotion, speed=speed, volume=volume,
             controls=controls,
         )

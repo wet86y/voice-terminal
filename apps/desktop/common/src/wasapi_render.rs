@@ -1,5 +1,8 @@
 //! WASAPI render（WASAPI 播放）：有界的默认输出端点共享模式 PCM 播放流。
-use std::{collections::{BTreeMap, HashSet, VecDeque}, time::Instant};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    time::Instant,
+};
 
 use crate::wasapi_capture::{CaptureFormat, SampleEncoding};
 
@@ -20,47 +23,54 @@ pub struct PlaybackSnapshot {
 /// PlaybackReplacementProgress（替换状态）：只跨 IPC 传编号、时钟与结算字段。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlaybackReplacementProgress {
-    pub replacement_id: String, // replacement_id（替换事务编号）。
+    pub replacement_id: String,   // replacement_id（替换事务编号）。
     pub old_playback_key: String, // old_playback_key（固定旧播放键）。
     pub successor_playback_key: Option<String>, // successor_playback_key（已绑定的后继播放键）。
-    pub reason: Option<String>, // reason（替换结束原因）。
+    pub reason: Option<String>,   // reason（替换结束原因）。
     pub started_device_time_us: u64, // started_device_time_us（受理替换的设备时钟，微秒）。
     pub finished_device_time_us: Option<u64>, // finished_device_time_us（旧音出口结清时钟，微秒）。
     pub finished_output_estimated_ms: Option<u64>, // finished_output_estimated_ms（旧音结清时设备输出估计位置，毫秒）。
     pub events_device_time_us: BTreeMap<String, u64>, // events_device_time_us（替换阶段事件设备时钟，微秒）。
     pub attenuated_range_ms: [u32; 2], // attenuated_range_ms（旧音衰减不确定区间，毫秒）。
-    pub done: bool, // done（旧音设备输出是否已结清）。
+    pub done: bool,                    // done（旧音设备输出是否已结清）。
 }
 
 struct RenderPacket {
-    playback_key: String, // playback_key（固定播放事务编号）。
-    bytes: Vec<u8>, // bytes（按默认混音格式编码的音频帧）。
+    playback_key: String,     // playback_key（固定播放事务编号）。
+    bytes: Vec<u8>,           // bytes（按默认混音格式编码的音频帧）。
     head_offset_bytes: usize, // head_offset_bytes（首个尚未提交字节位置）。
 }
 
 struct RenderReplacement {
     progress: PlaybackReplacementProgress, // progress（跨进程可序列化的替换事实）。
-    sample_rate: u32, // sample_rate（输出端点采样率）。
-    block_align: usize, // block_align（输出端点每帧字节数）。
-    max_ms: u32, // max_ms（替换硬时限，毫秒）。
-    duration_frames: u64, // duration_frames（旧音普通衰减包络采样数）。
-    early_frames: u64, // early_frames（后继就绪后的 30 毫秒淡出/淡入采样数）。
+    sample_rate: u32,                      // sample_rate（输出端点采样率）。
+    block_align: usize,                    // block_align（输出端点每帧字节数）。
+    max_ms: u32,                           // max_ms（替换硬时限，毫秒）。
+    duration_frames: u64,                  // duration_frames（旧音普通衰减包络采样数）。
+    early_frames: u64,                     // early_frames（后继就绪后的 30 毫秒淡出/淡入采样数）。
     initial_endpoint_frames: u64, // initial_endpoint_frames（受理时已提交给端点的旧音储备）。
-    rendered_old_frames: u64, // rendered_old_frames（过渡后提交的旧音采样数）。
-    rendered_new_frames: u64, // rendered_new_frames（后继淡入已提交采样数）。
-    early_position: Option<u64>, // early_position（后继准备时旧音包络的位置）。
-    early_gain: f64, // early_gain（后继提前接入时旧音当前增益）。
-    initial_played_ms: u64, // initial_played_ms（受理时的累计端点提交时长）。
+    rendered_old_frames: u64,     // rendered_old_frames（过渡后提交的旧音采样数）。
+    rendered_new_frames: u64,     // rendered_new_frames（后继淡入已提交采样数）。
+    early_position: Option<u64>,  // early_position（后继准备时旧音包络的位置）。
+    early_gain: f64,              // early_gain（后继提前接入时旧音当前增益）。
+    initial_played_ms: u64,       // initial_played_ms（受理时的累计端点提交时长）。
     completion_output_estimated_ms: u64, // completion_output_estimated_ms（旧音结清设备时钟目标）。
-    started_at: Instant, // started_at（本机单调时钟受理时刻）。
+    started_at: Instant,          // started_at（本机单调时钟受理时刻）。
 }
 
 impl RenderReplacement {
     fn elapsed_frames(&self) -> u64 {
-        let wall_frames = (self.started_at.elapsed().as_nanos()
-            .saturating_mul(u128::from(self.sample_rate)) / 1_000_000_000)
+        let wall_frames = (self
+            .started_at
+            .elapsed()
+            .as_nanos()
+            .saturating_mul(u128::from(self.sample_rate))
+            / 1_000_000_000)
             .min(u128::from(u64::MAX)) as u64;
-        wall_frames.max(self.initial_endpoint_frames.saturating_add(self.rendered_old_frames))
+        wall_frames.max(
+            self.initial_endpoint_frames
+                .saturating_add(self.rendered_old_frames),
+        )
     }
 
     fn base_gain(&self, position: u64) -> f64 {
@@ -95,8 +105,15 @@ impl Pcm16RenderQueue {
         max_frames: u64,
     ) -> Result<(), String> {
         self.enqueue_for_key(
-            "local-playback", bytes, frames, block_align, max_frames,
-            0, 0, 0, 0,
+            "local-playback",
+            bytes,
+            frames,
+            block_align,
+            max_frames,
+            0,
+            0,
+            0,
+            0,
         )
     }
 
@@ -114,8 +131,13 @@ impl Pcm16RenderQueue {
         device_time_us: u64,
     ) -> Result<(), String> {
         let expected = frames.checked_mul(block_align).ok_or("播放数据长度溢出")?;
-        if playback_key.is_empty() || playback_key.len() > 128 || playback_key.trim() != playback_key
-                || frames == 0 || block_align == 0 || bytes.len() != expected {
+        if playback_key.is_empty()
+            || playback_key.len() > 128
+            || playback_key.trim() != playback_key
+            || frames == 0
+            || block_align == 0
+            || bytes.len() != expected
+        {
             return Err("播放数据必须包含完整音频帧".into());
         }
         if self.closed_keys.contains(playback_key) {
@@ -139,15 +161,18 @@ impl Pcm16RenderQueue {
                 let position = replacement.elapsed_frames();
                 replacement.early_position = Some(position);
                 replacement.early_gain = replacement.base_gain(position);
-                replacement.progress.events_device_time_us
-                    .entry("new_audio_ready".into()).or_insert(device_time_us);
+                replacement
+                    .progress
+                    .events_device_time_us
+                    .entry("new_audio_ready".into())
+                    .or_insert(device_time_us);
                 let old_key = replacement.progress.old_playback_key.clone();
                 early_handoff = Some((old_key, replacement.early_frames));
             }
         }
         if let Some((old_key, early_frames)) = early_handoff {
-            let queued_before_ms = self.queued_frames.saturating_mul(1_000)
-                / u64::from(sample_rate.max(1));
+            let queued_before_ms =
+                self.queued_frames.saturating_mul(1_000) / u64::from(sample_rate.max(1));
             let endpoint_ms = buffered_ms.saturating_sub(queued_before_ms);
             self.trim_key_frames(&old_key, early_frames, block_align);
             let retained = self.queued_frames_for_key(&old_key, block_align);
@@ -180,11 +205,16 @@ impl Pcm16RenderQueue {
         output_estimated_ms: u64,
         device_time_us: u64,
     ) -> Result<PlaybackReplacementProgress, String> {
-        if replacement_id.is_empty() || replacement_id.len() > 128
-                || replacement_id.trim() != replacement_id
-                || old_playback_key.is_empty() || old_playback_key.len() > 128
-                || old_playback_key.trim() != old_playback_key
-                || !(1..=600).contains(&max_ms) || sample_rate == 0 || block_align == 0 {
+        if replacement_id.is_empty()
+            || replacement_id.len() > 128
+            || replacement_id.trim() != replacement_id
+            || old_playback_key.is_empty()
+            || old_playback_key.len() > 128
+            || old_playback_key.trim() != old_playback_key
+            || !(1..=600).contains(&max_ms)
+            || sample_rate == 0
+            || block_align == 0
+        {
             return Err("替换编号、播放键、时长或输出格式无效".into());
         }
         if let Some(existing) = self.replacement.as_ref() {
@@ -204,18 +234,22 @@ impl Pcm16RenderQueue {
         let duration_frames = (duration_ms * u64::from(sample_rate) / 1_000).max(1);
         let software_queued_ms = self.queued_frames.saturating_mul(1_000) / u64::from(sample_rate);
         let endpoint_pending_ms = buffered_ms.saturating_sub(software_queued_ms);
-        let endpoint_pending_frames = endpoint_pending_ms.saturating_mul(u64::from(sample_rate)) / 1_000;
+        let endpoint_pending_frames =
+            endpoint_pending_ms.saturating_mul(u64::from(sample_rate)) / 1_000;
         let retained_limit = duration_frames.saturating_sub(endpoint_pending_frames);
         self.trim_key_frames(old_playback_key, retained_limit, block_align);
         self.remember_closed_key(old_playback_key);
         let retained_frames = self.queued_frames_for_key(old_playback_key, block_align);
-        let endpoint_pending_ms = endpoint_pending_frames.saturating_mul(1_000) / u64::from(sample_rate);
+        let endpoint_pending_ms =
+            endpoint_pending_frames.saturating_mul(1_000) / u64::from(sample_rate);
         let retained_ms = retained_frames.saturating_mul(1_000) / u64::from(sample_rate);
         let mut events = BTreeMap::new();
         events.insert("cancel_accepted".into(), device_time_us);
         let done = endpoint_pending_frames == 0 && retained_frames == 0;
         let reason = done.then(|| "no_remaining_audio".to_owned());
-        if done { events.insert("old_audio_silenced".into(), device_time_us); }
+        if done {
+            events.insert("old_audio_silenced".into(), device_time_us);
+        }
         let progress = PlaybackReplacementProgress {
             replacement_id: replacement_id.to_owned(),
             old_playback_key: old_playback_key.to_owned(),
@@ -225,8 +259,12 @@ impl Pcm16RenderQueue {
             finished_device_time_us: done.then_some(device_time_us),
             finished_output_estimated_ms: done.then_some(output_estimated_ms),
             events_device_time_us: events,
-            attenuated_range_ms: [played_ms.min(u64::from(u32::MAX)) as u32,
-                played_ms.saturating_add(retained_ms).min(u64::from(u32::MAX)) as u32],
+            attenuated_range_ms: [
+                played_ms.min(u64::from(u32::MAX)) as u32,
+                played_ms
+                    .saturating_add(retained_ms)
+                    .min(u64::from(u32::MAX)) as u32,
+            ],
             done,
         };
         self.replacement = Some(RenderReplacement {
@@ -243,7 +281,8 @@ impl Pcm16RenderQueue {
             early_gain: 0.0,
             initial_played_ms: played_ms,
             completion_output_estimated_ms: output_estimated_ms
-                .saturating_add(endpoint_pending_ms).saturating_add(retained_ms),
+                .saturating_add(endpoint_pending_ms)
+                .saturating_add(retained_ms),
             started_at: Instant::now(),
         });
         Ok(progress)
@@ -255,11 +294,15 @@ impl Pcm16RenderQueue {
         replacement_id: &str,
         successor_playback_key: &str,
     ) -> Result<bool, String> {
-        if successor_playback_key.is_empty() || successor_playback_key.len() > 128
-                || successor_playback_key.trim() != successor_playback_key {
+        if successor_playback_key.is_empty()
+            || successor_playback_key.len() > 128
+            || successor_playback_key.trim() != successor_playback_key
+        {
             return Err("替换后继播放键无效".into());
         }
-        let Some(replacement) = self.replacement.as_mut() else { return Ok(false) };
+        let Some(replacement) = self.replacement.as_mut() else {
+            return Ok(false);
+        };
         if replacement.progress.replacement_id != replacement_id {
             return Ok(false);
         }
@@ -282,8 +325,12 @@ impl Pcm16RenderQueue {
         output_estimated_ms: u64,
         block_align: usize,
     ) -> Result<Option<PlaybackReplacementProgress>, String> {
-        let Some(replacement) = self.replacement.as_ref() else { return Ok(None) };
-        if replacement.progress.replacement_id != replacement_id { return Ok(None); }
+        let Some(replacement) = self.replacement.as_ref() else {
+            return Ok(None);
+        };
+        if replacement.progress.replacement_id != replacement_id {
+            return Ok(None);
+        }
         let old_key = replacement.progress.old_playback_key.clone();
         let was_done = replacement.progress.done;
         if !was_done {
@@ -293,30 +340,39 @@ impl Pcm16RenderQueue {
             replacement.progress.finished_device_time_us = Some(device_time_us);
             replacement.progress.finished_output_estimated_ms = Some(output_estimated_ms);
             replacement.progress.done = true;
-            replacement.progress.events_device_time_us.insert("old_audio_silenced".into(), device_time_us);
+            replacement
+                .progress
+                .events_device_time_us
+                .insert("old_audio_silenced".into(), device_time_us);
         }
         Ok(self.replacement.as_ref().map(|item| item.progress.clone()))
     }
 
     /// replacement_status（读取替换状态）：只返回当前稳定编号及设备时钟事实。
     pub fn replacement_status(&self, replacement_id: &str) -> Option<PlaybackReplacementProgress> {
-        self.replacement.as_ref()
+        self.replacement
+            .as_ref()
             .filter(|item| item.progress.replacement_id == replacement_id)
             .map(|item| item.progress.clone())
     }
 
     /// update_output_progress（更新设备输出进度）：仅在旧键队列已空且设备时钟越过目标时结算。
     pub fn update_output_progress(&mut self, output_estimated_ms: u64, device_time_us: u64) {
-        let Some(pending) = self.replacement.as_ref() else { return };
-        if pending.progress.done { return; }
+        let Some(pending) = self.replacement.as_ref() else {
+            return;
+        };
+        if pending.progress.done {
+            return;
+        }
         let old_key = pending.progress.old_playback_key.clone();
         let block_align = pending.block_align;
         let target = pending.completion_output_estimated_ms;
-        if self.queued_frames_for_key(&old_key, block_align) != 0
-                || output_estimated_ms < target {
+        if self.queued_frames_for_key(&old_key, block_align) != 0 || output_estimated_ms < target {
             return;
         }
-        let Some(replacement) = self.replacement.as_mut() else { return };
+        let Some(replacement) = self.replacement.as_mut() else {
+            return;
+        };
         let reason = if replacement.early_position.is_some() {
             "early_handoff"
         } else if replacement.started_at.elapsed().as_millis() >= u128::from(replacement.max_ms) {
@@ -327,7 +383,10 @@ impl Pcm16RenderQueue {
         replacement.progress.reason = Some(reason.into());
         replacement.progress.finished_device_time_us = Some(device_time_us);
         replacement.progress.finished_output_estimated_ms = Some(output_estimated_ms);
-        replacement.progress.events_device_time_us.insert("old_audio_silenced".into(), device_time_us);
+        replacement
+            .progress
+            .events_device_time_us
+            .insert("old_audio_silenced".into(), device_time_us);
         replacement.progress.done = true;
     }
 
@@ -350,8 +409,14 @@ impl Pcm16RenderQueue {
         format: CaptureFormat,
         device_time_us: u64,
     ) -> Result<usize, String> {
-        self.fill_inner(destination, frames, format.block_align as usize,
-            silence_byte(format.encoding), Some(format), device_time_us)
+        self.fill_inner(
+            destination,
+            frames,
+            format.block_align as usize,
+            silence_byte(format.encoding),
+            Some(format),
+            device_time_us,
+        )
     }
 
     fn fill_inner(
@@ -363,20 +428,26 @@ impl Pcm16RenderQueue {
         format: Option<CaptureFormat>,
         device_time_us: u64,
     ) -> Result<usize, String> {
-        let requested_bytes = frames.checked_mul(block_align).ok_or("WASAPI 输出缓冲长度溢出")?;
+        let requested_bytes = frames
+            .checked_mul(block_align)
+            .ok_or("WASAPI 输出缓冲长度溢出")?;
         if block_align == 0 || destination.len() != requested_bytes {
             return Err("WASAPI 输出缓冲与音频帧布局不一致".into());
         }
         destination.fill(silence);
         let mut filled_frames = 0;
         while filled_frames < frames {
-            let Some(packet) = self.packets.front() else { break };
+            let Some(packet) = self.packets.front() else {
+                break;
+            };
             let key = packet.playback_key.clone();
             let source_start = packet.head_offset_bytes;
             let available_bytes = packet.bytes.len().saturating_sub(source_start);
             let available_frames = available_bytes / block_align;
             let count = available_frames.min(frames - filled_frames);
-            if count == 0 { return Err("播放队列中存在未对齐音频数据".into()); }
+            if count == 0 {
+                return Err("播放队列中存在未对齐音频数据".into());
+            }
             let source_end = source_start + count * block_align;
             let destination_start = filled_frames * block_align;
             let destination_end = destination_start + count * block_align;
@@ -387,7 +458,11 @@ impl Pcm16RenderQueue {
                     let gain = self.replacement_gain(&key, device_time_us);
                     if gain < 0.999_999 {
                         let frame_start = destination_start + frame_index * block_align;
-                        scale_encoded_frame(&mut destination[frame_start..frame_start + block_align], format, gain);
+                        scale_encoded_frame(
+                            &mut destination[frame_start..frame_start + block_align],
+                            format,
+                            gain,
+                        );
                     }
                 }
             }
@@ -395,14 +470,26 @@ impl Pcm16RenderQueue {
             self.queued_frames = self.queued_frames.saturating_sub(count as u64);
             let packet = self.packets.front_mut().expect("读取过的播放队列头仍存在");
             packet.head_offset_bytes = source_end;
-            if packet.head_offset_bytes == packet.bytes.len() { self.packets.pop_front(); }
+            if packet.head_offset_bytes == packet.bytes.len() {
+                self.packets.pop_front();
+            }
         }
         if let Some(replacement) = self.replacement.as_mut() {
             let now_us = device_time_us;
-            if replacement.progress.events_device_time_us.contains_key("new_audio_ready")
-                    && !replacement.progress.events_device_time_us.contains_key("new_audio_first_output")
-                    && replacement.rendered_new_frames > 0 {
-                replacement.progress.events_device_time_us.insert("new_audio_first_output".into(), now_us);
+            if replacement
+                .progress
+                .events_device_time_us
+                .contains_key("new_audio_ready")
+                && !replacement
+                    .progress
+                    .events_device_time_us
+                    .contains_key("new_audio_first_output")
+                && replacement.rendered_new_frames > 0
+            {
+                replacement
+                    .progress
+                    .events_device_time_us
+                    .insert("new_audio_first_output".into(), now_us);
             }
         }
         Ok(filled_frames)
@@ -414,26 +501,38 @@ impl Pcm16RenderQueue {
         };
         if playback_key == replacement.progress.old_playback_key {
             let position = replacement.elapsed_frames();
-            replacement.progress.events_device_time_us
-                .entry("first_attenuated_audio".into()).or_insert(device_time_us);
+            replacement
+                .progress
+                .events_device_time_us
+                .entry("first_attenuated_audio".into())
+                .or_insert(device_time_us);
             let gain = if let Some(early_position) = replacement.early_position {
                 let elapsed = position.saturating_sub(early_position);
-                replacement.early_gain * (1.0 - elapsed as f64 / replacement.early_frames as f64).max(0.0)
+                replacement.early_gain
+                    * (1.0 - elapsed as f64 / replacement.early_frames as f64).max(0.0)
             } else {
                 replacement.base_gain(position)
             };
             replacement.rendered_old_frames = replacement.rendered_old_frames.saturating_add(1);
             let attenuated_ms = replacement.rendered_old_frames.saturating_mul(1_000)
                 / u64::from(replacement.sample_rate);
-            replacement.progress.attenuated_range_ms[1] = replacement.initial_played_ms
-                .saturating_add(attenuated_ms).min(u64::from(u32::MAX)) as u32;
+            replacement.progress.attenuated_range_ms[1] = replacement
+                .initial_played_ms
+                .saturating_add(attenuated_ms)
+                .min(u64::from(u32::MAX))
+                as u32;
             gain
         } else if replacement.progress.successor_playback_key.as_deref() == Some(playback_key) {
-            replacement.progress.events_device_time_us
-                .entry("new_audio_first_output".into()).or_insert(device_time_us);
+            replacement
+                .progress
+                .events_device_time_us
+                .entry("new_audio_first_output".into())
+                .or_insert(device_time_us);
             let gain = if replacement.early_position.is_some() {
                 (replacement.rendered_new_frames as f64 / replacement.early_frames as f64).min(1.0)
-            } else { 1.0 };
+            } else {
+                1.0
+            };
             replacement.rendered_new_frames = replacement.rendered_new_frames.saturating_add(1);
             gain
         } else {
@@ -446,12 +545,17 @@ impl Pcm16RenderQueue {
         let mut queued = 0_u64;
         let mut retained = VecDeque::with_capacity(self.packets.len());
         for mut packet in self.packets.drain(..) {
-            let available = packet.bytes.len().saturating_sub(packet.head_offset_bytes) / block_align;
+            let available =
+                packet.bytes.len().saturating_sub(packet.head_offset_bytes) / block_align;
             if packet.playback_key == key {
                 let take = (available as u64).min(remaining) as usize;
                 remaining = remaining.saturating_sub(take as u64);
-                if take == 0 { continue; }
-                packet.bytes.truncate(packet.head_offset_bytes + take * block_align);
+                if take == 0 {
+                    continue;
+                }
+                packet
+                    .bytes
+                    .truncate(packet.head_offset_bytes + take * block_align);
                 queued = queued.saturating_add(take as u64);
             } else {
                 queued = queued.saturating_add(available as u64);
@@ -467,7 +571,9 @@ impl Pcm16RenderQueue {
     }
 
     fn queued_frames_for_key(&self, key: &str, block_align: usize) -> u64 {
-        self.packets.iter().filter(|packet| packet.playback_key == key)
+        self.packets
+            .iter()
+            .filter(|packet| packet.playback_key == key)
             .map(|packet| packet.bytes.len().saturating_sub(packet.head_offset_bytes) / block_align)
             .map(|frames| frames as u64)
             .sum()
@@ -477,7 +583,9 @@ impl Pcm16RenderQueue {
         if self.closed_keys.insert(key.to_owned()) {
             self.closed_key_order.push_back(key.to_owned());
             while self.closed_key_order.len() > 256 {
-                if let Some(old) = self.closed_key_order.pop_front() { self.closed_keys.remove(&old); }
+                if let Some(old) = self.closed_key_order.pop_front() {
+                    self.closed_keys.remove(&old);
+                }
             }
         }
     }
@@ -702,7 +810,9 @@ fn encode_sample(sample: f32, encoding: SampleEncoding, bytes: &mut Vec<u8>, wid
 }
 
 fn scale_encoded_frame(frame: &mut [u8], format: CaptureFormat, gain: f64) {
-    if gain >= 1.0 { return; }
+    if gain >= 1.0 {
+        return;
+    }
     let channels = format.channels as usize;
     let width = format.block_align as usize / channels;
     let gain = gain.clamp(0.0, 1.0);
@@ -718,15 +828,26 @@ fn scale_encoded_frame(frame: &mut [u8], format: CaptureFormat, gain: f64) {
                 sample.copy_from_slice(&scaled.to_le_bytes());
             }
             SampleEncoding::PcmSigned24 => {
-                let raw = i32::from(sample[0]) | (i32::from(sample[1]) << 8) | (i32::from(sample[2]) << 16);
-                let signed = if raw & 0x80_0000 != 0 { raw | !0xff_ffff } else { raw };
-                let scaled = (signed as f64 * gain).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+                let raw = i32::from(sample[0])
+                    | (i32::from(sample[1]) << 8)
+                    | (i32::from(sample[2]) << 16);
+                let signed = if raw & 0x80_0000 != 0 {
+                    raw | !0xff_ffff
+                } else {
+                    raw
+                };
+                let scaled = (signed as f64 * gain)
+                    .round()
+                    .clamp(-8_388_608.0, 8_388_607.0) as i32;
                 let bytes = scaled.to_le_bytes();
                 sample.copy_from_slice(&bytes[..3]);
             }
             SampleEncoding::PcmSigned32 => {
-                let value = i32::from_le_bytes(sample.try_into().expect("validated 32-bit sample")) as f64;
-                let scaled = (value * gain).round().clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
+                let value =
+                    i32::from_le_bytes(sample.try_into().expect("validated 32-bit sample")) as f64;
+                let scaled = (value * gain)
+                    .round()
+                    .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
                 sample.copy_from_slice(&scaled.to_le_bytes());
             }
             SampleEncoding::Float32 => {
@@ -791,7 +912,7 @@ mod windows_render {
     pub struct WasapiRenderStream {
         stop: Arc<AtomicBool>,
         control_sender: mpsc::SyncSender<RenderControl>, // control_sender（同线程执行的暂停/恢复请求）。
-        paused: Arc<AtomicBool>, // paused（设备线程确认的暂停状态）。
+        paused: Arc<AtomicBool>,                         // paused（设备线程确认的暂停状态）。
         control_unknown: AtomicBool, // control_unknown（控制回执超时后的未知状态保护）。
         queue: Arc<Mutex<Pcm16RenderQueue>>,
         output_format: CaptureFormat,
@@ -978,34 +1099,60 @@ mod windows_render {
             let snapshot = self.snapshot()?;
             let mut queue = self.queue.lock().map_err(|_| "播放队列状态不可用")?;
             queue.prepare_replacement(
-                replacement_id, old_playback_key, max_ms,
-                self.output_format.sample_rate, self.output_format.block_align as usize,
-                snapshot.buffered_ms, snapshot.played_ms,
-                snapshot.output_estimated_ms, snapshot.device_time_us,
+                replacement_id,
+                old_playback_key,
+                max_ms,
+                self.output_format.sample_rate,
+                self.output_format.block_align as usize,
+                snapshot.buffered_ms,
+                snapshot.played_ms,
+                snapshot.output_estimated_ms,
+                snapshot.device_time_us,
             )
         }
 
         /// bind_replacement（绑定固定后继）：后继 PCM 到来后旧音按 30 毫秒提前收尾。
-        pub fn bind_replacement(&self, replacement_id: &str, playback_key: &str) -> Result<bool, String> {
+        pub fn bind_replacement(
+            &self,
+            replacement_id: &str,
+            playback_key: &str,
+        ) -> Result<bool, String> {
             self.check_error()?;
-            self.queue.lock().map_err(|_| "播放队列状态不可用")?
+            self.queue
+                .lock()
+                .map_err(|_| "播放队列状态不可用")?
                 .bind_replacement(replacement_id, playback_key)
         }
 
         /// abort_replacement（撤销替换）：丢弃旧淡出尾音，保留设备时钟结算状态。
         pub fn abort_replacement(
-            &self, replacement_id: &str, reason: &str,
+            &self,
+            replacement_id: &str,
+            reason: &str,
         ) -> Result<Option<PlaybackReplacementProgress>, String> {
             self.check_terminal_error()?;
             let snapshot = self.snapshot()?;
-            self.queue.lock().map_err(|_| "播放队列状态不可用")?
-                .abort_replacement(replacement_id, reason, snapshot.device_time_us,
-                    snapshot.output_estimated_ms, self.output_format.block_align as usize)
+            self.queue
+                .lock()
+                .map_err(|_| "播放队列状态不可用")?
+                .abort_replacement(
+                    replacement_id,
+                    reason,
+                    snapshot.device_time_us,
+                    snapshot.output_estimated_ms,
+                    self.output_format.block_align as usize,
+                )
         }
 
-        pub fn replacement_status(&self, replacement_id: &str) -> Result<Option<PlaybackReplacementProgress>, String> {
+        pub fn replacement_status(
+            &self,
+            replacement_id: &str,
+        ) -> Result<Option<PlaybackReplacementProgress>, String> {
             self.check_terminal_error()?;
-            Ok(self.queue.lock().map_err(|_| "播放队列状态不可用")?
+            Ok(self
+                .queue
+                .lock()
+                .map_err(|_| "播放队列状态不可用")?
                 .replacement_status(replacement_id))
         }
 
@@ -1019,7 +1166,11 @@ mod windows_render {
             if self.control_unknown.load(Ordering::Acquire) {
                 return Err("WASAPI 暂停/恢复结果未知；旧播放事务不能继续".into());
             }
-            if self.thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
                 Ok(())
             } else {
                 Err("WASAPI 播放线程已结束；旧播放结果保持未知".into())
@@ -1211,8 +1362,9 @@ mod windows_render {
                 break;
             }
         }
-        let stopped = unsafe { session.client.Stop() }
-            .map_err(|error| crate::device_audio::format_wasapi_error("停止 WASAPI 播放流失败", error));
+        let stopped = unsafe { session.client.Stop() }.map_err(|error| {
+            crate::device_audio::format_wasapi_error("停止 WASAPI 播放流失败", error)
+        });
         result?;
         stopped?;
         Ok(())
@@ -1289,15 +1441,15 @@ mod windows_render {
                 endpoint_id,
             };
             prime_silence(&mut session)?;
-            unsafe { session.client.Start() }
-                .map_err(|error| crate::device_audio::format_wasapi_error("启动 WASAPI 播放流失败", error))?;
+            unsafe { session.client.Start() }.map_err(|error| {
+                crate::device_audio::format_wasapi_error("启动 WASAPI 播放流失败", error)
+            })?;
             Ok(session)
         }
 
         fn default_endpoint_id(&self) -> Result<String, String> {
-            let device = unsafe {
-                self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
-            }.map_err(|error| format!("读取当前默认扬声器失败：{error}"))?;
+            let device = unsafe { self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+                .map_err(|error| format!("读取当前默认扬声器失败：{error}"))?;
             crate::device_audio::endpoint_id_from_device(&device)
         }
     }
@@ -1327,12 +1479,14 @@ mod windows_render {
         total_enqueued_frames: &AtomicU64,
         total_submitted_frames: &AtomicU64,
     ) -> Result<(), String> {
-        let padding = unsafe { session.client.GetCurrentPadding() }
-            .map_err(|error| crate::device_audio::format_wasapi_error("读取 WASAPI 输出储备失败", error))?;
+        let padding = unsafe { session.client.GetCurrentPadding() }.map_err(|error| {
+            crate::device_audio::format_wasapi_error("读取 WASAPI 输出储备失败", error)
+        })?;
         let available = session.buffer_frames.saturating_sub(padding);
         if available > 0 {
-            let data = unsafe { session.renderer.GetBuffer(available) }
-                .map_err(|error| crate::device_audio::format_wasapi_error("取得 WASAPI 输出缓冲失败", error))?;
+            let data = unsafe { session.renderer.GetBuffer(available) }.map_err(|error| {
+                crate::device_audio::format_wasapi_error("取得 WASAPI 输出缓冲失败", error)
+            })?;
             if data.is_null() {
                 let _ = unsafe {
                     session
@@ -1344,15 +1498,25 @@ mod windows_render {
             let length = available as usize * session.format.block_align as usize;
             let output = unsafe { std::slice::from_raw_parts_mut(data, length) };
             output.fill(silence_byte(session.format.encoding));
-            let device_time_us = snapshot.lock().map(|value| value.device_time_us).unwrap_or(0);
+            let device_time_us = snapshot
+                .lock()
+                .map(|value| value.device_time_us)
+                .unwrap_or(0);
             let fill_result = queue
                 .lock()
                 .map_err(|_| "播放队列状态不可用".to_owned())
                 .and_then(|mut queue| {
-                    queue.fill_for_device(output, available as usize, session.format, device_time_us)
+                    queue.fill_for_device(
+                        output,
+                        available as usize,
+                        session.format,
+                        device_time_us,
+                    )
                 });
-            let released = unsafe { session.renderer.ReleaseBuffer(available, 0) }
-                .map_err(|error| crate::device_audio::format_wasapi_error("提交 WASAPI 输出缓冲失败", error));
+            let released =
+                unsafe { session.renderer.ReleaseBuffer(available, 0) }.map_err(|error| {
+                    crate::device_audio::format_wasapi_error("提交 WASAPI 输出缓冲失败", error)
+                });
             let filled_frames = fill_result?;
             released?;
             total_submitted_frames.fetch_add(filled_frames as u64, Ordering::AcqRel);
@@ -1364,7 +1528,9 @@ mod windows_render {
                 .clock
                 .GetPosition(&mut device_position, Some(&mut qpc_position))
         }
-        .map_err(|error| crate::device_audio::format_wasapi_error("读取 WASAPI 设备时钟失败", error))?;
+        .map_err(|error| {
+            crate::device_audio::format_wasapi_error("读取 WASAPI 设备时钟失败", error)
+        })?;
         let output_rate = session.format.sample_rate as u64;
         let played_ms = total_submitted_frames.load(Ordering::Acquire) * 1_000 / output_rate;
         let output_estimated_ms = (device_position as u128 * 1_000
@@ -1388,7 +1554,6 @@ mod windows_render {
         *snapshot.lock().map_err(|_| "播放快照状态不可用")? = next;
         Ok(())
     }
-
 }
 
 #[cfg(windows)]
@@ -1453,30 +1618,73 @@ mod tests {
     fn replacement_queue_closes_old_key_fades_early_tail_and_fades_in_successor() {
         let format = format(1_000, 1, SampleEncoding::PcmSigned16);
         let mut queue = Pcm16RenderQueue::default();
-        queue.enqueue_for_key(
-            "speech-old", 10_000_i16.to_le_bytes().repeat(100),
-            100, 2, 500, 1_000, 100, 100, 1_000_000,
-        ).unwrap();
-        let prepared = queue.prepare_replacement(
-            "replacement-1", "speech-old", 500, 1_000, 2,
-            100, 80, 100, 1_000_000,
-        ).unwrap();
+        queue
+            .enqueue_for_key(
+                "speech-old",
+                10_000_i16.to_le_bytes().repeat(100),
+                100,
+                2,
+                500,
+                1_000,
+                100,
+                100,
+                1_000_000,
+            )
+            .unwrap();
+        let prepared = queue
+            .prepare_replacement(
+                "replacement-1",
+                "speech-old",
+                500,
+                1_000,
+                2,
+                100,
+                80,
+                100,
+                1_000_000,
+            )
+            .unwrap();
         assert_eq!(prepared.old_playback_key, "speech-old");
         assert!(!prepared.done);
         assert_eq!(queue.queued_frames_for_key("speech-old", 2), 100);
-        assert!(queue.enqueue_for_key(
-            "speech-old", vec![0; 2], 1, 2, 500, 1_000, 100, 100, 1_000_001,
-        ).is_err());
-        assert!(queue.bind_replacement("replacement-1", "speech-new").unwrap());
-        queue.enqueue_for_key(
-            "speech-new", 10_000_i16.to_le_bytes().repeat(60),
-            60, 2, 500, 1_000, 100, 100, 1_001_000,
-        ).unwrap();
+        assert!(queue
+            .enqueue_for_key(
+                "speech-old",
+                vec![0; 2],
+                1,
+                2,
+                500,
+                1_000,
+                100,
+                100,
+                1_000_001,
+            )
+            .is_err());
+        assert!(queue
+            .bind_replacement("replacement-1", "speech-new")
+            .unwrap());
+        queue
+            .enqueue_for_key(
+                "speech-new",
+                10_000_i16.to_le_bytes().repeat(60),
+                60,
+                2,
+                500,
+                1_000,
+                100,
+                100,
+                1_001_000,
+            )
+            .unwrap();
 
         let mut output = vec![0_u8; 35 * 2];
-        queue.fill_for_device(&mut output, 35, format, 1_002_000).unwrap();
-        let samples: Vec<i16> = output.chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]])).collect();
+        queue
+            .fill_for_device(&mut output, 35, format, 1_002_000)
+            .unwrap();
+        let samples: Vec<i16> = output
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
         assert!(samples[0] > 9_000);
         assert!(samples[29] < 1_000);
         assert_eq!(samples[30], 0);
@@ -1489,21 +1697,63 @@ mod tests {
         assert_eq!(result.reason.as_deref(), Some("early_handoff"));
         assert_eq!(result.finished_device_time_us, Some(1_035_000));
         assert_eq!(result.attenuated_range_ms, [80, 110]);
-        assert!(result.events_device_time_us.contains_key("first_attenuated_audio"));
-        assert!(result.events_device_time_us.contains_key("new_audio_first_output"));
+        assert!(result
+            .events_device_time_us
+            .contains_key("first_attenuated_audio"));
+        assert!(result
+            .events_device_time_us
+            .contains_key("new_audio_first_output"));
     }
 
     #[test]
     fn aborting_replacement_discards_only_old_tail_and_keeps_successor_queue() {
         let mut queue = Pcm16RenderQueue::default();
-        queue.enqueue_for_key("speech-old", vec![1; 200], 100, 2, 300, 1_000, 100, 100, 1_000)
+        queue
+            .enqueue_for_key(
+                "speech-old",
+                vec![1; 200],
+                100,
+                2,
+                300,
+                1_000,
+                100,
+                100,
+                1_000,
+            )
             .unwrap();
-        queue.prepare_replacement("replacement-2", "speech-old", 400, 1_000, 2,
-            100, 50, 100, 1_000).unwrap();
-        queue.bind_replacement("replacement-2", "speech-new").unwrap();
-        queue.enqueue_for_key("speech-new", vec![2; 40], 20, 2, 300, 1_000, 100, 100, 1_010)
+        queue
+            .prepare_replacement(
+                "replacement-2",
+                "speech-old",
+                400,
+                1_000,
+                2,
+                100,
+                50,
+                100,
+                1_000,
+            )
             .unwrap();
-        let result = queue.abort_replacement("replacement-2", "stopped", 1_020, 110, 2).unwrap().unwrap();
+        queue
+            .bind_replacement("replacement-2", "speech-new")
+            .unwrap();
+        queue
+            .enqueue_for_key(
+                "speech-new",
+                vec![2; 40],
+                20,
+                2,
+                300,
+                1_000,
+                100,
+                100,
+                1_010,
+            )
+            .unwrap();
+        let result = queue
+            .abort_replacement("replacement-2", "stopped", 1_020, 110, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.finished_output_estimated_ms, Some(110));
         assert!(result.done);
         assert_eq!(result.reason.as_deref(), Some("stopped"));
@@ -1514,27 +1764,85 @@ mod tests {
     #[test]
     fn retrying_the_same_replacement_id_returns_the_existing_ticket_without_mutation() {
         let mut queue = Pcm16RenderQueue::default();
-        queue.enqueue_for_key("speech-old", vec![1; 200], 100, 2, 500, 1_000, 0, 100, 10_000).unwrap();
-        let first = queue.prepare_replacement("replacement-repeat", "speech-old", 300, 1_000, 2,
-            100, 20, 0, 10_100).unwrap();
+        queue
+            .enqueue_for_key(
+                "speech-old",
+                vec![1; 200],
+                100,
+                2,
+                500,
+                1_000,
+                0,
+                100,
+                10_000,
+            )
+            .unwrap();
+        let first = queue
+            .prepare_replacement(
+                "replacement-repeat",
+                "speech-old",
+                300,
+                1_000,
+                2,
+                100,
+                20,
+                0,
+                10_100,
+            )
+            .unwrap();
         let queued_after_first = queue.queued_frames_for_key("speech-old", 2);
-        let repeated = queue.prepare_replacement("replacement-repeat", "speech-old", 300, 1_000, 2,
-            100, 20, 0, 10_200).unwrap();
+        let repeated = queue
+            .prepare_replacement(
+                "replacement-repeat",
+                "speech-old",
+                300,
+                1_000,
+                2,
+                100,
+                20,
+                0,
+                10_200,
+            )
+            .unwrap();
         assert_eq!(repeated, first);
-        assert_eq!(queue.queued_frames_for_key("speech-old", 2), queued_after_first);
-        assert!(queue.enqueue_for_key("speech-old", vec![2; 2], 1, 2, 500, 1_000, 0, 100, 10_300).is_err());
+        assert_eq!(
+            queue.queued_frames_for_key("speech-old", 2),
+            queued_after_first
+        );
+        assert!(queue
+            .enqueue_for_key("speech-old", vec![2; 2], 1, 2, 500, 1_000, 0, 100, 10_300)
+            .is_err());
     }
 
     #[test]
     fn completed_replacement_accepts_only_an_idempotent_successor_binding() {
         let mut queue = Pcm16RenderQueue::default();
-        let progress = queue.prepare_replacement("replacement-completed", "speech-old", 300,
-            1_000, 2, 0, 0, 0, 10_000).unwrap();
+        let progress = queue
+            .prepare_replacement(
+                "replacement-completed",
+                "speech-old",
+                300,
+                1_000,
+                2,
+                0,
+                0,
+                0,
+                10_000,
+            )
+            .unwrap();
         assert!(progress.done);
-        assert!(queue.bind_replacement("replacement-completed", "speech-new").unwrap());
-        assert!(queue.bind_replacement("replacement-completed", "speech-new").unwrap());
-        assert!(!queue.bind_replacement("replacement-completed", "speech-other").unwrap());
-        queue.enqueue_for_key("speech-new", vec![2; 40], 20, 2, 500, 1_000, 0, 0, 10_100).unwrap();
+        assert!(queue
+            .bind_replacement("replacement-completed", "speech-new")
+            .unwrap());
+        assert!(queue
+            .bind_replacement("replacement-completed", "speech-new")
+            .unwrap());
+        assert!(!queue
+            .bind_replacement("replacement-completed", "speech-other")
+            .unwrap());
+        queue
+            .enqueue_for_key("speech-new", vec![2; 40], 20, 2, 500, 1_000, 0, 0, 10_100)
+            .unwrap();
         assert_eq!(queue.queued_frames_for_key("speech-new", 2), 20);
     }
 

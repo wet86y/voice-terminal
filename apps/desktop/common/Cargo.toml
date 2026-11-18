@@ -13,12 +13,15 @@ sha1 = { version = "=0.11.0", optional = true } # sha1（WebSocket 协议接受�
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
-russh-sftp = { version = "=3.0.1", optional = true } # russh-sftp（独立 SSH 连接上的 SFTP 文件传输）。
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "fs", "macros"], optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"], optional = true } # futures-util（WebSocket 消息收发扩展）。
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"], optional = true } # tokio-tungstenite（Rust 异步 WebSocket，使用系统 TLS 根证书）。
-rand = { version = "=0.10.3", optional = true }
+rand = { version = "=0.10.3", features = ["sys_rng"], optional = true } # rand（设备身份密钥和签名的操作系统随机数）。
 ed25519-dalek = { version = "=3.0.0", optional = true }
+mdns-sd = { version = "=0.21.3", optional = true } # mdns-sd（局域网多播服务发现）。
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "serde", "argon2"], optional = true } # opaque-ke（OPAQUE 口令认证密钥交换实现）。
+aes-gcm = { version = "=0.11.1", optional = true } # aes-gcm（配对会话派生密钥的认证加密）。
+rand-pake = { package = "rand", version = "=0.8.6", default-features = false, features = ["getrandom", "std", "std_rng"], optional = true } # rand-pake（与 OPAQUE 4.x 匹配的随机数接口）。
 zeroize = "1"
 
 [build-dependencies]
@@ -28,7 +31,7 @@ cc = "1"
 distribution = []
 qualification = ["distribution"]
 native-audio = [] # native-audio（启用固定 WebRTC AEC/VAD 与 Opus 编解码原生组件）。
-ssh-device = ["dep:russh", "dep:russh-sftp", "dep:tokio", "dep:futures-util", "dep:tokio-tungstenite", "dep:rand", "dep:ed25519-dalek", "dep:sha1"] # ssh-device（客户端 SSH 主机固定、设备认证、控制及媒体通道、SFTP 传输与在线语音合成）。
+ssh-device = ["dep:russh", "dep:tokio", "dep:futures-util", "dep:tokio-tungstenite", "dep:rand", "dep:ed25519-dalek", "dep:sha1", "dep:mdns-sd", "dep:opaque-ke", "dep:aes-gcm", "dep:rand-pake"] # ssh-device（客户端 SSH 连接、局域网发现、OPAQUE 配对、设备媒体及固定 FILE 文件传输）。
 ssh-device-test-support = ["ssh-device"] # ssh-device-test-support（仅测试使用的固定指纹 SSH 集成夹具接口）。
 
 # SSH（安全外壳协议）验收示例使用可选 SSH 依赖，只在启用对应能力时编译。

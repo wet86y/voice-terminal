@@ -1,8 +1,8 @@
 //! Initialization（桌面初始化）：统一启动画面，管理能力不要求 Python。
 use super::{Desktop, ResourceManager};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -65,6 +65,15 @@ pub fn install_manager(
         state.startup_skipped.store(true, Ordering::Release);
     }
     manager.start_import_dispatcher();
+    #[cfg(feature = "ssh-device")]
+    {
+        *state
+            .remote_services
+            .lock()
+            .map_err(|_| "远程原生服务状态不可用。")? = Some(Arc::new(
+            super::remote_services::RemoteServices::new(manager.clone()),
+        ));
+    }
     app.manage(manager);
     // 页面真正加载后才登记就绪，迁移不能把窗口创建之前的阶段视为启动成功。
     Ok(())
@@ -131,8 +140,45 @@ pub fn auto_start(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Stri
     if state.mode == super::FrontendMode::UiPreview {
         return super::start_service(app, state);
     }
-    super::start_service(app, state)
+    super::start_service(app, state.clone())?;
+    #[cfg(feature = "ssh-device")]
+    if let Some(context) = state.context() {
+        let snapshot = voice_desktop_common::device_config::inspect(&context.data);
+        if snapshot.mode == Some(voice_desktop_common::device_config::RunMode::Local)
+            && snapshot.broadcast_enabled
+        {
+            let background_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                let preparation = async {
+                    let status = tauri::async_runtime::spawn_blocking(voice_desktop_common::system_feature::open_ssh_server_status)
+                        .await.map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
+                    if !status.ready {
+                        return Err("本机语音核心已启动，但微软 SSH 服务尚未就绪；请在设备设置中点击“检查 SSH 服务”后重试广播。".into());
+                    }
+                    if !status.project_access_enabled || !status.pairing_access_enabled {
+                        tauri::async_runtime::spawn_blocking(|| voice_desktop_common::system_feature::set_device_broadcast_access(true))
+                            .await.map_err(|_| "局域网受限防火墙准备任务无法启动。".to_string())??;
+                    }
+                    super::sync_local_discovery(background_state.clone()).await
+                }.await;
+                if let Err(error) = preparation {
+                    *background_state.error.lock().unwrap() = Some(error);
+                }
+            });
+        }
+    }
+    Ok(())
 }
+
+/// product_page_path（选择已保存运行模式的首屏）：远程客户端启动产品界面，本地角色启动管理页。
+fn product_page_path(remote_product: bool) -> &'static str {
+    if remote_product {
+        "/index.html"
+    } else {
+        "/management.html"
+    }
+}
+
 pub(super) fn manage(app: &tauri::AppHandle, state: &Arc<Desktop>) -> Result<(), String> {
     if state.context().is_none() {
         return Err("请先选择工作区并完成本体展开。".into());
@@ -152,16 +198,33 @@ pub(super) fn manage(app: &tauri::AppHandle, state: &Arc<Desktop>) -> Result<(),
         return Ok(());
     }
     let window = app.get_webview_window("main").ok_or("主窗口不可用")?;
+    let remote_product = state.context().is_some_and(|context| {
+        voice_desktop_common::device_config::inspect(&context.data).mode
+            == Some(voice_desktop_common::device_config::RunMode::Remote)
+    });
     let mut url = window.url().map_err(|e| e.to_string())?;
-    url.set_path("/management.html");
+    let page_path = product_page_path(remote_product);
+    url.set_path(page_path);
     url.set_query(None);
     url.set_fragment(None);
     if url.host_str() != Some("localhost") && url.host_str() != Some("tauri.localhost") {
-        url = tauri::Url::parse("http://tauri.localhost/management.html")
+        url = tauri::Url::parse(&format!("http://tauri.localhost{page_path}"))
             .map_err(|e| e.to_string())?;
     }
     window.navigate(url).map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::product_page_path;
+
+    #[test]
+    fn remote_mode_opens_the_product_page_while_local_mode_keeps_management_page() {
+        assert_eq!(product_page_path(true), "/index.html");
+        assert_eq!(product_page_path(false), "/management.html");
+    }
+}
+
 #[tauri::command]
 pub async fn desktop_initialize(
     window: WebviewWindow,

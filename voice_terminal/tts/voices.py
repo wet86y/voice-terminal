@@ -81,6 +81,41 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _remote_import_ledger_key(binding: Mapping[str, Any]) -> str:
+    """验证远程 TTS 导入绑定字段并生成 transfer_id/purpose 幂等键。"""
+    required = {
+        "transfer_id", "device_id", "connection_generation", "executor_generation",
+        "parent_request_id", "model_id", "purpose", "filename", "expected_bytes", "expected_sha256",
+    }
+    if not isinstance(binding, Mapping) or set(binding) != required:
+        raise VoiceLibraryError("远程音频导入票据字段不完整。")
+    transfer_id = binding.get("transfer_id")
+    device_id = binding.get("device_id")
+    parent_request_id = binding.get("parent_request_id")
+    model_id = binding.get("model_id")
+    purpose = binding.get("purpose")
+    filename = binding.get("filename")
+    expected_bytes = binding.get("expected_bytes")
+    expected_sha256 = binding.get("expected_sha256")
+    from .settings import valid_local_model
+    if (not isinstance(transfer_id, str) or not _ID_RE.fullmatch(transfer_id)
+            or not isinstance(device_id, str) or not 1 <= len(device_id) <= 128
+            or any(not (character.isascii() and (character.isalnum() or character in "._:-")) for character in device_id)
+            or type(binding.get("connection_generation")) is not int or binding["connection_generation"] < 1
+            or type(binding.get("executor_generation")) is not int or binding["executor_generation"] < 1
+            or not isinstance(parent_request_id, str) or not 1 <= len(parent_request_id) <= 128
+            or any(not (character.isascii() and (character.isalnum() or character in "._:-")) for character in parent_request_id)
+            or not valid_local_model(model_id)
+            or purpose not in {"asset", "source", "source_and_asset"}
+            or not isinstance(filename, str) or not filename or len(filename) > 240
+            or Path(filename).name != filename or "/" in filename or "\\" in filename
+            or any(ord(character) < 32 for character in filename)
+            or type(expected_bytes) is not int or not 1 <= expected_bytes <= MAX_IMPORT_BYTES
+            or not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
+        raise VoiceLibraryError("远程音频导入票据身份、代次、用途、文件名、大小或摘要无效。")
+    return f"{transfer_id}:{purpose}"
+
+
 def _collapse_description(value: Any, field: str, limit: int) -> str:
     if not isinstance(value, str):
         raise VoiceLibraryError(f"{field}（描述）必须为文字。")
@@ -332,6 +367,234 @@ class VoiceLibrary:
                 destination.unlink(missing_ok=True)
                 raise
         return {'asset_id': asset_id, **updated['assets'][asset_id]}
+
+    @staticmethod
+    def remote_import_asset_id(transfer_id: str, purpose: str, role: str) -> str:
+        """按固定 DFT 票据、导入用途和素材角色稳定派生 asset_id。"""
+        if not _ID_RE.fullmatch(transfer_id) or purpose not in {"asset", "source", "source_and_asset"}:
+            raise VoiceLibraryError("远程音频导入幂等编号无效。")
+        if role not in {"asset", "source"}:
+            raise VoiceLibraryError("远程音频导入素材角色无效。")
+        material = f"voice-terminal-tts-import-v1\0{transfer_id}\0{purpose}\0{role}".encode("ascii")
+        return hashlib.sha256(material).hexdigest()[:32]
+
+    def get_remote_import_result(self, binding: Mapping[str, Any]) -> dict[str, Any] | None:
+        """读取已提交远程音频导入的幂等回执；binding 必须完全匹配原票据。"""
+        key = _remote_import_ledger_key(binding)
+        with self._lock:
+            ledger = self._index.get("migrations", {}).get("remote_asset_imports", {})
+            row = ledger.get(key) if isinstance(ledger, dict) else None
+            if row is None:
+                return None
+            if not isinstance(row, dict) or row.get("binding") != dict(binding):
+                raise VoiceLibraryError("transfer_id/purpose 已提交到其他设备、代次或音频文件。")
+            result = row.get("result")
+            if not isinstance(result, dict):
+                raise VoiceLibraryError("远程音频导入幂等回执损坏。")
+            if binding["purpose"] == "source":
+                public_roles = {"asset": "source"}
+            elif binding["purpose"] == "source_and_asset":
+                public_roles = {"asset": "asset", "source": "source"}
+            else:
+                public_roles = {"asset": "asset"}
+            if set(result) != set(public_roles):
+                raise VoiceLibraryError("远程音频导入幂等回执用途字段不匹配。")
+            for key_name, role in public_roles.items():
+                entry = result[key_name]
+                if not isinstance(entry, dict) or entry.get("asset_id") != self.remote_import_asset_id(
+                    str(binding["transfer_id"]), str(binding["purpose"]), role,
+                ):
+                    raise VoiceLibraryError("远程音频导入的稳定素材编号不匹配。")
+                stored = self._index.get("assets", {}).get(entry["asset_id"])
+                if not isinstance(stored, dict) or not isinstance(stored.get("remote_import"), dict):
+                    raise VoiceLibraryError("远程音频导入素材索引不存在。")
+                if stored["remote_import"].get("binding") != dict(binding) or stored["remote_import"].get("role") != role:
+                    raise VoiceLibraryError("远程音频导入素材已绑定其他票据。")
+                path = self._source_path(entry["asset_id"]) if role == "source" else self._asset_path(entry["asset_id"])
+                if not path.is_file():
+                    raise VoiceLibraryError("远程音频导入的原素材文件缺失。")
+                expected_file_sha = stored["remote_import"].get("stored_sha256")
+                if not isinstance(expected_file_sha, str) or hashlib.sha256(path.read_bytes()).hexdigest() != expected_file_sha:
+                    raise VoiceLibraryError("远程音频导入的已登记素材摘要不匹配。")
+            return json.loads(json.dumps(result))
+
+    def commit_remote_import(
+        self,
+        data: bytes,
+        *,
+        model_id: str,
+        purpose: str,
+        filename: str,
+        transfer_id: str,
+        device_id: str,
+        connection_generation: int,
+        executor_generation: int,
+        parent_request_id: str,
+        expected_bytes: int,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        """在单次 VoiceLibrary（音色库）索引事务中幂等写入远程 TTS 音频素材。"""
+        binding = {
+            "transfer_id": transfer_id,
+            "device_id": device_id,
+            "connection_generation": connection_generation,
+            "executor_generation": executor_generation,
+            "parent_request_id": parent_request_id,
+            "model_id": model_id,
+            "purpose": purpose,
+            "filename": filename,
+            "expected_bytes": expected_bytes,
+            "expected_sha256": expected_sha256,
+        }
+        _remote_import_ledger_key(binding)
+        if (not isinstance(data, bytes) or not data or len(data) != expected_bytes
+                or len(data) > MAX_IMPORT_BYTES
+                or hashlib.sha256(data).hexdigest() != expected_sha256):
+            raise VoiceLibraryError("远程音频数据长度或 SHA-256 与 DFT 文件票据不匹配。")
+        existing = self.get_remote_import_result(binding)
+        if existing is not None:
+            return existing
+
+        roles = {"asset", "source"} if purpose == "source_and_asset" else {purpose}
+        prepared: dict[str, dict[str, Any]] = {}
+        if "asset" in roles:
+            limits = {"minimum": 3.0, "maximum": 10.0} if self.model == "aniflive" else {}
+            normalized, duration_ms = self._normalize_audio(data, filename, **limits)
+            asset_metadata = {
+                "created_at": _utc_now(),
+                "duration_ms": duration_ms,
+                "sample_rate": 16000,
+                "channels": 1,
+                "format": "wav",
+                "sha256": hashlib.sha256(normalized).hexdigest(),
+            }
+            high_fidelity = None
+            if self.model == "aniflive":
+                try:
+                    import numpy as np
+                    import soundfile as sf
+                    samples, rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+                    mono = np.clip(np.rint(samples.mean(axis=1) * 32768), -32768, 32767).astype("<i2")
+                    output = io.BytesIO()
+                    sf.write(output, mono, int(rate), format="WAV", subtype="PCM_16")
+                    high_bytes = output.getvalue()
+                except Exception as exc:
+                    raise VoiceLibraryError("无法生成原采样率参考音频副本。") from exc
+                high_fidelity = {
+                    "data": high_bytes,
+                    "metadata": {
+                        "sample_rate": int(rate),
+                        "channels": 1,
+                        "duration_ms": round(len(mono) / 2 / int(rate) * 1000),
+                        "format": "wav",
+                        "sha256": hashlib.sha256(high_bytes).hexdigest(),
+                    },
+                }
+            prepared["asset"] = {
+                "asset_id": self.remote_import_asset_id(transfer_id, purpose, "asset"),
+                "data": normalized,
+                "metadata": asset_metadata,
+                "high_fidelity": high_fidelity,
+            }
+        if "source" in roles:
+            extension = Path(filename).suffix.lower()
+            if extension not in ALLOWED_IMPORT_EXTENSIONS:
+                raise VoiceLibraryError("仅支持 WAV、MP3、FLAC 或 OGG 来源录音。")
+            prepared["source"] = {
+                "asset_id": self.remote_import_asset_id(transfer_id, purpose, "source"),
+                "data": data,
+                "metadata": {
+                    "created_at": _utc_now(),
+                    "format": "source",
+                    "extension": extension,
+                    "size_bytes": len(data),
+                    "sha256": expected_sha256,
+                },
+                "high_fidelity": None,
+            }
+
+        key = _remote_import_ledger_key(binding)
+        created_files: list[Path] = []
+        temporary_files: list[Path] = []
+
+        def ensure_bytes(destination: Path, payload: bytes) -> bool:
+            if destination.is_symlink():
+                raise VoiceLibraryError("远程 TTS 音频素材不能是符号链接。")
+            if destination.exists():
+                if not destination.is_file() or destination.read_bytes() != payload:
+                    raise VoiceLibraryError("稳定远程素材编号已被不同内容占用。")
+                return False
+            temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+            temporary_files.append(temporary)
+            with temporary.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            created_files.append(destination)
+            temporary_files.remove(temporary)
+            return True
+
+        with self._lock:
+            prior = self.get_remote_import_result(binding)
+            if prior is not None:
+                return prior
+            updated = json.loads(json.dumps(self._index))
+            assets = updated.setdefault("assets", {})
+            migrations = updated.setdefault("migrations", {})
+            ledger = migrations.setdefault("remote_asset_imports", {})
+            if key in ledger:
+                raise VoiceLibraryError("远程音频导入幂等记录已被不同请求占用。")
+            result: dict[str, Any] = {}
+            try:
+                for role, item in prepared.items():
+                    asset_id = item["asset_id"]
+                    remote_metadata = {
+                        "binding": binding,
+                        "role": role,
+                        "stored_sha256": item["metadata"].get("sha256"),
+                        "high_fidelity_sha256": (
+                            item["high_fidelity"]["metadata"]["sha256"] if item["high_fidelity"] else None
+                        ),
+                    }
+                    previous = assets.get(asset_id)
+                    if previous is not None:
+                        if not isinstance(previous, dict) or previous.get("remote_import") != remote_metadata:
+                            raise VoiceLibraryError("稳定远程素材编号已绑定另一 DFT 导入票据。")
+                    if role == "source":
+                        destination = self._source_path(asset_id)
+                    else:
+                        destination = self._asset_path(asset_id)
+                    ensure_bytes(destination, item["data"])
+                    if item["high_fidelity"] is not None:
+                        high_path = self._high_fidelity_path(asset_id)
+                        ensure_bytes(high_path, item["high_fidelity"]["data"])
+                    if previous is None:
+                        assets[asset_id] = {
+                            **item["metadata"],
+                            "remote_import": remote_metadata,
+                            **({
+                                "high_fidelity": {
+                                    key_name: value for key_name, value in item["high_fidelity"]["metadata"].items()
+                                    if key_name != "sha256"
+                                }
+                            } if item["high_fidelity"] is not None else {}),
+                        }
+                    public_metadata = {
+                        key_name: value for key_name, value in assets[asset_id].items()
+                        if key_name != "remote_import"
+                    }
+                    public_role = "asset" if purpose == "source" and role == "source" else role
+                    result[public_role] = {"asset_id": asset_id, **public_metadata}
+                ledger[key] = {"binding": binding, "result": result}
+                self._save_index(updated)
+            except Exception:
+                for temporary in temporary_files:
+                    temporary.unlink(missing_ok=True)
+                for destination in created_files:
+                    destination.unlink(missing_ok=True)
+                raise
+        return json.loads(json.dumps(result))
 
     def put_high_fidelity_pcm(self, asset_id: str, pcm: bytes, *, sample_rate: int,
                               channels: int = 1) -> dict[str, Any]:

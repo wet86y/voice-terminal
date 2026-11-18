@@ -463,6 +463,8 @@ const model = computed<LocalComponentsModel>(() => {
         canCancel: job.can_cancel !== false,
       }
     }),
+    remoteTarget: props.resourceController?.remoteMode.value ?? (application.snapshot.value?.remote_mode === true),
+    integrityAvailable: !(props.resourceController?.remoteMode.value ?? (application.snapshot.value?.remote_mode === true)),
     resourceActionsAvailable: props.resourceController?.resourcesCanManage.value ?? false,
     downloadResources: (props.resourceController?.resources.value ?? [])
       .map(resource => managedResource(resource.resource_id))
@@ -521,7 +523,7 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" :expand-aniflive-tts="props.expandAnifLiveTts" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()">
+  <LocalComponents :model="model" :saving="saving" :expand-anif-live-tts="props.expandAnifLiveTts" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()">
     <template #aniflive-tts>
       <AnifLiveTtsManagement
         :models="tts.status.value?.models ?? []"

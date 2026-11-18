@@ -1,601 +1,558 @@
 // @vitest-environment jsdom
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { nativeDeviceApi, type DeviceConfigStatus, type NativeSshIdentity, type NativeSshTransportIdentity, type OpenSshServerStatus, type RemoteDeviceSnapshot } from '../product/native-device-api'
-import { productApi, type DevicePairingStatus } from '../product/api'
+import { nativeDeviceApi, type DeviceConfigStatus, type DiscoveredDevice, type DeviceConfig, type ManagedResourceJob, type OpenSshServerStatus, type RemoteManagementOperation, type RemoteManagementResponse, type RemoteSshSystemFeatureSnapshot, type RemoteSshSystemFeatureJob } from '../product/native-device-api'
 import DeviceSettings from './DeviceSettings.vue'
 
-const readySharedHostRuntime: NonNullable<DeviceConfigStatus['device_runtime']> = {
-  actual_role: 'shared_host', core_ready: true,
-  device_gateway: { enabled: true, ready: true, error: null },
-  remote_client_connected: false, fields: {},
+const foundHost: DiscoveredDevice = {
+  host_id: 'server-a', display_name: '服务端 A', hostname: 'voice-terminal-server-a.local.',
+  addresses: ['192.168.1.20'], pairing_port: 18766, ssh_port: 22, protocol_version: 1,
+  compatible: true, state: 'ready', capabilities: ['remote_management', 'device_tasks', 'audio'], fields: {},
 }
 
-describe('DeviceSettings（设备设置）远端设备快照', () => {
+function makeConfig(mode: DeviceConfig['mode'] = 'local', broadcast = false): DeviceConfigStatus {
+  const desiredRole = mode === 'remote' ? 'remote_client' : broadcast ? 'shared_host' : 'standalone'
+  return {
+    local_core_available: true,
+    runtime: { config_state: 'valid', device_id: 'device-a', mode, broadcast_enabled: broadcast, desired_role: desiredRole, audio_mode: 'pcm', error: null },
+    device_config: {
+      schema_version: 3, device_id: 'device-a', mode, broadcast_enabled: broadcast,
+      client_online_tts_local: true, audio_compression: false, reconnect_suspended_reason: null,
+      desired_role: desiredRole, audio_mode: 'pcm', paired_host: null,
+    },
+    device_runtime: {
+      mode, broadcast_enabled: broadcast, expected_mode: mode, actual_mode: mode,
+      switch_phase: 'ready', broadcast_requested: broadcast, broadcast_actual: broadcast,
+      actual_role: desiredRole, core_ready: mode === 'local',
+      device_gateway: { enabled: broadcast, ready: broadcast, error: null },
+      remote_client_connected: mode === 'remote', fields: {},
+    },
+    fields: {},
+  }
+}
+
+function makeSshStatus(ready = true): OpenSshServerStatus {
+  return {
+    feature_id: 'openssh-server', capability_state: ready ? 'Installed' : 'NotPresent',
+    service_present: ready, service_state: ready ? 'Running' : null, startup_type: ready ? 'Automatic' : null,
+    source_path: ready ? 'C:\\Windows\\System32\\OpenSSH\\sshd.exe' : null,
+    source_version: ready ? '9.5.0.0' : null, signature_status: ready ? 'Valid' : null,
+    signature_subject: ready ? 'Microsoft Corporation' : null, official_binary: ready,
+    service_path_official: ready, effective_port: ready ? 22 : null, listening_ports: ready ? [22] : [],
+    configuration_valid: ready, authorized_keys_path: null, authorized_keys_exists: false,
+    account_name: 'MACHINE\\tester', account_ssh_username: 'tester', account_sid: 'S-1-5-21-42',
+    account_is_admin: false, account_is_entra: false, project_access_enabled: ready, project_access_valid: ready,
+    project_network_scope: ready ? ['192.168.1.0/24'] : [], pairing_access_enabled: ready,
+    pairing_access_valid: ready, pairing_network_scope: ready ? ['192.168.1.0/24'] : [], existing_ssh_inbound_rules: [],
+    local_lan_addresses: ['192.168.1.10'],
+    local_lan_scopes: ['192.168.1.0/24'], ready, fields: {},
+  }
+}
+
+function makeRemoteSshSnapshot(ready: boolean, job: RemoteSshSystemFeatureJob | null = null): RemoteSshSystemFeatureSnapshot {
+  return { status: makeSshStatus(ready), job, fields: { status: '服务端 SSH 系统功能快照', job: '固定系统功能任务' } }
+}
+
+function makeRemoteSshJob(
+  state: RemoteSshSystemFeatureJob['state'], phase: string, error: string | null = null,
+): RemoteSshSystemFeatureJob {
+  return { job_id: 'system-feature-openssh-server', resource_id: 'openssh-server', state, phase,
+    error, can_cancel: false, fields: { state: '任务状态', phase: '任务阶段' } }
+}
+
+function makeLocalSshJob(state: string): ManagedResourceJob {
+  return { job_id: 'system-feature-openssh-server', resource_id: 'openssh-server', state, phase: state,
+    error: null, can_cancel: false, fields: { state: '任务状态', phase: '任务阶段' } }
+}
+
+function makeManagementResponse(
+  operation: RemoteManagementOperation, body: Record<string, unknown>, status = 200,
+): RemoteManagementResponse {
+  return { request_id: 'b'.repeat(32), target_host_id: foundHost.host_id, session_kind: 'management',
+    session_generation: 4, operation, status, body, fields: {} }
+}
+
+describe('DeviceSettings（设备设置）', () => {
   let wrapper: VueWrapper | undefined
-  const requestGateway = vi.fn()
-  const readSnapshot = vi.fn()
-  const startWorker = vi.fn()
-  const readHelperHealth = vi.fn()
-  const taskChannel = vi.fn()
-  const mediaChannel = vi.fn()
-  const readLocalSnapshot = vi.fn()
-  const selectLocalDevice = vi.fn()
+  let currentStatus: DeviceConfigStatus
+  let sshReady: boolean
+  let sshConnected: boolean
+  let taskRunning: boolean
+  let mediaRunning: boolean
+  let interactionGeneration: number
+  const clipboardWrite = vi.fn()
+
+  function prepareRemoteHost() {
+    currentStatus = makeConfig('remote', false)
+    currentStatus.device_config!.paired_host = {
+      host_id: foundHost.host_id, display_name: foundHost.display_name, addresses: foundHost.addresses,
+      address: foundHost.addresses[0], port: foundHost.ssh_port, username: 'tester',
+      host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      credential_ref: 'VoiceTerminal/device/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    }
+    sshConnected = true
+  }
 
   beforeEach(() => {
-    const config: DeviceConfigStatus = {
-      runtime: { config_state: 'valid', device_id: 'client-a', desired_role: 'remote_client', audio_mode: 'pcm', error: null },
-      device_config: {
-        schema_version: 2,
-        device_id: 'client-a',
-        desired_role: 'remote_client',
-        audio_mode: 'pcm',
-        host: {
-          address: '192.0.2.10', port: 22, username: 'voice',
-          host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-          credential_ref: 'device-ssh:client-a',
-        },
-      },
-      fields: {},
-    }
-    const snapshot: RemoteDeviceSnapshot = {
-      protocol_version: 1,
-      ready: true,
-      active_device_id: 'host-local',
-      interaction_generation: 3,
-      devices: [{ device_id: 'host-local', name: '主机本机', connected: true, connection_generation: 3,
-        executor_generation: 2, capabilities: ['screen_capture'], error: null, interaction_active: true }],
-      capability_labels: { screen_capture: '屏幕捕获' },
-      fields: {},
-    }
-    vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockResolvedValue(config)
-    const opensshStatus: OpenSshServerStatus = {
-      feature_id: 'openssh-server', capability_state: 'NotPresent', service_present: false,
-      service_state: null, startup_type: null, ready: false, fields: {},
-    }
-    vi.spyOn(nativeDeviceApi, 'openSshServerStatus').mockResolvedValue(opensshStatus)
+    currentStatus = makeConfig('local', false)
+    sshReady = true
+    sshConnected = false
+    taskRunning = false
+    mediaRunning = false
+    interactionGeneration = 0
+    clipboardWrite.mockReset().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: clipboardWrite } })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockImplementation(async () => currentStatus)
+    vi.spyOn(nativeDeviceApi, 'saveDeviceConfig').mockImplementation(async (config: DeviceConfig) => {
+      currentStatus = makeConfig(config.mode, config.broadcast_enabled)
+      currentStatus.device_config = config
+      return currentStatus
+    })
+    vi.spyOn(nativeDeviceApi, 'searchDevices').mockResolvedValue({ protocol_version: 1, devices: [foundHost], fields: {} })
+    vi.spyOn(nativeDeviceApi, 'pairWithDiscoveredDevice').mockImplementation(async (hostId, pairingCode) => {
+      sshConnected = true
+      const saved = currentStatus.device_config!
+      const paired = {
+        host_id: hostId, display_name: foundHost.display_name, addresses: foundHost.addresses,
+        address: foundHost.addresses[0], port: foundHost.ssh_port, username: 'tester',
+        host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        credential_ref: 'VoiceTerminal/device/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      }
+      currentStatus = makeConfig('remote', false)
+      currentStatus.device_config = { ...saved, mode: 'remote', desired_role: 'remote_client', paired_host: paired }
+      return {
+        state: 'paired', device_id: saved.device_id, host_id: hostId, display_name: foundHost.display_name,
+        ssh_port: 22, address: foundHost.addresses[0], connected: true, connection_error: null, fields: {},
+      }
+    })
+    vi.spyOn(nativeDeviceApi, 'openPairingWindow').mockResolvedValue({ pairing_code: '000042', expires_in_seconds: 120, fields: {} })
+    vi.spyOn(nativeDeviceApi, 'closePairingWindow').mockResolvedValue(undefined)
+    vi.spyOn(nativeDeviceApi, 'pairingWindowStatus').mockResolvedValue({ open: true, expires_in_ms: 120000, fields: {} })
+    vi.spyOn(nativeDeviceApi, 'openSshServerStatus').mockImplementation(async () => makeSshStatus(sshReady))
+    vi.spyOn(nativeDeviceApi, 'enableOpenSshServer').mockResolvedValue({ job_id: 'system-feature-openssh-server', fields: {} })
     vi.spyOn(nativeDeviceApi, 'resourceJobs').mockResolvedValue([])
-    vi.spyOn(nativeDeviceApi, 'enableOpenSshServer').mockResolvedValue({
-      job_id: 'system-feature-openssh-server', fields: {},
+    vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockImplementation(async () => ({ state: sshConnected ? 'connected' : 'disconnected', connected: sshConnected, fields: {} }))
+    vi.spyOn(nativeDeviceApi, 'connectSshHost').mockImplementation(async () => {
+      sshConnected = true
+      return { state: 'ready', device_id: 'device-a', address: '192.168.1.20', port: 22,
+        host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', gateway_port: 18765, fields: {} }
     })
-    vi.spyOn(nativeDeviceApi, 'sshIdentityStatus').mockResolvedValue(null)
-    vi.spyOn(nativeDeviceApi, 'sshTransportIdentityStatus').mockResolvedValue(null)
-    vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockResolvedValue({
-      state: 'connected', connected: true, fields: {},
+    vi.spyOn(nativeDeviceApi, 'disconnectSshHost').mockImplementation(async () => {
+      sshConnected = false
+      return { state: 'disconnected', disconnected: true, fields: {} }
     })
-    requestGateway.mockReset().mockResolvedValue({
-      status: 200, body: { protocol_version: 1, ready: true, fields: {} },
+    vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockImplementation(async action => {
+      if (action === 'start') taskRunning = true
+      if (action === 'stop') taskRunning = false
+      return taskRunning
+        ? { state: 'running', device_id: 'device-a', connection_generation: 1, executor_generation: 1, stopped: action === 'stop', fields: {} }
+        : { state: 'stopped', stopped: action === 'stop', fields: {} }
     })
-    readSnapshot.mockReset().mockResolvedValue(snapshot)
-    startWorker.mockReset().mockResolvedValue({ state: 'ready', fields: {} })
-    readHelperHealth.mockReset().mockResolvedValue({
-      protocol_version: 1, request_id: '1', ok: true, state: 'ready',
-      data: { health: { protocol_version: 1, request_id: '1', ok: true, result: { session_id: 1 } }, fields: {} },
-      fields: {},
+    vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockImplementation(async action => {
+      if (action === 'start') mediaRunning = true
+      if (action === 'stop') mediaRunning = false
+      if (action === 'start') interactionGeneration += 1
+      return mediaRunning
+        ? { state: 'running', device_id: 'device-a', stream_id: 'stream-a', connection_generation: 1,
+          executor_generation: 1, interaction_generation: interactionGeneration, stopped: false, capture_active: true, fields: {} }
+        : { state: 'stopped', interaction_generation: interactionGeneration, stopped: action === 'stop', capture_active: false, fields: {} }
     })
-    taskChannel.mockReset().mockImplementation(async (action: 'start' | 'status' | 'stop') => ({
-      state: action === 'start' ? 'running' : 'stopped', stopped: action === 'stop', fields: {},
+    vi.spyOn(nativeDeviceApi, 'remoteDeviceSnapshot').mockImplementation(async () => ({
+      protocol_version: 1, ready: true,
+      active_device_id: mediaRunning ? 'device-a' : 'local',
+      interaction_generation: interactionGeneration,
+      devices: [{
+        device_id: 'device-a', name: '客户端 A', connected: sshConnected,
+        connection_generation: 1, executor_generation: 1,
+        capabilities: ['audio_stream'], error: null, interaction_active: mediaRunning,
+      }],
+      capability_labels: { audio_stream: '语音流' },
+      fields: { active_device_id: '当前语音占用设备编号', interaction_generation: '当前语音占用代次',
+        devices: '服务端已登记设备' },
     }))
-    mediaChannel.mockReset().mockImplementation(async (action: 'start' | 'status' | 'stop') => ({
-      state: action === 'start' ? 'running' : 'stopped', stopped: action === 'stop',
-      capture_active: action === 'start', fields: {},
-    }))
-    readLocalSnapshot.mockReset().mockResolvedValue({
-      devices: [{ device_id: 'local', name: '本机', connected: true, connection_generation: 1,
-        executor_generation: 1, capabilities: ['audio_stream'], error: null, interaction_active: false }],
-      active_device_id: 'remote-a', interaction_generation: 4,
-      capability_labels: { audio_stream: '语音音频流' }, fields: {},
+    vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockResolvedValue({
+      request_id: 'a'.repeat(32), target_host_id: foundHost.host_id, session_generation: 4,
+      session_kind: 'management', operation: 'management.status', status: 200, body: { core_state: 'ready' }, fields: {},
     })
-    selectLocalDevice.mockReset().mockResolvedValue({
-      protocol_version: 1, result: 'active', device_id: 'local', interaction_generation: 5, fields: {},
-    })
-    vi.spyOn(nativeDeviceApi, 'requestSshGateway').mockImplementation(requestGateway)
-    vi.spyOn(nativeDeviceApi, 'remoteDeviceSnapshot').mockImplementation(readSnapshot)
-    vi.spyOn(nativeDeviceApi, 'startWorker').mockImplementation(startWorker)
-    vi.spyOn(nativeDeviceApi, 'desktopHelperHealth').mockImplementation(readHelperHealth)
-    vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockImplementation(taskChannel)
-    vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockImplementation(mediaChannel)
-    vi.spyOn(productApi, 'deviceSnapshot').mockImplementation(readLocalSnapshot)
-    vi.spyOn(productApi, 'selectInteractionDevice').mockImplementation(selectLocalDevice)
   })
 
   afterEach(() => {
     wrapper?.unmount()
     wrapper = undefined
+    vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
-  it('将目标角色与当前实际核心角色分别显示', async () => {
-    const configured = await nativeDeviceApi.deviceConfigStatus() as DeviceConfigStatus
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValueOnce({
-      ...configured,
-      device_runtime: {
-        actual_role: 'standalone',
-        core_ready: true,
-        device_gateway: { enabled: false, ready: false, error: null },
-        remote_client_connected: false,
-        fields: {},
-      },
-    })
+  it('零组件远程客户端可直接搜索，并在搜索前保存远程模式', async () => {
+    currentStatus = { ...makeConfig('remote', false), local_core_available: false,
+      runtime: { ...makeConfig('remote', false).runtime, config_state: 'missing', device_id: null }, device_config: null }
     wrapper = mount(DeviceSettings)
     await flushPromises()
 
-    expect(wrapper.text()).toContain('实际角色：独立运行；当前核心留在本机。')
-    expect((wrapper.get('select').element as HTMLSelectElement).value).toBe('remote_client')
-  })
-
-  it('只有固定 SSH 主机连接回执才把目标标为实际远端客户端', async () => {
-    const configured = await nativeDeviceApi.deviceConfigStatus() as DeviceConfigStatus
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValueOnce({
-      ...configured,
-      device_runtime: {
-        actual_role: 'remote_client',
-        core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null },
-        remote_client_connected: true,
-        fields: {},
-      },
-    })
-    wrapper = mount(DeviceSettings)
+    const search = wrapper.findAll('button').find(button => button.text().trim() === '搜索设备')
+    expect(search).toBeDefined()
+    await search!.trigger('click')
     await flushPromises()
 
-    expect(wrapper.text()).toContain('实际角色：远端客户端；固定主机 SSH 连接已认证。')
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'remote', desired_role: 'remote_client', paired_host: null,
+    }), false)
+    expect(nativeDeviceApi.searchDevices).toHaveBeenCalledWith(3000)
+    expect(wrapper.text()).toContain('服务端 A')
   })
 
-  it('SSH 认证成功后刷新实际角色状态', async () => {
-    const configured = await nativeDeviceApi.deviceConfigStatus() as DeviceConfigStatus
-    const pending = {
-      ...configured,
-      device_runtime: {
-        actual_role: 'none' as const, core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null },
-        remote_client_connected: false, fields: {},
-      },
+  it('模式选远程后自动保存；配对码保持前导零并自动建立连接通道', async () => {
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    await wrapper.get('select').setValue('remote')
+    await flushPromises()
+
+    const search = wrapper.findAll('button').find(button => button.text().trim() === '搜索设备')
+    await search!.trigger('click')
+    await flushPromises()
+    const codeInput = wrapper.find('input[placeholder="输入服务端显示的配对码"]')
+    await codeInput.setValue('000042')
+    const connect = wrapper.findAll('button').find(button => button.text().trim() === '连接')
+    await connect!.trigger('click')
+    await flushPromises()
+
+    expect(nativeDeviceApi.pairWithDiscoveredDevice).toHaveBeenCalledWith('server-a', '000042')
+    expect(nativeDeviceApi.remoteTaskChannel).toHaveBeenCalledWith('start')
+    expect(nativeDeviceApi.remoteMediaChannel).toHaveBeenCalledWith('start')
+    expect(wrapper.text()).toContain('服务端 A')
+    expect(wrapper.find('input[placeholder*="192.168"]').exists()).toBe(false)
+    expect(wrapper.find('input[placeholder*="SHA256"]').exists()).toBe(false)
+  })
+
+  it('远程连接开关即时保存并按需重建通道，不暴露手工通道控制', async () => {
+    currentStatus = makeConfig('remote', false)
+    currentStatus.device_config!.paired_host = {
+      host_id: 'server-a', display_name: '服务端 A', addresses: foundHost.addresses,
+      address: foundHost.addresses[0], port: foundHost.ssh_port, username: 'tester',
+      host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      credential_ref: 'VoiceTerminal/device/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     }
-    const connected = {
-      ...configured,
-      device_runtime: {
-        actual_role: 'remote_client' as const, core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null },
-        remote_client_connected: true, fields: {},
-      },
-    }
-    const disconnected = {
-      ...configured,
-      device_runtime: {
-        actual_role: 'none' as const, core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null },
-        remote_client_connected: false, fields: {},
-      },
-    }
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockReset()
-      .mockResolvedValueOnce(pending).mockResolvedValueOnce(connected).mockResolvedValue(disconnected)
-    vi.mocked(nativeDeviceApi.sshHostStatus).mockReset()
-      .mockResolvedValueOnce({ state: 'disconnected', connected: false, fields: {} })
-      .mockResolvedValueOnce({ state: 'connected', connected: true, fields: {} })
-      .mockResolvedValue({ state: 'disconnected', connected: false, fields: {} })
-    vi.spyOn(nativeDeviceApi, 'connectSshHost').mockResolvedValue({
-      state: 'ready', device_id: 'client-a', address: '192.0.2.10', port: 22,
-      host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', gateway_port: 18765, fields: {},
-    })
-    vi.spyOn(nativeDeviceApi, 'disconnectSshHost').mockResolvedValue({ state: 'disconnected', disconnected: true, fields: {} })
+    sshConnected = true
+    taskRunning = true
+    mediaRunning = true
     wrapper = mount(DeviceSettings)
     await flushPromises()
-    expect(wrapper.text()).toContain('实际角色：尚未就绪')
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    vi.mocked(nativeDeviceApi.remoteTaskChannel).mockClear()
+    vi.mocked(nativeDeviceApi.remoteMediaChannel).mockClear()
 
-    const connect = wrapper.findAll('button').find(button => button.text().trim() === '连接主机')
-    if (!connect) throw new Error('没有出现 SSH 主机连接按钮')
-    await connect.trigger('click')
+    const audioCompressionToggle = wrapper.get('input[aria-label="压缩远程音频"]')
+    await audioCompressionToggle.setValue(true)
     await flushPromises()
 
-    expect(wrapper.text()).toContain('实际角色：远端客户端；固定主机 SSH 连接已认证。')
-    const disconnect = wrapper.findAll('button').find(button => button.text().trim() === '断开')
-    if (!disconnect) throw new Error('没有出现 SSH 连接断开按钮')
-    await disconnect.trigger('click')
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'remote', audio_compression: true, audio_mode: 'opus_experimental',
+    }))
+    expect(nativeDeviceApi.remoteMediaChannel).toHaveBeenNthCalledWith(1, 'stop')
+    expect(nativeDeviceApi.remoteMediaChannel).toHaveBeenNthCalledWith(2, 'start')
+    expect(nativeDeviceApi.remoteTaskChannel).not.toHaveBeenCalledWith('stop')
+
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    vi.mocked(nativeDeviceApi.remoteTaskChannel).mockClear()
+    vi.mocked(nativeDeviceApi.remoteMediaChannel).mockClear()
+    const onlineTtsToggle = wrapper.get('input[aria-label="在线语音在本机合成并播放"]')
+    await onlineTtsToggle.setValue(false)
     await flushPromises()
-    expect(wrapper.text()).toContain('实际角色：尚未就绪')
+
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'remote', client_online_tts_local: false, audio_compression: true, audio_mode: 'opus_experimental',
+    }))
+    expect(vi.mocked(nativeDeviceApi.remoteMediaChannel).mock.calls.map(([action]) => action)).toEqual(['stop', 'start'])
+    expect(vi.mocked(nativeDeviceApi.remoteTaskChannel).mock.calls.map(([action]) => action)).toEqual(['stop', 'start'])
+    expect(wrapper.findAll('button').map(button => button.text())).not.toContain('启动远端桌面通道')
+    expect(wrapper.findAll('button').map(button => button.text())).not.toContain('停止远端语音设备')
   })
 
-  it('从受信 SSH 会话读取并显示主机设备状态', async () => {
+  it('本机广播开关保存本地运行意图，获取配对码后自动复制', async () => {
+    currentStatus = makeConfig('local', false)
     wrapper = mount(DeviceSettings)
     await flushPromises()
-
-    const refreshButton = wrapper.findAll('button').find(button => button.text().trim() === '刷新主机状态与设备')
-    if (!refreshButton) throw new Error('没有出现主机设备刷新按钮')
-    await refreshButton.trigger('click')
+    vi.mocked(nativeDeviceApi.openSshServerStatus).mockClear()
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    const checkbox = wrapper.get('input[aria-label="广播并接受配对"]')
+    await checkbox.setValue(true)
     await flushPromises()
 
-    expect(requestGateway).toHaveBeenCalledWith('/v1/status', { protocol_version: 1 })
-    expect(readSnapshot).toHaveBeenCalledOnce()
-    expect(wrapper.get('.remote-device-list').text()).toContain('共享主机登记设备')
-    expect(wrapper.get('.remote-device-list').text()).toContain('主机本机')
-    expect(wrapper.get('.remote-device-list').text()).toContain('在线')
-    expect(wrapper.get('.remote-device-list').text()).toContain('当前语音设备')
-    expect(wrapper.get('.remote-device-list').text()).toContain('屏幕捕获')
-    expect(wrapper.text()).toContain('共登记 1 台设备')
-  })
-
-  it('仅对已启动设备进程发出无副作用桌面辅助健康检查', async () => {
-    wrapper = mount(DeviceSettings)
+    const getCode = wrapper.findAll('button').find(button => button.text().trim() === '获取配对码')
+    expect(getCode).toBeDefined()
+    await getCode!.trigger('click')
     await flushPromises()
 
-    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查桌面辅助进程')
-    if (!check) throw new Error('没有出现桌面辅助健康检查按钮')
-    await check.trigger('click')
-    await flushPromises()
-
-    expect(startWorker).toHaveBeenCalledOnce()
-    expect(readHelperHealth).toHaveBeenCalledOnce()
-    expect(startWorker.mock.invocationCallOrder[0]).toBeLessThan(readHelperHealth.mock.invocationCallOrder[0])
-    expect(wrapper.get('.helper-card').text()).toContain('辅助进程就绪')
-    expect(wrapper.text()).toContain('Windows 交互会话编号 1')
-  })
-
-  it('远端桌面任务通道须由用户显式启动并可安全停止', async () => {
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    const start = wrapper.findAll('button').find(button => button.text().trim() === '启动远端桌面通道')
-    if (!start) throw new Error('没有出现远端桌面通道启动按钮')
-    await start.trigger('click')
-    await flushPromises()
-    expect(taskChannel).toHaveBeenCalledWith('start')
-    expect(wrapper.get('.task-channel-card').text()).toContain('任务通道运行中')
-    expect(wrapper.text()).toContain('实际设备动作仍走 DSH 审批')
-
-    const stop = wrapper.findAll('button').find(button => button.text().trim() === '停止远端桌面通道')
-    if (!stop) throw new Error('没有出现远端桌面通道停止按钮')
-    await stop.trigger('click')
-    await flushPromises()
-    expect(taskChannel).toHaveBeenCalledWith('stop')
-    expect(wrapper.get('.task-channel-card').text()).toContain('任务通道未启动')
-  })
-
-  it('远端语音媒体通道须在任务会话运行后由用户显式开启和停止', async () => {
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    const startTasks = wrapper.findAll('button').find(button => button.text().trim() === '启动远端桌面通道')
-    if (!startTasks) throw new Error('没有出现远端桌面通道启动按钮')
-    await startTasks.trigger('click')
-    await flushPromises()
-
-    const startMedia = wrapper.findAll('button').find(button => button.text().trim() === '连接并启用远端语音设备')
-    if (!startMedia) throw new Error('没有出现远端语音设备启动按钮')
-    await startMedia.trigger('click')
-    await flushPromises()
-    expect(mediaChannel).toHaveBeenCalledWith('start')
-    expect(wrapper.get('.media-channel-card').text()).toContain('主机已请求麦克风采集')
-
-    const stopMedia = wrapper.findAll('button').find(button => button.text().trim() === '停止远端语音设备')
-    if (!stopMedia) throw new Error('没有出现远端语音设备停止按钮')
-    await stopMedia.trigger('click')
-    await flushPromises()
-    expect(mediaChannel).toHaveBeenCalledWith('stop')
-    expect(wrapper.get('.media-channel-card').text()).toContain('语音媒体通道未启动')
-  })
-
-  it('Opus 实验档可明确启动双向连接且不回退到 PCM', async () => {
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    const audioSelect = wrapper.findAll('select').find(select => select.find('option[value="opus_experimental"]').exists())
-    if (!audioSelect) throw new Error('没有出现 Opus 实验档选择项')
-    await audioSelect.setValue('opus_experimental')
-    await flushPromises()
-    expect(wrapper.text()).toContain('识别结果对照尚未完成')
-    expect(wrapper.text()).toContain('不会自动改用 PCM')
-
-    const start = wrapper.findAll('button').find(button => button.text().trim() === '启动远端桌面通道')
-    if (!start) throw new Error('没有出现远端桌面通道启动按钮')
-    await start.trigger('click')
-    await flushPromises()
-
-    const mediaStart = wrapper.findAll('button').find(button => button.text().trim() === '连接并启用远端语音设备')
-    if (!mediaStart) throw new Error('没有出现远端语音设备启动按钮')
-    expect(mediaStart.attributes('disabled')).toBeUndefined()
-    await mediaStart.trigger('click')
-    await flushPromises()
-    expect(mediaChannel).toHaveBeenCalledWith('start')
-    expect(wrapper.get('.media-channel-card').text()).toContain('语音媒体通道运行中')
-  })
-
-  it('共享主机仅在用户明确点击后切回本机语音设备', async () => {
-    vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockResolvedValue({
-      runtime: { config_state: 'valid', device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', error: null },
-      device_config: { schema_version: 2, device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', host: null },
-      local_core_available: true, device_runtime: readySharedHostRuntime,
-      fields: {},
-    })
-    vi.spyOn(productApi, 'devicePairingStatus').mockResolvedValue({
-      window_open: false, window_expires_at_ms: null, failed_attempts_remaining: 10,
-      pending_requests: [], trust: { schema_version: 1, state: 'valid', devices: [] }, fields: {},
-    })
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    expect(readLocalSnapshot).toHaveBeenCalledOnce()
-    const switchButton = wrapper.findAll('button').find(button => button.text().trim() === '明确切回主机本机语音')
-    if (!switchButton) throw new Error('没有出现明确切回本机语音按钮')
-    await switchButton.trigger('click')
-    await flushPromises()
-
-    expect(selectLocalDevice).toHaveBeenCalledWith('local', 4)
-    expect(readLocalSnapshot).toHaveBeenCalledTimes(2)
-    expect(wrapper.text()).toContain('已按本机明确操作切回主机语音设备')
-  })
-
-  it('系统 SSH 功能状态只在已保存的共享主机角色下查询', async () => {
-    const standalone: DeviceConfigStatus = {
-      runtime: { config_state: 'valid', device_id: 'host-a', desired_role: 'standalone', audio_mode: 'pcm', error: null },
-      device_config: { schema_version: 2, device_id: 'host-a', desired_role: 'standalone', audio_mode: 'pcm', host: null },
-      fields: {},
-    }
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue(standalone)
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
-    await wrapper.get('fieldset select').setValue('shared_host')
-    expect(wrapper.get('.system-feature-card').text()).toContain('先保存“共享主机”角色')
-    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
-  })
-
-  it('全新轻量工作区默认显示远端客户端且不自动保存角色或请求配对', async () => {
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue({
-      local_core_available: false,
-      runtime: { config_state: 'missing', device_id: null, desired_role: null, audio_mode: null, error: null },
-      device_config: null,
-      device_runtime: { ...readySharedHostRuntime, actual_role: 'none', core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null } },
-      fields: {},
-    })
-    const save = vi.spyOn(nativeDeviceApi, 'saveDeviceConfig')
-    const pairingStatus = vi.spyOn(productApi, 'devicePairingStatus')
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-    expect(wrapper.get('fieldset select').element).toHaveProperty('value', 'remote_client')
-    expect(wrapper.text()).toContain('待配置主机')
-    expect(wrapper.text()).toContain('本机核心未启动')
-    expect(wrapper.text()).not.toContain('当前核心留在本机')
-    expect(save).not.toHaveBeenCalled()
-    expect(pairingStatus).not.toHaveBeenCalled()
-  })
-
-  it('轻量客户端保留误保存的共享主机配置并阻止配对与系统安装请求', async () => {
-    const configured = await nativeDeviceApi.deviceConfigStatus() as DeviceConfigStatus
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue({
-      ...configured,
-      local_core_available: false,
-      runtime: { ...configured.runtime, desired_role: 'shared_host' },
-      device_config: { ...configured.device_config!, desired_role: 'shared_host', host: null },
-      device_runtime: { ...readySharedHostRuntime, actual_role: 'none', core_ready: false,
-        device_gateway: { enabled: false, ready: false, error: null } },
-    })
-    const pairingStatus = vi.spyOn(productApi, 'devicePairingStatus')
-    const save = vi.spyOn(nativeDeviceApi, 'saveDeviceConfig')
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    expect(wrapper.get('fieldset select').element).toHaveProperty('value', 'shared_host')
-    expect(wrapper.get('option[value="shared_host"]').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('option[value="standalone"]').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('option[value="remote_client"]').attributes('disabled')).toBeUndefined()
-    expect(wrapper.text()).toContain('轻量客户端请选择“远端客户端”')
-    expect(wrapper.get('.pairing-card').text()).toContain('配对管理暂不可用')
-    expect(wrapper.get('.system-feature-card').text()).toContain('轻量客户端无需安装 SSH 入站服务')
-    expect(pairingStatus).not.toHaveBeenCalled()
-    expect(readLocalSnapshot).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.resourceJobs).not.toHaveBeenCalled()
-    expect(wrapper.findAll('button').some(button => button.text().includes('开启配对窗口'))).toBe(false)
-    expect(save).not.toHaveBeenCalled()
-  })
-
-  it('完整工作区核心尚未就绪时不查询配对但仍可只读检查系统服务', async () => {
-    const configured = await nativeDeviceApi.deviceConfigStatus() as DeviceConfigStatus
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue({
-      ...configured, local_core_available: true,
-      runtime: { ...configured.runtime, desired_role: 'shared_host' },
-      device_config: { ...configured.device_config!, desired_role: 'shared_host', host: null },
-      device_runtime: { ...readySharedHostRuntime, actual_role: 'none', core_ready: false },
-    })
-    const pairingStatus = vi.spyOn(productApi, 'devicePairingStatus')
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-    expect(wrapper.get('.pairing-card').text()).toContain('配对管理暂不可用')
-    expect(pairingStatus).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledOnce()
-  })
-
-  it('安装 OpenSSH Server 前披露 TCP 22 防火墙副作用并要求额外确认', async () => {
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue({
-      runtime: { config_state: 'valid', device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', error: null },
-      device_config: { schema_version: 2, device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', host: null },
-      local_core_available: true, device_runtime: readySharedHostRuntime,
-      fields: {},
-    })
-    vi.spyOn(productApi, 'devicePairingStatus').mockResolvedValue({
-      window_open: false, window_expires_at_ms: null, failed_attempts_remaining: 10,
-      pending_requests: [], trust: { schema_version: 1, state: 'valid', devices: [] }, fields: {},
-    })
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-
-    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledOnce()
-    expect(wrapper.get('.system-feature-card').text()).toContain('OpenSSH-Server-In-TCP')
-    const enable = wrapper.findAll('button').find(button => button.text().trim() === '安装并启动 OpenSSH Server')
-    if (!enable) throw new Error('没有出现 OpenSSH Server 安装按钮')
-    await enable.trigger('click')
-    expect(confirm).toHaveBeenCalledOnce()
-    expect(confirm.mock.calls[0][0]).toContain('TCP 端口 22')
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'local', broadcast_enabled: true, desired_role: 'shared_host',
+    }), false)
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalled()
+    expect(vi.mocked(nativeDeviceApi.openSshServerStatus).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(nativeDeviceApi.saveDeviceConfig).mock.invocationCallOrder[0]!)
+    expect(nativeDeviceApi.openPairingWindow).toHaveBeenCalledOnce()
+    expect(clipboardWrite).toHaveBeenCalledWith('000042')
+    expect(wrapper.get('.pairing-code-box output').text()).toBe('000042')
   })
 
-  it('仅在用户接受系统副作用后登记不可取消的 OpenSSH 受管任务', async () => {
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue({
-      runtime: { config_state: 'valid', device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', error: null },
-      device_config: { schema_version: 2, device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', host: null },
-      local_core_available: true, device_runtime: readySharedHostRuntime,
-      fields: {},
-    })
-    vi.spyOn(productApi, 'devicePairingStatus').mockResolvedValue({
-      window_open: false, window_expires_at_ms: null, failed_attempts_remaining: 10,
-      pending_requests: [], trust: { schema_version: 1, state: 'valid', devices: [] }, fields: {},
-    })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
-    vi.mocked(nativeDeviceApi.resourceJobs)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([{
-        job_id: 'system-feature-openssh-server', resource_id: 'openssh-server', state: 'running',
-        phase: '等待 Windows 管理员授权', error: null, can_cancel: false, fields: {},
-      }])
+  it('广播开启前 SSH 未就绪时获准后等待系统任务完成再保存', async () => {
+    vi.useFakeTimers()
+    sshReady = false
     wrapper = mount(DeviceSettings)
     await flushPromises()
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    vi.mocked(nativeDeviceApi.openSshServerStatus).mockReset()
+      .mockResolvedValueOnce(makeSshStatus(false))
+      .mockResolvedValueOnce(makeSshStatus(true))
+      .mockResolvedValueOnce(makeSshStatus(true))
+      .mockResolvedValueOnce(makeSshStatus(true))
+    vi.mocked(nativeDeviceApi.resourceJobs).mockReset()
+      .mockResolvedValueOnce([makeLocalSshJob('running')])
+      .mockResolvedValueOnce([makeLocalSshJob('complete')])
+      .mockResolvedValueOnce([makeLocalSshJob('complete')])
 
-    const enable = wrapper.findAll('button').find(button => button.text().trim() === '安装并启动 OpenSSH Server')
-    if (!enable) throw new Error('没有出现 OpenSSH Server 安装按钮')
-    await enable.trigger('click')
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
     await flushPromises()
 
     expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledOnce()
-    expect(wrapper.get('.system-feature-card').text()).toContain('等待 Windows 管理员授权')
-  })
-
-  it('共享主机通过本地会话管理限时配对、批准及撤销', async () => {
-    const hostConfig: DeviceConfigStatus = {
-      runtime: { config_state: 'valid', device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', error: null },
-      device_config: { schema_version: 2, device_id: 'host-a', desired_role: 'shared_host', audio_mode: 'pcm', host: null },
-      local_core_available: true, device_runtime: readySharedHostRuntime,
-      fields: {},
-    }
-    vi.mocked(nativeDeviceApi.deviceConfigStatus).mockResolvedValue(hostConfig)
-
-    const pendingStatus: DevicePairingStatus = {
-      window_open: true,
-      window_expires_at_ms: 1_900_000_000_000,
-      failed_attempts_remaining: 10,
-      pending_requests: [{ request_id: 'a'.repeat(32), device_id: 'client-b', fingerprint: 'SHA256:device-fingerprint', created_at_ms: 1_800_000_000_000, expires_at_ms: 1_900_000_000_000 }],
-      trust: { schema_version: 1, state: 'valid', devices: [] },
-      fields: {},
-    }
-    const trustedStatus: DevicePairingStatus = {
-      ...pendingStatus,
-      pending_requests: [],
-      trust: { schema_version: 1, state: 'valid', devices: [{ device_id: 'client-b', fingerprint: 'SHA256:device-fingerprint', state: 'trusted', trusted_at_ms: 1_800_000_000_000, revoked_at_ms: null }] },
-    }
-    const revokedStatus: DevicePairingStatus = {
-      ...trustedStatus,
-      trust: { schema_version: 1, state: 'valid', devices: [{ ...trustedStatus.trust.devices[0], state: 'revoked', revoked_at_ms: 1_800_000_001_000 }] },
-    }
-    vi.spyOn(productApi, 'devicePairingStatus').mockResolvedValue(pendingStatus)
-    const openPairing = vi.spyOn(productApi, 'openDevicePairing').mockResolvedValue({ ...pendingStatus, pairing_code: '38472910' })
-    const approvePairing = vi.spyOn(productApi, 'approveDevicePairing').mockResolvedValue(trustedStatus)
-    const revokeDevice = vi.spyOn(productApi, 'revokeDeviceTrust').mockResolvedValue(revokedStatus)
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
-
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-    expect(productApi.devicePairingStatus).toHaveBeenCalledOnce()
-
-    await wrapper.get('.pairing-card').findAll('button').find(button => button.text().includes('开启配对窗口'))?.trigger('click')
-    await flushPromises()
-    expect(openPairing).toHaveBeenCalledWith(120)
-    expect(wrapper.get('.pairing-code-box').text()).toContain('38472910')
-
-    const approveButton = wrapper.get('.pairing-card').findAll('button').find(button => button.text().trim() === '明确批准')
-    if (!approveButton) throw new Error('没有出现明确批准按钮')
-    await approveButton.trigger('click')
-    await flushPromises()
-    expect(approvePairing).toHaveBeenCalledWith('a'.repeat(32))
-    expect(wrapper.get('.pairing-card').text()).toContain('client-b')
-    expect(wrapper.get('.pairing-card').text()).toContain('可信')
-
-    const revokeButton = wrapper.get('.pairing-card').findAll('button').find(button => button.text().trim() === '撤销信任')
-    if (!revokeButton) throw new Error('没有出现撤销信任按钮')
-    await revokeButton.trigger('click')
-    await flushPromises()
-    expect(revokeDevice).toHaveBeenCalledWith('client-b')
-    expect(wrapper.get('.pairing-card').text()).toContain('已撤销')
-  })
-
-  it('远端客户端只通过本机私钥签署已固定 SSH 会话的配对申请', async () => {
-    const identity: NativeSshIdentity = {
-      credential_ref: `VoiceTerminal/device/${'a'.repeat(64)}`,
-      public_key: 'ssh-ed25519 AAAA client-a',
-      fingerprint: 'SHA256:client-fingerprint',
-    }
-    vi.spyOn(nativeDeviceApi, 'sshIdentityStatus').mockResolvedValue(identity)
-    const submit = vi.spyOn(nativeDeviceApi, 'submitSshPairingRequest').mockResolvedValue({
-      status: 202,
-      body: { protocol_version: 1, request_id: 'b'.repeat(32), device_id: 'client-a', fingerprint: identity.fingerprint },
-      fields: {},
-    })
-
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-    await wrapper.get('input[placeholder="8 位数字"]').setValue('38472910')
-    const submitButton = wrapper.findAll('button').find(button => button.text().trim() === '提交签名配对申请')
-    if (!submitButton) throw new Error('没有出现签名配对申请按钮')
-    await submitButton.trigger('click')
+    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledWith(true)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', true)
+    await vi.advanceTimersByTimeAsync(1200)
     await flushPromises()
 
-    expect(submit).toHaveBeenCalledWith('38472910')
-    expect(wrapper.text()).toContain('须由主机本机明确批准')
-    expect(wrapper.text()).toContain('等待主机批准')
-    expect(wrapper.find('input[placeholder="8 位数字"]').element).toHaveProperty('value', '')
-  })
-
-  it('将 SSH 登录私钥交由原生层导入，并与产品设备签名身份分开保存', async () => {
-    const identity: NativeSshTransportIdentity = {
-      credential_ref: `VoiceTerminal/ssh-transport/${'b'.repeat(64)}`,
-      public_key: 'ssh-ed25519 AAAA transport-login',
-      fingerprint: 'SHA256:transport-fingerprint',
-    }
-    const configured: DeviceConfigStatus = {
-      runtime: { config_state: 'valid', device_id: 'client-a', desired_role: 'remote_client', audio_mode: 'pcm', error: null },
-      device_config: {
-        schema_version: 2, device_id: 'client-a', desired_role: 'remote_client', audio_mode: 'pcm',
-        host: {
-          address: '192.0.2.10', port: 22, username: 'voice',
-          host_key_sha256: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-          credential_ref: `VoiceTerminal/device/${'a'.repeat(64)}`,
-          transport_credential_ref: identity.credential_ref,
-        },
-      },
-      fields: {},
-    }
-    vi.spyOn(nativeDeviceApi, 'importSshTransportIdentity').mockResolvedValue(identity)
-    vi.spyOn(nativeDeviceApi, 'sshTransportIdentityStatus').mockResolvedValue(identity)
-    vi.spyOn(nativeDeviceApi, 'saveDeviceConfig').mockResolvedValue(configured)
-    vi.spyOn(nativeDeviceApi, 'deviceConfigStatus')
-      .mockResolvedValueOnce({ ...configured, device_config: { ...configured.device_config!, host: {
-        ...configured.device_config!.host!, transport_credential_ref: undefined,
-      } } })
-      .mockResolvedValue(configured)
-
-    wrapper = mount(DeviceSettings)
-    await flushPromises()
-    const pathInput = wrapper.get('input[placeholder*="id_ed25519"]')
-    await pathInput.setValue('C:\\Users\\tester\\.ssh\\id_ed25519')
-    const importButton = wrapper.findAll('button').find(button => button.text().trim() === '在本机导入登录密钥')
-    if (!importButton) throw new Error('没有出现 SSH 登录密钥导入按钮')
-    await importButton.trigger('click')
-    await flushPromises()
-
-    expect(nativeDeviceApi.importSshTransportIdentity).toHaveBeenCalledWith('C:\\Users\\tester\\.ssh\\id_ed25519')
-    expect(wrapper.text()).toContain('transport-fingerprint')
-    expect(wrapper.text()).toContain('产品配对批准不会修改主机登录账户')
-    const saveButton = wrapper.findAll('button').find(button => button.text().trim() === '保存设备配置')
-    if (!saveButton) throw new Error('没有出现设备配置保存按钮')
-    await saveButton.trigger('click')
-    await flushPromises()
     expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
-      host: expect.objectContaining({
-        credential_ref: expect.stringMatching(/^VoiceTerminal\/device\//),
-        transport_credential_ref: identity.credential_ref,
-      }),
+      mode: 'local', broadcast_enabled: true, desired_role: 'shared_host',
     }), false)
+    expect(wrapper.text()).toContain('版本：9.5.0.0')
+  })
+
+  it('SSH 准备超过五分钟后继续显示任务，晚到完成时清除等待告警并恢复检查按钮', async () => {
+    vi.useFakeTimers()
+    sshReady = false
+    let jobState = 'running'
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.resourceJobs).mockImplementation(async () => [makeLocalSshJob(jobState)])
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Windows SSH 准备任务仍在进行')
+    expect(wrapper.text()).toContain('任务状态：进行中')
+    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!
+    expect(check.element.disabled).toBe(true)
+
+    jobState = 'complete'
+    sshReady = true
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('微软 OpenSSH Server 已就绪')
+    expect(wrapper.text()).not.toContain('准备任务仍在进行')
+    expect(wrapper.text()).not.toContain('等待 Windows SSH 服务准备超时')
+    expect(check.element.disabled).toBe(false)
+  })
+
+  it('SSH 准备超时后晚到失败时显示真实原因并开放重试', async () => {
+    vi.useFakeTimers()
+    sshReady = false
+    let jobState = 'running'
+    let jobError: string | null = null
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.resourceJobs).mockImplementation(async () => [
+      { ...makeLocalSshJob(jobState), error: jobError },
+    ])
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    await flushPromises()
+    expect(wrapper.text()).toContain('Windows SSH 准备任务仍在进行')
+
+    jobState = 'failed'
+    jobError = 'Windows 管理员授权后安装失败。'
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('Windows 管理员授权后安装失败')
+    expect(wrapper.text()).toContain('任务状态：失败')
+    expect(wrapper.text()).not.toContain('准备任务仍在进行')
+    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!
+    expect(check.element.disabled).toBe(false)
+  })
+
+  it('广播开启前 SSH 未就绪且用户取消时还原开关并且不保存', async () => {
+    sshReady = false
+    vi.mocked(window.confirm).mockReturnValue(false)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    vi.mocked(nativeDeviceApi.enableOpenSshServer).mockClear()
+    vi.mocked(nativeDeviceApi.resourceJobs).mockClear()
+
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+
+    expect(window.confirm).toHaveBeenCalledOnce()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.resourceJobs).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('你取消了 SSH 服务准备')
+  })
+
+  it('SSH 已就绪时按钮只检查状态，不重新安装或重启', async () => {
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')
+    await check!.trigger('click')
+    await flushPromises()
+
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalled()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('微软 OpenSSH Server 已就绪')
+  })
+
+  it('SSH 未就绪且用户取消时不启动安装任务，并允许再次检查', async () => {
+    sshReady = false
+    vi.mocked(window.confirm).mockReturnValue(false)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')
+    await check!.trigger('click')
+    await flushPromises()
+
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('你取消了 SSH 服务准备')
+    expect(check!.element.disabled).toBe(false)
+  })
+
+  it('其他入站规则默认收起，只显示有限条数和短摘要', async () => {
+    sshReady = false
+    const snapshot = makeSshStatus(false)
+    snapshot.existing_ssh_inbound_rules = Array.from({ length: 8 }, (_, index) =>
+      `possible-ssh-rule-${index} ${'RemoteAddress=Any '.repeat(30)}`)
+    vi.mocked(nativeDeviceApi.openSshServerStatus).mockResolvedValue(snapshot)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+
+    const details = wrapper.get('details.ssh-rule-details')
+    expect((details.element as HTMLDetailsElement).open).toBe(false)
+    expect(details.get('summary').text()).toContain('检测到 8 条')
+    expect(details.findAll('li')).toHaveLength(5)
+    expect(details.text()).toContain('还有 3 条规则未展开显示')
+    expect(details.findAll('li').every(row => Array.from(row.text()).length <= 180)).toBe(true)
+  })
+
+  it('远程服务端 SSH 就绪时只读显示服务端状态，不请求安装或检查客户端', async () => {
+    prepareRemoteHost()
+    const snapshot = makeRemoteSshSnapshot(true)
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>)
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    request.mockClear()
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+
+    expect(request).toHaveBeenCalledWith('system.ssh.status', {})
+    expect(request).not.toHaveBeenCalledWith('system.ssh.enable', expect.anything())
+    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('服务端微软 OpenSSH Server 已就绪')
+    expect(wrapper.text()).toContain('9.5.0.0')
+    expect(wrapper.text()).not.toContain('MACHINE\\tester')
+    expect(wrapper.text()).not.toContain('authorized_keys')
+    expect(wrapper.find('input[placeholder*="192.168"]').exists()).toBe(false)
+    expect(wrapper.find('input[placeholder*="SHA256"]').exists()).toBe(false)
+  })
+
+  it('远程服务端未就绪时必须明确确认，取消不发送启动操作', async () => {
+    prepareRemoteHost()
+    const snapshot = makeRemoteSshSnapshot(false)
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>)
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    vi.mocked(window.confirm).mockReturnValue(false)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    const prepare = wrapper.findAll('button').find(button => button.text().trim() === '请求服务端安装或启动')
+    expect(prepare).toBeDefined()
+    await prepare!.trigger('click')
+    await flushPromises()
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('服务端'))
+    expect(request.mock.calls.filter(([operation]) => operation === 'system.ssh.enable')).toHaveLength(0)
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('服务端微软 OpenSSH Server 尚未就绪')
+  })
+
+  it('服务端 UAC 等待与失败显示服务端任务状态，失败后可重试并只按 ready 快照标记就绪', async () => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    const notReady = makeRemoteSshSnapshot(false)
+    const awaitingUac = makeRemoteSshSnapshot(false, makeRemoteSshJob('running', '等待 Windows 管理员授权'))
+    const failed = makeRemoteSshSnapshot(false, makeRemoteSshJob('failed', '管理员取消安装', 'Windows 管理员授权已取消。'))
+    const retrying = makeRemoteSshSnapshot(false, makeRemoteSshJob('running', '正在复核服务端状态'))
+    const ready = makeRemoteSshSnapshot(true, makeRemoteSshJob('complete', 'OpenSSH Server 已就绪'))
+    let statusReads = 0
+    let enableCalls = 0
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') {
+        statusReads += 1
+        const snapshot = statusReads === 1 ? notReady : statusReads === 2 ? failed : ready
+        return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>)
+      }
+      if (operation === 'system.ssh.enable') {
+        enableCalls += 1
+        const snapshot = enableCalls === 1 ? awaitingUac : retrying
+        return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>, 202)
+      }
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    request.mockClear()
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().trim() === '请求服务端安装或启动')!.trigger('click')
+    await flushPromises()
+    expect(request).toHaveBeenCalledWith('system.ssh.enable', { confirmed: true })
+    expect(wrapper.text()).toContain('服务端正在等待 Windows UAC（用户账户控制）授权')
+    expect(wrapper.text()).not.toContain('服务端微软 OpenSSH Server 已就绪')
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('Windows 管理员授权已取消')
+    const retry = wrapper.findAll('button').find(button => button.text().trim() === '重试服务端 SSH 准备')
+    expect(retry).toBeDefined()
+    await retry!.trigger('click')
+    await flushPromises()
+    expect(request).toHaveBeenCalledWith('system.ssh.enable', { confirmed: true })
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.text()).toContain('服务端微软 OpenSSH Server 已就绪')
+    expect(wrapper.text()).toContain('OpenSSH Server 已就绪')
+    expect(enableCalls).toBe(2)
+    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    vi.useRealTimers()
   })
 })

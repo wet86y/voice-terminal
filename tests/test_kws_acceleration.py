@@ -9,6 +9,7 @@ from voice_terminal.audio.player import AudioPlayerError, PcmPlayer
 from voice_terminal.audio.wake_cue import make_wake_cue
 from voice_terminal.controller.input_ownership import InputOwnershipMixin
 from voice_terminal.controller.realtime_controller import RealtimeController
+from voice_terminal.controller.turn_controller import InputController
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.turn_workspace import AudioFrame
 from voice_terminal.core.state import RuntimeState
@@ -332,6 +333,7 @@ def test_original_frame_path_processes_buffered_audio_once_before_vad_replay():
     async def scenario():
         class FrameHarness(WakeHarness):
             handle_frame = RealtimeController.handle_frame
+            _clear_remote_audio_processing = InputController._clear_remote_audio_processing
 
             async def _observe_activity(self, activity, frame):
                 self.replayed.append(frame)

@@ -3,7 +3,10 @@ fn main() {
     println!("cargo:rerun-if-changed=../src-tauri/icons/icon.ico");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
-            "desktop_status", "desktop_cancel_init", "exit_application",
+            "desktop_status",
+            "desktop_cancel_init",
+            "exit_application",
         ]),
-    )).expect("迁移辅助进程共享启动页权限构建失败");
+    ))
+    .expect("迁移辅助进程共享启动页权限构建失败");
 }

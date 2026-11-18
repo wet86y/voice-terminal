@@ -1,5 +1,5 @@
 //! Runtime recovery（运行期恢复）：页面生命周期独立于可替换的业务进程。
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Default)]
 pub struct RuntimeRecovery {

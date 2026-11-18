@@ -81,7 +81,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Some("create-device-identity") if args.len() == 2 => {
-            let device_id = &args[1]; // device_id（本机临时 SFTP 验收设备编号）。
+            let device_id = &args[1]; // device_id（本机临时固定文件通道验收设备编号）。
             let identity = create_device_identity(device_id)?;
             let result = serde_json::json!({
                 "device_id": device_id,
@@ -333,142 +333,7 @@ fn run() -> Result<(), String> {
             println!("{}", serde_json::to_string(&report).map_err(|_| "心跳烟测报告编码失败。")?);
             Ok(())
         }
-        Some("sftp-smoke") if args.len() == 12 => {
-            let device_id = args[1].clone(); // device_id（本机 SSH 身份绑定的验收编号）。
-            let port = args[3].parse::<u16>().map_err(|_| "SSH 端口无效。")?;
-            let identity_ref = args[5].clone(); // identity_ref（产品设备签名凭据引用）。
-            let transport_ref = args[6].clone(); // transport_ref（SSH 登录凭据引用）。
-            let remote_path = args[8].clone(); // remote_path（授权 cleanup 目录内的远端暂存文件）。
-            let local_source = Path::new(&args[9]); // local_source（本机待上传的归档或便携配置）。
-            let local_download = Path::new(&args[10]); // local_download（本机回读文件目标）。
-            let transfer_id = args[11].clone(); // transfer_id（不可用于路径穿越的唯一测试编号）。
-            let approved_root = r"D:\AI\example-test\VoiceTerminal-DeviceValidation-20261115\cleanup";
-            let normalized_path = remote_path.replace('/', "\\").to_ascii_lowercase();
-            let accepted_root = format!("{}\\", approved_root.to_ascii_lowercase());
-            let portable_suffix = normalized_path.rsplit('\\').next().unwrap_or_default();
-            let portable_build = portable_suffix.strip_prefix("client-payload-client-")
-                .and_then(|name| name.strip_suffix(".portable.json"));
-            let is_client_portable = normalized_path.starts_with(&format!(
-                "{}fixtures\\client-payload-client-", accepted_root,
-            )) && portable_build.is_some_and(|value| !value.is_empty()
-                && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
-            let is_standard_smoke_file = normalized_path.ends_with(".zip")
-                || normalized_path.ends_with(".bin") || normalized_path.ends_with(".exe");
-            if !normalized_path.starts_with(&accepted_root)
-                || remote_path.split(['\\', '/']).any(|part| matches!(part, "." | ".."))
-                || !(is_standard_smoke_file || is_client_portable)
-            {
-                return Err("SFTP 烟测只允许 cleanup 内的 ZIP/BIN/EXE 夹具或客户端 portable.json 旁车。".into());
-            }
-            let maximum_bytes: u64 = if is_client_portable { 64 * 1024 } else { 512 * 1024 * 1024 };
-            if is_client_portable {
-                let bytes = std::fs::read(local_source).map_err(|_| "客户端 portable.json 旁车无法读取。")?;
-                let portable: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|_| "客户端 portable.json 旁车不是有效 JSON。")?;
-                let workspace_id = portable.get("workspace_id").and_then(serde_json::Value::as_str)
-                    .and_then(|value| value.strip_prefix("device-client-"));
-                if bytes.len() as u64 > maximum_bytes || portable.get("schema").and_then(serde_json::Value::as_u64) != Some(2)
-                    || portable.get("app").and_then(serde_json::Value::as_str) != Some("app")
-                    || portable.get("data_dir").and_then(serde_json::Value::as_str) != Some("data")
-                    || workspace_id.is_none_or(|value| value.len() != 32
-                        || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-                {
-                    return Err("客户端 portable.json 旁车大小或工作区身份无效。".into());
-                }
-            }
-            if args[2] != ACCEPTANCE_HOST
-                || port != 22
-                || args[4] != ACCEPTANCE_USER
-                || args[7] != ACCEPTANCE_FINGERPRINT
-            {
-                return Err("SFTP 验收仅允许本计划固定的主机、账户、端口和指纹。".into());
-            }
-            let target = SshDeviceTarget {
-                address: args[2].clone(),
-                port,
-                username: args[4].clone(),
-                host_key_sha256: args[7].clone(),
-                gateway_port: DEFAULT_GATEWAY_PORT,
-            };
-            let manager = SshDeviceManager::default();
-            let runtime = tokio::runtime::Runtime::new().map_err(|_| "无法创建本机 SFTP 验收运行时。")?;
-            let result = runtime.block_on(async {
-                manager.connect(&identity_ref, Some(&transport_ref), &device_id, target,
-                    Duration::from_secs(10)).await?;
-                let result = async {
-                    let upload = manager.sftp_upload_file(local_source, &remote_path, &transfer_id,
-                        maximum_bytes, Duration::from_secs(300)).await?;
-                    let download = manager.sftp_download_file(&remote_path, local_download, &transfer_id,
-                        &upload.sha256, maximum_bytes, Duration::from_secs(300)).await?;
-                    if upload.bytes != download.bytes || upload.sha256 != download.sha256 {
-                        return Err("SFTP 上传与回读的字节数或摘要不一致。".into());
-                    }
-                    Ok::<_, String>((upload, download))
-                }.await;
-                let disconnected = manager.disconnect().await;
-                let (upload, download) = result?;
-                disconnected?;
-                Ok::<_, String>((upload, download))
-            })?;
-            let report = serde_json::json!({
-                "device_id": device_id,
-                "upload": result.0,
-                "download": result.1,
-                "fields": {"device_id":"本机 SFTP 客户端身份编号","upload":"独立 SSH/SFTP 上传长度及摘要回执",
-                    "download":"独立 SSH/SFTP 回读长度及摘要回执"},
-            });
-            println!("{}", serde_json::to_string(&report).map_err(|_| "SFTP 烟测报告编码失败。")?);
-            Ok(())
-        }
-        Some("sftp-download") if args.len() == 12 => {
-            let device_id = args[1].clone(); // device_id（本机 SSH 身份绑定的验收编号）。
-            let port = args[3].parse::<u16>().map_err(|_| "SSH 端口无效。")?;
-            let identity_ref = args[5].clone(); // identity_ref（本机临时产品签名凭据引用）。
-            let transport_ref = args[6].clone(); // transport_ref（SSH 登录凭据引用）。
-            let remote_path = args[8].clone(); // remote_path（只读回读的 cleanup 内远端文件）。
-            let local_download = Path::new(&args[9]); // local_download（本机尚不存在的绝对回读目标）。
-            let expected_sha256 = args[10].clone(); // expected_sha256（正式包已知 SHA-256 摘要）。
-            let transfer_id = args[11].clone(); // transfer_id（不可复用的只读回读任务编号）。
-            let approved_root = r"D:\AI\example-test\VoiceTerminal-DeviceValidation-20261115\cleanup\";
-            if !remote_path.to_ascii_lowercase().starts_with(&approved_root.to_ascii_lowercase())
-                || remote_path.split(['\\', '/']).any(|part| matches!(part, "." | ".."))
-                || !remote_path.to_ascii_lowercase().ends_with(".zip")
-            {
-                return Err("SFTP 下载回读仅允许读取用户授权验收根目录 cleanup 中的 ZIP 文件。".into());
-            }
-            if args[2] != ACCEPTANCE_HOST
-                || port != 22
-                || args[4] != ACCEPTANCE_USER
-                || args[7] != ACCEPTANCE_FINGERPRINT
-            {
-                return Err("SFTP 回读仅允许本计划固定的主机、账户、端口和指纹。".into());
-            }
-            let target = SshDeviceTarget {
-                address: args[2].clone(),
-                port,
-                username: args[4].clone(),
-                host_key_sha256: args[7].clone(),
-                gateway_port: DEFAULT_GATEWAY_PORT,
-            };
-            let manager = SshDeviceManager::default();
-            let runtime = tokio::runtime::Runtime::new().map_err(|_| "无法创建本机 SFTP 回读运行时。")?;
-            let receipt = runtime.block_on(async {
-                manager.connect(&identity_ref, Some(&transport_ref), &device_id, target,
-                    Duration::from_secs(10)).await?;
-                let result = manager.sftp_download_file(&remote_path, local_download, &transfer_id,
-                    &expected_sha256, 512 * 1024 * 1024, Duration::from_secs(300)).await;
-                let disconnected = manager.disconnect().await;
-                let receipt = result?;
-                disconnected?;
-                Ok::<_, String>(receipt)
-            })?;
-            let report = serde_json::json!({
-                "device_id":device_id,"download":receipt,
-                "fields":{"device_id":"本机 SFTP 客户端身份编号","download":"只读远端文件回读的长度及 SHA-256 摘要回执"},
-            });
-            println!("{}", serde_json::to_string(&report).map_err(|_| "SFTP 下载回读报告编码失败。")?);
-            Ok(())
-        }
+        Some("sftp-smoke" | "sftp-download") => Err("独立 SFTP 已停用；文件验收必须由 DSH（代理执行宿主）授权任务建立 FILE（固定文件通道）票据后使用正式设备文件接口。".into()),
         Some("verify-client-package") if args.len() == 10 => {
             let port = args[2].parse::<u16>().map_err(|_| "SSH 端口无效。")?;
             let runtime = tokio::runtime::Runtime::new().map_err(|_| "无法创建本机远端包校验运行时。")?;
@@ -522,7 +387,7 @@ fn run() -> Result<(), String> {
             println!("本机临时产品签名身份与 SSH 登录凭据已清理。");
             Ok(())
         }
-        _ => Err("用法：inspect-device-config|inspect-device-config-base64 <cleanup 内的隔离数据目录>；inspect-remote-device-config <host> <port> <username> <transport_credential_ref> <host_key_sha256> <cleanup 内的数据目录>；pairing-request <cleanup 内的有效 RemoteClient 数据目录>（配对码只从标准输入读取）；identity-status <device_id> <transport_credential_ref>；create-device-identity|delete-device-identity <device_id>；prepare <device_id> <local_private_key_path>；request|session-smoke|heartbeat-smoke <device_id> <host> <port> <username> <identity_credential_ref> <transport_credential_ref> <host_key_sha256>；sftp-smoke <device_id> <host> <port> <username> <identity_credential_ref> <transport_credential_ref> <host_key_sha256> <remote_cleanup_path> <local_source> <local_download> <transfer_id>；sftp-download <device_id> <host> <port> <username> <identity_credential_ref> <transport_credential_ref> <host_key_sha256> <remote_cleanup_path> <local_download> <expected_sha256> <transfer_id>；verify-client-package <host> <port> <username> <transport_credential_ref> <host_key_sha256> <source_build> <client_build> <archive_sha256> <attempt_id>；verify-program-package <host> <port> <username> <transport_credential_ref> <host_key_sha256> <program_build> <archive_sha256> <attempt_id>；launch-client-workspace <host> <port> <username> <transport_credential_ref> <host_key_sha256> <client_build> <attempt_id>；read-client-package-report <host> <port> <username> <transport_credential_ref> <host_key_sha256> <client_build> <attempt_id>；inspect-client-host <host> <port> <username> <transport_credential_ref> <host_key_sha256>；cleanup <device_id> <transport_credential_ref>".into()),
+        _ => Err("用法：inspect-device-config|inspect-device-config-base64 <cleanup 内的隔离数据目录>；inspect-remote-device-config <host> <port> <username> <transport_credential_ref> <host_key_sha256> <cleanup 内的数据目录>；pairing-request <cleanup 内的有效 RemoteClient 数据目录>（配对码只从标准输入读取）；identity-status <device_id> <transport_credential_ref>；create-device-identity|delete-device-identity <device_id>；prepare <device_id> <local_private_key_path>；request|session-smoke|heartbeat-smoke <device_id> <host> <port> <username> <identity_credential_ref> <transport_credential_ref> <host_key_sha256>；verify-client-package <host> <port> <username> <transport_credential_ref> <host_key_sha256> <source_build> <client_build> <archive_sha256> <attempt_id>；verify-program-package <host> <port> <username> <transport_credential_ref> <host_key_sha256> <program_build> <archive_sha256> <attempt_id>；launch-client-workspace <host> <port> <username> <transport_credential_ref> <host_key_sha256> <client_build> <attempt_id>；read-client-package-report <host> <port> <username> <transport_credential_ref> <host_key_sha256> <client_build> <attempt_id>；inspect-client-host <host> <port> <username> <transport_credential_ref> <host_key_sha256>；cleanup <device_id> <transport_credential_ref>".into()),
     }
 }
 
@@ -1820,7 +1685,7 @@ if (($archiveInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or 
     throw '程序包类型或压缩大小超过 512 MiB 上限。'
 }
 $actualSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualSha -ne $expectedSha) { throw '程序包摘要与本机 SFTP 回执不一致。' }
+if ($actualSha -ne $expectedSha) { throw '程序包摘要与本机已核验文件传输回执不一致。' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [IO.Compression.ZipFile]::OpenRead($archive)
 try {

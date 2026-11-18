@@ -16,18 +16,18 @@
 
 ## 实施进度
 
-截至 2026-11-18，旧版阶段百分比估算不再作为当前进度依据；本轮进度按下表列出的实现、自动化验证及现场验收状态记录。当前微软 OpenSSH 服务和 TCP 22 仅通过只读查询确认；本轮没有真实 UAC（用户账户控制）授权、系统安装或防火墙变更。最新统一程序包为 build-only（仅构建）候选 `product-54be91eeaeeed684`，已在独立 B 工作区通过零组件远程模式启动和正式退出，未覆盖本机。真实配对、双机语音与多设备接管仍未验收，整体计划尚未完成。
+截至 2026-11-18，实施进度以代码、自动化与真实程序证据分别登记。product-54be91eeaeeed684 已通过同包交付流程覆盖本机并生成同构建分发安装器；本体校验、兼容性交接及安装器内嵌摘要核对通过。正式程序按保存的 remote（远程配对）配置启动后显示等待服务端连接，业务状态不可用；真实发现、配对、远程业务、音频及多设备接管仍未验收。
 
 | 节点 | 状态 | 代码检查点 | 完成条件 |
 | --- | --- | --- | --- |
-| 1. 配置版本与启动选择 | A 首轮 local→remote→local 回环及最新 B 远程零组件产品页挂载已验证；第二轮 local 回切命令被执行审核拒绝 | `apps/desktop/common/src/device_config.rs`、`apps/desktop/common/src/compatibility.rs`、`apps/desktop/src-tauri/src/main.rs` | 上一已安装候选 A 以 `--mode local --broadcast off` 初始启动，配置为 v3/local/broadcast=false，健康状态 `IDLE`（空闲）、`can_start=true` 且本地能力就绪。第一次切到 `remote/remote_client` 后无本地 Python/worker，切回 local 后约 35 秒恢复 IDLE、`can_start=true`、七项本地能力 READY 且未开始监听。随后第二次切 remote 成功，执行恢复 local 的命令时被执行环境策略拒绝，命令未运行；A 已正式退出，当前 `.local` 配置仍为 v3/remote/remote_client/broadcast=false、活动进程为 0。最新整包安装到独立 B 工作区并以 `--mode remote` 启动；无 Python、模型文件、DSH 运行时、组件收据或 `--worker-host` 进程，`workspace-ready.json` 确认产品页实际挂载。B 未配对，不能据此宣称远程业务连接通过；退出后 workspace-ready.json 启动记录当前不存在。截图显示 Windows PIN（个人识别码）锁屏，未输入或绕过，产品页面布局仍未目视验收。最新候选没有覆盖本机。 |
+| 1. 配置版本与启动选择 | 配置/启动代码完成；旧覆盖版本一次本地→远程→本地回环曾通过；最新 product-54 已覆盖并运行于 remote 模式 | apps/desktop/common/src/device_config.rs、compatibility.rs、apps/desktop/src-tauri/src/main.rs | 最新包本地模式和广播仍需实测；当前正式窗口等待已配对服务端连接，语音与业务状态不可用。旧版本的回切证据不替代最新包验收。 |
 | 2. SSH 官方维护 | 微软 OpenSSH 当前服务和端口通过只读复核；安装引导模拟及长任务界面反馈已测试，真实安装/权限流程未操作 | `apps/desktop/common/src/system_feature.rs`、`apps/desktop/src-tauri/src/resource_commands.rs`、`apps/frontend/src/management/DeviceSettings.vue` | `system_feature::tests`（系统功能测试模块）28 项通过、1 项忽略；忽略项另行只读执行 1/1。生成安装脚本模拟测试以同名模拟命令替代 `Add-WindowsCapability`（Windows 可选功能安装）、服务和防火墙命令，只验证模拟分支，不执行真实安装。新增提权等待心跳：后台任务每 15 秒更新授权或官方功能处理的累计等待时间，不终止系统维护；注入回归与任务阶段测试通过。Tauri（桌面框架）系统功能服务测试 17/17。Rust（原生开发语言）真实 SSH 只读状态测试 1/1；当前为 Microsoft（微软）签名 `sshd` 9.5.6.4、Running/Auto（运行中/自动启动）、TCP 22 正在监听。Windows 可选功能 `capability_state=Unknown`（状态未知）是普通用户权限不足以查询登记项，不表示未安装。微软默认 OpenSSH 入站规则 Disabled（禁用），本程序 SSH/配对规则不存在；本轮未改任何防火墙规则，也未操作 UAC。 |
 | 3. 原生管理通道和桥接 | 管理/资源通道与已接入产品操作的固定业务白名单已贯通；真实远程业务会话未验收 | `apps/desktop/src-tauri/src/remote_services.rs`、`remote_management.rs`、`remote_import.rs`、`apps/desktop/common/src/device_file_channel.rs`、`ssh_device.rs` | 原生独立管理服务承接固定管理/资源/SSH 系统操作；受限 SSH（安全外壳协议）FILE（文件）桥接支持票据化来源、分块清单、摘要核验和服务端导入提交。前端已接入的设置、模型、音色、任务和实时事件按固定操作编号映射到 Rust 白名单及 Python 服务端路由；产品业务结果仍由服务端现有核心校验和持久化，核心未就绪时前端 fail-closed（失败即拒绝写入）。跨层操作集合契约、服务端接口和固定 SSH 本机夹具已有自动化测试；经真实 SSH 桥接读取/保存和实时事件仍未现场验收。 |
 | 4. 局域网发现与 PAKE（口令认证密钥交换）配对 | 核心代码已接入；真实局域网验收未做 | `device_pairing.rs`、`device_discovery.rs`、Tauri 原生命令、`DeviceSettings.vue` | mDNS（局域网服务发现）公告/搜索、OPAQUE（口令认证密钥交换）六位码认证、原生信任写入及固定 SSH 主机身份代码已接通；尚无真实局域网发现或 A/B/C（验收实例）配对证据。 |
 | 5. 远程模式与接管/回退 | 自动接管竞态和音频流信任撤销代码修复并有定向回归；真实 A/B/C（验收实例）闭环未验收 | `voice_terminal/server/websocket.py`、`http_api.py`、`capture_router.py`、Rust 设备媒体通道、`remote-client-runtime.ts` | 客户端监督器现在校验设备连接代次、执行器代次及交互租约代次；已知被另一远程客户端接管时持久暂停旧客户端重连，本机回退不误作远程接管；仅有音频流能力的设备被撤销信任时也会关闭媒体会话。前端回归通过，但断线重连、真实接管和本机回退仍未现场验收。 |
 | 6. 完整远程产品界面 | 远程静态产品入口、资源任务与业务就绪门禁已加固；真实服务端业务操作未验收 | `DeviceSettings.vue`、`ProductApp.vue`、`application-host.ts`、`api.ts`、`native-device-api.ts`、`desktop-port.ts`、Tauri 启动页 | 远程静态产品入口、服务端状态轮询、固定设置/任务/模型/音色/语音操作和连接设置即时保存已接入。`remote_business_ready`（服务端产品业务是否可用）只有在目标服务端 `product.snapshot`（产品状态快照）成功后才为 true；核心未就绪时前端产品 API（程序接口）在发送前返回未就绪，不回退到客户端。远程 API（程序接口）与会话就绪门禁测试 22/22，前端全量 43 个测试文件/516 项通过。资源任务仍使用独立原生管理通道。真实 SSH（安全外壳协议）设置落盘和实时字幕/对话转发仍未现场验收；服务端核心未就绪时设置和产品状态暂不可访问。 |
 | 7. 音频文件传输与客户端直放 TTS（语音合成） | 上传/提交歧义恢复与暂存清理已加固；真实传输和播放未验收 | `remote_import.rs`、`device_file_channel.rs`、`ssh_device.rs`、`client_tts_relay.rs`、`speech_pipeline.py`、`TtsVoiceLibrary.vue` | TTS 上传回执含糊时客户端以原 FILE（文件）票据和连接代次重试；提交回执含糊时再以同一传输票据和请求编号重放一次幂等提交。Python（后端语言）服务端在音色库确认提交或命中幂等结果后尽力关闭对应 DFT（设备文件传输）暂存。远程试听遇到超过 1 MiB 的高保真副本会回退到规范音频；导入摘要与当前副本不一致则拒绝回传。TTS、文件传输与设备信任定向测试 71/71。真实远端音频传输、音色保存、供应商请求、Windows 音频输出及播放回执仍未现场验收。完整 AnifLive 模型目录客户端导入/转换不属于本阶段，模型通过服务端可访问的在线 URL（网址）下载导入。 |
-| 8. 正式覆盖与真实回环验收 | 最新统一候选、独立 B 远程零组件模式启动/退出及 A 首轮 local↔remote 回环已验证；没有覆盖本机 | 统一包准备、固定覆盖发布、健康检查及验收报告 | 最新 build-only 候选为 `product-54be91eeaeeed684`；`program.zip` 为 109,034,030 字节、462 个归档条目，SHA-256 为 `25de318e447fb3b3b006b2c00a1be3f2f31dd75554ecf64b99706efb92cfb2cf`，`package-info.json` 摘要与长度匹配。新包正式安装到独立 B 工作区，包内 `Verify-Package.ps1` 通过；B 配置为 schema 3/remote/remote_client/无主机信任，组件收据为 0、模型文件为 0、Python 与 DSH 运行时不存在。`workspace-ready.json` 确认正式产品页真实挂载；正式 `--exit` 后 B 进程为 0，workspace-ready.json 启动记录当前不再保留于工作区。首次等待不充分的测试包装遗留 `.local/tmp/distributed-client-b-installed-product-0ff23ea32f104fc4` 未提交暂存现场，现保留供诊断；成功实例位于 .local/tmp/distributed-client-b-installed-product-54be91eeaeeed684。A 首轮本地→远程→本地切换曾完整恢复七项本地能力，后续恢复 local 命令被执行环境策略拒绝；当前 `.local` 仍为旧安装，设备模式 remote/remote_client/broadcast=false，A 已退出且没有 worker。A/B/C 搜索配对、真实 SSH 桥接、广播、客户端媒体、远程设置落盘、音频文件上传与服务端音色登记、供应商 TTS 播放和双机回环仍未验收；未构建分发安装器或公开发行，也未改系统服务或防火墙。 |
+| 8. 正式覆盖与真实回环验收 | product-54 已覆盖本机；同包正式优化分发安装器已生成并核对嵌入摘要；正式窗口启动成功 | 统一包准备、固定覆盖发布、分发器构建、安装后校验和验收报告 | program.zip 为 109,034,030 字节、461 个固定本体文件，SHA-256 为 25de318e447fb3b3b006b2c00a1be3f2f31dd75554ecf64b99706efb92cfb2cf。分发器为 119,349,760 字节，SHA-256 为 7efde44e7e0e36da15fbe1ee7cd0f7f5726aaa7ab35a491c620c24802b53cb43，delivery.json 与构建戳绑定同一程序包。Verify-Package.ps1 通过；未触发 UAC、安装外置组件或修改系统 SSH/防火墙。当前窗口在 remote 模式等待服务端；真实管理连接、发现/配对、业务设置落盘、音频文件导入、TTS 和多设备回环尚未验收，也未公开发行。 |
 
 ## 已实施代码节点
 
@@ -39,7 +39,8 @@
 - Tauri 正式入口将显式参数覆盖保存到受管设备配置，并按广播意图决定是否启动回环设备网关。
 - compatibility::migrate_device_runtime_config 在原生启动时归档有效旧配置并迁移至第 3 版；远程旧配置不沿用旧主机信任，要求重新配对。
 - 远程模式绕过本机语音组件和凭据门禁，不启动本机 Python 核心；模式切换进入协调流程。
-- 旧覆盖版本 A 曾完成一次 local→remote→local 切换并恢复七项本地能力；最新候选 B 以零组件 remote 模式启动、挂载正式产品页并正常退出。最新候选尚未覆盖 A；第二轮 A 回切命令被执行环境策略拒绝，没有执行。真实广播、最新包本地启动和窗口布局目视检查仍待验收。
+- 旧覆盖版本 A 曾完成一次 local→remote→local 切换并恢复七项本地能力；最新 product-54 已完成本机覆盖和正式程序启动，当前保存模式仍为 remote/remote_client/broadcast=false。窗口状态为等待服务端连接，组件设置页提示远程管理不可用。尚未在最新构建上验收本地模式、广播或真实远程业务。
+
 ### 当前轮次增量记录（2026-11-17 至 2026-11-18）
 
 - `DeviceConfig`（设备配置）已对外序列化为第 3 版 `paired_host` 字段；旧 `host` 只作为兼容输入，旧共享主机继续保留广播意图，旧 Opus（有损音频压缩编码）选择映射为压缩开启。
@@ -68,7 +69,7 @@
 - 当前定向验证：system_feature（系统功能）28 项通过、1 项只读忽略；SSH 安装脚本 PowerShell 模拟三场景通过；Tauri 系统资源任务 17/17、原生集成 96/96；公共原生模块 362 项通过、14 项忽略；OPAQUE TCP 本机配对回环 1/1；前端 43 个文件/516 项及开发入口 3 项通过，typecheck 通过；Python 网关/启动/信任/文件传输/TTS 音频导入/产品接口组合回归 98/98；远程操作跨层契约 1/1。Rust 格式检查通过。ProductApp（正式产品页）新增 AnifLive 组件卡跳转展开回归，前端全量 516 项通过。没有运行真实 SSH 安装或修改防火墙。
 - 本机统一程序覆盖验收（2026-11-17）：`npm run desktop:prepare` 与 `npm run desktop:publish` 完成；从 `0.9.12 / product-ae7f27b71ac28e54` 更新到 `1.0.0 / product-ff101a90ef905e38`。最终包 109,008,295 字节、462 个归档条目，SHA-256（文件摘要）为 `54830ce1827dd96dd7d20692a0848d28e63b576b086f9ef8f7628aa0774f5e4b`；`.local/Verify-Package.ps1`（固定程序完整性校验）通过，更新器没有安装外置组件。本机配置迁移后为 schema v3/local/broadcast=false；正式程序本地模式健康接口返回 HTTP 200（成功），音频、KWS（唤醒）、ASR（语音识别）、LLM（语言模型）、分析、TTS（语音合成）和影子代理就绪，输入租约为 none（未监听）。正式桌面进程有可见窗口标题，但 CUA（桌面操控）内核在本会话两次初始化失败，未核验窗口布局。详见[本机覆盖与 OpenSSH 模拟验收](../testing/local-delivery-1.0.0-20261117.md)。
 - 上一候选与本机覆盖验收（2026-11-18）：`product-4ae83f2a70ecf810` 已覆盖本机；A 本地模式健康状态为 IDLE、`can_start=true`、无启动错误，七项本地能力就绪，输入租约为空。
-- 最新构建候选（2026-11-18）：`product-54be91eeaeeed684`，`program.zip` 为 109,034,030 字节、462 个归档条目，SHA-256（文件摘要）为 `25de318e447fb3b3b006b2c00a1be3f2f31dd75554ecf64b99706efb92cfb2cf`；包内固定校验通过。正式安装到独立 B 临时目录后，以 `--mode remote` 启动；B 配置为 schema 3/remote/remote_client，没有 Python、模型文件、DSH 运行时、组件收据或 `--worker-host` 进程。`workspace-ready.json`（页面挂载记录）确认正式产品界面已在启动期间真实挂载；`--exit` 后 B 进程为 0，workspace-ready.json 启动记录当前不再保留于工作区。B 未配对，未连接服务端或运行远程产品业务。Windows PIN 锁屏仍阻断可视检查；未输入或绕过。最新候选没有覆盖本机。详见[本机候选包与 OpenSSH 模拟验收](../testing/local-delivery-1.0.0-20261118.md)。
+- 最新本机与分发构建（2026-11-18）：product-54be91eeaeeed684 已安装到 .local，产品包摘要为 25de318e447fb3b3b006b2c00a1be3f2f31dd75554ecf64b99706efb92cfb2cf；VoiceTerminalSetup.exe 已重建到 .local/releases/installer，交付摘要为 7efde44e7e0e36da15fbe1ee7cd0f7f5726aaa7ab35a491c620c24802b53cb43，内嵌包摘要匹配。固定安装校验通过。正式应用已运行于原有 remote 配置，界面等待服务端连接；本次未建立管理连接。详见[本机覆盖、分发器与 OpenSSH 验收](../testing/local-delivery-1.0.0-20261118.md)。
 - 历史自动化快照（2026-11-17，较早）：组件导入拆分测试覆盖前端“选择来源后只提交一次性票据”；ProductApp 定向测试 83 项、前端全量 41 个文件/447 项、Rust Tauri 55 项、Rust 核心 326 项/14 项忽略、Python 信任只读回归 21 项通过。该历史结果不替代本轮 516 项前端全量结果。
 - 历史自动化快照（2026-11-17，较早）：前端全量 41 个文件/452 项通过；Python 固定远程管理 2 项、设备媒体回退与租约 3 项、Tauri 固定 SSH 产品快照集成 1 项通过。这些是当时的定向结果，不代表真实配对、Windows 音频或文件传输已验收。
 - 当前仍未完成 Windows `authorized_keys`（授权公钥清单）ACL（访问控制列表）实机验证、mDNS（局域网服务发现）实测、A/B/C（验收实例）搜索配对与 SSH 业务桥接。没有真实远程产品设置落盘、音频文件传输/音色登记、客户端供应商请求与扬声器播放回执；也没有完成 A 本地/远程模式切换、接管/回退和双机语音回环。模拟脚本执行、自动化夹具、隔离 B 启动和只读状态核验均不代表真实配对或端到端业务验收。整体计划仍未完成。
@@ -90,8 +91,8 @@ VoiceTerminal.exe --mode remote                 # mode（运行模式）为远�
 VoiceTerminal.exe --exit                        # 沿用正式退出流程
 ```
 
-参数选择会保存至本机设备运行配置并进入正式桌面流程。远程零组件启动已在独立 B 工作区确认进入正式产品页；旧覆盖版本 A 曾完成一次本地→远程→本地循环。最新候选尚未覆盖 A，故最新包的本地运行、真实界面可视检查及广播验收仍待完成。
+参数选择会保存至本机设备运行配置并进入正式桌面流程。最新 product-54 已从统一程序包覆盖本机并启动；当前窗口处于 remote 模式，显示等待已配对服务端连接，业务状态不可用。零组件 B 的远程产品页挂载已单独验证；本机真实发现、配对和服务端业务操作尚未验证。
 
 ## 验收顺序
 
-先完成定向测试，再按现有受管正式入口构建和覆盖更新本机 A；随后完整启动 A 本地模式、明确开启广播。之后使用同一程序包在独立工作区 B 以远程模式启动，保持组件收据为零，通过发现和六位码配对。验证 B 的产品界面展示服务端状态、服务端配置可保存、B 选择音频文件后经 FILE 上传到 A 并完成音色配置、模型由 A 从其可访问的在线 URL 下载导入、客户端直接 TTS 播放、断线回本机和 A 的本地/远程模式切换。客户端完整 AnifLive 模型目录导入/转换不属于本阶段验收。记录正式构建号、模式状态、传输摘要和实际播放证据，不记录配对码或凭据。
+本机和分发器同包更新已完成。下一步先从当前 remote 窗口检查已配对服务端的发现、连接和 SSH 管理状态；连接建立后验证服务端状态、设置保存和客户端选择音频文件后上传配置音色，再验收客户端直放 TTS、断线回退和多设备接管。另在最新构建上切换至 local 模式，检查本地核心启动、广播开关与关闭广播后的状态。服务端在线模型由服务端从可访问网址导入；客户端完整 AnifLive 模型目录导入/转换不属于本阶段。记录实际结果，不把模拟、自动化或窗口挂载记作端到端通过。

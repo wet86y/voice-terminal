@@ -1,17 +1,18 @@
 //! Qualification（隔离验收）：仅验收构建包含，文件操作限定于用户指定的测试目录。
 use super::Desktop;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
 };
-use tauri::{Manager, WebviewWindow, webview::PageLoadEvent};
+use tauri::{webview::PageLoadEvent, Manager, WebviewWindow};
 use voice_desktop_common::{
-    LaunchContext, resources, runtime,
+    resources, runtime,
     workspace::{self, Locator},
+    LaunchContext,
 };
 
 fn configuration(locator: &Locator) -> Result<Value, String> {

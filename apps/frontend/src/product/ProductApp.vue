@@ -21,14 +21,21 @@ import SpeakerSettings from "./panels/SpeakerSettings.vue";
 import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
 import ComputeSettings from "./panels/ComputeSettings.vue";
 import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
+import DeviceSettings from "../management/DeviceSettings.vue";
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
+import { startRemoteClientRuntimeSupervisor } from './remote-client-runtime'
 import { FLOATING_WINDOW_CONTROL_EVENT, FLOATING_WINDOW_ERROR_EVENT, FLOATING_WINDOW_WORKBENCH_EVENT,
   type FloatingSessionAction, type FloatingWindowProjection } from './floating-window'
 
 const controls = useProductControls();
 const application = useApplicationHost();
 provideProductContext(controls);
+const remoteVoiceStatusLabel = computed(() => controls.voice.connection.value === 'connected'
+  ? '语音实时通道已连接'
+  : controls.voice.connection.value === 'connecting' ? '正在连接服务端语音实时通道' : '服务端语音实时通道已断开') // remoteVoiceStatusLabel（与管理连接分开的语音 WebSocket 状态）。
+const remoteVoiceStatusError = computed(() => application.snapshot.value?.remote_voice_error
+  || controls.voice.connectionError.value || '') // remoteVoiceStatusError（本机语音转发或套接字错误）。
 const workspaceResources = useWorkspaceResources();
 const {
   applicationSnapshot,
@@ -75,6 +82,16 @@ if (desktop.available && desktop.listen) {
   subscribeFloating(FLOATING_WINDOW_WORKBENCH_EVENT, () => { activePage.value = 'home'; });
 }
 onBeforeUnmount(() => { disposed = true; floatingUnlisteners.forEach(unlisten => unlisten()); });
+let stopRemoteClientRuntime: (() => void) | null = null
+watch(() => applicationSnapshot.value?.remote_mode === true, remote => {
+  if (remote && stopRemoteClientRuntime === null) {
+    stopRemoteClientRuntime = startRemoteClientRuntimeSupervisor()
+  } else if (!remote && stopRemoteClientRuntime !== null) {
+    stopRemoteClientRuntime()
+    stopRemoteClientRuntime = null
+  }
+}, { immediate: true })
+onBeforeUnmount(() => { stopRemoteClientRuntime?.(); stopRemoteClientRuntime = null })
 // floatingModel（悬浮窗投影）：语音快照包含字幕，仍由主页面独占真实会话。
 let floatingLatestModel: FloatingWindowProjection | null = null;
 let floatingPublishTimer: ReturnType<typeof setTimeout> | undefined;
@@ -131,7 +148,6 @@ function openAnifLiveComponentCard() {
   activeSettingsTab.value = 'compute'
 }
 function setSettingsTab(section: DesktopSettingsSection) {
-  if (section === 'devices') return
   activeSettingsTab.value = section
   if (section !== 'compute') expandAnifLiveTtsCard.value = false
 }
@@ -149,8 +165,18 @@ function exportLogs() {
   <AppFrame
     :runtime="runtimeState"
   >
-    <template #banner
-      ><div
+    <template #banner>
+      <div v-if="applicationSnapshot?.remote_mode" class="remote-host-banner" role="status">
+        <strong>正在管理：{{ applicationSnapshot.host_name || '已配对服务端' }}</strong>
+        <span>{{ applicationSnapshot.management_connected ? '管理通道已连接' : '正在等待服务端连接' }}</span>
+        <span>{{ remoteVoiceStatusLabel }}</span>
+        <span v-if="remoteVoiceStatusError">{{ remoteVoiceStatusError }}</span>
+        <span v-if="!applicationSnapshot.remote_business_ready">{{ applicationSnapshot.remote_error || '服务端业务状态暂不可用' }}</span>
+        <span v-else-if="applicationSnapshot.core_phase === 'ready'">服务端语音核心已就绪</span>
+        <span v-else-if="applicationSnapshot.core_phase === 'starting'">服务端语音核心准备中</span>
+        <span v-else>服务端语音核心不可用</span>
+      </div>
+      <div
         v-if="applicationSnapshot?.state === 'degraded' || application.runtimeFailure.value"
         class="application-degraded"
         role="status"
@@ -159,15 +185,14 @@ function exportLogs() {
           application.runtimeFailure.value
             ? `语音能力暂不可用${unavailableCapabilityLabel}，可在本地组件页单独恢复。`
             : "部分组件暂不可用，核心语音功能仍可使用。"
-        }}</span
-        ><button @click="showApplicationSystem">查看本地组件</button>
-      </div></template
-    >
+        }}</span><button @click="showApplicationSystem">查看本地组件</button>
+      </div>
+    </template>
     <Workbench
       v-show="activePage === 'home'"
       :model="workbenchModel"
-      :console-enabled="dsh.state === 'ready'"
-      :console-label="dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
+      :console-enabled="!applicationSnapshot?.remote_mode && dsh.state === 'ready'"
+      :console-label="applicationSnapshot?.remote_mode ? '仅服务端本机可打开' : dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
       @settings="activePage = 'settings'"
       @console="openDshConsole"
       @action="runtimeAction"
@@ -198,8 +223,9 @@ function exportLogs() {
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <HotwordSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
-        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" :expand-aniflive-tts="expandAnifLiveTtsCard" />
-        <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
+        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" :expand-anif-live-tts="expandAnifLiveTtsCard" />
+        <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" />
+        <DeviceSettings v-if="activeSettingsTab === 'devices'" /></article
     ></SettingsFrame>
     <template #overlays>
       <div class="notification-stack">

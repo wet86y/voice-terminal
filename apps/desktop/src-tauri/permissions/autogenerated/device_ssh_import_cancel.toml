@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-ssh-import-cancel"
+description = "Enables the device_ssh_import_cancel command without any pre-configured scope."
+commands.allow = ["device_ssh_import_cancel"]
+
+[[permission]]
+identifier = "deny-device-ssh-import-cancel"
+description = "Denies the device_ssh_import_cancel command without any pre-configured scope."
+commands.deny = ["device_ssh_import_cancel"]

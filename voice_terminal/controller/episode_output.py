@@ -1131,11 +1131,14 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
     def _playback_completed_fact(h, snapshot):
         """窗口、调度通知和最终送达共用同一设备输出完成事实。"""
         read = snapshot.get if isinstance(snapshot, dict) else lambda key: getattr(snapshot, key, None)
+        direct_samples = int(h.workspace.timings.get("tts_client_output_samples") or 0)
+        direct_key = read("playback_key") == h.workspace.playback_key
         return bool(
             not h.reason
             and h.text
             and h.workspace.timings.get("tts_text_sent")
-            and int(h.workspace.timings.get("tts_audio_bytes") or 0) > 0
+            and (int(h.workspace.timings.get("tts_audio_bytes") or 0) > 0
+                 or direct_samples > 0 and direct_key)
             and h.workspace.timings.get("playback_output_complete") is True
             and bool(read("started"))
             and int(read("buffered_ms") or 0) == 0

@@ -28,6 +28,26 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('业务 API 暂不可用时仍可连接已就绪的远程语音回环套接字', () => {
+    vi.stubGlobal('window', { __VOICE_APPLICATION__: {
+      managed: true, origin: '', voice_api_url: '',
+      voice_ws_url: 'ws://127.0.0.1:43127/random_token_123/ws',
+      remote_mode: true, management_connected: true, business_ready: false,
+    } })
+    const socket = new FakeSocket()
+    const terminal = useVoiceTerminal({ webSocketFactory: () => socket })
+    try {
+      terminal.connect()
+      expect(terminal.connection.value).toBe('connecting')
+      socket.open()
+      expect(terminal.connection.value).toBe('connected')
+      expect(JSON.parse(socket.sent[0]!)).toMatchObject({ command: 'subscribe' })
+    } finally {
+      terminal.dispose()
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('声纹阶段和异声摘要只更新状态，不裁剪转写或发送对话命令', () => {
     const { terminal, socket } = openTerminal()
     terminal.current.turn_id = 'a'

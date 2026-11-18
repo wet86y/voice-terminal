@@ -186,6 +186,10 @@ export interface ManagedResourceJob {
 
 /** LocalComponentsModel（本地组件页面数据）：统一呈现总量、硬件与组件。 */
 export interface LocalComponentsModel {
+  /** remoteTarget（当前组件清单所属服务端）：远程模式只能对服务端执行组件操作。 */
+  remoteTarget?: boolean
+  /** integrityAvailable（是否允许全面校验）：仅本机安装的程序可执行客户端完整性维护。 */
+  integrityAvailable?: boolean
   /** integrityReady（全面校验程序就绪）、integrityBusy（维护程序准备或交接中）与 integrityMessage（维护进度或错误）。 */
   integrityReady?: boolean
   integrityBusy?: boolean

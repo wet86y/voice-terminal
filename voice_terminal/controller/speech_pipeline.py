@@ -149,6 +149,7 @@ class SpeechPipeline:
             tts_client = self.tts
         tts_backend = handle.tts_backend if handle is not None else "minimax"
         transport = getattr(tts_client, "transport", "websocket") if tts_client is not None else "websocket"
+        direct_playback = bool(getattr(tts_client, "direct_playback", False))
 
         async def synthesis_permission():
             # synthesis_permission（合成许可）与设备播放许可独立。
@@ -193,7 +194,9 @@ class SpeechPipeline:
             lead_ms = max(1, int(self.options.tts_lead_ms))
         else:
             lead_ms = 0
-        lead_window_enabled = bool(lead_ms and self.player is not None and not sentence_window_enabled)
+        lead_window_enabled = bool(
+            lead_ms and self.player is not None and not sentence_window_enabled and not direct_playback
+        )
         segment_waits_enabled = bool(lead_window_enabled and transport != "websocket_bidi")
         scheduling_policy = (
             PlaybackWindowPolicy(lead_ms) if lead_window_enabled else DirectStreamingPolicy()
@@ -249,12 +252,20 @@ class SpeechPipeline:
             if isinstance(shared, dict):
                 ws.timings.update(shared)
         audio_bytes_per_second = (
-            self.player.sample_rate * self.player.channels * 2
-            if self.player is not None else 32000 * 2
+            int(getattr(tts_client, "sample_rate", 32000)) * 2
+            if direct_playback else (
+                self.player.sample_rate * self.player.channels * 2
+                if self.player is not None else 32000 * 2
+            )
         )
 
         async def reject_audio() -> None:
             """异常生成立即停止待播队列，已经听到的正文不自动重播。"""
+            if direct_playback and session is not None:
+                cancel = getattr(session, "cancel", None)
+                if callable(cancel):
+                    await cancel()
+                return
             if self.player is not None:
                 stop = getattr(self.player, "stop_and_snapshot_confirmed", None)
                 if callable(stop):
@@ -319,6 +330,24 @@ class SpeechPipeline:
                     handle.player_held = hold(playback_key) is not False
 
         def playback_progress() -> dict[str, int | bool | str | None]:
+            if direct_playback and session is not None:
+                current = session.playback_progress()
+                sample_rate = int(getattr(session, "sample_rate", getattr(tts_client, "sample_rate", 32000)))
+                accepted_samples = int(current.get("accepted_samples", 0) or 0)
+                played_samples = int(current.get("played_samples", 0) or 0)
+                buffered_samples = int(current.get("buffered_samples", 0) or 0)
+                if played_samples > 0:
+                    playback_started = getattr(self, "playback_started", None)
+                    if callable(playback_started):
+                        playback_started(playback_key)
+                return {
+                    "returned_ms": accepted_samples * 1000 // sample_rate,
+                    "played_ms": played_samples * 1000 // sample_rate,
+                    "output_estimated_ms": played_samples * 1000 // sample_rate,
+                    "remaining_ms": max(0, accepted_samples - played_samples) * 1000 // sample_rate,
+                    "queued_ms": buffered_samples * 1000 // sample_rate,
+                    "started": bool(current.get("played_samples", 0)),
+                }
             # The provider may have received far more than the player has
             # consumed from audio_chunks(). Include its entire PCM spool.
             received_bytes = max(audio_returned_bytes, getattr(session, "received_bytes", 0))
@@ -936,6 +965,12 @@ class SpeechPipeline:
                                 if getattr(session, "bidi", False)
                                 else getattr(session, "connection_ready", True)
                             )
+                            if direct_playback:
+                                # A non-reusable direct session is still the
+                                # fixed active playback transaction; starting
+                                # a fresh one would duplicate its key and
+                                # reissue the temporary credential.
+                                session_usable = True
                             if not session_usable:
                                 # A failed/cancelled prewarm may have closed
                                 # the shared candidate while this sender was
@@ -1010,7 +1045,8 @@ class SpeechPipeline:
                         await synthesis_permission()
                         if not self._valid(token) or not ws.committed:
                             return
-                        reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
+                        if not direct_playback:
+                            reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
                         await synthesis_permission()
@@ -1076,7 +1112,34 @@ class SpeechPipeline:
                     # current segment's final response before evaluating the
                     # total playback backlog and releasing another segment.
                     wait_for_segment = getattr(session, "wait_for_segment", None)
-                    if sentence_window_enabled:
+                    if direct_playback:
+                        if wait_for_segment is None:
+                            raise RuntimeError("客户端直放会话不支持播放事务回执")
+                        direct_receipt = await wait_for_segment(before_segments)
+                        try:
+                            receipt = TtsSegmentReceipt(
+                                index=int(direct_receipt["index"]),
+                                text_chars=int(direct_receipt["text_chars"]),
+                                end_received_bytes=int(direct_receipt["end_received_bytes"]),
+                            )
+                            end_sample = int(direct_receipt["end_sample"])
+                        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                            raise RuntimeError("客户端直放返回了无效的设备输出回执") from exc
+                        minimum_samples = int(getattr(session, "sample_rate", 32000)) * 80 // 1000
+                        if receipt.text_chars != len(segment) or end_sample * 2 != receipt.end_received_bytes \
+                                or receipt.end_received_bytes < minimum_samples * 2:
+                            raise RuntimeError("客户端设备实际输出少于最小有效 PCM 时长")
+                        if "first_audio" not in ws.timings:
+                            ready_at = getattr(session, "first_audio_ready_at", None) or time.monotonic()
+                            ws.timings["first_audio"] = ready_at
+                            ws.timings.setdefault("first_pcm", ready_at)
+                        # Direct output has no server-side PCM buffer to pace;
+                        # its receipt closes the submitted text boundary only
+                        # in the delivery resolver.
+                        if completed_markers <= receipt.index:
+                            completed_markers = receipt.index + 1
+                            resolver.mark_boundary(end_sample * 1000 // int(getattr(session, "sample_rate", 32000)))
+                    elif sentence_window_enabled:
                         if wait_for_segment is None:
                             raise RuntimeError("TTS session 不支持短句块完成回执")
                         previous_boundary_ms = (
@@ -1201,6 +1264,47 @@ class SpeechPipeline:
                     tts_failed = tts_failed or exc
                     tts_disabled = True
                     logger.warning("controller.tts_finish_degraded turn_id=%s error=%s", ws.turn_id, exc)
+                if direct_playback and tts_text_sent and tts_failed is None:
+                    try:
+                        wait_for_output = getattr(session, "wait_until_output_complete", None)
+                        if not callable(wait_for_output):
+                            raise RuntimeError("客户端直放会话缺少设备输出完成等待接口")
+                        device_output = await wait_for_output(timeout_seconds=120.0)
+                        sample_rate = int(getattr(session, "sample_rate", 32000))
+                        minimum_samples = sample_rate * 80 // 1000
+                        if (not device_output.get("output_complete")
+                                or int(device_output.get("played_samples", 0)) < minimum_samples
+                                or int(device_output.get("buffered_samples", -1)) != 0):
+                            raise RuntimeError("客户端设备时钟未确认最小有效音频输出完成")
+                        ws.timings["tts_client_output_samples"] = int(device_output["played_samples"])
+                        ws.timings["tts_client_device_time_us"] = int(device_output["device_time_us"])
+                        ws.timings["playback_output_complete"] = True
+                        ws.timings["playback_output_completed_at"] = time.monotonic()
+                        if handle is not None:
+                            handle.snapshot = {
+                                "playback_key": playback_key,
+                                "started": int(device_output["played_samples"]) > 0,
+                                "enqueued_ms": int(device_output["accepted_samples"]) * 1000 // sample_rate,
+                                "played_ms": int(device_output["played_samples"]) * 1000 // sample_rate,
+                                "buffered_ms": int(device_output["buffered_samples"]) * 1000 // sample_rate,
+                                "output_estimated_ms": int(device_output["played_samples"]) * 1000 // sample_rate,
+                                "device_time_us": int(device_output["device_time_us"]),
+                                "precision": "device_time",
+                            }
+                        alignment_events = getattr(session, "alignment_events", ())
+                        for alignment in alignment_events[alignment_cursor:]:
+                            if alignment is not None:
+                                resolver.add_provider_alignment(alignment)
+                        alignment_cursor = len(alignment_events)
+                        resolver.complete_pending(int(playback_progress()["returned_ms"]))
+                    except asyncio.CancelledError:
+                        raise
+                    except PassiveQuietSuppressed:
+                        raise
+                    except Exception as exc:
+                        tts_failed = tts_failed or exc
+                        tts_disabled = True
+                        logger.warning("controller.client_playback_degraded turn_id=%s error=%s", ws.turn_id, exc)
                 if reader is not None:
                     try:
                         # Bound stalls, not the duration of a long answer.
@@ -1245,8 +1349,8 @@ class SpeechPipeline:
             # EpisodeSpeechOutput preserves the MiniMax-only empty-audio retry.
             ws.timings["tts_audio_bytes"] = audio_returned_bytes
             ws.timings["tts_text_sent"] = int(tts_text_sent)
-            ws.timings["playback_output_complete"] = False
-            if session and tts_text_sent and audio_returned_bytes == 0 and tts_failed is None:
+            ws.timings.setdefault("playback_output_complete", False)
+            if session and tts_text_sent and not direct_playback and audio_returned_bytes == 0 and tts_failed is None:
                 tts_failed = RuntimeError(f"{tts_backend} TTS 已确认结束但未返回 PCM")
                 tts_disabled = True
                 logger.error(
@@ -1255,7 +1359,7 @@ class SpeechPipeline:
                     transport,
                     getattr(session, "generation_finished", False),
                 )
-            if self.player:
+            if self.player and not direct_playback:
                 playback_timeout = max(120.0, 30.0 + self.player.buffered_ms / 1000)
                 try:
                     await self.player.wait_until_output_complete(timeout_seconds=playback_timeout)

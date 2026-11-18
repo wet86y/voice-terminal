@@ -5,8 +5,8 @@ use windows_sys::Win32::{
     UI::{
         HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi},
         WindowsAndMessaging::{
-            ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON, SM_CXSMICON,
-            SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
+            LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON,
+            SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
         },
     },
 };

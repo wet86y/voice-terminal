@@ -21,14 +21,17 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "dynamic-acl"] }
 tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] } # serde（远程导入和管理 RPC（远程过程调用）契约的序列化）。
 serde_json = "1"
+base64 = "0.22" # base64（校验并解码受限的远程 TTS 音频预览）。
+sha2 = "0.10" # sha2（远程导入文件的 SHA-256（安全散列算法 256 位）完整性校验）。
+rand = { version = "=0.10.3", features = ["sys_rng"] } # rand（请求编号和临时标识的系统随机数生成）。
 voice-desktop-common = { path = "../common" }
 tokio = { version = "1", features = ["sync", "time"], optional = true } # tokio（SSH 媒体收发任务的有界异步通道）。
 
 [dev-dependencies]
 voice-desktop-common = { path = "../common", features = ["ssh-device-test-support"] } # voice-desktop-common（SSH（安全外壳协议）闭环集成测试支持，仅用于测试构建）。
 russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"] } # russh（固定指纹 SSH 回环测试服务）。
-rand = "=0.10.3" # rand（只为 SSH 回环测试生成临时 Ed25519 身份）。
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "process"] } # tokio（异步 SSH 与产品网关集成测试运行时）。
 
 [target.'cfg(windows)'.dependencies]

@@ -175,9 +175,17 @@ export interface DesktopWorkspacePort {
   saveTtsSelection?(request: TtsSelection): Promise<TtsSelection> // saveTtsSelection（仅保存，不启动）。
   audioEnhancements?(request?: Record<string, boolean>): Promise<{ dual_pass: boolean; emotion: boolean; acoustic_events: boolean }> // audioEnhancements（启动前读取或保存音频增强）。
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
-  resourceResetPlan(resourceId: string): Promise<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string }> // resourceResetPlan（读取重置确认范围）。
-  resetResource(resourceId: string, token: string): Promise<{ job_id: string }> // resetResource（确认并删除受管组件）。
+  resourceResetPlan(resourceId: string): Promise<{ resource_id: string; paths: string[]; voice_paths?: string[]; token: string; message: string; plan_request_id?: string }> // resourceResetPlan（读取重置确认范围及服务端一次性计划编号）。
+  resetResource(resourceId: string, token: string, planRequestId?: string): Promise<{ job_id: string }> // resetResource（确认并删除受管组件）。
   importResource(resourceId?: string): Promise<{ job_id: string }>
+  /** chooseImportSources（选择导入来源）：路径仅由原生进程持有，网页取得短期票据。 */
+  chooseImportSources?(resourceId?: string): Promise<{
+    cancelled: boolean // cancelled（用户取消了本机来源选择）。
+    selection_id: string | null // selection_id（一次性原生来源票据，不包含绝对路径）。
+    count: number // count（本次选择的来源数量）。
+  }>
+  /** startImportSources（启动已选来源导入）：原生端消费一次性选择票据。 */
+  startImportSources?(selectionId: string): Promise<{ job_id: string }>
   /** resource_open_source（打开上游）：由原生宿主打开资源来源页面。 */
   openResourceSource(resourceId: string): Promise<void>
   /** resource_cancel（取消资源任务）：资源任务与迁移复制阶段共用。 */
@@ -293,8 +301,10 @@ export function desktopPort(): DesktopPort {
     saveTtsSelection: request => call<TtsSelection>('tts_selection_save', { request }),
     audioEnhancements: request => call('audio_enhancements_settings', { request: request ?? null }),
     resourceResetPlan: resourceId => call('resource_reset_plan', { resource_id: resourceId }),
-    resetResource: (resourceId, token) => call('resource_reset', { resource_id: resourceId, token }),
+    resetResource: (resourceId, token, planRequestId) => call('resource_reset', { resource_id: resourceId, token, plan_request_id: planRequestId }),
     importResource: resourceId => call<{ job_id: string }>('resource_import', resourceId === undefined ? undefined : { resource_id: resourceId }),
+    chooseImportSources: resourceId => call('resource_import_choose_sources', resourceId === undefined ? undefined : { resource_id: resourceId }),
+    startImportSources: selectionId => call('resource_import_start', { selection_id: selectionId }),
     openResourceSource: resourceId => call('resource_open_source', { resource_id: resourceId }),
     cancelResource: jobId => call('resource_cancel', { job_id: jobId }),
     environmentStatus: () => call('voice_environment_status'),

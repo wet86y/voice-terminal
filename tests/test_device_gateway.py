@@ -199,10 +199,10 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
             self.scope = {"query_string": query}
 
     payload = _device_media_open_payload(WebSocket(
-        b"protocol_version=1&stream_id=stream-a&connection_generation=2&executor_generation=3&interaction_generation=4",
+        b"protocol_version=2&stream_id=stream-a&connection_generation=2&executor_generation=3&interaction_generation=4",
     ))
     assert payload == {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "stream_id": "stream-a",
         "connection_generation": 2,
         "executor_generation": 3,
@@ -211,9 +211,9 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
 
     from fastapi import HTTPException
     for query in (
-        b"protocol_version=1&protocol_version=1&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
-        b"protocol_version=01&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
-        b"protocol_version=1&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1&unexpected=x",
+        b"protocol_version=2&protocol_version=2&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
+        b"protocol_version=02&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
+        b"protocol_version=2&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1&unexpected=x",
     ):
         try:
             _device_media_open_payload(WebSocket(query))
@@ -224,10 +224,10 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
 
 
 def test_device_media_clock_response_requires_a_unique_exact_control_envelope():
-    valid = {"text": '{"type":"clock.sync.response","protocol_version":1,"sync_id":"sync-a",'
+    valid = {"text": '{"type":"clock.sync.response","protocol_version":2,"sync_id":"sync-a",'
                      '"device_receive_us":1000,"device_send_us":1100}'}
     assert _device_media_clock_response(valid, sync_id="sync-a") == (1000, 1100)
-    invalid = {"text": '{"type":"clock.sync.response","protocol_version":1,"sync_id":"sync-a",'
+    invalid = {"text": '{"type":"clock.sync.response","protocol_version":2,"sync_id":"sync-a",'
                        '"device_receive_us":1000,"device_receive_us":1000,"device_send_us":1100}'}
     try:
         _device_media_clock_response(invalid, sync_id="sync-a")

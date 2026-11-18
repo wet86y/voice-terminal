@@ -138,7 +138,10 @@ fn resource_workspace_path(kind: ResourceKind, relative: &str) -> Result<String,
 /// ensure_file_download_route（文件资源路由准入）：系统功能不得落入通用下载器。
 fn ensure_file_download_route(kind: ResourceKind) -> Result<(), String> {
     if kind == ResourceKind::SystemFeature {
-        return Err("system_feature（系统功能）不能由模型/DSH 文件下载器处理；请使用专用主机功能任务。".into());
+        return Err(
+            "system_feature（系统功能）不能由模型/DSH 文件下载器处理；请使用专用主机功能任务。"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -192,7 +195,10 @@ pub fn specs(context: &LaunchContext) -> Result<Vec<Value>, String> {
     for item in &mut items {
         let kind = resource_kind(item)?;
         if kind == ResourceKind::SystemFeature {
-            return Err("system_feature（系统功能）资源必须先注册专用主机功能任务，不能并入文件资源目录。".into());
+            return Err(
+                "system_feature（系统功能）资源必须先注册专用主机功能任务，不能并入文件资源目录。"
+                    .into(),
+            );
         }
         let selected = match item["resource_id"].as_str() {
             Some("paraformer-offline") => enhancements["dual_pass"] == true,
@@ -265,7 +271,10 @@ pub(crate) fn destination(context: &LaunchContext, spec: &Value) -> Result<PathB
         return safe_path(&context.install, "runtimes/aniflive-tts");
     }
     let relative = spec["destination"].as_str().ok_or("资源缺少固定目录")?;
-    safe_path(&context.install, &resource_workspace_path(resource_kind(spec)?, relative)?)
+    safe_path(
+        &context.install,
+        &resource_workspace_path(resource_kind(spec)?, relative)?,
+    )
 }
 fn file_spec(value: &Value, url: String) -> Result<DownloadFile, String> {
     let download_variants = serde_json::from_value::<Vec<crate::download::DownloadVariant>>(

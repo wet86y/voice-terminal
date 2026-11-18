@@ -130,20 +130,19 @@ pub(crate) fn endpoint_id_from_device(
     use std::ffi::c_void;
     use windows::Win32::System::Com::CoTaskMemFree;
 
-    let id = unsafe { device.GetId() }
-        .map_err(|error| format!("读取音频端点编号失败：{error}"))?;
+    let id = unsafe { device.GetId() }.map_err(|error| format!("读取音频端点编号失败：{error}"))?;
     if id.is_null() {
         return Err("系统音频端点编号为空".into());
     }
-    let endpoint_id = unsafe { id.to_string() }
-        .map_err(|_| "系统音频端点编号不是有效 UTF-16".to_owned());
+    let endpoint_id =
+        unsafe { id.to_string() }.map_err(|_| "系统音频端点编号不是有效 UTF-16".to_owned());
     unsafe { CoTaskMemFree(Some(id.as_ptr().cast::<c_void>())) };
     endpoint_id
 }
 
 #[cfg(windows)]
 pub(crate) fn format_wasapi_error(
-    context: &str, // context（操作失败上下文）。
+    context: &str,               // context（操作失败上下文）。
     error: windows::core::Error, // error（Windows 音频接口返回的 HRESULT 错误）。
 ) -> String {
     use windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_INVALIDATED;
@@ -155,7 +154,8 @@ pub(crate) fn format_wasapi_error(
 }
 
 #[cfg(windows)]
-pub(crate) fn is_wasapi_device_invalidated(message: &str) -> bool { // message（已格式化的 WASAPI 错误）。
+pub(crate) fn is_wasapi_device_invalidated(message: &str) -> bool {
+    // message（已格式化的 WASAPI 错误）。
     message.starts_with("WASAPI_DEVICE_INVALIDATED:")
 }
 

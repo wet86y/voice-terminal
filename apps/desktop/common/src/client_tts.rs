@@ -1,17 +1,21 @@
 //! Client MiniMax TTS（客户端 MiniMax 语音合成）：凭据只在本机进程内使用。
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use std::time::Duration;
+use serde_json::{json, Value};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest,
-        http::{HeaderValue, header::AUTHORIZATION},
+        http::{header::AUTHORIZATION, HeaderValue},
         protocol::{Message, WebSocketConfig},
     },
+    MaybeTlsStream, WebSocketStream,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -26,6 +30,13 @@ const MAX_ALIGNMENT_EVENTS: usize = 512; // MAX_ALIGNMENT_EVENTS（单次合成�
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12); // CONNECT_TIMEOUT（连接和启动握手时限）。
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(120); // RECEIVE_TIMEOUT（等待合成回执的无活动时限）。
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(2); // CANCEL_TIMEOUT（云端取消确认时限）。
+pub const MAX_AUTHORIZATION_TTL_MS: u64 = 5 * 60 * 1_000; // MAX_AUTHORIZATION_TTL_MS（单次播放授权最长有效时长）。
+pub type MiniMaxTtsCredential = Zeroizing<String>; // MiniMaxTtsCredential（离开授权会话时自动清零的密钥字符串）。
+
+/// zeroize_temporary_secret_buffer（清除授权 JSON 原文）：由媒体入口解析完授权后立即调用。
+pub fn zeroize_temporary_secret_buffer(buffer: &mut String) {
+    buffer.zeroize();
+}
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -76,6 +87,78 @@ impl MiniMaxTtsRequest {
         }
         Ok(())
     }
+}
+
+/// MiniMaxTtsAuthorization（MiniMax 临时授权）：只允许服务端签发并只保存在原生进程内存。
+///
+/// This type deliberately has no Serialize/Deserialize implementation. The credential is moved out
+/// of its parsed JSON value into Zeroizing storage and is never included in debug output.
+pub struct MiniMaxTtsAuthorization {
+    pub authorization_id: String, // authorization_id（服务端签发的临时授权编号）。
+    pub playback_key: String,     // playback_key（授权固定绑定的播放事务编号）。
+    expires_at: Instant,          // expires_at（收到授权后按 TTL 计算的本机单调过期时刻）。
+    api_key: Zeroizing<String>,   // api_key（服务端临时下发的 MiniMax 接口密钥）。
+}
+
+impl fmt::Debug for MiniMaxTtsAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiniMaxTtsAuthorization")
+            .field("authorization_id", &self.authorization_id)
+            .field("playback_key", &self.playback_key)
+            .field("expires_at", &self.expires_at)
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
+}
+
+impl MiniMaxTtsAuthorization {
+    /// new（创建临时授权）：key 从已认证服务端消息移入受清零保护的字符串。
+    pub fn new(
+        authorization_id: String,
+        playback_key: String,
+        ttl_ms: u64,
+        api_key: String,
+    ) -> Result<Self, String> {
+        let api_key = Zeroizing::new(api_key);
+        if !valid_identifier(&authorization_id, 128)
+            || !valid_playback_key(&playback_key)
+            || !(1..=MAX_AUTHORIZATION_TTL_MS).contains(&ttl_ms)
+        {
+            return Err("MiniMax 临时授权编号、播放键或有效时长无效。".into());
+        }
+        validate_api_key(&api_key)?;
+        Ok(Self {
+            authorization_id,
+            playback_key,
+            expires_at: Instant::now() + Duration::from_millis(ttl_ms),
+            api_key,
+        })
+    }
+
+    /// credential_for_request（按固定授权取请求密钥副本）：副本仍带 Zeroizing 所有权。
+    pub fn credential_for_request(
+        &self,
+        authorization_id: &str,
+        playback_key: &str,
+    ) -> Result<MiniMaxTtsCredential, String> {
+        if self.is_expired() {
+            return Err("MiniMax 临时授权已过期。".into());
+        }
+        if self.authorization_id != authorization_id || self.playback_key != playback_key {
+            return Err("MiniMax 临时授权与固定播放事务不匹配。".into());
+        }
+        Ok(Zeroizing::new(self.api_key.to_string()))
+    }
+
+    /// is_expired（检查授权过期）：使用单调时钟，不受系统时间校正影响。
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+}
+
+fn valid_playback_key(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.trim() == value && !value.contains('\0')
 }
 
 fn valid_identifier(value: &str, maximum_bytes: usize) -> bool {
@@ -369,6 +452,10 @@ async fn run_synthesis(
     let mut authorization = HeaderValue::from_str(&bearer)
         .map_err(|_| "本机 MiniMax 接口密钥不能用于 WebSocket 身份验证。".to_string())?;
     authorization.set_sensitive(true);
+    // The HTTP HeaderValue owns a separate handshake-only copy; the current tungstenite/http API
+    // exposes no zeroize method for that internal buffer. The request future is dropped at the
+    // select boundary below, while our Zeroizing bearer/key buffers are cleared immediately after
+    // connect completes or returns.
     websocket_request
         .headers_mut()
         .insert(AUTHORIZATION, authorization);
@@ -791,11 +878,9 @@ mod tests {
     #[test]
     fn rejects_invalid_requests_and_pcm_hex_before_network_access() {
         assert!(request("").validate().is_err());
-        assert!(
-            request(&"x".repeat(MAX_REQUEST_TEXT_CHARS + 1))
-                .validate()
-                .is_err()
-        );
+        assert!(request(&"x".repeat(MAX_REQUEST_TEXT_CHARS + 1))
+            .validate()
+            .is_err());
         let mut invalid_rate = request("你好");
         invalid_rate.sample_rate = 44_100;
         assert!(invalid_rate.validate().is_err());
@@ -806,6 +891,13 @@ mod tests {
         assert!(decode_pcm_hex("abc").is_err());
         assert!(decode_pcm_hex("0100zz00").is_err());
         assert!(decode_pcm_hex(&"00".repeat(MAX_AUDIO_CHUNK_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn temporary_secret_json_buffer_is_zeroized_by_the_media_owner() {
+        let mut message = r#"{"credential":"temporary-unit-test-key"}"#.to_owned();
+        zeroize_temporary_secret_buffer(&mut message);
+        assert!(message.is_empty());
     }
 
     #[test]

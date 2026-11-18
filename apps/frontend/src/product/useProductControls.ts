@@ -68,6 +68,9 @@ export function useProductControls() {
     loading,
     saving,
     connected,
+    managementConnected,
+    voiceConnected,
+    voiceReady,
     runtimeState,
     coreUnavailable,
     coreStarting,
@@ -127,6 +130,7 @@ export function useProductControls() {
     notice,
     noticeVisible,
     runtimeAction: performRuntimeAction,
+    setListening: setRemoteAwareListening,
     resetSession,
     clearSession,
     setReasoningMode,
@@ -1532,10 +1536,10 @@ export function useProductControls() {
     return performRuntimeAction();
   }
   function floatingSessionAction(action: FloatingSessionAction) {
-    if (action === 'silence') return voice.setListening(false);
+    if (action === 'silence') return setRemoteAwareListening(false);
     if (action !== 'start' || voice.listening.value || coreUnavailable.value || coreStarting.value
       || !applicationHost.businessReady.value || applicationSnapshot.value?.startup_complete === false) return false;
-    return voice.setListening(true);
+    return setRemoteAwareListening(true);
   }
   // workbenchConversation（消息呈现缓存）：实时音量更新不重新映射聊天条目。
   const workbenchConversation = computed(() => {
@@ -1591,7 +1595,7 @@ export function useProductControls() {
     return {
       state: runtimeState.value,
       audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
-      sessionActive: connected.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
+      sessionActive: voiceReady.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
       sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
@@ -1601,16 +1605,19 @@ export function useProductControls() {
         ? "组件启动中"
         : coreUnavailable.value
         ? "查看本地组件"
-        : connected.value
+        : !voiceReady.value && applicationSnapshot.value?.remote_mode
+          ? "等待服务端语音实时通道"
+        : voiceReady.value
           ? listening.value
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
       disabled: voice.inputPaused.value || Boolean(voice.sessionOperation.value) || loading.value || coreStarting.value
+        || applicationSnapshot.value?.startup_complete === false
+        || applicationSnapshot.value?.remote_mode === true && !voiceConnected.value,
+      modeDisabled: !voiceReady.value || Boolean(voice.sessionOperation.value) || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false,
-      modeDisabled: !connected.value || Boolean(voice.sessionOperation.value) || coreStarting.value
-        || applicationSnapshot.value?.startup_complete === false,
-      canReset: connected.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,
+      canReset: voiceReady.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
       modeVisible: voice.inference.value?.reasoning_mode_selectable !== false,
       latency: formatResponseLatency(latencyMs.value),
@@ -1626,7 +1633,9 @@ export function useProductControls() {
       partialKey: userMessageKey(voice.currentTurnId.value || "current"),
       thinking:
         runtimeState.value === "thinking" && !current.value.assistant_text,
-      conversationHint: waitingForWake.value
+      conversationHint: applicationSnapshot.value?.remote_mode === true && !voiceConnected.value
+        ? "服务端语音实时通道断开，语音提交已暂停"
+        : waitingForWake.value
         ? "正在等待唤醒词"
         : listening.value
           ? "正在聆听你的声音"
@@ -1692,6 +1701,9 @@ export function useProductControls() {
     loading,
     saving,
     connected,
+    managementConnected,
+    voiceConnected,
+    voiceReady,
     runtimeState,
     shadow,
     wakeForm,

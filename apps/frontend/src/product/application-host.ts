@@ -2,6 +2,8 @@ import { computed, ref } from 'vue'
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
 import { startupWasSkipped, rememberStartupSkip } from '../runtime/startup-choice'
 import { desktopPort } from './desktop-port'
+import { matchesRemoteManagementEnvelope, nativeDeviceApi, type RemoteManagementResponse } from './native-device-api'
+import type { ProductSnapshot } from './types'
 import type { RuntimeOperation } from '../runtime/runtime-operations'
 
 /** DesktopRecovery（原生恢复快照）：独立于可能离线的网页宿主。 */
@@ -69,6 +71,14 @@ export interface ApplicationSnapshot {
   resource_processes?: Array<Pick<ApplicationComponent, 'pid' | 'created_at' | 'memory_rss_bytes' | 'memory_private_commit_bytes' | 'gpu_dedicated_bytes'> & { component_id: string }>
   /** instance_id（应用实例标识）。 */
   instance_id: string
+  remote_mode?: boolean // remote_mode（本设备是否以远程配对身份运行）。
+  host_id?: string | null // host_id（当前远程服务端设备编号）。
+  host_name?: string | null // host_name（当前远程服务端显示名称）。
+  management_connected?: boolean // management_connected（SSH 管理及任务会话是否就绪）。
+  remote_business_ready?: boolean // remote_business_ready（服务端产品业务接口是否可访问）。
+  remote_error?: string | null // remote_error（远程目标暂不可用的原因）。
+  remote_voice_error?: string | null // remote_voice_error（本机远程语音 WebSocket 转发错误）。
+  remote_runtime_state?: string // remote_runtime_state（服务端实际语音核心状态）。
   /** revision（状态版本）。 */
   revision: number
   /** endpoint_revision（语音端点版本）：地址不变但服务进程重启时仍触发重连。 */
@@ -127,9 +137,18 @@ export function acceptApplicationSnapshot(previous: ApplicationSnapshot | null, 
 
 /** applicationApiReady（业务接口可用）：缺少语音能力或在线凭据时仍允许打开和保存设置。 */
 export function applicationApiReady(value: ApplicationSnapshot | null): boolean {
+  if (value?.remote_mode) return value.management_connected === true && value.remote_business_ready === true
   if (!value || value.stopping || !value.voice_api_url) return false
   const voice = value.components.find(component => component.id === 'voice')
   return Boolean(voice?.pid && (value.voice_api_ready === true || ['ready', 'failed', 'external'].includes(voice.state)))
+}
+
+/** applicationRemoteModeSelected（远程模式已选定）：启动配置或已读取快照声明远程时，禁止回退到本机应用宿主。 */
+export function applicationRemoteModeSelected(
+  value: ApplicationSnapshot | null,
+  configuredRemoteMode = false, // configuredRemoteMode（启动配置声明远程模式）。
+): boolean {
+  return configuredRemoteMode || value?.remote_mode === true
 }
 
 /** applicationCorePhase（核心能力阶段）：以宿主发布的 core_phase 为准，旧宿主按 core_available 回落。 */
@@ -180,6 +199,33 @@ let fallback: ReturnType<typeof setInterval> | undefined
 let clock: ReturnType<typeof setInterval> | undefined
 let reconnect: ReturnType<typeof setTimeout> | undefined
 let refreshRequest: Promise<void> | null = null
+let remoteApplicationRevision = 0 // remoteApplicationRevision（远程桌面状态投影修订号）。
+let remoteApplicationStartedAt: number | null = null // remoteApplicationStartedAt（本窗口首次读取远程状态的时间）。
+let remoteVoiceForwarderHostId: string | null = null // remoteVoiceForwarderHostId（本机回环转发绑定的服务端编号）。
+
+async function stopRemoteVoiceForwarder() {
+  if (!remoteVoiceForwarderHostId) return
+  remoteVoiceForwarderHostId = null
+  try { await nativeDeviceApi.remoteVoiceForwarder('stop') } catch { /* SSH 断开时本机转发仍由原生生命周期回收。 */ }
+}
+
+async function ensureRemoteVoiceForwarder(hostId: string): Promise<string> {
+  if (remoteVoiceForwarderHostId !== hostId) {
+    await stopRemoteVoiceForwarder()
+    const started = await nativeDeviceApi.remoteVoiceForwarder('start')
+    if (started.state !== 'running') throw new Error('远程语音本机转发未能启动。')
+    remoteVoiceForwarderHostId = hostId
+    return started.url
+  }
+  try {
+    const status = await nativeDeviceApi.remoteVoiceForwarder('status')
+    if (status.state === 'running') return status.url
+  } catch { /* 状态补查失败后尝试重新确认或启动固定转发。 */ }
+  const started = await nativeDeviceApi.remoteVoiceForwarder('start')
+  if (started.state !== 'running') throw new Error('远程语音本机转发未能恢复。')
+  remoteVoiceForwarderHostId = hostId
+  return started.url
+}
 
 if (typeof window !== 'undefined' && window.__VOICE_APPLICATION__) {
   window.__VOICE_APPLICATION__.business_ready = false
@@ -201,13 +247,23 @@ function clearHostTimers() {
 }
 
 function clearHostConfiguration() {
+  void stopRemoteVoiceForwarder()
   const configuration = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
   if (!configuration) return
   configuration.origin = ''
   configuration.voice_api_url = ''
   configuration.voice_ws_url = ''
+  configuration.remote_mode = false
+  configuration.host_id = null
+  configuration.management_connected = false
+  configuration.remote_business_ready = false
   delete configuration.endpoint_revision
   configuration.business_ready = false
+}
+
+function remoteModeSelected() {
+  return applicationRemoteModeSelected(snapshot.value,
+    typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.remote_mode === true)
 }
 
 function invalidateSession() {
@@ -231,6 +287,10 @@ function apply(value: ApplicationSnapshot) {
   if (window.__VOICE_APPLICATION__) {
     window.__VOICE_APPLICATION__.voice_api_url = value.voice_api_url
     window.__VOICE_APPLICATION__.voice_ws_url = value.voice_ws_url
+    window.__VOICE_APPLICATION__.remote_mode = value.remote_mode === true
+    window.__VOICE_APPLICATION__.host_id = value.host_id ?? null
+    window.__VOICE_APPLICATION__.management_connected = value.management_connected === true
+    window.__VOICE_APPLICATION__.remote_business_ready = value.remote_business_ready === true
     if (value.endpoint_revision === undefined) delete window.__VOICE_APPLICATION__.endpoint_revision
     else window.__VOICE_APPLICATION__.endpoint_revision = value.endpoint_revision
     window.__VOICE_APPLICATION__.business_ready = applicationApiReady(value)
@@ -242,6 +302,7 @@ function apply(value: ApplicationSnapshot) {
     rememberStartupSkip()
   }
   snapshot.value = value
+  if (value.remote_mode) connected.value = value.management_connected === true
   if (value.startup_complete) entered = true
   if (value.state === 'stopped' && clock !== undefined) {
     now.value = Date.now()
@@ -251,12 +312,149 @@ function apply(value: ApplicationSnapshot) {
   error.value = ''
 }
 
+async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> {
+  if (!locateNativeInvoker()) {
+    if (remoteModeSelected()) throw new Error('远程模式缺少原生管理通道，已取消本机宿主请求。')
+    return null
+  }
+  const local = await nativeDeviceApi.deviceConfigStatus()
+  if (local.runtime.mode !== 'remote') {
+    await stopRemoteVoiceForwarder()
+    return null
+  }
+  const hostId = local.device_config?.paired_host?.host_id ?? null
+  const hostName = local.device_config?.paired_host?.display_name ?? '已配对服务端'
+  let sshConnected = false
+  let management: RemoteManagementResponse | null = null
+  let remoteError: string | null = null
+  try {
+    sshConnected = (await nativeDeviceApi.sshHostStatus()).connected
+    if (sshConnected) management = await nativeDeviceApi.remoteManagementRequest('management.status', {})
+  } catch (failure) {
+    remoteError = failure instanceof Error ? failure.message : '远程连接状态暂不可读。'
+  }
+  const managementEnvelopeValid = management !== null
+    && matchesRemoteManagementEnvelope(management, hostId, 'management.status')
+  const managementConnected = sshConnected && management?.status === 200 && managementEnvelopeValid
+  const managementBody = management?.body && typeof management.body === 'object'
+    ? management.body as Record<string, unknown> : {}
+  const remoteCoreState = managementBody.core_state === 'ready' || managementBody.core_state === 'starting'
+    ? managementBody.core_state : 'unavailable'
+  if (sshConnected && management && management.status !== 200) {
+    const detail = typeof management.body?.detail === 'string' ? management.body.detail : ''
+    remoteError = detail || `服务端管理状态暂不可用（HTTP ${management.status}）。`
+  } else if (sshConnected && management?.status === 200 && !managementEnvelopeValid) {
+    remoteError = '服务端管理回执的目标主机或连接代次无效，已丢弃该状态。'
+  }
+  let product: ProductSnapshot | null = null
+  let remoteBusinessReady = false
+  if (managementConnected && remoteCoreState === 'ready') {
+    try {
+      const result: RemoteManagementResponse = await nativeDeviceApi.remoteManagementRequest('product.snapshot', {})
+      const productEnvelopeValid = matchesRemoteManagementEnvelope(result, hostId, 'product.snapshot')
+      if (result.status === 200 && productEnvelopeValid && result.body && typeof result.body === 'object'
+        && typeof result.body.runtime === 'object' && result.body.runtime !== null) {
+        product = result.body as unknown as ProductSnapshot
+        remoteBusinessReady = true
+        remoteError = null
+      } else {
+        const detail = result.body && typeof result.body.detail === 'string' ? result.body.detail : ''
+        remoteBusinessReady = false
+        remoteError = detail || (result.status === 200 && !productEnvelopeValid
+          ? '服务端产品状态的目标或通道代次不匹配，已丢弃该状态。'
+          : `服务端产品状态暂不可用（HTTP ${result.status}）。`)
+      }
+    } catch (failure) {
+      remoteBusinessReady = false
+      remoteError = failure instanceof Error ? failure.message : '无法读取服务端产品状态。'
+    }
+  }
+  if (remoteApplicationStartedAt === null) remoteApplicationStartedAt = Date.now() / 1000
+  remoteApplicationRevision += 1
+  const services = product?.runtime?.services as unknown as Record<string, unknown> | undefined
+  const serviceLabels: Record<string, string> = {
+    audio: '音频', kws: '关键词唤醒', asr: '语音识别', speaker: '声纹', llm: '语言模型', tts: '语音合成',
+    analysis: '分析', web_search: '网页搜索', shadow_agent: '影子代理',
+  }
+  const components: ApplicationComponent[] = Object.entries(services ?? {}).map(([id, raw]) => {
+    const rawState = typeof raw === 'string' ? raw : raw && typeof raw === 'object'
+      ? String((raw as Record<string, unknown>).state ?? 'unavailable') : 'unavailable'
+    const state = rawState.toLowerCase()
+    return {
+      id, name: serviceLabels[id] ?? id, state, phase: state, error: '', pid: null,
+      created_at: null, uptime_seconds: null, memory_rss_bytes: null, memory_private_commit_bytes: null,
+      gpu_dedicated_bytes: null, thread_count: null, cpu_percent: null, sampled_at: null,
+      shared_with: null, retry_allowed: false, retrying: false, external: false,
+    }
+  })
+  const coreAvailable = product?.runtime?.can_start === true
+  const loadingRemoteCore = Boolean(services && Object.values(services).some(value => {
+    const state = typeof value === 'string' ? value : value && typeof value === 'object'
+      ? String((value as Record<string, unknown>).state ?? '') : ''
+    return /starting|loading/i.test(state)
+  }))
+  const corePhase: 'ready' | 'starting' | 'failed' = coreAvailable ? 'ready'
+    : remoteCoreState === 'starting' || loadingRemoteCore ? 'starting' : 'failed'
+  let voiceWsUrl = ''
+  let remoteVoiceError: string | null = null
+  if (managementConnected && remoteCoreState === 'ready' && hostId) {
+    try { voiceWsUrl = await ensureRemoteVoiceForwarder(hostId) }
+    catch (failure) { remoteVoiceError = failure instanceof Error ? failure.message : '远程语音本机转发不可用。' }
+  } else {
+    await stopRemoteVoiceForwarder()
+  }
+  const unavailableCapabilities: ApplicationCapability[] = coreAvailable ? [] : [{
+    id: 'voice', label: '语音核心', state: corePhase, blocking: true,
+    phase: remoteError || (managementConnected ? '服务端语音核心仍在准备' : '等待远程服务端连接'),
+    error: remoteError ?? '', retry: null,
+  }]
+  const now = Date.now() / 1000
+  return {
+    instance_id: hostId ?? `remote-${local.runtime.device_id ?? 'unpaired'}`,
+    revision: remoteApplicationRevision,
+    endpoint_revision: managementConnected ? management?.session_generation : undefined,
+    remote_mode: true,
+    host_id: hostId,
+    host_name: hostName,
+    management_connected: managementConnected,
+    remote_business_ready: remoteBusinessReady,
+    remote_error: remoteError,
+    remote_voice_error: remoteVoiceError,
+    remote_runtime_state: product?.runtime?.state,
+    state: managementConnected ? 'running' : 'waiting',
+    core_phase: corePhase,
+    unavailable_capabilities: unavailableCapabilities,
+    phase: managementConnected ? `${hostName} · ${product ? '已连接' : '服务端业务准备中'}` : `${hostName} · 等待连接`,
+    started_at: remoteApplicationStartedAt,
+    startup_complete: true,
+    core_available: coreAvailable,
+    stopping: false,
+    voice_api_url: '',
+    voice_api_ready: product !== null,
+    voice_ws_url: voiceWsUrl,
+    capabilities: Object.fromEntries(components.map(row => [row.id, row.state])),
+    sampled_at: product ? now : null,
+    total_memory_rss_bytes: null,
+    total_memory_private_commit_bytes: null,
+    total_gpu_dedicated_bytes: null,
+    completed_components: components.length,
+    total_components: components.length,
+    components,
+  }
+}
+
 function refresh(): Promise<void> {
   if (sessionInvalid.value || recovery.value?.suspended) return Promise.resolve()
   if (refreshRequest) return refreshRequest
   const generation = hostGeneration
   const request = (async () => {
     try {
+      const remote = await remoteApplicationSnapshot()
+      if (generation !== hostGeneration) return
+      if (remote) {
+        apply(remote)
+        return
+      }
       const response = await fetch('/api/v1/application/snapshot', { cache: 'no-store' })
       if (generation !== hostGeneration) return
       if (isSessionInvalidStatus(response.status)) {
@@ -280,6 +478,10 @@ function refresh(): Promise<void> {
 function subscribe() {
   if (!started || sessionInvalid.value || recovery.value?.suspended || snapshot.value?.state === 'stopped') return
   closeEvents()
+  if (remoteModeSelected()) {
+    connected.value = snapshot.value?.management_connected === true
+    return
+  }
   let stream: EventSource
   try {
     stream = new EventSource('/api/v1/application/events')
@@ -313,6 +515,7 @@ function subscribe() {
 async function post(path: string) {
   if (sessionInvalid.value) throw new Error(SESSION_INVALID_MESSAGE)
   if (recovery.value?.suspended) throw new Error('组件正在更新，请等待业务服务恢复。')
+  if (remoteModeSelected()) throw new Error('远程模式不能调用本机应用宿主操作。')
   const generation = hostGeneration
   const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
   if (generation !== hostGeneration) return
@@ -342,7 +545,7 @@ async function retryCapability(id: string) {
 }
 
 async function retryFailed() {
-  if (sessionInvalid.value || retryingAll.value) return
+  if (sessionInvalid.value || retryingAll.value || remoteModeSelected()) return
   retryingAll.value = true
   const attempted = new Set<string>()
   try {
@@ -362,6 +565,11 @@ async function retryFailed() {
 }
 
 async function exit() {
+  if (remoteModeSelected()) {
+    try { await desktopPort().exit() }
+    catch (reason) { error.value = reason instanceof Error ? reason.message : '退出应用失败' }
+    return
+  }
   if (sessionInvalid.value) {
     try {
       const native = locateNativeInvoker()
@@ -382,7 +590,7 @@ async function start() {
   started = true
   const version = ++lifecycle
   const port = desktopPort()
-  if (port.available) {
+  if (port.available && !remoteModeSelected()) {
     void port.listen?.<DesktopRecovery>('desktop://runtime-recovery', event => {
       if (started && version === lifecycle) applyRecovery(event.payload)
     }).then(unlisten => { if (!started || version !== lifecycle) unlisten(); else unlistenRecovery = unlisten }).catch(() => undefined)
@@ -395,7 +603,9 @@ async function start() {
   if (!started || version !== lifecycle || sessionInvalid.value) return
   subscribe()
   fallback = setInterval(() => {
-    if (started && !sessionInvalid.value && !connected.value && snapshot.value?.state !== 'stopped') void refresh()
+    const remote = snapshot.value?.remote_mode === true
+    if (started && !sessionInvalid.value && snapshot.value?.state !== 'stopped'
+      && (remote || !connected.value)) void refresh()
   }, 2000)
 }
 
@@ -447,6 +657,7 @@ function stop() {
   hostGeneration++
   recovery.value = null
   entered = false
+  void stopRemoteVoiceForwarder()
 }
 
 export function useApplicationHost() {
@@ -462,6 +673,9 @@ export function useApplicationHost() {
   const runtimeOperations = computed(() => recovery.value?.operation ? [recovery.value.operation] : [])
   return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid, recovery, runtimeOperations,
     businessReady, overlay, corePhase, runtimeFailure, start, stop, retry, retryCapability, retryFailed, exit,
-    recover: () => locateNativeInvoker()?.invoke<void>('desktop_start_service'), // recover（原生恢复）：网页宿主离线时仍可重试。
+    recover: async () => {
+      if (remoteModeSelected()) throw new Error('远程模式不能启动本机语音服务。')
+      return locateNativeInvoker()?.invoke<void>('desktop_start_service')
+    }, // recover（原生恢复）：网页宿主离线时仍可重试。
     inspect: () => { inspecting.value = true; rememberStartupSkip() }, refresh }
 }

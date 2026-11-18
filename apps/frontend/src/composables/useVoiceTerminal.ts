@@ -1262,7 +1262,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function connect() {
     if (connection.value === 'connecting' || connection.value === 'connected') return
-    if (typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.business_ready === false) {
+    const application = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
+    const remoteVoiceReady = application?.remote_mode === true
+      && application.management_connected === true && Boolean(application.voice_ws_url)
+    if (application?.business_ready === false && !remoteVoiceReady) {
       connectionError.value = '应用宿主尚未允许业务连接。'
       return
     }

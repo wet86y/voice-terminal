@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-pairing-window-close"
+description = "Enables the device_pairing_window_close command without any pre-configured scope."
+commands.allow = ["device_pairing_window_close"]
+
+[[permission]]
+identifier = "deny-device-pairing-window-close"
+description = "Denies the device_pairing_window_close command without any pre-configured scope."
+commands.deny = ["device_pairing_window_close"]

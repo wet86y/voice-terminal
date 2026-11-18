@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { productApi, type AnifLiveImportJob, type AnifLiveImportScan } from '../api'
-import { desktopPort, type DesktopPort, type DesktopWorkspacePort } from '../desktop-port'
+import { desktopPort, type DesktopPort, type DesktopWorkspacePort, type ResourceJob, type ResourceStatus } from '../desktop-port'
+import { nativeDeviceApi } from '../native-device-api'
+import type { RemoteManagementOperation } from '../native-device-api'
 import { useApplicationHost } from '../application-host'
 import ManagedResourceProgress from '../../interface/ManagedResourceProgress.vue'
 import type { ManagedResourceJob } from '../../interface/local-components'
@@ -19,6 +21,7 @@ const emit = defineEmits<{
 }>()
 const desktop = desktopPort() as DesktopPort & DesktopWorkspacePort
 const application = useApplicationHost()
+const remoteMode = computed(() => application.snapshot?.value?.remote_mode === true) // remoteMode（是否通过配对服务端管理业务）。
 const localOpen = ref(false)
 const open = computed({
   get: () => props.open ?? localOpen.value,
@@ -27,7 +30,7 @@ const open = computed({
     emit('update:open', value)
   },
 })
-const sourceType = ref<'local' | 'huggingface' | 'modelscope'>('local')
+const sourceType = ref<'local' | 'huggingface' | 'modelscope'>(remoteMode.value ? 'huggingface' : 'local')
 const sourceValue = ref('')
 const scanning = ref(false)
 const submitting = ref(false)
@@ -64,8 +67,9 @@ const transcriptFiles = computed(() => {
     !file.path.toLowerCase().endsWith('.list') && stem(file.path) === stem(audio.path)) : []
 })
 watch(selectedAudio, () => { selectedTranscript.value = ''; referenceText.value = '' })
-const canSubmit = computed(() => Boolean(scan.value && selectedGpt.value && selectedSovits.value &&
-  selectedGpt.value !== selectedSovits.value && modelId.value.trim() && modelName.value.trim() && !submitting.value))
+const canSubmit = computed(() => Boolean(scan.value && (!remoteMode.value || scan.value.source_type !== 'local')
+  && selectedGpt.value && selectedSovits.value && selectedGpt.value !== selectedSovits.value
+  && modelId.value.trim() && modelName.value.trim() && !submitting.value))
 const sourceLabel = computed(() => sourceType.value === 'local' ? '本地文件夹' : sourceType.value === 'huggingface' ? 'Hugging Face（模型托管平台）' : 'ModelScope（魔搭模型托管平台）')
 
 onMounted(() => { void refreshPending() })
@@ -80,11 +84,64 @@ function updateJob(job: AnifLiveImportJob) {
   }
 }
 
+/** toManagedResourceJob（把服务端或本机资源快照映射为统一进度卡片）。 */
+function toManagedResourceJob(job: ResourceJob, label: string): ManagedResourceJob {
+  return {
+    id: job.job_id, resourceId: job.resource_id, label, state: job.state, phase: job.phase,
+    progressKind: job.progress_kind, completedBytes: job.completed_bytes, totalBytes: job.total_bytes,
+    downloadCompletedBytes: job.download_completed_bytes, downloadTotalBytes: job.download_total_bytes,
+    verificationCompletedBytes: job.verification_completed_bytes, verificationTotalBytes: job.verification_total_bytes,
+    error: job.error ?? undefined, canCancel: job.can_cancel === true,
+  }
+}
+
+/** remoteResourceRequest（调用固定服务端资源操作，并按原生管理回执返回业务体）。 */
+async function remoteResourceRequest<T>(operation: RemoteManagementOperation, argumentsValue: Record<string, unknown> = {}): Promise<T> {
+  const response = await nativeDeviceApi.remoteManagementRequest(operation, argumentsValue)
+  if (response.status < 200 || response.status >= 300) {
+    const message = typeof response.body.message === 'string' ? response.body.message
+      : typeof response.body.error === 'string' ? response.body.error : `服务端资源操作失败（${response.status}）。`
+    throw new Error(message)
+  }
+  return response.body as unknown as T
+}
+
+/** resourceJobSnapshots（读取当前目标的受管任务；远程模式只读服务端管理通道）。 */
+async function resourceJobSnapshots(remote = remoteMode.value): Promise<ResourceJob[]> {
+  if (remote) return remoteResourceRequest<ResourceJob[]>('resource.jobs')
+  return await desktop.resourceJobSnapshots?.() ?? []
+}
+
+/** applyRemoteImportRows（先显示独立 ResourceManager 任务，避免 Python 核心暂不可用时丢进度）。 */
+function applyRemoteImportRows(rows: ResourceJob[]) {
+  for (const row of rows) {
+    const match = /^aniflive-import-([0-9a-f]{32})$/.exec(row.job_id)
+    if (!match) continue
+    const taskId = match[1]!
+    conversionProgress.value[taskId] = toManagedResourceJob(row, '模型转换')
+    if (!jobs.value.some(job => job.task_id === taskId)) {
+      updateJob({ task_id: taskId, status: 'converting', phase: row.phase,
+        progress: row.total_bytes ? Math.min(100, Math.round((row.completed_bytes ?? 0) * 100 / row.total_bytes)) : undefined,
+        error: row.error })
+    }
+    if (['queued', 'running', 'waiting', 'cancelling'].includes(row.state)) void watchTask(taskId, true)
+  }
+}
+
 async function refreshPending() {
   if (props.demo) return
+  const remote = remoteMode.value
+  let remoteImportRows: ResourceJob[] = []
+  let remoteResourceError: unknown
   try {
+    if (remote) {
+      try {
+        remoteImportRows = (await resourceJobSnapshots(remote)).filter(row => /^aniflive-import-[0-9a-f]{32}$/.test(row.job_id))
+        applyRemoteImportRows(remoteImportRows)
+      } catch (failure) { remoteResourceError = failure }
+    }
     // 业务服务可能因显卡构建暂停；原生快照仍可读取并恢复进度。
-    if (application.recovery?.value?.suspended && desktop.resourceJobSnapshots) {
+    if (!remote && application.recovery?.value?.suspended && desktop.resourceJobSnapshots) {
       for (const row of await desktop.resourceJobSnapshots()) {
         if (row.job_id.startsWith('aniflive-import-') && ['queued', 'running', 'waiting', 'cancelling'].includes(row.state)) {
           const taskId = row.job_id.slice('aniflive-import-'.length)
@@ -94,18 +151,36 @@ async function refreshPending() {
       }
       return
     }
-    const response = await productApi.pendingAnifLiveImports()
+    let response: Awaited<ReturnType<typeof productApi.pendingAnifLiveImports>>
+    try { response = await productApi.pendingAnifLiveImports() }
+    catch (failure) {
+      if (remote) {
+        const message = failure instanceof Error ? failure.message : '无法读取待处理的模型导入任务。'
+        scanError.value = remoteResourceError instanceof Error
+          ? `服务端 Python 任务读取失败：${message}；ResourceManager 快照读取失败：${remoteResourceError.message}`
+          : message
+        return
+      }
+      throw failure
+    }
     jobs.value = response.jobs
     for (const job of response.jobs) {
       if (job.reference_text_draft) referenceDrafts.value[job.task_id] = job.reference_text_draft
       if (['queued', 'running', 'converting', 'staging', 'ready_to_convert', 'registering_references', 'reference_failed'].includes(job.status)) void watchTask(job.task_id, job.status !== 'staging' && job.status !== 'ready_to_convert')
     }
+    applyRemoteImportRows(remoteImportRows)
+    scanError.value = remoteResourceError instanceof Error
+      ? `已读取 Python 任务，但 ResourceManager 快照暂不可用：${remoteResourceError.message}` : ''
   } catch (failure) {
     scanError.value = failure instanceof Error ? failure.message : '无法读取待处理的模型导入任务。'
   }
 }
 
 async function chooseFolder() {
+  if (remoteMode.value) {
+    scanError.value = '远程模式不能把客户端本地路径发送给服务端，请使用服务端可访问的公开模型仓库来源。'
+    return
+  }
   scanError.value = ''
   try {
     const folder = await desktop.chooseAnifLiveImportFolder()
@@ -122,8 +197,20 @@ function resetScan() {
   referenceText.value = ''; scanError.value = ''; scanMessage.value = ''
 }
 
+watch(remoteMode, remote => {
+  if (remote && sourceType.value === 'local') {
+    sourceType.value = 'huggingface'
+    sourceValue.value = ''
+    resetScan()
+  }
+}, { immediate: true })
+
 async function scanSource() {
   if (props.demo) { scanError.value = '演示界面未连接模型导入接口。'; return }
+  if (remoteMode.value && sourceType.value === 'local') {
+    scanError.value = '远程模式不能扫描客户端本地文件夹；请选择服务端可访问的公开模型仓库来源。'
+    return
+  }
   if (!sourceValue.value.trim()) { scanError.value = sourceType.value === 'local' ? '请选择模型文件夹。' : '请输入公开模型仓库页面地址。'; return }
   scanning.value = true; scanError.value = ''; scanMessage.value = ''; resetScan()
   try {
@@ -145,20 +232,33 @@ async function scanSource() {
 }
 
 async function createImport() {
-  if (!scan.value || !canSubmit.value) return
+  const remote = remoteMode.value
+  if (!scan.value || !canSubmit.value || remote && scan.value.source_type === 'local') return
   submitting.value = true; scanError.value = ''
   try {
     if (!props.demo) {
-      const inventory = await desktop.resourceInventory()
+      const inventory = remote
+        ? await remoteResourceRequest<ResourceStatus[]>('resource.inventory')
+        : await desktop.resourceInventory()
       const framework = inventory.flatMap(row => [row, ...(row.runtime_components ?? [])]).find(row => row.resource_id === 'tts-aniflive-runtime')
       if (!framework?.can_start) {
         scanMessage.value = '正在配置 AnifLive 推理框架，完成后自动下载并转换所选模型。'
-        const task = await desktop.downloadResource('tts-aniflive-runtime')
-        frameworkProgress.value = { id: task.job_id, resourceId: 'tts-aniflive-runtime', label: 'AnifLive 推理框架', state: 'queued', phase: '准备配置推理框架', canCancel: false }
-        if (!desktop.resourceJobSnapshots) throw new Error('当前程序不支持框架配置进度，请更新程序。')
+        const activeFrameworkTask = remote
+          ? (await resourceJobSnapshots(remote)).find(row => row.resource_id === 'tts-aniflive-runtime'
+            && ['queued', 'running', 'waiting', 'cancelling'].includes(row.state))
+          : undefined
+        const task = activeFrameworkTask
+          ? { job_id: activeFrameworkTask.job_id }
+          : remote
+            ? await remoteResourceRequest<{ job_id: string }>('resource.install.start', { resource_id: 'tts-aniflive-runtime' })
+            : await desktop.downloadResource('tts-aniflive-runtime')
+        if (!task.job_id) throw new Error('服务端没有返回框架配置任务编号。')
+        frameworkProgress.value = activeFrameworkTask ? toManagedResourceJob(activeFrameworkTask, 'AnifLive 推理框架')
+          : { id: task.job_id, resourceId: 'tts-aniflive-runtime', label: 'AnifLive 推理框架', state: 'queued', phase: '准备配置推理框架', canCancel: false }
+        if (!remote && !desktop.resourceJobSnapshots) throw new Error('当前程序不支持框架配置进度，请更新程序。')
         while (true) {
-          const job = (await desktop.resourceJobSnapshots()).find(row => row.job_id === task.job_id)
-          if (job) frameworkProgress.value = { id: job.job_id, resourceId: job.resource_id, label: 'AnifLive 推理框架', state: job.state, phase: job.phase, progressKind: job.progress_kind, completedBytes: job.completed_bytes, totalBytes: job.total_bytes, downloadCompletedBytes: job.download_completed_bytes, downloadTotalBytes: job.download_total_bytes, verificationCompletedBytes: job.verification_completed_bytes, verificationTotalBytes: job.verification_total_bytes, canCancel: false }
+          const job = (await resourceJobSnapshots(remote)).find(row => row.job_id === task.job_id)
+          if (job) frameworkProgress.value = toManagedResourceJob(job, 'AnifLive 推理框架')
           if (job?.state === 'complete' || job?.state === 'completed') break
           if (job && ['failed', 'cancelled', 'canceled'].includes(job.state)) throw new Error(job.error || '框架配置未完成，请在组件页面重试。')
           if (disposed) return
@@ -188,15 +288,22 @@ function wait(milliseconds: number) { return new Promise(resolve => window.setTi
 async function watchTask(taskId: string, conversionAlreadyStarted: boolean) {
   if (workingTasks.has(taskId) || props.demo) return
   workingTasks.add(taskId)
+  const remote = remoteMode.value
   let started = conversionAlreadyStarted
   try {
     while (!disposed) {
-      // 转换运行于桌面进程，不能依赖被转换任务主动停止的业务接口。
-      const native = conversionAlreadyStarted || started
-        ? (await desktop.resourceJobSnapshots?.())?.find(row => row.job_id === `aniflive-import-${taskId}`) : undefined
+      // 转换运行于服务端 ResourceManager 或本机桌面进程；远程页面只读取服务端任务快照。
+      let native: ResourceJob | undefined
+      if (remote || conversionAlreadyStarted || started) {
+        try { native = (await resourceJobSnapshots(remote)).find(row => row.job_id === `aniflive-import-${taskId}`) }
+        catch (failure) {
+          if (!remote) throw failure
+          scanError.value = failure instanceof Error ? failure.message : '读取服务端资源任务进度失败。'
+        }
+      }
       if (native && ((['queued', 'running', 'waiting', 'cancelling'].includes(native.state) && native.phase !== '正在登记音色参考')
-        || application.recovery?.value?.suspended)) {
-        conversionProgress.value[taskId] = { id: native.job_id, resourceId: native.resource_id, label: '模型转换', state: native.state, phase: native.phase, progressKind: native.progress_kind, completedBytes: native.completed_bytes, totalBytes: native.total_bytes, canCancel: false }
+        || !remote && application.recovery?.value?.suspended)) {
+        conversionProgress.value[taskId] = toManagedResourceJob(native, '模型转换')
         const previous = jobs.value.find(row => row.task_id === taskId)
         updateJob({ ...previous, task_id: taskId, status: 'converting', phase: native.phase,
           progress: native.total_bytes ? Math.min(100, Math.round((native.completed_bytes ?? 0) * 100 / native.total_bytes)) : undefined,
@@ -204,15 +311,20 @@ async function watchTask(taskId: string, conversionAlreadyStarted: boolean) {
         await wait(1100)
         continue
       }
-      if (application.recovery?.value?.suspended) { await wait(1100); continue }
+      if (!remote && application.recovery?.value?.suspended) { await wait(1100); continue }
       delete conversionProgress.value[taskId]
       const job = await productApi.getAnifLiveImport(taskId)
       updateJob(job)
       if (job.status === 'ready_to_convert' && !started) {
-        const nativeTask = await desktop.startAnifLiveImport(taskId)
-        started = true
-        scanMessage.value = `转换任务 ${nativeTask.job_id} 已交给桌面资源管理器。`
-        continue
+        if (remote) {
+          started = true
+          scanMessage.value = '转换资料已交由服务端后台任务接续处理。'
+        } else {
+          const nativeTask = await desktop.startAnifLiveImport(taskId)
+          started = true
+          scanMessage.value = `转换任务 ${nativeTask.job_id} 已交给桌面资源管理器。`
+          continue
+        }
       }
       if (['queued', 'running', 'converting', 'registering_references'].includes(job.status)) started = true
       if (['complete', 'failed', 'cancelled', 'pending_reference', 'review_reference', 'reference_failed'].includes(job.status)) {
@@ -244,12 +356,16 @@ function setReferenceFile(taskId: string, event: Event) {
 
 async function transcribeReference(job: AnifLiveImportJob) {
   const file = referenceFiles.value[job.task_id]
-  if (!file || transcribingTasks.value.includes(job.task_id)) return
+  if (transcribingTasks.value.includes(job.task_id)) return
   scanError.value = ''
   transcribingTasks.value.push(job.task_id)
   try {
-    const assetId = (await productApi.uploadTtsAsset('aniflive', file)).asset.asset_id
-    referenceAssets.value[job.task_id] = assetId
+    let assetId = referenceAssets.value[job.task_id]
+    if (!assetId && file) {
+      assetId = (await productApi.uploadTtsAsset('aniflive', file)).asset.asset_id
+      referenceAssets.value[job.task_id] = assetId
+    }
+    if (!assetId) return
     let operation = await productApi.startTtsTranscribe('aniflive', assetId)
     while (operation.state === 'running') {
       await wait(400)
@@ -264,6 +380,20 @@ async function transcribeReference(job: AnifLiveImportJob) {
   } finally {
     transcribingTasks.value = transcribingTasks.value.filter(id => id !== job.task_id)
   }
+}
+
+async function importRemoteReference(job: AnifLiveImportJob) {
+  if (!remoteMode.value || submitting.value) return
+  submitting.value = true; scanError.value = ''
+  try {
+    const result = await nativeDeviceApi.remoteTtsAssetImport('aniflive', 'asset')
+    if ('cancelled' in result) return
+    const { asset } = result
+    referenceFiles.value[job.task_id] = undefined
+    referenceAssets.value[job.task_id] = asset.asset_id
+  } catch (failure) {
+    scanError.value = failure instanceof Error ? failure.message : '无法从客户端导入参考录音。'
+  } finally { submitting.value = false }
 }
 
 async function saveReference(job: AnifLiveImportJob) {
@@ -289,9 +419,14 @@ async function saveReference(job: AnifLiveImportJob) {
 }
 
 async function retryConversion(job: AnifLiveImportJob) {
+  const remote = remoteMode.value
   submitting.value = true; scanError.value = ''
   try {
-    await desktop.startAnifLiveImport(job.task_id)
+    if (remote) {
+      await remoteResourceRequest('resource.job.start', { kind: 'aniflive_import', task_id: job.task_id })
+    } else {
+      await desktop.startAnifLiveImport(job.task_id)
+    }
     void watchTask(job.task_id, true)
   } catch (failure) {
     scanError.value = failure instanceof Error ? failure.message : '无法重试模型转换。'
@@ -309,10 +444,11 @@ function sizeLabel(size?: number | null) {
 <template>
   <section v-if="open" class="aniflive-import-card">
     <div v-if="!embedded" class="import-heading">
-      <div><h3>导入 AnifLive 模型包</h3><p>递归扫描本地模型文件夹，或扫描公开 Hugging Face、ModelScope 仓库。</p></div>
+      <div><h3>导入 AnifLive 模型包</h3><p>{{ remoteMode ? '扫描服务器可访问的公开 Hugging Face、ModelScope 仓库。' : '递归扫描本地模型文件夹，或扫描公开 Hugging Face、ModelScope 仓库。' }}</p></div>
       <button class="outline-button" type="button" :disabled="scanning || submitting" @click="open = false">关闭导入</button>
     </div>
     <p class="instruction-hint">仅导入 GPT-SoVITS V2ProPlus（语音模型版本）权重配对；路径和文件名只用于识别候选，最终兼容性由现有安全检查器及转换验证确认。没有参考录音时可先保存为待补参考模型。</p>
+    <p v-if="remoteMode" class="instruction-hint">远程模式不能直接访问客户端本地文件夹。请使用 Hugging Face 或 ModelScope 公共仓库；若来源是本地目录，须由服务端可见，本页面暂不提供服务器目录选择。</p>
     <p class="instruction-hint">推荐可用模型：唐语歌（中文微调） · Hugging Face（模型托管平台） · <span class="model-recommendation-url">https://huggingface.co/shiqianyan/TangYuGe-GPT-SoVITS-v2ProPlus</span></p>
     <ManagedResourceProgress v-if="frameworkProgress" :job="frameworkProgress" label="AnifLive 推理框架" />
     <p v-if="scanError" class="instruction-error" role="alert">{{ scanError }}</p>
@@ -323,27 +459,30 @@ function sizeLabel(size?: number | null) {
       <ManagedResourceProgress v-if="['staging', 'queued', 'running', 'converting', 'registering_references'].includes(job.status)" :job="conversionProgress[job.task_id] ?? { id: job.task_id, resourceId: 'tts-aniflive-import', label: job.name || '模型导入', state: 'running', phase: job.phase, percentage: job.progress, canCancel: false }" :label="job.name || '模型导入'" />
       <p v-if="job.error" class="instruction-error">{{ job.error }}</p>
       <div v-if="['pending_reference', 'review_reference'].includes(job.status)" class="reference-repair">
-        <label v-if="!job.reference_audio_staged" class="form-field"><span>参考录音（3–10 秒）</span><input type="file" accept="audio/wav,audio/mpeg,audio/flac,audio/ogg,.wav,.mp3,.flac,.ogg" @change="setReferenceFile(job.task_id, $event)"></label>
-        <button v-if="!job.reference_audio_staged && referenceFiles[job.task_id]" class="outline-button" type="button" :disabled="transcribingTasks.includes(job.task_id)" @click="transcribeReference(job)">{{ transcribingTasks.includes(job.task_id) ? '正在识别转写…' : '按现有音色库流程识别转写' }}</button>
+        <label v-if="!remoteMode && !job.reference_audio_staged" class="form-field"><span>参考录音（3–10 秒）</span><input type="file" accept="audio/wav,audio/mpeg,audio/flac,audio/ogg,.wav,.mp3,.flac,.ogg" @change="setReferenceFile(job.task_id, $event)"></label>
+        <button v-else-if="remoteMode && !job.reference_audio_staged" class="outline-button" type="button" :disabled="submitting" @click="importRemoteReference(job)">{{ referenceAssets[job.task_id] ? '重新选择服务端参考录音' : '从客户端导入参考录音' }}</button>
+        <button v-if="!job.reference_audio_staged && (referenceFiles[job.task_id] || referenceAssets[job.task_id])" class="outline-button" type="button" :disabled="transcribingTasks.includes(job.task_id) || submitting" @click="transcribeReference(job)">{{ transcribingTasks.includes(job.task_id) ? '正在识别转写…' : '按现有音色库流程识别转写' }}</button>
         <label class="form-field"><span>{{ job.status === 'review_reference' ? '核对并校正参考转写' : '参考录音准确转写' }}</span><textarea v-model="referenceDrafts[job.task_id]" maxlength="2000" rows="3" placeholder="请输入录音中实际说出的内容" /></label>
         <label class="form-field"><span>参考语言</span><select v-model="referenceLanguage"><option value="zh">中文（普通话）</option><option value="yue">粤语</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option></select></label>
         <button class="outline-button" type="button" :disabled="submitting || (!job.reference_audio_staged && !referenceAssets[job.task_id] && !referenceFiles[job.task_id])" @click="saveReference(job)">保存参考并继续转换</button>
       </div>
-      <button v-if="job.status === 'ready_to_convert'" class="outline-button" type="button" :disabled="submitting" @click="retryConversion(job)">开始转换</button>
+      <p v-if="remoteMode && job.status === 'ready_to_convert'" class="instruction-hint" role="status">等待服务端后台任务接续转换。</p>
+      <button v-if="job.status === 'ready_to_convert' && !remoteMode" class="outline-button" type="button" :disabled="submitting" @click="retryConversion(job)">开始转换</button>
       <button v-if="['failed', 'cancelled', 'reference_failed'].includes(job.status) && job.stage_ready" class="outline-button" type="button" :disabled="submitting" @click="retryConversion(job)">{{ job.status === 'reference_failed' ? '重试参考登记' : '继续导入' }}</button>
       <p v-if="job.status === 'failed' && !job.stage_ready" class="instruction-hint">本次暂存未完成；请重新扫描来源并创建新的导入任务，来源文件夹不会被修改。</p>
     </section>
 
     <div class="import-panel">
       <div class="import-source-tabs">
-        <button type="button" :disabled="scanning || submitting" :class="{ active: sourceType === 'local' }" @click="sourceType = 'local'; sourceValue = ''; resetScan()">本地文件夹</button>
+        <button type="button" :disabled="remoteMode || scanning || submitting" :title="remoteMode ? '远程模式不能读取客户端本地文件夹。' : undefined" :class="{ active: sourceType === 'local' }" @click="sourceType = 'local'; sourceValue = ''; resetScan()">本地文件夹</button>
         <button type="button" :disabled="scanning || submitting" :class="{ active: sourceType === 'huggingface' }" @click="sourceType = 'huggingface'; sourceValue = ''; resetScan()">Hugging Face</button>
         <button type="button" :disabled="scanning || submitting" :class="{ active: sourceType === 'modelscope' }" @click="sourceType = 'modelscope'; sourceValue = ''; resetScan()">ModelScope</button>
       </div>
-      <div v-if="sourceType === 'local'" class="source-row">
+      <div v-if="sourceType === 'local' && !remoteMode" class="source-row">
         <input v-model="sourceValue" type="text" aria-label="本地模型文件夹路径" placeholder="选择本地模型文件夹" readonly>
-        <button class="outline-button" type="button" :disabled="scanning || submitting" @click="chooseFolder">选择文件夹</button>
+        <button class="outline-button" type="button" :disabled="scanning || submitting || remoteMode" @click="chooseFolder">选择文件夹</button>
       </div>
+      <p v-else-if="sourceType === 'local' && remoteMode" class="instruction-hint" role="status">客户端本地路径不会发送到服务端；请切换到 Hugging Face 或 ModelScope，或先让服务端能够访问该模型来源。</p>
       <label v-else class="form-field"><span>{{ sourceLabel }}公开模型仓库页面</span><input v-model="sourceValue" type="url" :disabled="scanning || submitting" placeholder="https://huggingface.co/用户/仓库 或 https://modelscope.cn/models/用户/仓库"></label>
       <button class="outline-button" type="button" :disabled="scanning || submitting || !sourceValue.trim()" @click="scanSource">{{ scanning ? '正在扫描…' : '扫描文件' }}</button>
 

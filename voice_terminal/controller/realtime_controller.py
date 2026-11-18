@@ -523,13 +523,27 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             return
         if not hasattr(self, "_vad_generation"):
             self._vad_generation = 0
-        processed = (
-            await asyncio.to_thread(self._process_audio, frame.pcm)
-            if not _wake_replay and self.audio_processor is not None and self.audio_processor.enabled
-            else frame.pcm
-        )
+        if frame.processing_identity is not None:
+            # RemoteAudioCapture receives PCM already processed on the device
+            # beside its microphone and speaker.  Preserve its frame health
+            # snapshot and never apply the core host's unrelated AEC again.
+            processed = self._process_audio(
+                frame.pcm,
+                audio_processing=frame.audio_processing,
+                processing_identity=frame.processing_identity,
+            )
+        else:
+            self._clear_remote_audio_processing()
+            processed = (
+                await asyncio.to_thread(self._process_audio, frame.pcm)
+                if not _wake_replay and self.audio_processor is not None and self.audio_processor.enabled
+                else frame.pcm
+            )
         if processed != frame.pcm:
-            frame = AudioFrame(processed, frame.start_sample, frame.captured_at, frame.clock_uncertainty_seconds)
+            frame = AudioFrame(
+                processed, frame.start_sample, frame.captured_at, frame.clock_uncertainty_seconds,
+                frame.audio_processing, frame.processing_identity,
+            )
         if getattr(self, "_input_resetting", False):
             return  # 原生音频处理等待期间可能开始重置。
         if not _wake_replay and await self._buffer_wake_frame(frame):

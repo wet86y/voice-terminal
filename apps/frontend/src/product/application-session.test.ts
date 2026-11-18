@@ -5,6 +5,7 @@ import { flushPromises } from '@vue/test-utils'
 import { useApplicationHost, type ApplicationSnapshot, type DesktopRecovery } from './application-host'
 import * as desktop from './desktop-port'
 import { productApi } from './api'
+import { nativeDeviceApi, type DeviceConfigStatus, type RemoteManagementOperation, type RemoteManagementResponse, type RemoteVoiceForwarderResult } from './native-device-api'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { useProductAdapter } from './useProductAdapter'
 
@@ -40,7 +41,8 @@ class FakeWebSocket {
   /** onclose（套接字关闭回调）。 */
   onclose: ((event: CloseEvent) => void) | null = null
   /** send（发送消息）：Vitest（前端测试框架）监视器。 */
-  send = vi.fn()
+  sent: string[] = []
+  send = vi.fn((data: string) => { this.sent.push(data) })
   /** close（关闭套接字）：Vitest（前端测试框架）监视器。 */
   close = vi.fn(() => { this.readyState = 3; this.onclose?.(new CloseEvent('close')) })
   /** url（业务 WebSocket（网页套接字）地址）。 */
@@ -48,6 +50,9 @@ class FakeWebSocket {
 
   constructor(url: string) { this.url = url; FakeWebSocket.instances.push(this) }
   open() { this.readyState = 1; this.onopen?.(new Event('open')) }
+  push(type: string, seq: number, payload: Record<string, unknown> = {}, ids: Record<string, string> = {}) {
+    this.onmessage?.({ data: JSON.stringify({ type, seq, timestamp: '2026-11-17T00:00:00.000Z', conversation_id: 'conversation_a', ...ids, payload }) } as MessageEvent)
+  }
 }
 
 const readySnapshot: ApplicationSnapshot = {
@@ -64,6 +69,29 @@ const readySnapshot: ApplicationSnapshot = {
 const productSnapshot = {
   settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
 } as never
+
+function remoteManagementResponse(
+  operation: RemoteManagementOperation,
+  body: Record<string, unknown>,
+  managementGeneration = 5,
+  hostId = 'server-a',
+): RemoteManagementResponse {
+  const managerStatus = operation === 'management.status'
+  return {
+    request_id: managerStatus ? 'a'.repeat(32) : 'b'.repeat(32),
+    target_host_id: hostId,
+    session_kind: managerStatus ? 'management' : 'task',
+    session_generation: managerStatus ? managementGeneration : 12,
+    ...(managerStatus ? {} : { connection_generation: 12 }),
+    operation, status: 200, body, fields: {},
+  }
+}
+
+function mockNativeInvoke(recovery: () => DesktopRecovery) {
+  return vi.fn(async (command: string) => command === 'device_config_status'
+    ? { runtime: { mode: 'local' }, device_config: null, fields: {} }
+    : { runtime_recovery: recovery() })
+}
 
 let app: ReturnType<typeof createApp> | undefined
 let host: ReturnType<typeof useApplicationHost>
@@ -117,7 +145,7 @@ describe('Host 会话失效处理', () => {
     let deliver!: (event: { payload: DesktopRecovery }) => void
     const operation = { id: 'native-update', revision: 1, target: 'resources', label: '本地组件',
       state: 'running', phase: 'switching', detail: '正在启用组件' } as const
-    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue({ runtime_recovery: { revision: 0, suspended: false, operation: null } }) }
+    window.__TAURI_INTERNALS__ = { invoke: mockNativeInvoke(() => ({ revision: 0, suspended: false, operation: null })) as unknown as NonNullable<Window['__TAURI_INTERNALS__']>['invoke'] }
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true,
       listen: vi.fn(async (_name, handler) => { deliver = handler; return vi.fn() }) } as unknown as desktop.DesktopPort)
     const response = (value: unknown, status = 200) => ({ status, ok: status === 200, json: async () => value }) as Response
@@ -130,6 +158,8 @@ describe('Host 会话失效处理', () => {
     await host.start()
     FakeWebSocket.instances[0]!.open()
     const pending = host.refresh()
+    // remote-mode probe（远程模式检查）现在先核对原生设备配置，再发出本地快照请求。
+    await flushPromises()
     deliver({ payload: { revision: 1, suspended: true, operation } })
     expect(host.businessReady.value).toBe(false)
     expect(host.overlay.value).toBe(false)
@@ -139,7 +169,7 @@ describe('Host 会话失效处理', () => {
     expect(host.sessionInvalid.value).toBe(false)
     deliver({ payload: { revision: 2, suspended: false, operation: { ...operation, revision: 2, phase: 'loading' } } })
     await flushPromises()
-    expect(host.snapshot.value?.instance_id).toBe('replacement')
+    expect(host.snapshot.value?.instance_id, host.error.value).toBe('replacement')
     expect(host.overlay.value).toBe(false)
     expect(host.runtimeOperations.value[0]?.state).toBe('running')
     expect(FakeEventSource.instances).toHaveLength(2)
@@ -156,8 +186,8 @@ describe('Host 会话失效处理', () => {
 
   it('原生补查恢复丢失的维护事件，恢复失败保留页面和原生重试入口', async () => {
     let nativeState: DesktopRecovery = { revision: 0, suspended: false, operation: null }
-    const invoke = vi.fn().mockImplementation(async () => ({ runtime_recovery: nativeState }))
-    window.__TAURI_INTERNALS__ = { invoke }
+    const invoke = mockNativeInvoke(() => nativeState)
+    window.__TAURI_INTERNALS__ = { invoke: invoke as unknown as NonNullable<Window['__TAURI_INTERNALS__']>['invoke'] }
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true } as desktop.DesktopPort)
     const fetchMock = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => readySnapshot })
     vi.stubGlobal('fetch', fetchMock)
@@ -177,7 +207,7 @@ describe('Host 会话失效处理', () => {
 
   it('整轮停机与恢复事件均丢失时，从已停止快照重新接入且不闪回启动画面', async () => {
     let nativeState: DesktopRecovery = { revision: 0, suspended: false, operation: null }
-    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockImplementation(async () => ({ runtime_recovery: nativeState })) }
+    window.__TAURI_INTERNALS__ = { invoke: mockNativeInvoke(() => nativeState) as unknown as NonNullable<Window['__TAURI_INTERNALS__']>['invoke'] }
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true } as desktop.DesktopPort)
     const response = (value: unknown) => ({ status: 200, ok: true, json: async () => value }) as Response
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(response(readySnapshot))
@@ -266,8 +296,8 @@ describe('Host 会话失效处理', () => {
     expect(window.__VOICE_APPLICATION__?.voice_ws_url).toBe('')
     expect(window.__VOICE_APPLICATION__?.business_ready).toBe(false)
 
-    const invoke = vi.fn().mockResolvedValue(undefined)
-    window.__TAURI_INTERNALS__ = { invoke }
+    const invoke = mockNativeInvoke(() => ({ revision: 0, suspended: false, operation: null }))
+    window.__TAURI_INTERNALS__ = { invoke: invoke as unknown as NonNullable<Window['__TAURI_INTERNALS__']>['invoke'] }
     await host.exit()
     expect(invoke).toHaveBeenCalledOnce()
     expect(invoke).toHaveBeenCalledWith('exit_application')
@@ -281,5 +311,158 @@ describe('Host 会话失效处理', () => {
     expect(FakeEventSource.instances).toHaveLength(1)
     expect(FakeWebSocket.instances).toHaveLength(1)
     expect(productApi.snapshot).toHaveBeenCalledTimes(snapshotRequestCount)
+  })
+})
+
+describe('远程 Host 管理代次', () => {
+  const remoteDeviceStatus = {
+    runtime: { config_state: 'valid', device_id: 'client-a', mode: 'remote', desired_role: 'remote_client', audio_mode: 'pcm', error: null },
+    device_config: { mode: 'remote', device_id: 'client-a', paired_host: { host_id: 'server-a', display_name: '服务端 A' } },
+  } as DeviceConfigStatus
+  const remoteProductStatus = {
+    runtime: { can_start: true, state: 'ready', services: { voice: 'READY' } },
+    settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
+  }
+
+  beforeEach(() => {
+    window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue({ runtime_recovery: { revision: 0, suspended: false, operation: null } }) }
+    vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockResolvedValue(remoteDeviceStatus)
+    vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockResolvedValue({ state: 'connected', connected: true, fields: {} })
+  })
+
+  it('只接受当前配对主机和同一管理代次的产品状态', async () => {
+    const url = 'ws://127.0.0.1:43127/random_token_123/ws'
+    const forwarder = vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockImplementation(async (action): Promise<RemoteVoiceForwarderResult> => action === 'stop'
+      ? { state: 'stopped', fields: {} }
+      : { state: 'running', url, fields: { url: '本机回环地址' } })
+    vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' })
+      : remoteManagementResponse(operation, remoteProductStatus))
+
+    await host.refresh()
+
+    expect(host.snapshot.value?.host_id).toBe('server-a')
+    expect(host.snapshot.value?.endpoint_revision).toBe(5)
+    expect(host.snapshot.value?.remote_business_ready).toBe(true)
+    expect(host.snapshot.value?.voice_api_ready).toBe(true)
+    expect(host.snapshot.value?.voice_ws_url).toBe(url)
+    expect(forwarder).toHaveBeenCalledWith('start')
+  })
+
+  it('管理通道可用但语音核心仍启动时不开放业务写入', async () => {
+    const forwarder = vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockResolvedValue({
+      state: 'stopped', fields: {},
+    })
+    const management = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockResolvedValue(
+      remoteManagementResponse('management.status', { core_state: 'starting' }),
+    )
+
+    await host.refresh()
+
+    expect(host.snapshot.value?.management_connected).toBe(true)
+    expect(host.snapshot.value?.remote_business_ready).toBe(false)
+    expect(host.snapshot.value?.voice_api_ready).toBe(false)
+    expect(window.__VOICE_APPLICATION__?.business_ready).toBe(false)
+    expect(management).toHaveBeenCalledOnce()
+    expect(forwarder).not.toHaveBeenCalledWith('start')
+  })
+
+  it('管理和语音通道状态独立，实时产品投影与语音命令走远程 WebSocket', async () => {
+    const url = 'ws://127.0.0.1:43127/random_token_123/ws'
+    vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockImplementation(async (action): Promise<RemoteVoiceForwarderResult> => action === 'stop'
+      ? { state: 'stopped', fields: {} }
+      : { state: 'running', url, fields: { url: '本机回环地址' } })
+    const apiEntry = { seq: 1, kind: 'user_turn', conversation_id: 'api-episode', turn_id: 'api-turn',
+      speech_id: '', text: '较旧的管理快照正文', status: 'completed', delivery: {}, termination: 'completed', at: '' }
+    const liveSnapshot = {
+      ...remoteProductStatus,
+      conversation: { current: { turn_id: 'api-turn', partial_text: '旧的管理快照草稿', final_text: '', assistant_text: '' },
+        entries: [apiEntry], recent: [] },
+    }
+    vi.spyOn(productApi, 'snapshot').mockResolvedValue(liveSnapshot as never)
+    vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' })
+      : remoteManagementResponse(operation, liveSnapshot))
+
+    await host.refresh()
+    await flushPromises()
+    const socket = FakeWebSocket.instances.at(-1)!
+    expect(socket.url).toBe(url)
+    socket.open()
+    await flushPromises()
+
+    expect(adapter.managementConnected.value).toBe(true)
+    expect(adapter.voiceConnected.value).toBe(true)
+    socket.push('runtime.snapshot', 1, {
+      state: 'IDLE', listening: false, can_start: true,
+      current: { turn_id: 'live-turn', partial_text: '实时语音草稿', final_text: '', assistant_text: '' },
+    }, { turn_id: 'live-turn' })
+    socket.push('conversation.snapshot', 2, { entries: [{ ...apiEntry, seq: 2, conversation_id: 'live-episode',
+      turn_id: 'live-turn', text: '实时对话记录' }], latest_seq: 2 })
+    socket.push('agent.state', 3, { conversation_id: 'live-episode', agent_busy: true, context_token_estimate: 12 })
+    socket.push('speech.queued', 4, { speech_id: 'live-speech', conversation_id: 'live-episode', turn_id: 'live-turn',
+      output_generation: 1, text: '' }, { turn_id: 'live-turn', speech_id: 'live-speech' })
+    socket.push('speech.delta', 5, { speech_id: 'live-speech', conversation_id: 'live-episode', turn_id: 'live-turn',
+      output_generation: 1, text_delta: '实时播报正文' }, { turn_id: 'live-turn', speech_id: 'live-speech' })
+
+    expect(adapter.current.value.partial_text).toBe('实时语音草稿')
+    expect(adapter.conversationRows.value.map(row => row.text)).toContain('实时对话记录')
+    expect(adapter.voice.agentEpisode.value?.conversation_id).toBe('live-episode')
+    expect(adapter.pendingSpeechRows.value[0]?.text).toBe('实时播报正文')
+
+    expect(adapter.setListening(true)).toBe(true)
+    socket.push('runtime.snapshot', 6, { state: 'LISTENING', listening: true, can_start: false,
+      current: { turn_id: 'live-turn' } }, { turn_id: 'live-turn' })
+    expect(adapter.setListening(false)).toBe(true)
+    expect(adapter.setReasoningMode('deep')).toBe(true)
+    socket.push('runtime.snapshot', 7, { state: 'IDLE', listening: false, can_start: true,
+      session_operation: null, current: { turn_id: 'live-turn' } }, { turn_id: 'live-turn' })
+    expect(adapter.resetSession()).toBe(true)
+    const resetRequest = JSON.parse(socket.sent.filter(row => JSON.parse(row).command === 'session.reset').at(-1)!)
+    socket.push('runtime.snapshot', 8, { session_operation: 'reset', can_start: false })
+    socket.push('session.operation', 9, { request_id: resetRequest.request_id, operation: 'reset', status: 'completed' })
+    socket.push('runtime.snapshot', 10, { session_operation: null, can_start: true, conversation: { entries: [], latest_seq: 0 } })
+    expect(adapter.clearSession()).toBe(true)
+    expect(socket.sent.map(row => JSON.parse(row).command)).toEqual([
+      'subscribe', 'session.start', 'session.stop', 'session.reasoning_mode', 'session.reset', 'session.clear',
+    ])
+    expect(vi.mocked(nativeDeviceApi.remoteManagementRequest).mock.calls.some(([operation]) => operation === 'voice.command')).toBe(false)
+
+    adapter.wakeForm.keywords = ['断线期间保留设置草稿']
+    socket.close()
+    expect(adapter.connected.value).toBe(true)
+    expect(adapter.managementConnected.value).toBe(true)
+    expect(adapter.voiceConnected.value).toBe(false)
+    expect(adapter.voiceReady.value).toBe(false)
+    expect(adapter.wakeForm.keywords).toEqual(['断线期间保留设置草稿'])
+    expect(adapter.setListening(true)).toBe(false)
+  })
+
+  it('拒绝错误目标的管理状态，不请求产品快照', async () => {
+    const request = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockResolvedValue(
+      remoteManagementResponse('management.status', { core_state: 'ready' }, 5, 'server-b'),
+    )
+
+    await host.refresh()
+
+    expect(request).toHaveBeenCalledOnce()
+    expect(host.snapshot.value?.management_connected).toBe(false)
+    expect(host.snapshot.value?.endpoint_revision).toBeUndefined()
+    expect(host.snapshot.value?.remote_error).toContain('目标主机或连接代次无效')
+  })
+
+  it('拒绝错误目标的产品状态并关闭该代次的业务可用标记', async () => {
+    const request = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' }, 5)
+      : remoteManagementResponse(operation, remoteProductStatus, 5, 'server-b'))
+
+    await host.refresh()
+
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(host.snapshot.value?.management_connected).toBe(true)
+    expect(host.snapshot.value?.endpoint_revision).toBe(5)
+    expect(host.snapshot.value?.remote_business_ready).toBe(false)
+    expect(host.snapshot.value?.voice_api_ready).toBe(false)
+    expect(host.snapshot.value?.remote_error).toContain('目标或通道代次')
   })
 })

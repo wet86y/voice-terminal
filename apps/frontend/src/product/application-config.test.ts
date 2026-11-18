@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { loadProductApplicationConfig, readProductApplicationConfig } from './application-config'
+import { isBundledRemoteProductPage, loadProductApplicationConfig, readProductApplicationConfig } from './application-config'
 import { runDesktopPreflight } from '../runtime/desktop-preflight'
 
 const validConfig = {
@@ -16,6 +16,15 @@ afterEach(() => {
 })
 
 describe('Host application configuration（宿主运行配置）', () => {
+  it('只把 Tauri 包内根路径和 index.html 当作无本地语音宿主的产品入口', () => {
+    expect(isBundledRemoteProductPage({ protocol: 'tauri:', hostname: 'localhost', pathname: '/index.html' })).toBe(true)
+    expect(isBundledRemoteProductPage({ protocol: 'tauri:', hostname: 'localhost', pathname: '/' })).toBe(true)
+    expect(isBundledRemoteProductPage({ protocol: 'http:', hostname: 'tauri.localhost', pathname: '/index.html' })).toBe(true)
+    expect(isBundledRemoteProductPage({ protocol: 'http:', hostname: 'tauri.localhost', pathname: '/' })).toBe(true)
+    expect(isBundledRemoteProductPage({ protocol: 'http:', hostname: '127.0.0.1', pathname: '/index.html' })).toBe(false)
+    expect(isBundledRemoteProductPage({ protocol: 'tauri:', hostname: 'localhost', pathname: '/management.html' })).toBe(false)
+  })
+
   it('accepts an initially empty voice endpoint while preserving the managed context', () => {
     expect(readProductApplicationConfig(validConfig)).toEqual(validConfig)
   })

@@ -8,10 +8,65 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     path::Path,
     sync::{atomic::AtomicBool, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// migrate_device_runtime_config（迁移设备运行配置）：经兼容组件归档 v2 原件并原子写入 v3。
+/// 迁移完全由原生层完成，不读取 Python（后端运行环境）或业务组件。
+pub fn migrate_device_runtime_config(data_root: &Path) -> Result<bool, String> {
+    let path = safe_path(data_root, "config/device-runtime.json")?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("读取设备配置迁移源失败：{error}")),
+    };
+    if crate::workspace::metadata_reparse(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > 64 * 1024
+    {
+        return Err("设备配置迁移源路径或大小无效；原件已保留。".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("读取设备配置迁移源失败：{error}"))?;
+    let raw: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "设备配置不是可识别的 JSON；迁移未覆盖原件。".to_string())?;
+    if raw.get("schema_version").and_then(Value::as_u64) != Some(2) {
+        return Ok(false);
+    }
+    let crate::device_config::LoadResult::Valid(config) = crate::device_config::load(&path) else {
+        return Err("第 2 版设备配置校验失败；原件已保留，未执行迁移。".into());
+    };
+    let archive = safe_path(
+        data_root,
+        &format!(
+            "archives/compatibility/device-runtime-v2-{}.json",
+            crate::workspace::new_id()
+        ),
+    )?;
+    fs::create_dir_all(archive.parent().ok_or("设备配置归档缺少父目录")?)
+        .map_err(|error| format!("建立设备配置归档目录失败：{error}"))?;
+    let mut saved = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive)
+        .map_err(|error| format!("建立设备配置迁移归档失败：{error}"))?;
+    saved
+        .write_all(&bytes)
+        .map_err(|error| format!("写入设备配置迁移归档失败：{error}"))?;
+    saved
+        .sync_all()
+        .map_err(|error| format!("同步设备配置迁移归档失败：{error}"))?;
+    drop(saved);
+    if let Err(error) = crate::device_config::save(data_root, &config) {
+        return Err(format!(
+            "设备配置迁移写入失败；旧配置仍保留于原路径和归档 {}：{error}",
+            archive.display()
+        ));
+    }
+    Ok(true)
+}
 
 pub const TRANSACTION_PATHS: [&str; 2] = [
     "data/state/compatibility.json",

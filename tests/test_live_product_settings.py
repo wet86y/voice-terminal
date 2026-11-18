@@ -124,8 +124,14 @@ def test_dsh_approval_requires_host_auth_and_rejects_stale_requests(runtime, mon
             assert response.status_code == 403
             session.decide_approval.assert_not_awaited()
             headers = {"Authorization": "Bearer approval-test-token"}
-            response = await client.post(endpoint, json={**payload, "run_seq": True}, headers=headers)
-            assert response.status_code == 422
+            for invalid in (
+                {**payload, "run_seq": True},
+                {**payload, "run_seq": 1 << 53},
+                {**payload, "approval_id": " "},
+                {**payload, "decision": {"allowed": False}},
+            ):
+                response = await client.post(endpoint, json=invalid, headers=headers)
+                assert response.status_code == 422
             response = await client.post(endpoint, json=payload, headers=headers)
             assert response.status_code == 200
             session.decide_approval.assert_awaited_once_with("request-demo", "rejected", 2)

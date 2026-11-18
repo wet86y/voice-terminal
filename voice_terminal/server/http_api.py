@@ -7,7 +7,9 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -21,7 +23,8 @@ from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..application.ports import validate_endpoint_url
 from ..devices.clock_sync import DeviceClockMapper
 from ..devices.media_protocol import (
-    MediaProtocolError, decode_client_tts_audio_frame, decode_frame,
+    PROTOCOL_VERSION as MEDIA_PROTOCOL_VERSION, MediaProtocolError, decode_client_tts_audio_frame,
+    decode_frame, parse_tts_control,
 )
 from ..devices.pcm_stream import PcmInputStream
 from ..devices.remote_capture import RemoteAudioCapture
@@ -54,6 +57,241 @@ def device_file_transfer_id(connection: Any, request_id: str) -> str:
     material = (f"{connection.device_id}\0{connection.connection_generation}\0"
                 f"{connection.executor_generation}\0{request_id}").encode("utf-8")
     return hashlib.sha256(material).hexdigest()[:32]
+
+
+# DEVICE_MANAGEMENT_OPERATIONS（受限远程业务操作）：每个枚举只映射到本服务既有业务路由。
+DEVICE_MANAGEMENT_OPERATIONS: dict[str, tuple[str, str, bool]] = {
+    "product.snapshot": ("GET", "/api/v1/product/snapshot", False),
+    "product.devices": ("GET", "/api/v1/devices", False),
+    "product.devices.select": ("POST", "/api/v1/devices/interaction", True),
+    "product.compute_status": ("GET", "/api/v1/product/compute-status", False),
+    "product.compute_status.refresh": ("GET", "/api/v1/product/compute-status?refresh=true", False),
+    "product.dsh_status": ("GET", "/api/v1/dsh/status", False),
+    "product.wake_tasks": ("GET", "/api/v1/wake-tasks", False),
+    "settings.hotwords.read": ("GET", "/api/v1/product/settings/hotwords", False),
+    "settings.hotwords.save": ("PUT", "/api/v1/product/settings/hotwords", True),
+    "hotwords.import": ("POST", "/api/v1/product/hotwords/import", True),
+    "hotwords.preview": ("POST", "/api/v1/product/hotwords/preview", True),
+    "settings.wake.save": ("PUT", "/api/v1/product/settings/wake", True),
+    "settings.silence.save": ("PUT", "/api/v1/product/settings/silence", True),
+    "settings.quiet_hours.save": ("PUT", "/api/v1/product/settings/quiet-hours", True),
+    "settings.shadow.save": ("PUT", "/api/v1/product/settings/shadow", True),
+    "settings.approvals.save": ("PUT", "/api/v1/product/settings/approvals", True),
+    "settings.persona.save": ("PUT", "/api/v1/product/settings/persona", True),
+    "settings.custom_instructions.save": ("PUT", "/api/v1/product/settings/custom-instructions", True),
+    "settings.speaker.save": ("PUT", "/api/v1/product/settings/speaker", True),
+    "settings.compute.save": ("PUT", "/api/v1/product/settings/compute", True),
+    "settings.audio_enhancements.save": ("PUT", "/api/v1/product/settings/audio-enhancements", True),
+    "settings.screen_capture.save": ("PUT", "/api/v1/product/settings/screen-capture", True),
+    "settings.tts.save": ("PUT", "/api/v1/product/settings/tts", True),
+    "settings.inference.save": ("PUT", "/api/v1/settings/inference", True),
+    "models.registry.read": ("GET", "/api/v1/models/registry", False),
+    "models.scan": ("POST", "/api/v1/models/scan", False),
+    "models.validate": ("POST", "/api/v1/models/validate", True),
+    "models.providers.add": ("POST", "/api/v1/models/providers", True),
+    "models.assignments.apply": ("POST", "/api/v1/models/assignments/apply", True),
+    "models.credentials.read": ("GET", "/api/v1/models/credentials", False),
+    "models.credentials.save": ("PUT", "/api/v1/models/credentials", True),
+    "tts.status": ("GET", "/api/v1/tts/status", False),
+    "speaker.status": ("GET", "/api/v1/speaker/status", False),
+    "speaker.profile": ("GET", "/api/v1/speaker/profile", False),
+    "speaker.enrollment.start": ("POST", "/api/v1/speaker/enrollment/start", False),
+    "speaker.test.capture": ("POST", "/api/v1/speaker/test/capture", True),
+    "speaker.test.capture_stop": ("POST", "/api/v1/speaker/test/capture/stop", True),
+    "speaker.test.run": ("POST", "/api/v1/speaker/test", True),
+    "tts.minimax.voice_name": ("POST", "/api/v1/tts/minimax/voice-name", True),
+    "tts.operation.preview": ("POST", "/api/v1/tts/operations/preview", True),
+    "tts.operation.minimax_preview": ("POST", "/api/v1/tts/operations/minimax-preview", True),
+    "tts.operation.play": ("POST", "/api/v1/tts/operations/play", True),
+    "tts.operation.transcribe": ("POST", "/api/v1/tts/operations/transcribe", True),
+    "tts.aniflive.import.pending": ("GET", "/api/v1/tts/aniflive/import/pending", False),
+    "tts.aniflive.import.scan": ("POST", "/api/v1/tts/aniflive/import/scan", True),
+    "tts.aniflive.import.start": ("POST", "/api/v1/tts/aniflive/import/jobs", True),
+    "tts.assets.import.prepare": ("POST", "/internal/application/tts-assets/import/prepare", False),
+    "tts.assets.import.commit": ("POST", "/internal/application/tts-assets/import/commit", False),
+    "tts.assets.import.abort": ("POST", "/internal/application/tts-assets/import/abort", False),
+    "tts.assets.audio.read": ("POST", "/internal/application/tts-assets/audio/read", True),
+    "dsh.approval.decide": ("POST", "/internal/application/dsh-approval", True),
+}
+
+
+def _remote_management_request_spec(
+    operation: str, arguments: dict[str, Any],
+) -> tuple[str, str, dict[str, Any] | None]:
+    """_remote_management_request_spec（固定操作解析）：返回既有路由，不接收任意 URL。"""
+    tts_import_fields = {
+        "tts.assets.import.prepare": {"model_id", "purpose", "filename", "expected_bytes", "parent_request_id"},
+        "tts.assets.import.commit": {"model_id", "purpose", "filename", "expected_bytes", "expected_sha256",
+                                     "parent_request_id", "transfer_id"},
+        "tts.assets.import.abort": {"parent_request_id", "transfer_id"},
+    }
+    if operation in tts_import_fields:
+        if set(arguments) != tts_import_fields[operation]:
+            raise ValueError("TTS 单文件导入操作字段不符合固定票据契约。")
+        return DEVICE_MANAGEMENT_OPERATIONS[operation][0], DEVICE_MANAGEMENT_OPERATIONS[operation][1], dict(arguments)
+    if operation == "tts.assets.audio.read":
+        value = arguments.get("value")
+        if (set(arguments) != {"value"} or not isinstance(value, dict)
+                or set(value) != {"model_id", "asset_id"}):
+            raise ValueError("TTS 音频读取只接受 value 中的 model_id 与 asset_id。")
+        return DEVICE_MANAGEMENT_OPERATIONS[operation][0], DEVICE_MANAGEMENT_OPERATIONS[operation][1], dict(value)
+    if operation == "dsh.approval.decide":
+        if set(arguments) != {"approval_id", "decision", "run_seq"}:
+            raise ValueError("DSH 权限答复只接受 approval_id、decision 与 run_seq。")
+        approval_id = arguments.get("approval_id")
+        decision = arguments.get("decision")
+        run_seq = arguments.get("run_seq")
+        if (not isinstance(approval_id, str) or not 1 <= len(approval_id) <= 160
+                or approval_id != approval_id.strip() or "\0" in approval_id
+                or not isinstance(decision, str)
+                or decision not in {"allowed-once", "allowed-until-silence", "rejected"}
+                or type(run_seq) is not int or not 0 <= run_seq <= (1 << 53) - 1):
+            raise ValueError("DSH 权限答复编号、决定或运行序号无效。")
+        return DEVICE_MANAGEMENT_OPERATIONS[operation][0], DEVICE_MANAGEMENT_OPERATIONS[operation][1], dict(arguments)
+    spec = DEVICE_MANAGEMENT_OPERATIONS.get(operation)
+    if spec is not None:
+        method, path, needs_value = spec
+        if needs_value:
+            if set(arguments) != {"value"} or not isinstance(arguments["value"], dict):
+                raise ValueError("远程业务操作要求一个 JSON 对象参数。")
+            value = arguments["value"]
+            if operation == "tts.aniflive.import.scan":
+                source_type = value.get("source_type")
+                if source_type == "local":
+                    raise ValueError("客户端本机目录须经受授权文件传输上传；远程接口不接收客户端路径。")
+                if source_type not in {"huggingface", "modelscope"}:
+                    raise ValueError("远程模型来源类型无效。")
+            return method, path, value
+        if arguments:
+            raise ValueError("远程业务读取操作不接受额外参数。")
+        return method, path, None
+
+    def segment(key: str) -> str:
+        value = arguments.get(key)
+        if (not isinstance(value, str) or not value or len(value) > 128
+                or value != value.strip() or value in {".", ".."}
+                or not value.isascii()
+                or any(not (character.isalnum() or character in "._:-") for character in value)):
+            raise ValueError("远程业务资源编号无效。")
+        return quote(value, safe="")
+
+    # wake_task.create（创建唤醒任务）：严格接收服务端原宿主 API 的 value 对象。
+    if operation == "wake_task.create":
+        if set(arguments) != {"value"} or not isinstance(arguments["value"], dict):
+            raise ValueError("创建定时任务必须只提供一个 JSON 对象参数 value。")
+        return "POST", "/internal/application/wake-tasks", arguments["value"]
+    if operation == "wake_task.update" and set(arguments) == {"task_id", "value"}:
+        task_id = segment("task_id")
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("定时任务更新内容必须是 JSON 对象。")
+        return "PATCH", f"/api/v1/wake-tasks/{task_id}", arguments["value"]
+    if operation in {"wake_task.delete", "wake_task.cancel"} and set(arguments) == {"task_id"}:
+        task_id = segment("task_id")
+        if operation == "wake_task.delete":
+            return "DELETE", f"/api/v1/wake-tasks/{task_id}", None
+        return "POST", f"/api/v1/wake-tasks/{task_id}/cancel", {}
+    if operation == "provider.usage" and set(arguments) == {"provider"}:
+        provider = arguments.get("provider")
+        if not isinstance(provider, str) or provider not in {"deepseek", "minimax"}:
+            raise ValueError("模型服务提供方编号无效。")
+        return "GET", f"/api/v1/models/credentials/{provider}/usage", None
+    if operation in {"model.update", "model.delete", "model.hide", "model.restore"}:
+        expected = {"model_id", "value"} if operation == "model.update" else {"model_id"}
+        if set(arguments) != expected:
+            raise ValueError("模型操作参数字段无效。")
+        model_id = segment("model_id")
+        if operation == "model.update":
+            if not isinstance(arguments["value"], dict):
+                raise ValueError("模型更新内容必须是 JSON 对象。")
+            return "PATCH", f"/api/v1/models/{model_id}", arguments["value"]
+        if operation == "model.delete":
+            return "DELETE", f"/api/v1/models/{model_id}", None
+        action = "hide" if operation == "model.hide" else "restore"
+        return "POST", f"/api/v1/models/{model_id}/{action}", {}
+    if operation == "tts.voices.read" and set(arguments) == {"model_id"}:
+        return "GET", f"/api/v1/tts/voices/{segment('model_id')}", None
+    if operation == "tts.voices.capabilities" and set(arguments) == {"model_id"}:
+        return "GET", f"/api/v1/tts/voices/{segment('model_id')}/capabilities", None
+    if operation in {"tts.voices.create", "tts.voices.select"} and set(arguments) == {"model_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("语音音色参数必须是 JSON 对象。")
+        model_id = segment("model_id")
+        if operation == "tts.voices.create":
+            return "POST", f"/api/v1/tts/voices/{model_id}", arguments["value"]
+        return "PUT", f"/api/v1/tts/voices/{model_id}/selection", arguments["value"]
+    if operation in {"tts.voices.update", "tts.voices.delete"}:
+        expected = {"model_id", "voice_id", "value"} if operation == "tts.voices.update" else {"model_id", "voice_id"}
+        if set(arguments) != expected:
+            raise ValueError("语音音色目标参数无效。")
+        model_id = segment("model_id")
+        voice_id = segment("voice_id")
+        if operation == "tts.voices.update":
+            if not isinstance(arguments["value"], dict):
+                raise ValueError("语音音色更新内容必须是 JSON 对象。")
+            return "PUT", f"/api/v1/tts/voices/{model_id}/{voice_id}", arguments["value"]
+        return "DELETE", f"/api/v1/tts/voices/{model_id}/{voice_id}", None
+    if operation == "tts.voices.restore_default" and set(arguments) == {"model_id"}:
+        return "POST", f"/api/v1/tts/voices/{segment('model_id')}/restore-default", {}
+    if operation == "tts.voices.default_reference" and set(arguments) == {"model_id", "voice_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("默认参考录音参数必须是 JSON 对象。")
+        model_id = segment("model_id")
+        voice_id = segment("voice_id")
+        return "PUT", f"/api/v1/tts/voices/{model_id}/{voice_id}/default-reference", arguments["value"]
+    if operation == "tts.assets.clip" and set(arguments) == {"model_id", "asset_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("音频裁剪参数必须是 JSON 对象。")
+        model_id = segment("model_id")
+        asset_id = segment("asset_id")
+        return "POST", f"/api/v1/tts/assets/{model_id}/{asset_id}/clip", arguments["value"]
+    if operation == "tts.operation.read" and set(arguments) == {"operation_id"}:
+        return "GET", f"/api/v1/tts/operations/{segment('operation_id')}", None
+    if operation == "tts.operation.cancel" and set(arguments) == {"operation_id"}:
+        return "POST", f"/api/v1/tts/operations/{segment('operation_id')}/cancel", {}
+    if operation == "tts.aniflive.references.import" and set(arguments) == {"model_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("参考录音导入参数必须是 JSON 对象。")
+        return "POST", f"/api/v1/tts/aniflive/models/{segment('model_id')}/references/import", arguments["value"]
+    if operation == "tts.aniflive.model.rename" and set(arguments) == {"model_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("AnifLive 模型重命名参数必须是 JSON 对象。")
+        return "PATCH", f"/api/v1/tts/aniflive/models/{segment('model_id')}", arguments["value"]
+    if operation == "tts.aniflive.import.read" and set(arguments) == {"task_id"}:
+        return "GET", f"/api/v1/tts/aniflive/import/jobs/{segment('task_id')}", None
+    if operation == "tts.aniflive.import.reference" and set(arguments) == {"task_id", "value"}:
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("参考转写内容必须是 JSON 对象。")
+        return "POST", f"/api/v1/tts/aniflive/import/jobs/{segment('task_id')}/reference", arguments["value"]
+    if operation in {
+        "speaker.enrollment.segment", "speaker.enrollment.capture",
+        "speaker.enrollment.capture_stop", "speaker.enrollment.commit", "speaker.enrollment.delete",
+    }:
+        method_by_operation = {
+            "speaker.enrollment.segment": ("POST", "segment", True),
+            "speaker.enrollment.capture": ("POST", "capture", True),
+            "speaker.enrollment.capture_stop": ("POST", "capture/stop", True),
+            "speaker.enrollment.commit": ("POST", "commit", False),
+            "speaker.enrollment.delete": ("DELETE", "", False),
+        }
+        method, suffix, needs_value = method_by_operation[operation]
+        expected = {"enrollment_id", "value"} if needs_value else {"enrollment_id"}
+        if set(arguments) != expected or (needs_value and not isinstance(arguments["value"], dict)):
+            raise ValueError("声纹登记操作参数字段无效。")
+        path = f"/api/v1/speaker/enrollment/{segment('enrollment_id')}"
+        if suffix:
+            path += f"/{suffix}"
+        return method, path, arguments["value"] if needs_value else None
+    if operation in {"speaker.template.delete", "speaker.template.update"}:
+        expected = {"template_id", "value"} if operation == "speaker.template.update" else {"template_id"}
+        if set(arguments) != expected:
+            raise ValueError("声纹模板操作字段无效。")
+        path = f"/api/v1/speaker/templates/{segment('template_id')}"
+        if operation == "speaker.template.delete":
+            return "DELETE", path, None
+        if not isinstance(arguments["value"], dict):
+            raise ValueError("声纹模板更新参数必须是 JSON 对象。")
+        return "PATCH", path, arguments["value"]
+    raise ValueError("远程业务操作不在服务端固定白名单中。")
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
@@ -125,6 +363,138 @@ async def _device_gateway_payload(request: Any) -> dict[str, Any]:
     return payload
 
 
+_PRODUCT_CONVERSATION_ENTRY_LIMIT = 200  # _PRODUCT_CONVERSATION_ENTRY_LIMIT（远程产品快照最多保留的服务器对话条数）。
+_PRODUCT_CONVERSATION_BYTES_LIMIT = 1_048_576  # _PRODUCT_CONVERSATION_BYTES_LIMIT（对话快照编码上限，字节）。
+_PRODUCT_CONVERSATION_TEXT_LIMIT = 4_000  # _PRODUCT_CONVERSATION_TEXT_LIMIT（单条对话及当前字幕字符上限）。
+_PRODUCT_DELIVERY_TEXT_LIMIT = 1_000  # _PRODUCT_DELIVERY_TEXT_LIMIT（播报交付摘要文本字符上限）。
+_PRODUCT_DELIVERY_TEXT_FIELDS = frozenset({"heard_text", "uncertain_text", "unheard_text"})
+_PRODUCT_DELIVERY_LABEL_FIELDS = frozenset({"status", "termination", "precision", "playback_precision"})
+_PRODUCT_DELIVERY_NUMBER_FIELDS = frozenset({
+    "played_ms", "callback_played_ms", "output_tail_estimated_ms", "speech_onset_ms",
+    "interrupt_confirmed_ms", "speech_onset_to_confirm_ms", "confirm_to_stop_ms",
+    "playback_stop_ms", "cancel_confirmed_ms",
+})
+
+
+def _product_conversation_snapshot(
+    conversation: Any, *, runtime_current: Any = None,
+) -> dict[str, Any]:
+    """_product_conversation_snapshot（产品对话投影）：给轮询端稳定的次序、当前字幕和有界内容。"""
+    if not isinstance(conversation, Mapping):
+        return {"recent": [], "entries": [], "latest_seq": 0, "current": {}}
+
+    latest_seq = conversation.get("latest_seq")
+    if type(latest_seq) is not int or not 0 <= latest_seq <= (1 << 53) - 1:
+        latest_seq = 0
+
+    def text(value: Any, limit: int) -> str:
+        return value.replace("\0", "")[:limit] if isinstance(value, str) else ""
+
+    recent: list[dict[str, Any]] = []
+    raw_recent = conversation.get("recent")
+    if isinstance(raw_recent, list):
+        for item in raw_recent[-10:]:
+            if not isinstance(item, Mapping):
+                continue
+            recent.append({
+                "turn_id": text(item.get("turn_id"), 128),
+                "transcript": text(item.get("transcript"), _PRODUCT_CONVERSATION_TEXT_LIMIT),
+                "response": text(item.get("response"), _PRODUCT_CONVERSATION_TEXT_LIMIT),
+                "completed_at": text(item.get("completed_at"), 80),
+                "status": text(item.get("status"), 64),
+            })
+
+    current = dict(conversation.get("current")) if isinstance(conversation.get("current"), Mapping) else {}
+    for name in ("partial_text", "final_text", "assistant_text", "tts_text"):
+        current[name] = text(current.get(name), _PRODUCT_CONVERSATION_TEXT_LIMIT)
+    for name, limit in (("tts_status", 80), ("admission_phase", 80)):
+        if name in current:
+            current[name] = text(current[name], limit)
+    raw_current = runtime_current if isinstance(runtime_current, Mapping) else {}
+    current_turn_id = raw_current.get("turn_id")
+    if current_turn_id is None or isinstance(current_turn_id, str):
+        current["turn_id"] = text(current_turn_id, 128) if current_turn_id is not None else None  # turn_id（当前语音输入轮次标识）。
+    output_generation = raw_current.get("output_generation")
+    if type(output_generation) is int and 0 <= output_generation <= (1 << 53) - 1:
+        current["output_generation"] = output_generation  # output_generation（当前输出修订代次）。
+
+    allowed_kinds = {"user_turn", "assistant_speech", "system_speech", "screen_capture"}
+    entries: list[dict[str, Any]] = []
+    previous_seq = 0
+    raw_entries = conversation.get("entries")
+    if isinstance(raw_entries, list):
+        for item in raw_entries:
+            if not isinstance(item, Mapping):
+                continue
+            sequence = item.get("seq")
+            kind = item.get("kind")
+            conversation_id = item.get("conversation_id")
+            if (type(sequence) is not int or not previous_seq < sequence <= latest_seq
+                    or not isinstance(kind, str) or kind not in allowed_kinds
+                    or not isinstance(conversation_id, str) or not conversation_id):
+                continue
+            delivery_value = item.get("delivery")
+            delivery_source = delivery_value if isinstance(delivery_value, Mapping) else {}
+            delivery: dict[str, Any] = {}
+            for name in _PRODUCT_DELIVERY_LABEL_FIELDS:
+                if isinstance(delivery_source.get(name), str):
+                    delivery[name] = text(delivery_source[name], 80)
+            for name in _PRODUCT_DELIVERY_TEXT_FIELDS:
+                if isinstance(delivery_source.get(name), str):
+                    delivery[name] = text(delivery_source[name], _PRODUCT_DELIVERY_TEXT_LIMIT)
+            for name in _PRODUCT_DELIVERY_NUMBER_FIELDS:
+                value = delivery_source.get(name)
+                if (value is None or type(value) in (int, float)
+                        and 0 <= value <= (1 << 53) - 1 and math.isfinite(value)):
+                    if name in delivery_source:
+                        delivery[name] = value
+            entries.append({
+                "seq": sequence,  # seq（服务器分配的单调对话序号）。
+                "kind": kind,
+                "conversation_id": text(conversation_id, 128),
+                "turn_id": text(item.get("turn_id"), 128),
+                "speech_id": text(item.get("speech_id"), 128),
+                "text": text(item.get("text"), _PRODUCT_CONVERSATION_TEXT_LIMIT),
+                "status": text(item.get("status"), 80),
+                "termination": text(item.get("termination"), 80),
+                "delivery": delivery,
+                "at": text(item.get("at"), 80),
+            })
+            previous_seq = sequence
+    entries = entries[-_PRODUCT_CONVERSATION_ENTRY_LIMIT:]
+    projection = {"recent": recent, "entries": entries, "latest_seq": latest_seq, "current": current}
+
+    # The product snapshot is fetched through a 2 MiB management response cap.
+    # Keep the ordered tail that fits a smaller budget so a long conversation
+    # cannot make remote status polling fail; latest_seq remains the server head.
+    def encoded_size(value: Any) -> int:
+        return len(json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8"))
+
+    entry_sizes = [encoded_size(entry) for entry in entries]
+    current_size = encoded_size({**projection, "entries": []})
+    current_size += sum(entry_sizes) + max(0, len(entries) - 1)
+    while entries and current_size > _PRODUCT_CONVERSATION_BYTES_LIMIT:
+        current_size -= entry_sizes.pop(0) + (1 if len(entries) > 1 else 0)
+        entries.pop(0)
+    recent_sizes = [encoded_size(item) for item in recent]
+    current_size = encoded_size({**projection, "recent": []})
+    current_size += sum(recent_sizes) + max(0, len(recent) - 1)
+    while recent and current_size > _PRODUCT_CONVERSATION_BYTES_LIMIT:
+        current_size -= recent_sizes.pop(0) + (1 if len(recent) > 1 else 0)
+        recent.pop(0)
+    if encoded_size(projection) > _PRODUCT_CONVERSATION_BYTES_LIMIT:
+        # Defensive fallback for malformed historical speaker projections.
+        bounded_current = {
+            name: current[name]
+            for name in ("partial_text", "final_text", "assistant_text", "tts_text", "tts_status", "turn_id", "output_generation")
+            if name in current
+        }
+        projection["current"] = bounded_current
+    return projection
+
+
 def _unique_json_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """_unique_json_fields（唯一 JSON 字段）：拒绝配对签名输入中的重复键。"""
     value: dict[str, Any] = {}
@@ -143,7 +513,7 @@ async def _device_gateway_challenge_payload(request: Any) -> dict[str, Any]:
     allowed_post_paths = {
         "/v1/status", "/v1/devices", "/v1/session/open", "/v1/session/poll",
         "/v1/session/complete", "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
-        "/v1/interaction/prepare", "/v1/interaction/abort",
+        "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer",
     }
     if (set(payload) != expected or type(payload.get("protocol_version")) is not int
             or payload.get("protocol_version") != 1
@@ -216,7 +586,7 @@ def _device_media_open_payload(websocket: Any) -> dict[str, Any]:
             or set(values) - required - codec_fields - {downlink_pre_skip_field}
             or present_codec_fields not in (set(), codec_fields)
             or (downlink_pre_skip_field in values and present_codec_fields != codec_fields)):
-        raise HTTPException(status_code=422, detail="设备媒体握手字段不符合协议版本 1。")
+        raise HTTPException(status_code=422, detail="设备媒体握手字段不符合协议版本 2。")
     stream_id = values["stream_id"]
     if (not stream_id or len(stream_id) > 128
             or any(not (char.isascii() and (char.isalnum() or char in "._:-")) for char in stream_id)):
@@ -267,7 +637,7 @@ def _device_media_open_payload(websocket: Any) -> dict[str, Any]:
         })
         if downlink_pre_skip_field in values:
             payload[downlink_pre_skip_field] = downlink_pre_skip
-    if payload["protocol_version"] != 1:
+    if payload["protocol_version"] != MEDIA_PROTOCOL_VERSION:
         raise HTTPException(status_code=422, detail="设备媒体协议版本不受支持。")
     return payload
 
@@ -283,7 +653,7 @@ def _device_media_clock_response(message: Any, *, sync_id: str) -> tuple[int, in
     if (not isinstance(payload, dict)
             or set(payload) != {"type", "protocol_version", "sync_id", "device_receive_us", "device_send_us"}
             or payload.get("type") != "clock.sync.response"
-            or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
+            or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != MEDIA_PROTOCOL_VERSION
             or payload.get("sync_id") != sync_id
             or type(payload.get("device_receive_us")) is not int
             or type(payload.get("device_send_us")) is not int
@@ -309,7 +679,7 @@ def _device_media_playback_acceptance(
     }
     if (not isinstance(value, dict) or set(value) != expected
             or value.get("type") not in {"playback.accepted", "playback.cancelled"}
-            or type(value.get("protocol_version")) is not int or value["protocol_version"] != 1
+            or type(value.get("protocol_version")) is not int or value["protocol_version"] != MEDIA_PROTOCOL_VERSION
             or value.get("device_id") != lease.device_id
             or value.get("delivery_device_id") != lease.device_id
             or value.get("core_session_id") != core_session_id
@@ -334,7 +704,7 @@ def _device_media_playback_progress(
     if not isinstance(message, dict) or not isinstance(message.get("text"), str):
         raise ValueError("设备播放快照必须是 JSON 控制消息。")
     encoded = message["text"].encode("utf-8")
-    if not 0 < len(encoded) <= 4096:
+    if not 0 < len(encoded) <= 16 * 1024:
         raise ValueError("设备播放快照超过控制消息上限。")
     value = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
     expected = {
@@ -345,7 +715,7 @@ def _device_media_playback_progress(
     }
     if (not isinstance(value, dict) or set(value) != expected
             or value.get("type") != "playback.progress"
-            or type(value.get("protocol_version")) is not int or value["protocol_version"] != 1
+            or type(value.get("protocol_version")) is not int or value["protocol_version"] != MEDIA_PROTOCOL_VERSION
             or value.get("device_id") != lease.device_id
             or value.get("delivery_device_id") != lease.device_id
             or value.get("core_session_id") != core_session_id
@@ -564,7 +934,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         allowed_paths=frozenset({"/v1/challenge", "/v1/status", "/v1/devices", "/v1/pairing/request",
                                  "/v1/session/open", "/v1/session/poll", "/v1/session/complete",
                                  "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
-                                 "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/media"}),
+                                 "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management",
+                                 "/v1/file-transfer", "/v1/media"}),
     )
 
     @app.get("/health")
@@ -587,6 +958,130 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except DeviceTrustError as exc:
             raise HTTPException(status_code=422, detail="设备签名挑战字段无效。") from exc
         return JSONResponse(challenge, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/file-transfer")
+    async def device_gateway_file_transfer(request: Request) -> JSONResponse:
+        """device_gateway_file_transfer（签名 FILE 文件操作）：只操作既有 DSH 文件票据。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="设备文件通道操作", max_bytes=128 * 1024)
+        action = payload.get("action")
+        if type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1:
+            raise HTTPException(status_code=422, detail="设备文件通道协议版本无效。")
+        store = getattr(runtime, "device_file_transfer_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+
+        if action == "begin":
+            base = {"protocol_version", "action", "transfer_id", "operation", "parent_request_id",
+                    "connection_generation", "executor_generation", "maximum_bytes", "fields"}
+            expected = base | ({"expected_sha256"} if payload.get("operation") == "file.sftp.download" else set())
+            if (set(payload) != expected or not isinstance(payload.get("operation"), str)
+                    or payload["operation"] not in {"file.sftp.upload", "file.sftp.download"}
+                    or not isinstance(payload.get("transfer_id"), str)
+                    or len(payload["transfer_id"]) != 32
+                    or any(character not in "0123456789abcdef" for character in payload["transfer_id"])
+                    or not valid_device_request_id(payload.get("parent_request_id"))
+                    or type(payload.get("connection_generation")) is not int
+                    or payload["connection_generation"] < 1
+                    or type(payload.get("executor_generation")) is not int
+                    or payload["executor_generation"] < 1
+                    or type(payload.get("maximum_bytes")) is not int
+                    or not 1 <= payload["maximum_bytes"] <= 4 * 1024 * 1024 * 1024
+                    or not isinstance(payload.get("fields"), dict)
+                    or set(payload["fields"]) != expected - {"fields"}
+                    or any(not isinstance(value, str) or not value.strip() or len(value) > 120
+                           for value in payload["fields"].values())):
+                raise HTTPException(status_code=422, detail="设备文件通道开始请求字段无效。")
+            _authorize_device_gateway_request(runtime, request, payload)
+            device_id = request.headers.get("x-voice-terminal-device-id", "")
+            connection = runtime.device_registry.connection(device_id)
+            if (device_id == "local" or connection is None or not connection.connected
+                    or "file_transfer" not in connection.capabilities
+                    or payload["connection_generation"] != connection.connection_generation
+                    or payload["executor_generation"] != connection.executor_generation
+                    or payload["transfer_id"] != device_file_transfer_id(connection, payload["parent_request_id"])):
+                raise HTTPException(status_code=409, detail="文件传输票据与已认证设备、原请求或连接代次不匹配。")
+            expected_sha256 = payload.get("expected_sha256")
+            try:
+                transfer = await asyncio.to_thread(store.open_device_file_channel,
+                    transfer_id=payload["transfer_id"], device_id=device_id,
+                    connection_generation=connection.connection_generation,
+                    executor_generation=connection.executor_generation,
+                    operation=payload["operation"], maximum_bytes=payload["maximum_bytes"],
+                    expected_sha256=expected_sha256)
+            except Exception as exc:
+                raise HTTPException(status_code=409, detail="设备文件通道未匹配到可用的原 DSH 审批票据。") from exc
+            return JSONResponse({"protocol_version": 1, "result": "accepted", "transfer": transfer,
+                "fields": {"protocol_version": "设备文件通道协议版本", "result": "固定文件通道操作结果",
+                           "transfer": "原 DSH 票据签发的短期文件通道能力与长度摘要"}},
+                headers={"Cache-Control": "no-store"})
+
+        action_fields = {
+            "upload_chunk": {"offset", "data_base64", "chunk_sha256"},
+            "read_chunk": {"offset", "limit"},
+            "finish_upload": {"expected_bytes", "expected_sha256"},
+            "finish_download": {"expected_bytes", "expected_sha256"},
+            "cancel": set(),
+        }
+        if not isinstance(action, str) or action not in action_fields:
+            raise HTTPException(status_code=422, detail="设备文件通道操作不在固定白名单中。")
+        base = {"protocol_version", "action", "device_id", "connection_generation",
+                "executor_generation", "transfer_id", "channel_token", "fields"}
+        expected = base | action_fields[action]
+        if (set(payload) != expected or not valid_device_request_id(payload.get("device_id"))
+                or payload["device_id"] == "local"
+                or type(payload.get("connection_generation")) is not int
+                or type(payload.get("executor_generation")) is not int
+                or not isinstance(payload.get("transfer_id"), str)
+                or len(payload["transfer_id"]) != 32
+                or any(character not in "0123456789abcdef" for character in payload["transfer_id"])
+                or not isinstance(payload.get("channel_token"), str)
+                or not 32 <= len(payload["channel_token"]) <= 128
+                or not isinstance(payload.get("fields"), dict)
+                or set(payload["fields"]) != expected - {"fields"}
+                or any(not isinstance(value, str) or not value.strip() or len(value) > 120
+                       for value in payload["fields"].values())):
+            raise HTTPException(status_code=422, detail="设备文件通道续传请求字段无效。")
+        connection = runtime.device_registry.connection(payload["device_id"])
+        if (connection is None or not connection.connected or "file_transfer" not in connection.capabilities
+                or payload["connection_generation"] != connection.connection_generation
+                or payload["executor_generation"] != connection.executor_generation):
+            raise HTTPException(status_code=409, detail="设备文件通道对应的受信设备或执行器代次已变化。")
+        key = {"transfer_id": payload["transfer_id"], "device_id": payload["device_id"],
+               "connection_generation": connection.connection_generation,
+               "executor_generation": connection.executor_generation,
+               "channel_token": payload["channel_token"]}
+        try:
+            if action == "upload_chunk":
+                if (type(payload["offset"]) is not int or not isinstance(payload["data_base64"], str)
+                        or not isinstance(payload["chunk_sha256"], str)):
+                    raise ValueError("文件分块字段无效。")
+                transfer = await asyncio.to_thread(store.append_device_channel_chunk, **key,
+                    offset=payload["offset"], data_base64=payload["data_base64"],
+                    chunk_sha256=payload["chunk_sha256"])
+            elif action == "read_chunk":
+                if type(payload["offset"]) is not int or type(payload["limit"]) is not int:
+                    raise ValueError("文件读取偏移或分块上限无效。")
+                transfer = await asyncio.to_thread(store.read_device_channel_chunk, **key,
+                    offset=payload["offset"], limit=payload["limit"])
+            elif action == "finish_upload":
+                if type(payload["expected_bytes"]) is not int or not isinstance(payload["expected_sha256"], str):
+                    raise ValueError("上传完成摘要字段无效。")
+                transfer = await asyncio.to_thread(store.finish_device_channel_upload, **key,
+                    expected_bytes=payload["expected_bytes"], expected_sha256=payload["expected_sha256"])
+            elif action == "finish_download":
+                if type(payload["expected_bytes"]) is not int or not isinstance(payload["expected_sha256"], str):
+                    raise ValueError("下载完成摘要字段无效。")
+                transfer = await asyncio.to_thread(store.finish_device_channel_download, **key,
+                    expected_bytes=payload["expected_bytes"], expected_sha256=payload["expected_sha256"])
+            else:
+                transfer = {"cancelled": await asyncio.to_thread(store.cancel_device_file_channel, **key)}
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="固定文件通道能力、偏移或内容核验失败。") from exc
+        return JSONResponse({"protocol_version": 1, "result": "accepted", "transfer": transfer,
+            "fields": {"protocol_version": "设备文件通道协议版本", "result": "固定文件通道操作结果",
+                       "transfer": "与原 DSH 票据和受信连接代次绑定的分块收据"}},
+            headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/status")
     async def device_gateway_status(request: Request) -> JSONResponse:
@@ -622,6 +1117,150 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             {"protocol_version": 1, "ready": True, **device_snapshot()},
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.post("/v1/management")
+    async def device_gateway_management(request: Request) -> JSONResponse:
+        """device_gateway_management（受限业务操作）：操作枚举映射到现有 HTTP 业务处理器。"""
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="远程业务操作", max_bytes=1_048_576)
+        expected = {
+            "protocol_version", "request_id", "target_host_id", "session_generation",
+            "operation", "arguments", "fields",
+        }
+        if (set(payload) != expected or type(payload.get("protocol_version")) is not int
+                or payload["protocol_version"] != 1
+                or not isinstance(payload.get("request_id"), str)
+                or len(payload["request_id"]) != 32
+                or any(character not in "0123456789abcdef" for character in payload["request_id"])
+                or not isinstance(payload.get("target_host_id"), str)
+                or not payload["target_host_id"] or len(payload["target_host_id"]) > 128
+                or not isinstance(payload.get("operation"), str)
+                or not isinstance(payload.get("arguments"), dict)
+                or not isinstance(payload.get("fields"), dict)
+                or set(payload["fields"]) != expected - {"fields"}):
+            raise HTTPException(status_code=422, detail="远程业务操作字段或版本无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        if payload["target_host_id"] != getattr(runtime, "device_host_id", None):
+            raise HTTPException(status_code=409, detail="请求目标服务端身份与当前工作区不匹配。")
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        connection = runtime.device_registry.connection(device_id)
+        generation = payload.get("session_generation")
+        if (type(generation) is not int or generation < 1 or connection is None
+                or not connection.connected or connection.connection_generation != generation):
+            raise HTTPException(status_code=409, detail="远程管理会话已失效，请重新连接并读取最新状态。")
+        operation = payload["operation"]
+        response_status = 200
+        if operation == "voice.command":
+            arguments = payload["arguments"]
+            command = arguments.get("command")
+            voice_commands = {"session.start", "session.stop", "session.reset", "session.clear"}
+            if command == "session.reasoning_mode":
+                if set(arguments) != {"command", "mode"} or arguments.get("mode") not in {"fast", "deep"}:
+                    raise HTTPException(status_code=422, detail="语音推理模式操作参数无效。")
+            elif command not in voice_commands or set(arguments) != {"command"}:
+                raise HTTPException(status_code=422, detail="语音会话操作不在固定白名单中。")
+            if (getattr(runtime, "application_initializing", False) is True
+                    and command in {"session.start", "session.reset", "session.clear"}):
+                response_status = 503
+                response_body = {"detail": "服务端语音核心仍在启动。"}
+            else:
+                try:
+                    if command == "session.start":
+                        await runtime.start_listening()
+                    elif command == "session.stop":
+                        await runtime.stop_listening()
+                    elif command == "session.reset":
+                        await runtime.reset_session()
+                    elif command == "session.clear":
+                        await runtime.clear_session()
+                    else:
+                        if not await runtime.set_reasoning_mode(arguments["mode"]):
+                            raise ValueError("服务端没有接受该语音推理模式。")
+                    response_body = {"result": "completed", "runtime": runtime.snapshot().payload}
+                except ValueError as exc:
+                    response_status = 422
+                    response_body = {"detail": str(exc)[:320]}
+                except Exception as exc:
+                    logger.exception("remote voice command failed operation=%s", command)
+                    response_status = 503
+                    response_body = {"detail": "服务端没有完成该语音操作，请读取最新状态后重试。"}
+        else:
+            try:
+                method, internal_path, internal_body = _remote_management_request_spec(
+                    operation, payload["arguments"],
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if operation in {
+                "tts.assets.import.prepare", "tts.assets.import.commit", "tts.assets.import.abort",
+                "tts.assets.audio.read",
+            }:
+                if "file_transfer" not in connection.capabilities:
+                    raise HTTPException(status_code=403, detail="远程设备未获准使用文件传输能力。")
+                internal_body = {
+                    **(internal_body or {}),
+                    "_authenticated_device_id": device_id,
+                    "_connection_generation": connection.connection_generation,
+                    "_executor_generation": connection.executor_generation,
+                }
+            try:
+                import httpx
+
+                transport = httpx.ASGITransport(app=app)
+                internal_headers = {"Accept": "application/json"}
+                if internal_path == "/internal/application/wake-tasks":
+                    # 复用内部应用路由原有宿主授权；令牌留在服务端进程，不进入远端请求与响应。
+                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                    if application_token:
+                        internal_headers["Authorization"] = "Bearer " + application_token
+                if internal_path.startswith("/internal/application/tts-assets/"):
+                    # TTS 素材导入端点只接受本进程 ASGI 转发；令牌留在服务端进程。
+                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                    if application_token:
+                        internal_headers["Authorization"] = "Bearer " + application_token
+                if internal_path == "/internal/application/dsh-approval":
+                    # DSH approval decisions use the same host-only authorization as the local product endpoint.
+                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                    if not application_token:
+                        raise HTTPException(status_code=503, detail="本次应用宿主权限转发凭据不可用。")
+                    internal_headers["Authorization"] = "Bearer " + application_token
+                async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18764") as client:
+                    response = await client.request(
+                        method,
+                        internal_path,
+                        json=internal_body,
+                        headers=internal_headers,
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("远程业务处理器暂不可用：%s", type(exc).__name__)
+                raise HTTPException(status_code=503, detail="服务端现有业务处理器暂不可用。") from exc
+            if len(response.content) > 2_097_152:
+                raise HTTPException(status_code=502, detail="服务端业务回执超过大小上限。")
+            response_status = response.status_code
+            try:
+                response_body = response.json()
+            except ValueError:
+                response_body = {"detail": "服务端业务回执不是 JSON。"}
+        return JSONResponse({
+            "protocol_version": 1,
+            "request_id": payload["request_id"],
+            "target_host_id": payload["target_host_id"],
+            "session_generation": generation,
+            "operation": operation,
+            "status": response_status,
+            "body": response_body,
+            "fields": {
+                "protocol_version": "远程管理协议版本",
+                "request_id": "服务端回传的原操作编号",
+                "target_host_id": "本次操作所属服务端设备编号",
+                "session_generation": "本次已认证管理会话代次",
+                "operation": "服务端固定业务操作枚举",
+                "status": "既有服务端业务处理器的原 HTTP 状态码",
+                "body": "既有业务逻辑返回的结果或原始校验错误",
+            },
+        }, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/session/open")
     async def device_gateway_session_open(request: Request) -> JSONResponse:
@@ -997,7 +1636,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 host_send = time.monotonic()
                 await websocket.send_json({
                     "type": "clock.sync.request",
-                    "protocol_version": 1,
+                    "protocol_version": MEDIA_PROTOCOL_VERSION,
                     "sync_id": sync_id,
                     "fields": {
                         "type": "控制消息类型",
@@ -1022,7 +1661,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             estimate = mapper.estimate(now=time.monotonic())
             media_ready = {
                 "type": "media.ready",
-                "protocol_version": 1,
+                "protocol_version": MEDIA_PROTOCOL_VERSION,
                 "device_id": device_id,
                 "stream_id": payload["stream_id"],
                 "core_session_id": runtime.core_session_id,
@@ -1090,7 +1729,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     capture_active = capture.running
                     if capture_active != last_capture_active:
                         await websocket.send_json({
-                            "type": "media.capture_state", "protocol_version": 1,
+                            "type": "media.capture_state", "protocol_version": MEDIA_PROTOCOL_VERSION,
                             "device_id": device_id, "stream_id": payload["stream_id"],
                             "capture_active": capture_active,
                             "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
@@ -1125,7 +1764,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     capture_active = capture.running
                     if capture_active != last_capture_active:
                         await websocket.send_json({
-                            "type": "media.capture_state", "protocol_version": 1,
+                            "type": "media.capture_state", "protocol_version": MEDIA_PROTOCOL_VERSION,
                             "device_id": device_id, "stream_id": payload["stream_id"],
                             "capture_active": capture_active,
                             "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
@@ -1153,14 +1792,37 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         await client_tts.accept_audio(tts_frame)
                     continue
                 text_message = message.get("text")
-                if isinstance(text_message, str) and len(text_message.encode("utf-8")) <= 4096:
-                    control = json.loads(text_message, object_pairs_hook=_unique_json_fields)
-                    if (isinstance(control, dict)
-                            and isinstance(control.get("type"), str)
-                            and control["type"].startswith("media.tts.")):
+                if isinstance(text_message, str) and len(text_message.encode("utf-8")) <= 16 * 1024:
+                    try:
+                        control = json.loads(text_message, object_pairs_hook=_unique_json_fields)
+                    except Exception as exc:
+                        raise MediaProtocolError("设备媒体控制消息不是有效且唯一字段的 JSON。") from exc
+                    control_type = control.get("type") if isinstance(control, dict) else None
+                    if isinstance(control_type, str) and control_type.startswith("media.tts."):
+                        control = parse_tts_control(text_message)
                         if client_tts is None:
                             raise MediaProtocolError("设备没有协商客户端在线合成能力。")
                         client_tts.accept_control(control)
+                        if control_type in {
+                            "media.tts.output_progress", "media.tts.completed",
+                            "media.tts.cancelled", "media.tts.failed",
+                        }:
+                            playback_key = control.get("playback_key")
+                            if not isinstance(playback_key, str):
+                                raise MediaProtocolError("客户端直放输出回执缺少固定播放键。")
+                            snapshot = client_tts.playback_progress(playback_key)
+                            record_client_tts = getattr(runtime, "record_client_tts_output_progress", None)
+                            if callable(record_client_tts):
+                                host_output_time, uncertainty = mapper.map_time(
+                                    int(snapshot["device_time_us"]), now=time.monotonic(),
+                                )
+                                recorded = await record_client_tts(
+                                    lease, payload["stream_id"], playback_key,
+                                    {**snapshot, "host_output_time": host_output_time,
+                                     "clock_uncertainty_us": int(round(uncertainty * 1_000_000))},
+                                )
+                                if not recorded:
+                                    raise MediaProtocolError("客户端直放输出证据属于旧播放代次或进度倒退。")
                         continue
                     if isinstance(control, dict) and control.get("type") in {"playback.accepted", "playback.cancelled"}:
                         sequence, cancelled = _device_media_playback_acceptance(
@@ -1191,11 +1853,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             and set(control) == {"type", "protocol_version", "sequence"}
                             and control.get("type") == "media.ping"
                             and type(control.get("protocol_version")) is int
-                            and control["protocol_version"] == 1
+                            and control["protocol_version"] == MEDIA_PROTOCOL_VERSION
                             and type(control.get("sequence")) is int
                             and control["sequence"] >= 0):
                         await websocket.send_json({
-                            "type": "media.pong", "protocol_version": 1,
+                            "type": "media.pong", "protocol_version": MEDIA_PROTOCOL_VERSION,
                             "sequence": control["sequence"],
                             "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
                                        "sequence": "与请求对应的保活序号"},
@@ -1224,6 +1886,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         await runtime.detach_remote_playback_outbox(lease, playback)
                     await runtime.clear_remote_capture(capture, lease)
                     await runtime.abort_interaction_switch(lease)
+                    recover_local = getattr(runtime, "recover_local_after_remote_media_loss", None)
+                    if callable(recover_local):
+                        await recover_local(lease)
                     refresh_client_tts = getattr(runtime, "refresh_client_tts_service", None)
                     if callable(refresh_client_tts):
                         await refresh_client_tts()
@@ -1379,10 +2044,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if not trust_store.revoke(device_id):
                     raise HTTPException(status_code=404, detail="可信设备不存在。")
                 connection = runtime.device_registry.connection(device_id)
-                if (connection is not None and connection.connected
-                        and any(capability in connection.capabilities
-                                for capability in ("desktop_control", "file_transfer", "terminal_control"))):
-                    # 撤销信任后立即使对应受管通道失效；在途结果由路由结算为未知。
+                if connection is not None and connection.connected:
+                    # 撤销信任后立即使所有能力的受管会话失效，包括仅有音频流的客户端；在途结果由路由结算为未知。
                     await runtime.close_remote_device_session(device_id, connection.connection_generation)
                 result = {"revoked": True, **manager.status()}
             else:
@@ -1405,11 +2068,15 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.get("/api/v1/product/snapshot")
     async def get_product_snapshot() -> dict[str, Any]:
-        runtime_payload = sanitize_runtime_snapshot(runtime.snapshot().payload)
+        raw_runtime_snapshot = runtime.snapshot().payload
+        runtime_payload = sanitize_runtime_snapshot(raw_runtime_snapshot)
         # Keep the response field for existing clients without reviving the
         # archived local synthesizer or inspecting its model directory.
         runtime_payload["tts_worker"] = {"state": "stopped"}
-        conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
+        conversation = _product_conversation_snapshot(
+            runtime_payload.pop("conversation", {"recent": [], "current": {}}),
+            runtime_current=raw_runtime_snapshot.get("current"),
+        )
         settings = product_settings.snapshot() if product_settings is not None else {
             "schema_version": 12,
             "wake": {
@@ -1883,7 +2550,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.post("/api/internal/dsh-bridge/device.file")
     async def dsh_device_file(request: Request) -> JSONResponse:
-        """device.file（设备文件）：目录、小/大文件读取与获批文件写入；远端大文件走独立 SFTP。"""
+        """device.file（设备文件）：目录、小/大文件读取与获批文件写入；远端大文件走固定 FILE 通道。"""
         payload, session = await dsh_callback_body(request)
         base = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
                 "context_revision", "activation_id", "device_id", "action", "path"}
@@ -2019,7 +2686,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 transfer_id=transfer_id)
                             sftp_id = device_file_subtask_id(request_id, "sftp")
                             record = await execute_file_task(sftp_id, "file.sftp.upload", {
-                                "local_path":path,"remote_path":ticket["sftp_path"],"transfer_id":transfer_id,
+                                "local_path":path,"transfer_id":transfer_id,"parent_request_id":request_id,
                                 "maximum_bytes":max(1,size)}, timeout_seconds=600.0)
                             task_id, operation, result = sftp_id, "file.sftp.upload", None
                             if record is None or record.status == "unknown":
@@ -2027,7 +2694,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                     "operation":"file.read","status":"unknown","result":None,
                                     "source_task_id":sftp_id,"transfer_id":transfer_id}
                                 return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
-                                    "task":response_task,"fields":{"task":"SFTP 原任务结果未知；查询 source_task_id，不得重放"}},
+                                    "task":response_task,"fields":{"task":"固定 FILE 原任务结果未知；查询 source_task_id，不得重放"}},
                                     headers={"Cache-Control":"no-store"})
                             if record.status != "succeeded" or not isinstance(record.result, dict):
                                 await asyncio.to_thread(store.close, transfer_id=transfer_id,
@@ -2036,12 +2703,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
                                     "task":{"request_id":request_id,"device_id":connection.device_id,"operation":"file.read",
                                         "status":"failed","result":record.result if record is not None else None},
-                                    "fields":{"task":"固定设备 SFTP 读取失败；不会改投本机"}},
+                                    "fields":{"task":"固定设备 FILE 读取失败；不会改投本机"}},
                                     headers={"Cache-Control":"no-store"})
                             receipt = record.result
-                            if (receipt.get("transfer_id") != transfer_id or receipt.get("path") != ticket["sftp_path"]
+                            if (receipt.get("transfer_id") != transfer_id
+                                    or receipt.get("path") != f"transfer:{transfer_id}"
                                     or receipt.get("bytes") != size or not isinstance(receipt.get("sha256"), str)):
-                                raise HTTPException(status_code=502, detail="远端 SFTP 原任务回执与暂存票据不匹配。")
+                                raise HTTPException(status_code=502, detail="远端 FILE 原任务回执与暂存票据不匹配。")
                             staged = await asyncio.to_thread(store.verify_device_upload,
                                 transfer_id=transfer_id, device_id=connection.device_id,
                                 connection_generation=connection.connection_generation,
@@ -2118,11 +2786,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         target_path=finished["target_path"])
                     status = "succeeded"
                 else:
-                    ticket = await asyncio.to_thread(store.device_download_ticket, **key)
+                    ticket = await asyncio.to_thread(store.device_file_download_ticket, **key)
                     source_task_id = device_file_subtask_id(payload["parent_request_id"], "sftp")
-                    task_arguments = {"local_path":ticket["target_path"],"remote_path":ticket["sftp_path"],
-                        "transfer_id":payload["transfer_id"],"sha256":ticket["sha256"],
-                        "maximum_bytes":max(1,ticket["bytes"])}
+                    task_arguments = {"local_path":ticket["target_path"],
+                        "transfer_id":payload["transfer_id"],"parent_request_id":payload["parent_request_id"],
+                        "sha256":ticket["sha256"],"maximum_bytes":max(1,ticket["bytes"])}
                     try:
                         task_record = await runtime.execute_device_task(request_id=source_task_id,
                             device_id=connection.device_id, operation="file.sftp.download",
@@ -2145,10 +2813,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     else:
                         receipt = task_record.result
                         if (receipt.get("transfer_id") != payload["transfer_id"]
-                                or receipt.get("path") != ticket["sftp_path"]
+                                or receipt.get("path") != f"transfer:{payload['transfer_id']}"
                                 or receipt.get("bytes") != ticket["bytes"]
                                 or receipt.get("sha256") != ticket["sha256"]):
-                            raise HTTPException(status_code=502, detail="设备 SFTP 写入回执与审批附件摘要不匹配。")
+                            raise HTTPException(status_code=502, detail="设备 FILE 写入回执与审批附件摘要不匹配。")
                         status, result = "succeeded", {"path":ticket["target_path"],"bytes":ticket["bytes"],
                             "sha256":ticket["sha256"],"transfer_id":payload["transfer_id"]}
                 if session.activation_id != payload["activation_id"]:
@@ -2386,8 +3054,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         body = await request.json()
         if (not isinstance(body, dict) or set(body) != {"approval_id", "decision", "run_seq"}
                 or not isinstance(body.get("approval_id"), str) or not 1 <= len(body["approval_id"]) <= 160
-                or body.get("decision") not in {"allowed-once", "allowed-until-silence", "rejected"}
-                or type(body.get("run_seq")) is not int or body["run_seq"] < 0):
+                or body["approval_id"] != body["approval_id"].strip() or "\0" in body["approval_id"]
+                or not isinstance(body.get("decision"), str)
+                or body["decision"] not in {"allowed-once", "allowed-until-silence", "rejected"}
+                or type(body.get("run_seq")) is not int
+                or not 0 <= body["run_seq"] <= (1 << 53) - 1):
             raise HTTPException(status_code=422, detail="权限决定需要有效的请求标识、运行序号以及同意或拒绝。")
         async with runtime._session_lock:
             session = runtime.shadow_session
@@ -2623,6 +3294,273 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             return libraries.for_model(target) if target else libraries
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def validate_remote_tts_import_binding(payload: dict[str, Any], public_fields: set[str]):
+        internal_fields = {"_authenticated_device_id", "_connection_generation", "_executor_generation"}
+        if set(payload) != public_fields | internal_fields:
+            raise HTTPException(status_code=422, detail="TTS 文件导入票据字段无效。")
+        device_id = payload.get("_authenticated_device_id")
+        connection_generation = payload.get("_connection_generation")
+        executor_generation = payload.get("_executor_generation")
+        parent_request_id = payload.get("parent_request_id")
+        if (not isinstance(device_id, str) or not valid_device_request_id(device_id)
+                or type(connection_generation) is not int or connection_generation < 1
+                or type(executor_generation) is not int or executor_generation < 1
+                or not valid_device_request_id(parent_request_id)):
+            raise HTTPException(status_code=422, detail="TTS 文件导入请求身份或代次无效。")
+        connection = runtime.device_registry.connection(device_id)
+        if (connection is None or not connection.connected or "file_transfer" not in connection.capabilities
+                or connection.connection_generation != connection_generation
+                or connection.executor_generation != executor_generation):
+            raise HTTPException(status_code=409, detail="TTS 文件导入设备连接或执行器代次已变化。")
+        return connection
+
+    @app.post("/internal/application/tts-assets/import/prepare")
+    async def prepare_remote_tts_asset_import(request: Request) -> JSONResponse:
+        """prepare_remote_tts_asset_import（预留 TTS 音频票据）：只创建 DFT 文件传输票据。"""
+        authorize_application(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="TTS 文件导入准备请求不是有效 JSON。") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="TTS 文件导入准备请求必须是 JSON 对象。")
+        public_fields = {"model_id", "purpose", "filename", "expected_bytes", "parent_request_id"}
+        connection = validate_remote_tts_import_binding(payload, public_fields)
+        library = tts_voice_library_or_503(payload.get("model_id"))
+        model_id = getattr(library, "model_id", None) or getattr(library, "model", None)
+        store = getattr(runtime, "device_file_transfer_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+        transfer_id = device_file_transfer_id(connection, payload["parent_request_id"])
+        try:
+            ticket = await asyncio.to_thread(store.prepare_tts_asset_import,
+                transfer_id=transfer_id, device_id=connection.device_id,
+                connection_generation=connection.connection_generation,
+                executor_generation=connection.executor_generation,
+                parent_request_id=payload["parent_request_id"], model_id=model_id,
+                purpose=payload["purpose"], filename=payload["filename"],
+                expected_bytes=payload["expected_bytes"])
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="TTS 文件导入请求未能绑定到唯一 DFT 票据。") from exc
+        return JSONResponse(ticket, headers={"Cache-Control": "no-store"})
+
+    @app.post("/internal/application/tts-assets/audio/read")
+    async def read_remote_tts_asset_audio(request: Request) -> JSONResponse:
+        """read_remote_tts_asset_audio（远程音频素材读取）：只回传已登记且不超过 1 MiB 的音频字节。"""
+        authorize_application(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="TTS 音频读取请求不是有效 JSON。") from exc
+        public_fields = {"model_id", "asset_id"}
+        internal_fields = {"_authenticated_device_id", "_connection_generation", "_executor_generation"}
+        if not isinstance(payload, dict) or set(payload) != public_fields | internal_fields:
+            raise HTTPException(status_code=422, detail="TTS 音频读取字段不符合固定契约。")
+        device_id = payload.get("_authenticated_device_id")
+        connection_generation = payload.get("_connection_generation")
+        executor_generation = payload.get("_executor_generation")
+        if (not valid_device_request_id(device_id) or type(connection_generation) is not int
+                or connection_generation < 1 or type(executor_generation) is not int
+                or executor_generation < 1):
+            raise HTTPException(status_code=422, detail="TTS 音频读取设备身份或代次无效。")
+        connection = runtime.device_registry.connection(device_id)
+        if (connection is None or not connection.connected or "file_transfer" not in connection.capabilities
+                or connection.connection_generation != connection_generation
+                or connection.executor_generation != executor_generation):
+            raise HTTPException(status_code=409, detail="TTS 音频读取设备连接或执行器代次已变化。")
+        model_id, asset_id = payload.get("model_id"), payload.get("asset_id")
+        if (not isinstance(model_id, str) or not model_id or len(model_id) > 128
+                or not model_id.isascii()
+                or any(not (character.isalnum() or character in "._:-") for character in model_id)
+                or not isinstance(asset_id, str) or not re.fullmatch(r"[0-9a-f]{32}", asset_id)):
+            raise HTTPException(status_code=422, detail="TTS 音色库或素材编号无效。")
+        try:
+            library = tts_voice_library_or_503(model_id)
+            with library._lock:
+                metadata = library._index["assets"].get(asset_id)
+            if not isinstance(metadata, dict):
+                raise HTTPException(status_code=404, detail="TTS 音频素材不存在。")
+            asset_root = Path(library.assets_dir).resolve()
+            maximum_audio_bytes = 1024 * 1024  # maximum_audio_bytes（远程预览最大原始音频长度：1 MiB）。
+
+            def checked_audio_path(path: Path):
+                if path.is_symlink() or not path.is_file():
+                    raise HTTPException(status_code=404, detail="TTS 音频素材不存在或不可读取。")
+                resolved_path = path.resolve(strict=True)
+                if not resolved_path.is_relative_to(asset_root):
+                    raise HTTPException(status_code=404, detail="TTS 音频素材不存在或不可读取。")
+                return path.stat()
+
+            high_fidelity_path = library.high_fidelity_path(asset_id)
+            use_high_fidelity = high_fidelity_path is not None
+            if use_high_fidelity:
+                data_path = high_fidelity_path
+                media_type = "audio/wav"
+                before = checked_audio_path(data_path)
+                if before.st_size > maximum_audio_bytes:
+                    # 高保真旁路副本过大时，改用登记的规范素材，仍对实际回传字节实施相同大小限制。
+                    data_path = (library._source_path(asset_id) if metadata.get("format") == "source"
+                                 else library.asset_path(asset_id))
+                    media_type = library.asset_media_type(asset_id)
+                    use_high_fidelity = False
+                    before = checked_audio_path(data_path)
+            else:
+                data_path = (library._source_path(asset_id) if metadata.get("format") == "source"
+                             else library.asset_path(asset_id))
+                media_type = library.asset_media_type(asset_id)
+                before = checked_audio_path(data_path)
+            if before.st_size <= 0:
+                raise HTTPException(status_code=404, detail="TTS 音频素材为空。")
+            if before.st_size > maximum_audio_bytes:
+                raise HTTPException(status_code=413, detail="TTS 音频素材超过 1 MiB 预览上限。")
+            data = await asyncio.to_thread(data_path.read_bytes)
+            after = data_path.stat()
+            if (data_path.is_symlink() or before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns or before.st_ino != after.st_ino
+                    or len(data) != after.st_size):
+                raise HTTPException(status_code=409, detail="TTS 音频素材读取期间发生变化。")
+            if len(data) > maximum_audio_bytes:
+                raise HTTPException(status_code=413, detail="TTS 音频素材超过 1 MiB 预览上限。")
+            remote_import = metadata.get("remote_import")
+            expected_sha256 = None
+            if isinstance(remote_import, dict):
+                stored_digest_field = ("high_fidelity_sha256" if use_high_fidelity else "stored_sha256")
+                expected_sha256 = remote_import.get(stored_digest_field)
+                if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                    raise HTTPException(status_code=409, detail="TTS 音频素材缺少有效的导入摘要。")
+            elif use_high_fidelity:
+                expected_sha256 = metadata.get("high_fidelity_sha256")
+                if expected_sha256 is not None and (not isinstance(expected_sha256, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
+                    raise HTTPException(status_code=409, detail="TTS 高保真素材登记摘要无效。")
+            actual_sha256 = hashlib.sha256(data).hexdigest()
+            if expected_sha256 is not None and actual_sha256 != expected_sha256:
+                raise HTTPException(status_code=409, detail="TTS 音频素材与导入时登记的 SHA-256 摘要不匹配。")
+        except HTTPException:
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="TTS 音频素材不存在或文件缺失。") from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail="TTS 音频素材无法安全读取。") from exc
+        return JSONResponse({"data_base64": base64.b64encode(data).decode("ascii"),
+            "media_type": media_type, "bytes": len(data), "sha256": actual_sha256,
+            "fields": {"data_base64": "已登记 TTS 音频的规范 Base64 字节内容",
+                "media_type": "原音频或高保真旁路副本的媒体类型",
+                "bytes": "实际返回音频内容的字节数，最大 1 MiB",
+                "sha256": "本次实际回传音频内容的 SHA-256 摘要"}},
+            headers={"Cache-Control": "no-store"})
+
+    @app.post("/internal/application/tts-assets/import/commit")
+    async def commit_remote_tts_asset_import(request: Request) -> JSONResponse:
+        """commit_remote_tts_asset_import（提交 TTS 音频导入）：复核 DFT staging 后幂等写 VoiceLibrary。"""
+        authorize_application(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="TTS 文件导入提交请求不是有效 JSON。") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="TTS 文件导入提交请求必须是 JSON 对象。")
+        public_fields = {"model_id", "purpose", "filename", "expected_bytes", "expected_sha256",
+                         "parent_request_id", "transfer_id"}
+        connection = validate_remote_tts_import_binding(payload, public_fields)
+        model_library = tts_voice_library_or_503(payload.get("model_id"))
+        model_id = getattr(model_library, "model_id", None) or getattr(model_library, "model", None)
+        transfer_id = device_file_transfer_id(connection, payload["parent_request_id"])
+        if payload.get("transfer_id") != transfer_id:
+            raise HTTPException(status_code=409, detail="TTS transfer_id 与设备、代次或 parent_request_id 不匹配。")
+        store = getattr(runtime, "device_file_transfer_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+        binding = {
+            "transfer_id": transfer_id,
+            "device_id": connection.device_id,
+            "connection_generation": connection.connection_generation,
+            "executor_generation": connection.executor_generation,
+            "parent_request_id": payload["parent_request_id"],
+            "model_id": model_id,
+            "purpose": payload["purpose"],
+            "filename": payload["filename"],
+            "expected_bytes": payload["expected_bytes"],
+            "expected_sha256": payload["expected_sha256"],
+        }
+
+        async def cleanup_committed_staging() -> None:
+            """只在 VoiceLibrary（音色库）确认提交后，尽力关闭精确绑定的 DFT 暂存。"""
+            try:
+                await asyncio.to_thread(store.close_tts_asset_import, **binding)
+            except Exception:
+                logger.warning("已提交 TTS 素材的 DFT 暂存清理失败 transfer_id=%s", transfer_id,
+                               exc_info=True)
+
+        try:
+            previous = await asyncio.to_thread(model_library.get_remote_import_result, binding)
+            if previous is not None:
+                await cleanup_committed_staging()
+                return JSONResponse(previous, headers={"Cache-Control": "no-store"})
+            data, verified = await asyncio.to_thread(store.read_tts_asset_import,
+                transfer_id=transfer_id, device_id=connection.device_id,
+                connection_generation=connection.connection_generation,
+                executor_generation=connection.executor_generation,
+                parent_request_id=payload["parent_request_id"], model_id=model_id,
+                purpose=payload["purpose"], filename=payload["filename"],
+                expected_bytes=payload["expected_bytes"], expected_sha256=payload["expected_sha256"])
+            if verified != binding:
+                raise HTTPException(status_code=409, detail="TTS DFT 票据绑定与提交请求不一致。")
+            result = await asyncio.to_thread(model_library.commit_remote_import, data, **binding)
+            try:
+                await asyncio.to_thread(store.mark_tts_asset_import_committed,
+                    transfer_id=transfer_id, device_id=connection.device_id,
+                    connection_generation=connection.connection_generation,
+                    executor_generation=connection.executor_generation, metadata={
+                        "transfer_id":transfer_id,"device_id":connection.device_id,
+                        "connection_generation":connection.connection_generation,
+                        "executor_generation":connection.executor_generation,
+                        "parent_request_id":payload["parent_request_id"],"model_id":model_id,
+                        "purpose":payload["purpose"],"filename":payload["filename"],
+                        "expected_bytes":payload["expected_bytes"]})
+            except Exception:
+                # VoiceLibrary（音色库）已经持久化并返回结果；标记和暂存回收均属于尽力清理。
+                logger.warning("已提交 TTS 素材的 DFT 完成标记失败 transfer_id=%s", transfer_id,
+                               exc_info=True)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="TTS 文件票据未完成、内容摘要错误或已绑定其他导入。") from exc
+        await cleanup_committed_staging()
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/internal/application/tts-assets/import/abort")
+    async def abort_remote_tts_asset_import(request: Request) -> JSONResponse:
+        """abort_remote_tts_asset_import（取消 TTS 上传）：只清理未提交 DFT 暂存。"""
+        authorize_application(request)
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="TTS 文件导入取消请求不是有效 JSON。") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="TTS 文件导入取消请求必须是 JSON 对象。")
+        public_fields = {"parent_request_id", "transfer_id"}
+        connection = validate_remote_tts_import_binding(payload, public_fields)
+        expected_transfer_id = device_file_transfer_id(connection, payload["parent_request_id"])
+        if payload.get("transfer_id") != expected_transfer_id:
+            raise HTTPException(status_code=409, detail="TTS abort transfer_id 与原设备请求不匹配。")
+        store = getattr(runtime, "device_file_transfer_store", None)
+        if store is None:
+            raise HTTPException(status_code=503, detail="设备文件暂存目录尚未就绪。")
+        try:
+            aborted = await asyncio.to_thread(store.abort_tts_asset_import,
+                transfer_id=expected_transfer_id, device_id=connection.device_id,
+                connection_generation=connection.connection_generation,
+                executor_generation=connection.executor_generation,
+                parent_request_id=payload["parent_request_id"])
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="TTS abort 请求与原 DFT 票据不匹配。") from exc
+        return JSONResponse({"transfer_id":expected_transfer_id,"parent_request_id":payload["parent_request_id"],
+            "aborted":aborted,"committed":not aborted,
+            "fields":{"transfer_id":"原 TTS DFT 票据编号","parent_request_id":"原稳定导入请求编号",
+                "aborted":"是否已清理未提交暂存","committed":"是否已存在已提交的 TTS 素材"}},
+            headers={"Cache-Control":"no-store"})
 
     def tts_voice_operations_or_503():
         operations = getattr(runtime, "tts_voice_operations", None)

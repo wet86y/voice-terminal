@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import struct
 import tempfile
@@ -16,6 +17,10 @@ from unittest.mock import AsyncMock, PropertyMock, patch, ANY
 
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.config import COMPUTE_MODEL_IDS
+from voice_terminal.devices.capture_router import SelectableCapturePort
+from voice_terminal.devices.media_protocol import MediaFrame, MediaProtocolError
+from voice_terminal.devices.pcm_stream import PcmInputStream
+from voice_terminal.devices.remote_capture import RemoteAudioCapture, RemoteAudioCaptureError
 from voice_terminal.model_registry.service import ModelRegistryService
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
@@ -76,6 +81,9 @@ class ProductApiTests(unittest.TestCase):
         )
         runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=self.root / ".local")
         self.runtime = runtime
+        # 仅此测试进程模拟桌面原生层写入隔离临时信任库；正式服务保持只读。
+        assert self.runtime.device_trust_store is not None
+        self.runtime.device_trust_store._read_only = False
         registry = ModelRegistryService(
             config=config,
             registry_path=self.root / "config" / "model-registry.json",
@@ -127,7 +135,7 @@ class ProductApiTests(unittest.TestCase):
             "POST", "/v1/challenge",
             json={"protocol_version": 1, "device_id": device_id, "method": "POST", "path": path},
         )
-        assert challenge_response.status_code == 200
+        assert challenge_response.status_code == 200, challenge_response.text
         challenge = challenge_response.json()
         timestamp_ms = time.time_ns() // 1_000_000
         message = device_request_proof_message(
@@ -196,6 +204,881 @@ class ProductApiTests(unittest.TestCase):
             assert (await self._gateway_request("POST", "/v1/devices", json={"protocol_version": 1, "device_id": "local"})).status_code == 422
             assert (await self._gateway_request("POST", "/v1/devices", json={"protocol_version": 2})).status_code == 422
         asyncio.run(scenario())
+
+    def test_signed_fixed_file_gateway_uses_existing_dsh_ticket_and_bounded_chunks(self) -> None:
+        from voice_terminal.server.http_api import device_file_transfer_id
+
+        async def scenario():
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "file-gateway-client"
+            self.runtime.device_trust_store.approve(device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000)
+            opened, _headers = await self._signed_gateway_request(private_key, device_id, "/v1/session/open",
+                {"protocol_version": 1, "capabilities": ["file_transfer"]})
+            assert opened.status_code == 200, opened.text
+            lease = opened.json()
+            parent_request_id = "dsh-file-gateway-parent"
+            connection = self.runtime.device_registry.connection(device_id)
+            assert connection is not None
+            transfer_id = device_file_transfer_id(connection, parent_request_id)
+            content = b"signed fixed FILE payload" * 3000
+            digest = __import__("hashlib").sha256(content).hexdigest()
+            store = self.runtime.device_file_transfer_store
+            store.prepare_device_upload(device_id=device_id,
+                connection_generation=lease["connection_generation"],
+                executor_generation=lease["executor_generation"], expected_bytes=len(content),
+                transfer_id=transfer_id)
+            begin = {"protocol_version":1,"action":"begin","transfer_id":transfer_id,
+                "operation":"file.sftp.upload","parent_request_id":parent_request_id,
+                "connection_generation":lease["connection_generation"],
+                "executor_generation":lease["executor_generation"],"maximum_bytes":len(content),
+                "fields":{"protocol_version":"设备文件通道协议版本","action":"固定为 begin 的原票据申请",
+                    "transfer_id":"原 DSH 文件传输编号","operation":"兼容保留的文件任务操作编号",
+                    "parent_request_id":"生成原文件票据的稳定 DSH 请求编号",
+                    "connection_generation":"当前 SSH 设备连接代次",
+                    "executor_generation":"当前设备执行器代次","maximum_bytes":"原审批允许的最大字节数"}}
+            missing_auth = await self._gateway_request("POST", "/v1/file-transfer", json=begin)
+            assert missing_auth.status_code == 401
+            started, auth_headers = await self._signed_gateway_request(private_key, device_id, "/v1/file-transfer", begin)
+            assert started.status_code == 200, started.text
+            channel = started.json()["transfer"]
+            assert channel["transfer_id"] == transfer_id
+            assert channel["total_bytes"] == len(content)
+            assert channel["ready"] is False
+            assert "path" not in channel and "sftp_path" not in channel and "target_path" not in channel
+            replay = await self._gateway_request("POST", "/v1/file-transfer", json=begin, headers=auth_headers)
+            assert replay.status_code == 401
+
+            token = channel["channel_token"]
+            common = {"protocol_version":1,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],
+                "executor_generation":lease["executor_generation"],"transfer_id":transfer_id,
+                "channel_token":token}
+            offset = 0
+            for part in (content[:64 * 1024], content[64 * 1024:]):
+                payload = {**common,"action":"upload_chunk","offset":offset,
+                    "data_base64":base64.b64encode(part).decode("ascii"),
+                    "chunk_sha256":__import__("hashlib").sha256(part).hexdigest()}
+                payload["fields"] = {key:"中文字段说明" for key in payload}
+                stale = {**payload,"executor_generation":lease["executor_generation"] + 1}
+                assert (await self._gateway_request("POST", "/v1/file-transfer", json=stale)).status_code == 409
+                wrong_token = {**payload,"channel_token":"x" * len(token)}
+                assert (await self._gateway_request("POST", "/v1/file-transfer", json=wrong_token)).status_code == 409
+                accepted = await self._gateway_request("POST", "/v1/file-transfer", json=payload)
+                assert accepted.status_code == 200, accepted.text
+                offset = accepted.json()["transfer"]["next_offset"]
+            assert offset == len(content)
+            wrong_digest = {**common,"action":"finish_upload","expected_bytes":len(content),
+                "expected_sha256":"0" * 64}
+            wrong_digest["fields"] = {key:"中文字段说明" for key in wrong_digest}
+            assert (await self._gateway_request("POST", "/v1/file-transfer", json=wrong_digest)).status_code == 409
+            finish = {**common,"action":"finish_upload","expected_bytes":len(content),"expected_sha256":digest}
+            finish["fields"] = {key:"中文字段说明" for key in finish}
+            completed = await self._gateway_request("POST", "/v1/file-transfer", json=finish)
+            assert completed.status_code == 200, completed.text
+            assert completed.json()["transfer"]["state"] == "ready"
+            assert completed.json()["transfer"]["sha256"] == digest
+            assert "target_path" not in completed.json()["transfer"]
+
+            download_parent = "dsh-file-gateway-download"
+            download_transfer_id = device_file_transfer_id(connection, download_parent)
+            attachment = b"signed fixed download" * 4000
+            attachment_sha = __import__("hashlib").sha256(attachment).hexdigest()
+            store.prepare_core_upload(device_id=device_id,
+                connection_generation=lease["connection_generation"],
+                executor_generation=lease["executor_generation"], expected_bytes=len(attachment),
+                expected_sha256=attachment_sha, target_path=r"D:\approved\target.bin",
+                transfer_id=download_transfer_id)
+            for chunk_offset in range(0, len(attachment), 64 * 1024):
+                part = attachment[chunk_offset:chunk_offset + 64 * 1024]
+                store.append_core_chunk(transfer_id=download_transfer_id, device_id=device_id,
+                    connection_generation=lease["connection_generation"],
+                    executor_generation=lease["executor_generation"], offset=chunk_offset,
+                    data_base64=base64.b64encode(part).decode("ascii"))
+            store.finish_core_upload(transfer_id=download_transfer_id, device_id=device_id,
+                connection_generation=lease["connection_generation"],
+                executor_generation=lease["executor_generation"], expected_bytes=len(attachment),
+                expected_sha256=attachment_sha)
+            download_begin = {"protocol_version":1,"action":"begin","transfer_id":download_transfer_id,
+                "operation":"file.sftp.download","parent_request_id":download_parent,
+                "connection_generation":lease["connection_generation"],
+                "executor_generation":lease["executor_generation"],"maximum_bytes":len(attachment),
+                "expected_sha256":attachment_sha,
+                "fields":{"protocol_version":"设备文件通道协议版本","action":"固定为 begin 的原票据申请",
+                    "transfer_id":"原 DSH 文件传输编号","operation":"兼容保留的文件任务操作编号",
+                    "parent_request_id":"生成原文件票据的稳定 DSH 请求编号",
+                    "connection_generation":"当前 SSH 设备连接代次",
+                    "executor_generation":"当前设备执行器代次","maximum_bytes":"原审批允许的最大文件字节数",
+                    "expected_sha256":"服务端已锁定的附件完整摘要"}}
+            download_started, _headers = await self._signed_gateway_request(
+                private_key, device_id, "/v1/file-transfer", download_begin)
+            assert download_started.status_code == 200, download_started.text
+            download_channel = download_started.json()["transfer"]
+            assert download_channel["ready"] is True and download_channel["sha256"] == attachment_sha
+            assert "path" not in download_channel and "target_path" not in download_channel
+            download_common = {"protocol_version":1,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],
+                "executor_generation":lease["executor_generation"],"transfer_id":download_transfer_id,
+                "channel_token":download_channel["channel_token"]}
+            received = bytearray()
+            for chunk_offset in range(0, len(attachment), 64 * 1024):
+                read_payload = {**download_common,"action":"read_chunk","offset":chunk_offset,"limit":64 * 1024}
+                read_payload["fields"] = {key:"中文字段说明" for key in read_payload}
+                read_response = await self._gateway_request("POST", "/v1/file-transfer", json=read_payload)
+                assert read_response.status_code == 200, read_response.text
+                transfer = read_response.json()["transfer"]
+                part = base64.b64decode(transfer["data_base64"], validate=True)
+                assert transfer["offset"] == chunk_offset
+                assert transfer["chunk_sha256"] == __import__("hashlib").sha256(part).hexdigest()
+                received.extend(part)
+            assert bytes(received) == attachment
+            finish_download = {**download_common,"action":"finish_download",
+                "expected_bytes":len(attachment),"expected_sha256":attachment_sha}
+            finish_download["fields"] = {key:"中文字段说明" for key in finish_download}
+            download_finished = await self._gateway_request("POST", "/v1/file-transfer", json=finish_download)
+            assert download_finished.status_code == 200, download_finished.text
+            assert download_finished.json()["transfer"]["sha256"] == attachment_sha
+            assert "target_path" not in download_finished.json()["transfer"]
+            closed, _headers = await self._signed_gateway_request(private_key, device_id, "/v1/session/close",
+                {"protocol_version":1,"connection_generation":lease["connection_generation"],
+                 "executor_generation":lease["executor_generation"]})
+            assert closed.status_code == 200
+
+        asyncio.run(scenario())
+
+    def test_signed_remote_management_routes_allowlisted_reads_and_existing_settings_writes(self) -> None:
+        async def scenario():
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "client-management"
+            host_id = "host-management"
+            self.runtime.device_host_id = host_id
+            self.runtime.device_trust_store.approve(
+                device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000,
+            )
+            opened, _headers = await self._signed_gateway_request(
+                private_key, device_id, "/v1/session/open",
+                {"protocol_version": 1, "capabilities": ["audio_stream"]},
+            )
+            assert opened.status_code == 200
+            generation = opened.json()["connection_generation"]
+
+            fields = {
+                "protocol_version": "远程管理协议版本",
+                "request_id": "唯一操作编号",
+                "target_host_id": "目标服务端设备编号",
+                "session_generation": "当前管理会话代次",
+                "operation": "固定服务端业务操作编号",
+                "arguments": "与操作编号对应的类型化参数",
+            }
+
+            async def management(operation: str, arguments: dict, *, target=host_id, session=generation):
+                from uuid import uuid4
+                payload = {
+                    "protocol_version": 1,
+                    "request_id": uuid4().hex,
+                    "target_host_id": target,
+                    "session_generation": session,
+                    "operation": operation,
+                    "arguments": arguments,
+                    "fields": fields,
+                }
+                return (await self._signed_gateway_request(
+                    private_key, device_id, "/v1/management", payload,
+                ))[0]
+
+            snapshot = await management("product.snapshot", {})
+            assert snapshot.status_code == 200
+            assert snapshot.json()["operation"] == "product.snapshot"
+            assert snapshot.json()["body"]["settings"]["silence"]["seconds"] == 30
+
+            with patch.object(self.runtime, "compute_status", new=AsyncMock(return_value={"refreshed": True})) as compute_status:
+                refreshed = await management("product.compute_status.refresh", {})
+            assert refreshed.status_code == 200
+            assert refreshed.json()["status"] == 200
+            assert refreshed.json()["body"] == {"refreshed": True}
+            compute_status.assert_awaited_once_with(refresh_capabilities=True)
+
+            prior = self.runtime.product_settings.settings_only()["silence"]["seconds"]
+            updated = prior + 1 if prior < 120 else prior - 1
+            saved = await management("settings.silence.save", {"value": {"seconds": updated}})
+            assert saved.status_code == 200
+            assert saved.json()["status"] == 200
+            assert self.runtime.product_settings.settings_only()["silence"]["seconds"] == updated
+
+            with patch.object(self.runtime, "start_listening", new=AsyncMock()) as start_listening:
+                started = await management("voice.command", {"command": "session.start"})
+            assert started.status_code == 200
+            assert started.json()["status"] == 200
+            assert started.json()["body"]["result"] == "completed"
+            start_listening.assert_awaited_once_with()
+
+            manual_task_body = {
+                "text": "远程服务端提醒", "at": "2026-11-17T12:00:00+08:00",
+                "target": "shadow_agent", "reference": "", "creation_source": "manual",
+            }
+            with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": "test-host-token"}):
+                with patch.object(
+                    self.runtime.dsh.bridge, "task_api",
+                    new=AsyncMock(return_value={"task_id": "server-task-1", "result": "accepted"}),
+                ) as create_task:
+                    created_task = await management("wake_task.create", {"value": {
+                        "text": "  远程服务端提醒  ", "at": "2026-11-17T12:00:00+08:00",
+                    }})
+            assert created_task.status_code == 200, created_task.text
+            assert created_task.json()["status"] == 200
+            assert created_task.json()["body"]["task_id"] == "server-task-1"
+            create_task.assert_awaited_once_with("POST", "tasks", manual_task_body)
+
+            missing_task = await management(
+                "wake_task.update", {"task_id": "missing-task", "value": {"text": "测试"}},
+            )
+            assert missing_task.status_code == 200
+            # The DSH scheduler may be absent in this isolated runtime, but the fixed
+            # management operation must still reach its existing handler.
+            assert missing_task.json()["status"] in {404, 503}, missing_task.text
+            traversal = await management(
+                "wake_task.update", {"task_id": "../outside", "value": {"text": "测试"}},
+            )
+            assert traversal.status_code == 422
+
+            wrong_host = await management("product.snapshot", {}, target="another-host")
+            assert wrong_host.status_code == 409
+            stale_session = await management("product.snapshot", {}, session=generation + 1)
+            assert stale_session.status_code == 409
+            arbitrary = await management("product.snapshot?path=/api/v1/models/credentials", {})
+            assert arbitrary.status_code == 422
+
+        asyncio.run(scenario())
+
+    def test_remote_product_snapshot_has_ordered_bounded_conversation_and_current_subtitles(self) -> None:
+        async def scenario():
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "client-conversation-snapshot"
+            host_id = "host-conversation-snapshot"
+            self.runtime.device_host_id = host_id
+            self.runtime.device_trust_store.approve(
+                device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000,
+            )
+            opened, _headers = await self._signed_gateway_request(
+                private_key, device_id, "/v1/session/open",
+                {"protocol_version": 1, "capabilities": ["audio_stream"]},
+            )
+            assert opened.status_code == 200
+            generation = opened.json()["connection_generation"]
+            fields = {
+                "protocol_version": "远程管理协议版本",
+                "request_id": "唯一操作编号",
+                "target_host_id": "目标服务端设备编号",
+                "session_generation": "当前管理会话代次",
+                "operation": "固定服务端业务操作编号",
+                "arguments": "与操作编号对应的类型化参数",
+            }
+
+            async def product_snapshot():
+                from uuid import uuid4
+
+                payload = {
+                    "protocol_version": 1,
+                    "request_id": uuid4().hex,
+                    "target_host_id": host_id,
+                    "session_generation": generation,
+                    "operation": "product.snapshot",
+                    "arguments": {},
+                    "fields": fields,
+                }
+                return (await self._signed_gateway_request(
+                    private_key, device_id, "/v1/management", payload,
+                ))[0]
+
+            self.runtime.state.current.update({
+                "turn_id": "turn-live-caption",
+                "output_generation": 7,
+                "assistant_text": "助手逐字字幕全文",
+                "tts_text": "当前正在播报的字幕片段",
+                "tts_status": "STREAMING",
+            })
+            for index in range(205):
+                kind = USER_TURN if index % 2 == 0 else SYSTEM_SPEECH
+                self.runtime.history.conversation.append(
+                    kind,
+                    conversation_id="conversation-remote",
+                    turn_id=f"turn-{index}",
+                    speech_id="" if kind == USER_TURN else f"speech-{index}",
+                    text=f"对话第 {index} 条",
+                    status="completed",
+                    delivery={
+                        "status": "partial", "termination": "interrupted",
+                        "heard_text": "已听到的部分", "precision": "device_time",
+                        "untrusted_debug_secret": "delivery-secret-must-not-leak",
+                    },
+                )
+
+            response = await product_snapshot()
+            assert response.status_code == 200, response.text
+            result = response.json()
+            conversation = result["body"]["conversation"]
+            assert result["operation"] == "product.snapshot"
+            assert conversation["latest_seq"] == 205
+            assert [item["seq"] for item in conversation["entries"]] == list(range(6, 206))
+            assert set(conversation) == {"recent", "entries", "latest_seq", "current"}
+            assert conversation["current"]["turn_id"] == "turn-live-caption"
+            assert conversation["current"]["output_generation"] == 7
+            assert conversation["current"]["assistant_text"] == "助手逐字字幕全文"
+            assert conversation["current"]["tts_text"] == "当前正在播报的字幕片段"
+            assert conversation["current"]["tts_status"] == "STREAMING"
+            entry = conversation["entries"][-1]
+            assert set(entry) == {
+                "seq", "kind", "conversation_id", "turn_id", "speech_id", "text",
+                "status", "termination", "delivery", "at",
+            }
+            assert entry["delivery"] == {
+                "status": "partial", "termination": "interrupted",
+                "heard_text": "已听到的部分", "precision": "device_time",
+            }
+            assert "delivery-secret-must-not-leak" not in response.text
+
+            for index in range(205, 405):
+                self.runtime.history.conversation.append(
+                    SYSTEM_SPEECH,
+                    conversation_id="conversation-remote",
+                    turn_id=f"turn-long-{index}",
+                    speech_id=f"speech-long-{index}",
+                    text="界" * 4_000,
+                    status="completed",
+                    delivery={
+                        "status": "full", "termination": "completed",
+                        "heard_text": "听到" * 4_000,
+                        "uncertain_text": "不确定" * 4_000,
+                        "unheard_text": "未听到" * 4_000,
+                    },
+                )
+
+            large = await product_snapshot()
+            assert large.status_code == 200, large.text
+            large_snapshot = large.json()["body"]
+            large_conversation = large_snapshot["conversation"]
+            sequences = [item["seq"] for item in large_conversation["entries"]]
+            assert large_conversation["latest_seq"] == 405
+            assert sequences and sequences == sorted(set(sequences))
+            assert sequences[-1] == 405
+            assert len(large_conversation["entries"]) <= 200
+            assert all(len(item["text"]) <= 4_000 for item in large_conversation["entries"])
+            assert all(len(item["delivery"].get("heard_text", "")) <= 1_000
+                       for item in large_conversation["entries"])
+            assert len(json.dumps(large_conversation, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1_048_576
+            assert len(large.content) <= 2 * 1024 * 1024
+
+            # A new session snapshot starts from the new ledger head, never the previous session's entries.
+            self.runtime.history.conversation.reset()
+            self.runtime.state.clear_current()
+            reset = await product_snapshot()
+            assert reset.status_code == 200, reset.text
+            reset_conversation = reset.json()["body"]["conversation"]
+            assert reset_conversation["latest_seq"] == 0
+            assert reset_conversation["entries"] == []
+            assert reset_conversation["current"]["turn_id"] is None
+
+        asyncio.run(scenario())
+
+    def test_remote_management_maps_typed_tts_and_hotword_operations_without_file_paths(self) -> None:
+        from voice_terminal.server.http_api import _remote_management_request_spec
+
+        assert _remote_management_request_spec("hotwords.preview", {"value": {"text": "测试"}}) == (
+            "POST", "/api/v1/product/hotwords/preview", {"text": "测试"},
+        )
+        assert _remote_management_request_spec("product.devices.select", {"value": {
+            "device_id": "client-a", "expected_interaction_generation": 3,
+        }}) == (
+            "POST", "/api/v1/devices/interaction",
+            {"device_id": "client-a", "expected_interaction_generation": 3},
+        )
+        assert _remote_management_request_spec("settings.screen_capture.save", {"value": {
+            "enabled": True,
+        }}) == ("PUT", "/api/v1/product/settings/screen-capture", {"enabled": True})
+        assert _remote_management_request_spec("tts.voices.read", {"model_id": "aniflive"}) == (
+            "GET", "/api/v1/tts/voices/aniflive", None,
+        )
+        assert _remote_management_request_spec("tts.voices.capabilities", {"model_id": "aniflive"}) == (
+            "GET", "/api/v1/tts/voices/aniflive/capabilities", None,
+        )
+        assert _remote_management_request_spec("tts.voices.update", {
+            "model_id": "aniflive", "voice_id": "voice-1",
+            "value": {"name": "测试音色", "expected_revision": 2},
+        }) == (
+            "PUT", "/api/v1/tts/voices/aniflive/voice-1",
+            {"name": "测试音色", "expected_revision": 2},
+        )
+        assert _remote_management_request_spec("tts.operation.cancel", {"operation_id": "op-123"}) == (
+            "POST", "/api/v1/tts/operations/op-123/cancel", {},
+        )
+        assert _remote_management_request_spec("tts.assets.clip", {
+            "model_id": "aniflive", "asset_id": "asset-1", "value": {"start_ms": 20, "end_ms": 80},
+        }) == (
+            "POST", "/api/v1/tts/assets/aniflive/asset-1/clip", {"start_ms": 20, "end_ms": 80},
+        )
+        prepare_args = {"model_id":"minimax-female-shaonv-zh","purpose":"source_and_asset",
+            "filename":"reference.wav","expected_bytes":4096,"parent_request_id":"tts-parent-1"}
+        assert _remote_management_request_spec("tts.assets.import.prepare", prepare_args) == (
+            "POST", "/internal/application/tts-assets/import/prepare", prepare_args,
+        )
+        commit_args = {**prepare_args,"expected_sha256":"a" * 64,"transfer_id":"b" * 32}
+        assert _remote_management_request_spec("tts.assets.import.commit", commit_args) == (
+            "POST", "/internal/application/tts-assets/import/commit", commit_args,
+        )
+        abort_args = {"parent_request_id":"tts-parent-1","transfer_id":"b" * 32}
+        assert _remote_management_request_spec("tts.assets.import.abort", abort_args) == (
+            "POST", "/internal/application/tts-assets/import/abort", abort_args,
+        )
+        audio_args = {"value":{"model_id":"minimax-female-shaonv-zh","asset_id":"a" * 32}}
+        assert _remote_management_request_spec("tts.assets.audio.read", audio_args) == (
+            "POST", "/internal/application/tts-assets/audio/read", audio_args["value"],
+        )
+        approval_args = {"approval_id": "approval-1", "decision": "rejected", "run_seq": 3}
+        assert _remote_management_request_spec("dsh.approval.decide", approval_args) == (
+            "POST", "/internal/application/dsh-approval", approval_args,
+        )
+        for invalid_approval in (
+            {**approval_args, "path": "/api/v1/application/control"},
+            {**approval_args, "run_seq": True},
+            {**approval_args, "run_seq": 1 << 53},
+            {**approval_args, "decision": {"allowed": True}},
+            {**approval_args, "approval_id": " "},
+        ):
+            with self.subTest(invalid_approval=invalid_approval), self.assertRaisesRegex(ValueError, "DSH 权限答复"):
+                _remote_management_request_spec("dsh.approval.decide", invalid_approval)
+        with self.assertRaisesRegex(ValueError, "TTS 音频读取"):
+            _remote_management_request_spec("tts.assets.audio.read", {
+                "value":{"model_id":"minimax-female-shaonv-zh","asset_id":"a" * 32,"path":"C:/private"},
+            })
+        with self.assertRaisesRegex(ValueError, "TTS 单文件导入操作字段"):
+            _remote_management_request_spec("tts.assets.import.commit", {**commit_args,"path":"C:/bad"})
+        assert _remote_management_request_spec("tts.aniflive.import.reference", {
+            "task_id": "task-1", "value": {"reference_text": "你好", "reference_language": "zh"},
+        }) == (
+            "POST", "/api/v1/tts/aniflive/import/jobs/task-1/reference",
+            {"reference_text": "你好", "reference_language": "zh"},
+        )
+        assert _remote_management_request_spec("tts.aniflive.import.scan", {"value": {
+            "source_type": "huggingface", "source": "owner/repository",
+        }}) == (
+            "POST", "/api/v1/tts/aniflive/import/scan",
+            {"source_type": "huggingface", "source": "owner/repository"},
+        )
+        assert _remote_management_request_spec("speaker.enrollment.capture_stop", {
+            "enrollment_id": "enrollment-1", "value": {"capture_id": "capture-1", "cancel": True},
+        }) == (
+            "POST", "/api/v1/speaker/enrollment/enrollment-1/capture/stop",
+            {"capture_id": "capture-1", "cancel": True},
+        )
+        assert _remote_management_request_spec("speaker.template.update", {
+            "template_id": "template-1", "value": {"include_in_centroid": False},
+        }) == (
+            "PATCH", "/api/v1/speaker/templates/template-1", {"include_in_centroid": False},
+        )
+        with self.assertRaisesRegex(ValueError, "客户端本机目录"):
+            _remote_management_request_spec("tts.aniflive.import.scan", {"value": {
+                "source_type": "local", "source": "C:/client/data/models",
+            }})
+        with self.assertRaisesRegex(ValueError, "资源编号无效"):
+            _remote_management_request_spec("tts.voices.read", {"model_id": "../outside"})
+        with self.assertRaisesRegex(ValueError, "固定白名单"):
+            _remote_management_request_spec("tts.assets.upload", {"path": "client-local-path.wav"})
+
+    def test_remote_dsh_approval_uses_authenticated_host_handler_and_internal_token(self) -> None:
+        async def scenario():
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "client-dsh-approval"
+            host_id = "host-dsh-approval"
+            self.runtime.device_host_id = host_id
+            self.runtime.device_trust_store.approve(
+                device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000,
+            )
+            opened, _headers = await self._signed_gateway_request(
+                private_key, device_id, "/v1/session/open",
+                {"protocol_version": 1, "capabilities": ["audio_stream"]},
+            )
+            assert opened.status_code == 200
+            generation = opened.json()["connection_generation"]
+            fields = {
+                "protocol_version": "远程管理协议版本",
+                "request_id": "唯一操作编号",
+                "target_host_id": "目标服务端设备编号",
+                "session_generation": "当前管理会话代次",
+                "operation": "固定服务端业务操作编号",
+                "arguments": "审批标识、决定及 DSH 运行序号",
+            }
+
+            class FakeDshShadowSession:
+                def __init__(self):
+                    self.decisions = []
+
+                async def decide_approval(self, approval_id, decision, run_seq):
+                    self.decisions.append((approval_id, decision, run_seq))
+                    return {"result": "accepted", "fields": {"result": "权威服务端已接受的决定"}}
+
+            session = FakeDshShadowSession()
+            self.runtime.shadow_session = session
+
+            async def management(operation, arguments, *, target=host_id, session_generation=generation):
+                from uuid import uuid4
+
+                payload = {
+                    "protocol_version": 1,
+                    "request_id": uuid4().hex,
+                    "target_host_id": target,
+                    "session_generation": session_generation,
+                    "operation": operation,
+                    "arguments": arguments,
+                    "fields": fields,
+                }
+                return (await self._signed_gateway_request(
+                    private_key, device_id, "/v1/management", payload,
+                ))[0]
+
+            with patch("voice_terminal.server.http_api.DshShadowAgentSession", FakeDshShadowSession):
+                with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": "isolated-host-token"}):
+                    accepted = await management("dsh.approval.decide", {
+                        "approval_id": "approval-9",
+                        "decision": "allowed-until-silence",
+                        "run_seq": 12,
+                    })
+                    assert accepted.status_code == 200, accepted.text
+                    assert accepted.json()["status"] == 200
+                    assert accepted.json()["body"]["result"] == "accepted"
+                    assert session.decisions == [("approval-9", "allowed-until-silence", 12)]
+                    assert "isolated-host-token" not in accepted.text
+
+                    for arguments in (
+                        {"approval_id": "approval-9", "decision": "allowed-once", "run_seq": True},
+                        {"approval_id": "approval-9", "decision": "unknown", "run_seq": 12},
+                        {"approval_id": "approval-9", "decision": "rejected", "run_seq": 12,
+                         "url": "http://127.0.0.1/api/v1/settings/inference"},
+                    ):
+                        rejected = await management("dsh.approval.decide", arguments)
+                        assert rejected.status_code == 422, rejected.text
+                    arbitrary = await management("dsh.approval.decide?path=/internal/application/control", {
+                        "approval_id": "approval-9", "decision": "rejected", "run_seq": 12,
+                    })
+                    assert arbitrary.status_code == 422
+                    wrong_host = await management("dsh.approval.decide", {
+                        "approval_id": "approval-9", "decision": "rejected", "run_seq": 12,
+                    }, target="another-host")
+                    assert wrong_host.status_code == 409
+                    stale_session = await management("dsh.approval.decide", {
+                        "approval_id": "approval-9", "decision": "rejected", "run_seq": 12,
+                    }, session_generation=generation + 1)
+                    assert stale_session.status_code == 409
+                    assert session.decisions == [("approval-9", "allowed-until-silence", 12)]
+
+                with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": ""}):
+                    unavailable = await management("dsh.approval.decide", {
+                        "approval_id": "approval-9", "decision": "rejected", "run_seq": 12,
+                    })
+                assert unavailable.status_code == 503
+                assert session.decisions == [("approval-9", "allowed-until-silence", 12)]
+
+        asyncio.run(scenario())
+
+    def test_remote_management_wake_task_create_preserves_host_authorization_and_payload(self) -> None:
+        from voice_terminal.server.http_api import _remote_management_request_spec
+
+        value = {"text": "测试提醒", "at": "2026-11-17T12:00:00+08:00"}
+        assert _remote_management_request_spec("wake_task.create", {"value": value}) == (
+            "POST", "/internal/application/wake-tasks", value,
+        )
+        for arguments in ({}, {"value": []}, {"value": value, "task_id": "unexpected"}):
+            with self.assertRaisesRegex(ValueError, "JSON 对象参数 value"):
+                _remote_management_request_spec("wake_task.create", arguments)
+
+    def test_remote_tts_asset_import_uses_dft_ticket_and_idempotent_library_commit(self) -> None:
+        async def scenario():
+            import hashlib
+            import io
+            import numpy as np
+            import soundfile as sf
+            from voice_terminal.server.http_api import device_file_transfer_id
+            from voice_terminal.devices.file_transfer import MAX_CHUNK_BYTES
+
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "tts-import-client"
+            host_id = "tts-import-host"
+            self.runtime.device_host_id = host_id
+            self.runtime.device_trust_store.approve(device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000)
+            opened, _ = await self._signed_gateway_request(private_key, device_id, "/v1/session/open",
+                {"protocol_version":1,"capabilities":["file_transfer"]})
+            assert opened.status_code == 200, opened.text
+            lease = opened.json()
+            connection = self.runtime.device_registry.connection(device_id)
+            assert connection is not None
+            model_id = self.runtime.config.tts.local_model
+
+            async def management(request_id, operation, arguments, *, session_generation=None,
+                                 expected_http_status=200):
+                payload = {"protocol_version":1,"request_id":request_id,"target_host_id":host_id,
+                    "session_generation":session_generation or lease["connection_generation"],
+                    "operation":operation,"arguments":arguments,
+                    "fields":{"protocol_version":"远程管理协议版本","request_id":"稳定操作编号",
+                        "target_host_id":"目标服务端编号","session_generation":"当前设备会话代次",
+                        "operation":"固定管理操作","arguments":"固定操作参数"}}
+                response, _ = await self._signed_gateway_request(private_key, device_id, "/v1/management", payload)
+                assert response.status_code == expected_http_status, response.text
+                return response.json()
+
+            sample_rate = 16_000
+            time_axis = np.arange(sample_rate * 5, dtype=np.float32) / sample_rate
+            signal = (0.15 * np.sin(2 * np.pi * 220 * time_axis)).astype(np.float32)
+            wav = io.BytesIO()
+            sf.write(wav, signal, sample_rate, format="WAV", subtype="PCM_16")
+            content = wav.getvalue()
+            digest = hashlib.sha256(content).hexdigest()
+            parent_request_id = "tts-import-parent-1"
+            prepare_arguments = {"model_id":model_id,"purpose":"source_and_asset",
+                "filename":"reference.wav","expected_bytes":len(content),
+                "parent_request_id":parent_request_id}
+            prepared = await management("a" * 32, "tts.assets.import.prepare", prepare_arguments)
+            assert prepared["status"] == 200, prepared["body"]
+            ticket = prepared["body"]
+            expected_transfer_id = device_file_transfer_id(connection, parent_request_id)
+            assert ticket["transfer_id"] == expected_transfer_id
+            assert ticket["expected_bytes"] == len(content)
+            assert "path" not in ticket and "staging_dir" not in ticket
+
+            store = self.runtime.device_file_transfer_store
+            library = self.runtime.voice_library.for_model(model_id)
+            channel = store.open_device_file_channel(transfer_id=expected_transfer_id, device_id=device_id,
+                connection_generation=lease["connection_generation"],executor_generation=lease["executor_generation"],
+                operation="file.sftp.upload",maximum_bytes=len(content))
+            channel_key = {"transfer_id":expected_transfer_id,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],"executor_generation":lease["executor_generation"],
+                "channel_token":channel["channel_token"]}
+            for offset in range(0, len(content), MAX_CHUNK_BYTES):
+                chunk = content[offset:offset + MAX_CHUNK_BYTES]
+                store.append_device_channel_chunk(**channel_key,offset=offset,
+                    data_base64=base64.b64encode(chunk).decode("ascii"),
+                    chunk_sha256=hashlib.sha256(chunk).hexdigest())
+            store.finish_device_channel_upload(**channel_key,expected_bytes=len(content),expected_sha256=digest)
+            commit_arguments = {**prepare_arguments,"expected_sha256":digest,"transfer_id":expected_transfer_id}
+            committed = await management("b" * 32,"tts.assets.import.commit",commit_arguments)
+            assert committed["status"] == 200, committed["body"]
+            result = committed["body"]
+            assert set(result) == {"asset","source"}
+            assert result["asset"]["asset_id"] != result["source"]["asset_id"]
+            assert expected_transfer_id not in store._records
+            before_count = len(self.runtime.voice_library.for_model(model_id)._index["assets"])
+            repeated = await management("c" * 32,"tts.assets.import.commit",commit_arguments)
+            assert repeated["status"] == 200, repeated["body"]
+            assert repeated["body"] == result
+            assert expected_transfer_id not in store._records
+            assert len(self.runtime.voice_library.for_model(model_id)._index["assets"]) == before_count
+
+            # 模拟 VoiceLibrary（音色库）已提交、HTTP 回执丢失但 DFT 暂存仍在的重放路径。
+            replay_parent = "tts-import-replay-parent"
+            replay_prepare = {**prepare_arguments, "purpose":"asset", "parent_request_id":replay_parent}
+            replay_ticket_result = await management("2" * 32, "tts.assets.import.prepare", replay_prepare)
+            assert replay_ticket_result["status"] == 200, replay_ticket_result["body"]
+            replay_transfer_id = replay_ticket_result["body"]["transfer_id"]
+            replay_channel = store.open_device_file_channel(transfer_id=replay_transfer_id, device_id=device_id,
+                connection_generation=lease["connection_generation"],executor_generation=lease["executor_generation"],
+                operation="file.sftp.upload",maximum_bytes=len(content))
+            replay_channel_key = {"transfer_id":replay_transfer_id,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],"executor_generation":lease["executor_generation"],
+                "channel_token":replay_channel["channel_token"]}
+            for offset in range(0, len(content), MAX_CHUNK_BYTES):
+                chunk = content[offset:offset + MAX_CHUNK_BYTES]
+                store.append_device_channel_chunk(**replay_channel_key,offset=offset,
+                    data_base64=base64.b64encode(chunk).decode("ascii"),
+                    chunk_sha256=hashlib.sha256(chunk).hexdigest())
+            store.finish_device_channel_upload(**replay_channel_key,expected_bytes=len(content),expected_sha256=digest)
+            replay_binding = {"transfer_id":replay_transfer_id,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],"executor_generation":lease["executor_generation"],
+                "parent_request_id":replay_parent,"model_id":model_id,"purpose":"asset",
+                "filename":"reference.wav","expected_bytes":len(content),"expected_sha256":digest}
+            replay_staged, replay_verified = store.read_tts_asset_import(**replay_binding)
+            assert replay_verified == replay_binding
+            durable_result = await asyncio.to_thread(library.commit_remote_import, replay_staged, **replay_binding)
+            assert replay_transfer_id in store._records
+            replay_commit_arguments = {**replay_prepare,"expected_sha256":digest,"transfer_id":replay_transfer_id}
+            replayed = await management("3" * 32,"tts.assets.import.commit",replay_commit_arguments)
+            assert replayed["status"] == 200 and replayed["body"] == durable_result
+            assert replay_transfer_id not in store._records
+
+            mismatched_transfer = {**commit_arguments,"transfer_id":"f" * 32}
+            rejected = await management("d" * 32,"tts.assets.import.commit",mismatched_transfer)
+            assert rejected["status"] == 409
+            stale = await management("e" * 32,"tts.assets.import.commit",commit_arguments,
+                session_generation=lease["connection_generation"] + 1, expected_http_status=409)
+            assert "detail" in stale
+
+            abort_parent = "tts-import-abort-1"
+            abort_arguments = {"model_id":"aniflive","purpose":"source","filename":"abort.wav",
+                "expected_bytes":len(content),"parent_request_id":abort_parent}
+            abort_ticket = await management("f" * 32,"tts.assets.import.prepare",abort_arguments)
+            assert abort_ticket["status"] == 200
+            abort_id = abort_ticket["body"]["transfer_id"]
+            aborted = await management("1" * 32,"tts.assets.import.abort",
+                {"parent_request_id":abort_parent,"transfer_id":abort_id})
+            assert aborted["status"] == 200 and aborted["body"]["aborted"] is True
+            assert abort_id not in store._records
+
+            closed, _ = await self._signed_gateway_request(private_key, device_id,"/v1/session/close",
+                {"protocol_version":1,"connection_generation":lease["connection_generation"],
+                 "executor_generation":lease["executor_generation"]})
+            assert closed.status_code == 200
+
+        token = "test-tts-import-internal-token"
+        with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": token}):
+            asyncio.run(scenario())
+
+    def test_remote_tts_asset_audio_read_returns_bounded_pathless_library_bytes(self) -> None:
+        async def scenario():
+            import hashlib
+            import io
+            import numpy as np
+            import soundfile as sf
+
+            private_key = Ed25519PrivateKey.generate()
+            device_id = "tts-audio-client"
+            host_id = "tts-audio-host"
+            self.runtime.device_host_id = host_id
+            self.runtime.device_trust_store.approve(device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000)
+            opened, _ = await self._signed_gateway_request(private_key, device_id, "/v1/session/open",
+                {"protocol_version":1,"capabilities":["file_transfer"]})
+            assert opened.status_code == 200, opened.text
+            lease = opened.json()
+            model_id = self.runtime.config.tts.local_model
+            library = self.runtime.voice_library.for_model(model_id)
+
+            sample_rate = 16_000
+            time_axis = np.arange(sample_rate * 5, dtype=np.float32) / sample_rate
+            signal = (0.15 * np.sin(2 * np.pi * 220 * time_axis)).astype(np.float32)
+            wav = io.BytesIO()
+            sf.write(wav, signal, sample_rate, format="WAV", subtype="PCM_16")
+            imported = await asyncio.to_thread(library.put_import, wav.getvalue(), "reference.wav")
+            asset_id = imported["asset_id"]
+            imported_pcm = np.frombuffer(wav.getvalue()[44:], dtype="<i2")
+            hifi_result = await asyncio.to_thread(library.put_high_fidelity_pcm, asset_id,
+                imported_pcm.tobytes(), sample_rate=32_000)
+            high_fidelity = library.high_fidelity_path(asset_id)
+            assert high_fidelity is not None and hifi_result
+            stored_high_fidelity_digest = hashlib.sha256(high_fidelity.read_bytes()).hexdigest()
+            with library._lock:
+                library._index["assets"][asset_id]["remote_import"] = {
+                    "stored_sha256": hashlib.sha256(library.asset_bytes(asset_id)).hexdigest(),
+                    "high_fidelity_sha256": stored_high_fidelity_digest,
+                }
+            expected_audio = high_fidelity.read_bytes() if high_fidelity else library.asset_bytes(asset_id)
+            expected_media_type = "audio/wav" if high_fidelity else library.asset_media_type(asset_id)
+            assert 0 < len(expected_audio) <= 1024 * 1024
+
+            async def management(request_id, arguments, *, session_generation=None, expected_http_status=200):
+                payload = {"protocol_version":1,"request_id":request_id,"target_host_id":host_id,
+                    "session_generation":session_generation or lease["connection_generation"],
+                    "operation":"tts.assets.audio.read","arguments":arguments,
+                    "fields":{"protocol_version":"远程管理协议版本","request_id":"稳定操作编号",
+                        "target_host_id":"目标服务端编号","session_generation":"当前设备会话代次",
+                        "operation":"固定 TTS 音频读取操作","arguments":"model_id 与 asset_id 固定参数"}}
+                response, _ = await self._signed_gateway_request(private_key, device_id, "/v1/management", payload)
+                assert response.status_code == expected_http_status, response.text
+                return response.json()
+
+            response = await management("a" * 32, {"value":{"model_id":model_id,"asset_id":asset_id}})
+            assert response["status"] == 200, response["body"]
+            result = response["body"]
+            assert base64.b64decode(result["data_base64"], validate=True) == expected_audio
+            assert result["media_type"] == expected_media_type
+            assert result["bytes"] == len(expected_audio)
+            assert result["sha256"] == hashlib.sha256(expected_audio).hexdigest()
+            assert set(result["fields"]) == {"data_base64","media_type","bytes","sha256"}
+            assert "path" not in result and "staging_dir" not in result
+            assert str(self.root) not in str(result)
+
+            # 超过 1 MiB 的高保真副本应回退为登记的规范资产字节。
+            large_hifi_import = await asyncio.to_thread(library.put_import, wav.getvalue(), "large-hifi.wav")
+            large_hifi_id = large_hifi_import["asset_id"]
+            await asyncio.to_thread(library.put_high_fidelity_pcm, large_hifi_id,
+                b"\x00\x00" * 600_000, sample_rate=48_000)
+            large_hifi_path = library.high_fidelity_path(large_hifi_id)
+            assert large_hifi_path is not None and large_hifi_path.stat().st_size > 1024 * 1024
+            canonical_audio = library.asset_bytes(large_hifi_id)
+            fallback = await management("f" * 32,
+                {"value":{"model_id":model_id,"asset_id":large_hifi_id}})
+            assert fallback["status"] == 200, fallback["body"]
+            fallback_body = fallback["body"]
+            assert base64.b64decode(fallback_body["data_base64"], validate=True) == canonical_audio
+            assert fallback_body["media_type"] == library.asset_media_type(large_hifi_id)
+            assert fallback_body["bytes"] == len(canonical_audio) <= 1024 * 1024
+            assert fallback_body["sha256"] == hashlib.sha256(canonical_audio).hexdigest()
+
+            # 被登记的导入高保真摘要与当前副本不一致时，预览必须拒绝回传。
+            corrupt_import = await asyncio.to_thread(library.put_import, wav.getvalue(), "corrupt-hifi.wav")
+            corrupt_id = corrupt_import["asset_id"]
+            await asyncio.to_thread(library.put_high_fidelity_pcm, corrupt_id,
+                imported_pcm.tobytes(), sample_rate=32_000)
+            corrupt_path = library.high_fidelity_path(corrupt_id)
+            assert corrupt_path is not None
+            registered_digest = hashlib.sha256(corrupt_path.read_bytes()).hexdigest()
+            with library._lock:
+                library._index["assets"][corrupt_id]["remote_import"] = {
+                    "stored_sha256": hashlib.sha256(library.asset_bytes(corrupt_id)).hexdigest(),
+                    "high_fidelity_sha256": registered_digest,
+                }
+            damaged = bytearray(corrupt_path.read_bytes())
+            damaged[-1] ^= 1
+            corrupt_path.write_bytes(damaged)
+            corrupt_preview = await management("1" * 32,
+                {"value":{"model_id":model_id,"asset_id":corrupt_id}})
+            assert corrupt_preview["status"] == 409
+            forged_internal = await self._request("POST", "/internal/application/tts-assets/audio/read",
+                json={"model_id":model_id,"asset_id":asset_id,
+                    "_authenticated_device_id":device_id,
+                    "_connection_generation":lease["connection_generation"],
+                    "_executor_generation":lease["executor_generation"]})
+            assert forged_internal.status_code == 403
+
+            invalid_asset = await management("b" * 32,
+                {"value":{"model_id":model_id,"asset_id":"../outside"}})
+            assert invalid_asset["status"] == 422
+            missing = await management("c" * 32,
+                {"value":{"model_id":model_id,"asset_id":"f" * 32}})
+            assert missing["status"] == 404
+            oversized_asset = await asyncio.to_thread(
+                library.put_source, b"x" * (1024 * 1024 + 1), "large-reference.wav",
+            )
+            oversized = await management("d" * 32,
+                {"value":{"model_id":model_id,"asset_id":oversized_asset["asset_id"]}})
+            assert oversized["status"] == 413
+
+            stale = await management("e" * 32, {"value":{"model_id":model_id,"asset_id":asset_id}},
+                session_generation=lease["connection_generation"] + 1, expected_http_status=409)
+            assert "detail" in stale
+
+            limited_private_key = Ed25519PrivateKey.generate()
+            limited_device_id = "tts-audio-limited-client"
+            self.runtime.device_trust_store.approve(limited_device_id,
+                self._ssh_public_key(limited_private_key), trusted_at_ms=1_000)
+            limited_opened, _ = await self._signed_gateway_request(limited_private_key, limited_device_id,
+                "/v1/session/open", {"protocol_version":1,"capabilities":["audio_stream"]})
+            assert limited_opened.status_code == 200, limited_opened.text
+            limited_lease = limited_opened.json()
+            limited_payload = {"protocol_version":1,"request_id":"f" * 32,"target_host_id":host_id,
+                "session_generation":limited_lease["connection_generation"],
+                "operation":"tts.assets.audio.read",
+                "arguments":{"value":{"model_id":model_id,"asset_id":asset_id}},
+                "fields":{"protocol_version":"远程管理协议版本","request_id":"稳定操作编号",
+                    "target_host_id":"目标服务端编号","session_generation":"当前设备会话代次",
+                    "operation":"固定 TTS 音频读取操作","arguments":"model_id 与 asset_id 固定参数"}}
+            limited_response, _ = await self._signed_gateway_request(limited_private_key, limited_device_id,
+                "/v1/management", limited_payload)
+            assert limited_response.status_code == 403, limited_response.text
+
+            for key, ident, current_lease in ((private_key, device_id, lease),
+                                               (limited_private_key, limited_device_id, limited_lease)):
+                closed, _ = await self._signed_gateway_request(key, ident, "/v1/session/close",
+                    {"protocol_version":1,"connection_generation":current_lease["connection_generation"],
+                     "executor_generation":current_lease["executor_generation"]})
+                assert closed.status_code == 200
+
+        with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": "test-tts-audio-internal-token"}):
+            asyncio.run(scenario())
 
     def test_signed_remote_session_routes_dsh_tasks_and_queries_original_receipt(self) -> None:
         from types import SimpleNamespace
@@ -474,10 +1357,24 @@ class ProductApiTests(unittest.TestCase):
             upload_task = upload_poll.json()["task"]
             assert upload_task["operation"] == "file.sftp.upload"
             assert upload_task["arguments"]["local_path"] == read_body["path"]
-            with open(upload_task["arguments"]["remote_path"], "xb") as handle:
-                handle.write(source)
-            upload_receipt = {"path":upload_task["arguments"]["remote_path"],"bytes":len(source),
-                "sha256":source_sha,"transfer_id":upload_task["arguments"]["transfer_id"]}
+            assert "remote_path" not in upload_task["arguments"]
+            assert upload_task["arguments"]["parent_request_id"] == read_body["request_id"]
+            transfer_id = upload_task["arguments"]["transfer_id"]
+            store = self.runtime.device_file_transfer_store
+            channel = store.open_device_file_channel(transfer_id=transfer_id, device_id=device_id,
+                connection_generation=lease["connection_generation"], executor_generation=lease["executor_generation"],
+                operation="file.sftp.upload", maximum_bytes=len(source))
+            channel_key = {"transfer_id":transfer_id,"device_id":device_id,
+                "connection_generation":lease["connection_generation"],"executor_generation":lease["executor_generation"],
+                "channel_token":channel["channel_token"]}
+            for offset in range(0, len(source), 64 * 1024):
+                part = source[offset:offset + 64 * 1024]
+                store.append_device_channel_chunk(**channel_key, offset=offset,
+                    data_base64=base64.b64encode(part).decode("ascii"),
+                    chunk_sha256=__import__("hashlib").sha256(part).hexdigest())
+            store.finish_device_channel_upload(**channel_key, expected_bytes=len(source), expected_sha256=source_sha)
+            upload_receipt = {"path":f"transfer:{transfer_id}","bytes":len(source),
+                "sha256":source_sha,"transfer_id":transfer_id}
             upload_complete = {"protocol_version":1,"connection_generation":lease["connection_generation"],
                 "executor_generation":lease["executor_generation"],"task_id":upload_task["task_id"],
                 "sequence":upload_task["sequence"],"core_session_id":upload_task["core_session_id"],
@@ -530,7 +1427,22 @@ class ProductApiTests(unittest.TestCase):
             download_task = download_poll.json()["task"]
             assert download_task["operation"] == "file.sftp.download"
             assert download_task["arguments"]["local_path"] == write_body["path"]
-            download_receipt = {"path":download_task["arguments"]["remote_path"],"bytes":len(attachment),
+            assert "remote_path" not in download_task["arguments"]
+            assert download_task["arguments"]["parent_request_id"] == write_body["request_id"]
+            download_channel = store.open_device_file_channel(transfer_id=ticket["transfer_id"], device_id=device_id,
+                connection_generation=lease["connection_generation"], executor_generation=lease["executor_generation"],
+                operation="file.sftp.download", maximum_bytes=len(attachment), expected_sha256=attachment_sha)
+            download_key = {"transfer_id":ticket["transfer_id"],"device_id":device_id,
+                "connection_generation":lease["connection_generation"],"executor_generation":lease["executor_generation"],
+                "channel_token":download_channel["channel_token"]}
+            downloaded = bytearray()
+            for offset in range(0, len(attachment), 64 * 1024):
+                part = store.read_device_channel_chunk(**download_key, offset=offset, limit=64 * 1024)
+                downloaded.extend(base64.b64decode(part["data_base64"], validate=True))
+            assert bytes(downloaded) == attachment
+            store.finish_device_channel_download(**download_key,
+                expected_bytes=len(attachment), expected_sha256=attachment_sha)
+            download_receipt = {"path":f"transfer:{ticket['transfer_id']}","bytes":len(attachment),
                 "sha256":attachment_sha,"transfer_id":ticket["transfer_id"]}
             download_complete = {"protocol_version":1,"connection_generation":lease["connection_generation"],
                 "executor_generation":lease["executor_generation"],"task_id":download_task["task_id"],
@@ -576,7 +1488,7 @@ class ProductApiTests(unittest.TestCase):
                 )
                 assert opened.status_code == 200
                 pairing_code = opened.json()["pairing_code"]
-                assert len(pairing_code) == 8 and pairing_code.isdigit()
+                assert len(pairing_code) == 6 and pairing_code.isdigit()
                 assert not (self.root / ".local" / "state" / "device-trust.json").exists()
 
                 private_key = Ed25519PrivateKey.generate()
@@ -680,6 +1592,111 @@ class ProductApiTests(unittest.TestCase):
                     "POST", "/internal/application/device-pairing", json={"operation": "close"}, headers=headers,
                 )
                 assert closed.status_code == 200 and closed.json()["window_open"] is False
+        asyncio.run(scenario())
+
+    def test_revoking_audio_stream_only_device_closes_media_lease_and_recovers_local(self) -> None:
+        async def scenario():
+            class LocalCapture:
+                def __init__(self) -> None:
+                    self.running = False
+                    self.diagnostics = {}
+
+                async def start(self) -> None:
+                    self.running = True
+
+                async def stop(self) -> None:
+                    self.running = False
+
+                async def read_frame(self):
+                    await asyncio.Future()
+
+                def pending_frame_count(self) -> int:
+                    return 0
+
+                def read_pending_frame(self):
+                    raise asyncio.QueueEmpty
+
+                def preroll(self, _milliseconds: int) -> bytes:
+                    return b""
+
+            device_id = "audio-only-client"
+            private_key = Ed25519PrivateKey.generate()
+            self.runtime.device_trust_store.approve(
+                device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000,
+            )
+            capture_route = SelectableCapturePort(LocalCapture())
+            self.runtime._capture_router = capture_route
+            await capture_route.start()
+
+            class ListeningController:
+                def __init__(self, runtime) -> None:
+                    self.runtime = runtime
+
+                async def stop_listening(self) -> None:
+                    self.runtime.state.listening = False
+                    await capture_route.stop()
+
+                async def start_listening(self) -> None:
+                    await capture_route.start()
+                    self.runtime.state.listening = True
+
+            self.runtime.controller = ListeningController(self.runtime)
+            self.runtime.state.listening = True
+
+            connection = await self.runtime.open_remote_device_session(device_id, ["audio_stream"])
+            lease = await self.runtime.prepare_interaction_switch(
+                device_id, self.runtime.device_registry.generation,
+            )
+            stream = PcmInputStream(
+                stream_id="stream-audio-only", core_session_id=self.runtime.core_session_id,
+                lease=lease, registry=self.runtime.device_registry,
+                map_device_time=lambda value: (10.0 + value / 1_000_000, 0.001),
+            )
+            capture = RemoteAudioCapture(stream)
+            await self.runtime.select_remote_capture(capture, lease)
+            await self.runtime.complete_remote_interaction_switch(capture, lease)
+            assert self.runtime.device_registry.active == lease
+
+            token = "audio-only-revoke-token"
+            with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": token}):
+                revoked = await self._request(
+                    "POST", "/internal/application/device-pairing",
+                    json={"operation": "revoke", "device_id": device_id},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+            assert revoked.status_code == 200
+            assert revoked.json()["trust"]["devices"][0]["state"] == "revoked"
+            disconnected = self.runtime.device_registry.connection(device_id)
+            assert disconnected is not None and disconnected.connected is False
+            assert not self.runtime.device_registry.accepts(lease)
+            active = self.runtime.device_registry.active
+            assert active is not None and active.device_id == "local"
+            assert capture_route.active_device_id == "local"
+            assert capture.running is False
+
+            late_stream = PcmInputStream(
+                stream_id="stream-late-audio-only", core_session_id=self.runtime.core_session_id,
+                lease=lease, registry=self.runtime.device_registry,
+                map_device_time=lambda value: (20.0 + value / 1_000_000, 0.001),
+            )
+            late_frame = MediaFrame(
+                stream_id="stream-late-audio-only", sequence=0, start_sample=0,
+                sample_count=320, device_time_us=1_000,
+                payload=b"\x00\x00" * 320, device_id=device_id,
+                core_session_id=self.runtime.core_session_id,
+                connection_generation=lease.connection_generation,
+                executor_generation=lease.executor_generation,
+                interaction_generation=lease.interaction_generation,
+            )
+            with self.assertRaisesRegex(MediaProtocolError, "交互设备租约已失效"):
+                late_stream.accept(late_frame)
+            with self.assertRaises(RemoteAudioCaptureError):
+                capture.accept_frame(late_frame)
+
+            await capture_route.stop()
+            await self.runtime.device_remote_sessions.close_all()
+
         asyncio.run(scenario())
 
     def test_dsh_device_list_requires_current_authorized_activation(self) -> None:

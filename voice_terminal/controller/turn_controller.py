@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections import deque
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -17,6 +18,7 @@ from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..vad.barge_in import BargeInGate
 from ..vad.detector import FsmnVadDetector
+from .turn_workspace import AudioProcessingIdentity
 
 
 class InputController:
@@ -65,6 +67,11 @@ class InputController:
         self._active_input = False
         self._closed = False
         self._last_playback_stop_unknown = False  # _last_playback_stop_unknown（最近一次设备停止是否未确认）。
+        self._remote_audio_processing = None  # _remote_audio_processing（当前远端帧的设备前处理快照）。
+        self._remote_audio_processing_identity: AudioProcessingIdentity | None = None  # _remote_audio_processing_identity（当前连接/执行器/交互/媒体流身份）。
+        self._remote_audio_reverse_generation: int | None = None  # _remote_audio_reverse_generation（当前帧序列绑定的反向参考代次）。
+        self._remote_audio_max_interaction_generation: int | None = None  # _remote_audio_max_interaction_generation（拒绝迟到旧租约）。
+        self._remote_audio_retired_identities: deque[AudioProcessingIdentity] = deque(maxlen=32)  # _remote_audio_retired_identities（有界旧媒体流墓碑）。
         self._loop: asyncio.AbstractEventLoop | None = None
         if self.asr is not None:
             self.asr.on_result = self._on_asr_result
@@ -146,6 +153,7 @@ class InputController:
             allowed = getattr(self, "listening_start_allowed", None)
             if allowed is not None and not allowed():
                 return
+            self._clear_remote_audio_processing()
             await self.capture.start()
             if self.audio_processor is not None:
                 self.audio_processor.reset()
@@ -167,6 +175,7 @@ class InputController:
     async def stop_listening(self) -> None:
         self.state.listening = False
         self.state.input_owner = "none"
+        self._clear_remote_audio_processing()
         if self._listen_task is not None:
             self._listen_task.cancel()
             await asyncio.gather(self._listen_task, return_exceptions=True)
@@ -192,7 +201,18 @@ class InputController:
         if self.player is not None:
             self.player.stop()
 
-    def _process_audio(self, chunk: bytes) -> bytes:
+    def _process_audio(
+        self,
+        chunk: bytes,
+        *,
+        audio_processing=None,
+        processing_identity: AudioProcessingIdentity | None = None,
+    ) -> bytes:
+        """_process_audio（处理采集帧）：远端 PCM 已处理，保留其帧级健康证据并跳过本机 AEC。"""
+        if processing_identity is not None:
+            self._accept_remote_audio_processing(audio_processing, processing_identity)
+            return chunk
+        self._clear_remote_audio_processing()
         if self.audio_processor is None:
             return chunk
         processed = self.audio_processor.process(chunk)
@@ -200,6 +220,73 @@ class InputController:
             self.state.current["audio_processing_status"] = self.audio_processor.status
             self.state.current["audio_processing_error"] = self.audio_processor.error or ""
         return processed
+
+    def _accept_remote_audio_processing(self, status, identity: AudioProcessingIdentity) -> None:
+        """_accept_remote_audio_processing（登记远端状态）：租约或反向代次变化时丢弃旧参考。"""
+        if (not isinstance(identity, tuple) or len(identity) != 5
+                or not isinstance(identity[0], str) or not identity[0]
+                or any(type(value) is not int or value < 1 for value in identity[1:4])
+                or not isinstance(identity[4], str) or not identity[4]):
+            raise ValueError("远端音频处理状态缺少有效设备、租约或流身份。")
+        interaction_generation = identity[3]
+        previous_interaction_generation = getattr(self, "_remote_audio_max_interaction_generation", None)
+        if (previous_interaction_generation is not None
+                and interaction_generation < previous_interaction_generation):
+            raise ValueError("远端音频处理状态属于已撤销的交互代次。")
+        retired_identities = getattr(self, "_remote_audio_retired_identities", None)
+        if retired_identities is None:
+            retired_identities = self._remote_audio_retired_identities = deque(maxlen=32)
+        if identity in retired_identities:
+            raise ValueError("远端音频处理状态属于已关闭的媒体流。")
+        if getattr(self, "_remote_audio_processing_identity", None) != identity:
+            previous = getattr(self, "_remote_audio_processing_identity", None)
+            if (previous is not None and interaction_generation == previous[3]
+                    and identity[:4] != previous[:4]):
+                raise ValueError("远端设备租约身份变化但交互代次没有递增。")
+            if previous is not None:
+                retired_identities.append(previous)
+            self._remote_audio_processing = None
+            self._remote_audio_reverse_generation = None
+            self._remote_audio_processing_identity = identity
+        self._remote_audio_max_interaction_generation = max(
+            interaction_generation,
+            previous_interaction_generation or interaction_generation,
+        )
+
+        from ..devices.media_protocol import AudioProcessingStatus
+        if status is None:
+            status = AudioProcessingStatus.unavailable()
+        if not isinstance(status, AudioProcessingStatus):
+            raise ValueError("远端音频处理状态格式无效。")
+        try:
+            status = AudioProcessingStatus.from_wire(status.to_wire())
+        except ValueError as exc:
+            raise ValueError("远端音频处理状态未通过协议校验。") from exc
+        previous_reverse_generation = getattr(self, "_remote_audio_reverse_generation", None)
+        if (previous_reverse_generation is not None
+                and status.reverse_generation < previous_reverse_generation):
+            raise ValueError("远端音频处理状态引用了迟到的播放参考代次。")
+        if (previous_reverse_generation is not None
+                and status.reverse_generation != previous_reverse_generation):
+            # A fresh reverse generation invalidates every cached decision from
+            # the previous playback reference, even when the lease is stable.
+            self._remote_audio_processing = None
+        self._remote_audio_reverse_generation = status.reverse_generation
+        self._remote_audio_processing = status
+        self.state.current["audio_processing_status"] = status.state.upper()
+        self.state.current["audio_processing_error"] = status.error or ""
+
+    def _clear_remote_audio_processing(self) -> None:
+        """_clear_remote_audio_processing（清除设备参考）：切回本机或停听时不复用远端健康状态。"""
+        identity = getattr(self, "_remote_audio_processing_identity", None)
+        if identity is not None:
+            retired = getattr(self, "_remote_audio_retired_identities", None)
+            if retired is None:
+                retired = self._remote_audio_retired_identities = deque(maxlen=32)
+            retired.append(identity)
+        self._remote_audio_processing = None
+        self._remote_audio_processing_identity = None
+        self._remote_audio_reverse_generation = None
 
     async def _stop_playback_snapshot(self, key: str | None = None) -> PlaybackSnapshot | None:
         self._last_playback_stop_unknown = False
@@ -229,10 +316,13 @@ class InputController:
     def _add_playback_delivery_fields(delivery: dict[str, Any], snapshot: PlaybackSnapshot | None) -> dict[str, Any]:
         if snapshot is None:
             return delivery
-        delivery.setdefault("played_ms", snapshot.output_estimated_ms)
-        delivery.setdefault("callback_played_ms", snapshot.played_ms)
-        delivery.setdefault("output_tail_estimated_ms", max(0, snapshot.played_ms - snapshot.output_estimated_ms))
-        delivery.setdefault("playback_precision", snapshot.precision)
+        read = snapshot.get if isinstance(snapshot, dict) else lambda name, default=None: getattr(snapshot, name, default)
+        output_estimated_ms = int(read("output_estimated_ms", 0) or 0)
+        callback_played_ms = int(read("played_ms", 0) or 0)
+        delivery.setdefault("played_ms", output_estimated_ms)
+        delivery.setdefault("callback_played_ms", callback_played_ms)
+        delivery.setdefault("output_tail_estimated_ms", max(0, callback_played_ms - output_estimated_ms))
+        delivery.setdefault("playback_precision", read("precision", "unknown"))
         return delivery
 
     def _barge_in_protected_available(self) -> bool:
@@ -254,9 +344,16 @@ class InputController:
                     return True
             except Exception:
                 pass
+        if getattr(self, "_remote_audio_processing_identity", None) is not None:
+            status = getattr(self, "_remote_audio_processing", None)
+            return bool(status is not None and status.state == "ready"
+                        and status.protected_interruption_available)
         return bool(self.audio_processor and self.audio_processor.enabled and self.audio_processor.protected_interruption_available)
 
     def _near_voice_activity(self) -> bool | None:
+        if getattr(self, "_remote_audio_processing_identity", None) is not None:
+            status = getattr(self, "_remote_audio_processing", None)
+            return (status.near_end_voice if status is not None and status.state == "ready" else None)
         if self.audio_processor is None or not self.audio_processor.enabled:
             return None
         return self.audio_processor.last_voice_activity if self.audio_processor.last_voice_activity is not None else False

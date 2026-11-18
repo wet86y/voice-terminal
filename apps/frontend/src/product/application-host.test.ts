@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  acceptApplicationSnapshot, applicationApiReady, applicationCorePhase, applicationOverlay,
+  acceptApplicationSnapshot, applicationApiReady, applicationCorePhase, applicationOverlay, applicationRemoteModeSelected,
   applicationRuntimeFailure, applicationStateLabel, type ApplicationSnapshot,
 } from './application-host'
 
@@ -60,5 +60,25 @@ describe('独立应用状态投影', () => {
     expect(applicationRuntimeFailure({ ...base, core_phase: 'starting', core_available: false })).toBe(false)
     expect(applicationRuntimeFailure({ ...base, core_phase: 'failed', core_available: false })).toBe(true)
     expect(applicationRuntimeFailure({ ...base, core_phase: 'failed', core_available: false, startup_complete: false })).toBe(false)
+  })
+  it('远程管理连通后允许业务设置，但继续单独报告服务端语音核心状态', () => {
+    const remote = {
+      remote_mode: true,
+      management_connected: true,
+      remote_business_ready: true,
+      core_phase: 'failed',
+      core_available: false,
+      stopping: false,
+    } as ApplicationSnapshot
+    expect(applicationApiReady(remote)).toBe(true)
+    expect(applicationCorePhase(remote)).toBe('failed')
+    expect(applicationApiReady({ ...remote, remote_business_ready: false })).toBe(false)
+    expect(applicationApiReady({ ...remote, management_connected: false })).toBe(false)
+  })
+  it('启动配置已声明远程时，即使尚无快照也保持远程目标选择', () => {
+    expect(applicationRemoteModeSelected(null, true)).toBe(true)
+    expect(applicationRemoteModeSelected({ remote_mode: true } as ApplicationSnapshot)).toBe(true)
+    expect(applicationRemoteModeSelected({ remote_mode: false } as ApplicationSnapshot)).toBe(false)
+    expect(applicationRemoteModeSelected(null)).toBe(false)
   })
 })

@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import time
 
+from ..devices.media_protocol import AudioProcessingStatus
+
+
+AudioProcessingIdentity = tuple[str, int, int, int, str]
 
 @dataclass(frozen=True)
 class AudioFrame:
@@ -10,6 +14,8 @@ class AudioFrame:
     start_sample: int
     captured_at: float
     clock_uncertainty_seconds: float | None = None  # clock_uncertainty_seconds（采集时间映射误差；本机无需映射）。
+    audio_processing: AudioProcessingStatus | None = None  # audio_processing（远端设备对同帧 PCM 的处理健康快照）。
+    processing_identity: AudioProcessingIdentity | None = None  # processing_identity（设备、连接、执行器、交互代次及媒体流编号）。
 
     @property
     def end_sample(self) -> int:

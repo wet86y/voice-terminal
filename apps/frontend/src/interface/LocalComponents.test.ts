@@ -33,6 +33,20 @@ it('网络与占用仅给重试建议，内容恢复失败才进入既有全面�
   wrapper.unmount()
 })
 
+it('远程组件故障不显示本机程序全面校验入口', () => {
+  const value = model()
+  value.remoteTarget = true
+  value.integrityAvailable = false
+  value.managedResourceJobs = [{ id: 'remote-failure', resourceId: 'voice-server', label: '服务端语音依赖',
+    state: 'failed', phase: '恢复失败', canCancel: false,
+    recovery: { event: 'integrity', state: 'integrity_required', next_action: 'check_integrity', message: '服务端需要修复' } }]
+  const wrapper = mount(LocalComponents, { props: { model: value } })
+  expect(wrapper.get('[aria-label="组件恢复处理"]').text()).toContain('服务端需要修复')
+  expect(wrapper.find('[aria-label="组件恢复处理"] button').exists()).toBe(false)
+  expect(wrapper.text()).not.toContain('准备校验程序')
+  wrapper.unmount()
+})
+
 it('模型转换失败入口进入专用导入面板，不请求普通组件下载', async () => {
   const value = model()
   value.managedResourceJobs = [{ id: 'aniflive-import-task', resourceId: 'tts-aniflive-import', label: '模型导入',
@@ -96,6 +110,17 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.emitted('resourceImport')).toEqual([['paraformer-offline']])
     expect(wrapper.emitted('openResourceSource')).toEqual([['paraformer-offline']])
     expect(value.rows[0]!.enhancement!.toggle).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('远程组件卡片隐藏服务端来源跳转并说明限制', async () => {
+    const value = dualPassModel()
+    value.remoteTarget = true
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    expect(card.findAll('button[aria-label$="：跳转"]')).toHaveLength(0)
+    expect(card.text()).toContain('远程模式暂不支持从客户端打开服务端组件来源链接。')
+    expect(card.findAll('button[aria-label="离线精修模型：下载"]')).toHaveLength(1)
     wrapper.unmount()
   })
 
@@ -334,6 +359,21 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.emitted('resourceDownload')).toEqual([['tts-aniflive-tangyuge-v2pp-d78cf598']])
     expect(wrapper.find('[data-category="tts"] .category-download').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('自动准备共用运行程序')
+    wrapper.unmount()
+  })
+  it('远程 AnifLive 模型卡只允许下载，不提供客户端目录导入按钮', async () => {
+    const value = model()
+    value.remoteTarget = true
+    value.rows = [{ id: 'tts-aniflive', category: 'tts', name: 'TTS（语音合成）', state: 'failed', status: '待配置', available: true,
+      runtime: '在线或本地', description: '本地模型或在线接口', facts: [],
+      resourceChoices: [{ id: 'tts-aniflive-tangyuge-v2pp-d78cf598', label: '唐语歌（AnifLive 本地语音）', state: 'missing', status: '缺失', required: false }],
+    }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'tts', 'tts-aniflive')
+    const resource = card.get('[data-model-resource="tts-aniflive-tangyuge-v2pp-d78cf598"]')
+    expect(resource.find('button[aria-label="唐语歌（AnifLive 本地语音）：下载"]').exists()).toBe(true)
+    expect(resource.find('button[aria-label="唐语歌（AnifLive 本地语音）：导入"]').exists()).toBe(false)
+    expect(resource.text()).toContain('不能上传客户端模型目录')
     wrapper.unmount()
   })
   it('全部安装就绪后保留批量导入，并保持语音服务详情入口与运行时摘要', async () => {

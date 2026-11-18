@@ -1,26 +1,64 @@
 //! Resource commands（资源命令）：manage fixed model and DSH resources without Voice service.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, ExitStatus, Stdio},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use voice_desktop_common::remote_import_contract::{
+    valid_source_id, RemoteImportManifest, RemoteImportSourceTicket,
+};
 use voice_desktop_common::LaunchContext;
 
 const PROGRESS_EVENT: &str = "desktop://resource-progress";
 const MAX_PERSISTED_JOBS: usize = 128;
+const REMOTE_IMPORT_TICKET_TTL: Duration = Duration::from_secs(30 * 60); // REMOTE_IMPORT_TICKET_TTL（未提交远程来源有效期）。
+const REMOTE_IMPORT_RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60); // REMOTE_IMPORT_RESULT_TTL（远程来源幂等结果保留时间）。
+const REMOTE_IMPORT_MAX_ACTIVE: usize = 32; // REMOTE_IMPORT_MAX_ACTIVE（并行未提交来源上限）。
+const REMOTE_IMPORT_MAX_RECORDS: usize = 128; // REMOTE_IMPORT_MAX_RECORDS（来源幂等记录上限）。
+const REMOTE_RESET_CONFIRMATION_TTL: Duration = Duration::from_secs(5 * 60); // REMOTE_RESET_CONFIRMATION_TTL（重置计划一次性确认有效期）。
+const REMOTE_RESET_MAX_APPROVALS: usize = 64; // REMOTE_RESET_MAX_APPROVALS（待确认重置计划上限）。
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+
+struct RemoteImportReservation {
+    request_id: String,          // request_id（本次远程来源预留的稳定操作编号）。
+    source_id: String,           // source_id（服务端签发的导入来源编号）。
+    resource_id: Option<String>, // resource_id（服务端绑定的目标资源编号）。
+    staging_dir: PathBuf,        // staging_dir（仅原生进程持有的受管暂存路径）。
+    expires_at: Instant,         // expires_at（原生单调时钟到期时刻）。
+    retain_until: Instant,       // retain_until（操作幂等记录清理时刻）。
+    state: RemoteImportState,    // state（预留、提交、完成或取消状态）。
+}
+
+enum RemoteImportState {
+    Reserved,                         // Reserved（允许 FILE 通道继续写入的未提交来源）。
+    Committing(RemoteImportManifest), // Committing（清单已锁定并正在封存、核验及派发）。
+    Committed {
+        manifest: RemoteImportManifest, // manifest（已核验并绑定的原始文件清单）。
+        result: Value,                  // result（现有导入任务的原始回执）。
+        job_id: String,                 // job_id（资源管理器接受的原任务编号）。
+        committed_dir: PathBuf,         // committed_dir（封存后仅原生任务可读取的导入目录）。
+    },
+    Aborted, // Aborted（已取消、过期或失败后清理的来源）。
+}
+
+struct RemoteResetApproval {
+    resource_id: String, // resource_id（获准重置的固定组件编号）。
+    token: String,       // token（组件清理模块生成的一次性重置范围确认值）。
+    plan: Value,         // plan（原生生成的删除范围预览）。
+    expires_at: Instant, // expires_at（用户确认有效期）。
+}
 
 // ready_import（待接续导入）：失败、取消、参考缺失及已派发任务均不自动重试。
 fn ready_import(task: &Value, id: &str, known: bool) -> bool {
@@ -70,6 +108,12 @@ struct JobControl {
     last_persist: Instant,   // last_persist（最近状态持久化时刻）。
 }
 
+struct PendingImportSelection {
+    resource_id: Option<String>, // resource_id（目标资源编号）：与本次来源选择绑定。
+    sources: Vec<PathBuf>,       // sources（本机来源路径）：仅保留在原生进程，不返回网页。
+    expires_at: Instant,         // expires_at（票据过期时间）：避免来源选择长期悬挂。
+}
+
 struct ControlledProcess {
     child: Child,
     #[cfg(windows)]
@@ -112,6 +156,24 @@ enum JobError {
     },
 }
 
+fn open_ssh_server_job_error(message: String) -> JobError {
+    if message == voice_desktop_common::system_feature::OPENSSH_SERVER_UAC_CANCELLED_ERROR {
+        JobError::Cancelled
+    } else {
+        JobError::Failed {
+            message,
+            installed: vec![],
+        }
+    }
+}
+
+fn open_ssh_server_wait_phase(elapsed: Duration) -> String {
+    format!(
+        "等待 Windows 管理员授权或官方功能处理（已等待 {} 秒）",
+        elapsed.as_secs()
+    )
+}
+
 struct ProcessError {
     message: String,
     installed: Vec<String>,
@@ -127,6 +189,11 @@ pub struct ResourceManager {
     jobs_changed: Condvar, // jobs_changed（资源任务状态变化通知）。
     jobs_path: PathBuf,
     reviews: Mutex<HashMap<String, bool>>, // reviews（用户对导入内容的选择）。
+    import_selections: Mutex<HashMap<String, PendingImportSelection>>, // import_selections（短期来源票据）：路径只保存在原生进程。
+    remote_imports: Mutex<HashMap<String, RemoteImportReservation>>, // remote_imports（服务端签发的远程导入票据及幂等结果）。
+    remote_reset_approvals: Mutex<HashMap<String, RemoteResetApproval>>, // remote_reset_approvals（短期一次性删除范围确认）。
+    management_core_status: Mutex<Option<String>>, // management_core_status（最近向远端公开的语音核心状态）。
+    management_core_status_revision: AtomicU64, // management_core_status_revision（核心状态变化修订号）。
     activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
     tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
@@ -236,12 +303,19 @@ impl ResourceManager {
             environment: Mutex::new(()),
             tts_runtime: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
+            import_selections: Mutex::new(HashMap::new()),
+            remote_imports: Mutex::new(HashMap::new()),
+            remote_reset_approvals: Mutex::new(HashMap::new()),
+            management_core_status: Mutex::new(None),
+            management_core_status_revision: AtomicU64::new(0),
             resume_pending: Mutex::new(false),
             resetting: AtomicBool::new(false),
             batch_active: AtomicBool::new(false),
             accepting_jobs: AtomicBool::new(true),
             validation_failures: Mutex::new(HashMap::new()),
         };
+        // 仅清理本功能专用暂存根中带有效管理标记的过期来源；其他目录与用户文件不触碰。
+        let _ = manager.cleanup_orphaned_remote_imports();
         for job in manager.snapshots() {
             if !is_system_feature_job(job["job_id"].as_str().unwrap_or_default())
                 && job["state"] == "failed"
@@ -330,22 +404,571 @@ impl ResourceManager {
         self.context.clone()
     }
 
-    fn require_saved_shared_host(&self) -> Result<(), String> {
-        let snapshot = voice_desktop_common::device_config::inspect(&self.context.data);
-        voice_desktop_common::system_feature::require_shared_host(&snapshot)
+    /// remote_management_status（独立管理状态）：读取当前桌面宿主的真实核心进程与握手状态。
+    pub(crate) fn remote_management_status(&self) -> Value {
+        let Some(state) = self.app.try_state::<Arc<super::Desktop>>() else {
+            let revision = self.next_management_status_revision("unavailable");
+            return json!({
+                "core_state":"unavailable",
+                "resource_management_ready":true,
+                "revision":revision,
+                "fields": {
+                    "core_state":"语音核心的真实状态：ready、starting 或 unavailable",
+                    "resource_management_ready":"原生 ResourceManager 是否可响应组件和任务请求",
+                    "revision":"核心服务代次与当前状态编码的修订号",
+                }
+            });
+        };
+        let epoch = state.service_epoch.load(Ordering::Acquire);
+        let process_alive = state
+            .service
+            .lock()
+            .ok()
+            .and_then(|mut service| {
+                service
+                    .as_mut()
+                    .and_then(|current| matches!(current.child.try_wait(), Ok(None)).then_some(()))
+            })
+            .is_some();
+        let current_core = state
+            .recovery
+            .lock()
+            .map(|recovery| recovery.current_core)
+            .unwrap_or(None);
+        let core_ready = process_alive
+            && state.service_ready_epoch.load(Ordering::Acquire) == epoch
+            && current_core == Some(true);
+        let starting = state.service_starting.load(Ordering::Acquire)
+            || process_alive && current_core.is_none();
+        let core_state = if core_ready {
+            "ready"
+        } else if starting {
+            "starting"
+        } else {
+            "unavailable"
+        };
+        let state_revision = self.next_management_status_revision(core_state);
+        json!({
+            "core_state":core_state,
+            "resource_management_ready":true,
+            "revision":epoch.saturating_mul(1_u64 << 32).saturating_add(state_revision.min(u64::from(u32::MAX))),
+            "fields": {
+                "core_state":"语音核心的真实状态：ready、starting 或 unavailable",
+                "resource_management_ready":"原生 ResourceManager 已就绪，不依赖 Python 核心",
+                "revision":"核心服务代次与当前状态编码的修订号",
+            }
+        })
     }
 
-    /// open_ssh_server_status（读取 OpenSSH Server 状态）：只读且仅限已保存共享主机。
+    fn next_management_status_revision(&self, core_state: &str) -> u64 {
+        let changed = if let Ok(mut previous) = self.management_core_status.lock() {
+            let changed = previous.as_deref() != Some(core_state);
+            if changed {
+                *previous = Some(core_state.to_owned());
+            }
+            changed
+        } else {
+            true
+        };
+        if changed {
+            self.management_core_status_revision
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1)
+        } else {
+            self.management_core_status_revision.load(Ordering::Acquire)
+        }
+    }
+
+    fn remote_import_root(&self) -> Result<PathBuf, String> {
+        let root = voice_desktop_common::workspace::safe_path(
+            &self.context.install,
+            "cache/remote-management/import-staging",
+        )?;
+        fs::create_dir_all(&root).map_err(|_| "远程导入暂存根不可用。".to_owned())?;
+        let verified = voice_desktop_common::workspace::safe_path(
+            &self.context.install,
+            "cache/remote-management/import-staging",
+        )?;
+        if verified != root {
+            return Err("远程导入暂存根路径在创建期间发生变化。".into());
+        }
+        let metadata = fs::symlink_metadata(&verified).map_err(|_| "远程导入暂存根不可用。")?;
+        if remote_import_is_reparse(&metadata) || !metadata.is_dir() {
+            return Err("远程导入暂存根不是受管普通目录。".into());
+        }
+        Ok(root)
+    }
+
+    /// reserve_remote_import_source（签发远程导入暂存来源）：创建独占目录，不接受调用方路径。
+    pub fn reserve_remote_import_source(
+        &self,
+        request_id: &str,
+        resource_id: Option<String>,
+    ) -> Result<RemoteImportSourceTicket, String> {
+        if !voice_desktop_common::device_management_contract::valid_request_id(request_id) {
+            return Err("远程导入操作编号无效。".into());
+        }
+        if resource_id
+            .as_deref()
+            .is_some_and(|id| !valid_resource_id(id))
+        {
+            return Err("远程导入目标资源编号无效。".into());
+        }
+        self.cleanup_remote_imports()?;
+
+        let mut reservations = self
+            .remote_imports
+            .lock()
+            .map_err(|_| "远程导入状态不可用。")?;
+        if let Some(existing) = reservations.get(request_id) {
+            if existing.resource_id != resource_id {
+                return Err("同一远程导入操作编号不能更改目标资源。".into());
+            }
+            if matches!(&existing.state, RemoteImportState::Aborted)
+                || existing.retain_until <= Instant::now()
+            {
+                return Err("该远程导入来源已取消或过期；请使用新的操作编号重新申请。".into());
+            }
+            if existing.expires_at <= Instant::now()
+                && matches!(
+                    &existing.state,
+                    RemoteImportState::Reserved | RemoteImportState::Committing(_)
+                )
+            {
+                return Err("该远程导入来源已过期；请使用新的操作编号重新申请。".into());
+            }
+            return Ok(RemoteImportSourceTicket {
+                source_id: existing.source_id.clone(),
+                resource_id: existing.resource_id.clone(),
+                staging_dir: existing.staging_dir.clone(),
+            });
+        }
+        let active = reservations
+            .values()
+            .filter(|reservation| {
+                reservation.expires_at > Instant::now()
+                    && matches!(
+                        &reservation.state,
+                        RemoteImportState::Reserved | RemoteImportState::Committing(_)
+                    )
+            })
+            .count();
+        if active >= REMOTE_IMPORT_MAX_ACTIVE {
+            return Err("远程导入暂存容量已满，请提交或取消现有来源后重试。".into());
+        }
+        if reservations.len() >= REMOTE_IMPORT_MAX_RECORDS {
+            return Err("远程导入幂等记录容量已满，请稍后重试。".into());
+        }
+
+        let root = self.remote_import_root()?;
+        let (source_id, staging_dir) = create_remote_import_stage(&root)?;
+        let now = Instant::now();
+        let expires_at = now + REMOTE_IMPORT_TICKET_TTL;
+        let expires_at_ms =
+            unix_millis().saturating_add(REMOTE_IMPORT_TICKET_TTL.as_millis() as u64);
+        let retain_until = now + REMOTE_IMPORT_RESULT_TTL;
+        if let Err(error) = write_remote_import_owner_marker(&root, &source_id, expires_at_ms) {
+            let _ = remove_remote_import_tree(&root, &source_id);
+            let _ = remove_remote_import_marker(&root, &source_id);
+            return Err(error);
+        }
+        reservations.insert(
+            request_id.to_owned(),
+            RemoteImportReservation {
+                request_id: request_id.to_owned(),
+                source_id: source_id.clone(),
+                resource_id: resource_id.clone(),
+                staging_dir: staging_dir.clone(),
+                expires_at,
+                retain_until,
+                state: RemoteImportState::Reserved,
+            },
+        );
+        Ok(RemoteImportSourceTicket {
+            source_id,
+            resource_id,
+            staging_dir,
+        })
+    }
+
+    /// commit_remote_import_source（核验并接入现有导入事务）：服务端逐文件复核后才启动原导入任务。
+    pub fn commit_remote_import_source(
+        self: &Arc<Self>,
+        ticket: &RemoteImportSourceTicket,
+        manifest: RemoteImportManifest,
+    ) -> Result<Value, String> {
+        manifest.validate()?;
+        if manifest.source_id != ticket.source_id {
+            return Err("远程导入清单来源编号与服务端票据不匹配。".into());
+        }
+        let source_id = ticket.source_id.clone();
+        let (request_id, resource_id, original_dir) = {
+            let mut reservations = self
+                .remote_imports
+                .lock()
+                .map_err(|_| "远程导入状态不可用。")?;
+            let reservation = reservations
+                .values_mut()
+                .find(|row| row.source_id == source_id)
+                .ok_or_else(|| "远程导入暂存票据不存在或已过期。".to_owned())?;
+            if reservation.resource_id != ticket.resource_id
+                || reservation.staging_dir != ticket.staging_dir
+            {
+                return Err("远程导入票据与服务端登记内容不匹配。".into());
+            }
+            match &reservation.state {
+                RemoteImportState::Committed {
+                    manifest: accepted,
+                    result,
+                    ..
+                } => {
+                    if accepted == &manifest {
+                        return Ok(result.clone());
+                    }
+                    return Err("同一远程导入来源不能提交不同的清单。".into());
+                }
+                RemoteImportState::Committing(current) => {
+                    if current == &manifest {
+                        return Err("相同远程导入事务仍在提交，请查询原任务。".into());
+                    }
+                    return Err("同一远程导入来源不能并行提交不同的清单。".into());
+                }
+                RemoteImportState::Aborted => return Err("远程导入暂存票据已取消。".into()),
+                RemoteImportState::Reserved => {}
+            }
+            if reservation.expires_at <= Instant::now() {
+                return Err("远程导入暂存票据已过期。".into());
+            }
+            reservation.state = RemoteImportState::Committing(manifest.clone());
+            (
+                reservation.request_id.clone(),
+                reservation.resource_id.clone(),
+                reservation.staging_dir.clone(),
+            )
+        };
+
+        let root = match self.remote_import_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.restore_remote_import_reservation(&request_id, &manifest);
+                return Err(error);
+            }
+        };
+        let committed_dir = match seal_remote_import_stage(&root, &source_id, &original_dir) {
+            Ok(path) => path,
+            Err(error) => {
+                self.restore_remote_import_reservation(&request_id, &manifest);
+                return Err(error);
+            }
+        };
+        if let Err(error) = verify_remote_import_tree(&committed_dir, &manifest) {
+            if fs::rename(&committed_dir, &original_dir).is_ok() {
+                self.restore_remote_import_reservation(&request_id, &manifest);
+            } else {
+                if let Ok(mut reservations) = self.remote_imports.lock() {
+                    if let Some(reservation) = reservations.get_mut(&request_id) {
+                        reservation.state = RemoteImportState::Aborted;
+                        reservation.retain_until = Instant::now() + REMOTE_IMPORT_RESULT_TTL;
+                    }
+                }
+                let _ = remove_remote_import_path(&root, &committed_dir);
+                let _ = remove_remote_import_marker(&root, &source_id);
+            }
+            return Err(error);
+        }
+        let result = match self.start_import_job(resource_id.clone(), vec![committed_dir.clone()]) {
+            Ok(result) => result,
+            Err(error) => {
+                let restored = fs::rename(&committed_dir, &original_dir).is_ok();
+                if restored {
+                    self.restore_remote_import_reservation(&request_id, &manifest);
+                } else {
+                    if let Ok(mut reservations) = self.remote_imports.lock() {
+                        if let Some(reservation) = reservations.get_mut(&request_id) {
+                            reservation.state = RemoteImportState::Aborted;
+                            reservation.retain_until = Instant::now() + REMOTE_IMPORT_RESULT_TTL;
+                        }
+                    }
+                    let _ = remove_remote_import_path(&root, &committed_dir);
+                    let _ = remove_remote_import_marker(&root, &source_id);
+                }
+                return Err(error);
+            }
+        };
+        let job_id = result["job_id"]
+            .as_str()
+            .ok_or("导入任务已启动但未返回任务编号。")?
+            .to_owned();
+        {
+            let mut reservations = self
+                .remote_imports
+                .lock()
+                .map_err(|_| "远程导入状态不可用。")?;
+            let reservation = reservations
+                .get_mut(&request_id)
+                .ok_or("远程导入任务已启动，但幂等记录不可用。")?;
+            reservation.state = RemoteImportState::Committed {
+                manifest,
+                result: result.clone(),
+                job_id: job_id.clone(),
+                committed_dir,
+            };
+            reservation.retain_until = Instant::now() + REMOTE_IMPORT_RESULT_TTL;
+        }
+        if self.snapshots().iter().any(|row| {
+            row["job_id"] == job_id && terminal(row["state"].as_str().unwrap_or_default())
+        }) {
+            self.cleanup_remote_import_job(&job_id);
+        }
+        Ok(result)
+    }
+
+    /// abort_remote_import_source（取消未提交远程导入来源）：仅移除服务端签发的独占暂存目录。
+    pub fn abort_remote_import_source(
+        &self,
+        ticket: &RemoteImportSourceTicket,
+    ) -> Result<(), String> {
+        if !valid_source_id(&ticket.source_id) {
+            return Err("远程导入暂存来源编号无效。".into());
+        }
+        let root = self.remote_import_root()?;
+        let request_id = {
+            let mut reservations = self
+                .remote_imports
+                .lock()
+                .map_err(|_| "远程导入状态不可用。")?;
+            let Some((request_id, reservation)) = reservations
+                .iter_mut()
+                .find(|(_, row)| row.source_id == ticket.source_id)
+            else {
+                return Ok(());
+            };
+            if reservation.resource_id != ticket.resource_id
+                || reservation.staging_dir != ticket.staging_dir
+            {
+                return Err("远程导入票据与服务端登记内容不匹配。".into());
+            }
+            if matches!(&reservation.state, RemoteImportState::Committed { .. }) {
+                return Err("导入任务已经接受；请使用原任务编号查询或取消。".into());
+            }
+            if matches!(&reservation.state, RemoteImportState::Committing(_)) {
+                return Err("导入事务正在提交，不能取消暂存来源。".into());
+            }
+            if matches!(&reservation.state, RemoteImportState::Aborted) {
+                return Ok(());
+            }
+            reservation.state = RemoteImportState::Aborted;
+            reservation.retain_until = Instant::now() + REMOTE_IMPORT_RESULT_TTL;
+            request_id.clone()
+        };
+        self.abort_remote_import_record(&request_id, &root);
+        Ok(())
+    }
+
+    fn restore_remote_import_reservation(&self, request_id: &str, manifest: &RemoteImportManifest) {
+        if let Ok(mut reservations) = self.remote_imports.lock() {
+            if let Some(reservation) = reservations.get_mut(request_id) {
+                if matches!(&reservation.state, RemoteImportState::Committing(current) if current == manifest)
+                {
+                    reservation.state = RemoteImportState::Reserved;
+                }
+            }
+        }
+    }
+
+    fn abort_remote_import_record(&self, request_id: &str, root: &Path) {
+        let target = self
+            .remote_imports
+            .lock()
+            .ok()
+            .and_then(|mut reservations| {
+                let reservation = reservations.get_mut(request_id)?;
+                reservation.state = RemoteImportState::Aborted;
+                reservation.retain_until = Instant::now() + REMOTE_IMPORT_RESULT_TTL;
+                Some((
+                    reservation.source_id.clone(),
+                    reservation.staging_dir.clone(),
+                ))
+            });
+        if let Some((source_id, staging_dir)) = target {
+            let _ = remove_remote_import_path(root, &staging_dir);
+            let _ = remove_remote_import_marker(root, &source_id);
+        }
+    }
+
+    pub(crate) fn cleanup_remote_imports(&self) -> Result<(), String> {
+        let now = Instant::now();
+        let terminal_jobs = self
+            .snapshots()
+            .into_iter()
+            .filter_map(|row| {
+                let job_id = row["job_id"].as_str()?.to_owned();
+                terminal(row["state"].as_str().unwrap_or_default()).then_some(job_id)
+            })
+            .collect::<HashSet<_>>();
+        let mut remove_paths = Vec::new();
+        let mut remove_records = Vec::new();
+        if let Ok(mut reservations) = self.remote_imports.lock() {
+            for (request_id, reservation) in reservations.iter_mut() {
+                if matches!(&reservation.state, RemoteImportState::Reserved)
+                    && reservation.expires_at <= now
+                {
+                    reservation.state = RemoteImportState::Aborted;
+                    reservation.retain_until = now + REMOTE_IMPORT_RESULT_TTL;
+                    remove_paths.push((
+                        reservation.source_id.clone(),
+                        reservation.staging_dir.clone(),
+                    ));
+                    continue;
+                }
+                let committed_cleanup = match &reservation.state {
+                    RemoteImportState::Committed {
+                        job_id,
+                        committed_dir,
+                        ..
+                    } if reservation.retain_until <= now && terminal_jobs.contains(job_id) => {
+                        Some(committed_dir.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(path) = committed_cleanup {
+                    remove_paths.push((reservation.source_id.clone(), path));
+                    remove_records.push(request_id.clone());
+                    continue;
+                }
+                let committed_active = match &reservation.state {
+                    RemoteImportState::Committed { job_id, .. }
+                        if reservation.retain_until <= now && !terminal_jobs.contains(job_id) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if committed_active {
+                    reservation.retain_until = now + REMOTE_IMPORT_RESULT_TTL;
+                } else if matches!(&reservation.state, RemoteImportState::Committing(_))
+                    && reservation.retain_until <= now
+                {
+                    reservation.retain_until = now + REMOTE_IMPORT_RESULT_TTL;
+                } else if reservation.retain_until <= now {
+                    remove_records.push(request_id.clone());
+                }
+            }
+            for request_id in &remove_records {
+                reservations.remove(request_id);
+            }
+        }
+        if let Ok(root) = self.remote_import_root() {
+            for (source_id, path) in remove_paths {
+                let _ = remove_remote_import_path(&root, &path);
+                let _ = remove_remote_import_marker(&root, &source_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_remote_import_job(&self, job_id: &str) {
+        let cleanup = self.remote_imports.lock().ok().and_then(|reservations| {
+            reservations
+                .values()
+                .find_map(|reservation| match &reservation.state {
+                    RemoteImportState::Committed {
+                        job_id: committed_job,
+                        committed_dir,
+                        ..
+                    } if committed_job == job_id => {
+                        Some((reservation.source_id.clone(), committed_dir.clone()))
+                    }
+                    _ => None,
+                })
+        });
+        if let Some((source_id, committed_dir)) = cleanup {
+            if let Ok(root) = self.remote_import_root() {
+                let _ = remove_remote_import_path(&root, &committed_dir);
+                let _ = remove_remote_import_marker(&root, &source_id);
+            }
+        }
+    }
+
+    fn cleanup_orphaned_remote_imports(&self) -> Result<(), String> {
+        let root = voice_desktop_common::workspace::safe_path(
+            &self.context.install,
+            "cache/remote-management/import-staging",
+        )?;
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("远程导入暂存根不可读取。".into()),
+        };
+        if remote_import_is_reparse(&root_metadata) || !root_metadata.is_dir() {
+            return Err("远程导入暂存根不是受管普通目录。".into());
+        }
+        let now_ms = unix_millis();
+        for entry in fs::read_dir(&root).map_err(|_| "远程导入暂存根不可读取。")? {
+            let entry = entry.map_err(|_| "远程导入暂存目录项不可读取。")?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(source_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".owner.json"))
+                .filter(|value| valid_source_id(value))
+            {
+                if read_remote_import_owner_marker(&root, source_id)
+                    .is_ok_and(|expires_at| now_ms >= expires_at)
+                {
+                    let _ = remove_remote_import_tree(&root, source_id);
+                    let _ = remove_remote_import_path(
+                        &root,
+                        &root.join(format!("accepted-{source_id}")),
+                    );
+                    let _ = remove_remote_import_marker(&root, source_id);
+                }
+                continue;
+            }
+            let source_id = if valid_source_id(&name) {
+                name.as_str()
+            } else if let Some(source_id) = name
+                .strip_prefix("accepted-")
+                .filter(|id| valid_source_id(id))
+            {
+                source_id
+            } else {
+                continue;
+            };
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("远程导入暂存项不可读取。".into()),
+            };
+            if remote_import_is_reparse(&metadata) || !metadata.is_dir() {
+                continue;
+            }
+            let marker = read_remote_import_owner_marker(&root, source_id).ok();
+            if marker.is_some_and(|expires_at| now_ms >= expires_at) {
+                let _ = remove_remote_import_path(&root, &entry.path());
+                let _ = remove_remote_import_marker(&root, source_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn require_local_runtime(&self) -> Result<(), String> {
+        let snapshot = voice_desktop_common::device_config::inspect(&self.context.data);
+        voice_desktop_common::system_feature::require_local_runtime(&snapshot)
+    }
+
+    /// open_ssh_server_status（读取 OpenSSH Server 状态）：只读且仅限本地运行设备。
     pub fn open_ssh_server_status(
         &self,
     ) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
-        self.require_saved_shared_host()?;
+        self.require_local_runtime()?;
         voice_desktop_common::system_feature::open_ssh_server_status()
     }
 
     /// enable_open_ssh_server（启动受管主机功能任务）：使用固定任务编号，不进入普通文件下载器。
     pub fn enable_open_ssh_server(self: &Arc<Self>) -> Result<Value, String> {
-        self.require_saved_shared_host()?;
+        self.require_local_runtime()?;
         let job_id = voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID.to_owned();
         self.start_job(
             job_id.clone(),
@@ -354,17 +977,21 @@ impl ResourceManager {
             false,
             move |manager, id| {
                 manager
-                    .require_saved_shared_host()
+                    .require_local_runtime()
                     .map_err(|message| JobError::Failed { message, installed: vec![] })?;
                 manager.set_phase(&id, "核对系统状态并等待 Windows 管理员授权", false, 0, None);
                 manager
-                    .require_saved_shared_host()
+                    .require_local_runtime()
                     .map_err(|message| JobError::Failed { message, installed: vec![] })?;
-                let after = voice_desktop_common::system_feature::enable_open_ssh_server()
-                    .map_err(|message| JobError::Failed { message, installed: vec![] })?;
+                let after = voice_desktop_common::system_feature::enable_open_ssh_server_with_progress(
+                    |elapsed| {
+                        manager.set_phase(&id, &open_ssh_server_wait_phase(elapsed), false, 0, None);
+                    },
+                )
+                .map_err(open_ssh_server_job_error)?;
                 manager.set_phase(&id, "复核 OpenSSH Server 与 sshd 状态", false, 0, None);
                 manager
-                    .require_saved_shared_host()
+                    .require_local_runtime()
                     .map_err(|message| JobError::Failed { message, installed: vec![] })?;
                 if !after.ready {
                     return Err(JobError::Failed {
@@ -381,7 +1008,16 @@ impl ResourceManager {
         }))
     }
 
-    fn reset_resource(
+    /// set_open_ssh_project_access（设置项目专用入站访问）：只操作 Voice Terminal 命名的防火墙规则。
+    pub fn set_open_ssh_project_access(
+        &self,
+        enabled: bool,
+    ) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
+        self.require_local_runtime()?;
+        voice_desktop_common::system_feature::set_open_ssh_project_access(enabled)
+    }
+
+    pub(crate) fn reset_resource(
         self: &Arc<Self>,
         resource_id: String,
         token: String,
@@ -732,6 +1368,187 @@ impl ResourceManager {
         rows.sort_by_key(|row| row["created_at"].as_u64().unwrap_or(0));
         rows
     }
+
+    /// remote_install_plan（读取固定组件安装计划）：复用原生清单与依赖计划，不启动任务。
+    pub(crate) fn remote_install_plan(&self, resource_id: &str) -> Result<Value, String> {
+        let context = &self.context;
+        let mut plan = if matches!(
+            resource_id,
+            "voice-server"
+                | voice_desktop_common::runtime::CPU_RESOURCE
+                | voice_desktop_common::runtime::GPU_RESOURCE
+        ) {
+            let group = if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {
+                "gpu"
+            } else {
+                "cpu"
+            };
+            json!({
+                "resource_id":resource_id,
+                "title":if group == "gpu" { "GPU（图形处理器）运行依赖" } else if resource_id == "voice-server" { "Voice Server（语音服务）运行环境" } else { "CPU（中央处理器）运行依赖" },
+                "model_bytes":0,
+                "environment":voice_desktop_common::runtime::plan(context, group)?,
+                "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}
+            })
+        } else {
+            if !valid_resource_id(resource_id) {
+                return Err("资源编号格式无效。".into());
+            }
+            let spec = voice_desktop_common::resources::spec(context, resource_id)?;
+            let model_bytes = voice_desktop_common::resources::download_bytes(&spec);
+            let mut shared_resources = Vec::new();
+            if let Some(shared) = spec["runtime_resource"]
+                .as_str()
+                .filter(|_| spec["preparation"] != "aniflive_local_build")
+            {
+                let ready = voice_desktop_common::resources::inventory(context)?
+                    .iter()
+                    .any(|row| row["resource_id"] == shared && row["can_start"] == true);
+                if !ready {
+                    let shared_spec = voice_desktop_common::resources::spec(context, shared)?;
+                    shared_resources.push(json!({
+                        "resource_id":shared,
+                        "title":shared_spec["title"],
+                        "download_bytes":voice_desktop_common::resources::download_bytes(&shared_spec),
+                        "fields":{"resource_id":"需要先安装的固定共用资源编号","title":"共用资源名称","download_bytes":"共用资源最大下载字节数"}
+                    }));
+                }
+            }
+            let environment = if spec["dependency_group"].as_str().is_some() {
+                voice_desktop_common::runtime::plan(context, "all")?
+            } else {
+                Value::Null
+            };
+            json!({
+                "resource_id":resource_id,
+                "title":spec["title"],
+                "model_bytes":model_bytes,
+                "environment":environment,
+                "shared_resources":shared_resources,
+                "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","shared_resources":"需要先安装的共用原生运行程序","environment":"组件专用依赖组对应的完整共享运行环境计划；空值表示无需单独更新依赖"}
+            })
+        };
+        let sources = if matches!(
+            resource_id,
+            "voice-server"
+                | voice_desktop_common::runtime::CPU_RESOURCE
+                | voice_desktop_common::runtime::GPU_RESOURCE
+        ) {
+            let urls = std::iter::once(&plan["environment"]["python"]["url"]).chain(
+                plan["environment"]["wheels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|row| &row["url"]),
+            );
+            let mut hosts = Vec::new();
+            for url in urls.filter_map(Value::as_str).filter(|url| !url.is_empty()) {
+                for candidate in voice_desktop_common::download_sources::candidates(url) {
+                    let host = voice_desktop_common::download_sources::host(&candidate).to_owned();
+                    if !hosts.contains(&host) {
+                        hosts.push(host);
+                    }
+                }
+            }
+            hosts
+        } else {
+            voice_desktop_common::download_sources::plan_sources(
+                &voice_desktop_common::resources::spec(context, resource_id)?,
+            )
+        };
+        plan["download_sources"] = json!(sources);
+        plan["fields"]["download_sources"] =
+            json!("各类资源使用的镜像和原站域名，下载失败时按资源切换备用来源");
+        Ok(plan)
+    }
+
+    /// remote_reset_plan（签发短期一次性重置确认）：服务端保存计划与 token（确认值）的绑定。
+    pub(crate) fn remote_reset_plan(
+        &self,
+        request_id: &str,
+        resource_id: &str,
+    ) -> Result<Value, String> {
+        if !voice_desktop_common::device_management_contract::valid_request_id(request_id)
+            || !valid_resource_id(resource_id)
+        {
+            return Err("重置计划操作编号或组件编号无效。".into());
+        }
+        let mut approvals = self
+            .remote_reset_approvals
+            .lock()
+            .map_err(|_| "远程重置确认状态不可用。")?;
+        approvals.retain(|_, approval| approval.expires_at > Instant::now());
+        if let Some(existing) = approvals.get(request_id) {
+            if existing.resource_id != resource_id {
+                return Err("同一重置计划编号不能更改组件目标。".into());
+            }
+            return Ok(existing.plan.clone());
+        }
+        if approvals.len() >= REMOTE_RESET_MAX_APPROVALS {
+            return Err("远程重置确认容量已满，请稍后重试。".into());
+        }
+        let mut plan = voice_desktop_common::component_reset::plan(&self.context, resource_id)?;
+        let token = plan["token"]
+            .as_str()
+            .ok_or("原生重置计划缺少确认值。")?
+            .to_owned();
+        let expires_at = Instant::now() + REMOTE_RESET_CONFIRMATION_TTL;
+        plan["plan_request_id"] = json!(request_id);
+        plan["expires_at_ms"] =
+            json!(unix_millis().saturating_add(REMOTE_RESET_CONFIRMATION_TTL.as_millis() as u64));
+        plan["fields"]["plan_request_id"] =
+            json!("本次重置范围预览操作编号；执行重置必须回传相同编号");
+        plan["fields"]["expires_at_ms"] = json!("本次重置确认到期时刻，Unix 毫秒");
+        approvals.insert(
+            request_id.to_owned(),
+            RemoteResetApproval {
+                resource_id: resource_id.to_owned(),
+                token,
+                plan: plan.clone(),
+                expires_at,
+            },
+        );
+        Ok(plan)
+    }
+
+    /// remote_reset（消费一次性确认并调用既有重置任务）：不能凭客户端自报路径删除文件。
+    pub(crate) fn remote_reset(
+        self: &Arc<Self>,
+        plan_request_id: &str,
+        resource_id: String,
+        token: &str,
+        confirmed: bool,
+    ) -> Result<Value, String> {
+        if !confirmed {
+            return Err("用户尚未确认本次组件重置。".into());
+        }
+        if !voice_desktop_common::device_management_contract::valid_request_id(plan_request_id)
+            || !valid_resource_id(&resource_id)
+            || token.is_empty()
+            || token.len() > 128
+        {
+            return Err("重置目标或一次性确认值无效。".into());
+        }
+        let mut approvals = self
+            .remote_reset_approvals
+            .lock()
+            .map_err(|_| "远程重置确认状态不可用。")?;
+        approvals.retain(|_, approval| approval.expires_at > Instant::now());
+        let approved = approvals
+            .get(plan_request_id)
+            .is_some_and(|approval| approval.resource_id == resource_id && approval.token == token);
+        if !approved {
+            return Err("重置确认值不存在、已过期、已使用或不属于该组件。".into());
+        }
+        approvals.retain(|_, approval| approval.token != token);
+        drop(approvals);
+        let current = voice_desktop_common::component_reset::plan(&self.context, &resource_id)?;
+        if current["token"] != token {
+            return Err("组件重置范围已变化，请重新查看计划并确认。".into());
+        }
+        self.reset_resource(resource_id, token.to_owned())
+    }
+
     pub fn has_active_jobs(&self) -> bool {
         self.jobs
             .lock()
@@ -1218,6 +2035,109 @@ impl ResourceManager {
             "正在选择资源来源".into(),
             true,
             move |manager, job_id| manager.run_import(&job_id, resource_id),
+        )?;
+        Ok(json!({ "job_id": job_id }))
+    }
+
+    /// choose_import_sources（选择导入来源）：只返回短期票据，来源路径始终留在原生进程。
+    pub fn choose_import_sources(&self, resource_id: Option<String>) -> Result<Value, String> {
+        if let Some(id) = &resource_id {
+            if !valid_resource_id(id) {
+                return Err("资源编号格式无效。".into());
+            }
+        }
+        let sources = voice_desktop_common::native_ui::choose_resource(resource_id.as_deref())?;
+        if sources.is_empty() {
+            return Ok(json!({
+                "cancelled": true,
+                "selection_id": null,
+                "count": 0,
+                "fields": {
+                    "cancelled": "用户取消了本机来源选择",
+                    "selection_id": "一次性原生来源票据；取消时为空",
+                    "count": "选择的来源数量",
+                }
+            }));
+        }
+        if sources.len() > 64 {
+            return Err("一次最多选择 64 个导入来源。".into());
+        }
+        for source in &sources {
+            let metadata =
+                fs::symlink_metadata(source).map_err(|_| "所选导入来源已不存在或不可访问。")?;
+            if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                return Err("导入来源必须是普通文件或文件夹，不能是链接或特殊文件。".into());
+            }
+        }
+        let selection_id = new_job_id("is");
+        let mut selections = self
+            .import_selections
+            .lock()
+            .map_err(|_| "导入来源状态不可用。")?;
+        selections.retain(|_, row| row.expires_at > Instant::now());
+        while selections.len() >= 64 {
+            let Some(oldest) = selections
+                .iter()
+                .min_by_key(|(_, row)| row.expires_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            selections.remove(&oldest);
+        }
+        selections.insert(
+            selection_id.clone(),
+            PendingImportSelection {
+                resource_id,
+                sources,
+                expires_at: Instant::now() + Duration::from_secs(10 * 60),
+            },
+        );
+        Ok(json!({
+            "cancelled": false,
+            "selection_id": selection_id,
+            "count": selections[&selection_id].sources.len(),
+            "fields": {
+                "cancelled": "用户是否取消了本机来源选择",
+                "selection_id": "一次性原生来源票据；绝对路径不会返回前端",
+                "count": "选择的来源数量",
+            }
+        }))
+    }
+
+    /// start_import_sources（启动已选择来源的导入）：消费一次性票据并启动既有导入事务。
+    pub fn start_import_sources(self: &Arc<Self>, selection_id: String) -> Result<Value, String> {
+        if selection_id.len() > 96 || !selection_id.starts_with("is-") {
+            return Err("导入来源票据无效。".into());
+        }
+        let selection = self
+            .import_selections
+            .lock()
+            .map_err(|_| "导入来源状态不可用。")?
+            .remove(&selection_id)
+            .ok_or_else(|| "导入来源票据已使用、取消或过期，请重新选择。".to_owned())?;
+        if selection.expires_at <= Instant::now() {
+            return Err("导入来源票据已过期，请重新选择。".into());
+        }
+        self.start_import_job(selection.resource_id, selection.sources)
+    }
+
+    fn start_import_job(
+        self: &Arc<Self>,
+        resource_id: Option<String>,
+        sources: Vec<PathBuf>,
+    ) -> Result<Value, String> {
+        if sources.is_empty() || sources.len() > 64 {
+            return Err("导入来源数量无效，请重新选择。".into());
+        }
+        let job_id = new_job_id("im");
+        let resource_key = resource_id.clone().unwrap_or_else(|| "batch".into());
+        self.start_job(
+            job_id.clone(),
+            resource_key,
+            "正在校验所选资源来源".into(),
+            true,
+            move |manager, job_id| manager.run_import_sources(&job_id, resource_id, sources),
         )?;
         Ok(json!({ "job_id": job_id }))
     }
@@ -1877,6 +2797,33 @@ impl ResourceManager {
             })?;
         if sources.is_empty() {
             return Err(JobError::Cancelled);
+        }
+        self.run_import_sources(job_id, resource_id, sources)
+    }
+
+    fn run_import_sources(
+        self: &Arc<Self>,
+        job_id: &str,
+        resource_id: Option<String>,
+        sources: Vec<PathBuf>,
+    ) -> Result<Vec<String>, JobError> {
+        if sources.is_empty() || sources.len() > 64 {
+            return Err(JobError::Failed {
+                message: "导入来源数量无效，请重新选择。".into(),
+                installed: vec![],
+            });
+        }
+        for source in &sources {
+            let metadata = fs::symlink_metadata(source).map_err(|_| JobError::Failed {
+                message: "所选导入来源已不存在或不可访问，请重新选择。".into(),
+                installed: vec![],
+            })?;
+            if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                return Err(JobError::Failed {
+                    message: "导入来源必须是普通文件或文件夹，不能是链接或特殊文件。".into(),
+                    installed: vec![],
+                });
+            }
         }
         let mut installed = vec![];
         let mut progress = |phase: &str, done: u64, total: u64| {
@@ -2596,13 +3543,11 @@ impl ResourceManager {
                 parent_job_id: parent,
                 recovery: None,
             };
-            // previous_run（旧任务历史）：同一组件手动重试前保留终态及首轮错误。
-            if let Some(previous) = jobs
+            // previous_run（旧任务历史）：同一固定任务重试前保留终态及首轮错误。
+            let historical = jobs
                 .get(&job_id)
-                .filter(|job| terminal(&job.snapshot.state))
-            {
-                let mut historical = previous.snapshot.clone();
-                historical.job_id = format!("history-{}-{}", job_id, historical.created_at);
+                .and_then(|previous| terminal_job_history_for_retry(&job_id, &previous.snapshot));
+            if let Some(historical) = historical {
                 jobs.insert(
                     historical.job_id.clone(),
                     JobControl {
@@ -2701,7 +3646,16 @@ impl ResourceManager {
                 None,
                 installed,
             ),
-            Err(JobError::Cancelled) => ("cancelled", "任务已取消；临时下载可供重试", None, vec![]),
+            Err(JobError::Cancelled) => (
+                "cancelled",
+                if system_feature_job {
+                    "Windows 管理员授权已取消；可重新尝试 OpenSSH Server 管理任务"
+                } else {
+                    "任务已取消；临时下载可供重试"
+                },
+                None,
+                vec![],
+            ),
             Err(JobError::Failed { message, installed }) => {
                 ("failed", "资源处理失败", Some(message), installed)
             }
@@ -2817,6 +3771,7 @@ impl ResourceManager {
                 }
             }
         }
+        self.cleanup_remote_import_job(job_id);
     }
 
     fn finish_recovery(&self, error: Option<&str>) {
@@ -3362,6 +4317,15 @@ fn terminal(state: &str) -> bool {
     )
 }
 
+fn terminal_job_history_for_retry(job_id: &str, previous: &JobSnapshot) -> Option<JobSnapshot> {
+    if !terminal(&previous.state) {
+        return None;
+    }
+    let mut history = previous.clone();
+    history.job_id = format!("history-{job_id}-{}", history.created_at);
+    Some(history)
+}
+
 fn is_system_feature_job(job_id: &str) -> bool {
     job_id.starts_with("system-feature-")
 }
@@ -3445,7 +4409,7 @@ pub(crate) fn retryable_failure(message: &str) -> bool {
     .any(|reason| message.contains(reason))
 }
 
-fn valid_resource_id(value: &str) -> bool {
+pub(crate) fn valid_resource_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.bytes().enumerate().all(|(index, byte)| {
@@ -3466,6 +4430,299 @@ fn new_job_id(prefix: &str) -> String {
     format!("{prefix}-{:x}-{:x}", unix_millis(), counter)
 }
 
+fn remote_import_is_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn new_remote_source_id() -> String {
+    let mut value = String::with_capacity(32);
+    while value.len() < 32 {
+        value.extend(
+            voice_desktop_common::workspace::new_id()
+                .bytes()
+                .filter(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                .map(char::from),
+        );
+    }
+    value.truncate(32);
+    value
+}
+
+fn create_remote_import_stage(root: &Path) -> Result<(String, PathBuf), String> {
+    for _ in 0..8 {
+        let source_id = new_remote_source_id();
+        if !valid_source_id(&source_id) {
+            continue;
+        }
+        let staging_dir = root.join(&source_id);
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => return Ok((source_id, staging_dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("无法创建独占远程导入暂存目录。".into()),
+        }
+    }
+    Err("无法生成唯一远程导入来源编号。".into())
+}
+
+fn remote_import_marker_path(root: &Path, source_id: &str) -> Result<PathBuf, String> {
+    if !valid_source_id(source_id) {
+        return Err("远程导入来源编号无效。".into());
+    }
+    Ok(root.join(format!(".{source_id}.owner.json")))
+}
+
+fn write_remote_import_owner_marker(
+    root: &Path,
+    source_id: &str,
+    expires_at_ms: u64,
+) -> Result<(), String> {
+    let marker = remote_import_marker_path(root, source_id)?;
+    let marker_name = marker
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("远程导入所有权标记名称无效。")?;
+    let marker = voice_desktop_common::workspace::safe_path(root, marker_name)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .map_err(|_| "无法登记远程导入暂存目录所有权。".to_owned())?;
+    let payload = serde_json::to_vec(&json!({
+        "source_id": source_id,
+        "expires_at_ms": expires_at_ms,
+        "fields": {
+            "source_id": "服务端签发的暂存来源编号",
+            "expires_at_ms": "暂存来源到期时刻，Unix 毫秒",
+        }
+    }))
+    .map_err(|_| "无法编码远程导入暂存目录所有权。".to_owned())?;
+    use std::io::Write;
+    file.write_all(&payload)
+        .map_err(|_| "无法写入远程导入暂存目录所有权。".to_owned())?;
+    file.sync_all()
+        .map_err(|_| "无法持久化远程导入暂存目录所有权。".to_owned())
+}
+
+fn read_remote_import_owner_marker(root: &Path, source_id: &str) -> Result<u64, String> {
+    let marker = remote_import_marker_path(root, source_id)?;
+    let marker_name = marker
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("远程导入所有权标记名称无效。")?;
+    let marker = voice_desktop_common::workspace::safe_path(root, marker_name)?;
+    let metadata = fs::symlink_metadata(&marker).map_err(|_| "远程导入所有权标记不存在。")?;
+    if remote_import_is_reparse(&metadata) || !metadata.is_file() || metadata.len() > 4096 {
+        return Err("远程导入所有权标记无效。".into());
+    }
+    let value: Value =
+        serde_json::from_slice(&fs::read(marker).map_err(|_| "远程导入所有权标记不可读取。")?)
+            .map_err(|_| "远程导入所有权标记格式无效。")?;
+    if value["source_id"] != source_id {
+        return Err("远程导入所有权标记与目录不匹配。".into());
+    }
+    value["expires_at_ms"]
+        .as_u64()
+        .ok_or_else(|| "远程导入所有权标记缺少到期时间。".into())
+}
+
+fn remove_remote_import_marker(root: &Path, source_id: &str) -> Result<(), String> {
+    let marker = remote_import_marker_path(root, source_id)?;
+    let marker_name = marker
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("远程导入所有权标记名称无效。")?;
+    let marker = voice_desktop_common::workspace::safe_path(root, marker_name)?;
+    match fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("无法复核远程导入所有权标记。".into()),
+        Ok(metadata) if remote_import_is_reparse(&metadata) || !metadata.is_file() => {
+            Err("远程导入所有权标记不是普通文件，已保留。".into())
+        }
+        Ok(_) => fs::remove_file(marker).map_err(|_| "无法清理远程导入所有权标记。".into()),
+    }
+}
+
+fn remove_remote_import_tree(root: &Path, source_id: &str) -> Result<(), String> {
+    if !valid_source_id(source_id) {
+        return Err("远程导入来源编号无效。".into());
+    }
+    remove_remote_import_path(root, &root.join(source_id))
+}
+
+fn remove_remote_import_path(root: &Path, path: &Path) -> Result<(), String> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| "远程导入暂存根无法复核。")?;
+    if remote_import_is_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err("远程导入暂存根不是普通目录，已停止清理。".into());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|_| "远程导入暂存根无法复核。")?;
+    if path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .as_deref()
+        != Some(root.as_path())
+    {
+        return Err("远程导入清理路径不在专用暂存根内。".into());
+    }
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return Err("远程导入清理路径名称无效。".into());
+    };
+    if !(valid_source_id(name) || name.strip_prefix("accepted-").is_some_and(valid_source_id)) {
+        return Err("远程导入清理路径不属于签发目录。".into());
+    }
+    remove_tree_without_following_reparse(path)
+}
+
+fn remove_tree_without_following_reparse(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("无法复核远程导入暂存内容。".into()),
+    };
+    if remote_import_is_reparse(&metadata) {
+        return if metadata.is_dir() {
+            fs::remove_dir(path).map_err(|_| "无法移除远程导入重解析点。".into())
+        } else {
+            fs::remove_file(path).map_err(|_| "无法移除远程导入链接。".into())
+        };
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(|_| "无法读取远程导入暂存目录。")? {
+            let entry = entry.map_err(|_| "无法读取远程导入暂存项。")?;
+            remove_tree_without_following_reparse(&entry.path())?;
+        }
+        fs::remove_dir(path).map_err(|_| "无法移除远程导入暂存目录。".into())
+    } else if metadata.is_file() {
+        fs::remove_file(path).map_err(|_| "无法移除远程导入暂存文件。".into())
+    } else {
+        Err("远程导入暂存内容含特殊文件，已停止清理。".into())
+    }
+}
+
+fn seal_remote_import_stage(
+    root: &Path,
+    source_id: &str,
+    original_dir: &Path,
+) -> Result<PathBuf, String> {
+    if !valid_source_id(source_id) || original_dir != root.join(source_id) {
+        return Err("远程导入暂存目录与来源编号不匹配。".into());
+    }
+    let metadata = fs::symlink_metadata(original_dir).map_err(|_| "远程导入暂存目录已消失。")?;
+    if remote_import_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err("远程导入暂存目录不是普通目录。".into());
+    }
+    let committed_dir = root.join(format!("accepted-{source_id}"));
+    if fs::symlink_metadata(&committed_dir).is_ok() {
+        return Err("已核验导入目录编号已存在，未覆盖现有内容。".into());
+    }
+    fs::rename(original_dir, &committed_dir)
+        .map_err(|_| String::from("无法锁定已核验的远程导入暂存目录。"))?;
+    Ok(committed_dir)
+}
+
+fn verify_remote_import_tree(
+    staging_dir: &Path,
+    manifest: &RemoteImportManifest,
+) -> Result<(), String> {
+    manifest.validate()?;
+    let root_metadata =
+        fs::symlink_metadata(staging_dir).map_err(|_| "远程导入暂存目录不可用。")?;
+    if remote_import_is_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err("远程导入暂存根不是普通目录。".into());
+    }
+    let mut actual_files = HashSet::new();
+    collect_remote_import_files(staging_dir, staging_dir, &mut actual_files)?;
+    let expected_files = manifest
+        .files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<HashSet<_>>();
+    if actual_files != expected_files {
+        return Err("远程导入清单未完整覆盖暂存目录中的文件。".into());
+    }
+    for entry in &manifest.files {
+        let path =
+            entry
+                .relative_path
+                .split('/')
+                .fold(staging_dir.to_path_buf(), |mut path, part| {
+                    path.push(part);
+                    path
+                });
+        let safe = voice_desktop_common::workspace::safe_path(staging_dir, &entry.relative_path)?;
+        if safe != path {
+            return Err("远程导入相对路径解析结果不一致。".into());
+        }
+        let before = fs::symlink_metadata(&safe).map_err(|_| "远程导入清单中的文件不可读取。")?;
+        if remote_import_is_reparse(&before)
+            || !before.is_file()
+            || before.len() != entry.byte_length
+        {
+            return Err("远程导入文件类型或长度与清单不匹配。".into());
+        }
+        let actual_hash = voice_desktop_common::workspace::file_hash(&safe)
+            .map_err(|_| "远程导入文件读取或摘要核验失败。".to_owned())?;
+        if voice_desktop_common::workspace::safe_path(staging_dir, &entry.relative_path)? != safe {
+            return Err("远程导入文件路径在校验期间发生变化。".into());
+        }
+        let after = fs::symlink_metadata(&safe).map_err(|_| "远程导入文件在校验期间发生变化。")?;
+        if remote_import_is_reparse(&after)
+            || !after.is_file()
+            || after.len() != entry.byte_length
+            || actual_hash != entry.sha256
+        {
+            return Err("远程导入文件摘要、长度或普通文件状态复核失败。".into());
+        }
+    }
+    Ok(())
+}
+
+fn collect_remote_import_files(
+    root: &Path,
+    current: &Path,
+    files: &mut HashSet<String>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(current).map_err(|_| "无法读取远程导入暂存目录。")? {
+        let entry = entry.map_err(|_| "无法读取远程导入暂存文件项。")?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "远程导入路径越界。")?
+            .components()
+            .map(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .ok_or("远程导入文件名不能表示为 Unicode。")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        let safe = voice_desktop_common::workspace::safe_path(root, &relative)?;
+        if safe != path {
+            return Err("远程导入暂存路径解析结果不一致。".into());
+        }
+        let metadata = fs::symlink_metadata(&safe).map_err(|_| "无法复核远程导入暂存项。")?;
+        if metadata.is_dir() {
+            collect_remote_import_files(root, &safe, files)?;
+        } else if metadata.is_file() {
+            if !files.insert(relative) {
+                return Err("远程导入暂存目录包含路径冲突。".into());
+            }
+        } else {
+            return Err("远程导入暂存目录包含特殊文件。".into());
+        }
+    }
+    Ok(())
+}
+
 fn localized_phase(value: &str) -> &'static str {
     match value {
         "starting" => "正在启动下载",
@@ -3484,7 +4741,18 @@ fn command_allowed(
     desktop: &State<'_, Arc<super::Desktop>>,
 ) -> Result<(), String> {
     super::require_command(desktop.mode, super::DesktopCommand::FocusMain)?;
-    super::trusted(window, desktop)
+    super::trusted(window, desktop)?;
+    super::require_local_device_target(desktop)
+}
+
+fn schedule_after_system_feature_confirmation<T>(
+    confirmed: bool,
+    schedule: impl FnOnce() -> T,
+) -> Result<T, String> {
+    if !confirmed {
+        return Err("启用 OpenSSH Server 必须先由用户明确确认 Windows 系统安装及服务启动。".into());
+    }
+    Ok(schedule())
 }
 
 #[tauri::command]
@@ -3517,12 +4785,30 @@ pub async fn resource_system_feature_enable(
     window: WebviewWindow,
     desktop: State<'_, Arc<super::Desktop>>,
     manager: State<'_, Arc<ResourceManager>>,
+    confirmed: bool, // confirmed（用户已确认 Windows 系统功能安装与 sshd 服务启动）。
 ) -> Result<Value, String> {
     command_allowed(&window, &desktop)?;
-    let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.enable_open_ssh_server())
-        .await
+    let task = schedule_after_system_feature_confirmation(confirmed, || {
+        let manager = manager.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || manager.enable_open_ssh_server())
+    })?;
+    task.await
         .map_err(|_| "OpenSSH Server 管理任务无法启动。".to_string())?
+}
+
+/// resource_system_feature_access（设置项目局域网访问）：系统授权只编辑程序专用规则。
+#[tauri::command]
+pub async fn resource_system_feature_access(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    enabled: bool,
+) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.set_open_ssh_project_access(enabled))
+        .await
+        .map_err(|_| "OpenSSH Server 访问范围管理任务无法启动。".to_string())?
 }
 
 #[tauri::command]
@@ -3604,6 +4890,36 @@ pub async fn resource_import(
         .map_err(|_| "资源导入任务无法启动。")?
 }
 
+/// resource_import_choose_sources（选择资源导入来源）：由点击按钮的设备调用原生选择器。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resource_import_choose_sources(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    resource_id: Option<String>, // resource_id（目标资源编号；空值表示批量导入）。
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.choose_import_sources(resource_id))
+        .await
+        .map_err(|_| "资源来源选择器无法启动。")?
+}
+
+/// resource_import_start（按来源票据启动导入）：服务端只处理本机原生已登记的来源。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resource_import_start(
+    window: WebviewWindow,
+    desktop: State<'_, Arc<super::Desktop>>,
+    manager: State<'_, Arc<ResourceManager>>,
+    selection_id: String, // selection_id（原生进程签发的一次性来源票据）。
+) -> Result<Value, String> {
+    command_allowed(&window, &desktop)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.start_import_sources(selection_id))
+        .await
+        .map_err(|_| "资源导入任务无法启动。")?
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn resource_open_source(
     window: WebviewWindow,
@@ -3639,6 +4955,71 @@ pub fn resource_import_confirm(
 ) -> Result<(), String> {
     super::trusted(&window, &desktop)?;
     manager.confirm_import(&job_id, accepted)
+}
+
+#[cfg(test)]
+mod remote_import_tests {
+    use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "voice-{label}-{}",
+            voice_desktop_common::workspace::new_id()
+        ))
+    }
+
+    #[test]
+    fn remote_import_source_ids_are_contract_sized_and_unique() {
+        let first = new_remote_source_id();
+        let second = new_remote_source_id();
+        assert!(valid_source_id(&first));
+        assert!(valid_source_id(&second));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn remote_import_tree_requires_exact_files_lengths_and_sha256() {
+        let root = temp_root("remote-import-tree");
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::write(root.join("models/voice.bin"), b"checked-data").unwrap();
+        let manifest = voice_desktop_common::remote_import_contract::RemoteImportManifest {
+            source_id: "0123456789abcdef0123456789abcdef".into(),
+            total_bytes: 12,
+            files: vec![
+                voice_desktop_common::remote_import_contract::RemoteImportFileEntry {
+                    relative_path: "models/voice.bin".into(),
+                    byte_length: 12,
+                    sha256: voice_desktop_common::workspace::file_hash(
+                        &root.join("models/voice.bin"),
+                    )
+                    .unwrap(),
+                },
+            ],
+        };
+        assert!(verify_remote_import_tree(&root, &manifest).is_ok());
+
+        let mut bad_hash = manifest.clone();
+        bad_hash.files[0].sha256 = "0".repeat(64);
+        assert!(verify_remote_import_tree(&root, &bad_hash).is_err());
+        fs::write(root.join("unlisted.bin"), b"extra").unwrap();
+        assert!(verify_remote_import_tree(&root, &manifest).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_import_cleanup_rejects_paths_outside_its_root() {
+        let root = temp_root("remote-import-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        let staging_root = root.join("staging");
+        fs::create_dir_all(&staging_root).unwrap();
+
+        assert!(remove_remote_import_path(&staging_root, &outside).is_err());
+        assert!(outside.join("keep.txt").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3678,6 +5059,103 @@ mod service_tests {
         );
         assert!(super::is_system_feature_job(&snapshot.job_id));
         assert!(!super::is_system_feature_job("dl-dsh"));
+    }
+
+    #[test]
+    fn ssh_elevation_heartbeat_stays_a_waiting_phase_and_shows_elapsed_time() {
+        let phase = super::open_ssh_server_wait_phase(Duration::from_secs(75));
+        assert!(phase.contains("管理员授权或官方功能处理"));
+        assert!(phase.contains("75 秒"));
+        assert_eq!(super::progress_kind(&phase), "waiting");
+    }
+
+    #[test]
+    fn local_system_feature_command_requires_confirmation_before_scheduling() {
+        let scheduled = std::cell::Cell::new(0);
+        let rejected = super::schedule_after_system_feature_confirmation(false, || {
+            scheduled.set(scheduled.get() + 1);
+            "scheduled"
+        });
+        assert!(rejected.is_err());
+        assert_eq!(
+            scheduled.get(),
+            0,
+            "unconfirmed request must not spawn the manager task"
+        );
+
+        let accepted = super::schedule_after_system_feature_confirmation(true, || {
+            scheduled.set(scheduled.get() + 1);
+            "scheduled"
+        })
+        .unwrap();
+        assert_eq!(accepted, "scheduled");
+        assert_eq!(scheduled.get(), 1);
+    }
+
+    #[test]
+    fn fixed_ssh_job_reports_uac_cancel_and_archives_terminal_attempts_for_retry() {
+        let cancelled = super::open_ssh_server_job_error(
+            voice_desktop_common::system_feature::OPENSSH_SERVER_UAC_CANCELLED_ERROR.into(),
+        );
+        assert!(matches!(cancelled, super::JobError::Cancelled));
+        let source_failure = super::open_ssh_server_job_error(
+            "Windows 官方 OpenSSH Server 功能源安装失败；请检查 Windows Update。".into(),
+        );
+        assert!(
+            matches!(source_failure, super::JobError::Failed { message, .. } if message.contains("功能源"))
+        );
+
+        let make_snapshot = |state: &str, created_at: u64| super::JobSnapshot {
+            job_id: voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID.into(),
+            resource_id: voice_desktop_common::system_feature::OPENSSH_SERVER_ID.into(),
+            state: state.into(),
+            phase: "等待 Windows 管理员授权".into(),
+            progress_kind: "waiting".into(),
+            attempt: 1,
+            parent_job_id: None,
+            completed_bytes: 0,
+            total_bytes: None,
+            download_completed_bytes: None,
+            download_total_bytes: None,
+            verification_completed_bytes: None,
+            verification_total_bytes: None,
+            failure_resource_id: None,
+            first_error: (state == "failed").then(|| "Windows 官方功能源失败".into()),
+            error: (state == "failed").then(|| "Windows 官方功能源失败".into()),
+            can_cancel: false,
+            installed_resources: vec![],
+            import_preview: None,
+            created_at,
+            revision: 2,
+            recovery: None,
+        };
+
+        for state in ["failed", "cancelled"] {
+            let previous = make_snapshot(state, 17);
+            assert!(super::terminal(&previous.state));
+            let history = super::terminal_job_history_for_retry(
+                voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID,
+                &previous,
+            )
+            .expect("terminal fixed OpenSSH task must remain reviewable on retry");
+            assert_eq!(
+                history.job_id,
+                format!(
+                    "history-{}-17",
+                    voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID
+                )
+            );
+            assert_eq!(history.state, state);
+            assert_eq!(history.error, previous.error);
+        }
+
+        let active = make_snapshot("running", 18);
+        assert!(!super::terminal(&active.state));
+        assert!(super::terminal_job_history_for_retry(
+            voice_desktop_common::system_feature::OPENSSH_SERVER_JOB_ID,
+            &active,
+        )
+        .is_none());
     }
 
     #[test]
@@ -3805,12 +5283,10 @@ mod service_tests {
         assert_eq!(event["revision"], 8);
         assert_eq!(event["created_at"], 100);
         assert_eq!(event["can_cancel"], false);
-        assert!(
-            event["fields"]["revision"]
-                .as_str()
-                .unwrap()
-                .contains("修订号")
-        );
+        assert!(event["fields"]["revision"]
+            .as_str()
+            .unwrap()
+            .contains("修订号"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3891,12 +5367,14 @@ mod service_tests {
             let accepting = AtomicBool::new(false);
             let batch = AtomicBool::new(false);
             let mut paused = ServiceLease::pause(&control, lock.lock().unwrap()).unwrap();
-            assert!(
-                !resume_service_if_ready(&mut paused, &pending, &accepting, &batch, || panic!(
-                    "维护期间不能启动资源检查或服务"
-                ))
-                .unwrap()
-            );
+            assert!(!resume_service_if_ready(
+                &mut paused,
+                &pending,
+                &accepting,
+                &batch,
+                || panic!("维护期间不能启动资源检查或服务")
+            )
+            .unwrap());
             drop(paused);
             assert_eq!(*pending.lock().unwrap(), running);
             accepting.store(true, Ordering::Release);

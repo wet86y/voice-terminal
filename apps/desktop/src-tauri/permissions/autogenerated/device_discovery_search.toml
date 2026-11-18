@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-discovery-search"
+description = "Enables the device_discovery_search command without any pre-configured scope."
+commands.allow = ["device_discovery_search"]
+
+[[permission]]
+identifier = "deny-device-discovery-search"
+description = "Denies the device_discovery_search command without any pre-configured scope."
+commands.deny = ["device_discovery_search"]

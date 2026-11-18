@@ -1,6 +1,6 @@
 //! Environment commands（环境命令）：原生配置语音服务、登记与检测显卡环境。
 use super::{Desktop, ResourceManager};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};
 use tauri::{State, WebviewWindow};
 use voice_desktop_common::{
@@ -9,7 +9,8 @@ use voice_desktop_common::{
 };
 fn allowed(window: &WebviewWindow, desktop: &Desktop) -> Result<(), String> {
     super::trusted(window, desktop)?;
-    super::require_command(desktop.mode, super::DesktopCommand::FocusMain)
+    super::require_command(desktop.mode, super::DesktopCommand::FocusMain)?;
+    super::require_local_device_target(desktop)
 }
 fn dependency_plan(
     context: &voice_desktop_common::LaunchContext,

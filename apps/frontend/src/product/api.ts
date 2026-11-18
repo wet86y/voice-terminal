@@ -7,6 +7,8 @@ import type {
   ProductSnapshot,
   WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductMinimaxVoiceName, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
+import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import { nativeDeviceApi, type RemoteManagementOperation } from './native-device-api'
 
 /** AnifLiveImportFile（模型导入文件）：扫描结果中的单个文件及仓库相对路径。 */
 export interface AnifLiveImportFile {
@@ -131,10 +133,291 @@ export interface ProductDeviceSnapshot {
 
 function apiBaseUrl() {
   const configuration = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
+  if (configuration?.remote_mode === true) {
+    throw new ProductApiError('远程产品请求不能使用客户端语音服务地址。', 501, {
+      code: 'REMOTE_LOCAL_HTTP_DISABLED', // code（业务错误码）：禁止远程页面使用客户端本机 HTTP。
+    }, 'REMOTE_LOCAL_HTTP_DISABLED')
+  }
   if (configuration?.business_ready === false) throw new Error('应用宿主尚未允许业务请求。')
   const configuredUrl = configuration?.voice_api_url
   if (!configuredUrl) throw new Error('应用宿主尚未提供语音服务接口地址。')
   return configuredUrl.replace(/\/$/, '')
+}
+
+const REMOTE_PRODUCT_OPERATIONS: Record<string, RemoteManagementOperation> = {
+  'GET /api/v1/product/snapshot': 'product.snapshot',
+  'GET /api/v1/devices': 'product.devices',
+  'POST /api/v1/devices/interaction': 'product.devices.select',
+  'GET /api/v1/product/compute-status': 'product.compute_status',
+  'GET /api/v1/product/compute-status?refresh=true': 'product.compute_status.refresh',
+  'GET /api/v1/dsh/status': 'product.dsh_status',
+  'POST /api/v1/application/dsh-approval': 'dsh.approval.decide', // dsh.approval.decide（提交服务端权限答复）。
+  'GET /api/v1/wake-tasks': 'product.wake_tasks',
+  'POST /api/v1/application/wake-tasks': 'wake_task.create', // wake_task.create（服务端创建定时任务）。
+  'GET /api/v1/product/settings/hotwords': 'settings.hotwords.read',
+  'PUT /api/v1/product/settings/hotwords': 'settings.hotwords.save',
+  'POST /api/v1/product/hotwords/import': 'hotwords.import',
+  'POST /api/v1/product/hotwords/preview': 'hotwords.preview',
+  'PUT /api/v1/product/settings/wake': 'settings.wake.save',
+  'PUT /api/v1/product/settings/silence': 'settings.silence.save',
+  'PUT /api/v1/product/settings/quiet-hours': 'settings.quiet_hours.save',
+  'PUT /api/v1/product/settings/shadow': 'settings.shadow.save',
+  'PUT /api/v1/product/settings/approvals': 'settings.approvals.save',
+  'PUT /api/v1/product/settings/persona': 'settings.persona.save',
+  'PUT /api/v1/product/settings/custom-instructions': 'settings.custom_instructions.save',
+  'PUT /api/v1/product/settings/speaker': 'settings.speaker.save',
+  'PUT /api/v1/product/settings/compute': 'settings.compute.save',
+  'PUT /api/v1/product/settings/audio-enhancements': 'settings.audio_enhancements.save',
+  'PUT /api/v1/product/settings/screen-capture': 'settings.screen_capture.save',
+  'PUT /api/v1/product/settings/tts': 'settings.tts.save',
+  'PUT /api/v1/settings/inference': 'settings.inference.save',
+  'GET /api/v1/models/registry': 'models.registry.read',
+  'POST /api/v1/models/scan': 'models.scan',
+  'POST /api/v1/models/validate': 'models.validate',
+  'POST /api/v1/models/providers': 'models.providers.add',
+  'POST /api/v1/models/assignments/apply': 'models.assignments.apply',
+  'GET /api/v1/models/credentials': 'models.credentials.read',
+  'PUT /api/v1/models/credentials': 'models.credentials.save',
+  'GET /api/v1/tts/status': 'tts.status',
+  'GET /api/v1/speaker/status': 'speaker.status',
+  'GET /api/v1/speaker/profile': 'speaker.profile',
+  'POST /api/v1/tts/minimax/voice-name': 'tts.minimax.voice_name',
+  'POST /api/v1/tts/operations/preview': 'tts.operation.preview',
+  'POST /api/v1/tts/operations/minimax-preview': 'tts.operation.minimax_preview',
+  'POST /api/v1/tts/operations/play': 'tts.operation.play',
+  'POST /api/v1/tts/operations/transcribe': 'tts.operation.transcribe',
+  'GET /api/v1/tts/aniflive/import/pending': 'tts.aniflive.import.pending',
+  'POST /api/v1/tts/aniflive/import/scan': 'tts.aniflive.import.scan',
+  'POST /api/v1/tts/aniflive/import/jobs': 'tts.aniflive.import.start',
+  'POST /api/v1/speaker/enrollment/start': 'speaker.enrollment.start',
+  'POST /api/v1/speaker/test/capture': 'speaker.test.capture',
+  'POST /api/v1/speaker/test/capture/stop': 'speaker.test.capture_stop',
+  'POST /api/v1/speaker/test': 'speaker.test.run',
+}
+
+async function remoteModeSelected(): Promise<boolean> {
+  const application = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
+  const configuredRemoteMode = application?.remote_mode === true
+  if (configuredRemoteMode && application?.business_ready === false) {
+    throw new ProductApiError('服务端语音核心或产品业务尚未就绪；请等待服务端状态恢复后再操作。', 503, {
+      code: 'REMOTE_BUSINESS_NOT_READY', // code（业务错误码）：服务端产品业务当前不可访问。
+    }, 'REMOTE_BUSINESS_NOT_READY')
+  }
+  if (!locateNativeInvoker()) {
+    if (configuredRemoteMode) {
+      throw new ProductApiError('远程模式缺少原生管理通道，已取消产品请求。', 0, {
+        code: 'REMOTE_TARGET_UNAVAILABLE', // code（业务错误码）：远程目标无法安全确认。
+      }, 'REMOTE_TARGET_UNAVAILABLE')
+    }
+    return false
+  }
+  try {
+    const status = await nativeDeviceApi.deviceConfigStatus()
+    if (status?.runtime?.mode === 'remote') return true
+    if (status?.runtime?.mode === 'local') return false
+    throw new Error('设备配置没有提供有效的运行模式。')
+  } catch {
+    throw new ProductApiError(
+      '无法确认产品请求的目标主机，已取消请求。',
+      0,
+      { code: 'REMOTE_TARGET_UNAVAILABLE' }, // code（业务错误码）：远程目标无法安全确认。
+      'REMOTE_TARGET_UNAVAILABLE',
+    )
+  }
+}
+
+async function remoteProductResponse(path: string, init: RequestInit): Promise<Response> {
+  const method = (init.method ?? (init.body === undefined ? 'GET' : 'POST')).toUpperCase()
+  const pathWithoutQuery = path.split('?', 1)[0]
+  let operation = REMOTE_PRODUCT_OPERATIONS[`${method} ${path}`]
+    ?? REMOTE_PRODUCT_OPERATIONS[`${method} ${pathWithoutQuery}`]
+  let pathArguments: Record<string, unknown> = {}
+  let bodyRequired = operation === 'dsh.approval.decide'
+  if (!operation) {
+    const wakeTask = /^\/api\/v1\/wake-tasks\/([^/]+)(\/cancel)?$/.exec(pathWithoutQuery)
+    const model = /^\/api\/v1\/models\/([^/]+)(?:\/(hide|restore))?$/.exec(pathWithoutQuery)
+    const providerUsage = /^\/api\/v1\/models\/credentials\/(deepseek|minimax)\/usage$/.exec(pathWithoutQuery)
+    const ttsVoice = /^\/api\/v1\/tts\/voices\/([^/]+)(?:\/([^/]+))?$/.exec(pathWithoutQuery)
+    const ttsOperation = /^\/api\/v1\/tts\/operations\/([^/]+)(\/cancel)?$/.exec(pathWithoutQuery)
+    const ttsDefaultReference = /^\/api\/v1\/tts\/voices\/([^/]+)\/([^/]+)\/default-reference$/.exec(pathWithoutQuery)
+    const ttsClip = /^\/api\/v1\/tts\/assets\/([^/]+)\/([^/]+)\/clip$/.exec(pathWithoutQuery)
+    const ttsAnifReferenceImport = /^\/api\/v1\/tts\/aniflive\/models\/([^/]+)\/references\/import$/.exec(pathWithoutQuery)
+    const ttsAnifImportJob = /^\/api\/v1\/tts\/aniflive\/import\/jobs\/([^/]+)(\/reference)?$/.exec(pathWithoutQuery)
+    const ttsAnifModel = /^\/api\/v1\/tts\/aniflive\/models\/([^/]+)$/.exec(pathWithoutQuery)
+    const speakerEnrollment = /^\/api\/v1\/speaker\/enrollment\/([^/]+)(?:\/(capture\/stop|segment|capture|commit))?$/.exec(pathWithoutQuery)
+    const speakerTemplate = /^\/api\/v1\/speaker\/templates\/([^/]+)$/.exec(pathWithoutQuery)
+    try {
+      if (wakeTask) {
+        const taskId = decodeURIComponent(wakeTask[1])
+        if (wakeTask[2] === '/cancel' && method === 'POST') {
+          operation = 'wake_task.cancel'
+          pathArguments = { task_id: taskId }
+        } else if (!wakeTask[2] && method === 'DELETE') {
+          operation = 'wake_task.delete'
+          pathArguments = { task_id: taskId }
+        } else if (!wakeTask[2] && method === 'PATCH') {
+          operation = 'wake_task.update'
+          pathArguments = { task_id: taskId }
+          bodyRequired = true
+        }
+      } else if (providerUsage && method === 'GET') {
+        operation = 'provider.usage'
+        pathArguments = { provider: providerUsage[1] }
+      } else if (model && method === 'PATCH' && !model[2]) {
+        operation = 'model.update'
+        pathArguments = { model_id: decodeURIComponent(model[1]) }
+        bodyRequired = true
+      } else if (model && method === 'DELETE' && !model[2]) {
+        operation = 'model.delete'
+        pathArguments = { model_id: decodeURIComponent(model[1]) }
+      } else if (model && method === 'POST' && model[2] === 'hide') {
+        operation = 'model.hide'
+        pathArguments = { model_id: decodeURIComponent(model[1]) }
+      } else if (model && method === 'POST' && model[2] === 'restore') {
+        operation = 'model.restore'
+        pathArguments = { model_id: decodeURIComponent(model[1]) }
+      } else if (ttsDefaultReference && method === 'PUT') {
+        operation = 'tts.voices.default_reference'
+        pathArguments = { model_id: decodeURIComponent(ttsDefaultReference[1]), voice_id: decodeURIComponent(ttsDefaultReference[2]) }
+        bodyRequired = true
+      } else if (ttsClip && method === 'POST') {
+        operation = 'tts.assets.clip'
+        pathArguments = { model_id: decodeURIComponent(ttsClip[1]), asset_id: decodeURIComponent(ttsClip[2]) }
+        bodyRequired = true
+      } else if (ttsVoice && ttsVoice[2] === 'selection' && method === 'PUT') {
+        operation = 'tts.voices.select'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]) }
+        bodyRequired = true
+      } else if (ttsVoice && ttsVoice[2] === 'restore-default' && method === 'POST') {
+        operation = 'tts.voices.restore_default'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]) }
+      } else if (ttsVoice && ttsVoice[2] === 'capabilities' && method === 'GET') {
+        operation = 'tts.voices.capabilities'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]) }
+      } else if (ttsVoice && ttsVoice[2] && method === 'DELETE') {
+        operation = 'tts.voices.delete'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]), voice_id: decodeURIComponent(ttsVoice[2]) }
+      } else if (ttsVoice && ttsVoice[2] && method === 'PUT') {
+        operation = 'tts.voices.update'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]), voice_id: decodeURIComponent(ttsVoice[2]) }
+        bodyRequired = true
+      } else if (ttsVoice && !ttsVoice[2] && method === 'POST') {
+        operation = 'tts.voices.create'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]) }
+        bodyRequired = true
+      } else if (ttsVoice && !ttsVoice[2] && method === 'GET') {
+        operation = 'tts.voices.read'
+        pathArguments = { model_id: decodeURIComponent(ttsVoice[1]) }
+      } else if (ttsOperation && ttsOperation[2] === '/cancel' && method === 'POST') {
+        operation = 'tts.operation.cancel'
+        pathArguments = { operation_id: decodeURIComponent(ttsOperation[1]) }
+      } else if (ttsOperation && !ttsOperation[2] && method === 'GET') {
+        operation = 'tts.operation.read'
+        pathArguments = { operation_id: decodeURIComponent(ttsOperation[1]) }
+      } else if (ttsAnifReferenceImport && method === 'POST') {
+        operation = 'tts.aniflive.references.import'
+        pathArguments = { model_id: decodeURIComponent(ttsAnifReferenceImport[1]) }
+        bodyRequired = true
+      } else if (ttsAnifModel && method === 'PATCH') {
+        operation = 'tts.aniflive.model.rename'
+        pathArguments = { model_id: decodeURIComponent(ttsAnifModel[1]) }
+        bodyRequired = true
+      } else if (ttsAnifImportJob && ttsAnifImportJob[2] === '/reference' && method === 'POST') {
+        operation = 'tts.aniflive.import.reference'
+        pathArguments = { task_id: decodeURIComponent(ttsAnifImportJob[1]) }
+        bodyRequired = true
+      } else if (ttsAnifImportJob && !ttsAnifImportJob[2] && method === 'GET') {
+        operation = 'tts.aniflive.import.read'
+        pathArguments = { task_id: decodeURIComponent(ttsAnifImportJob[1]) }
+      } else if (speakerEnrollment && speakerEnrollment[2] === 'segment' && method === 'POST') {
+        operation = 'speaker.enrollment.segment'
+        pathArguments = { enrollment_id: decodeURIComponent(speakerEnrollment[1]) }
+        bodyRequired = true
+      } else if (speakerEnrollment && speakerEnrollment[2] === 'capture' && method === 'POST') {
+        operation = 'speaker.enrollment.capture'
+        pathArguments = { enrollment_id: decodeURIComponent(speakerEnrollment[1]) }
+        bodyRequired = true
+      } else if (speakerEnrollment && speakerEnrollment[2] === 'capture/stop' && method === 'POST') {
+        operation = 'speaker.enrollment.capture_stop'
+        pathArguments = { enrollment_id: decodeURIComponent(speakerEnrollment[1]) }
+        bodyRequired = true
+      } else if (speakerEnrollment && speakerEnrollment[2] === 'commit' && method === 'POST') {
+        operation = 'speaker.enrollment.commit'
+        pathArguments = { enrollment_id: decodeURIComponent(speakerEnrollment[1]) }
+      } else if (speakerEnrollment && !speakerEnrollment[2] && method === 'DELETE') {
+        operation = 'speaker.enrollment.delete'
+        pathArguments = { enrollment_id: decodeURIComponent(speakerEnrollment[1]) }
+      } else if (speakerTemplate && method === 'DELETE') {
+        operation = 'speaker.template.delete'
+        pathArguments = { template_id: decodeURIComponent(speakerTemplate[1]) }
+      } else if (speakerTemplate && method === 'PATCH') {
+        operation = 'speaker.template.update'
+        pathArguments = { template_id: decodeURIComponent(speakerTemplate[1]) }
+        bodyRequired = true
+      }
+    } catch {
+      throw new ProductApiError('远程产品资源编号编码无效。', 400)
+    }
+  }
+  if (!operation) {
+    throw new ProductApiError('此远程产品操作尚未接入服务端固定操作接口。', 501, {
+      code: 'REMOTE_OPERATION_UNAVAILABLE', operation: `${method} ${pathWithoutQuery}`,
+    })
+  }
+  let argumentsValue = pathArguments
+  if (operation === 'dsh.approval.decide') {
+    if (typeof init.body !== 'string') {
+      throw new ProductApiError('远程 DSH 权限答复缺少结构化 JSON 参数。', 400)
+    }
+    let value: unknown
+    try { value = JSON.parse(init.body) as unknown }
+    catch { throw new ProductApiError('远程 DSH 权限答复不是有效 JSON。', 400) }
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new ProductApiError('远程 DSH 权限答复必须是 JSON 对象。', 400)
+    }
+    const fields = value as Record<string, unknown>
+    const keys = Object.keys(fields).sort()
+    if (keys.join(',') !== 'approval_id,decision,run_seq'
+      || typeof fields.approval_id !== 'string' || fields.approval_id.length < 1 || fields.approval_id.length > 160
+      || !['allowed-once', 'allowed-until-silence', 'rejected'].includes(String(fields.decision))
+      || !Number.isSafeInteger(fields.run_seq) || (fields.run_seq as number) < 0) {
+      throw new ProductApiError('远程 DSH 权限答复字段或取值无效。', 400)
+    }
+    argumentsValue = fields
+  } else if (init.body !== undefined && init.body !== null) {
+    if (typeof init.body !== 'string') {
+      throw new ProductApiError('远程产品操作只接受结构化 JSON 参数。', 415)
+    }
+    try {
+      const value: unknown = JSON.parse(init.body)
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('shape')
+      if (Object.keys(pathArguments).length > 0) {
+        if (bodyRequired) argumentsValue = { ...pathArguments, value }
+        else if (Object.keys(value).length === 0) argumentsValue = pathArguments
+        else throw new Error('unexpected-body')
+      } else {
+        argumentsValue = { value }
+      }
+    } catch {
+      throw new ProductApiError('远程产品操作参数不是有效 JSON 对象或字段不匹配。', 400)
+    }
+  } else if (bodyRequired) {
+    throw new ProductApiError('远程产品操作缺少结构化 JSON 参数。', 400)
+  }
+  if (operation === 'tts.aniflive.import.scan') {
+    const source = argumentsValue.value
+    if (typeof source === 'object' && source !== null && !Array.isArray(source)
+      && (source as Record<string, unknown>).source_type === 'local') {
+      throw new ProductApiError('客户端本机目录须通过受授权文件传输上传；不会把客户端路径发送给服务端。', 501, {
+        code: 'REMOTE_FILE_TRANSFER_REQUIRED', operation: 'tts.aniflive.import.scan',
+      })
+    }
+  }
+  const result = await nativeDeviceApi.remoteManagementRequest(operation, argumentsValue)
+  return new Response(JSON.stringify(result.body), {
+    status: result.status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  })
 }
 
 async function readError(response: Response): Promise<ProductApiError> {
@@ -160,15 +443,20 @@ async function readError(response: Response): Promise<ProductApiError> {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response
   try {
-    response = await fetch(`${apiBaseUrl()}${path}`, {
-      ...init,
-      headers: {
-        Accept: 'application/json',
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(init.headers || {}),
-      },
-    })
+    if (await remoteModeSelected()) {
+      response = await remoteProductResponse(path, init)
+    } else {
+      response = await fetch(`${apiBaseUrl()}${path}`, {
+        ...init,
+        headers: {
+          Accept: 'application/json',
+          ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+          ...(init.headers || {}),
+        },
+      })
+    }
   } catch (error) {
+    if (error instanceof ProductApiError) throw error
     throw new ProductApiError(error instanceof Error ? error.message : '无法连接 Voice Server。')
   }
   if (!response.ok) throw await readError(response)
@@ -198,7 +486,16 @@ export const productApi = {
   importHotwords: (text: string) => request<{ entries: import('./hotwords').HotwordEntry[] }>('/api/v1/product/hotwords/import', { method: 'POST', body: JSON.stringify({ text }) }), // importHotwords（解析导入，不自动保存）。
   previewHotwords: (settings: import('./hotwords').HotwordSettings, text: string) => request<import('./hotwords').HotwordPreview>('/api/v1/product/hotwords/preview', { method: 'POST', body: JSON.stringify({ settings, text }) }), // previewHotwords（试测当前草稿）。
   /** decideDshApproval（权限答复）：经桌面同源宿主转发，连续授权只限当前语音窗口。 */
-  decideDshApproval: async (value: { approval_id: string; decision: 'allowed-once' | 'allowed-until-silence' | 'rejected'; run_seq: number }) => {
+  decideDshApproval: async (value: {
+    approval_id: string // approval_id（待处理的服务端权限请求编号）。
+    decision: 'allowed-once' | 'allowed-until-silence' | 'rejected' // decision（用户对权限请求的答复）。
+    run_seq: number // run_seq（服务端运行序号，用于拒绝已过期请求）。
+  }) => {
+    if (await remoteModeSelected()) {
+      return request<{ result: string }>('/api/v1/application/dsh-approval', {
+        method: 'POST', body: JSON.stringify(value),
+      })
+    }
     const response = await fetch('/api/v1/application/dsh-approval', { method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
     if (!response.ok) throw await readError(response)
     return await response.json() as { result: string }
@@ -242,10 +539,17 @@ export const productApi = {
   }),
   /** createWakeTask（手动创建任务）：同源宿主校验桌面会话，内部凭据不进入前端。 */
   createWakeTask: async (value: {
-    text: string
-    at?: string
-    daily?: { time: string; time_zone: string }
-    weekly?: { time: string; time_zone: string; weekdays: number[] }
+    text: string // text（保存的任务说明）。
+    at?: string // at（单次触发的 ISO（国际标准化组织）时间）。
+    daily?: {
+      time: string // time（本地时区执行时刻）。
+      time_zone: string // time_zone（执行时区编号）。
+    } // daily（每日执行规则）。
+    weekly?: {
+      time: string // time（本地时区执行时刻）。
+      time_zone: string // time_zone（执行时区编号）。
+      weekdays: number[] // weekdays（执行星期，1 为周一至 7 为周日）。
+    } // weekly（每周执行规则）。
     /** every_seconds（间隔秒数）：整分钟，范围为 60 至 86400。 */
     every_seconds?: number
     /** loop（是否持续循环）：关闭时必须提供 trigger_count（总触发次数）。 */
@@ -253,8 +557,14 @@ export const productApi = {
     /** trigger_count（总触发次数）：包含第一次触发。 */
     trigger_count?: number
   }) => {
+    const init: RequestInit = {
+      method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(value),
+    }
+    // 远程客户端通过固定管理操作创建服务端任务；本地模式保留同源桌面会话校验。
+    if (await remoteModeSelected()) return request<WakeTask>('/api/v1/application/wake-tasks', init)
     const response = await fetch('/api/v1/application/wake-tasks', {
-      method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+      ...init, credentials: 'same-origin',
     })
     if (!response.ok) throw await readError(response)
     return await response.json() as WakeTask

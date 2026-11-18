@@ -96,6 +96,22 @@ async def main() -> None:
     control_port = int(os.environ.get("VOICE_DEVICE_E2E_CONTROL_PORT", "18766"))
     test_case = load_product_api_tests()("test_device_gateway_status_is_versioned_and_contains_no_private_snapshot")
     test_case.setUp()
+    # 该回环测试只使用 ProductApiTests 自建的临时目录；此处模拟桌面原生信任写入，以覆盖旧版网关兼容接口。
+    # 正式服务仍以只读 DeviceTrustStore（设备信任存储）视图运行，真实配对由 Rust（原生层）写入。
+    assert test_case.runtime.device_trust_store is not None
+    test_case.runtime.device_trust_store._read_only = False
+    test_case.runtime.device_host_id = os.environ.get("VOICE_TERMINAL_HOST_ID")
+    # 并行 Rust 集成测试各自绑定临时回环端口；只在隔离夹具中同步两处端口门禁。
+    from voice_terminal.server import http_api as device_http_api
+    def require_fixture_gateway_port(request) -> None:
+        server = request.scope.get("server")
+        if not isinstance(server, (tuple, list)) or len(server) != 2 or server[1] != gateway_port:
+            raise HTTPException(status_code=404, detail="测试设备请求必须通过本次固定 SSH 回环通道。")
+
+    device_http_api._require_device_gateway_port = require_fixture_gateway_port
+    for middleware in test_case.app.user_middleware:
+        if middleware.cls is device_http_api.LoopbackDeviceGatewayGuard:
+            middleware.kwargs["gateway_port"] = gateway_port
     control_app = FastAPI()
     state: dict[str, object] = {}
     from voice_terminal.audio.player import PcmPlayer

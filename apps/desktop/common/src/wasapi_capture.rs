@@ -15,12 +15,15 @@ pub const CAPTURE_QUEUE_FRAMES: usize = 6; // CAPTURE_QUEUE_FRAMES（设备侧�
 /// monotonic_device_time_us（设备单调时钟）：与 WASAPI 音频包 QPC 时间戳同源。
 #[cfg(windows)]
 pub fn monotonic_device_time_us() -> Result<u64, String> {
-    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
     let mut counter = 0_i64;
     let mut frequency = 0_i64;
     if unsafe { QueryPerformanceCounter(&mut counter) } == 0
         || unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
-        || counter < 0 || frequency <= 0
+        || counter < 0
+        || frequency <= 0
     {
         return Err("Windows 高精度单调时钟不可用。".into());
     }
@@ -321,8 +324,8 @@ impl Pcm16CaptureConverter {
     /// resume_after_endpoint_change（默认端点更换后恢复）：清除旧滤波/相位状态并标记缺口。
     fn resume_after_endpoint_change(
         &mut self,
-        format: CaptureFormat, // format（新默认端点混音格式）。
-        next_sequence: u64, // next_sequence（后续连续采集帧编号）。
+        format: CaptureFormat,  // format（新默认端点混音格式）。
+        next_sequence: u64,     // next_sequence（后续连续采集帧编号）。
         next_start_sample: u64, // next_start_sample（后续逻辑采样位置）。
     ) -> Result<(), String> {
         self.format = format.validate()?;
@@ -516,7 +519,9 @@ mod windows_capture {
 
         /// recv_frame（读取采集帧）：超时返回 None，不会阻塞控制线程超过指定时长。
         pub fn recv_frame(&self, timeout: Duration) -> Result<Option<CaptureFrame>, String> {
-            let receiver = self.frames.lock()
+            let receiver = self
+                .frames
+                .lock()
                 .map_err(|_| "WASAPI 采集帧接收队列不可用".to_owned())?;
             match receiver.recv_timeout(timeout) {
                 Ok(Ok(frame)) => Ok(Some(frame)),
@@ -639,7 +644,8 @@ mod windows_capture {
                         }
                         Err(_error) => {
                             let until = std::time::Instant::now() + retry_delay;
-                            while !stop.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                            while !stop.load(Ordering::Acquire) && std::time::Instant::now() < until
+                            {
                                 std::thread::sleep(Duration::from_millis(20));
                             }
                             retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
@@ -668,10 +674,7 @@ mod windows_capture {
     }
 
     impl Session {
-        fn open(
-            stop: &AtomicBool,
-            continuation: Option<(u64, u64)>,
-        ) -> Result<Self, String> {
+        fn open(stop: &AtomicBool, continuation: Option<(u64, u64)>) -> Result<Self, String> {
             let enumerator: IMMDeviceEnumerator =
                 unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                     .map_err(|error| format!("WASAPI 设备枚举器不可用：{error}"))?;
@@ -734,9 +737,8 @@ mod windows_capture {
         }
 
         fn default_endpoint_id(&self) -> Result<String, String> {
-            let device = unsafe {
-                self.enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)
-            }.map_err(|error| format!("读取当前默认麦克风失败：{error}"))?;
+            let device = unsafe { self.enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }
+                .map_err(|error| format!("读取当前默认麦克风失败：{error}"))?;
             crate::device_audio::endpoint_id_from_device(&device)
         }
     }
@@ -791,8 +793,9 @@ mod windows_capture {
         queue_discontinuity: &mut bool,
     ) -> Result<(), String> {
         loop {
-            let available = unsafe { session.capture.GetNextPacketSize() }
-                .map_err(|error| crate::device_audio::format_wasapi_error("读取 WASAPI 采集包大小失败", error))?;
+            let available = unsafe { session.capture.GetNextPacketSize() }.map_err(|error| {
+                crate::device_audio::format_wasapi_error("读取 WASAPI 采集包大小失败", error)
+            })?;
             if available == 0 {
                 return Ok(());
             }
@@ -810,10 +813,13 @@ mod windows_capture {
                     Some(&mut qpc_position),
                 )
             }
-            .map_err(|error| crate::device_audio::format_wasapi_error("读取 WASAPI 采集缓冲失败", error))?;
+            .map_err(|error| {
+                crate::device_audio::format_wasapi_error("读取 WASAPI 采集缓冲失败", error)
+            })?;
             if count == 0 {
-                unsafe { session.capture.ReleaseBuffer(0) }
-                    .map_err(|error| crate::device_audio::format_wasapi_error("释放空 WASAPI 采集缓冲失败", error))?;
+                unsafe { session.capture.ReleaseBuffer(0) }.map_err(|error| {
+                    crate::device_audio::format_wasapi_error("释放空 WASAPI 采集缓冲失败", error)
+                })?;
                 continue;
             }
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
@@ -832,8 +838,9 @@ mod windows_capture {
                     unsafe { std::slice::from_raw_parts(data, length.unwrap()) }.to_vec(),
                 ))
             };
-            unsafe { session.capture.ReleaseBuffer(count) }
-                .map_err(|error| crate::device_audio::format_wasapi_error("释放 WASAPI 采集缓冲失败", error))?;
+            unsafe { session.capture.ReleaseBuffer(count) }.map_err(|error| {
+                crate::device_audio::format_wasapi_error("释放 WASAPI 采集缓冲失败", error)
+            })?;
             let payload = payload_result?;
             let timestamp = if timestamp_valid {
                 qpc_position / 10

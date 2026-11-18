@@ -3,52 +3,99 @@
 //! 本模块只提供 SSH 主机验证、一次性密钥认证和到远端回环网关的受限
 //! HTTP（超文本传输协议）控制通道。不得回退到命令行 SSH、密码认证或未固定主机。
 
-use crate::device_protocol::AudioCodec;
+use crate::device_file_channel::{
+    DeviceFileTransferBegin, FileTransferAuthorization, FILE_TRANSFER_GATEWAY_PATH,
+};
+use crate::device_management_contract::{
+    RemoteManagementOpenRequest, RemoteManagementOpenResponse, RemoteManagementRequest,
+    RemoteManagementResponse, DEVICE_MANAGEMENT_PROTOCOL_VERSION,
+};
+use crate::device_protocol::{AudioCodec, MEDIA_PROTOCOL_VERSION};
 use crate::device_receipts::{DeviceTaskReceiptJournal, PendingDeviceReceipt};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use russh::keys::ssh_key::LineEnding;
 use russh::{
     client::{self, AuthResult},
     keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
     Disconnect,
 };
-use russh::keys::ssh_key::LineEnding;
-use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest, Sha256};
 use std::{
-    fs, future::Future, io::Read, path::{Component, Path},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    collections::BTreeMap,
+    fs,
+    future::Future,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 18_765; // DEFAULT_GATEWAY_PORT（主机回环业务网关端口）。
+const CONTROL_BRIDGE_MARKER: &str = "voice-terminal-v1-control"; // CONTROL_BRIDGE_MARKER（受限 SSH 控制桥接标记）。
+const MEDIA_BRIDGE_MARKER: &str = "voice-terminal-v1-media"; // MEDIA_BRIDGE_MARKER（受限 SSH 媒体桥接标记）。
+const MANAGEMENT_BRIDGE_MARKER: &str = "voice-terminal-v1-management"; // MANAGEMENT_BRIDGE_MARKER（独立 SSH 原生管理桥接标记）。
+const FILE_BRIDGE_MARKER: &str = "voice-terminal-v1-file"; // FILE_BRIDGE_MARKER（独立 SSH 大文件通道标记）。
 const MAX_REQUEST_BYTES: usize = 1_048_576; // MAX_REQUEST_BYTES（控制请求体上限，字节）。
 const MAX_RESPONSE_BYTES: usize = 2_097_152; // MAX_RESPONSE_BYTES（控制回执体上限，字节）。
 const MAX_HEADER_BYTES: usize = 16_384; // MAX_HEADER_BYTES（HTTP 响应头上限，字节）。
 const MAX_MEDIA_MESSAGE_BYTES: usize = 270_336; // MAX_MEDIA_MESSAGE_BYTES（WebSocket 单消息上限，字节）。
 const REMOTE_DEVICE_OPERATIONS: &[&str] = &[
-    "windows", "apps", "snapshot", "shot", "tree", "click", "type", "scroll", "key", "move",
-    "windowControl", "invokePattern", "readText", "readTable", "clipboard", "process", "displays",
-    "cursorPosition", "notify", "multi_action", "terminal.create", "terminal.input", "terminal.output",
-    "terminal.status", "terminal.cancel", "terminal.close", "file.list", "file.read", "file.stat",
-    "file.sftp.upload", "file.sftp.download", "playback.pause", "playback.resume",
+    "windows",
+    "apps",
+    "snapshot",
+    "shot",
+    "tree",
+    "click",
+    "type",
+    "scroll",
+    "key",
+    "move",
+    "windowControl",
+    "invokePattern",
+    "readText",
+    "readTable",
+    "clipboard",
+    "process",
+    "displays",
+    "cursorPosition",
+    "notify",
+    "multi_action",
+    "terminal.create",
+    "terminal.input",
+    "terminal.output",
+    "terminal.status",
+    "terminal.cancel",
+    "terminal.close",
+    "file.list",
+    "file.read",
+    "file.stat",
+    "file.sftp.upload",
+    "file.sftp.download",
+    "playback.pause",
+    "playback.resume",
     "playback.stop_and_snapshot",
-    "playback.prepare_replacement", "playback.bind_replacement", "playback.abort_replacement",
+    "playback.prepare_replacement",
+    "playback.bind_replacement",
+    "playback.abort_replacement",
     "playback.wait_replacement",
 ]; // REMOTE_DEVICE_OPERATIONS（远端设备任务操作白名单）。
 
 /// SshDeviceTarget（SSH 目标）：只含可公开的主机身份与 SSH 登录名。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshDeviceTarget {
-    pub address: String, // address（主机 DNS 名称或 IP 地址）。
-    pub port: u16, // port（主机 SSH 端口）。
-    pub username: String, // username（受管 SSH 登录账户）。
+    pub address: String,         // address（主机 DNS 名称或 IP 地址）。
+    pub port: u16,               // port（主机 SSH 端口）。
+    pub username: String,        // username（受管 SSH 登录账户）。
     pub host_key_sha256: String, // host_key_sha256（用户已确认的 SHA-256 主机指纹）。
-    pub gateway_port: u16, // gateway_port（主机回环业务网关端口）。
+    pub gateway_port: u16,       // gateway_port（主机回环业务网关端口）。
 }
 
 impl SshDeviceTarget {
@@ -58,12 +105,13 @@ impl SshDeviceTarget {
             && self.address.len() <= 255
             && self.address.trim() == self.address
             && self.address.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'-' | b'_' | b':' | b'[' | b']')
             });
         let username_ok = !self.username.is_empty()
             && self.username.len() <= 128
             && self.username.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'\\')
             });
         let fingerprint_ok = self
             .host_key_sha256
@@ -73,7 +121,11 @@ impl SshDeviceTarget {
                     .decode(encoded)
                     .is_ok_and(|digest| digest.len() == 32)
             });
-        if !address_ok || self.port == 0 || !username_ok || !fingerprint_ok || self.gateway_port == 0
+        if !address_ok
+            || self.port == 0
+            || !username_ok
+            || !fingerprint_ok
+            || self.gateway_port == 0
         {
             return Err("SSH 主机、端口、登录名或已确认指纹无效。".into());
         }
@@ -84,24 +136,24 @@ impl SshDeviceTarget {
 /// GatewayResponse（网关回执）：已限制大小并解析为 JSON（结构化数据）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayResponse {
-    pub status: u16, // status（HTTP 状态码）。
+    pub status: u16,             // status（HTTP 状态码）。
     pub body: serde_json::Value, // body（JSON 业务回执）。
 }
 
-/// SftpTransferReceipt（SFTP 传输回执）：只在远端文件关闭并复核摘要后返回。
+/// SftpTransferReceipt（兼容文件任务回执）：path 使用 transfer:<id>，不含任何服务器路径。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SftpTransferReceipt {
-    pub path: String, // path（文件传输目标路径）。
-    pub bytes: u64, // bytes（实际传输字节数）。
+    pub path: String,   // path（文件传输目标路径）。
+    pub bytes: u64,     // bytes（实际传输字节数）。
     pub sha256: String, // sha256（原始字节摘要）。
 }
 
 /// RemoteDeviceSessionLease（远端设备会话租约）：主机授予的连接与执行器代次。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteDeviceSessionLease {
-    pub protocol_version: u32, // protocol_version（设备任务通道协议版本）。
-    pub result: String, // result（会话注册结果）。
-    pub device_id: String, // device_id（固定远端设备编号）。
+    pub protocol_version: u32,   // protocol_version（设备任务通道协议版本）。
+    pub result: String,          // result（会话注册结果）。
+    pub device_id: String,       // device_id（固定远端设备编号）。
     pub core_session_id: String, // core_session_id（当前权威核心运行编号）。
     pub connection_generation: u64, // connection_generation（主机授予的连接代次）。
     pub executor_generation: u64, // executor_generation（主机授予的执行器代次）。
@@ -111,23 +163,23 @@ pub struct RemoteDeviceSessionLease {
 /// RemoteDeviceTask（远端设备任务）：绑定设备、核心及两类代次的有界桌面命令。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteDeviceTask {
-    pub request_id: String, // request_id（核心控制请求编号）。
-    pub device_id: String, // device_id（固定执行设备编号）。
-    pub core_session_id: String, // core_session_id（权威核心运行编号）。
-    pub task_id: String, // task_id（持久任务编号）。
-    pub connection_generation: u64, // connection_generation（设备连接代次）。
-    pub executor_generation: u64, // executor_generation（设备执行器代次）。
-    pub sequence: u64, // sequence（当前连接内的递增任务序号）。
-    pub operation: String, // operation（白名单桌面操作编号）。
+    pub request_id: String,           // request_id（核心控制请求编号）。
+    pub device_id: String,            // device_id（固定执行设备编号）。
+    pub core_session_id: String,      // core_session_id（权威核心运行编号）。
+    pub task_id: String,              // task_id（持久任务编号）。
+    pub connection_generation: u64,   // connection_generation（设备连接代次）。
+    pub executor_generation: u64,     // executor_generation（设备执行器代次）。
+    pub sequence: u64,                // sequence（当前连接内的递增任务序号）。
+    pub operation: String,            // operation（白名单桌面操作编号）。
     pub arguments: serde_json::Value, // arguments（JSON 桌面任务参数）。
 }
 
 /// RemoteDeviceTaskPoll（远端设备任务轮询）：无任务时 task（任务）为空。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteDeviceTaskPoll {
-    pub protocol_version: u32, // protocol_version（设备任务通道协议版本）。
-    pub result: String, // result（轮询结果）。
-    pub device_id: String, // device_id（固定轮询设备编号）。
+    pub protocol_version: u32,   // protocol_version（设备任务通道协议版本）。
+    pub result: String,          // result（轮询结果）。
+    pub device_id: String,       // device_id（固定轮询设备编号）。
     pub core_session_id: String, // core_session_id（当前权威核心运行编号）。
     pub connection_generation: u64, // connection_generation（当前连接代次）。
     pub executor_generation: u64, // executor_generation（当前执行器代次）。
@@ -137,7 +189,7 @@ pub struct RemoteDeviceTaskPoll {
 /// RemoteDeviceTaskResult（远端执行结果）：只在辅助进程给出确定回执时提交。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteDeviceTaskResult {
-    pub succeeded: bool, // succeeded（辅助进程是否明确确认成功）。
+    pub succeeded: bool,           // succeeded（辅助进程是否明确确认成功）。
     pub result: serde_json::Value, // result（有限 JSON 操作结果或明确错误）。
 }
 
@@ -145,41 +197,41 @@ pub struct RemoteDeviceTaskResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshDeviceIdentity {
     pub credential_ref: String, // credential_ref（本机 Windows 凭据引用）。
-    pub public_key: String, // public_key（供主机接受登记的 OpenSSH 公钥）。
-    pub fingerprint: String, // fingerprint（本设备公钥 SHA-256 指纹）。
+    pub public_key: String,     // public_key（供主机接受登记的 OpenSSH 公钥）。
+    pub fingerprint: String,    // fingerprint（本设备公钥 SHA-256 指纹）。
 }
 
 /// SshTransportIdentity（SSH 登录身份）：登录密钥独立于主机批准的产品设备身份。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTransportIdentity {
     pub credential_ref: String, // credential_ref（本机 Windows 凭据引用；仅供 SSH 账户登录）。
-    pub public_key: String, // public_key（需由主机操作系统账户单独准入的 OpenSSH 公钥）。
-    pub fingerprint: String, // fingerprint（登录公钥 SHA-256 指纹）。
+    pub public_key: String,     // public_key（需由主机操作系统账户单独准入的 OpenSSH 公钥）。
+    pub fingerprint: String,    // fingerprint（登录公钥 SHA-256 指纹）。
 }
 
 #[derive(Debug, Clone)]
 struct DeviceGatewayAuthHeaders {
-    device_id: String, // device_id（已获主机批准的产品设备编号）。
+    device_id: String,       // device_id（已获主机批准的产品设备编号）。
     core_session_id: String, // core_session_id（本次权威核心运行编号）。
-    challenge: String, // challenge（本次请求的一次性签名挑战）。
-    timestamp_ms: u64, // timestamp_ms（客户端 Unix 时间毫秒）。
-    signature: String, // signature（签名后的 Base64 请求证明）。
+    challenge: String,       // challenge（本次请求的一次性签名挑战）。
+    timestamp_ms: u64,       // timestamp_ms（客户端 Unix 时间毫秒）。
+    signature: String,       // signature（签名后的 Base64 请求证明）。
 }
 
 #[derive(Debug, Deserialize)]
 struct DeviceGatewayChallenge {
-    protocol_version: u32, // protocol_version（设备网关协议版本）。
+    protocol_version: u32,   // protocol_version（设备网关协议版本）。
     core_session_id: String, // core_session_id（本次权威核心运行编号）。
-    challenge: String, // challenge（一次性随机挑战）。
-    expires_at_ms: u64, // expires_at_ms（挑战过期 Unix 毫秒）。
+    challenge: String,       // challenge（一次性随机挑战）。
+    expires_at_ms: u64,      // expires_at_ms（挑战过期 Unix 毫秒）。
 }
 
 struct ConnectedDeviceSession {
     connection: SshDeviceConnection, // connection（已固定主机身份的 SSH 通道）。
-    device_id: String, // device_id（当前远端客户端稳定编号）。
+    device_id: String,               // device_id（当前远端客户端稳定编号）。
     identity_credential_ref: String, // identity_credential_ref（产品设备签名身份引用）。
     transport_credential_ref: String, // transport_credential_ref（独立文件传输连接复用的凭据引用）。
-    target: SshDeviceTarget, // target（固定主机、指纹及端口，文件传输不可替换）。
+    target: SshDeviceTarget,          // target（固定主机、指纹及端口，文件传输不可替换）。
     #[cfg(any(test, feature = "ssh-device-test-support"))]
     signing_key_for_test: Option<Zeroizing<String>>, // signing_key_for_test（只在 SSH 集成测试中代替系统凭据库）。
     #[cfg(any(test, feature = "ssh-device-test-support"))]
@@ -194,7 +246,9 @@ fn load_session_signing_key(session: &ConnectedDeviceSession) -> Result<Zeroizin
     crate::credentials::load_device_ssh_key(&session.identity_credential_ref)
 }
 
-fn load_session_transport_key(session: &ConnectedDeviceSession) -> Result<Zeroizing<String>, String> {
+fn load_session_transport_key(
+    session: &ConnectedDeviceSession,
+) -> Result<Zeroizing<String>, String> {
     #[cfg(any(test, feature = "ssh-device-test-support"))]
     if let Some(private_key) = &session.transport_key_for_test {
         return Ok(Zeroizing::new(private_key.to_string()));
@@ -205,36 +259,85 @@ fn load_session_transport_key(session: &ConnectedDeviceSession) -> Result<Zeroiz
 trait AsyncDeviceStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncDeviceStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
+async fn write_management_line<T: serde::Serialize>(
+    stream: &mut dyn AsyncDeviceStream,
+    value: &T,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(value).map_err(|_| "远程管理请求无法编码。".to_string())?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err("远程管理请求超过大小上限。".into());
+    }
+    bytes.push(b'\n');
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(|_| "SSH 管理请求写入失败。".to_string())?;
+    stream
+        .flush()
+        .await
+        .map_err(|_| "SSH 管理请求刷新失败。".to_string())
+}
+
+async fn read_management_line<T: serde::de::DeserializeOwned>(
+    stream: &mut dyn AsyncDeviceStream,
+    max_bytes: usize,
+) -> Result<T, String> {
+    let mut bytes = Vec::with_capacity(4096);
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = stream
+            .read(&mut byte)
+            .await
+            .map_err(|_| "SSH 管理回执读取失败。".to_string())?;
+        if count == 0 {
+            return Err("SSH 管理回执在换行终止前关闭。".into());
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= max_bytes {
+            return Err("SSH 管理回执超过大小上限。".into());
+        }
+        if byte[0] != b'\r' {
+            bytes.push(byte[0]);
+        }
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "SSH 管理回执不是有效 JSON。".to_string())
+}
+
 /// SshMediaMessage（SSH 媒体消息）：服务端控制 JSON 或原始二进制音频帧。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshMediaMessage {
-    Text(String), // text（服务端 JSON 控制消息）。
+    Text(String),    // text（服务端 JSON 控制消息）。
     Binary(Vec<u8>), // binary（设备媒体二进制帧）。
-    Ping(Vec<u8>), // ping（服务端 WebSocket 保活探测负载）。
-    Pong(Vec<u8>), // pong（服务端对客户端保活探测的响应）。
-    Closed, // closed（对端正常关闭 WebSocket）。
+    Ping(Vec<u8>),   // ping（服务端 WebSocket 保活探测负载）。
+    Pong(Vec<u8>),   // pong（服务端对客户端保活探测的响应）。
+    Closed,          // closed（对端正常关闭 WebSocket）。
 }
 
 /// SshMediaChannel（SSH 媒体通道）：单独 SSH 连接承载一条已签名 WebSocket 音频流。
 pub struct SshMediaChannel {
     websocket: SshWebSocketStream, // websocket（经过主机固定与签名握手的媒体通道）。
     _connection: SshDeviceConnection, // _connection（维持该媒体通道所属的 SSH 会话）。
-    pub device_id: String, // device_id（本机稳定设备编号）。
-    pub stream_id: String, // stream_id（本次连续媒体流编号）。
-    pub core_session_id: String, // core_session_id（主机本次权威核心运行编号）。
+    pub device_id: String,         // device_id（本机稳定设备编号）。
+    pub stream_id: String,         // stream_id（本次连续媒体流编号）。
+    pub core_session_id: String,   // core_session_id（主机本次权威核心运行编号）。
     pub connection_generation: u64, // connection_generation（主机授予的连接代次）。
-    pub executor_generation: u64, // executor_generation（设备执行器代次）。
+    pub executor_generation: u64,  // executor_generation（设备执行器代次）。
     pub interaction_generation: u64, // interaction_generation（主机授予的语音占用代次）。
-    pub uplink_codec: AudioCodec, // uplink_codec（握手协商的设备上行编码）。
+    pub uplink_codec: AudioCodec,  // uplink_codec（握手协商的设备上行编码）。
     pub downlink_codec: AudioCodec, // downlink_codec（握手协商的设备下行编码）。
     pub encoder_pre_skip_samples: u32, // encoder_pre_skip_samples（上行 Opus 编码器预延迟样本数）。
     pub downlink_encoder_pre_skip_samples: u32, // downlink_encoder_pre_skip_samples（下行 Opus 编码器预延迟样本数）。
     pub clock_uncertainty_us: Option<u64>, // clock_uncertainty_us（主机返回的设备时钟误差估计，微秒）。
-    pub capture_active: bool, // capture_active（主机当前是否已启动远端采集）。
+    pub capture_active: bool,              // capture_active（主机当前是否已启动远端采集）。
 }
 
 /// media_ready_codecs（就绪回执编码协商）：旧 PCM 主机兼容，拒绝部分或类型错误的扩展字段。
-fn media_ready_codecs(value: &serde_json::Value) -> Result<(AudioCodec, AudioCodec, u32, u32), String> {
+fn media_ready_codecs(
+    value: &serde_json::Value,
+) -> Result<(AudioCodec, AudioCodec, u32, u32), String> {
     let object = value
         .as_object()
         .ok_or("主机媒体就绪回执必须是 JSON 对象。")?;
@@ -261,13 +364,15 @@ fn media_ready_codecs(value: &serde_json::Value) -> Result<(AudioCodec, AudioCod
     };
     let uplink = codec("uplink_codec")?;
     let downlink = codec("downlink_codec")?;
-    let pre_skip = object.get("encoder_pre_skip_samples")
+    let pre_skip = object
+        .get("encoder_pre_skip_samples")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or("主机媒体就绪回执的 Opus 编码预延迟字段无效。")?;
     let downlink_pre_skip = match object.get("downlink_encoder_pre_skip_samples") {
         None => 0,
-        Some(value) => value.as_u64()
+        Some(value) => value
+            .as_u64()
             .and_then(|value| u32::try_from(value).ok())
             .ok_or("主机媒体就绪回执的下行 Opus 编码预延迟字段无效。")?,
     };
@@ -322,7 +427,8 @@ impl SshMediaChannel {
             || header.executor_generation != self.executor_generation
             || header.interaction_generation != self.interaction_generation
             || header.audio_codec != self.uplink_codec
-            || header.sample_count == 0 || header.sample_count > 320
+            || header.sample_count == 0
+            || header.sample_count > 320
         {
             return Err("待发送媒体帧与 SSH 媒体通道身份、代次、模式或采样数不匹配。".into());
         }
@@ -343,25 +449,40 @@ impl SshMediaChannel {
     {
         for _ in 0..5 {
             let message = match self.receive().await? {
-                SshMediaMessage::Text(value) => serde_json::from_str::<serde_json::Value>(&value)
-                    .map_err(|_| "主机时钟同步控制消息不是有效 JSON。".to_string())?,
+                SshMediaMessage::Text(value) => {
+                    serde_json::from_str::<serde_json::Value>(&value)
+                        .map_err(|_| "主机时钟同步控制消息不是有效 JSON。".to_string())?
+                }
                 SshMediaMessage::Closed => return Err("主机在完成时钟同步前关闭媒体通道。".into()),
-                SshMediaMessage::Binary(_) => return Err("主机在时钟同步期间发送了二进制音频。".into()),
+                SshMediaMessage::Binary(_) => {
+                    return Err("主机在时钟同步期间发送了二进制音频。".into())
+                }
                 SshMediaMessage::Ping(_) | SshMediaMessage::Pong(_) => {
                     return Err("主机时钟同步期间出现未处理的 WebSocket 控制帧。".into());
                 }
             };
-            let object = message.as_object().ok_or("主机时钟同步控制消息必须是 JSON 对象。")?;
+            let object = message
+                .as_object()
+                .ok_or("主机时钟同步控制消息必须是 JSON 对象。")?;
             if object.len() != 4
-                || object.get("type").and_then(serde_json::Value::as_str) != Some("clock.sync.request")
-                || object.get("protocol_version").and_then(serde_json::Value::as_u64) != Some(1)
+                || object.get("type").and_then(serde_json::Value::as_str)
+                    != Some("clock.sync.request")
+                || object
+                    .get("protocol_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(MEDIA_PROTOCOL_VERSION))
             {
                 return Err("主机时钟同步控制字段或协议版本无效。".into());
             }
-            let sync_id = object.get("sync_id").and_then(serde_json::Value::as_str)
+            let sync_id = object
+                .get("sync_id")
+                .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty() && value.len() <= 128)
                 .ok_or("主机时钟同步编号无效。")?;
-            if !object.get("fields").is_some_and(serde_json::Value::is_object) {
+            if !object
+                .get("fields")
+                .is_some_and(serde_json::Value::is_object)
+            {
                 return Err("主机时钟同步字段说明无效。".into());
             }
             let device_receive_us = clock_now().await?;
@@ -370,7 +491,7 @@ impl SshMediaChannel {
                 return Err("设备时钟读取顺序倒退。".into());
             }
             self.send_text(&serde_json::json!({
-                "type":"clock.sync.response", "protocol_version":1, "sync_id":sync_id,
+                "type":"clock.sync.response", "protocol_version":MEDIA_PROTOCOL_VERSION, "sync_id":sync_id,
                 "device_receive_us":device_receive_us, "device_send_us":device_send_us,
             }).to_string()).await?;
         }
@@ -383,33 +504,64 @@ impl SshMediaChannel {
                 return Err("主机媒体就绪前连续发送了非控制负载帧。".into());
             }
         };
-        let object = ready.as_object().ok_or("主机媒体就绪回执必须是 JSON 对象。")?;
+        let object = ready
+            .as_object()
+            .ok_or("主机媒体就绪回执必须是 JSON 对象。")?;
         let (ready_uplink_codec, ready_downlink_codec, ready_pre_skip, ready_downlink_pre_skip) =
             media_ready_codecs(&ready)?;
         if object.get("type").and_then(serde_json::Value::as_str) != Some("media.ready")
-            || object.get("protocol_version").and_then(serde_json::Value::as_u64) != Some(1)
-            || object.get("device_id").and_then(serde_json::Value::as_str) != Some(self.device_id.as_str())
-            || object.get("stream_id").and_then(serde_json::Value::as_str) != Some(self.stream_id.as_str())
-            || object.get("core_session_id").and_then(serde_json::Value::as_str) != Some(self.core_session_id.as_str())
-            || object.get("connection_generation").and_then(serde_json::Value::as_u64) != Some(self.connection_generation)
-            || object.get("executor_generation").and_then(serde_json::Value::as_u64) != Some(self.executor_generation)
-            || object.get("interaction_generation").and_then(serde_json::Value::as_u64) != Some(self.interaction_generation)
-            || object.get("sample_rate").and_then(serde_json::Value::as_u64) != Some(16_000)
+            || object
+                .get("protocol_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(MEDIA_PROTOCOL_VERSION))
+            || object.get("device_id").and_then(serde_json::Value::as_str)
+                != Some(self.device_id.as_str())
+            || object.get("stream_id").and_then(serde_json::Value::as_str)
+                != Some(self.stream_id.as_str())
+            || object
+                .get("core_session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.core_session_id.as_str())
+            || object
+                .get("connection_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.connection_generation)
+            || object
+                .get("executor_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.executor_generation)
+            || object
+                .get("interaction_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.interaction_generation)
+            || object
+                .get("sample_rate")
+                .and_then(serde_json::Value::as_u64)
+                != Some(16_000)
             || object.get("channels").and_then(serde_json::Value::as_u64) != Some(1)
-            || object.get("bits_per_sample").and_then(serde_json::Value::as_u64) != Some(16)
+            || object
+                .get("bits_per_sample")
+                .and_then(serde_json::Value::as_u64)
+                != Some(16)
             || ready_uplink_codec != self.uplink_codec
             || ready_downlink_codec != self.downlink_codec
             || ready_pre_skip != self.encoder_pre_skip_samples
             || ready_downlink_pre_skip != self.downlink_encoder_pre_skip_samples
-            || !object.get("fields").is_some_and(serde_json::Value::is_object)
+            || !object
+                .get("fields")
+                .is_some_and(serde_json::Value::is_object)
         {
             return Err("主机媒体就绪回执与已签名设备租约不匹配。".into());
         }
-        self.clock_uncertainty_us = object.get("clock_uncertainty_us").and_then(serde_json::Value::as_u64);
+        self.clock_uncertainty_us = object
+            .get("clock_uncertainty_us")
+            .and_then(serde_json::Value::as_u64);
         if self.clock_uncertainty_us.is_none() {
             return Err("主机媒体回执缺少设备时钟误差。".into());
         }
-        self.capture_active = object.get("capture_active").and_then(serde_json::Value::as_bool)
+        self.capture_active = object
+            .get("capture_active")
+            .and_then(serde_json::Value::as_bool)
             .ok_or("主机媒体回执缺少采集状态。")?;
         Ok(())
     }
@@ -422,28 +574,44 @@ impl SshMediaChannel {
 
     /// into_parts（拆分全双工通道）：读写各自独占一半 SSH 流，允许并行送入采集帧。
     pub fn into_parts(self) -> (SshMediaReader, SshMediaWriter, SshMediaSessionGuard) {
-        let Self { websocket, _connection, .. } = self;
+        let Self {
+            websocket,
+            _connection,
+            ..
+        } = self;
         let (reader, writer) = websocket.into_parts();
-        (reader, writer, SshMediaSessionGuard { connection: Some(_connection) })
+        (
+            reader,
+            writer,
+            SshMediaSessionGuard {
+                connection: Some(_connection),
+            },
+        )
     }
 }
 
 /// SshMediaReader（SSH 媒体读取端）：单独消费服务端 WebSocket 帧。
 pub struct SshMediaReader {
     stream: ReadHalf<Box<dyn AsyncDeviceStream>>, // stream（SSH WebSocket 只读半流）。
-    closed: bool, // closed（是否已读取对端关闭帧）。
+    closed: bool,                                 // closed（是否已读取对端关闭帧）。
 }
 
 impl SshMediaReader {
     /// receive（接收服务端消息）：Ping（保活探测）由调用方提交给配对写端回应。
     pub async fn receive(&mut self) -> Result<SshMediaMessage, String> {
-        if self.closed { return Ok(SshMediaMessage::Closed); }
+        if self.closed {
+            return Ok(SshMediaMessage::Closed);
+        }
         let (opcode, payload) = read_server_ws_frame(&mut self.stream).await?;
         match opcode {
-            0x1 => String::from_utf8(payload).map(SshMediaMessage::Text)
+            0x1 => String::from_utf8(payload)
+                .map(SshMediaMessage::Text)
                 .map_err(|_| "SSH WebSocket 文本控制消息不是 UTF-8。".to_string()),
             0x2 => Ok(SshMediaMessage::Binary(payload)),
-            0x8 => { self.closed = true; Ok(SshMediaMessage::Closed) }
+            0x8 => {
+                self.closed = true;
+                Ok(SshMediaMessage::Closed)
+            }
             0x9 => Ok(SshMediaMessage::Ping(payload)),
             0xa => Ok(SshMediaMessage::Pong(payload)),
             _ => Err("SSH WebSocket 收到不支持的帧操作码。".into()),
@@ -454,7 +622,7 @@ impl SshMediaReader {
 /// SshMediaWriter（SSH 媒体写入端）：对设备上行帧进行客户端掩码编码。
 pub struct SshMediaWriter {
     stream: WriteHalf<Box<dyn AsyncDeviceStream>>, // stream（SSH WebSocket 只写半流）。
-    closed: bool, // closed（是否已写入关闭帧）。
+    closed: bool,                                  // closed（是否已写入关闭帧）。
 }
 
 impl SshMediaWriter {
@@ -484,7 +652,9 @@ impl SshMediaWriter {
 
     /// send_close（关闭 WebSocket）：发送一次空负载关闭帧。
     pub async fn send_close(&mut self) -> Result<(), String> {
-        if self.closed { return Ok(()); }
+        if self.closed {
+            return Ok(());
+        }
         write_client_ws_frame(&mut self.stream, 0x8, &[]).await?;
         self.closed = true;
         Ok(())
@@ -509,22 +679,35 @@ impl SshMediaSessionGuard {
 struct SshWebSocketStream {
     reader: ReadHalf<Box<dyn AsyncDeviceStream>>, // reader（SSH WebSocket 只读半流）。
     writer: WriteHalf<Box<dyn AsyncDeviceStream>>, // writer（SSH WebSocket 只写半流）。
-    closed: bool, // closed（是否已发送关闭帧或收到对端关闭）。
+    closed: bool,                                 // closed（是否已发送关闭帧或收到对端关闭）。
 }
 
 impl SshWebSocketStream {
     fn new(stream: Box<dyn AsyncDeviceStream>) -> Self {
         let (reader, writer) = io::split(stream);
-        Self { reader, writer, closed: false }
+        Self {
+            reader,
+            writer,
+            closed: false,
+        }
     }
 
     fn into_parts(self) -> (SshMediaReader, SshMediaWriter) {
-        (SshMediaReader { stream: self.reader, closed: false },
-         SshMediaWriter { stream: self.writer, closed: false })
+        (
+            SshMediaReader {
+                stream: self.reader,
+                closed: false,
+            },
+            SshMediaWriter {
+                stream: self.writer,
+                closed: false,
+            },
+        )
     }
 
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), String> {
-        if self.closed || !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xa)
+        if self.closed
+            || !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xa)
             || payload.len() > MAX_MEDIA_MESSAGE_BYTES
             || (opcode >= 0x8 && payload.len() > 125)
         {
@@ -540,8 +723,11 @@ impl SshWebSocketStream {
             }
             let (opcode, payload) = read_server_ws_frame(&mut self.reader).await?;
             match opcode {
-                0x1 => return String::from_utf8(payload).map(SshMediaMessage::Text)
-                    .map_err(|_| "SSH WebSocket 文本控制消息不是 UTF-8。".to_string()),
+                0x1 => {
+                    return String::from_utf8(payload)
+                        .map(SshMediaMessage::Text)
+                        .map_err(|_| "SSH WebSocket 文本控制消息不是 UTF-8。".to_string())
+                }
                 0x2 => return Ok(SshMediaMessage::Binary(payload)),
                 0x8 => {
                     self.closed = true;
@@ -555,7 +741,9 @@ impl SshWebSocketStream {
     }
 
     async fn send_close(&mut self) -> Result<(), String> {
-        if self.closed { return Ok(()); }
+        if self.closed {
+            return Ok(());
+        }
         self.send_frame(0x8, &[]).await?;
         self.closed = true;
         Ok(())
@@ -563,7 +751,9 @@ impl SshWebSocketStream {
 }
 
 async fn write_client_ws_frame<W: AsyncWrite + Unpin>(
-    stream: &mut W, opcode: u8, payload: &[u8],
+    stream: &mut W,
+    opcode: u8,
+    payload: &[u8],
 ) -> Result<(), String> {
     if !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xa)
         || payload.len() > MAX_MEDIA_MESSAGE_BYTES
@@ -586,19 +776,40 @@ async fn write_client_ws_frame<W: AsyncWrite + Unpin>(
         }
     }
     header.extend_from_slice(&mask);
-    stream.write_all(&header).await.map_err(|_| "SSH WebSocket 帧头写入失败。".to_string())?;
+    stream
+        .write_all(&header)
+        .await
+        .map_err(|_| "SSH WebSocket 帧头写入失败。".to_string())?;
     let mut masked = Vec::with_capacity(payload.len());
-    masked.extend(payload.iter().enumerate().map(|(index, byte)| *byte ^ mask[index & 3]));
-    stream.write_all(&masked).await.map_err(|_| "SSH WebSocket 帧负载写入失败。".to_string())?;
-    stream.flush().await.map_err(|_| "SSH WebSocket 帧刷新失败。".to_string())
+    masked.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| *byte ^ mask[index & 3]),
+    );
+    stream
+        .write_all(&masked)
+        .await
+        .map_err(|_| "SSH WebSocket 帧负载写入失败。".to_string())?;
+    stream
+        .flush()
+        .await
+        .map_err(|_| "SSH WebSocket 帧刷新失败。".to_string())
 }
 
-async fn read_server_ws_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(u8, Vec<u8>), String> {
+async fn read_server_ws_frame<R: AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<(u8, Vec<u8>), String> {
     let mut prefix = [0_u8; 2];
-    stream.read_exact(&mut prefix).await.map_err(|_| "SSH WebSocket 对端已断开。".to_string())?;
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|_| "SSH WebSocket 对端已断开。".to_string())?;
     let fin = prefix[0] & 0x80 != 0;
     let opcode = prefix[0] & 0x0f;
-    if !fin || prefix[0] & 0x70 != 0 || prefix[1] & 0x80 != 0
+    if !fin
+        || prefix[0] & 0x70 != 0
+        || prefix[1] & 0x80 != 0
         || !matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xa)
     {
         return Err("SSH WebSocket 服务端帧标志或操作码无效。".into());
@@ -607,12 +818,21 @@ async fn read_server_ws_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(u
     let length = match indicator {
         value @ 0..=125 => value as u64,
         126 => {
-            let value = stream.read_u16().await.map_err(|_| "SSH WebSocket 长度字段截断。".to_string())? as u64;
-            if value < 126 { return Err("SSH WebSocket 长度编码不是最短形式。".into()); }
+            let value = stream
+                .read_u16()
+                .await
+                .map_err(|_| "SSH WebSocket 长度字段截断。".to_string())?
+                as u64;
+            if value < 126 {
+                return Err("SSH WebSocket 长度编码不是最短形式。".into());
+            }
             value
         }
         127 => {
-            let value = stream.read_u64().await.map_err(|_| "SSH WebSocket 长度字段截断。".to_string())?;
+            let value = stream
+                .read_u64()
+                .await
+                .map_err(|_| "SSH WebSocket 长度字段截断。".to_string())?;
             if value <= 65_535 || value >> 63 != 0 {
                 return Err("SSH WebSocket 64 位长度编码无效。".into());
             }
@@ -624,7 +844,10 @@ async fn read_server_ws_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(u
         return Err("SSH WebSocket 服务端帧超过长度上限。".into());
     }
     let mut payload = vec![0_u8; length as usize];
-    stream.read_exact(&mut payload).await.map_err(|_| "SSH WebSocket 帧负载截断。".to_string())?;
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| "SSH WebSocket 帧负载截断。".to_string())?;
     Ok((opcode, payload))
 }
 
@@ -634,6 +857,131 @@ fn websocket_accept_value(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+async fn read_http_header_bounded(
+    stream: &mut dyn AsyncDeviceStream,
+    limit: usize,
+    error: &'static str,
+) -> Result<Vec<u8>, String> {
+    let mut response = Vec::with_capacity(1024);
+    loop {
+        if response.len() >= limit {
+            return Err(error.into());
+        }
+        let byte = stream.read_u8().await.map_err(|_| error.to_string())?;
+        response.push(byte);
+        if response.ends_with(b"\r\n\r\n") {
+            return Ok(response);
+        }
+    }
+}
+
+fn local_voice_upgrade_key(header: &[u8], token: &str) -> Result<String, String> {
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("本机语音 WebSocket 转发票据无效。".into());
+    }
+    let text = std::str::from_utf8(header)
+        .map_err(|_| "本机语音 WebSocket 握手头不是有效 UTF-8。".to_string())?;
+    let mut lines = text.split("\r\n");
+    let request = lines.next().ok_or("本机语音 WebSocket 握手缺少请求行。")?;
+    if request != format!("GET /{token}/ws HTTP/1.1") {
+        return Err("本机语音 WebSocket 只允许当前随机票据对应的固定路径。".into());
+    }
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    let mut websocket_key = None;
+    let mut websocket_version = None;
+    let mut seen = std::collections::HashSet::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or("本机语音 WebSocket 握手头字段格式无效。")?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || value
+                .bytes()
+                .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+        {
+            return Err("本机语音 WebSocket 握手头包含无效字段。".into());
+        }
+        let lower = name.to_ascii_lowercase();
+        let value = value.trim();
+        if !seen.insert(lower.clone()) {
+            return Err("本机语音 WebSocket 握手头不接受重复字段。".into());
+        }
+        match lower.as_str() {
+            "upgrade" => upgrade = value.eq_ignore_ascii_case("websocket"),
+            "connection" => {
+                connection_upgrade = value
+                    .split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("upgrade"))
+            }
+            "sec-websocket-key" => websocket_key = Some(value.to_owned()),
+            "sec-websocket-version" => websocket_version = Some(value.to_owned()),
+            "content-length" | "transfer-encoding" => {
+                return Err("本机语音 WebSocket 握手不能带请求正文。".into())
+            }
+            _ => {}
+        }
+    }
+    if !upgrade || !connection_upgrade || websocket_version.as_deref() != Some("13") {
+        return Err("本机语音 WebSocket 握手升级字段无效。".into());
+    }
+    let key = websocket_key.ok_or("本机语音 WebSocket 握手缺少客户端随机键。")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&key)
+        .map_err(|_| "本机语音 WebSocket 客户端随机键无效。".to_string())?;
+    if decoded.len() != 16 || base64::engine::general_purpose::STANDARD.encode(&decoded) != key {
+        return Err("本机语音 WebSocket 客户端随机键长度或编码无效。".into());
+    }
+    Ok(key)
+}
+
+fn validate_voice_upgrade_response(response: &[u8], key: &str) -> Result<(), String> {
+    let text = std::str::from_utf8(response)
+        .map_err(|_| "服务端语音 WebSocket 响应头不是有效 HTTP。".to_string())?;
+    let mut lines = text.split("\r\n");
+    let status = lines
+        .next()
+        .ok_or("服务端语音 WebSocket 响应缺少状态行。")?;
+    if status.split_ascii_whitespace().take(2).collect::<Vec<_>>() != ["HTTP/1.1", "101"] {
+        return Err("服务端没有接受语音 WebSocket 升级。".into());
+    }
+    let expected_accept = websocket_accept_value(key);
+    let mut accept = None;
+    let mut upgrade = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or("服务端语音 WebSocket 响应头字段格式无效。")?;
+        match name.trim().to_ascii_lowercase().as_str() {
+            "sec-websocket-accept" => {
+                if accept.is_some() {
+                    return Err("服务端语音 WebSocket 重复返回随机键校验值。".into());
+                }
+                accept = Some(value.trim().to_owned());
+            }
+            "upgrade" => upgrade = value.trim().eq_ignore_ascii_case("websocket"),
+            _ => {}
+        }
+    }
+    if !upgrade || accept.as_deref() != Some(expected_accept.as_str()) {
+        return Err("服务端语音 WebSocket 随机键校验失败。".into());
+    }
+    Ok(())
+}
+
 fn encode_websocket_upgrade_request(
     path_and_query: &str,
     auth: &DeviceGatewayAuthHeaders,
@@ -641,9 +989,12 @@ fn encode_websocket_upgrade_request(
     gateway_port: u16,
 ) -> Result<Vec<u8>, String> {
     validate_gateway_auth_headers(auth)?;
-    if path_and_query.len() > 2048 || !path_and_query.starts_with("/v1/media?")
-        || !path_and_query.bytes().all(|byte| byte.is_ascii_alphanumeric()
-            || matches!(byte, b'/' | b'_' | b'-' | b'.' | b':' | b'?' | b'&' | b'='))
+    if path_and_query.len() > 2048
+        || !path_and_query.starts_with("/v1/media?")
+        || !path_and_query.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'_' | b'-' | b'.' | b':' | b'?' | b'&' | b'=')
+        })
     {
         return Err("SSH WebSocket 媒体路径或查询字段无效。".into());
     }
@@ -655,8 +1006,14 @@ fn encode_websocket_upgrade_request(
             "X-Voice-Terminal-Core-Session-Id: {}\r\nX-Voice-Terminal-Challenge: {}\r\n",
             "X-Voice-Terminal-Timestamp-Ms: {}\r\nX-Voice-Terminal-Signature: {}\r\n\r\n",
         ),
-        path_and_query, gateway_port, key, auth.device_id, auth.core_session_id,
-        auth.challenge, auth.timestamp_ms, auth.signature,
+        path_and_query,
+        gateway_port,
+        key,
+        auth.device_id,
+        auth.core_session_id,
+        auth.challenge,
+        auth.timestamp_ms,
+        auth.signature,
     );
     if request.len() > MAX_HEADER_BYTES {
         return Err("SSH WebSocket 握手头超过长度上限。".into());
@@ -673,7 +1030,10 @@ async fn read_websocket_upgrade_response(
         if response.len() >= MAX_HEADER_BYTES {
             return Err("SSH WebSocket 握手响应头超过长度上限。".into());
         }
-        let byte = stream.read_u8().await.map_err(|_| "SSH WebSocket 握手响应读取失败。".to_string())?;
+        let byte = stream
+            .read_u8()
+            .await
+            .map_err(|_| "SSH WebSocket 握手响应读取失败。".to_string())?;
         response.push(byte);
         if response.ends_with(b"\r\n\r\n") {
             break;
@@ -691,7 +1051,9 @@ async fn read_websocket_upgrade_response(
     let mut upgrade = false;
     let mut connection_upgrade = false;
     for line in lines {
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         let Some((name, value)) = line.split_once(':') else {
             return Err("SSH WebSocket 握手响应头格式无效。".into());
         };
@@ -705,12 +1067,17 @@ async fn read_websocket_upgrade_response(
             }
             "upgrade" => upgrade = value.eq_ignore_ascii_case("websocket"),
             "connection" => {
-                connection_upgrade = value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+                connection_upgrade = value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
             }
             _ => {}
         }
     }
-    if accept.as_deref() != Some(websocket_accept_value(key).as_str()) || !upgrade || !connection_upgrade {
+    if accept.as_deref() != Some(websocket_accept_value(key).as_str())
+        || !upgrade
+        || !connection_upgrade
+    {
         return Err("SSH WebSocket 握手响应校验失败。".into());
     }
     Ok(())
@@ -770,6 +1137,23 @@ pub fn device_identity_status(device_id: &str) -> Result<Option<SshDeviceIdentit
     }))
 }
 
+/// sign_device_pairing_challenge（签署 OPAQUE 配对挑战）：仅由原生层读取本机设备密钥。
+pub fn sign_device_pairing_challenge(device_id: &str, message: &[u8]) -> Result<String, String> {
+    let credential_ref = device_credential_reference(device_id)?;
+    let private_key_text = crate::credentials::load_device_ssh_key(&credential_ref)?;
+    let private_key = PrivateKey::from_openssh(private_key_text.as_str())
+        .map_err(|_| "本机设备 SSH 私钥无法读取。".to_string())?;
+    if private_key.algorithm() != Algorithm::Ed25519 || private_key.is_encrypted() {
+        return Err("本机配对身份必须是未加密的 Ed25519 设备密钥。".into());
+    }
+    let keypair = private_key
+        .key_data()
+        .ed25519()
+        .ok_or_else(|| "本机配对身份不是 Ed25519 密钥。".to_string())?;
+    let signing_key = SigningKey::from_bytes(keypair.private.as_ref());
+    Ok(base64::engine::general_purpose::STANDARD.encode(signing_key.sign(message).to_bytes()))
+}
+
 /// delete_device_identity（撤销本机 SSH 身份）：只移除对应凭据库条目。
 pub fn delete_device_identity(device_id: &str) -> Result<(), String> {
     let reference = device_credential_reference(device_id)?;
@@ -786,14 +1170,19 @@ fn parse_transport_private_key(private_key_openssh: &str) -> Result<PrivateKey, 
 }
 
 fn transport_credential_reference(fingerprint: &str) -> Result<String, String> {
-    let encoded = fingerprint.strip_prefix("SHA256:")
+    let encoded = fingerprint
+        .strip_prefix("SHA256:")
         .ok_or_else(|| "SSH 登录密钥指纹格式无效。".to_string())?;
-    let digest = base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded)
+    let digest = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(encoded)
         .map_err(|_| "SSH 登录密钥指纹格式无效。".to_string())?;
     if digest.len() != 32 {
         return Err("SSH 登录密钥指纹长度无效。".into());
     }
-    let suffix = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Ok(format!("VoiceTerminal/ssh-transport/{suffix}"))
 }
 
@@ -804,7 +1193,11 @@ fn read_transport_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400; // FILE_ATTRIBUTE_REPARSE_POINT（Windows 链接属性）。
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000; // FILE_FLAG_OPEN_REPARSE_POINT（打开链接本身而非跟随）。
 
-    if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
         return Err("SSH 登录密钥路径必须是无父目录跳转的绝对路径。".into());
     }
     let absolute = path.to_path_buf();
@@ -818,23 +1211,31 @@ fn read_transport_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
 
     let metadata = fs::symlink_metadata(&absolute)
         .map_err(|_| "SSH 登录密钥文件不存在或不可读取。".to_string())?;
-    if crate::workspace::metadata_reparse(&metadata) || !metadata.is_file()
-        || metadata.len() == 0 || metadata.len() > MAX_PRIVATE_KEY_BYTES
+    if crate::workspace::metadata_reparse(&metadata)
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_PRIVATE_KEY_BYTES
     {
         return Err("SSH 登录密钥必须是 1 至 65536 字节的普通文件，不能是链接。".into());
     }
-    let file = fs::OpenOptions::new().read(true)
+    let file = fs::OpenOptions::new()
+        .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&absolute)
         .map_err(|_| "无法打开 SSH 登录密钥文件。".to_string())?;
-    let opened = file.metadata().map_err(|_| "无法检查 SSH 登录密钥文件。".to_string())?;
-    if !opened.is_file() || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || opened.len() == 0 || opened.len() > MAX_PRIVATE_KEY_BYTES
+    let opened = file
+        .metadata()
+        .map_err(|_| "无法检查 SSH 登录密钥文件。".to_string())?;
+    if !opened.is_file()
+        || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || opened.len() == 0
+        || opened.len() > MAX_PRIVATE_KEY_BYTES
     {
         return Err("SSH 登录密钥打开后类型、链接或大小无效。".into());
     }
     let mut bytes = Zeroizing::new(Vec::with_capacity(opened.len() as usize));
-    file.take(MAX_PRIVATE_KEY_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_PRIVATE_KEY_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| "读取 SSH 登录密钥文件失败。".to_string())?;
     if bytes.is_empty() || bytes.len() as u64 > MAX_PRIVATE_KEY_BYTES {
         return Err("SSH 登录密钥文件为空或超过 65536 字节。".into());
@@ -850,14 +1251,26 @@ pub fn import_transport_identity(path: &Path) -> Result<SshTransportIdentity, St
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| "SSH 登录密钥必须是 UTF-8 编码的 OpenSSH 私钥文件。".to_string())?;
         let private_key = parse_transport_private_key(text)?;
-        let public_key = private_key.public_key().to_openssh()
+        let public_key = private_key
+            .public_key()
+            .to_openssh()
             .map_err(|_| "SSH 登录公钥编码失败。".to_string())?;
-        let fingerprint = private_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let fingerprint = private_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let credential_ref = transport_credential_reference(&fingerprint)?;
-        let private_key_openssh = Zeroizing::new(private_key.to_openssh(LineEnding::LF)
-            .map_err(|_| "SSH 登录私钥规范化失败。".to_string())?);
+        let private_key_openssh = Zeroizing::new(
+            private_key
+                .to_openssh(LineEnding::LF)
+                .map_err(|_| "SSH 登录私钥规范化失败。".to_string())?,
+        );
         crate::credentials::store_device_ssh_key(&credential_ref, private_key_openssh.as_str())?;
-        Ok(SshTransportIdentity { credential_ref, public_key, fingerprint })
+        Ok(SshTransportIdentity {
+            credential_ref,
+            public_key,
+            fingerprint,
+        })
     }
     #[cfg(not(windows))]
     {
@@ -867,7 +1280,9 @@ pub fn import_transport_identity(path: &Path) -> Result<SshTransportIdentity, St
 }
 
 /// transport_identity_status（读取 SSH 登录公钥）：只回传公钥和指纹，不返回私钥。
-pub fn transport_identity_status(credential_ref: &str) -> Result<Option<SshTransportIdentity>, String> {
+pub fn transport_identity_status(
+    credential_ref: &str,
+) -> Result<Option<SshTransportIdentity>, String> {
     if !credential_ref.starts_with("VoiceTerminal/ssh-transport/") {
         return Err("SSH 登录密钥凭据引用无效。".into());
     }
@@ -876,20 +1291,32 @@ pub fn transport_identity_status(credential_ref: &str) -> Result<Option<SshTrans
     }
     let private_key_text = crate::credentials::load_device_ssh_key(credential_ref)?;
     let private_key = parse_transport_private_key(private_key_text.as_str())?;
-    let fingerprint = private_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let fingerprint = private_key
+        .public_key()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
     if transport_credential_reference(&fingerprint)? != credential_ref {
         return Err("SSH 登录凭据与其确定性引用不匹配。".into());
     }
-    let public_key = private_key.public_key().to_openssh()
+    let public_key = private_key
+        .public_key()
+        .to_openssh()
         .map_err(|_| "SSH 登录公钥编码失败。".to_string())?;
-    Ok(Some(SshTransportIdentity { credential_ref: credential_ref.to_string(), public_key, fingerprint }))
+    Ok(Some(SshTransportIdentity {
+        credential_ref: credential_ref.to_string(),
+        public_key,
+        fingerprint,
+    }))
 }
 
 /// delete_transport_identity（删除 SSH 登录密钥）：仅删除指定本机凭据条目。
 pub fn delete_transport_identity(credential_ref: &str) -> Result<(), String> {
     let suffix = credential_ref.strip_prefix("VoiceTerminal/ssh-transport/");
     if !suffix.is_some_and(|suffix| {
-        suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        suffix.len() == 64
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }) {
         return Err("SSH 登录密钥凭据引用无效。".into());
     }
@@ -922,11 +1349,7 @@ impl client::Handler for ProbeHostKeyHandler {
 }
 
 /// probe_host_key（读取候选主机指纹）：不认证、不执行命令、不自动建立信任。
-pub async fn probe_host_key(
-    address: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<String, String> {
+pub async fn probe_host_key(address: &str, port: u16, timeout: Duration) -> Result<String, String> {
     let address_ok = !address.is_empty()
         && address.len() <= 255
         && address.trim() == address
@@ -941,13 +1364,10 @@ pub async fn probe_host_key(
         observed: observed.clone(),
     };
     let config = Arc::new(client::Config::default());
-    let handle = tokio::time::timeout(
-        timeout,
-        client::connect(config, (address, port), handler),
-    )
-    .await
-    .map_err(|_| "SSH 主机指纹探测超时。".to_string())?
-    .map_err(|_| "无法读取 SSH 主机候选指纹。".to_string())?;
+    let handle = tokio::time::timeout(timeout, client::connect(config, (address, port), handler))
+        .await
+        .map_err(|_| "SSH 主机指纹探测超时。".to_string())?
+        .map_err(|_| "无法读取 SSH 主机候选指纹。".to_string())?;
     let fingerprint = observed
         .lock()
         .map_err(|_| "SSH 主机指纹暂存不可用。".to_string())?
@@ -998,7 +1418,7 @@ fn device_ssh_client_config() -> client::Config {
 /// SshDeviceConnection（SSH 设备连接）：持有一个固定主机的已认证 SSH 会话。
 pub struct SshDeviceConnection {
     handle: client::Handle<PinnedHostHandler>, // handle（已验证 SSH 会话）。
-    target: SshDeviceTarget, // target（不可在会话中途替换的主机身份）。
+    target: SshDeviceTarget,                   // target（不可在会话中途替换的主机身份）。
 }
 
 impl SshDeviceConnection {
@@ -1027,11 +1447,7 @@ impl SshDeviceConnection {
         let config = Arc::new(device_ssh_client_config());
         let mut handle = tokio::time::timeout(
             timeout,
-            client::connect(
-                config,
-                (target.address.as_str(), target.port),
-                handler,
-            ),
+            client::connect(config, (target.address.as_str(), target.port), handler),
         )
         .await
         .map_err(|_| "SSH 连接或主机指纹验证超时。".to_string())?
@@ -1047,7 +1463,11 @@ impl SshDeviceConnection {
         .map_err(|_| "SSH 公钥认证失败。".to_string())?;
         if !matches!(auth, AuthResult::Success) {
             let _ = handle
-                .disconnect(Disconnect::ByApplication, "device authentication failed", "")
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "device authentication failed",
+                    "",
+                )
                 .await;
             return Err("SSH 公钥未获主机接受。".into());
         }
@@ -1059,7 +1479,33 @@ impl SshDeviceConnection {
         self.handle.is_closed()
     }
 
-    /// post_json（提交控制请求）：经 direct-tcpip（SSH TCP 通道）连主机回环网关。
+    /// open_fixed_bridge（打开固定桥接）：只允许产品内置的控制、媒体、管理或文件标记。
+    async fn open_fixed_bridge(
+        &self,
+        marker: &'static str,
+    ) -> Result<Box<dyn AsyncDeviceStream>, String> {
+        if !matches!(
+            marker,
+            CONTROL_BRIDGE_MARKER
+                | MEDIA_BRIDGE_MARKER
+                | MANAGEMENT_BRIDGE_MARKER
+                | FILE_BRIDGE_MARKER
+        ) {
+            return Err("SSH 桥接标记不在固定白名单中。".into());
+        }
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|_| "无法打开受限 SSH 桥接会话。".to_string())?;
+        channel
+            .exec(true, marker.as_bytes())
+            .await
+            .map_err(|_| "受限 SSH 桥接命令被主机拒绝。".to_string())?;
+        Ok(Box::new(channel.into_stream()))
+    }
+
+    /// post_json（提交控制请求）：经固定 SSH exec（远程执行）桥接进入主机回环网关。
     pub async fn post_json(
         &mut self,
         path: &str,
@@ -1081,24 +1527,13 @@ impl SshDeviceConnection {
             return Err("网关请求超时必须在 1 至 600 秒之间。".into());
         }
         let operation = async {
-            let channel = self
-                .handle
-                .channel_open_direct_tcpip(
-                    "127.0.0.1",
-                    u32::from(self.target.gateway_port),
-                    "127.0.0.1",
-                    0,
-                )
-                .await
-                .map_err(|_| "SSH 主机未开放受管回环业务网关。".to_string())?;
-            let mut stream = channel.into_stream();
+            let mut stream = self.open_fixed_bridge(CONTROL_BRIDGE_MARKER).await?;
             stream
                 .write_all(&request)
                 .await
                 .map_err(|_| "SSH 业务请求写入失败。".to_string())?;
-            // SSH EOF（通道结束标记）在 Windows OpenSSH 的 direct-tcpip（直连转发）上会关闭双向套接字，
-            // 使服务端响应被丢弃。HTTP（超文本传输协议）请求已带 Content-Length 和 Connection: close，
-            // 无需提前发送 EOF；收到完整响应后由服务端关闭连接。
+            // HTTP（超文本传输协议）请求带 Content-Length；客户端不提前发送 SSH EOF，
+            // 以免关闭桥接双向流。收到完整响应后由本机网关关闭连接。
             let mut response = Vec::with_capacity(4096);
             let mut chunk = [0_u8; 8192];
             loop {
@@ -1122,6 +1557,52 @@ impl SshDeviceConnection {
             .map_err(|_| "SSH 业务请求等待回执超时。".to_string())?
     }
 
+    /// management_exchange（独立管理请求）：一条固定 SSH 会话交换管理租约与单个请求行。
+    async fn management_exchange(
+        &mut self,
+        open_request: &RemoteManagementOpenRequest,
+        request: &RemoteManagementRequest,
+        timeout: Duration,
+    ) -> Result<RemoteManagementResponse, String> {
+        request.validate()?;
+        if timeout.is_zero() || timeout > Duration::from_secs(600) {
+            return Err("独立管理请求超时必须在 1 至 600 秒之间。".into());
+        }
+        let operation = async {
+            let mut stream = self.open_fixed_bridge(MANAGEMENT_BRIDGE_MARKER).await?;
+            write_management_line(&mut *stream, open_request, MAX_REQUEST_BYTES).await?;
+            let opened: RemoteManagementOpenResponse =
+                read_management_line(&mut *stream, MAX_RESPONSE_BYTES).await?;
+            if opened.protocol_version != DEVICE_MANAGEMENT_PROTOCOL_VERSION
+                || opened.request_id != open_request.request_id
+                || opened.target_host_id != open_request.target_host_id
+                || opened.client_device_id != open_request.client_device_id
+                || opened.session_generation == 0
+                || opened.expires_at_ms <= unix_timestamp_ms()?
+            {
+                return Err("服务端管理会话回执与请求身份或时效不匹配。".into());
+            }
+            let mut operation_request = request.clone();
+            operation_request.session_generation = opened.session_generation;
+            write_management_line(&mut *stream, &operation_request, MAX_REQUEST_BYTES).await?;
+            let response: RemoteManagementResponse =
+                read_management_line(&mut *stream, MAX_RESPONSE_BYTES).await?;
+            if response.protocol_version != DEVICE_MANAGEMENT_PROTOCOL_VERSION
+                || response.request_id != request.request_id
+                || response.target_host_id != request.target_host_id
+                || response.session_generation != opened.session_generation
+                || response.operation != request.operation
+                || !(100..=599).contains(&response.status)
+            {
+                return Err("服务端管理回执与请求编号、目标、会话或操作不匹配。".into());
+            }
+            Ok(response)
+        };
+        tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| "SSH 独立管理请求等待回执超时。".to_string())?
+    }
+
     async fn open_websocket(
         &mut self,
         path_and_query: &str,
@@ -1135,33 +1616,21 @@ impl SshDeviceConnection {
         let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 16]>());
         let request = encode_websocket_upgrade_request(path_and_query, auth, &key, target_port)?;
         let operation = async {
-            let channel = self.handle.channel_open_direct_tcpip(
-                "127.0.0.1", u32::from(target_port), "127.0.0.1", 0,
-            ).await.map_err(|_| "SSH 主机未开放受管媒体网关。".to_string())?;
-            let mut stream: Box<dyn AsyncDeviceStream> = Box::new(channel.into_stream());
-            stream.write_all(&request).await.map_err(|_| "SSH WebSocket 握手请求写入失败。".to_string())?;
-            stream.flush().await.map_err(|_| "SSH WebSocket 握手请求刷新失败。".to_string())?;
+            let mut stream = self.open_fixed_bridge(MEDIA_BRIDGE_MARKER).await?;
+            stream
+                .write_all(&request)
+                .await
+                .map_err(|_| "SSH WebSocket 握手请求写入失败。".to_string())?;
+            stream
+                .flush()
+                .await
+                .map_err(|_| "SSH WebSocket 握手请求刷新失败。".to_string())?;
             read_websocket_upgrade_response(stream.as_mut(), &key).await?;
             Ok(SshWebSocketStream::new(stream))
         };
         tokio::time::timeout(timeout, operation)
             .await
             .map_err(|_| "SSH WebSocket 媒体通道建立超时。".to_string())?
-    }
-
-    /// open_sftp（打开独立文件子系统通道）：由独立 SSH 连接实例调用，不复用控制连接。
-    async fn open_sftp(&mut self, timeout: Duration) -> Result<SftpSession, String> {
-        if timeout.is_zero() || timeout > Duration::from_secs(600) {
-            return Err("SFTP 会话超时时限无效。".into());
-        }
-        tokio::time::timeout(timeout, async {
-            let channel = self.handle.channel_open_session().await
-                .map_err(|_| "无法打开 SSH SFTP 子系统通道。".to_string())?;
-            channel.request_subsystem(true, "sftp").await
-                .map_err(|_| "SSH 主机未开放 SFTP 子系统。".to_string())?;
-            SftpSession::new(channel.into_stream()).await
-                .map_err(|_| "SSH SFTP 子系统初始化失败。".to_string())
-        }).await.map_err(|_| "SSH SFTP 子系统建立超时。".to_string())?
     }
 
     /// close（关闭）：显式关闭 SSH 会话，不迁移或重放未确认任务。
@@ -1177,6 +1646,7 @@ impl SshDeviceConnection {
 #[derive(Default)]
 pub struct SshDeviceManager {
     connection: tokio::sync::Mutex<Option<ConnectedDeviceSession>>, // connection（当前 SSH 与产品设备身份绑定会话）。
+    active_lease: tokio::sync::Mutex<Option<RemoteDeviceSessionLease>>, // active_lease（当前任务通道确认的设备连接与执行器代次）。
 }
 
 impl SshDeviceManager {
@@ -1194,10 +1664,13 @@ impl SshDeviceManager {
             return Err("产品设备身份凭据引用与当前设备编号不匹配。".into());
         }
         {
-            let signing_private_key = crate::credentials::load_device_ssh_key(identity_credential_ref)?;
+            let signing_private_key =
+                crate::credentials::load_device_ssh_key(identity_credential_ref)?;
             let signing_private_key = PrivateKey::from_openssh(signing_private_key.as_str())
                 .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
-            if signing_private_key.algorithm() != Algorithm::Ed25519 || signing_private_key.is_encrypted() {
+            if signing_private_key.algorithm() != Algorithm::Ed25519
+                || signing_private_key.is_encrypted()
+            {
                 return Err("产品设备身份必须是未加密的 Ed25519 私钥。".into());
             }
         }
@@ -1208,7 +1681,9 @@ impl SshDeviceManager {
             return Err("SSH 登录凭据必须引用本机产品身份或已导入的传输密钥。".into());
         }
         let login_private_key = crate::credentials::load_device_ssh_key(login_credential_ref)?;
-        let connection = SshDeviceConnection::connect(target.clone(), login_private_key.as_str(), timeout).await?;
+        let connection =
+            SshDeviceConnection::connect(target.clone(), login_private_key.as_str(), timeout)
+                .await?;
         let session = ConnectedDeviceSession {
             connection,
             device_id: device_id.to_string(),
@@ -1227,6 +1702,7 @@ impl SshDeviceManager {
         if let Some(old) = old {
             let _ = old.connection.close().await;
         }
+        *self.active_lease.lock().await = None;
         Ok(())
     }
 
@@ -1247,9 +1723,8 @@ impl SshDeviceManager {
         if signing_key.algorithm() != Algorithm::Ed25519 || signing_key.is_encrypted() {
             return Err("测试产品设备身份必须是未加密的 Ed25519 私钥。".into());
         }
-        let connection = SshDeviceConnection::connect(
-            target.clone(), transport_private_key, timeout,
-        ).await?;
+        let connection =
+            SshDeviceConnection::connect(target.clone(), transport_private_key, timeout).await?;
         let session = ConnectedDeviceSession {
             connection,
             device_id: device_id.to_owned(),
@@ -1263,7 +1738,210 @@ impl SshDeviceManager {
         if let Some(old) = old {
             let _ = old.connection.close().await;
         }
+        *self.active_lease.lock().await = None;
         Ok(())
+    }
+
+    /// management_request（独立管理操作）：不读取任务/媒体租约，直接打开受限管理 SSH 标记。
+    pub async fn management_request(
+        &self,
+        request_id: &str,
+        target_host_id: &str,
+        operation: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<RemoteManagementResponse, String> {
+        if !crate::device_management_contract::valid_request_id(request_id)
+            || !crate::device_management_contract::valid_host_id(target_host_id)
+        {
+            return Err("远程管理请求编号或服务端目标编号无效。".into());
+        }
+        let mut slot = self.connection.lock().await;
+        let session = slot
+            .as_mut()
+            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+        let open_request = RemoteManagementOpenRequest {
+            protocol_version: DEVICE_MANAGEMENT_PROTOCOL_VERSION,
+            request_id: random_hex_id(),
+            target_host_id: target_host_id.to_owned(),
+            client_device_id: session.device_id.clone(),
+            fields: BTreeMap::from([
+                ("protocol_version".into(), "独立远程管理协议版本".into()),
+                ("request_id".into(), "本次管理会话申请的幂等编号".into()),
+                ("target_host_id".into(), "已配对服务端稳定编号".into()),
+                (
+                    "client_device_id".into(),
+                    "当前 SSH 认证客户端设备编号".into(),
+                ),
+            ]),
+        };
+        let request = RemoteManagementRequest {
+            protocol_version: DEVICE_MANAGEMENT_PROTOCOL_VERSION,
+            request_id: request_id.to_owned(),
+            target_host_id: target_host_id.to_owned(),
+            // management_exchange（管理会话交换）先使用非零占位值，再换成服务端回执的独立代次。
+            session_generation: 1,
+            operation: operation.to_owned(),
+            arguments,
+            fields: BTreeMap::from([
+                ("protocol_version".into(), "独立远程管理协议版本".into()),
+                ("request_id".into(), "一次业务请求的稳定编号".into()),
+                ("target_host_id".into(), "已配对服务端稳定编号".into()),
+                ("session_generation".into(), "管理服务授予的会话代次".into()),
+                ("operation".into(), "服务端固定操作名称".into()),
+                ("arguments".into(), "与固定操作对应的 JSON 对象参数".into()),
+            ]),
+        };
+        session
+            .connection
+            .management_exchange(&open_request, &request, timeout)
+            .await
+    }
+
+    /// relay_voice_websocket（转发产品语音 WebSocket）：仅接受本机随机票据路径，并经固定 control（控制）强制桥接。
+    pub async fn relay_voice_websocket(
+        &self,
+        mut local_stream: tokio::net::TcpStream,
+        token: &str,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        if !local_stream
+            .peer_addr()
+            .map_err(|_| "本机语音 WebSocket 缺少回环对端地址。".to_string())?
+            .ip()
+            .is_loopback()
+            || token.len() != 64
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("本机语音 WebSocket 转发对端或随机票据无效。".into());
+        }
+        local_stream
+            .set_nodelay(true)
+            .map_err(|_| "无法配置本机语音 WebSocket 套接字。".to_string())?;
+        let relay = async {
+            let (target, credential_ref) = {
+                let slot = self.connection.lock().await;
+                let session = slot
+                    .as_ref()
+                    .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+                (
+                    session.target.clone(),
+                    session.transport_credential_ref.clone(),
+                )
+            };
+            let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+            let connection = SshDeviceConnection::connect(
+                target.clone(),
+                private_key.as_str(),
+                Duration::from_secs(20),
+            )
+            .await?;
+            let mut upstream = connection.open_fixed_bridge(CONTROL_BRIDGE_MARKER).await?;
+            let local_header = read_http_header_bounded(
+                &mut local_stream,
+                MAX_HEADER_BYTES,
+                "本机语音 WebSocket 握手头缺失或超过限制。",
+            )
+            .await?;
+            let key = local_voice_upgrade_key(&local_header, token)?;
+            let request = format!(
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                target.gateway_port, key,
+            );
+            if request.len() > MAX_HEADER_BYTES {
+                return Err("固定服务端语音 WebSocket 握手超过长度上限。".into());
+            }
+            upstream
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|_| "SSH 语音 WebSocket 握手请求写入失败。".to_string())?;
+            upstream
+                .flush()
+                .await
+                .map_err(|_| "SSH 语音 WebSocket 握手刷新失败。".to_string())?;
+            let response = read_http_header_bounded(
+                upstream.as_mut(),
+                MAX_HEADER_BYTES,
+                "服务端语音 WebSocket 握手响应缺失或超过限制。",
+            )
+            .await?;
+            validate_voice_upgrade_response(&response, &key)?;
+            local_stream
+                .write_all(&response)
+                .await
+                .map_err(|_| "本机语音 WebSocket 升级回执写入失败。".to_string())?;
+            local_stream
+                .flush()
+                .await
+                .map_err(|_| "本机语音 WebSocket 升级回执刷新失败。".to_string())?;
+            let copied = tokio::io::copy_bidirectional(&mut local_stream, upstream.as_mut())
+                .await
+                .map_err(|_| "SSH 语音 WebSocket 双向数据通道中断。".to_string());
+            drop(upstream);
+            let close = connection.close().await;
+            match (copied, close) {
+                (Err(error), _) => Err(error),
+                (Ok(_), Ok(())) => Ok(()),
+                (Ok(_), Err(error)) => Err(format!("语音消息已转发，但 SSH 连接收尾失败：{error}")),
+            }
+        };
+        tokio::select! {
+            _ = async {
+                if *stop.borrow() { return; }
+                let _ = stop.changed().await;
+            } => Ok(()),
+            result = relay => result,
+        }
+    }
+
+    /// upload_remote_import（上传客户端所选资源来源）：另建固定 FILE（文件）SSH 连接，避免阻塞管理或媒体通道。
+    #[cfg(feature = "ssh-device")]
+    pub async fn upload_remote_import<F>(
+        &self,
+        source_id: &str,
+        request_id: &str,
+        local_sources: &[PathBuf],
+        cancel: &AtomicBool,
+        on_progress: F,
+    ) -> Result<crate::device_file_channel::UploadReceipt, String>
+    where
+        F: FnMut(crate::device_file_channel::UploadProgress) + Send,
+    {
+        let (target, transport_credential_ref) = {
+            let slot = self.connection.lock().await;
+            let session = slot
+                .as_ref()
+                .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+            (
+                session.target.clone(),
+                session.transport_credential_ref.clone(),
+            )
+        };
+        let private_key = crate::credentials::load_device_ssh_key(&transport_credential_ref)?;
+        let mut connection =
+            SshDeviceConnection::connect(target, private_key.as_str(), Duration::from_secs(20))
+                .await?;
+        let transfer = async {
+            let mut stream = connection.open_fixed_bridge(FILE_BRIDGE_MARKER).await?;
+            crate::device_file_channel::upload_manifested_files(
+                &mut stream,
+                source_id,
+                request_id,
+                local_sources,
+                cancel,
+                on_progress,
+            )
+            .await
+        }
+        .await;
+        let close = connection.close().await;
+        match (transfer, close) {
+            (Ok(receipt), Ok(())) => Ok(receipt),
+            (Ok(_), Err(error)) => Err(format!("文件已提交，但 SSH 文件会话关闭失败：{error}")),
+            (Err(error), _) => Err(error),
+        }
     }
 
     /// post_json（设备控制）：并发调用在单一连接锁上顺序结算。
@@ -1277,10 +1955,20 @@ impl SshDeviceManager {
         let session = slot
             .as_mut()
             .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
-        if !matches!(path,
-            "/v1/status" | "/v1/devices" | "/v1/session/open" | "/v1/session/poll"
-                | "/v1/session/complete" | "/v1/session/reconcile" | "/v1/session/heartbeat" | "/v1/session/close"
-                | "/v1/interaction/prepare" | "/v1/interaction/abort") {
+        if !matches!(
+            path,
+            "/v1/status"
+                | "/v1/devices"
+                | "/v1/management"
+                | "/v1/session/open"
+                | "/v1/session/poll"
+                | "/v1/session/complete"
+                | "/v1/session/reconcile"
+                | "/v1/session/heartbeat"
+                | "/v1/session/close"
+                | "/v1/interaction/prepare"
+                | "/v1/interaction/abort"
+        ) {
             return Err("当前 SSH 客户端只开放已登记的设备状态和任务通道接口。".into());
         }
         let challenge_body = serde_json::json!({
@@ -1289,8 +1977,10 @@ impl SshDeviceManager {
             "method": "POST",
             "path": path,
         });
-        let challenge_response = session.connection
-            .post_json("/v1/challenge", &challenge_body, timeout).await?;
+        let challenge_response = session
+            .connection
+            .post_json("/v1/challenge", &challenge_body, timeout)
+            .await?;
         if challenge_response.status != 200 {
             return Ok(challenge_response);
         }
@@ -1304,9 +1994,17 @@ impl SshDeviceManager {
             .map_err(|_| "系统凭据中的设备签名身份无法读取。".to_string())?;
         let timestamp_ms = unix_timestamp_ms()?;
         let auth = sign_device_gateway_request(
-            &private_key, &session.device_id, path, body, &challenge, timestamp_ms,
+            &private_key,
+            &session.device_id,
+            path,
+            body,
+            &challenge,
+            timestamp_ms,
         )?;
-        session.connection.post_json_with_auth(path, body, Some(&auth), timeout).await
+        session
+            .connection
+            .post_json_with_auth(path, body, Some(&auth), timeout)
+            .await
     }
 
     /// open_media_channel（开启 PCM 媒体通道）：新建独立固定主机 SSH 连接并签名升级 WebSocket。
@@ -1328,7 +2026,8 @@ impl SshDeviceManager {
             0,
             0,
             timeout,
-        ).await
+        )
+        .await
     }
 
     /// open_media_channel_with_codecs（分别协商上/下行编码及各自预延迟）：签名主体绑定两个方向的完整参数。
@@ -1344,19 +2043,28 @@ impl SshDeviceManager {
         downlink_encoder_pre_skip_samples: u32,
         timeout: Duration,
     ) -> Result<SshMediaChannel, String> {
-        let valid_stream_id = !stream_id.is_empty() && stream_id.len() <= 128
-            && stream_id.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'_' | b':' | b'-'));
+        let valid_stream_id = !stream_id.is_empty()
+            && stream_id.len() <= 128
+            && stream_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            });
         let max_generation = (1_u64 << 53) - 1;
-        if !valid_stream_id || [connection_generation, executor_generation, interaction_generation]
-            .iter().any(|value| *value == 0 || *value > max_generation)
+        if !valid_stream_id
+            || [
+                connection_generation,
+                executor_generation,
+                interaction_generation,
+            ]
+            .iter()
+            .any(|value| *value == 0 || *value > max_generation)
             || encoder_pre_skip_samples > 320
             || (uplink_codec == AudioCodec::Pcm && encoder_pre_skip_samples != 0)
             || (uplink_codec == AudioCodec::Opus && encoder_pre_skip_samples == 0)
             || downlink_encoder_pre_skip_samples > 960
             || (downlink_codec == AudioCodec::Pcm && downlink_encoder_pre_skip_samples != 0)
             || (downlink_codec == AudioCodec::Opus && downlink_encoder_pre_skip_samples == 0)
-            || timeout.is_zero() || timeout > Duration::from_secs(60)
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(60)
         {
             return Err("SSH 媒体流编号、设备代次或握手时限无效。".into());
         }
@@ -1367,14 +2075,16 @@ impl SshDeviceManager {
             let target = session.target.clone();
             let transport_private_key = load_session_transport_key(session)?;
             let mut body = serde_json::json!({
-                "protocol_version": 1,
+                "protocol_version": MEDIA_PROTOCOL_VERSION,
                 "stream_id": stream_id,
                 "connection_generation": connection_generation,
                 "executor_generation": executor_generation,
                 "interaction_generation": interaction_generation,
             });
-            if uplink_codec != AudioCodec::Pcm || downlink_codec != AudioCodec::Pcm
-                || encoder_pre_skip_samples != 0 || downlink_encoder_pre_skip_samples != 0
+            if uplink_codec != AudioCodec::Pcm
+                || downlink_codec != AudioCodec::Pcm
+                || encoder_pre_skip_samples != 0
+                || downlink_encoder_pre_skip_samples != 0
             {
                 body["uplink_codec"] = serde_json::json!(uplink_codec.as_str());
                 body["downlink_codec"] = serde_json::json!(downlink_codec.as_str());
@@ -1388,8 +2098,10 @@ impl SshDeviceManager {
                 "method": "GET",
                 "path": "/v1/media",
             });
-            let challenge_response = session.connection
-                .post_json("/v1/challenge", &challenge_body, timeout).await?;
+            let challenge_response = session
+                .connection
+                .post_json("/v1/challenge", &challenge_body, timeout)
+                .await?;
             if challenge_response.status != 200 {
                 return Err("主机未签发 SSH 媒体通道挑战。".into());
             }
@@ -1406,35 +2118,64 @@ impl SshDeviceManager {
             let signing_private_key = PrivateKey::from_openssh(signing_private_key.as_str())
                 .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
             let auth = sign_device_gateway_request_for_method(
-                &signing_private_key, "GET", &device_id, "/v1/media", &body,
-                &challenge, timestamp_ms,
+                &signing_private_key,
+                "GET",
+                &device_id,
+                "/v1/media",
+                &body,
+                &challenge,
+                timestamp_ms,
             )?;
-            (device_id, target, transport_private_key, challenge.core_session_id,
-             body, auth, uplink_codec, downlink_codec, encoder_pre_skip_samples,
-             downlink_encoder_pre_skip_samples)
+            (
+                device_id,
+                target,
+                transport_private_key,
+                challenge.core_session_id,
+                body,
+                auth,
+                uplink_codec,
+                downlink_codec,
+                encoder_pre_skip_samples,
+                downlink_encoder_pre_skip_samples,
+            )
         };
-        let (device_id, target, login_private_key, core_session_id, body, auth,
-             uplink_codec, downlink_codec, encoder_pre_skip_samples,
-             downlink_encoder_pre_skip_samples) = handshake;
-        let mut connection = SshDeviceConnection::connect(
-            target.clone(), login_private_key.as_str(), timeout,
-        ).await?;
+        let (
+            device_id,
+            target,
+            login_private_key,
+            core_session_id,
+            body,
+            auth,
+            uplink_codec,
+            downlink_codec,
+            encoder_pre_skip_samples,
+            downlink_encoder_pre_skip_samples,
+        ) = handshake;
+        let mut connection =
+            SshDeviceConnection::connect(target.clone(), login_private_key.as_str(), timeout)
+                .await?;
         let mut path_and_query = format!(
-            "/v1/media?protocol_version=1&stream_id={}&connection_generation={}&executor_generation={}&interaction_generation={}",
+            "/v1/media?protocol_version={}&stream_id={}&connection_generation={}&executor_generation={}&interaction_generation={}",
+            MEDIA_PROTOCOL_VERSION,
             body["stream_id"].as_str().ok_or("设备媒体流编号丢失。")?,
             connection_generation, executor_generation, interaction_generation,
         );
         if body.get("uplink_codec").is_some() {
             path_and_query.push_str(&format!(
                 "&uplink_codec={}&downlink_codec={}&encoder_pre_skip_samples={}",
-                uplink_codec.as_str(), downlink_codec.as_str(), encoder_pre_skip_samples,
+                uplink_codec.as_str(),
+                downlink_codec.as_str(),
+                encoder_pre_skip_samples,
             ));
             if let Some(pre_skip) = body.get("downlink_encoder_pre_skip_samples") {
                 let pre_skip = pre_skip.as_u64().ok_or("下行 Opus 预延迟字段丢失。")?;
                 path_and_query.push_str(&format!("&downlink_encoder_pre_skip_samples={pre_skip}"));
             }
         }
-        let websocket = match connection.open_websocket(&path_and_query, &auth, timeout).await {
+        let websocket = match connection
+            .open_websocket(&path_and_query, &auth, timeout)
+            .await
+        {
             Ok(stream) => stream,
             Err(error) => {
                 let _ = connection.close().await;
@@ -1459,141 +2200,263 @@ impl SshDeviceManager {
         })
     }
 
-    async fn open_sftp_connection(&self, timeout: Duration) -> Result<(SshDeviceConnection, SftpSession), String> {
-        let (target, credential_ref) = {
-            let slot = self.connection.lock().await;
-            let session = slot.as_ref().ok_or("当前没有已认证的 SSH 主机连接。")?;
-            (session.target.clone(), session.transport_credential_ref.clone())
-        };
+    /// device_file_upload（固定 FILE 上传）：签名 begin 绑定原票据、请求与活动设备代次。
+    pub async fn device_file_upload(
+        &self,
+        local_path: &Path,
+        transfer_id: &str,
+        parent_request_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+        maximum_bytes: u64,
+        timeout: Duration,
+    ) -> Result<SftpTransferReceipt, String> {
+        let (target, credential_ref, begin, authorization) = self
+            .prepare_device_file_transfer(
+                "file.sftp.upload",
+                transfer_id,
+                parent_request_id,
+                connection_generation,
+                executor_generation,
+                maximum_bytes,
+                None,
+                timeout,
+            )
+            .await?;
+        crate::device_files::validate_transfer_source(local_path, maximum_bytes)?;
         let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
-        let connection_timeout = timeout.min(Duration::from_secs(60));
-        let mut connection = SshDeviceConnection::connect(target, private_key.as_str(), connection_timeout).await?;
-        match connection.open_sftp(connection_timeout).await {
-            Ok(sftp) => Ok((connection, sftp)),
-            Err(error) => {
-                let _ = connection.close().await;
-                Err(error)
-            }
-        }
-    }
-
-    /// sftp_upload_file（独立 SFTP 上传）：客户端把设备文件放入核心授予的主机暂存路径。
-    pub async fn sftp_upload_file(&self, local_path: &Path, remote_path: &str, transfer_id: &str,
-                                  maximum_bytes: u64, timeout: Duration) -> Result<SftpTransferReceipt, String> {
-        validate_sftp_remote_path(remote_path)?;
-        validate_transfer_id(transfer_id)?;
-        if maximum_bytes == 0 || timeout.is_zero() || timeout > Duration::from_secs(600) {
-            return Err("SFTP 文件上限或超时时限无效。".into());
-        }
-        let expected_bytes = crate::device_files::validate_transfer_source(local_path, maximum_bytes)?;
-        let (connection, sftp) = self.open_sftp_connection(timeout).await?;
-        let temp_path = format!("{remote_path}.{transfer_id}.part");
+        let mut connection = SshDeviceConnection::connect(
+            target,
+            private_key.as_str(),
+            timeout.min(Duration::from_secs(60)),
+        )
+        .await?;
+        let cancelled = AtomicBool::new(false);
         let transfer = tokio::time::timeout(timeout, async {
-            if sftp.try_exists(remote_path.to_owned()).await.map_err(|_| "SFTP 暂存目标已存在或不可查询。".to_string())? {
-                return Err("SFTP 暂存目标必须是此前不存在的唯一路径。".into());
-            }
-            if sftp.try_exists(temp_path.clone()).await.map_err(|_| "SFTP 暂存临时项不可查询。".to_string())? {
-                return Err("SFTP 暂存临时路径已存在，拒绝覆盖。".into());
-            }
-            let mut destination = sftp.open_with_flags(temp_path.clone(),
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE).await
-                .map_err(|_| "SFTP 暂存文件无法创建。".to_string())?;
-            let mut source = tokio::fs::File::open(local_path).await
-                .map_err(|_| "SFTP 本地上传源无法打开。".to_string())?;
-            let mut hasher = Sha256::new();
-            let mut total = 0_u64;
-            let mut buffer = vec![0_u8; 64 * 1024];
-            loop {
-                let read = source.read(&mut buffer).await.map_err(|_| "SFTP 本地上传源读取失败。".to_string())?;
-                if read == 0 { break; }
-                total = total.checked_add(read as u64).ok_or("SFTP 上传长度溢出。")?;
-                if total > maximum_bytes || total > expected_bytes { return Err("SFTP 上传源长度发生变化或超过上限。".into()); }
-                hasher.update(&buffer[..read]);
-                destination.write_all(&buffer[..read]).await.map_err(|_| "SFTP 上传数据写入失败；远端结果未知。".to_string())?;
-            }
-            if total != expected_bytes { return Err("SFTP 上传源读取长度与初始快照不一致。".into()); }
-            destination.sync_all().await.map_err(|_| "SFTP 上传文件同步失败；远端结果未知。".to_string())?;
-            destination.close().await.map_err(|_| "SFTP 上传文件关闭未确认；远端结果未知。".to_string())?;
-            let metadata = sftp.metadata(temp_path.clone()).await.map_err(|_| "SFTP 上传文件元数据回读失败。".to_string())?;
-            if metadata.len() != total { return Err("SFTP 上传文件长度复核失败。".into()); }
-            let mut verify = sftp.open(temp_path.clone()).await.map_err(|_| "SFTP 上传文件摘要复核无法打开。".to_string())?;
-            let mut verify_hasher = Sha256::new();
-            let mut verify_total = 0_u64;
-            loop {
-                let read = verify.read(&mut buffer).await.map_err(|_| "SFTP 上传文件摘要复核读取失败。".to_string())?;
-                if read == 0 { break; }
-                verify_total = verify_total.checked_add(read as u64).ok_or("SFTP 复核长度溢出。")?;
-                if verify_total > maximum_bytes { return Err("SFTP 复核读取超过大小上限。".into()); }
-                verify_hasher.update(&buffer[..read]);
-            }
-            verify.close().await.map_err(|_| "SFTP 上传摘要复核句柄关闭失败。".to_string())?;
-            let sha256 = format_digest(verify_hasher.finalize().as_slice());
-            if verify_total != total || sha256 != format_digest(hasher.finalize().as_slice()) {
-                return Err("SFTP 上传字节摘要或长度复核不一致。".into());
-            }
-            sftp.rename(temp_path.clone(), remote_path.to_owned()).await
-                .map_err(|_| "SFTP 暂存文件原子改名失败；请查询原传输任务。".to_string())?;
-            let committed = sftp.metadata(remote_path.to_owned()).await.map_err(|_| "SFTP 暂存提交后元数据不可读。".to_string())?;
-            if committed.len() != total { return Err("SFTP 暂存提交后的长度复核失败。".into()); }
-            Ok(SftpTransferReceipt { path: remote_path.to_owned(), bytes: total, sha256 })
-        }).await.map_err(|_| "SFTP 上传等待超时；原传输任务结果未知。".to_string())?;
-        let _ = sftp.close().await;
-        let _ = connection.close().await;
-        transfer
+            let mut stream = connection.open_fixed_bridge(FILE_BRIDGE_MARKER).await?;
+            crate::device_file_channel::upload_device_file(
+                &mut stream,
+                begin,
+                authorization,
+                local_path,
+                &cancelled,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            "固定 FILE 上传等待超时；原任务状态可能未知，请查询原任务编号。".to_string()
+        })?;
+        let close = connection.close().await;
+        match (transfer, close) {
+            (Ok(receipt), Ok(())) => Ok(SftpTransferReceipt {
+                path: receipt.path,
+                bytes: receipt.bytes,
+                sha256: receipt.sha256,
+            }),
+            (Ok(_), Err(error)) => Err(format!("文件传输已完成但 SSH FILE 会话关闭失败：{error}")),
+            (Err(error), _) => Err(error),
+        }
     }
 
-    /// sftp_download_file（独立 SFTP 下载）：核对长度与摘要后才原子落入未占用目标路径。
-    pub async fn sftp_download_file(&self, remote_path: &str, local_path: &Path, transfer_id: &str,
-                                    expected_sha256: &str, maximum_bytes: u64,
-                                    timeout: Duration) -> Result<SftpTransferReceipt, String> {
-        validate_sftp_remote_path(remote_path)?;
-        validate_transfer_id(transfer_id)?;
-        validate_sha256(expected_sha256)?;
+    /// device_file_download（固定 FILE 下载）：仅从原 DFT 附件票据读取并原子写入本机目标。
+    pub async fn device_file_download(
+        &self,
+        local_path: &Path,
+        transfer_id: &str,
+        parent_request_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+        expected_sha256: &str,
+        maximum_bytes: u64,
+        timeout: Duration,
+    ) -> Result<SftpTransferReceipt, String> {
+        let (target, credential_ref, begin, authorization) = self
+            .prepare_device_file_transfer(
+                "file.sftp.download",
+                transfer_id,
+                parent_request_id,
+                connection_generation,
+                executor_generation,
+                maximum_bytes,
+                Some(expected_sha256),
+                timeout,
+            )
+            .await?;
         crate::device_files::validate_transfer_target_parent(local_path)?;
-        if maximum_bytes == 0 || timeout.is_zero() || timeout > Duration::from_secs(600) {
-            return Err("SFTP 文件上限或超时时限无效。".into());
-        }
-        let parent = local_path.parent().ok_or("SFTP 下载目标没有父目录。")?;
-        let file_name = local_path.file_name().ok_or("SFTP 下载目标没有文件名。")?.to_string_lossy();
-        let temp_path = parent.join(format!("{file_name}.{transfer_id}.part"));
-        let (connection, sftp) = self.open_sftp_connection(timeout).await?;
+        let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+        let mut connection = SshDeviceConnection::connect(
+            target,
+            private_key.as_str(),
+            timeout.min(Duration::from_secs(60)),
+        )
+        .await?;
+        let cancelled = AtomicBool::new(false);
         let transfer = tokio::time::timeout(timeout, async {
-            let metadata = sftp.metadata(remote_path.to_owned()).await.map_err(|_| "SFTP 远端文件不可读。".to_string())?;
-            if metadata.len() > maximum_bytes { return Err("SFTP 远端文件超过授权的传输上限。".into()); }
-            let mut source = sftp.open(remote_path.to_owned()).await.map_err(|_| "SFTP 远端文件无法打开。".to_string())?;
-            let mut destination = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path).await
-                .map_err(|_| "SFTP 本地临时目标已存在或无法创建。".to_string())?;
-            let mut hasher = Sha256::new();
-            let mut total = 0_u64;
-            let mut buffer = vec![0_u8; 64 * 1024];
-            loop {
-                let read = source.read(&mut buffer).await.map_err(|_| "SFTP 远端文件读取失败。".to_string())?;
-                if read == 0 { break; }
-                total = total.checked_add(read as u64).ok_or("SFTP 下载长度溢出。")?;
-                if total > maximum_bytes || total > metadata.len() { return Err("SFTP 下载超出远端长度或授权上限。".into()); }
-                hasher.update(&buffer[..read]);
-                destination.write_all(&buffer[..read]).await.map_err(|_| "SFTP 本地临时文件写入失败。".to_string())?;
-            }
-            source.close().await.map_err(|_| "SFTP 远端读取句柄关闭失败。".to_string())?;
-            destination.flush().await.map_err(|_| "SFTP 本地文件刷新失败。".to_string())?;
-            destination.sync_all().await.map_err(|_| "SFTP 本地文件同步失败。".to_string())?;
-            drop(destination);
-            let sha256 = format_digest(hasher.finalize().as_slice());
-            if total != metadata.len() || sha256 != expected_sha256 {
-                return Err("SFTP 下载字节摘要或长度与主机暂存回执不一致。".into());
-            }
-            if tokio::fs::try_exists(local_path).await.map_err(|_| "SFTP 下载目标状态无法复核。".to_string())? {
-                return Err("SFTP 下载目标在传输期间已被占用，拒绝覆盖。".into());
-            }
-            tokio::fs::rename(&temp_path, local_path).await.map_err(|_| "SFTP 下载文件提交失败。".to_string())?;
-            Ok(SftpTransferReceipt { path: remote_path.to_owned(), bytes: total, sha256 })
-        }).await.map_err(|_| "SFTP 下载等待超时；本地提交状态未知。".to_string())?;
-        let _ = sftp.close().await;
-        let _ = connection.close().await;
-        if transfer.is_err() {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            let mut stream = connection.open_fixed_bridge(FILE_BRIDGE_MARKER).await?;
+            crate::device_file_channel::download_device_file(
+                &mut stream,
+                begin,
+                authorization,
+                local_path,
+                &cancelled,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            "固定 FILE 下载等待超时；原任务状态可能未知，请查询原任务编号。".to_string()
+        })?;
+        let close = connection.close().await;
+        match (transfer, close) {
+            (Ok(receipt), Ok(())) => Ok(SftpTransferReceipt {
+                path: receipt.path,
+                bytes: receipt.bytes,
+                sha256: receipt.sha256,
+            }),
+            (Ok(_), Err(error)) => Err(format!("文件传输已完成但 SSH FILE 会话关闭失败：{error}")),
+            (Err(error), _) => Err(error),
         }
-        transfer
+    }
+
+    async fn prepare_device_file_transfer(
+        &self,
+        operation: &str,
+        transfer_id: &str,
+        parent_request_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+        maximum_bytes: u64,
+        expected_sha256: Option<&str>,
+        timeout: Duration,
+    ) -> Result<
+        (
+            SshDeviceTarget,
+            String,
+            DeviceFileTransferBegin,
+            FileTransferAuthorization,
+        ),
+        String,
+    > {
+        if !matches!(operation, "file.sftp.upload" | "file.sftp.download")
+            || !valid_dsh_transfer_id(transfer_id)
+            || !valid_dsh_request_id(parent_request_id)
+            || connection_generation == 0
+            || connection_generation > (1_u64 << 53) - 1
+            || executor_generation == 0
+            || executor_generation > (1_u64 << 53) - 1
+            || maximum_bytes == 0
+            || maximum_bytes > 4 * 1024 * 1024 * 1024
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(600)
+            || (operation == "file.sftp.download"
+                && !expected_sha256.is_some_and(|value| validate_sha256(value).is_ok()))
+            || (operation == "file.sftp.upload" && expected_sha256.is_some())
+        {
+            return Err("固定 FILE 票据、操作、设备代次、文件上限或超时时限无效。".into());
+        }
+        let lease = self
+            .active_lease
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "当前没有正在运行的远端设备任务租约。".to_string())?;
+        if lease.connection_generation != connection_generation
+            || lease.executor_generation != executor_generation
+        {
+            return Err("文件任务连接或执行器代次与当前远端设备租约不匹配。".into());
+        }
+        let mut slot = self.connection.lock().await;
+        let session = slot
+            .as_mut()
+            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+        if session.device_id != lease.device_id || session.connection.is_closed() {
+            return Err("固定 FILE 连接的设备身份与当前任务租约不一致。".into());
+        }
+        let mut fields = BTreeMap::from([
+            ("protocol_version".into(), "固定设备文件通道协议版本".into()),
+            ("action".into(), "固定为 begin 的原票据申请".into()),
+            ("transfer_id".into(), "原 DSH 文件传输票据编号".into()),
+            ("operation".into(), "兼容保留的文件任务操作编号".into()),
+            (
+                "parent_request_id".into(),
+                "生成原文件票据的稳定 DSH 请求编号".into(),
+            ),
+            (
+                "connection_generation".into(),
+                "当前 SSH 设备连接代次".into(),
+            ),
+            ("executor_generation".into(), "当前设备执行器代次".into()),
+            ("maximum_bytes".into(), "原审批允许的最大文件字节数".into()),
+        ]);
+        if expected_sha256.is_some() {
+            fields.insert(
+                "expected_sha256".into(),
+                "服务端已锁定的审批附件完整摘要".into(),
+            );
+        }
+        let begin = DeviceFileTransferBegin {
+            protocol_version: 1,
+            action: "begin".into(),
+            transfer_id: transfer_id.to_owned(),
+            operation: operation.to_owned(),
+            parent_request_id: parent_request_id.to_owned(),
+            connection_generation,
+            executor_generation,
+            maximum_bytes,
+            expected_sha256: expected_sha256.map(str::to_owned),
+            fields,
+        };
+        begin.validate()?;
+        let challenge_body = serde_json::json!({
+            "protocol_version":1,"device_id":session.device_id,"method":"POST","path":FILE_TRANSFER_GATEWAY_PATH,
+        });
+        let challenge_response = session
+            .connection
+            .post_json("/v1/challenge", &challenge_body, timeout)
+            .await?;
+        if challenge_response.status != 200 {
+            return Err(format!(
+                "主机未签发固定 FILE 请求签名挑战，HTTP 状态码 {}。",
+                challenge_response.status
+            ));
+        }
+        let challenge: DeviceGatewayChallenge = serde_json::from_value(challenge_response.body)
+            .map_err(|_| "固定 FILE 签名挑战格式无效。".to_string())?;
+        if challenge.protocol_version != 1 || challenge.expires_at_ms == 0 {
+            return Err("固定 FILE 签名挑战版本或有效期无效。".into());
+        }
+        let timestamp_ms = unix_timestamp_ms()?;
+        if timestamp_ms > challenge.expires_at_ms {
+            return Err("固定 FILE 签名挑战已过期。".into());
+        }
+        let signing_key_text = load_session_signing_key(session)?;
+        let signing_key = PrivateKey::from_openssh(signing_key_text.as_str())
+            .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
+        let signed_body =
+            serde_json::to_value(&begin).map_err(|_| "固定 FILE 签名正文无法编码。")?;
+        let signed = sign_device_gateway_request(
+            &signing_key,
+            &session.device_id,
+            FILE_TRANSFER_GATEWAY_PATH,
+            &signed_body,
+            &challenge,
+            timestamp_ms,
+        )?;
+        let authorization = FileTransferAuthorization {
+            device_id: signed.device_id,
+            core_session_id: signed.core_session_id,
+            challenge: signed.challenge,
+            timestamp_ms: signed.timestamp_ms,
+            signature: signed.signature,
+        };
+        authorization.validate()?;
+        Ok((
+            session.target.clone(),
+            session.transport_credential_ref.clone(),
+            begin,
+            authorization,
+        ))
     }
 
     /// open_remote_device_session（建立受信任务通道）：不授予远端语音交互租约。
@@ -1602,9 +2465,14 @@ impl SshDeviceManager {
         timeout: Duration,
     ) -> Result<RemoteDeviceSessionLease, String> {
         self.open_remote_device_session_with_capabilities(
-            vec!["desktop_control".into(), "file_transfer".into(), "terminal_control".into()],
+            vec![
+                "desktop_control".into(),
+                "file_transfer".into(),
+                "terminal_control".into(),
+            ],
             timeout,
-        ).await
+        )
+        .await
     }
 
     /// open_remote_device_session_with_capabilities（按已就绪能力开通）：不授予语音交互租约。
@@ -1613,18 +2481,34 @@ impl SshDeviceManager {
         capabilities: Vec<String>,
         timeout: Duration,
     ) -> Result<RemoteDeviceSessionLease, String> {
-        let valid_capabilities = !capabilities.is_empty() && capabilities.len() <= 5
+        let valid_capabilities = !capabilities.is_empty()
+            && capabilities.len() <= 5
             && capabilities.windows(2).all(|pair| pair[0] < pair[1])
-            && capabilities.iter().all(|value| matches!(value.as_str(),
-                "audio_stream" | "client_tts" | "desktop_control" | "file_transfer" | "terminal_control"));
-        if !valid_capabilities { return Err("远端设备能力列表必须是固定清单中的排序子集。".into()); }
-        let response = self.post_json(
-            "/v1/session/open",
-            &serde_json::json!({"protocol_version":1,"capabilities":capabilities}),
-            timeout,
-        ).await?;
+            && capabilities.iter().all(|value| {
+                matches!(
+                    value.as_str(),
+                    "audio_stream"
+                        | "client_tts"
+                        | "desktop_control"
+                        | "file_transfer"
+                        | "terminal_control"
+                )
+            });
+        if !valid_capabilities {
+            return Err("远端设备能力列表必须是固定清单中的排序子集。".into());
+        }
+        let response = self
+            .post_json(
+                "/v1/session/open",
+                &serde_json::json!({"protocol_version":1,"capabilities":capabilities}),
+                timeout,
+            )
+            .await?;
         if response.status != 200 {
-            return Err(format!("主机拒绝远端设备会话注册，HTTP 状态码 {}。", response.status));
+            return Err(format!(
+                "主机拒绝远端设备会话注册，HTTP 状态码 {}。",
+                response.status
+            ));
         }
         let lease: RemoteDeviceSessionLease = serde_json::from_value(response.body)
             .map_err(|_| "主机远端设备会话租约格式无效。".to_string())?;
@@ -1634,6 +2518,8 @@ impl SshDeviceManager {
         if lease.device_id != session.device_id {
             return Err("主机返回的会话租约属于其他设备。".into());
         }
+        drop(slot);
+        *self.active_lease.lock().await = Some(lease.clone());
         Ok(lease)
     }
 
@@ -1648,25 +2534,33 @@ impl SshDeviceManager {
         if wait_ms > 5_000 || timeout.is_zero() || timeout > Duration::from_secs(15) {
             return Err("远端设备轮询等待或超时时限无效。".into());
         }
-        let response = self.post_json(
-            "/v1/session/poll",
-            &serde_json::json!({
-                "protocol_version":1,
-                "connection_generation":lease.connection_generation,
-                "executor_generation":lease.executor_generation,
-                "wait_ms":wait_ms,
-            }),
-            timeout,
-        ).await?;
+        let response = self
+            .post_json(
+                "/v1/session/poll",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "connection_generation":lease.connection_generation,
+                    "executor_generation":lease.executor_generation,
+                    "wait_ms":wait_ms,
+                }),
+                timeout,
+            )
+            .await?;
         if response.status != 200 {
-            return Err(format!("远端设备任务轮询失败，HTTP 状态码 {}。", response.status));
+            return Err(format!(
+                "远端设备任务轮询失败，HTTP 状态码 {}。",
+                response.status
+            ));
         }
         let poll: RemoteDeviceTaskPoll = serde_json::from_value(response.body)
             .map_err(|_| "远端设备任务轮询回执格式无效。".to_string())?;
-        if poll.protocol_version != 1 || poll.result != "accepted" || poll.device_id != lease.device_id
-                || poll.core_session_id != lease.core_session_id
-                || poll.connection_generation != lease.connection_generation
-                || poll.executor_generation != lease.executor_generation {
+        if poll.protocol_version != 1
+            || poll.result != "accepted"
+            || poll.device_id != lease.device_id
+            || poll.core_session_id != lease.core_session_id
+            || poll.connection_generation != lease.connection_generation
+            || poll.executor_generation != lease.executor_generation
+        {
             return Err("远端设备任务轮询回执与当前设备租约不匹配。".into());
         }
         if let Some(task) = &poll.task {
@@ -1691,24 +2585,32 @@ impl SshDeviceManager {
         if serde_json::to_vec(&result).map_or(true, |encoded| encoded.len() > 256 * 1024) {
             return Err("远端设备操作结果超过大小限制。".into());
         }
-        let response = self.post_json(
-            "/v1/session/complete",
-            &serde_json::json!({
-                "protocol_version":1,
-                "connection_generation":lease.connection_generation,
-                "executor_generation":lease.executor_generation,
-                "task_id":task.task_id,
-                "sequence":task.sequence,
-                "core_session_id":task.core_session_id,
-                "succeeded":succeeded,
-                "result":result,
-            }),
-            timeout,
-        ).await?;
+        let response = self
+            .post_json(
+                "/v1/session/complete",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "connection_generation":lease.connection_generation,
+                    "executor_generation":lease.executor_generation,
+                    "task_id":task.task_id,
+                    "sequence":task.sequence,
+                    "core_session_id":task.core_session_id,
+                    "succeeded":succeeded,
+                    "result":result,
+                }),
+                timeout,
+            )
+            .await?;
         if response.status != 200 {
-            return Err(format!("主机未接受远端设备任务回执，HTTP 状态码 {}。", response.status));
+            return Err(format!(
+                "主机未接受远端设备任务回执，HTTP 状态码 {}。",
+                response.status
+            ));
         }
-        let receipt = response.body.get("result").and_then(serde_json::Value::as_str)
+        let receipt = response
+            .body
+            .get("result")
+            .and_then(serde_json::Value::as_str)
             .ok_or("主机远端设备回执格式无效。")?;
         if !matches!(receipt, "accepted" | "already_completed") {
             return Err("主机返回了未知的远端设备回执状态。".into());
@@ -1724,40 +2626,71 @@ impl SshDeviceManager {
         timeout: Duration,
     ) -> Result<String, String> {
         validate_remote_session_lease(lease)?;
-        if receipt.device_id != lease.device_id || receipt.task_id.is_empty()
-                || receipt.task_id.len() > 128 || receipt.task_id.trim() != receipt.task_id
-                || receipt.core_session_id.is_empty() || receipt.core_session_id.len() > 128
-                || receipt.core_session_id.trim() != receipt.core_session_id
-                || receipt.connection_generation == 0 || receipt.executor_generation == 0
-                || receipt.sequence == 0 || timeout.is_zero() || timeout > Duration::from_secs(30)
-                || serde_json::to_vec(&receipt.result).map_or(true, |bytes| bytes.len() > 256 * 1024) {
+        if receipt.device_id != lease.device_id
+            || receipt.task_id.is_empty()
+            || receipt.task_id.len() > 128
+            || receipt.task_id.trim() != receipt.task_id
+            || receipt.core_session_id.is_empty()
+            || receipt.core_session_id.len() > 128
+            || receipt.core_session_id.trim() != receipt.core_session_id
+            || receipt.connection_generation == 0
+            || receipt.executor_generation == 0
+            || receipt.sequence == 0
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(30)
+            || serde_json::to_vec(&receipt.result).map_or(true, |bytes| bytes.len() > 256 * 1024)
+        {
             return Err("待恢复设备回执与当前设备或原代次不匹配，或超过大小时限。".into());
         }
-        let response = self.post_json(
-            "/v1/session/reconcile",
-            &serde_json::json!({
-                "protocol_version":1,
-                "task_id":receipt.task_id,
-                "core_session_id":receipt.core_session_id,
-                "connection_generation":receipt.connection_generation,
-                "executor_generation":receipt.executor_generation,
-                "sequence":receipt.sequence,
-                "succeeded":receipt.succeeded,
-                "result":receipt.result,
-            }),
-            timeout,
-        ).await?;
+        let response = self
+            .post_json(
+                "/v1/session/reconcile",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "task_id":receipt.task_id,
+                    "core_session_id":receipt.core_session_id,
+                    "connection_generation":receipt.connection_generation,
+                    "executor_generation":receipt.executor_generation,
+                    "sequence":receipt.sequence,
+                    "succeeded":receipt.succeeded,
+                    "result":receipt.result,
+                }),
+                timeout,
+            )
+            .await?;
         if response.status != 200 {
-            let detail = response.body.get("detail").and_then(serde_json::Value::as_str)
-                .map(|value| value.chars().take(160).collect::<String>()).unwrap_or_default();
-            return Err(format!("核心未接受原任务回执恢复，HTTP 状态码 {}；{}；本地回执保留。", response.status, detail));
+            let detail = response
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.chars().take(160).collect::<String>())
+                .unwrap_or_default();
+            return Err(format!(
+                "核心未接受原任务回执恢复，HTTP 状态码 {}；{}；本地回执保留。",
+                response.status, detail
+            ));
         }
-        if response.body.get("protocol_version").and_then(serde_json::Value::as_u64) != Some(1)
-                || response.body.get("task_id").and_then(serde_json::Value::as_str) != Some(receipt.task_id.as_str()) {
+        if response
+            .body
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || response
+                .body
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(receipt.task_id.as_str())
+        {
             return Err("原任务回执恢复响应与本地任务编号不匹配；本地回执保留。".into());
         }
-        match response.body.get("result").and_then(serde_json::Value::as_str) {
-            Some(value @ ("reconciled" | "already_completed" | "pending" | "unknown")) => Ok(value.to_owned()),
+        match response
+            .body
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(value @ ("reconciled" | "already_completed" | "pending" | "unknown")) => {
+                Ok(value.to_owned())
+            }
             _ => Err("核心返回了未知的原任务回执恢复状态；本地回执保留。".into()),
         }
     }
@@ -1773,20 +2706,43 @@ impl SshDeviceManager {
         if timeout.is_zero() || timeout > Duration::from_secs(15) {
             return Err("远端设备续租超时时限无效。".into());
         }
-        let response = self.post_json(
-            "/v1/session/heartbeat",
-            &serde_json::json!({
-                "protocol_version":1,
-                "connection_generation":lease.connection_generation,
-                "executor_generation":lease.executor_generation,
-            }),
-            timeout,
-        ).await?;
-        if response.status != 200 || response.body.get("result").and_then(serde_json::Value::as_str) != Some("accepted")
-                || response.body.get("device_id").and_then(serde_json::Value::as_str) != Some(lease.device_id.as_str())
-                || response.body.get("connection_generation").and_then(serde_json::Value::as_u64) != Some(lease.connection_generation)
-                || response.body.get("executor_generation").and_then(serde_json::Value::as_u64) != Some(lease.executor_generation) {
-            return Err(format!("主机未确认当前远端设备租约续接，HTTP 状态码 {}。", response.status));
+        let response = self
+            .post_json(
+                "/v1/session/heartbeat",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "connection_generation":lease.connection_generation,
+                    "executor_generation":lease.executor_generation,
+                }),
+                timeout,
+            )
+            .await?;
+        if response.status != 200
+            || response
+                .body
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                != Some("accepted")
+            || response
+                .body
+                .get("device_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(lease.device_id.as_str())
+            || response
+                .body
+                .get("connection_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(lease.connection_generation)
+            || response
+                .body
+                .get("executor_generation")
+                .and_then(serde_json::Value::as_u64)
+                != Some(lease.executor_generation)
+        {
+            return Err(format!(
+                "主机未确认当前远端设备租约续接，HTTP 状态码 {}。",
+                response.status
+            ));
         }
         Ok(())
     }
@@ -1797,19 +2753,40 @@ impl SshDeviceManager {
         timeout: Duration,
     ) -> Result<bool, String> {
         validate_remote_session_lease(lease)?;
-        let response = self.post_json(
-            "/v1/session/close",
-            &serde_json::json!({
-                "protocol_version":1,
-                "connection_generation":lease.connection_generation,
-                "executor_generation":lease.executor_generation,
-            }),
-            timeout,
-        ).await?;
-        if response.status != 200 {
-            return Err(format!("主机未接受远端设备会话关闭，HTTP 状态码 {}。", response.status));
+        {
+            let mut active = self.active_lease.lock().await;
+            if active.as_ref().is_some_and(|current| {
+                current.device_id == lease.device_id
+                    && current.connection_generation == lease.connection_generation
+                    && current.executor_generation == lease.executor_generation
+            }) {
+                *active = None;
+            }
         }
-        Ok(matches!(response.body.get("result").and_then(serde_json::Value::as_str), Some("closed")))
+        let response = self
+            .post_json(
+                "/v1/session/close",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "connection_generation":lease.connection_generation,
+                    "executor_generation":lease.executor_generation,
+                }),
+                timeout,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(format!(
+                "主机未接受远端设备会话关闭，HTTP 状态码 {}。",
+                response.status
+            ));
+        }
+        Ok(matches!(
+            response
+                .body
+                .get("result")
+                .and_then(serde_json::Value::as_str),
+            Some("closed")
+        ))
     }
 
     /// run_remote_device_task_channel（运行受管设备任务通道）：错误或断线时不重放原操作。
@@ -1822,8 +2799,11 @@ impl SshDeviceManager {
         F: FnMut(RemoteDeviceTask) -> Fut,
         Fut: Future<Output = Result<RemoteDeviceTaskResult, String>>,
     {
-        let lease = self.open_remote_device_session(Duration::from_secs(10)).await?;
-        self.run_remote_device_task_channel_for_lease(lease, stop, execute).await
+        let lease = self
+            .open_remote_device_session(Duration::from_secs(10))
+            .await?;
+        self.run_remote_device_task_channel_for_lease(lease, stop, execute)
+            .await
     }
 
     /// run_remote_device_task_channel_for_lease（运行指定租约）：重连后不得复用旧代次。
@@ -1837,7 +2817,8 @@ impl SshDeviceManager {
         F: FnMut(RemoteDeviceTask) -> Fut,
         Fut: Future<Output = Result<RemoteDeviceTaskResult, String>>,
     {
-        self.run_remote_device_task_channel_inner(lease, stop, None, execute).await
+        self.run_remote_device_task_channel_inner(lease, stop, None, execute)
+            .await
     }
 
     /// run_remote_device_task_channel_for_lease_with_receipts（带本地回执日志的任务通道）。
@@ -1852,7 +2833,8 @@ impl SshDeviceManager {
         F: FnMut(RemoteDeviceTask) -> Fut,
         Fut: Future<Output = Result<RemoteDeviceTaskResult, String>>,
     {
-        self.run_remote_device_task_channel_inner(lease, stop, Some(journal), execute).await
+        self.run_remote_device_task_channel_inner(lease, stop, Some(journal), execute)
+            .await
     }
 
     async fn run_remote_device_task_channel_inner<F, Fut>(
@@ -1867,23 +2849,29 @@ impl SshDeviceManager {
         Fut: Future<Output = Result<RemoteDeviceTaskResult, String>>,
     {
         validate_remote_session_lease(&lease)?;
+        *self.active_lease.lock().await = Some(lease.clone());
         let result = async {
             if let Some(journal) = journal {
                 for receipt in journal.pending_for_device(&lease.device_id)? {
-                    let state = self.reconcile_remote_device_receipt(
-                        &lease, &receipt, Duration::from_secs(10),
-                    ).await?;
+                    let state = self
+                        .reconcile_remote_device_receipt(&lease, &receipt, Duration::from_secs(10))
+                        .await?;
                     if matches!(state.as_str(), "reconciled" | "already_completed") {
                         journal.remove(&receipt.device_id, &receipt.task_id)?;
                     }
                 }
             }
             loop {
-                if stop.load(Ordering::Acquire) { break Ok(()); }
-                if let Some(journal) = journal { journal.ensure_room()?; }
-                let task = match self.poll_remote_device_task(
-                    &lease, 1000, Duration::from_secs(8),
-                ).await {
+                if stop.load(Ordering::Acquire) {
+                    break Ok(());
+                }
+                if let Some(journal) = journal {
+                    journal.ensure_room()?;
+                }
+                let task = match self
+                    .poll_remote_device_task(&lease, 1000, Duration::from_secs(8))
+                    .await
+                {
                     Ok(task) => task,
                     Err(error) => break Err(error),
                 };
@@ -1909,11 +2897,20 @@ impl SshDeviceManager {
                     }
                 };
                 if let Some(journal) = journal {
-                    if let Err(error) = journal.record(&task, &outcome) { break Err(error); }
+                    if let Err(error) = journal.record(&task, &outcome) {
+                        break Err(error);
+                    }
                 }
-                if let Err(error) = self.complete_remote_device_task(
-                    &lease, &task, outcome.succeeded, outcome.result, Duration::from_secs(10),
-                ).await {
+                if let Err(error) = self
+                    .complete_remote_device_task(
+                        &lease,
+                        &task,
+                        outcome.succeeded,
+                        outcome.result,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                {
                     // A lost completion receipt leaves the durable client receipt for the next SSH connection.
                     break Err(error);
                 }
@@ -1925,7 +2922,9 @@ impl SshDeviceManager {
             }
         };
         let result = result.await;
-        let close_result = self.close_remote_device_session(&lease, Duration::from_secs(5)).await;
+        let close_result = self
+            .close_remote_device_session(&lease, Duration::from_secs(5))
+            .await;
         match (result, close_result) {
             (Err(error), _) => Err(error),
             (Ok(()), Ok(_) | Err(_)) => Ok(()),
@@ -1939,8 +2938,8 @@ impl SshDeviceManager {
         pairing_code: &str,
         timeout: Duration,
     ) -> Result<GatewayResponse, String> {
-        if pairing_code.len() != 8 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("配对码必须是 8 位数字。".into());
+        if pairing_code.len() != 6 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("配对码必须是 6 位数字。".into());
         }
         let mut slot = self.connection.lock().await;
         let session = slot
@@ -1956,11 +2955,15 @@ impl SshDeviceManager {
         let private_key = PrivateKey::from_openssh(private_key_text.as_str())
             .map_err(|_| "系统凭据中的设备私钥无法读取。".to_string())?;
         let body = signed_pairing_request(&private_key, device_id, pairing_code)?;
-        session.connection.post_json("/v1/pairing/request", &body, timeout).await
+        session
+            .connection
+            .post_json("/v1/pairing/request", &body, timeout)
+            .await
     }
 
     /// disconnect（断开）：只关闭连接，不重试未结算业务任务。
     pub async fn disconnect(&self) -> Result<bool, String> {
+        *self.active_lease.lock().await = None;
         let connection = self.connection.lock().await.take();
         match connection {
             Some(connection) => {
@@ -1973,7 +2976,10 @@ impl SshDeviceManager {
 
     /// connected（连接状态）：只报告本机连接对象，不访问远端或续租。
     pub async fn connected(&self) -> bool {
-        self.connection.lock().await.as_ref()
+        self.connection
+            .lock()
+            .await
+            .as_ref()
             .is_some_and(|session| !session.connection.is_closed())
     }
 }
@@ -1984,14 +2990,24 @@ fn pairing_proof_message(
     pairing_code: &str,
     client_nonce: &[u8; 24],
 ) -> Result<Vec<u8>, String> {
-    if device_id.is_empty() || device_id.len() > 128 || device_id.trim() != device_id
-        || !device_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    if device_id.is_empty()
+        || device_id.len() > 128
+        || device_id.trim() != device_id
+        || !device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
         || !fingerprint.starts_with("SHA256:")
-        || pairing_code.len() != 8 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit())
+        || pairing_code.len() != 6
+        || !pairing_code.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err("设备配对证明字段无效。".into());
     }
-    let fields = [device_id.as_bytes(), fingerprint.as_bytes(), pairing_code.as_bytes(), client_nonce.as_slice()];
+    let fields = [
+        device_id.as_bytes(),
+        fingerprint.as_bytes(),
+        pairing_code.as_bytes(),
+        client_nonce.as_slice(),
+    ];
     let mut message = b"voice-terminal-device-pairing-v1\0".to_vec();
     for field in fields {
         let length = u32::try_from(field.len()).map_err(|_| "配对证明字段超过长度上限。")?;
@@ -2009,11 +3025,18 @@ fn signed_pairing_request(
     if private_key.algorithm() != Algorithm::Ed25519 || private_key.is_encrypted() {
         return Err("配对申请只支持未加密的本机 Ed25519 设备身份。".into());
     }
-    let keypair = private_key.key_data().ed25519()
+    let keypair = private_key
+        .key_data()
+        .ed25519()
         .ok_or_else(|| "系统凭据不是 Ed25519 设备身份。".to_string())?;
-    let public_key = private_key.public_key().to_openssh()
+    let public_key = private_key
+        .public_key()
+        .to_openssh()
         .map_err(|_| "设备公钥编码失败。".to_string())?;
-    let fingerprint = private_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let fingerprint = private_key
+        .public_key()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
     let client_nonce = rand::random::<[u8; 24]>();
     let proof = pairing_proof_message(device_id, &fingerprint, pairing_code, &client_nonce)?;
     let signing_key = SigningKey::from_bytes(keypair.private.as_ref());
@@ -2028,8 +3051,16 @@ fn signed_pairing_request(
     }))
 }
 
+fn random_hex_id() -> String {
+    rand::random::<[u8; 16]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn unix_timestamp_ms() -> Result<u64, String> {
-    SystemTime::now().duration_since(UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
         .map_err(|_| "系统时间早于 Unix epoch，无法签署设备请求。".to_string())
 }
@@ -2047,7 +3078,9 @@ fn append_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Res
         Value::Array(values) => {
             output.push(b'[');
             for (index, item) in values.iter().enumerate() {
-                if index > 0 { output.push(b','); }
+                if index > 0 {
+                    output.push(b',');
+                }
                 append_canonical_json(item, output)?;
             }
             output.push(b']');
@@ -2057,7 +3090,9 @@ fn append_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Res
             let mut keys = values.keys().collect::<Vec<_>>();
             keys.sort();
             for (index, key) in keys.iter().enumerate() {
-                if index > 0 { output.push(b','); }
+                if index > 0 {
+                    output.push(b',');
+                }
                 output.extend_from_slice(
                     &serde_json::to_vec(key).map_err(|_| "设备请求 JSON 字段编码失败。")?,
                 );
@@ -2081,7 +3116,13 @@ fn device_request_proof_message(
     body: &serde_json::Value,
 ) -> Result<Vec<u8>, String> {
     device_request_proof_message_for_method(
-        "POST", device_id, path, core_session_id, challenge, timestamp_ms, body,
+        "POST",
+        device_id,
+        path,
+        core_session_id,
+        challenge,
+        timestamp_ms,
+        body,
     )
 }
 
@@ -2094,21 +3135,37 @@ fn device_request_proof_message_for_method(
     timestamp_ms: u64,
     body: &serde_json::Value,
 ) -> Result<Vec<u8>, String> {
-    let device_id_ok = !device_id.is_empty() && device_id.len() <= 128
-        && device_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-        });
+    let device_id_ok = !device_id.is_empty()
+        && device_id.len() <= 128
+        && device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
     let session_ok = core_session_id.len() == 32
-        && core_session_id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        && core_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
     let challenge_ok = (32..=128).contains(&challenge.len())
-        && challenge.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-    let target_ok = (method == "POST" && matches!(path,
-        "/v1/status" | "/v1/devices" | "/v1/session/open" | "/v1/session/poll"
-            | "/v1/session/complete" | "/v1/session/reconcile" | "/v1/session/heartbeat" | "/v1/session/close"
-            | "/v1/interaction/prepare" | "/v1/interaction/abort"))
+        && challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    let target_ok = (method == "POST"
+        && matches!(
+            path,
+            "/v1/status"
+                | "/v1/devices"
+                | "/v1/session/open"
+                | "/v1/session/poll"
+                | "/v1/session/complete"
+                | "/v1/session/reconcile"
+                | "/v1/session/heartbeat"
+                | "/v1/session/close"
+                | "/v1/interaction/prepare"
+                | "/v1/interaction/abort"
+                | "/v1/management"
+                | "/v1/file-transfer"
+        ))
         || (method == "GET" && path == "/v1/media");
-    if !device_id_ok || !target_ok
-        || !session_ok || !challenge_ok {
+    if !device_id_ok || !target_ok || !session_ok || !challenge_ok {
         return Err("设备业务请求签名字段无效。".into());
     }
     let mut canonical_body = Vec::new();
@@ -2116,8 +3173,13 @@ fn device_request_proof_message_for_method(
     let body_digest = Sha256::digest(canonical_body);
     let timestamp = timestamp_ms.to_string();
     let fields: [&[u8]; 7] = [
-        method.as_bytes(), path.as_bytes(), device_id.as_bytes(), core_session_id.as_bytes(),
-        challenge.as_bytes(), timestamp.as_bytes(), body_digest.as_slice(),
+        method.as_bytes(),
+        path.as_bytes(),
+        device_id.as_bytes(),
+        core_session_id.as_bytes(),
+        challenge.as_bytes(),
+        timestamp.as_bytes(),
+        body_digest.as_slice(),
     ];
     let mut message = b"voice-terminal-device-request-v1\0".to_vec();
     for field in fields {
@@ -2128,66 +3190,91 @@ fn device_request_proof_message_for_method(
     Ok(message)
 }
 
-fn validate_sftp_remote_path(value: &str) -> Result<(), String> {
-    let path = Path::new(value);
-    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control)
-        || !path.is_absolute() || path.components().any(|component| matches!(component, Component::ParentDir | Component::CurDir)) {
-        return Err("SFTP 远端路径必须是有限长度绝对路径，不能含 . 或 .. 路径段。".into());
-    }
-    Ok(())
+fn valid_dsh_transfer_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_transfer_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 128 || !value.bytes().enumerate().all(|(index, byte)| {
-        byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
-    }) { return Err("SFTP 传输编号格式无效。".into()); }
-    Ok(())
+fn valid_dsh_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn validate_sha256(value: &str) -> Result<(), String> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
-        return Err("SFTP 传输摘要必须是小写 SHA-256（摘要）。".into());
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("固定文件通道摘要必须是小写 SHA-256。".into());
     }
     Ok(())
 }
 
-fn format_digest(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn validate_remote_session_lease(lease: &RemoteDeviceSessionLease) -> Result<(), String> {
-    let device_id_ok = !lease.device_id.is_empty() && lease.device_id.len() <= 128
+    let device_id_ok = !lease.device_id.is_empty()
+        && lease.device_id.len() <= 128
         && lease.device_id != "local"
-        && lease.device_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-        });
+        && lease
+            .device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
     let core_session_ok = lease.core_session_id.len() == 32
-        && lease.core_session_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    let capabilities_valid = !lease.capabilities.is_empty() && lease.capabilities.len() <= 5
+        && lease
+            .core_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let capabilities_valid = !lease.capabilities.is_empty()
+        && lease.capabilities.len() <= 5
         && lease.capabilities.windows(2).all(|pair| pair[0] < pair[1])
-        && lease.capabilities.iter().all(|value| matches!(value.as_str(),
-            "audio_stream" | "client_tts" | "desktop_control" | "file_transfer" | "terminal_control"));
-    if lease.protocol_version != 1 || lease.result != "accepted" || !device_id_ok
-            || !core_session_ok || lease.connection_generation == 0 || lease.executor_generation == 0
-            || !capabilities_valid
+        && lease.capabilities.iter().all(|value| {
+            matches!(
+                value.as_str(),
+                "audio_stream"
+                    | "client_tts"
+                    | "desktop_control"
+                    | "file_transfer"
+                    | "terminal_control"
+            )
+        });
+    if lease.protocol_version != 1
+        || lease.result != "accepted"
+        || !device_id_ok
+        || !core_session_ok
+        || lease.connection_generation == 0
+        || lease.executor_generation == 0
+        || !capabilities_valid
     {
         return Err("远端设备会话租约字段或能力无效。".into());
     }
     Ok(())
 }
 
-fn validate_remote_device_task(task: &RemoteDeviceTask, lease: &RemoteDeviceSessionLease) -> Result<(), String> {
-    let request_id_ok = !task.request_id.is_empty() && task.request_id.len() <= 128
-        && task.request_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-        });
-    if !request_id_ok || task.task_id != task.request_id || task.device_id != lease.device_id
-            || task.core_session_id != lease.core_session_id
-            || task.connection_generation != lease.connection_generation
-            || task.executor_generation != lease.executor_generation || task.sequence == 0
-            || !REMOTE_DEVICE_OPERATIONS.contains(&task.operation.as_str())
-            || !task.arguments.is_object()
-            || serde_json::to_vec(&task.arguments).map_or(true, |encoded| encoded.len() > 256 * 1024)
+fn validate_remote_device_task(
+    task: &RemoteDeviceTask,
+    lease: &RemoteDeviceSessionLease,
+) -> Result<(), String> {
+    let request_id_ok = !task.request_id.is_empty()
+        && task.request_id.len() <= 128
+        && task
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
+    if !request_id_ok
+        || task.task_id != task.request_id
+        || task.device_id != lease.device_id
+        || task.core_session_id != lease.core_session_id
+        || task.connection_generation != lease.connection_generation
+        || task.executor_generation != lease.executor_generation
+        || task.sequence == 0
+        || !REMOTE_DEVICE_OPERATIONS.contains(&task.operation.as_str())
+        || !task.arguments.is_object()
+        || serde_json::to_vec(&task.arguments).map_or(true, |encoded| encoded.len() > 256 * 1024)
     {
         return Err("远端桌面任务与固定设备、代次或操作白名单不匹配。".into());
     }
@@ -2203,7 +3290,13 @@ fn sign_device_gateway_request(
     timestamp_ms: u64,
 ) -> Result<DeviceGatewayAuthHeaders, String> {
     sign_device_gateway_request_for_method(
-        private_key, "POST", device_id, path, body, challenge, timestamp_ms,
+        private_key,
+        "POST",
+        device_id,
+        path,
+        body,
+        challenge,
+        timestamp_ms,
     )
 }
 
@@ -2219,10 +3312,18 @@ fn sign_device_gateway_request_for_method(
     if private_key.algorithm() != Algorithm::Ed25519 || private_key.is_encrypted() {
         return Err("设备业务签名只支持未加密的本机 Ed25519 身份。".into());
     }
-    let keypair = private_key.key_data().ed25519()
+    let keypair = private_key
+        .key_data()
+        .ed25519()
         .ok_or_else(|| "系统凭据不是 Ed25519 设备身份。".to_string())?;
     let message = device_request_proof_message_for_method(
-        method, device_id, path, &challenge.core_session_id, &challenge.challenge, timestamp_ms, body,
+        method,
+        device_id,
+        path,
+        &challenge.core_session_id,
+        &challenge.challenge,
+        timestamp_ms,
+        body,
     )?;
     let signing_key = SigningKey::from_bytes(keypair.private.as_ref());
     let signature = signing_key.sign(&message).to_bytes();
@@ -2236,16 +3337,25 @@ fn sign_device_gateway_request_for_method(
 }
 
 fn validate_gateway_auth_headers(auth: &DeviceGatewayAuthHeaders) -> Result<(), String> {
-    let device_id_ok = !auth.device_id.is_empty() && auth.device_id.len() <= 128
-        && auth.device_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-        });
+    let device_id_ok = !auth.device_id.is_empty()
+        && auth.device_id.len() <= 128
+        && auth
+            .device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
     let session_ok = auth.core_session_id.len() == 32
-        && auth.core_session_id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        && auth
+            .core_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
     let challenge_ok = (32..=128).contains(&auth.challenge.len())
-        && auth.challenge.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        && auth
+            .challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
     let signature_ok = base64::engine::general_purpose::STANDARD
-        .decode(auth.signature.as_bytes()).is_ok_and(|value| value.len() == 64);
+        .decode(auth.signature.as_bytes())
+        .is_ok_and(|value| value.len() == 64);
     if !device_id_ok || !session_ok || !challenge_ok || !signature_ok {
         return Err("设备请求授权头字段无效。".into());
     }
@@ -2292,10 +3402,12 @@ fn parse_http_response(response: &[u8]) -> Result<GatewayResponse, String> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| format!(
-            "SSH 业务回执缺少完整 HTTP 响应头（已收到 {} 字节）。",
-            response.len(),
-        ))?;
+        .ok_or_else(|| {
+            format!(
+                "SSH 业务回执缺少完整 HTTP 响应头（已收到 {} 字节）。",
+                response.len(),
+            )
+        })?;
     if header_end > MAX_HEADER_BYTES || response.len() > MAX_HEADER_BYTES + MAX_RESPONSE_BYTES + 4 {
         return Err("SSH 业务回执超过大小上限。".into());
     }
@@ -2344,8 +3456,8 @@ fn parse_http_response(response: &[u8]) -> Result<GatewayResponse, String> {
             content_type = Some(value.to_ascii_lowercase());
         }
     }
-    let expected = content_length
-        .ok_or_else(|| "SSH 业务回执未声明 HTTP 内容长度。".to_string())?;
+    let expected =
+        content_length.ok_or_else(|| "SSH 业务回执未声明 HTTP 内容长度。".to_string())?;
     if expected > MAX_RESPONSE_BYTES {
         return Err("SSH 业务回执超过大小上限。".into());
     }
@@ -2363,8 +3475,7 @@ fn parse_http_response(response: &[u8]) -> Result<GatewayResponse, String> {
     let body = if payload.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(payload)
-            .map_err(|_| "SSH 业务回执 JSON 内容无效。".to_string())?
+        serde_json::from_slice(payload).map_err(|_| "SSH 业务回执 JSON 内容无效。".to_string())?
     };
     Ok(GatewayResponse { status, body })
 }
@@ -2387,7 +3498,10 @@ mod tests {
         use tokio::net::TcpListener;
 
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let host_fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let host_fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let host_config = Arc::new(russh::server::Config {
             keys: vec![host_key],
             ..Default::default()
@@ -2415,8 +3529,12 @@ mod tests {
             gateway_port: DEFAULT_GATEWAY_PORT,
         };
         let connection = SshDeviceConnection::connect(
-            target.clone(), login_key_text.as_str(), Duration::from_secs(10),
-        ).await.unwrap();
+            target.clone(),
+            login_key_text.as_str(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
@@ -2432,7 +3550,9 @@ mod tests {
         ssh_handle.shutdown("connection liveness test completed".into());
         server_task.await.unwrap().unwrap();
         for _ in 0..100 {
-            if !manager.connected().await { break; }
+            if !manager.connected().await {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!manager.connected().await);
@@ -2461,24 +3581,29 @@ mod tests {
         );
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":"pcm", "downlink_codec":"pcm",
-        })).is_err());
+        }))
+        .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":7, "downlink_codec":"pcm", "encoder_pre_skip_samples":0,
-        })).is_err());
+        }))
+        .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":"opus", "downlink_codec":"pcm", "encoder_pre_skip_samples":0,
-        })).is_err());
+        }))
+        .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":"opus", "downlink_codec":"opus",
             "encoder_pre_skip_samples":104,"downlink_encoder_pre_skip_samples":0,
-        })).is_err());
+        }))
+        .is_err());
     }
 
     #[test]
     fn python_stop_task_poll_fixture_deserializes_with_the_native_client_contract() {
         let poll: RemoteDeviceTaskPoll = serde_json::from_str(include_str!(
             "../../../../tests/fixtures/device-playback-stop-task.json"
-        )).unwrap();
+        ))
+        .unwrap();
         assert_eq!(poll.protocol_version, 1);
         assert_eq!(poll.result, "accepted");
         assert_eq!(poll.device_id, "device-a");
@@ -2508,7 +3633,9 @@ mod tests {
         const TEST_CONTROL_PORT: u16 = 18_766; // TEST_CONTROL_PORT（仅限本机集成测试控制端口）。
 
         let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..").canonicalize().unwrap();
+            .join("../../..")
+            .canonicalize()
+            .unwrap();
         let python = repository.join(".local/runtimes/python/python.exe");
         let fixture = repository.join("tests/fixtures/device-gateway-ssh-task-e2e-server.py");
         let mut child = Command::new(python)
@@ -2519,13 +3646,18 @@ mod tests {
             .env("VOICE_DEVICE_E2E_PUBLIC_KEY", public_key)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn().expect("本机 Python 设备网关测试服务应能启动");
+            .spawn()
+            .expect("本机 Python 设备网关测试服务应能启动");
         for _ in 0..200 {
             if let Some(status) = child.try_wait().expect("读取测试服务状态失败") {
                 panic!("Python 设备网关测试服务提前退出：{status}");
             }
-            let gateway_ready = TcpStream::connect(("127.0.0.1", DEFAULT_GATEWAY_PORT)).await.is_ok();
-            let control_ready = TcpStream::connect(("127.0.0.1", TEST_CONTROL_PORT)).await.is_ok();
+            let gateway_ready = TcpStream::connect(("127.0.0.1", DEFAULT_GATEWAY_PORT))
+                .await
+                .is_ok();
+            let control_ready = TcpStream::connect(("127.0.0.1", TEST_CONTROL_PORT))
+                .await
+                .is_ok();
             if gateway_ready && control_ready {
                 return PythonGatewayProcess(child);
             }
@@ -2541,12 +3673,16 @@ mod tests {
         use tokio::net::TcpStream;
         const TEST_CONTROL_PORT: u16 = 18_766; // TEST_CONTROL_PORT（仅限本机集成测试控制端口）。
 
-        let mut stream = TcpStream::connect(("127.0.0.1", TEST_CONTROL_PORT)).await.unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", TEST_CONTROL_PORT))
+            .await
+            .unwrap();
         let request = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{TEST_CONTROL_PORT}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response)).await
-            .expect("Python 测试网关控制接口应返回").expect("读取 Python 测试网关回执失败");
+        tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response))
+            .await
+            .expect("Python 测试网关控制接口应返回")
+            .expect("读取 Python 测试网关回执失败");
         parse_http_response(&response).unwrap()
     }
     #[derive(Clone)]
@@ -2573,22 +3709,18 @@ mod tests {
             Ok(russh::server::Auth::Accept)
         }
 
-        async fn channel_open_direct_tcpip(
+        async fn channel_open_session(
             &mut self,
             channel: russh::Channel<russh::server::Msg>,
-            host_to_connect: &str,
-            port_to_connect: u32,
-            _originator_address: &str,
-            _originator_port: u32,
             reply: russh::server::ChannelOpenHandle,
             _session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
-            if host_to_connect != "127.0.0.1" || port_to_connect != u32::from(self.gateway.port()) {
-                return Ok(());
-            }
-            let mut target = tokio::net::TcpStream::connect(self.gateway).await?;
+            let gateway = self.gateway;
             reply.accept().await;
             tokio::spawn(async move {
+                let Ok(mut target) = tokio::net::TcpStream::connect(gateway).await else {
+                    return;
+                };
                 let mut channel = channel.into_stream();
                 let _ = tokio::io::copy_bidirectional(&mut channel, &mut target).await;
             });
@@ -2607,10 +3739,15 @@ mod tests {
         let public_key = product_key.public_key().to_openssh().unwrap();
         let mut gateway = start_python_gateway_test_server(&public_key).await;
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let config = Arc::new(russh::server::Config {
-            keys: vec![host_key], inactivity_timeout: Some(Duration::from_secs(30)),
-            auth_rejection_time: Duration::ZERO, auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
             ..Default::default()
         });
         let (address_tx, address_rx) = oneshot::channel();
@@ -2626,58 +3763,113 @@ mod tests {
         });
         let (address, ssh_handle) = address_rx.await.unwrap();
         let target = SshDeviceTarget {
-            address: "127.0.0.1".into(), port: address.port(), username: "test-device".into(),
-            host_key_sha256: fingerprint, gateway_port: DEFAULT_GATEWAY_PORT,
+            address: "127.0.0.1".into(),
+            port: address.port(),
+            username: "test-device".into(),
+            host_key_sha256: fingerprint,
+            gateway_port: DEFAULT_GATEWAY_PORT,
         };
         let login_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
         let mut wrong_target = target.clone();
         wrong_target.host_key_sha256 = format!("SHA256:{}", "A".repeat(43));
-        assert!(SshDeviceConnection::connect(wrong_target, &login_key_text, Duration::from_secs(5)).await.is_err());
+        assert!(SshDeviceConnection::connect(
+            wrong_target,
+            &login_key_text,
+            Duration::from_secs(5)
+        )
+        .await
+        .is_err());
 
         let manager = SshDeviceManager::default();
-        manager.connect_with_test_credentials(
-            "test-device", target, &product_key_text, &login_key_text, Duration::from_secs(10),
-        ).await.unwrap();
+        manager
+            .connect_with_test_credentials(
+                "test-device",
+                target,
+                &product_key_text,
+                &login_key_text,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
         let opened = call_python_gateway_test_route("POST", "/__test__/pairing-open").await;
         assert_eq!(opened.status, 200);
         let code = opened.body["pairing_code"].as_str().unwrap();
         let status_body = serde_json::json!({"protocol_version": 1});
-        let denied = manager.post_json("/v1/status", &status_body, Duration::from_secs(5)).await.unwrap();
+        let denied = manager
+            .post_json("/v1/status", &status_body, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(denied.status, 401, "SSH 登录不应自动取得产品信任");
-        let wrong_code = if code == "00000000" { "11111111" } else { "00000000" };
-        let refused = manager.submit_pairing_request("test-device", wrong_code, Duration::from_secs(5)).await.unwrap();
+        let wrong_code = if code == "000000" { "000001" } else { "000000" };
+        let refused = manager
+            .submit_pairing_request("test-device", wrong_code, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(refused.status, 403);
-        let submitted = manager.submit_pairing_request("test-device", code, Duration::from_secs(5)).await.unwrap();
+        let submitted = manager
+            .submit_pairing_request("test-device", code, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(submitted.status, 202);
         assert_eq!(submitted.body["device_id"], "test-device");
         assert!(submitted.body.get("public_key").is_none());
         assert!(submitted.body.get("pairing_code").is_none());
-        let pending = manager.post_json("/v1/status", &status_body, Duration::from_secs(5)).await.unwrap();
+        let pending = manager
+            .post_json("/v1/status", &status_body, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(pending.status, 401, "申请成功后仍须主机明确批准");
         let approved = call_python_gateway_test_route("POST", "/__test__/pairing-approve").await;
         assert_eq!(approved.status, 200);
-        let trusted = manager.post_json("/v1/status", &status_body, Duration::from_secs(5)).await.unwrap();
+        let trusted = manager
+            .post_json("/v1/status", &status_body, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(trusted.status, 200);
         assert_eq!(trusted.body["ready"], true);
-        let lease = manager.open_remote_device_session_with_capabilities(
-            vec!["file_transfer".into()], Duration::from_secs(5),
-        ).await.unwrap();
+        let lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["file_transfer".into()],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         assert_eq!(lease.device_id, "test-device");
-        assert!(manager.close_remote_device_session(&lease, Duration::from_secs(5)).await.unwrap());
+        assert!(manager
+            .close_remote_device_session(&lease, Duration::from_secs(5))
+            .await
+            .unwrap());
         let revoked = call_python_gateway_test_route("POST", "/__test__/pairing-revoke").await;
         assert_eq!(revoked.status, 200);
-        let denied = manager.post_json("/v1/status", &status_body, Duration::from_secs(5)).await.unwrap();
+        let denied = manager
+            .post_json("/v1/status", &status_body, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(denied.status, 401, "撤销后不得继续使用产品接口");
         manager.disconnect().await.unwrap();
         ssh_handle.shutdown("local pairing acceptance complete".into());
-        tokio::time::timeout(Duration::from_secs(10), ssh_task).await.unwrap().unwrap().unwrap();
-        assert_eq!(call_python_gateway_test_route("POST", "/__test__/shutdown").await.status, 200);
+        tokio::time::timeout(Duration::from_secs(10), ssh_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            call_python_gateway_test_route("POST", "/__test__/shutdown")
+                .await
+                .status,
+            200
+        );
         for _ in 0..100 {
-            if gateway.0.try_wait().unwrap().is_some() { break; }
+            if gateway.0.try_wait().unwrap().is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(gateway.0.try_wait().unwrap().is_some(), "本地配对测试网关须正常退出");
+        assert!(
+            gateway.0.try_wait().unwrap().is_some(),
+            "本地配对测试网关须正常退出"
+        );
     }
 
     #[tokio::test]
@@ -2686,10 +3878,12 @@ mod tests {
         use tokio::sync::oneshot;
 
         let _gateway_lock = PYTHON_GATEWAY_TEST_LOCK.lock().await;
-        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT)).await
+        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT))
+            .await
             .expect("本机测试网关默认端口必须空闲");
         drop(gateway_probe);
-        let control_probe = TcpListener::bind(("127.0.0.1", 18_766)).await
+        let control_probe = TcpListener::bind(("127.0.0.1", 18_766))
+            .await
             .expect("本机测试控制端口必须空闲");
         drop(control_probe);
 
@@ -2698,7 +3892,10 @@ mod tests {
         let public_key = product_key.public_key().to_openssh().unwrap();
         let mut python_gateway = start_python_gateway_test_server(&public_key).await;
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let host_fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let host_fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let host_config = Arc::new(russh::server::Config {
             keys: vec![host_key],
             inactivity_timeout: Some(Duration::from_secs(30)),
@@ -2711,7 +3908,9 @@ mod tests {
         let ssh_task = tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
-            let mut server = LoopbackForwardSshServer { gateway: ssh_gateway };
+            let mut server = LoopbackForwardSshServer {
+                gateway: ssh_gateway,
+            };
             let running = russh::server::Server::run_on_socket(&mut server, host_config, &listener);
             let handle = running.handle();
             let _ = address_tx.send((address, handle));
@@ -2728,8 +3927,12 @@ mod tests {
         let login_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
         let connection = SshDeviceConnection::connect(
-            target.clone(), login_key_text.as_str(), Duration::from_secs(10),
-        ).await.unwrap();
+            target.clone(),
+            login_key_text.as_str(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
@@ -2741,9 +3944,13 @@ mod tests {
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
         });
 
-        let lease = manager.open_remote_device_session_with_capabilities(
-            vec!["audio_stream".into(), "client_tts".into()], Duration::from_secs(10),
-        ).await.unwrap();
+        let lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["audio_stream".into(), "client_tts".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
         assert_eq!(lease.device_id, "test-device");
         assert_eq!(lease.capabilities, ["audio_stream", "client_tts"]);
         assert_eq!(lease.connection_generation, 1);
@@ -2755,25 +3962,28 @@ mod tests {
         let stop_after_execute = stop.clone();
         let execute_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let execute_count_ref = execute_count.clone();
-        manager.run_remote_device_task_channel_for_lease(lease, stop, move |task| {
-            let stop = stop_after_execute.clone();
-            let execute_count = execute_count_ref.clone();
-            async move {
-                assert_eq!(task.operation, "playback.stop_and_snapshot");
-                assert_eq!(task.arguments["playback_key"], "speech-playback-e2e");
-                assert_eq!(task.connection_generation, 1);
-                assert_eq!(task.executor_generation, 1);
-                execute_count.fetch_add(1, Ordering::AcqRel);
-                stop.store(true, Ordering::Release);
-                Ok(RemoteDeviceTaskResult {
-                    succeeded: true,
-                    result: serde_json::json!({"playback_key":"speech-playback-e2e",
+        manager
+            .run_remote_device_task_channel_for_lease(lease, stop, move |task| {
+                let stop = stop_after_execute.clone();
+                let execute_count = execute_count_ref.clone();
+                async move {
+                    assert_eq!(task.operation, "playback.stop_and_snapshot");
+                    assert_eq!(task.arguments["playback_key"], "speech-playback-e2e");
+                    assert_eq!(task.connection_generation, 1);
+                    assert_eq!(task.executor_generation, 1);
+                    execute_count.fetch_add(1, Ordering::AcqRel);
+                    stop.store(true, Ordering::Release);
+                    Ok(RemoteDeviceTaskResult {
+                        succeeded: true,
+                        result: serde_json::json!({"playback_key":"speech-playback-e2e",
                         "enqueued_ms":420,"played_ms":280,"buffered_ms":140,
                         "output_estimated_ms":240,"started":true,
                         "device_time_us":9_000_000,"precision":"device_time"}),
-                })
-            }
-        }).await.unwrap();
+                    })
+                }
+            })
+            .await
+            .unwrap();
 
         assert_eq!(execute_count.load(Ordering::Acquire), 1);
         manager.disconnect().await.unwrap();
@@ -2782,21 +3992,31 @@ mod tests {
 
         let status = loop {
             let response = call_python_gateway_test_route("GET", "/__test__/stop-status").await;
-            if response.status != 202 { break response; }
+            if response.status != 202 {
+                break response;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(status.status, 200, "{status:?}");
         assert_eq!(status.body["state"], "succeeded");
-        assert_eq!(status.body["snapshot"]["playback_key"], "speech-playback-e2e");
+        assert_eq!(
+            status.body["snapshot"]["playback_key"],
+            "speech-playback-e2e"
+        );
         assert_eq!(status.body["snapshot"]["played_ms"], 280);
         assert_eq!(status.body["snapshot"]["device_time_us"], 9_000_000);
         let stopped = call_python_gateway_test_route("POST", "/__test__/shutdown").await;
         assert_eq!(stopped.status, 200);
         for _ in 0..100 {
-            if python_gateway.0.try_wait().unwrap().is_some() { break; }
+            if python_gateway.0.try_wait().unwrap().is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(python_gateway.0.try_wait().unwrap().is_some(), "Python 设备网关应已退出");
+        assert!(
+            python_gateway.0.try_wait().unwrap().is_some(),
+            "Python 设备网关应已退出"
+        );
     }
     #[tokio::test]
     async fn replacement_transactions_round_trip_over_a_pinned_ssh_task_channel() {
@@ -2804,7 +4024,9 @@ mod tests {
         use tokio::sync::oneshot;
 
         let _gateway_lock = PYTHON_GATEWAY_TEST_LOCK.lock().await;
-        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT)).await.unwrap();
+        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT))
+            .await
+            .unwrap();
         drop(gateway_probe);
         let control_probe = TcpListener::bind(("127.0.0.1", 18_766)).await.unwrap();
         drop(control_probe);
@@ -2814,10 +4036,15 @@ mod tests {
         let public_key = product_key.public_key().to_openssh().unwrap();
         let mut python_gateway = start_python_gateway_test_server(&public_key).await;
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let host_fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let host_fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let host_config = Arc::new(russh::server::Config {
-            keys: vec![host_key], inactivity_timeout: Some(Duration::from_secs(30)),
-            auth_rejection_time: Duration::ZERO, auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
             ..Default::default()
         });
         let (address_tx, address_rx) = oneshot::channel();
@@ -2825,7 +4052,9 @@ mod tests {
         let ssh_task = tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
-            let mut server = LoopbackForwardSshServer { gateway: ssh_gateway };
+            let mut server = LoopbackForwardSshServer {
+                gateway: ssh_gateway,
+            };
             let running = russh::server::Server::run_on_socket(&mut server, host_config, &listener);
             let handle = running.handle();
             let _ = address_tx.send((address, handle));
@@ -2833,25 +4062,40 @@ mod tests {
         });
         let (ssh_address, ssh_handle) = address_rx.await.unwrap();
         let target = SshDeviceTarget {
-            address: "127.0.0.1".into(), port: ssh_address.port(), username: "test-device".into(),
-            host_key_sha256: host_fingerprint, gateway_port: DEFAULT_GATEWAY_PORT,
+            address: "127.0.0.1".into(),
+            port: ssh_address.port(),
+            username: "test-device".into(),
+            host_key_sha256: host_fingerprint,
+            gateway_port: DEFAULT_GATEWAY_PORT,
         };
         let login_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
-        let connection = SshDeviceConnection::connect(target.clone(), login_key_text.as_str(), Duration::from_secs(10))
-            .await.unwrap();
+        let connection = SshDeviceConnection::connect(
+            target.clone(),
+            login_key_text.as_str(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
-            connection, device_id: "test-device".into(),
+            connection,
+            device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
-            transport_credential_ref: "test-only-login-key".into(), target,
+            transport_credential_ref: "test-only-login-key".into(),
+            target,
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
         });
-        let lease = manager.open_remote_device_session_with_capabilities(
-            vec!["audio_stream".into()], Duration::from_secs(10),
-        ).await.unwrap();
-        let dispatch = call_python_gateway_test_route("POST", "/__test__/dispatch-replacement").await;
+        let lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["audio_stream".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let dispatch =
+            call_python_gateway_test_route("POST", "/__test__/dispatch-replacement").await;
         assert_eq!(dispatch.status, 200, "{dispatch:?}");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2909,23 +4153,44 @@ mod tests {
         ssh_task.await.unwrap().unwrap();
 
         let status = loop {
-            let response = call_python_gateway_test_route("GET", "/__test__/replacement-status").await;
-            if response.status != 202 { break response; }
+            let response =
+                call_python_gateway_test_route("GET", "/__test__/replacement-status").await;
+            if response.status != 202 {
+                break response;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(status.status, 200, "{status:?}");
         assert_eq!(status.body["state"], "succeeded");
         assert_eq!(status.body["replacement"]["bound"], true);
-        assert_eq!(status.body["replacement"]["ticket"]["replacement_id"].as_str(),
-            replacement_id.lock().unwrap().as_deref());
-        assert_eq!(status.body["replacement"]["result"]["reason"], "early_handoff");
-        assert_eq!(status.body["replacement"]["result"]["events_device_time_us"]["old_audio_silenced"], 9_240_000);
-        assert_eq!(call_python_gateway_test_route("POST", "/__test__/shutdown").await.status, 200);
+        assert_eq!(
+            status.body["replacement"]["ticket"]["replacement_id"].as_str(),
+            replacement_id.lock().unwrap().as_deref()
+        );
+        assert_eq!(
+            status.body["replacement"]["result"]["reason"],
+            "early_handoff"
+        );
+        assert_eq!(
+            status.body["replacement"]["result"]["events_device_time_us"]["old_audio_silenced"],
+            9_240_000
+        );
+        assert_eq!(
+            call_python_gateway_test_route("POST", "/__test__/shutdown")
+                .await
+                .status,
+            200
+        );
         for _ in 0..100 {
-            if python_gateway.0.try_wait().unwrap().is_some() { break; }
+            if python_gateway.0.try_wait().unwrap().is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(python_gateway.0.try_wait().unwrap().is_some(), "Python 设备网关应已退出");
+        assert!(
+            python_gateway.0.try_wait().unwrap().is_some(),
+            "Python 设备网关应已退出"
+        );
     }
 
     #[tokio::test]
@@ -2935,7 +4200,9 @@ mod tests {
         use tokio::sync::oneshot;
 
         let _gateway_lock = PYTHON_GATEWAY_TEST_LOCK.lock().await;
-        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT)).await.unwrap();
+        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT))
+            .await
+            .unwrap();
         drop(gateway_probe);
         let control_probe = TcpListener::bind(("127.0.0.1", 18_766)).await.unwrap();
         drop(control_probe);
@@ -2945,10 +4212,15 @@ mod tests {
         let public_key = product_key.public_key().to_openssh().unwrap();
         let mut python_gateway = start_python_gateway_test_server(&public_key).await;
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let host_fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let host_fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let host_config = Arc::new(russh::server::Config {
-            keys: vec![host_key], inactivity_timeout: Some(Duration::from_secs(30)),
-            auth_rejection_time: Duration::ZERO, auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![host_key],
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
             ..Default::default()
         });
         let (address_tx, address_rx) = oneshot::channel();
@@ -2956,7 +4228,9 @@ mod tests {
         let ssh_task = tokio::spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
-            let mut server = LoopbackForwardSshServer { gateway: ssh_gateway };
+            let mut server = LoopbackForwardSshServer {
+                gateway: ssh_gateway,
+            };
             let running = russh::server::Server::run_on_socket(&mut server, host_config, &listener);
             let handle = running.handle();
             let _ = address_tx.send((address, handle));
@@ -2964,88 +4238,164 @@ mod tests {
         });
         let (ssh_address, ssh_handle) = address_rx.await.unwrap();
         let target = SshDeviceTarget {
-            address:"127.0.0.1".into(), port:ssh_address.port(), username:"test-device".into(),
-            host_key_sha256:host_fingerprint, gateway_port:DEFAULT_GATEWAY_PORT,
+            address: "127.0.0.1".into(),
+            port: ssh_address.port(),
+            username: "test-device".into(),
+            host_key_sha256: host_fingerprint,
+            gateway_port: DEFAULT_GATEWAY_PORT,
         };
         let login_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
         let connection = SshDeviceConnection::connect(
-            target.clone(), login_key_text.as_str(), Duration::from_secs(10),
-        ).await.unwrap();
+            target.clone(),
+            login_key_text.as_str(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
-            connection, device_id:"test-device".into(),
-            identity_credential_ref:"test-only-device-key".into(),
-            transport_credential_ref:"test-only-login-key".into(), target,
-            signing_key_for_test:Some(Zeroizing::new(product_key_text.to_string())),
-            transport_key_for_test:Some(Zeroizing::new(login_key_text.to_string())),
+            connection,
+            device_id: "test-device".into(),
+            identity_credential_ref: "test-only-device-key".into(),
+            transport_credential_ref: "test-only-login-key".into(),
+            target,
+            signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
+            transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
         });
-        let first_lease = manager.open_remote_device_session_with_capabilities(
-            vec!["audio_stream".into()], Duration::from_secs(10),
-        ).await.unwrap();
-        let dispatch = call_python_gateway_test_route("POST", "/__test__/dispatch-receipt-reconciliation").await;
+        let first_lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["audio_stream".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let dispatch =
+            call_python_gateway_test_route("POST", "/__test__/dispatch-receipt-reconciliation")
+                .await;
         assert_eq!(dispatch.status, 200, "{dispatch:?}");
         let task = loop {
-            if let Some(task) = manager.poll_remote_device_task(&first_lease, 1000, Duration::from_secs(8)).await.unwrap() {
+            if let Some(task) = manager
+                .poll_remote_device_task(&first_lease, 1000, Duration::from_secs(8))
+                .await
+                .unwrap()
+            {
                 break task;
             }
         };
         assert_eq!(task.task_id, "receipt-reconcile-e2e");
-        assert_eq!(task.connection_generation, first_lease.connection_generation);
+        assert_eq!(
+            task.connection_generation,
+            first_lease.connection_generation
+        );
         let original_result = RemoteDeviceTaskResult {
-            succeeded:true,
-            result:serde_json::json!({"playback_key":"speech-reconcile-e2e","played_ms":0,
+            succeeded: true,
+            result: serde_json::json!({"playback_key":"speech-reconcile-e2e","played_ms":0,
                 "enqueued_ms":0,"buffered_ms":0,"output_estimated_ms":0,"started":false,
                 "device_time_us":10_500_000,"precision":"unknown"}),
         };
         let journal_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../.local/tmp").join(format!("receipt-reconcile-{}", crate::workspace::new_id()));
+            .join("../../../.local/tmp")
+            .join(format!("receipt-reconcile-{}", crate::workspace::new_id()));
         let receipt_journal = DeviceTaskReceiptJournal::new(journal_root.clone());
         let persisted_receipt = receipt_journal.record(&task, &original_result).unwrap();
         let mut stale_generation_receipt = persisted_receipt.clone();
         stale_generation_receipt.sequence += 1;
-        assert!(manager.reconcile_remote_device_receipt(
-            &first_lease, &stale_generation_receipt, Duration::from_secs(10),
-        ).await.is_err());
-        assert_eq!(receipt_journal.pending_for_device("test-device").unwrap().len(), 1);
-        assert!(manager.close_remote_device_session(&first_lease, Duration::from_secs(5)).await.unwrap());
+        assert!(manager
+            .reconcile_remote_device_receipt(
+                &first_lease,
+                &stale_generation_receipt,
+                Duration::from_secs(10),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            receipt_journal
+                .pending_for_device("test-device")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager
+            .close_remote_device_session(&first_lease, Duration::from_secs(5))
+            .await
+            .unwrap());
 
         let unknown = loop {
-            let response = call_python_gateway_test_route("GET", "/__test__/receipt-reconciliation-status").await;
-            if response.status == 200 && response.body["state"] == "unknown" { break response; }
+            let response =
+                call_python_gateway_test_route("GET", "/__test__/receipt-reconciliation-status")
+                    .await;
+            if response.status == 200 && response.body["state"] == "unknown" {
+                break response;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(unknown.body["task_id"], task.task_id);
         assert_eq!(unknown.body["run_id"], first_lease.core_session_id);
 
-        let second_lease = manager.open_remote_device_session_with_capabilities(
-            vec!["audio_stream".into()], Duration::from_secs(10),
-        ).await.unwrap();
-        assert_ne!(second_lease.connection_generation, first_lease.connection_generation);
+        let second_lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["audio_stream".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            second_lease.connection_generation,
+            first_lease.connection_generation
+        );
         let stop = Arc::new(AtomicBool::new(true));
-        manager.run_remote_device_task_channel_for_lease_with_receipts(
-            second_lease.clone(), stop, &receipt_journal, move |_task| async move {
-                Err::<RemoteDeviceTaskResult, String>("恢复流程不应领取或重放新副作用".into())
-            },
-        ).await.unwrap();
-        assert!(receipt_journal.pending_for_device("test-device").unwrap().is_empty());
-        assert_eq!(manager.reconcile_remote_device_receipt(
-            &second_lease, &persisted_receipt, Duration::from_secs(10),
-        ).await.unwrap(), "already_completed");
+        manager
+            .run_remote_device_task_channel_for_lease_with_receipts(
+                second_lease.clone(),
+                stop,
+                &receipt_journal,
+                move |_task| async move {
+                    Err::<RemoteDeviceTaskResult, String>("恢复流程不应领取或重放新副作用".into())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(receipt_journal
+            .pending_for_device("test-device")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manager
+                .reconcile_remote_device_receipt(
+                    &second_lease,
+                    &persisted_receipt,
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap(),
+            "already_completed"
+        );
         manager.disconnect().await.unwrap();
         ssh_handle.shutdown("receipt reconciliation test completed".into());
         ssh_task.await.unwrap().unwrap();
 
-        let settled = call_python_gateway_test_route("GET", "/__test__/receipt-reconciliation-status").await;
+        let settled =
+            call_python_gateway_test_route("GET", "/__test__/receipt-reconciliation-status").await;
         assert_eq!(settled.status, 200, "{settled:?}");
         assert_eq!(settled.body["state"], "succeeded");
         assert_eq!(settled.body["result"]["played_ms"], 0);
-        assert_eq!(call_python_gateway_test_route("POST", "/__test__/shutdown").await.status, 200);
+        assert_eq!(
+            call_python_gateway_test_route("POST", "/__test__/shutdown")
+                .await
+                .status,
+            200
+        );
         for _ in 0..100 {
-            if python_gateway.0.try_wait().unwrap().is_some() { break; }
+            if python_gateway.0.try_wait().unwrap().is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(python_gateway.0.try_wait().unwrap().is_some(), "Python 设备网关应已退出");
+        assert!(
+            python_gateway.0.try_wait().unwrap().is_some(),
+            "Python 设备网关应已退出"
+        );
         let _ = std::fs::remove_dir_all(journal_root);
     }
 
@@ -3055,10 +4405,12 @@ mod tests {
         use tokio::sync::oneshot;
 
         let _gateway_lock = PYTHON_GATEWAY_TEST_LOCK.lock().await;
-        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT)).await
+        let gateway_probe = TcpListener::bind(("127.0.0.1", DEFAULT_GATEWAY_PORT))
+            .await
             .expect("本机测试网关默认端口必须空闲");
         drop(gateway_probe);
-        let control_probe = TcpListener::bind(("127.0.0.1", 18_766)).await
+        let control_probe = TcpListener::bind(("127.0.0.1", 18_766))
+            .await
             .expect("本机测试控制端口必须空闲");
         drop(control_probe);
 
@@ -3067,7 +4419,10 @@ mod tests {
         let public_key = product_key.public_key().to_openssh().unwrap();
         let mut python_gateway = start_python_gateway_test_server(&public_key).await;
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let host_fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let host_fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
         let host_config = Arc::new(russh::server::Config {
             keys: vec![host_key],
             inactivity_timeout: Some(Duration::from_secs(30)),
@@ -3097,8 +4452,12 @@ mod tests {
         let login_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
         let connection = SshDeviceConnection::connect(
-            target.clone(), login_key_text.as_str(), Duration::from_secs(10),
-        ).await.unwrap();
+            target.clone(),
+            login_key_text.as_str(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
@@ -3109,28 +4468,47 @@ mod tests {
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
         });
-        let lease = manager.open_remote_device_session_with_capabilities(
-            vec!["audio_stream".into()], Duration::from_secs(10),
-        ).await.unwrap();
+        let lease = manager
+            .open_remote_device_session_with_capabilities(
+                vec!["audio_stream".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
 
         let generation = call_python_gateway_test_route("GET", "/__test__/device-generation").await;
         assert_eq!(generation.status, 200, "{generation:?}");
-        let prepared = manager.post_json("/v1/interaction/prepare", &serde_json::json!({
-            "protocol_version":1,
-            "expected_interaction_generation":generation.body["generation"],
-        }), Duration::from_secs(10)).await.unwrap();
+        let prepared = manager
+            .post_json(
+                "/v1/interaction/prepare",
+                &serde_json::json!({
+                    "protocol_version":1,
+                    "expected_interaction_generation":generation.body["generation"],
+                }),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
         assert_eq!(prepared.status, 200, "{prepared:?}");
         assert_eq!(prepared.body["result"], "pending_media");
         let interaction_generation = prepared.body["interaction_generation"].as_u64().unwrap();
 
         let mut encoder = crate::native_opus::OpusEncoder::new(16_000, None).unwrap();
         let uplink_pre_skip_samples = encoder.lookahead_samples();
-        let mut media = manager.open_media_channel_with_codecs(
-            "ssh-media-tts-e2e", lease.connection_generation,
-            lease.executor_generation, interaction_generation,
-            AudioCodec::Opus, AudioCodec::Pcm, uplink_pre_skip_samples, 0,
-            Duration::from_secs(10),
-        ).await.unwrap();
+        let mut media = manager
+            .open_media_channel_with_codecs(
+                "ssh-media-tts-e2e",
+                lease.connection_generation,
+                lease.executor_generation,
+                interaction_generation,
+                AudioCodec::Opus,
+                AudioCodec::Pcm,
+                uplink_pre_skip_samples,
+                0,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
         assert_eq!(media.device_id, "test-device");
         assert_eq!(media.stream_id, "ssh-media-tts-e2e");
         assert_eq!(media.uplink_codec, AudioCodec::Opus);
@@ -3138,10 +4516,13 @@ mod tests {
         assert_eq!(media.downlink_encoder_pre_skip_samples, 0);
         let device_clock_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let clock_sync = device_clock_us.clone();
-        media.synchronize_clock(move || {
-            let sample = clock_sync.fetch_add(10_000, Ordering::AcqRel) + 10_000;
-            async move { Ok(sample) }
-        }).await.unwrap();
+        media
+            .synchronize_clock(move || {
+                let sample = clock_sync.fetch_add(10_000, Ordering::AcqRel) + 10_000;
+                async move { Ok(sample) }
+            })
+            .await
+            .unwrap();
         assert!(media.clock_uncertainty_us.is_some());
         assert!(media.capture_active);
 
@@ -3149,15 +4530,15 @@ mod tests {
             let samples = (0..320_u64)
                 .map(|index| {
                     (6_000.0_f64
-                        * (2.0 * std::f64::consts::PI * 440.0
-                            * (sequence * 320 + index) as f64 / 16_000.0)
+                        * (2.0 * std::f64::consts::PI * 440.0 * (sequence * 320 + index) as f64
+                            / 16_000.0)
                             .sin()) as i16
                 })
                 .collect::<Vec<_>>();
             let packet = encoder.encode(&samples).unwrap();
             let device_time_us = device_clock_us.fetch_add(20_000, Ordering::AcqRel) + 20_000;
             let header = crate::device_protocol::MediaHeader {
-                protocol_version: 1,
+                protocol_version: MEDIA_PROTOCOL_VERSION,
                 device_id: media.device_id.clone(),
                 core_session_id: media.core_session_id.clone(),
                 connection_generation: media.connection_generation,
@@ -3170,12 +4551,30 @@ mod tests {
                 device_time_us,
                 audio_codec: AudioCodec::Opus,
                 discontinuity_before: false,
+                audio_processing: crate::device_protocol::AudioProcessingMetadata {
+                    state: crate::device_protocol::AudioProcessingHealth::Ready,
+                    near_end_voice: crate::device_protocol::NullableMetadata(Some(false)),
+                    protected_interruption_available: false,
+                    reverse_generation: 0,
+                    error: crate::device_protocol::NullableMetadata(None),
+                    fields: BTreeMap::from([
+                        ("error".into(), "设备前处理故障摘要".into()),
+                        ("near_end_voice".into(), "近端语音结论".into()),
+                        (
+                            "protected_interruption_available".into(),
+                            "受保护打断资格".into(),
+                        ),
+                        ("reverse_generation".into(), "反向参考代次".into()),
+                        ("state".into(), "前处理健康状态".into()),
+                    ]),
+                },
             };
             media.send_media_frame(&header, &packet).await.unwrap();
         }
         let mut decoded_capture = None;
         for _ in 0..100 {
-            let status = call_python_gateway_test_route("GET", "/__test__/media-capture-status").await;
+            let status =
+                call_python_gateway_test_route("GET", "/__test__/media-capture-status").await;
             assert_eq!(status.status, 200, "{status:?}");
             if status.body["frames"].as_u64() == Some(1) {
                 decoded_capture = Some(status.body);
@@ -3189,8 +4588,10 @@ mod tests {
         let started = call_python_gateway_test_route("POST", "/__test__/tts-enqueue").await;
         assert_eq!(started.status, 200, "{started:?}");
         let binary = loop {
-            let message = tokio::time::timeout(Duration::from_secs(10), media.receive()).await
-                .expect("客户端应在期限内收到 TTS 播放帧").unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(10), media.receive())
+                .await
+                .expect("客户端应在期限内收到 TTS 播放帧")
+                .unwrap();
             match message {
                 SshMediaMessage::Binary(bytes) => break bytes,
                 SshMediaMessage::Ping(_) => continue,
@@ -3213,35 +4614,49 @@ mod tests {
         assert_eq!(header.sample_rate, 16_000);
         assert_eq!(payload, b"\x2a\x00".repeat(320));
 
-        media.send_text(&serde_json::json!({
-            "type":"playback.accepted", "protocol_version":1,
-            "device_id":media.device_id, "delivery_device_id":media.device_id,
-            "core_session_id":media.core_session_id,
-            "connection_generation":media.connection_generation,
-            "executor_generation":media.executor_generation,
-            "interaction_generation":media.interaction_generation,
-            "stream_id":media.stream_id, "sequence":header.sequence,
-            "fields":{"type":"控制消息类型","sequence":"已加入模拟设备播放队列的帧序号"},
-        }).to_string()).await.unwrap();
-        media.send_text(&serde_json::json!({
-            "type":"playback.progress", "protocol_version":1,
-            "device_id":media.device_id, "delivery_device_id":media.device_id,
-            "core_session_id":media.core_session_id,
-            "connection_generation":media.connection_generation,
-            "executor_generation":media.executor_generation,
-            "interaction_generation":media.interaction_generation,
-            "stream_id":media.stream_id, "playback_key":header.playback_key,
-            "receipt_sequence":1, "sequence":header.sequence,
-            "enqueued_ms":20, "played_ms":20, "buffered_ms":0,
-            "output_estimated_ms":20, "started":true,
-            "device_time_us":device_clock_us.fetch_add(1, Ordering::AcqRel) / 2 + 1,
-            "precision":"device_time",
-            "fields":{"type":"控制消息类型","played_ms":"模拟设备已提交输出的时长"},
-        }).to_string()).await.unwrap();
+        media
+            .send_text(
+                &serde_json::json!({
+                    "type":"playback.accepted", "protocol_version":MEDIA_PROTOCOL_VERSION,
+                    "device_id":media.device_id, "delivery_device_id":media.device_id,
+                    "core_session_id":media.core_session_id,
+                    "connection_generation":media.connection_generation,
+                    "executor_generation":media.executor_generation,
+                    "interaction_generation":media.interaction_generation,
+                    "stream_id":media.stream_id, "sequence":header.sequence,
+                    "fields":{"type":"控制消息类型","sequence":"已加入模拟设备播放队列的帧序号"},
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        media
+            .send_text(
+                &serde_json::json!({
+                    "type":"playback.progress", "protocol_version":MEDIA_PROTOCOL_VERSION,
+                    "device_id":media.device_id, "delivery_device_id":media.device_id,
+                    "core_session_id":media.core_session_id,
+                    "connection_generation":media.connection_generation,
+                    "executor_generation":media.executor_generation,
+                    "interaction_generation":media.interaction_generation,
+                    "stream_id":media.stream_id, "playback_key":header.playback_key,
+                    "receipt_sequence":1, "sequence":header.sequence,
+                    "enqueued_ms":20, "played_ms":20, "buffered_ms":0,
+                    "output_estimated_ms":20, "started":true,
+                    "device_time_us":device_clock_us.fetch_add(1, Ordering::AcqRel) / 2 + 1,
+                    "precision":"device_time",
+                    "fields":{"type":"控制消息类型","played_ms":"模拟设备已提交输出的时长"},
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
 
         let status = loop {
             let response = call_python_gateway_test_route("GET", "/__test__/tts-status").await;
-            if response.status != 202 { break response; }
+            if response.status != 202 {
+                break response;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(status.status, 200, "{status:?}");
@@ -3250,17 +4665,25 @@ mod tests {
         assert_eq!(status.body["progress"]["played_ms"], 20);
         assert_eq!(status.body["progress"]["buffered_ms"], 0);
         media.close().await.unwrap();
-        assert!(manager.close_remote_device_session(&lease, Duration::from_secs(5)).await.unwrap());
+        assert!(manager
+            .close_remote_device_session(&lease, Duration::from_secs(5))
+            .await
+            .unwrap());
         manager.disconnect().await.unwrap();
         ssh_handle.shutdown("media integration test completed".into());
         ssh_task.await.unwrap().unwrap();
         let stopped = call_python_gateway_test_route("POST", "/__test__/shutdown").await;
         assert_eq!(stopped.status, 200);
         for _ in 0..100 {
-            if python_gateway.0.try_wait().unwrap().is_some() { break; }
+            if python_gateway.0.try_wait().unwrap().is_some() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(python_gateway.0.try_wait().unwrap().is_some(), "Python 设备网关应已退出");
+        assert!(
+            python_gateway.0.try_wait().unwrap().is_some(),
+            "Python 设备网关应已退出"
+        );
     }
 
     fn target() -> SshDeviceTarget {
@@ -3290,14 +4713,12 @@ mod tests {
         assert!(value.validate().is_err());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn sftp_transfer_paths_are_absolute_and_ids_cannot_escape_staging_names() {
-        assert!(validate_sftp_remote_path(r"D:\AI\example-test\cleanup\stage-1.bin").is_ok());
-        assert!(validate_sftp_remote_path(r"stage-1.bin").is_err());
-        assert!(validate_sftp_remote_path(r"D:\AI\..\outside.bin").is_err());
-        assert!(validate_transfer_id("transfer-123").is_ok());
-        assert!(validate_transfer_id("../other").is_err());
+    fn dsh_file_transfer_binds_strict_ticket_id_and_request_without_remote_paths() {
+        assert!(valid_dsh_transfer_id("0123456789abcdef0123456789abcdef"));
+        assert!(!valid_dsh_transfer_id("transfer-123"));
+        assert!(valid_dsh_request_id("remote-large-read-1"));
+        assert!(!valid_dsh_request_id("../outside"));
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_sha256(&"A".repeat(64)).is_err());
     }
@@ -3310,7 +4731,10 @@ mod tests {
         let host_key = PublicKeyOrCertificate::from(key.clone());
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         assert!(host_fingerprint_matches(&host_key, &fingerprint));
-        assert!(!host_fingerprint_matches(&host_key, "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!host_fingerprint_matches(
+            &host_key,
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
     }
 
     #[test]
@@ -3336,13 +4760,17 @@ mod tests {
         assert_eq!(reference.len(), "VoiceTerminal/ssh-transport/".len() + 64);
         assert!(!reference.starts_with("VoiceTerminal/device/"));
         assert!(public_key.starts_with("ssh-ed25519 "));
-        assert_eq!(transport_credential_reference(&fingerprint).unwrap(), reference);
+        assert_eq!(
+            transport_credential_reference(&fingerprint).unwrap(),
+            reference
+        );
         assert!(parse_transport_private_key("not an OpenSSH key").is_err());
         let public_only = serde_json::to_value(SshTransportIdentity {
             credential_ref: reference,
             public_key,
             fingerprint,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(public_only.get("private_key").is_none());
     }
 
@@ -3350,54 +4778,79 @@ mod tests {
     fn pairing_proof_matches_the_versioned_length_delimited_protocol() {
         let nonce = [7_u8; 24];
         let message = pairing_proof_message(
-            "desk-a", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "12345678", &nonce,
-        ).unwrap();
+            "desk-a",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "001234",
+            &nonce,
+        )
+        .unwrap();
         let mut expected = b"voice-terminal-device-pairing-v1\0".to_vec();
         for field in [
             &b"desk-a"[..],
             &b"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"[..],
-            &b"12345678"[..],
+            &b"001234"[..],
             &nonce[..],
         ] {
             expected.extend_from_slice(&(field.len() as u32).to_be_bytes());
             expected.extend_from_slice(field);
         }
         assert_eq!(message, expected);
-        assert!(pairing_proof_message("desk-a\n", "SHA256:bad", "12345678", &nonce).is_err());
+        assert!(pairing_proof_message("desk-a\n", "SHA256:bad", "001234", &nonce).is_err());
     }
 
     #[test]
     fn pairing_request_signature_verifies_against_its_open_ssh_public_key() {
         let mut rng = rand::rng();
         let private_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
-        let request = signed_pairing_request(&private_key, "client-a", "38472910").unwrap();
-        let public_key: russh::keys::PublicKey = request["public_key"].as_str().unwrap().parse().unwrap();
+        let request = signed_pairing_request(&private_key, "client-a", "384729").unwrap();
+        let public_key: russh::keys::PublicKey =
+            request["public_key"].as_str().unwrap().parse().unwrap();
         let public_bytes: [u8; 32] = *public_key.key_data().ed25519().unwrap().as_ref();
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_bytes).unwrap();
         let nonce: [u8; 24] = base64::engine::general_purpose::STANDARD
-            .decode(request["client_nonce"].as_str().unwrap()).unwrap().try_into().unwrap();
+            .decode(request["client_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let signature_bytes: [u8; 64] = base64::engine::general_purpose::STANDARD
-            .decode(request["signature"].as_str().unwrap()).unwrap().try_into().unwrap();
+            .decode(request["signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let proof = pairing_proof_message(
             "client-a",
             &public_key.fingerprint(HashAlg::Sha256).to_string(),
-            "38472910",
+            "384729",
             &nonce,
-        ).unwrap();
-        verifying_key.verify_strict(&proof, &ed25519_dalek::Signature::from_bytes(&signature_bytes)).unwrap();
+        )
+        .unwrap();
+        verifying_key
+            .verify_strict(
+                &proof,
+                &ed25519_dalek::Signature::from_bytes(&signature_bytes),
+            )
+            .unwrap();
         let mut tampered = proof.clone();
         tampered.extend_from_slice(b"tampered");
-        assert!(verifying_key.verify_strict(&tampered,
-            &ed25519_dalek::Signature::from_bytes(&signature_bytes)).is_err());
+        assert!(verifying_key
+            .verify_strict(
+                &tampered,
+                &ed25519_dalek::Signature::from_bytes(&signature_bytes)
+            )
+            .is_err());
         assert_eq!(request["protocol_version"], 1);
     }
 
     #[test]
     fn control_request_rejects_path_injection_and_oversized_body() {
-        assert!(encode_http_request("/v1/status\r\nHost:evil", &serde_json::json!({}), None).is_err());
+        assert!(
+            encode_http_request("/v1/status\r\nHost:evil", &serde_json::json!({}), None).is_err()
+        );
         let too_large = serde_json::json!({"data":"x".repeat(MAX_REQUEST_BYTES)});
         assert!(encode_http_request("/v1/status", &too_large, None).is_err());
-        assert!(encode_http_request("/v1/status", &serde_json::json!({"device_id":"A"}), None).is_ok());
+        assert!(
+            encode_http_request("/v1/status", &serde_json::json!({"device_id":"A"}), None).is_ok()
+        );
     }
 
     #[test]
@@ -3405,10 +4858,18 @@ mod tests {
         let body = serde_json::json!({"protocol_version": 1});
         let challenge = "a".repeat(43);
         let message = device_request_proof_message(
-            "client-a", "/v1/devices", "0123456789abcdef0123456789abcdef",
-            &challenge, 1_700_000_000_123, &body,
-        ).unwrap();
-        let actual = message.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            "client-a",
+            "/v1/devices",
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &body,
+        )
+        .unwrap();
+        let actual = message
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert_eq!(actual,
             "766f6963652d7465726d696e616c2d6465766963652d726571756573742d76310000000004504f53540000000b2f76312f6465766963657300000008636c69656e742d610000002030313233343536373839616263646566303132333435363738396162636465660000002b616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000000d313730303030303030303132330000002000aa4c2c857995eb8e19cb0fade07e4b49aac774e37a99c37a0c9f549204d9de");
     }
@@ -3419,17 +4880,57 @@ mod tests {
             "connection_generation":2,"executor_generation":3,"interaction_generation":4});
         let challenge = "a".repeat(43);
         assert!(device_request_proof_message_for_method(
-            "GET", "client-a", "/v1/media", "0123456789abcdef0123456789abcdef",
-            &challenge, 1_700_000_000_123, &body,
-        ).is_ok());
+            "GET",
+            "client-a",
+            "/v1/media",
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &body,
+        )
+        .is_ok());
         assert!(device_request_proof_message_for_method(
-            "POST", "client-a", "/v1/media", "0123456789abcdef0123456789abcdef",
-            &challenge, 1_700_000_000_123, &body,
-        ).is_err());
+            "POST",
+            "client-a",
+            "/v1/media",
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &body,
+        )
+        .is_err());
         assert!(device_request_proof_message_for_method(
-            "GET", "client-a", "/v1/status", "0123456789abcdef0123456789abcdef",
-            &challenge, 1_700_000_000_123, &body,
-        ).is_err());
+            "GET",
+            "client-a",
+            "/v1/status",
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &body,
+        )
+        .is_err());
+        assert!(device_request_proof_message_for_method(
+            "POST",
+            "client-a",
+            FILE_TRANSFER_GATEWAY_PATH,
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &serde_json::json!({
+                "protocol_version":1,"action":"begin","transfer_id":"a".repeat(32)
+            }),
+        )
+        .is_ok());
+        assert!(device_request_proof_message_for_method(
+            "POST",
+            "client-a",
+            "/v1/file-transfer/other",
+            "0123456789abcdef0123456789abcdef",
+            &challenge,
+            1_700_000_000_123,
+            &body,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3441,8 +4942,44 @@ mod tests {
     }
 
     #[test]
+    fn remote_voice_forwarder_accepts_only_the_random_loopback_path_and_valid_upgrade() {
+        let token = "a".repeat(64);
+        let key = base64::engine::general_purpose::STANDARD.encode([9_u8; 16]);
+        let request = format!(
+            "GET /{token}/ws HTTP/1.1\r\nHost: 127.0.0.1:40000\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        assert_eq!(
+            local_voice_upgrade_key(request.as_bytes(), &token).unwrap(),
+            key
+        );
+
+        let wrong_path = request.replace(&format!("/{token}/ws"), "/ws");
+        assert!(local_voice_upgrade_key(wrong_path.as_bytes(), &token).is_err());
+        let duplicate_key = request.replace(
+            "Sec-WebSocket-Version: 13\r\n",
+            &format!("Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"),
+        );
+        assert!(local_voice_upgrade_key(duplicate_key.as_bytes(), &token).is_err());
+        let with_body = request.replace("\r\n\r\n", "\r\nContent-Length: 1\r\n\r\n");
+        assert!(local_voice_upgrade_key(with_body.as_bytes(), &token).is_err());
+
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            websocket_accept_value(&key),
+        );
+        assert!(validate_voice_upgrade_response(response.as_bytes(), &key).is_ok());
+        assert!(
+            validate_voice_upgrade_response(response.as_bytes(), "dGhlIHNhbXBsZSBub25jZQ==")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn websocket_client_frames_are_masked_and_server_text_is_bounded() {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let (client, mut server) = tokio::io::duplex(1024);
             let mut websocket = SshWebSocketStream::new(Box::new(client));
@@ -3456,11 +4993,19 @@ mod tests {
             server.read_exact(&mut mask).await.unwrap();
             let mut payload = [0_u8; 4];
             server.read_exact(&mut payload).await.unwrap();
-            for index in 0..payload.len() { payload[index] ^= mask[index & 3]; }
+            for index in 0..payload.len() {
+                payload[index] ^= mask[index & 3];
+            }
             assert_eq!(&payload, b"ping");
 
-            server.write_all(&[0x81, 3, b'o', b'k', b'!']).await.unwrap();
-            assert_eq!(websocket.receive_message().await.unwrap(), SshMediaMessage::Text("ok!".into()));
+            server
+                .write_all(&[0x81, 3, b'o', b'k', b'!'])
+                .await
+                .unwrap();
+            assert_eq!(
+                websocket.receive_message().await.unwrap(),
+                SshMediaMessage::Text("ok!".into())
+            );
         });
     }
 
@@ -3468,10 +5013,25 @@ mod tests {
     fn remote_session_signing_paths_and_task_targets_are_bounded() {
         let body = serde_json::json!({"protocol_version":1,"connection_generation":1});
         let challenge = "a".repeat(43);
-        for path in ["/v1/session/open", "/v1/session/poll", "/v1/session/complete", "/v1/session/reconcile", "/v1/session/close",
-                     "/v1/interaction/prepare", "/v1/interaction/abort"] {
-            assert!(device_request_proof_message("client-a", path,
-                "0123456789abcdef0123456789abcdef", &challenge, 1_700_000_000_123, &body).is_ok());
+        for path in [
+            "/v1/session/open",
+            "/v1/session/poll",
+            "/v1/session/complete",
+            "/v1/session/reconcile",
+            "/v1/session/close",
+            "/v1/interaction/prepare",
+            "/v1/interaction/abort",
+            "/v1/management",
+        ] {
+            assert!(device_request_proof_message(
+                "client-a",
+                path,
+                "0123456789abcdef0123456789abcdef",
+                &challenge,
+                1_700_000_000_123,
+                &body
+            )
+            .is_ok());
         }
         let lease = RemoteDeviceSessionLease {
             protocol_version: 1,
@@ -3496,13 +5056,34 @@ mod tests {
         };
         validate_remote_device_task(&task, &lease).unwrap();
         let playback_operations = [
-            ("playback.pause", serde_json::json!({"playback_key":"speech-1"})),
-            ("playback.resume", serde_json::json!({"playback_key":"speech-1"})),
-            ("playback.stop_and_snapshot", serde_json::json!({"playback_key":"speech-1"})),
-            ("playback.prepare_replacement", serde_json::json!({"playback_key":"speech-1","max_ms":400})),
-            ("playback.bind_replacement", serde_json::json!({"replacement_id":"replace-1","playback_key":"speech-2"})),
-            ("playback.abort_replacement", serde_json::json!({"replacement_id":"replace-1","reason":"cancelled"})),
-            ("playback.wait_replacement", serde_json::json!({"replacement_id":"replace-1"})),
+            (
+                "playback.pause",
+                serde_json::json!({"playback_key":"speech-1"}),
+            ),
+            (
+                "playback.resume",
+                serde_json::json!({"playback_key":"speech-1"}),
+            ),
+            (
+                "playback.stop_and_snapshot",
+                serde_json::json!({"playback_key":"speech-1"}),
+            ),
+            (
+                "playback.prepare_replacement",
+                serde_json::json!({"playback_key":"speech-1","max_ms":400}),
+            ),
+            (
+                "playback.bind_replacement",
+                serde_json::json!({"replacement_id":"replace-1","playback_key":"speech-2"}),
+            ),
+            (
+                "playback.abort_replacement",
+                serde_json::json!({"replacement_id":"replace-1","reason":"cancelled"}),
+            ),
+            (
+                "playback.wait_replacement",
+                serde_json::json!({"replacement_id":"replace-1"}),
+            ),
         ];
         for (index, (operation, arguments)) in playback_operations.into_iter().enumerate() {
             let mut playback_task = task.clone();
@@ -3530,14 +5111,26 @@ mod tests {
             timestamp_ms: 1_700_000_000_123,
             signature: base64::engine::general_purpose::STANDARD.encode([7_u8; 64]),
         };
-        let request = encode_http_request("/v1/status", &serde_json::json!({"protocol_version":1}), Some(&auth)).unwrap();
+        let request = encode_http_request(
+            "/v1/status",
+            &serde_json::json!({"protocol_version":1}),
+            Some(&auth),
+        )
+        .unwrap();
         let request = String::from_utf8(request).unwrap();
         assert!(request.contains("X-Voice-Terminal-Device-ID: client-a\r\n"));
-        assert!(request.contains("X-Voice-Terminal-Core-Session-ID: 0123456789abcdef0123456789abcdef\r\n"));
+        assert!(request
+            .contains("X-Voice-Terminal-Core-Session-ID: 0123456789abcdef0123456789abcdef\r\n"));
         assert!(request.contains("X-Voice-Terminal-Timestamp-Ms: 1700000000123\r\n"));
-        assert!(encode_http_request("/v1/status", &serde_json::json!({}), Some(&DeviceGatewayAuthHeaders {
-            signature: "bad".into(), ..auth
-        })).is_err());
+        assert!(encode_http_request(
+            "/v1/status",
+            &serde_json::json!({}),
+            Some(&DeviceGatewayAuthHeaders {
+                signature: "bad".into(),
+                ..auth
+            })
+        )
+        .is_err());
     }
 
     #[test]
@@ -3546,7 +5139,8 @@ mod tests {
         let parsed = parse_http_response(bytes).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.body["ready"], true);
-        let truncated = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{}";
+        let truncated =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{}";
         assert!(parse_http_response(truncated).is_err());
     }
 

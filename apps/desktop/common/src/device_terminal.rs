@@ -62,7 +62,9 @@ impl DeviceTerminalManager {
         if connection_generation == 0 || executor_generation == 0 {
             return Err("终端任务缺少有效连接或执行器代次。".into());
         }
-        let arguments = arguments.as_object().ok_or("终端任务参数必须是 JSON（结构化数据）对象。")?;
+        let arguments = arguments
+            .as_object()
+            .ok_or("终端任务参数必须是 JSON（结构化数据）对象。")?;
         match operation {
             "terminal.create" => {
                 exact_fields(arguments, &["terminal_id"])?;
@@ -72,16 +74,30 @@ impl DeviceTerminalManager {
             "terminal.input" => {
                 exact_fields(arguments, &["terminal_id", "command_id"])?;
                 let terminal_id = required_id(arguments.get("terminal_id"), "terminal_id")?;
-                let command_id = arguments.get("command_id").and_then(Value::as_str)
+                let command_id = arguments
+                    .get("command_id")
+                    .and_then(Value::as_str)
                     .ok_or("command_id（命令编号）无效。")?;
-                self.start_command(terminal_id, command_id, connection_generation, executor_generation)
+                self.start_command(
+                    terminal_id,
+                    command_id,
+                    connection_generation,
+                    executor_generation,
+                )
             }
             "terminal.output" => {
                 exact_fields(arguments, &["terminal_id", "offset"])?;
                 let terminal_id = required_id(arguments.get("terminal_id"), "terminal_id")?;
-                let offset = arguments.get("offset").and_then(Value::as_u64)
+                let offset = arguments
+                    .get("offset")
+                    .and_then(Value::as_u64)
                     .ok_or("offset（输出字节偏移）无效。")?;
-                self.output(terminal_id, offset, connection_generation, executor_generation)
+                self.output(
+                    terminal_id,
+                    offset,
+                    connection_generation,
+                    executor_generation,
+                )
             }
             "terminal.status" => {
                 exact_fields(arguments, &["terminal_id"])?;
@@ -102,9 +118,18 @@ impl DeviceTerminalManager {
         }
     }
 
-    fn create(&self, terminal_id: &str, connection_generation: u64, executor_generation: u64) -> Result<Value, String> {
+    fn create(
+        &self,
+        terminal_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
         self.expire_idle();
-        let mut sessions = self.inner.sessions.lock().map_err(|_| "终端会话台账不可用。")?;
+        let mut sessions = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| "终端会话台账不可用。")?;
         if let Some(existing) = sessions.get(terminal_id) {
             validate_generation(existing, connection_generation, executor_generation)?;
             return Ok(session_snapshot(terminal_id, existing)?);
@@ -133,9 +158,17 @@ impl DeviceTerminalManager {
         session_snapshot(terminal_id, &session)
     }
 
-    fn start_command(&self, terminal_id: &str, command_id: &str,
-                     connection_generation: u64, executor_generation: u64) -> Result<Value, String> {
-        if !matches!(command_id, "hostname" | "identity" | "processes" | "network") {
+    fn start_command(
+        &self,
+        terminal_id: &str,
+        command_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
+        if !matches!(
+            command_id,
+            "hostname" | "identity" | "processes" | "network"
+        ) {
             return Err("command_id（命令编号）不在受限只读命令清单中。".into());
         }
         let session = self.get(terminal_id, connection_generation, executor_generation)?;
@@ -151,7 +184,12 @@ impl DeviceTerminalManager {
             if active >= MAX_ACTIVE_COMMANDS {
                 return Err("设备上的并行终端命令已达上限。".into());
             }
-            if self.inner.active_commands.compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if self
+                .inner
+                .active_commands
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 break;
             }
         }
@@ -167,25 +205,34 @@ impl DeviceTerminalManager {
         let session_for_thread = session.clone();
         let inner = self.inner.clone();
         let command_id = command_id.to_owned();
-        let spawn = thread::Builder::new().name("voice-device-terminal".into()).spawn(move || {
-            let outcome = run_fixed_command(&command_id, &session_for_thread, &cancel);
-            if let Ok(mut state) = session_for_thread.state.lock() {
-                state.cancel = None;
-                state.touched_at = Instant::now();
-                match outcome {
-                    Ok((exit_code, cancelled, timed_out)) => {
-                        state.exit_code = Some(exit_code);
-                        state.state = if cancelled { "cancelled" } else if timed_out { "timed_out" }
-                            else if exit_code == 0 { "completed" } else { "failed" };
-                    }
-                    Err(error) => {
-                        state.state = "failed";
-                        state.error = Some(error.chars().take(240).collect());
+        let spawn = thread::Builder::new()
+            .name("voice-device-terminal".into())
+            .spawn(move || {
+                let outcome = run_fixed_command(&command_id, &session_for_thread, &cancel);
+                if let Ok(mut state) = session_for_thread.state.lock() {
+                    state.cancel = None;
+                    state.touched_at = Instant::now();
+                    match outcome {
+                        Ok((exit_code, cancelled, timed_out)) => {
+                            state.exit_code = Some(exit_code);
+                            state.state = if cancelled {
+                                "cancelled"
+                            } else if timed_out {
+                                "timed_out"
+                            } else if exit_code == 0 {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                        }
+                        Err(error) => {
+                            state.state = "failed";
+                            state.error = Some(error.chars().take(240).collect());
+                        }
                     }
                 }
-            }
-            inner.active_commands.fetch_sub(1, Ordering::AcqRel);
-        });
+                inner.active_commands.fetch_sub(1, Ordering::AcqRel);
+            });
         if let Err(error) = spawn {
             self.inner.active_commands.fetch_sub(1, Ordering::AcqRel);
             if let Ok(mut state) = session.state.lock() {
@@ -198,17 +245,29 @@ impl DeviceTerminalManager {
         session_snapshot(terminal_id, &session)
     }
 
-    fn output(&self, terminal_id: &str, offset: u64, connection_generation: u64,
-              executor_generation: u64) -> Result<Value, String> {
+    fn output(
+        &self,
+        terminal_id: &str,
+        offset: u64,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
         let session = self.get(terminal_id, connection_generation, executor_generation)?;
         let mut state = session.state.lock().map_err(|_| "终端会话状态不可用。")?;
         state.touched_at = Instant::now();
         if offset < state.output_base || offset > state.output_total {
             return Err("终端输出偏移已过期或超出当前输出。".into());
         }
-        let start = usize::try_from(offset - state.output_base).map_err(|_| "终端输出偏移无效。")?;
+        let start =
+            usize::try_from(offset - state.output_base).map_err(|_| "终端输出偏移无效。")?;
         let length = (state.output.len().saturating_sub(start)).min(MAX_READ_BYTES);
-        let bytes = state.output.iter().skip(start).take(length).copied().collect::<Vec<_>>();
+        let bytes = state
+            .output
+            .iter()
+            .skip(start)
+            .take(length)
+            .copied()
+            .collect::<Vec<_>>();
         let next_offset = offset + length as u64;
         Ok(json!({
             "terminal_id": terminal_id,
@@ -224,88 +283,147 @@ impl DeviceTerminalManager {
         }))
     }
 
-    fn status(&self, terminal_id: &str, connection_generation: u64,
-              executor_generation: u64) -> Result<Value, String> {
+    fn status(
+        &self,
+        terminal_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
         let session = self.get(terminal_id, connection_generation, executor_generation)?;
         session_snapshot(terminal_id, &session)
     }
 
-    fn cancel(&self, terminal_id: &str, connection_generation: u64,
-              executor_generation: u64) -> Result<Value, String> {
+    fn cancel(
+        &self,
+        terminal_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
         let session = self.get(terminal_id, connection_generation, executor_generation)?;
         let mut state = session.state.lock().map_err(|_| "终端会话状态不可用。")?;
         state.touched_at = Instant::now();
-        if let Some(cancel) = &state.cancel { cancel.store(true, Ordering::Release); }
+        if let Some(cancel) = &state.cancel {
+            cancel.store(true, Ordering::Release);
+        }
         Ok(session_snapshot_locked(terminal_id, &state))
     }
 
-    fn close(&self, terminal_id: &str, connection_generation: u64,
-             executor_generation: u64) -> Result<Value, String> {
+    fn close(
+        &self,
+        terminal_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Value, String> {
         let session = self.get(terminal_id, connection_generation, executor_generation)?;
         {
             let mut state = session.state.lock().map_err(|_| "终端会话状态不可用。")?;
-            if let Some(cancel) = &state.cancel { cancel.store(true, Ordering::Release); }
+            if let Some(cancel) = &state.cancel {
+                cancel.store(true, Ordering::Release);
+            }
             state.state = "closed";
             state.touched_at = Instant::now();
             state.output.clear();
             state.output_base = state.output_total;
         }
-        self.inner.sessions.lock().map_err(|_| "终端会话台账不可用。")?.remove(terminal_id);
-        Ok(json!({"terminal_id":terminal_id,"state":"closed","fields":{"terminal_id":"设备终端会话编号","state":"关闭状态"}}))
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "终端会话台账不可用。")?
+            .remove(terminal_id);
+        Ok(
+            json!({"terminal_id":terminal_id,"state":"closed","fields":{"terminal_id":"设备终端会话编号","state":"关闭状态"}}),
+        )
     }
 
-    fn get(&self, terminal_id: &str, connection_generation: u64,
-           executor_generation: u64) -> Result<Arc<TerminalSession>, String> {
+    fn get(
+        &self,
+        terminal_id: &str,
+        connection_generation: u64,
+        executor_generation: u64,
+    ) -> Result<Arc<TerminalSession>, String> {
         validate_id(terminal_id)?;
-        let sessions = self.inner.sessions.lock().map_err(|_| "终端会话台账不可用。")?;
-        let session = sessions.get(terminal_id).cloned().ok_or("设备终端会话不存在、已过期或执行器已重建。")?;
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| "终端会话台账不可用。")?;
+        let session = sessions
+            .get(terminal_id)
+            .cloned()
+            .ok_or("设备终端会话不存在、已过期或执行器已重建。")?;
         validate_generation(&session, connection_generation, executor_generation)?;
         Ok(session)
     }
 
     fn expire_idle(&self) {
-        let Ok(mut sessions) = self.inner.sessions.lock() else { return };
-        let expired = sessions.iter().filter_map(|(id, session)| {
-            let state = session.state.lock().ok()?;
-            (state.state != "running" && state.touched_at.elapsed() >= SESSION_IDLE).then(|| id.clone())
-        }).collect::<Vec<_>>();
-        for id in expired { sessions.remove(&id); }
+        let Ok(mut sessions) = self.inner.sessions.lock() else {
+            return;
+        };
+        let expired = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let state = session.state.lock().ok()?;
+                (state.state != "running" && state.touched_at.elapsed() >= SESSION_IDLE)
+                    .then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in expired {
+            sessions.remove(&id);
+        }
     }
 
     /// shutdown（关闭管理器）：取消本机正在运行的受限命令。
     pub fn shutdown(&self) {
-        let Ok(sessions) = self.inner.sessions.lock() else { return };
+        let Ok(sessions) = self.inner.sessions.lock() else {
+            return;
+        };
         for session in sessions.values() {
             if let Ok(state) = session.state.lock() {
-                if let Some(cancel) = &state.cancel { cancel.store(true, Ordering::Release); }
+                if let Some(cancel) = &state.cancel {
+                    cancel.store(true, Ordering::Release);
+                }
             }
         }
     }
 }
 
 fn exact_fields(arguments: &serde_json::Map<String, Value>, fields: &[&str]) -> Result<(), String> {
-    if arguments.len() != fields.len() || arguments.keys().any(|key| !fields.contains(&key.as_str())) {
+    if arguments.len() != fields.len()
+        || arguments.keys().any(|key| !fields.contains(&key.as_str()))
+    {
         return Err("终端任务字段不符合严格参数结构。".into());
     }
     Ok(())
 }
 
 fn required_id<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str, String> {
-    let value = value.and_then(Value::as_str).ok_or_else(|| format!("{field}（编号）无效。"))?;
+    let value = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{field}（编号）无效。"))?;
     validate_id(value)?;
     Ok(value)
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 128 || !value.bytes().enumerate().all(|(index, byte)| {
-        byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
-    }) { return Err("终端编号格式无效。".into()); }
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'-'))
+        })
+    {
+        return Err("终端编号格式无效。".into());
+    }
     Ok(())
 }
 
-fn validate_generation(session: &TerminalSession, connection_generation: u64,
-                       executor_generation: u64) -> Result<(), String> {
-    if session.connection_generation != connection_generation || session.executor_generation != executor_generation {
+fn validate_generation(
+    session: &TerminalSession,
+    connection_generation: u64,
+    executor_generation: u64,
+) -> Result<(), String> {
+    if session.connection_generation != connection_generation
+        || session.executor_generation != executor_generation
+    {
         return Err("终端会话所属设备连接或执行器代次已失效。".into());
     }
     Ok(())
@@ -326,11 +444,15 @@ fn session_snapshot_locked(terminal_id: &str, state: &SessionState) -> Value {
 }
 
 fn append_output(state: &Arc<Mutex<SessionState>>, bytes: &[u8]) {
-    if bytes.is_empty() { return; }
+    if bytes.is_empty() {
+        return;
+    }
     let Ok(mut state) = state.lock() else { return };
     let accepted = bytes.len().min(MAX_OUTPUT_BYTES);
     let bytes = &bytes[..accepted];
-    for byte in bytes { state.output.push_back(*byte); }
+    for byte in bytes {
+        state.output.push_back(*byte);
+    }
     state.output_total = state.output_total.saturating_add(bytes.len() as u64);
     while state.output.len() > MAX_OUTPUT_BYTES {
         state.output.pop_front();
@@ -339,8 +461,11 @@ fn append_output(state: &Arc<Mutex<SessionState>>, bytes: &[u8]) {
 }
 
 #[cfg(windows)]
-fn run_fixed_command(command_id: &str, session: &TerminalSession, cancel: &AtomicBool)
-    -> Result<(i32, bool, bool), String> {
+fn run_fixed_command(
+    command_id: &str,
+    session: &TerminalSession,
+    cancel: &AtomicBool,
+) -> Result<(i32, bool, bool), String> {
     use std::os::windows::process::CommandExt;
     let system_root = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录。")?;
     let system32 = std::path::Path::new(&system_root).join("System32");
@@ -352,10 +477,16 @@ fn run_fixed_command(command_id: &str, session: &TerminalSession, cancel: &Atomi
         _ => return Err("终端命令配置不在只读命令清单中。".into()),
     };
     let mut command = Command::new(system32.join(program));
-    command.args(arguments).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .creation_flags(0x0800_0000);
     let job = crate::windows::Job::new().map_err(|_| "无法建立终端命令作业对象。".to_string())?;
-    let mut child = job.spawn(&mut command).map_err(|_| "无法启动固定只读终端命令。".to_string())?;
+    let mut child = job
+        .spawn(&mut command)
+        .map_err(|_| "无法启动固定只读终端命令。".to_string())?;
     let stdout = child.stdout.take().ok_or("终端命令标准输出不可用。")?;
     let stderr = child.stderr.take().ok_or("终端命令诊断输出不可用。")?;
     let stdout_state = session.state.clone();
@@ -369,17 +500,25 @@ fn run_fixed_command(command_id: &str, session: &TerminalSession, cancel: &Atomi
         if cancel.load(Ordering::Acquire) {
             cancelled = true;
             let _ = child.kill();
-            break child.wait().map_err(|_| "终端命令取消后无法回收。".to_string())?;
+            break child
+                .wait()
+                .map_err(|_| "终端命令取消后无法回收。".to_string())?;
         }
         if started.elapsed() >= COMMAND_TIMEOUT {
             timed_out = true;
             let _ = child.kill();
-            break child.wait().map_err(|_| "终端命令超时后无法回收。".to_string())?;
+            break child
+                .wait()
+                .map_err(|_| "终端命令超时后无法回收。".to_string())?;
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => { let _ = child.kill(); let _ = child.wait(); return Err("终端命令状态查询失败。".into()); }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("终端命令状态查询失败。".into());
+            }
         }
     };
     let _ = out.join();
@@ -391,14 +530,19 @@ fn run_fixed_command(command_id: &str, session: &TerminalSession, cancel: &Atomi
 fn copy_capped_output(mut stream: impl Read, state: Arc<Mutex<SessionState>>) {
     let mut buffer = [0_u8; 4096];
     while let Ok(read) = stream.read(&mut buffer) {
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         append_output(&state, &buffer[..read]);
     }
 }
 
 #[cfg(not(windows))]
-fn run_fixed_command(_command_id: &str, _session: &TerminalSession, _cancel: &AtomicBool)
-    -> Result<(i32, bool, bool), String> {
+fn run_fixed_command(
+    _command_id: &str,
+    _session: &TerminalSession,
+    _cancel: &AtomicBool,
+) -> Result<(i32, bool, bool), String> {
     Err("受限终端命令目前仅支持 Windows 设备。".into())
 }
 
@@ -409,41 +553,107 @@ mod tests {
     #[test]
     fn terminal_actions_reject_unknown_operations_and_shell_commands() {
         let manager = DeviceTerminalManager::default();
-        assert!(manager.execute("terminal.powershell", &json!({}), 1, 1).is_err());
-        let created = manager.execute("terminal.create", &json!({"terminal_id":"term-1"}), 1, 1).unwrap();
+        assert!(manager
+            .execute("terminal.powershell", &json!({}), 1, 1)
+            .is_err());
+        let created = manager
+            .execute("terminal.create", &json!({"terminal_id":"term-1"}), 1, 1)
+            .unwrap();
         assert_eq!(created["state"], "ready");
-        assert!(manager.execute("terminal.input", &json!({"terminal_id":"term-1","command_id":"powershell"}), 1, 1).is_err());
-        assert!(manager.execute("terminal.status", &json!({"terminal_id":"term-1","extra":true}), 1, 1).is_err());
+        assert!(manager
+            .execute(
+                "terminal.input",
+                &json!({"terminal_id":"term-1","command_id":"powershell"}),
+                1,
+                1
+            )
+            .is_err());
+        assert!(manager
+            .execute(
+                "terminal.status",
+                &json!({"terminal_id":"term-1","extra":true}),
+                1,
+                1
+            )
+            .is_err());
     }
 
     #[test]
     fn terminal_sessions_are_bound_to_connection_and_executor_generations() {
         let manager = DeviceTerminalManager::default();
-        manager.execute("terminal.create", &json!({"terminal_id":"term-2"}), 3, 4).unwrap();
-        assert!(manager.execute("terminal.status", &json!({"terminal_id":"term-2"}), 4, 4).is_err());
-        assert!(manager.execute("terminal.status", &json!({"terminal_id":"term-2"}), 3, 5).is_err());
+        manager
+            .execute("terminal.create", &json!({"terminal_id":"term-2"}), 3, 4)
+            .unwrap();
+        assert!(manager
+            .execute("terminal.status", &json!({"terminal_id":"term-2"}), 4, 4)
+            .is_err());
+        assert!(manager
+            .execute("terminal.status", &json!({"terminal_id":"term-2"}), 3, 5)
+            .is_err());
     }
 
     #[cfg(windows)]
     #[test]
     fn terminal_fixed_command_streams_output_and_finishes_with_status() {
         let manager = DeviceTerminalManager::default();
-        manager.execute("terminal.create", &json!({"terminal_id":"term-command"}), 1, 1).unwrap();
-        let started = manager.execute("terminal.input", &json!({"terminal_id":"term-command","command_id":"hostname"}), 1, 1).unwrap();
+        manager
+            .execute(
+                "terminal.create",
+                &json!({"terminal_id":"term-command"}),
+                1,
+                1,
+            )
+            .unwrap();
+        let started = manager
+            .execute(
+                "terminal.input",
+                &json!({"terminal_id":"term-command","command_id":"hostname"}),
+                1,
+                1,
+            )
+            .unwrap();
         assert_eq!(started["terminal_id"], "term-command");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let status = manager.execute("terminal.status", &json!({"terminal_id":"term-command"}), 1, 1).unwrap();
+            let status = manager
+                .execute(
+                    "terminal.status",
+                    &json!({"terminal_id":"term-command"}),
+                    1,
+                    1,
+                )
+                .unwrap();
             if status["state"] != "running" {
                 assert_eq!(status["state"], "completed");
                 assert_eq!(status["exit_code"], 0);
                 break;
             }
-            assert!(Instant::now() < deadline, "固定主机名命令没有在测试期限内完成");
+            assert!(
+                Instant::now() < deadline,
+                "固定主机名命令没有在测试期限内完成"
+            );
             thread::sleep(Duration::from_millis(20));
         }
-        let output = manager.execute("terminal.output", &json!({"terminal_id":"term-command","offset":0}), 1, 1).unwrap();
-        assert!(!output["output"].as_str().unwrap_or_default().trim().is_empty());
-        manager.execute("terminal.close", &json!({"terminal_id":"term-command"}), 1, 1).unwrap();
+        let output = manager
+            .execute(
+                "terminal.output",
+                &json!({"terminal_id":"term-command","offset":0}),
+                1,
+                1,
+            )
+            .unwrap();
+        assert!(!output["output"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty());
+        manager
+            .execute(
+                "terminal.close",
+                &json!({"terminal_id":"term-command"}),
+                1,
+                1,
+            )
+            .unwrap();
     }
 }

@@ -410,13 +410,19 @@ const DEVICE_KEY_REFERENCE_PREFIX: &str = "VoiceTerminal/device/"; // DEVICE_KEY
 const SSH_TRANSPORT_KEY_REFERENCE_PREFIX: &str = "VoiceTerminal/ssh-transport/"; // SSH_TRANSPORT_KEY_REFERENCE_PREFIX（SSH 登录传输密钥凭据引用前缀）。
 
 fn valid_device_key_reference(reference: &str) -> bool {
-    [DEVICE_KEY_REFERENCE_PREFIX, SSH_TRANSPORT_KEY_REFERENCE_PREFIX]
-        .iter()
-        .any(|prefix| {
-            reference.strip_prefix(prefix).is_some_and(|suffix| {
-                suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+    [
+        DEVICE_KEY_REFERENCE_PREFIX,
+        SSH_TRANSPORT_KEY_REFERENCE_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| {
+        reference.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.len() == 64
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
+    })
 }
 
 /// store_device_ssh_key（保存设备 SSH 私钥）：仅写入本机范围的 Windows 凭据库。
@@ -651,10 +657,16 @@ mod tests {
         assert!(valid_device_key_reference(
             "VoiceTerminal/ssh-transport/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         ));
-        assert!(!valid_device_key_reference("VoiceTerminal/device/../../model"));
-        assert!(!valid_device_key_reference("VoiceTerminal/model/0123456789abcdef"));
+        assert!(!valid_device_key_reference(
+            "VoiceTerminal/device/../../model"
+        ));
+        assert!(!valid_device_key_reference(
+            "VoiceTerminal/model/0123456789abcdef"
+        ));
         assert!(!valid_device_key_reference("VoiceTerminal/device/"));
-        assert!(!valid_device_key_reference("VoiceTerminal/ssh-transport/not-a-fingerprint"));
+        assert!(!valid_device_key_reference(
+            "VoiceTerminal/ssh-transport/not-a-fingerprint"
+        ));
     }
 
     #[test]
@@ -726,11 +738,9 @@ mod tests {
         let secret = load_provider_credential_with_vault(&root, "minimax", &vault).unwrap();
 
         assert_eq!(secret.as_str(), "local-test-minimax-secret");
-        assert!(
-            !fs::read_to_string(&path)
-                .unwrap()
-                .contains("local-test-minimax-secret")
-        );
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("local-test-minimax-secret"));
         assert!(load_provider_credential_with_vault(&root, "unknown", &vault).is_err());
         assert!(load_provider_credential_with_vault(&root, "deepseek", &vault).is_err());
         fs::remove_dir_all(root).unwrap();

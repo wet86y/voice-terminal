@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ReferenceAudioPlayer from './ReferenceAudioPlayer.vue'
 import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE, type VoiceDraft } from './useTtsVoiceState'
-import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, ProductTtsReference, TtsVoicePort } from './tts-voice-types'
+import type { ProductLocalTtsModelId, ProductTtsAsset, ProductTtsVoice, ProductTtsOperation, ProductTtsReference, RemoteTtsAssetAudioPort, RemoteTtsAssetImportCancelled, RemoteTtsAssetImportPort, TtsVoicePort } from './tts-voice-types'
 
 const props = withDefaults(defineProps<{
   model: ProductLocalTtsModelId
@@ -10,9 +10,29 @@ const props = withDefaults(defineProps<{
   unavailable?: boolean // unavailable（目标切换或事务进行期间暂不可操作）。
   demo?: boolean // demo（仅演示界面）。
   port?: TtsVoicePort // port（音色库业务接口）。
+  remoteMode?: boolean // remoteMode（产品注入的远程连接模式）。
+  remoteAudioScope?: string // remoteAudioScope（服务端或连接代次，变化时丢弃旧音频结果）。
+  remoteTtsAssetImport?: RemoteTtsAssetImportPort // remoteTtsAssetImport（产品注入的远程 FILE 上传端口）。
+  remoteTtsAssetAudio?: RemoteTtsAssetAudioPort // remoteTtsAssetAudio（产品注入的远程参考音频读取端口）。
   ensureSupport?: (model: ProductLocalTtsModelId) => Promise<void> // ensureSupport（试听前确保对应本地模型就绪）。
 }>(), { unavailable: false, demo: false })
 const productApi = props.port! // port（业务接口）：演示模式仅使用模拟数据。
+function importRemoteTtsAsset(model: ProductLocalTtsModelId, purpose: 'source_and_asset'):
+  Promise<RemoteTtsAssetImportCancelled | { asset: ProductTtsAsset; source: ProductTtsAsset }>
+function importRemoteTtsAsset(model: ProductLocalTtsModelId, purpose: 'asset' | 'source'):
+  Promise<RemoteTtsAssetImportCancelled | { asset: ProductTtsAsset }>
+function importRemoteTtsAsset(model: ProductLocalTtsModelId, purpose: 'asset' | 'source' | 'source_and_asset'):
+  Promise<RemoteTtsAssetImportCancelled | { asset: ProductTtsAsset; source?: ProductTtsAsset }> {
+  if (!props.remoteTtsAssetImport) return Promise.reject(new Error('远程音频导入接口尚未连接。'))
+  const importer = props.remoteTtsAssetImport as (model: ProductLocalTtsModelId, purpose: 'asset' | 'source' | 'source_and_asset') =>
+    Promise<RemoteTtsAssetImportCancelled | { asset: ProductTtsAsset; source?: ProductTtsAsset }>
+  return importer(model, purpose)
+}
+const remoteMode = computed(() => !props.demo && (props.remoteMode
+  ?? (typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.remote_mode === true))) // remoteMode（是否通过配对服务端执行业务）。
+const remoteAudioScope = computed(() => props.remoteAudioScope ?? (remoteMode.value && typeof window !== 'undefined'
+  ? `${window.__VOICE_APPLICATION__?.host_id ?? ''}:${window.__VOICE_APPLICATION__?.endpoint_revision ?? ''}:${window.__VOICE_APPLICATION__?.management_connected === true}`
+  : 'local')) // remoteAudioScope（远程目标和管理连接代次标识）。
 const emit = defineEmits<{ changed: []; modelImport: [] }>()
 const state = useTtsVoiceState()
 function ensureModelBucket(model: ProductLocalTtsModelId) {
@@ -25,6 +45,10 @@ let disposed = false
 const activeReferenceKey = ref('') // activeReferenceKey（当前播放附件所属草稿）。
 const transcribingKey = ref('') // transcribingKey（正在识别的草稿）。
 const localAudioUrls = ref<Record<string, string>>({}) // localAudioUrls（演示附件的临时播放地址）。
+const remoteAudioUrls = ref<Record<string, string>>({}) // remoteAudioUrls（已校验远程音频的临时 Blob URL）。
+const remoteAudioLoading = ref<Record<string, boolean>>({}) // remoteAudioLoading（按模型和资产编号去重的读取状态）。
+const remoteAudioRequests = new Map<string, Promise<void>>() // remoteAudioRequests（同一连接代次的并发读取请求）。
+let remoteAudioGeneration = 0 // remoteAudioGeneration（连接或组件资源变化代次）。
 const clipStarts = ref<Record<string, number>>({}) // 参考片段起点，单位秒。
 const clipEnds = ref<Record<string, number>>({}) // 参考片段终点，单位秒。
 const expandedExpressions = ref<Record<string, boolean>>({}) // expandedExpressions（逐条情绪参考的展开状态）。
@@ -33,10 +57,17 @@ function releaseLocalAudio(draft: VoiceDraft) {
   const assetId = draft.source?.asset_id
   if (assetId && localAudioUrls.value[assetId]) { URL.revokeObjectURL(localAudioUrls.value[assetId]); delete localAudioUrls.value[assetId] }
 }
-onBeforeUnmount(() => { disposed = true; for (const url of Object.values(localAudioUrls.value)) URL.revokeObjectURL(url) })
+onBeforeUnmount(() => {
+  disposed = true
+  for (const url of Object.values(localAudioUrls.value)) URL.revokeObjectURL(url)
+  clearRemoteAudioCache()
+})
 function referenceUrl(draft: VoiceDraft) {
   if (!draft.source) return undefined
-  return props.demo ? localAudioUrls.value[draft.source.asset_id] : productApi.ttsAssetAudioUrl(props.model, draft.source.asset_id)
+  if (props.demo) return localAudioUrls.value[draft.source.asset_id]
+  if (remoteMode.value) return remoteAudioUrls.value[remoteAudioKey(draft.source.asset_id)]
+  try { return productApi.ttsAssetAudioUrl(props.model, draft.source.asset_id) }
+  catch { return undefined }
 }
 async function edit(draft: VoiceDraft) {
   draft.expanded = !draft.expanded
@@ -50,6 +81,123 @@ watch(() => [props.model, props.steps] as const, ([model, steps]) => { state.inf
 const bucket = computed(() => state.models[props.model])
 const drafts = computed(() => Object.values(bucket.value.drafts))
 const globalBusy = computed(() => Object.values(state.models).some(model => Object.values(model.drafts).some(draft => draft.busy)))
+function remoteAudioKey(assetId: string, model = props.model) { return JSON.stringify([model, assetId]) }
+function remoteAudioIsLoading(assetId: string) { return remoteAudioLoading.value[remoteAudioKey(assetId)] === true }
+const activeRemoteAudioKeys = computed(() => {
+  const keys = new Set<string>()
+  if (!remoteMode.value) return keys
+  for (const draft of drafts.value) {
+    if (draft.source?.asset_id) keys.add(remoteAudioKey(draft.source.asset_id))
+    for (const item of draft.references) {
+      const assetId = item.asset_id || item.source_asset_id
+      if (assetId) keys.add(remoteAudioKey(assetId))
+    }
+  }
+  return keys
+})
+function clearRemoteAudioCache() {
+  remoteAudioGeneration += 1
+  for (const url of Object.values(remoteAudioUrls.value)) URL.revokeObjectURL(url)
+  remoteAudioUrls.value = {}
+  remoteAudioLoading.value = {}
+  remoteAudioRequests.clear()
+}
+watch(remoteAudioScope, (value, previous) => {
+  if (value !== previous) clearRemoteAudioCache()
+}, { flush: 'sync' })
+watch(activeRemoteAudioKeys, keys => {
+  const next = { ...remoteAudioUrls.value }
+  let changed = false
+  for (const [key, url] of Object.entries(next)) {
+    if (keys.has(key)) continue
+    URL.revokeObjectURL(url)
+    delete next[key]
+    changed = true
+  }
+  if (changed) remoteAudioUrls.value = next
+  const loading = { ...remoteAudioLoading.value }
+  for (const key of Object.keys(loading)) if (!keys.has(key)) delete loading[key]
+  remoteAudioLoading.value = loading
+}, { flush: 'sync' })
+
+const REMOTE_AUDIO_MAX_BYTES = 1024 * 1024 // REMOTE_AUDIO_MAX_BYTES（远程参考音频最大字节数）。
+const REMOTE_AUDIO_MEDIA_TYPES = new Set(['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/ogg'])
+function decodeRemoteAudioBase64(value: string): Uint8Array {
+  if (value.length === 0 || value.length > Math.ceil(REMOTE_AUDIO_MAX_BYTES / 3) * 4
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error('服务端返回的音频编码无效。')
+  }
+  let binary: string
+  try { binary = atob(value) } catch { throw new Error('服务端返回的音频编码无效。') }
+  if (binary.length === 0 || binary.length > REMOTE_AUDIO_MAX_BYTES) throw new Error('服务端参考音频超出 1 MiB 限制。')
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+async function createRemoteAudioUrl(value: Awaited<ReturnType<RemoteTtsAssetAudioPort>>): Promise<string> {
+  if (!REMOTE_AUDIO_MEDIA_TYPES.has(value.media_type) || !Number.isSafeInteger(value.bytes)
+    || value.bytes < 1 || value.bytes > REMOTE_AUDIO_MAX_BYTES || !/^[0-9a-f]{64}$/.test(value.sha256)
+    || !value.fields || Object.values(value.fields).some(field => typeof field !== 'string')) {
+    throw new Error('远程音频回执字段无效。')
+  }
+  const bytes = decodeRemoteAudioBase64(value.data_base64)
+  if (bytes.byteLength !== value.bytes) throw new Error('远程音频字节数与回执不匹配。')
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) throw new Error('当前桌面运行时无法校验远程音频摘要。')
+  const buffer = new Uint8Array(bytes.byteLength)
+  buffer.set(bytes)
+  const digest = await subtle.digest('SHA-256', buffer.buffer)
+  const sha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+  if (sha256 !== value.sha256) throw new Error('远程音频 SHA-256 摘要不匹配。')
+  return URL.createObjectURL(new Blob([buffer.buffer], { type: value.media_type }))
+}
+async function loadRemoteAudio(assetId: string) {
+  if (!remoteMode.value || !props.remoteTtsAssetAudio) throw new Error('远程音频读取接口尚未连接。')
+  const key = remoteAudioKey(assetId)
+  if (!activeRemoteAudioKeys.value.has(key)) return
+  if (remoteAudioUrls.value[key]) return
+  const scope = remoteAudioScope.value
+  const requestKey = `${scope}\u0000${key}`
+  const existing = remoteAudioRequests.get(requestKey)
+  if (existing) return existing
+  const generation = remoteAudioGeneration
+  remoteAudioLoading.value = { ...remoteAudioLoading.value, [key]: true }
+  let request!: Promise<void>
+  request = Promise.resolve()
+    .then(() => props.remoteTtsAssetAudio!(props.model, assetId))
+    .then(createRemoteAudioUrl)
+    .then(url => {
+      if (disposed || generation !== remoteAudioGeneration || scope !== remoteAudioScope.value
+        || !activeRemoteAudioKeys.value.has(key)) {
+        URL.revokeObjectURL(url)
+        return
+      }
+      remoteAudioUrls.value = { ...remoteAudioUrls.value, [key]: url }
+    })
+    .finally(() => {
+      if (generation !== remoteAudioGeneration) return
+      if (remoteAudioRequests.get(requestKey) === request) remoteAudioRequests.delete(requestKey)
+      const loading = { ...remoteAudioLoading.value }
+      delete loading[key]
+      remoteAudioLoading.value = loading
+    })
+  remoteAudioRequests.set(requestKey, request)
+  return request
+}
+function playReferenceAudio(draft: VoiceDraft) {
+  activeReferenceKey.value = draft.key
+  const assetId = draft.source?.asset_id
+  if (remoteMode.value && assetId) void loadRemoteAudio(assetId).catch(failure => {
+    if (!disposed) draft.error = failure instanceof Error ? failure.message : '无法读取服务端参考音频。'
+  })
+}
+function playExpressionAudio(draft: VoiceDraft, item: ProductTtsReference, area: 'summary' | 'detail') {
+  activeReferenceKey.value = expressionAudioKey(draft, item, area)
+  const assetId = item.asset_id || item.source_asset_id
+  if (remoteMode.value && assetId) void loadRemoteAudio(assetId).catch(failure => {
+    if (!disposed) draft.error = failure instanceof Error ? failure.message : '无法读取服务端参考音频。'
+  })
+}
 function signature(draft: VoiceDraft, model = props.model) {
   return JSON.stringify([model, draft.description.trim(), draft.source?.asset_id, draft.transcript, draft.referenceLanguage, draft.text, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE])
 }
@@ -97,6 +245,7 @@ function inheritReferenceLanguage(draft: VoiceDraft) {
   invalidate(draft)
 }
 async function uploadExpression(draft: VoiceDraft, item: ProductTtsReference, event: Event) {
+  if (remoteMode.value) return
   const input = event.target as HTMLInputElement; const file = input.files?.[0]; input.value = ''
   if (!file) return
   await run(draft, async () => {
@@ -116,6 +265,18 @@ async function uploadExpression(draft: VoiceDraft, item: ProductTtsReference, ev
   })
   if (item.asset_id) await transcribeExpression(draft, item)
 }
+async function chooseRemoteExpression(draft: VoiceDraft, item: ProductTtsReference) {
+  if (!remoteMode.value) return
+  await run(draft, async () => {
+    const imported = await importRemoteTtsAsset(props.model, 'source_and_asset')
+    if ('cancelled' in imported) return
+    item.source_asset_id = imported.source.asset_id
+    item.asset_id = imported.asset.asset_id
+    item.reference_text = ''; item.error = ''
+    expressionChanged(item)
+  })
+  if (item.asset_id) await transcribeExpression(draft, item)
+}
 async function transcribeExpression(draft: VoiceDraft, item: ProductTtsReference) {
   const asset = item.asset_id; if (!asset) return
   transcribingKey.value = item.id
@@ -131,7 +292,11 @@ async function transcribeExpression(draft: VoiceDraft, item: ProductTtsReference
 }
 function expressionUrl(item: ProductTtsReference) {
   const asset = item.asset_id || item.source_asset_id
-  return asset ? (props.demo ? localAudioUrls.value[asset] : productApi.ttsAssetAudioUrl(props.model, asset)) : undefined
+  if (!asset) return undefined
+  if (props.demo) return localAudioUrls.value[asset]
+  if (remoteMode.value) return remoteAudioUrls.value[remoteAudioKey(asset)]
+  try { return productApi.ttsAssetAudioUrl(props.model, asset) }
+  catch { return undefined }
 }
 /** expressionKey（区分不同音色卡片中情绪参考的界面状态键）。 */
 function expressionKey(draft: VoiceDraft, item: ProductTtsReference) { return `${draft.key}:${item.id}` }
@@ -247,6 +412,7 @@ async function transcribe(draft: VoiceDraft) {
   } finally { transcribingKey.value = '' }
 }
 async function upload(draft: VoiceDraft, files: FileList | File[]) {
+  if (remoteMode.value) return
   if (files.length !== 1) { draft.error = '请一次选择一条参考音频。'; return }
   const model = props.model; const file = files[0]
   invalidate(draft); const generation = draft.generation; draft.busy = true; draft.error = ''
@@ -261,7 +427,26 @@ async function upload(draft: VoiceDraft, files: FileList | File[]) {
   if (draft.generation === generation && draft.source?.filename === file.name) await transcribe(draft)
 }
 function fileChange(draft: VoiceDraft, event: Event) { const input = event.target as HTMLInputElement; if (input.files?.length) void upload(draft, input.files); input.value = '' }
-function drop(draft: VoiceDraft, event: DragEvent) { if (!globalBusy.value && event.dataTransfer?.files.length) void upload(draft, event.dataTransfer.files) }
+function drop(draft: VoiceDraft, event: DragEvent) { if (!remoteMode.value && !globalBusy.value && event.dataTransfer?.files.length) void upload(draft, event.dataTransfer.files) }
+async function chooseRemoteReference(draft: VoiceDraft) {
+  if (!remoteMode.value) return
+  let generation: number | undefined
+  let imported = false
+  await run(draft, async actionGeneration => {
+    const result = await importRemoteTtsAsset(props.model, 'asset')
+    if ('cancelled' in result) return
+    const asset = result.asset
+    if (draft.generation !== actionGeneration) return
+    invalidate(draft)
+    generation = draft.generation
+    releaseLocalAudio(draft)
+    draft.source = { ...asset, filename: '参考音频' }
+    draft.transcript = ''
+    draft.name ||= '参考音频'
+    imported = true
+  })
+  if (imported && generation !== undefined && draft.generation === generation) await transcribe(draft)
+}
 async function preview(draft: VoiceDraft, expression?: ProductTtsReference) {
   const model = props.model; const prepared = signature(draft, model)
   await run(draft, async generation => {
@@ -403,14 +588,18 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
             </div>
             <div class="voice-reference">
               <div v-if="draft.source" class="reference-input">
-                <ReferenceAudioPlayer :key="`${model}:${draft.source.asset_id}`" :src="referenceUrl(draft)" :filename="draft.source.filename" :duration-ms="draft.source.duration_ms" :busy="globalBusy" :transcribing="transcribingKey === draft.key" :active="activeReferenceKey === draft.key" :removable="false" :transcribable="false" @play="activeReferenceKey = draft.key" @error="draft.error = $event" />
+                <ReferenceAudioPlayer :key="`${model}:${draft.source.asset_id}`" :src="referenceUrl(draft)" :filename="draft.source.filename" :duration-ms="draft.source.duration_ms" :busy="globalBusy" :transcribing="transcribingKey === draft.key" :active="activeReferenceKey === draft.key" :loadable="remoteMode" :loading="remoteAudioIsLoading(draft.source.asset_id)" :removable="false" :transcribable="false" @play="playReferenceAudio(draft)" @error="draft.error = $event" />
               </div>
               <div v-else-if="stored(draft)?.default_reference_registered !== true" class="reference-input" @dragover.prevent @drop.prevent="drop(draft, $event)">
-                <label class="attachment-upload" :class="{ disabled: globalBusy }">
+                <label v-if="!remoteMode" class="attachment-upload" :class="{ disabled: globalBusy }">
                   <input type="file" aria-label="添加参考音频" accept=".wav,.mp3,.flac,.ogg" :disabled="globalBusy" @change="fileChange(draft, $event)">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5" /></svg>
                   <span class="upload-caption"><strong>添加参考音频</strong><small>点击选择或拖入文件</small></span>
                 </label>
+                <button v-else type="button" class="attachment-upload" :class="{ disabled: globalBusy }" :disabled="globalBusy" @click="chooseRemoteReference(draft)">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5" /></svg>
+                  <span class="upload-caption"><strong>添加参考音频</strong><small>从客户端选择并安全上传</small></span>
+                </button>
               </div>
               <p v-else class="instruction-hint" role="status">模型默认参考音频暂不可用，请在下方选择另一条已就绪参考音频。</p>
               <small class="reference-hint">支持 3–10 秒清晰单声道参考录音，保留原采样率，最大 20 MiB（二进制兆字节）。</small>
@@ -434,7 +623,7 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
                 <span>{{ item.name || '参考音频' }}</span>
               </button>
               <span class="expression-readiness" :class="{ ready: item.status === 'ready' }" role="status"><i aria-hidden="true"></i>{{ item.status === 'ready' ? '已就绪' : '待完善' }}</span>
-              <ReferenceAudioPlayer :compact="true" :src="expressionUrl(item)" :filename="item.name + '.wav'" :duration-ms="0" :busy="globalBusy" :transcribing="transcribingKey === item.id" :active="activeReferenceKey === expressionAudioKey(draft, item, 'summary')" @play="activeReferenceKey = expressionAudioKey(draft, item, 'summary')" @error="draft.error = $event" />
+              <ReferenceAudioPlayer :compact="true" :src="expressionUrl(item)" :filename="item.name + '.wav'" :duration-ms="0" :busy="globalBusy" :transcribing="transcribingKey === item.id" :active="activeReferenceKey === expressionAudioKey(draft, item, 'summary')" :loadable="remoteMode && Boolean(item.asset_id || item.source_asset_id)" :loading="remoteAudioIsLoading(item.asset_id || item.source_asset_id || '')" @play="playExpressionAudio(draft, item, 'summary')" @error="draft.error = $event" />
               <label class="voice-toggle expression-default-toggle">
                 <input type="checkbox" role="switch" :aria-checked="isDefaultReference(draft, item)" :aria-label="isDefaultReference(draft, item) ? `取消${item.name || '参考音频'}的默认参考` : `将${item.name || '参考音频'}设为默认参考`" :checked="isDefaultReference(draft, item)" :disabled="globalBusy || (!isDefaultReference(draft, item) && !defaultSelectable(draft, item))" @change="setDefaultReference(draft, ($event.target as HTMLInputElement).checked ? item : null)"><span aria-hidden="true"></span>
               </label>
@@ -450,8 +639,9 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
                 <label class="form-field"><span>参考强度 · {{ item.intensity }}</span><input v-model.number="item.intensity" type="range" min="0" max="1" step="0.1"></label>
                 <label class="form-field"><span>参考录音转写</span><textarea v-model="item.reference_text" class="compact-textarea" rows="1" @input="item.verification_source = 'manual'; expressionChanged(item)"></textarea></label>
               </div>
-              <ReferenceAudioPlayer v-if="item.asset_id || item.source_asset_id" :src="expressionUrl(item)" :filename="item.name + '.wav'" :duration-ms="0" :busy="globalBusy" :transcribing="transcribingKey === item.id" :active="activeReferenceKey === expressionAudioKey(draft, item, 'detail')" @play="activeReferenceKey = expressionAudioKey(draft, item, 'detail')" @transcribe="transcribeExpression(draft, item)" @remove="item.asset_id = null; item.source_asset_id = null; expressionChanged(item)" @error="draft.error = $event" />
-              <label v-if="!item.asset_id && !item.source_asset_id" class="form-field"><span>添加参考录音（3–10 秒）</span><input type="file" accept=".wav,.mp3,.flac,.ogg" :disabled="globalBusy" @change="uploadExpression(draft, item, $event)"></label>
+              <ReferenceAudioPlayer v-if="item.asset_id || item.source_asset_id" :src="expressionUrl(item)" :filename="item.name + '.wav'" :duration-ms="0" :busy="globalBusy" :transcribing="transcribingKey === item.id" :active="activeReferenceKey === expressionAudioKey(draft, item, 'detail')" :loadable="remoteMode" :loading="remoteAudioIsLoading(item.asset_id || item.source_asset_id || '')" @play="playExpressionAudio(draft, item, 'detail')" @transcribe="transcribeExpression(draft, item)" @remove="item.asset_id = null; item.source_asset_id = null; expressionChanged(item)" @error="draft.error = $event" />
+              <label v-if="!remoteMode && !item.asset_id && !item.source_asset_id" class="form-field"><span>添加参考录音（3–10 秒）</span><input type="file" accept=".wav,.mp3,.flac,.ogg" :disabled="globalBusy" @change="uploadExpression(draft, item, $event)"></label>
+              <button v-else-if="remoteMode && !item.asset_id && !item.source_asset_id" type="button" :disabled="globalBusy" @click="chooseRemoteExpression(draft, item)">从客户端导入参考录音（保留可裁剪原件）</button>
               <div v-if="item.source_asset_id" class="expression-clip"><label>起点（秒）<input v-model.number="clipStarts[item.id]" type="number" min="0" step="0.1" placeholder="0"></label><label>终点（秒）<input v-model.number="clipEnds[item.id]" type="number" min="0" step="0.1" placeholder="5"></label><button type="button" :disabled="globalBusy" @click="clipExpression(draft, item)">裁剪参考</button></div>
               <p v-if="item.error" class="instruction-hint">{{ item.error }}</p>
               <button type="button" class="danger-action" :disabled="globalBusy || isDefaultReference(draft, item)" @click="draft.references.splice(index, 1)">删除参考音频</button>

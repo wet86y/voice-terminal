@@ -56,7 +56,7 @@ def test_media_wire_opus_packet_uses_bounded_binary_payload_and_codec_tag() -> N
 
 def test_media_handshake_negotiates_uplink_codec_and_encoder_pre_skip() -> None:
     websocket = SimpleNamespace(scope={"query_string": (
-        b"protocol_version=1&stream_id=opus-stream&connection_generation=1&executor_generation=1"
+        b"protocol_version=2&stream_id=opus-stream&connection_generation=1&executor_generation=1"
         b"&interaction_generation=1&uplink_codec=opus&downlink_codec=pcm&encoder_pre_skip_samples=104"
         b"&downlink_encoder_pre_skip_samples=0"
     )})
@@ -69,13 +69,13 @@ def test_media_handshake_negotiates_uplink_codec_and_encoder_pre_skip() -> None:
 
 def test_media_handshake_defaults_legacy_clients_to_pcm_and_negotiates_opus_output() -> None:
     legacy = SimpleNamespace(scope={"query_string": (
-        b"protocol_version=1&stream_id=pcm-stream&connection_generation=1&executor_generation=1"
+        b"protocol_version=2&stream_id=pcm-stream&connection_generation=1&executor_generation=1"
         b"&interaction_generation=1"
     )})
     assert "uplink_codec" not in _device_media_open_payload(legacy)
 
     opus_downlink = SimpleNamespace(scope={"query_string": (
-        b"protocol_version=1&stream_id=opus-stream&connection_generation=1&executor_generation=1"
+        b"protocol_version=2&stream_id=opus-stream&connection_generation=1&executor_generation=1"
         b"&interaction_generation=1&uplink_codec=opus&downlink_codec=opus&encoder_pre_skip_samples=104"
         b"&downlink_encoder_pre_skip_samples=312"
     )})
@@ -87,7 +87,7 @@ def test_media_handshake_defaults_legacy_clients_to_pcm_and_negotiates_opus_outp
 
 
 def test_media_handshake_rejects_partial_or_inconsistent_codec_options() -> None:
-    base = b"protocol_version=1&stream_id=opus-stream&connection_generation=1&executor_generation=1&interaction_generation=1"
+    base = b"protocol_version=2&stream_id=opus-stream&connection_generation=1&executor_generation=1&interaction_generation=1"
     for extension in (
         b"&uplink_codec=opus&downlink_codec=pcm",
         b"&uplink_codec=opus&downlink_codec=pcm&encoder_pre_skip_samples=0",

@@ -85,7 +85,7 @@ def parse_ed25519_public_key(value: str) -> tuple[bytes, str]:
 class DeviceTrustStore:
     """DeviceTrustStore（设备信任存储）：原子登记设备公钥并支持撤销。"""
 
-    def __init__(self, runtime_data_dir: Path) -> None:
+    def __init__(self, runtime_data_dir: Path, *, read_only: bool = False) -> None:
         self._root = Path(runtime_data_dir).absolute()
         self._state_dir = self._root / "state"
         self._path = self._state_dir / "device-trust.json"
@@ -94,7 +94,41 @@ class DeviceTrustStore:
         self._state = "missing"
         self._error: str | None = None
         self._disk_digest: bytes | None = None
+        self._read_only = read_only
         self._load()
+
+    @property
+    def read_only(self) -> bool:
+        """read_only（只读视图）：正式产品由桌面原生层唯一写入。"""
+        return self._read_only
+
+    def _refresh_native_view(self) -> None:
+        """refresh_native_view（刷新原生信任视图）：磁盘变化后重新严格解析，不写回。"""
+        try:
+            self._ensure_safe_parent(create=False)
+            if not self._path.exists():
+                if self._disk_digest is not None:
+                    self._records = []
+                    self._disk_digest = None
+                    self._state = "invalid"
+                    self._error = "设备信任登记在外部被移除，拒绝继续授权。"
+                return
+            raw = self._path.read_bytes()
+            if len(raw) > _MAX_STORE_BYTES:
+                raise DeviceTrustError("设备信任登记超过大小限制。")
+            digest = hashlib.sha256(raw).digest()
+            if self._disk_digest is not None and hmac.compare_digest(self._disk_digest, digest):
+                return
+            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_fields)
+            self._records = self._parse_document(parsed)
+            self._disk_digest = digest
+            self._state = "valid"
+            self._error = None
+        except (OSError, UnicodeError, json.JSONDecodeError, DeviceTrustError, ValueError, TypeError) as exc:
+            self._records = []
+            self._disk_digest = None
+            self._state = "invalid"
+            self._error = str(exc)[:240] or "设备信任登记无法重新读取。"
 
     @property
     def state(self) -> str:
@@ -107,6 +141,8 @@ class DeviceTrustStore:
     def snapshot(self) -> dict[str, Any]:
         """snapshot（快照）：返回不含私钥、签名或凭据的管理视图。"""
         with self._lock:
+            if self._read_only:
+                self._refresh_native_view()
             return {
                 "schema_version": _SCHEMA_VERSION,
                 "state": self._state,
@@ -126,6 +162,8 @@ class DeviceTrustStore:
     def trusted_key(self, device_id: str) -> bytes | None:
         """trusted_key（查询受信公钥）：撤销设备始终返回空值。"""
         with self._lock:
+            if self._read_only:
+                self._refresh_native_view()
             for item in self._records:
                 if item.device_id == device_id and item.state == "trusted":
                     return item.public_key
@@ -162,6 +200,8 @@ class DeviceTrustStore:
         raw_key, fingerprint = parse_ed25519_public_key(public_key)
         timestamp = self._timestamp(trusted_at_ms)
         with self._lock:
+            if self._read_only:
+                raise DeviceTrustError("设备信任登记由桌面原生层唯一写入。")
             if self._state == "invalid":
                 raise DeviceTrustError("信任登记无效，已保留原文件并拒绝写入。")
             self._check_disk_unchanged()
@@ -192,6 +232,8 @@ class DeviceTrustStore:
         self._validate_device_id(device_id)
         timestamp = self._timestamp(revoked_at_ms)
         with self._lock:
+            if self._read_only:
+                raise DeviceTrustError("设备信任登记由桌面原生层唯一写入。")
             if self._state == "invalid":
                 raise DeviceTrustError("信任登记无效，已保留原文件并拒绝写入。")
             self._check_disk_unchanged()
@@ -382,7 +424,7 @@ def pairing_proof_message(device_id: str, fingerprint: str, pairing_code: str, c
     """构造设备签名内容，绑定编号、指纹、当次配对码与客户端随机数。"""
     DeviceTrustStore._validate_device_id(device_id)
     if (not isinstance(fingerprint, str) or not fingerprint.startswith("SHA256:")
-            or not isinstance(pairing_code, str) or not re.fullmatch(r"[0-9]{8}", pairing_code)
+            or not isinstance(pairing_code, str) or not re.fullmatch(r"[0-9]{6}", pairing_code)
             or not isinstance(client_nonce, bytes) or not 16 <= len(client_nonce) <= 64):
         raise DeviceTrustError("配对证明字段无效。")
     fields = (device_id.encode("ascii"), fingerprint.encode("ascii"), pairing_code.encode("ascii"), client_nonce)
@@ -410,10 +452,12 @@ class DevicePairingManager:
 
     def open_window(self, *, ttl_seconds: int = 120, now_ms: int | None = None) -> tuple[str, int]:
         """open_window（开启配对窗口）：返回一次性显示码，仅在此对象内保存其摘要。"""
+        if self._trust_store.read_only:
+            raise DeviceTrustError("配对窗口由桌面原生层管理，后端不接收或生成配对码。")
         if type(ttl_seconds) is not int or not self.PAIRING_TTL_MIN_SECONDS <= ttl_seconds <= self.PAIRING_TTL_MAX_SECONDS:
             raise DeviceTrustError("配对窗口时长必须为 30 至 600 秒。")
         now = self._now(now_ms)
-        code = f"{secrets.randbelow(100_000_000):08d}"
+        code = f"{secrets.randbelow(1_000_000):06d}"
         expires = now + ttl_seconds * 1000
         with self._lock:
             # 打开新窗口会撤销旧码及其未处理请求，避免旧界面继续批准过期挑战。
@@ -448,7 +492,7 @@ class DevicePairingManager:
             raise DeviceTrustError("客户端随机数长度无效。")
         if not isinstance(signature, bytes) or len(signature) != 64:
             raise DeviceTrustError("设备配对签名长度无效。")
-        if not isinstance(pairing_code, str) or not re.fullmatch(r"[0-9]{8}", pairing_code):
+        if not isinstance(pairing_code, str) or not re.fullmatch(r"[0-9]{6}", pairing_code):
             raise DeviceTrustError("配对请求未获授权或配对窗口已关闭。")
         proof = pairing_proof_message(device_id, fingerprint, pairing_code, client_nonce)
         try:
@@ -571,7 +615,7 @@ class DevicePairingManager:
 _DEVICE_REQUEST_PATHS = frozenset({
     "/v1/status", "/v1/devices", "/v1/session/open", "/v1/session/poll",
     "/v1/session/complete", "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
-    "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/media",
+    "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer", "/v1/media",
 })
 _CORE_SESSION_ID = re.compile(r"^[a-f0-9]{32}$")
 _CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")

@@ -5,6 +5,8 @@ import TtsVoiceLibrary from '../../interface/TtsVoiceLibrary.vue'
 import TtsSynthesisPreferences from '../../interface/TtsSynthesisPreferences.vue'
 import OnlineTtsVoiceSettings from '../../interface/OnlineTtsVoiceSettings.vue'
 import { productApi } from '../api'
+import { nativeDeviceApi } from '../native-device-api'
+import { useApplicationHost } from '../application-host'
 import { desktopPort } from '../desktop-port'
 import { useProductContext } from '../product-context'
 import { isRecord } from '../../record'
@@ -14,6 +16,15 @@ import { useLocalTtsStatus } from '../useLocalTtsStatus'
 const props = withDefaults(defineProps<{ demo?: boolean }>(), { demo: false })
 const emit = defineEmits<{ 'open-aniflive-components': [] }>()
 const context = props.demo ? undefined : useProductContext()
+const applicationHost = props.demo ? undefined : useApplicationHost()
+const remoteMode = computed(() => !props.demo && applicationHost?.snapshot.value?.remote_mode === true)
+const remoteAudioScope = computed(() => {
+  const snapshot = applicationHost?.snapshot.value
+  return snapshot?.remote_mode
+    ? JSON.stringify([snapshot.host_id ?? '', snapshot.endpoint_revision ?? 0,
+      snapshot.management_connected === true, snapshot.remote_business_ready === true])
+    : 'local'
+})
 const desktop = desktopPort()
 const settings = context?.settings ?? reactive({ tts: { backend: 'minimax', local_model: 'minimax-female-shaonv-zh' } as ProductTtsSettings })
 type Choice = 'minimax' | ProductLocalTtsModelId // Choice（播放目标）。
@@ -206,7 +217,7 @@ async function openOfficialVoiceLibrary() {
       <label v-if="status?.models.length" class="form-field"><span>本地模型</span><select v-model="selected" :disabled="unavailable" @change="localDraft = selected"><option v-for="model in status.models" :key="model.id" :value="model.id" :disabled="!model.available">{{ model.name }}{{ model.available ? '' : '（未就绪）' }}</option></select></label>
       <div v-else class="tts-model-link"><p class="instruction-hint">暂无已登记的本地模型，请先导入。</p><button class="outline-button" type="button" :disabled="demo" @click="emit('open-aniflive-components')">模型导入</button></div>
     </div>
-    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :model="selected" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" @model-import="emit('open-aniflive-components')" />
+    <TtsVoiceLibrary v-if="selected !== 'minimax' && selectedReady" :port="productApi" :remote-mode="remoteMode" :remote-audio-scope="remoteAudioScope" :remote-tts-asset-import="nativeDeviceApi.remoteTtsAssetImport" :remote-tts-asset-audio="nativeDeviceApi.remoteTtsAssetAudio" :model="selected" :unavailable="unavailable" :ensure-support="ensureTargetSupport" :demo="demo" @changed="refreshStatus" @model-import="emit('open-aniflive-components')" />
     <section v-if="selected !== 'minimax'" class="aniflive-options" aria-label="AnifLive 音色选项">
       <label class="switch-row"><div><strong>高性能</strong><span title="开启后暂停并取消事件预热，下一回答生效。">暂停事件预热</span></div><input type="checkbox" role="switch" aria-label="显卡高性能" :checked="options.gpu_max_performance" :disabled="savingQuality" @change="saveOption('gpu_max_performance', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>
       <label class="switch-row"><div><strong>分块优化</strong><span title="开启使用 48 个语义标记，关闭使用 96 个，下一回答生效。">优化后续音频分块</span></div><input type="checkbox" role="switch" aria-label="分块优化" :checked="options.aniflive_chunk_optimization" :disabled="savingQuality" @change="saveOption('aniflive_chunk_optimization', ($event.target as HTMLInputElement).checked)"><i aria-hidden="true"></i></label>

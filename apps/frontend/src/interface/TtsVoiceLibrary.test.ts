@@ -1,21 +1,77 @@
 // @vitest-environment jsdom
-import { defineComponent, h } from 'vue'
+import { defineComponent, h, ref, type Ref } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import TtsVoiceLibrary from './TtsVoiceLibrary.vue'
 import { provideTtsVoiceState, type TtsVoiceState } from './useTtsVoiceState'
-import type { TtsVoicePort, ProductLocalTtsModelId, ProductTtsOperation, ProductTtsVoice } from './tts-voice-types'
+import type { TtsVoicePort, ProductLocalTtsModelId, ProductTtsOperation, ProductTtsVoice, RemoteTtsAssetAudio, RemoteTtsAssetAudioPort, RemoteTtsAssetImportPort } from './tts-voice-types'
+import { nativeDeviceApi } from '../product/native-device-api'
 
-beforeEach(() => { vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {}) })
-afterEach(() => vi.restoreAllMocks())
+const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
 
-function harness(port?: TtsVoicePort) {
+beforeEach(() => {
+  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+  vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
+})
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+  if (originalCreateObjectURL) Object.defineProperty(URL, 'createObjectURL', originalCreateObjectURL)
+  else Reflect.deleteProperty(URL, 'createObjectURL')
+  if (originalRevokeObjectURL) Object.defineProperty(URL, 'revokeObjectURL', originalRevokeObjectURL)
+  else Reflect.deleteProperty(URL, 'revokeObjectURL')
+  Reflect.deleteProperty(window, '__VOICE_APPLICATION__')
+})
+
+const AUDIO_SHA256 = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+
+function installRemoteAudioRuntime() {
+  const created: string[] = []
+  const revoked: string[] = []
+  const toBytes = (hex: string) => new Uint8Array(hex.match(/.{2}/g)!.map(value => Number.parseInt(value, 16)))
+  const digest = vi.fn().mockResolvedValue(toBytes(AUDIO_SHA256).buffer)
+  const originalCrypto = globalThis.crypto
+  vi.stubGlobal('crypto', {
+    subtle: { digest },
+    randomUUID: () => originalCrypto.randomUUID?.() ?? 'test-random-id',
+  })
+  const createObjectURL = vi.fn((_blob: Blob) => {
+    const url = `blob:remote-${created.length + 1}`
+    created.push(url)
+    return url
+  })
+  const revokeObjectURL = vi.fn((url: string) => { revoked.push(url) })
+  Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+  Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL })
+  return { created, revoked, createObjectURL, revokeObjectURL, digest }
+}
+
+function remoteAudioResponse(overrides: Partial<RemoteTtsAssetAudio> = {}): RemoteTtsAssetAudio {
+  return { data_base64: 'YWJj', media_type: 'audio/wav', bytes: 3, sha256: AUDIO_SHA256,
+    fields: { asset_id: '服务端资产编号', bytes: '音频字节数' }, ...overrides }
+}
+
+function remoteVoice(assetId = 'shared-asset'): ProductTtsVoice {
+  return {
+    id: 'remote-voice', revision: 1, name: '远程音色', source: 'legacy', model: 'aniflive',
+    is_default: false, enabled: false, reference_asset_id: assetId, reference_text: '基础参考转写',
+    source_reference_asset_id: assetId, source_reference_text: '基础参考转写',
+    references: [{ id: 'remote-expression', name: '温柔', tag: 'soft', intensity: 0.5,
+      asset_id: assetId, source_asset_id: null, reference_text: '情绪参考转写', reference_language: 'zh', status: 'ready' }],
+  }
+}
+
+function harness(port?: TtsVoicePort, remoteTtsAssetImport?: RemoteTtsAssetImportPort,
+  remoteTtsAssetAudio?: RemoteTtsAssetAudioPort, remoteAudioScope?: Ref<string>) {
   let state!: TtsVoiceState // state（应用根层草稿状态）。
   const Host = defineComponent({
     props: { model: { type: String, default: 'aniflive' }, steps: { type: Number, default: 20 } },
     setup(props) {
       state = provideTtsVoiceState()
-      return () => h(TtsVoiceLibrary, { model: props.model as ProductLocalTtsModelId, steps: props.steps, demo: !port, port })
+      return () => h(TtsVoiceLibrary, { model: props.model as ProductLocalTtsModelId, steps: props.steps,
+        demo: !port, port, remoteMode: window.__VOICE_APPLICATION__?.remote_mode === true,
+        remoteTtsAssetImport, remoteTtsAssetAudio, remoteAudioScope: remoteAudioScope?.value })
     },
   })
   const wrapper = mount(Host)
@@ -202,6 +258,183 @@ describe('本地音色卡片', () => {
     expect(view.wrapper.find('button[aria-label="移除参考音频"]').exists()).toBe(false)
     expect(port.startTtsTranscribe).toHaveBeenCalledOnce()
     expect(view.wrapper.find('.audio-attachment').exists()).toBe(true)
+    view.wrapper.unmount()
+  })
+})
+
+describe('远程音色卡片文件导入', () => {
+  beforeEach(() => {
+    window.__VOICE_APPLICATION__ = { managed: true, origin: '', voice_api_url: '', voice_ws_url: '', remote_mode: true }
+  })
+
+  it('基础参考通过客户端原生选择器上传，不显示浏览器文件输入', async () => {
+    const port = {
+      ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
+      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'transcribe', state: 'succeeded', result: { text: '远程参考转写' } }),
+      uploadTtsAsset: vi.fn(),
+    } as unknown as TtsVoicePort
+    const importAsset = vi.spyOn(nativeDeviceApi, 'remoteTtsAssetImport').mockResolvedValue({
+      asset: { asset_id: 'remote-reference', duration_ms: 5680 },
+    })
+    const view = harness(port, nativeDeviceApi.remoteTtsAssetImport); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+
+    expect(view.wrapper.findAll('input[type="file"]')).toHaveLength(0)
+    expect(view.wrapper.find('button.attachment-upload').exists()).toBe(true)
+    await view.wrapper.find('button.attachment-upload').trigger('click')
+    await flushPromises()
+
+    expect(importAsset).toHaveBeenCalledWith('aniflive', 'asset')
+    expect(port.uploadTtsAsset).not.toHaveBeenCalled()
+    expect(port.startTtsTranscribe).toHaveBeenCalledWith('aniflive', 'remote-reference')
+    expect(view.state.models.aniflive.drafts[Object.keys(view.state.models.aniflive.drafts)[0]!]!.source?.asset_id)
+      .toBe('remote-reference')
+    view.wrapper.unmount()
+  })
+
+  it('取消基础参考文件选择时保留草稿且不启动转写', async () => {
+    const port = {
+      ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
+      startTtsTranscribe: vi.fn(),
+      uploadTtsAsset: vi.fn(),
+    } as unknown as TtsVoicePort
+    const importAsset = vi.spyOn(nativeDeviceApi, 'remoteTtsAssetImport').mockResolvedValue({
+      cancelled: true, fields: { cancelled: '用户取消文件选择' },
+    })
+    const view = harness(port, nativeDeviceApi.remoteTtsAssetImport); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+    const draft = view.state.models.aniflive.drafts[Object.keys(view.state.models.aniflive.drafts)[0]!]!
+    const previousName = draft.name
+
+    await view.wrapper.find('button.attachment-upload').trigger('click')
+    await flushPromises()
+
+    expect(importAsset).toHaveBeenCalledWith('aniflive', 'asset')
+    expect(draft.source).toBeNull()
+    expect(draft.name).toBe(previousName)
+    expect(port.startTtsTranscribe).not.toHaveBeenCalled()
+    expect(draft.error).toBe('')
+    view.wrapper.unmount()
+  })
+
+  it('情绪参考通过一次原生选择同时导入可裁剪原件和参考资产', async () => {
+    const port = {
+      ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
+      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'transcribe', state: 'succeeded', result: { text: '情绪参考转写' } }),
+      uploadTtsAsset: vi.fn(), uploadTtsSource: vi.fn(),
+    } as unknown as TtsVoicePort
+    const importResponse = {
+      asset: { asset_id: 'remote-asset', duration_ms: 5680 },
+      source: { asset_id: 'remote-source', duration_ms: 8000 },
+    }
+    const importAsset = vi.spyOn(nativeDeviceApi, 'remoteTtsAssetImport').mockResolvedValue(importResponse)
+    const view = harness(port, nativeDeviceApi.remoteTtsAssetImport); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+    await button(view.wrapper, '＋ 添加情绪参考').trigger('click')
+    await view.wrapper.find('button.expression-expand').trigger('click')
+
+    expect(view.wrapper.findAll('input[type="file"]')).toHaveLength(0)
+    const importButton = view.wrapper.findAll('button').find(node => node.text().includes('从客户端导入参考录音'))
+    expect(importButton).toBeDefined()
+    await importButton!.trigger('click')
+    await flushPromises()
+
+    expect(importAsset).toHaveBeenCalledOnce()
+    expect(importAsset).toHaveBeenCalledWith('aniflive', 'source_and_asset')
+    expect(port.uploadTtsSource).not.toHaveBeenCalled()
+    expect(port.uploadTtsAsset).not.toHaveBeenCalled()
+    expect(view.state.models.aniflive.drafts[Object.keys(view.state.models.aniflive.drafts)[0]!]!.references[0])
+      .toMatchObject({ source_asset_id: 'remote-source', asset_id: 'remote-asset', status: 'ready' })
+    view.wrapper.unmount()
+  })
+})
+
+describe('远程参考音频试听', () => {
+  beforeEach(() => {
+    window.__VOICE_APPLICATION__ = { managed: true, origin: '', voice_api_url: '', voice_ws_url: '', remote_mode: true }
+  })
+
+  it('按需读取并校验同一资产，替换资产和卸载时回收 Blob URL', async () => {
+    const runtime = installRemoteAudioRuntime()
+    const pending = new Map<string, (response: RemoteTtsAssetAudio) => void>()
+    const readAudio = vi.fn<RemoteTtsAssetAudioPort>((_model, assetId) => new Promise(resolve => pending.set(assetId, resolve)))
+    const port = { ttsVoices: vi.fn().mockResolvedValue({ voices: [remoteVoice()] }) } as unknown as TtsVoicePort
+    const view = harness(port, undefined, readAudio)
+    await flushPromises()
+    await button(view.wrapper, '编辑').trigger('click')
+
+    expect(readAudio).not.toHaveBeenCalled()
+    const first = view.wrapper.get('.voice-reference .audio-play').trigger('click')
+    const second = view.wrapper.get('.expression-summary .audio-play').trigger('click')
+    await Promise.all([first, second])
+    await flushPromises()
+    expect(readAudio).toHaveBeenCalledOnce()
+    expect(readAudio).toHaveBeenCalledWith('aniflive', 'shared-asset')
+
+    pending.get('shared-asset')!(remoteAudioResponse())
+    await flushPromises()
+    expect(runtime.createObjectURL).toHaveBeenCalledOnce()
+    expect(view.wrapper.findAll('audio').map(player => player.attributes('src')))
+      .toEqual(['blob:remote-1', 'blob:remote-1'])
+
+    const draft = view.state.models.aniflive.drafts['remote-voice']!
+    draft.source!.asset_id = 'replacement-asset'
+    draft.references[0]!.asset_id = 'replacement-asset'
+    await flushPromises()
+    expect(runtime.revokeObjectURL).toHaveBeenCalledWith('blob:remote-1')
+    expect(view.wrapper.find('.voice-reference audio').exists()).toBe(false)
+
+    await view.wrapper.get('.voice-reference .audio-play').trigger('click')
+    await flushPromises()
+    expect(readAudio).toHaveBeenCalledTimes(2)
+    pending.get('replacement-asset')!(remoteAudioResponse())
+    await flushPromises()
+    expect(view.wrapper.get('.voice-reference audio').attributes('src')).toBe('blob:remote-2')
+
+    view.wrapper.unmount()
+    expect(runtime.revokeObjectURL).toHaveBeenCalledWith('blob:remote-2')
+  })
+
+  it('连接代次变化后丢弃迟到音频并撤销刚创建的 URL', async () => {
+    const runtime = installRemoteAudioRuntime()
+    const scope = ref('host-a:management-1')
+    let resolveAudio!: (response: RemoteTtsAssetAudio) => void
+    const readAudio = vi.fn<RemoteTtsAssetAudioPort>(() => new Promise(resolve => { resolveAudio = resolve }))
+    const port = { ttsVoices: vi.fn().mockResolvedValue({ voices: [remoteVoice()] }) } as unknown as TtsVoicePort
+    const view = harness(port, undefined, readAudio, scope)
+    await flushPromises()
+    await button(view.wrapper, '编辑').trigger('click')
+
+    await view.wrapper.get('.voice-reference .audio-play').trigger('click')
+    await flushPromises()
+    expect(readAudio).toHaveBeenCalledOnce()
+    scope.value = 'host-a:management-2'
+    await flushPromises()
+
+    resolveAudio(remoteAudioResponse())
+    await flushPromises()
+    expect(runtime.createObjectURL).toHaveBeenCalledOnce()
+    expect(runtime.revokeObjectURL).toHaveBeenCalledWith('blob:remote-1')
+    expect(view.wrapper.find('.voice-reference audio').exists()).toBe(false)
+    view.wrapper.unmount()
+  })
+
+  it('拒绝校验和不匹配的服务端音频，不创建播放地址', async () => {
+    const runtime = installRemoteAudioRuntime()
+    const readAudio = vi.fn<RemoteTtsAssetAudioPort>().mockResolvedValue(remoteAudioResponse({ sha256: '0'.repeat(64) }))
+    const port = { ttsVoices: vi.fn().mockResolvedValue({ voices: [remoteVoice()] }) } as unknown as TtsVoicePort
+    const view = harness(port, undefined, readAudio)
+    await flushPromises()
+    await button(view.wrapper, '编辑').trigger('click')
+
+    await view.wrapper.get('.voice-reference .audio-play').trigger('click')
+    await flushPromises()
+    expect(view.state.models.aniflive.drafts['remote-voice']!.error).toContain('SHA-256 摘要不匹配')
+    expect(runtime.createObjectURL).not.toHaveBeenCalled()
+    expect(view.wrapper.find('.voice-reference audio').exists()).toBe(false)
     view.wrapper.unmount()
   })
 })

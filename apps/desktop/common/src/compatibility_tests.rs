@@ -62,6 +62,37 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn device_runtime_v2_migration_archives_the_original_and_requires_remote_repairing() {
+    let fixture = Fixture::new();
+    let path = fixture.context.data.join("config/device-runtime.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let old = json!({
+        "schema_version":2,"device_id":"legacy-device","desired_role":"remote_client",
+        "audio_mode":"pcm","host":{"address":"old-host.local","port":22,
+            "username":"old_user","host_key_sha256":"old-fingerprint",
+            "credential_ref":"old-credential-reference"}
+    });
+    let original = serde_json::to_vec(&old).unwrap();
+    fs::write(&path, &original).unwrap();
+
+    assert!(migrate_device_runtime_config(&fixture.context.data).unwrap());
+    let crate::device_config::LoadResult::Valid(config) =
+        crate::device_config::load_from_root(&fixture.context.data)
+    else {
+        panic!("迁移后的设备配置应可读")
+    };
+    assert_eq!(config.schema_version, 3);
+    assert_eq!(config.mode, crate::device_config::RunMode::Remote);
+    assert!(config.host.is_none());
+    let archives = fs::read_dir(fixture.context.data.join("archives/compatibility"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(archives, vec![original]);
+    assert!(!migrate_device_runtime_config(&fixture.context.data).unwrap());
+}
+
+#[test]
 fn current_inventory_supersedes_old_success_and_preserves_optional_semantics() {
     let fixture = Fixture::new();
     fixture.ready_runtime();
@@ -210,37 +241,45 @@ fn invalid_or_unprepared_device_role_is_a_preserved_startup_compatibility_blocke
     assert_eq!(fs::read(&path).unwrap(), corrupt);
     assert_eq!(rows[0]["compatibility"]["status"], "needs_repair");
 
-    use crate::device_config::{AudioMode, DeviceConfig, HostTrust, Role};
+    use crate::device_config::{AudioMode, DeviceConfig, HostTrust, Role, RunMode};
     let remote = DeviceConfig {
         schema_version: crate::device_config::SCHEMA_VERSION,
         device_id: "remote-device".into(),
+        mode: RunMode::Remote,
+        broadcast_enabled: false,
+        client_online_tts_local: true,
+        audio_compression: false,
+        reconnect_suspended_reason: None,
         desired_role: Role::RemoteClient,
         audio_mode: AudioMode::Pcm,
         host: Some(HostTrust {
-            address: "host.example".into(),
+            host_id: Some("host-a".into()),
+            display_name: Some("测试服务端".into()),
+            addresses: vec!["192.168.1.2".into()],
+            address: "192.168.1.2".into(),
             port: 22,
             username: "voice_terminal".into(),
             host_key_sha256: format!(
                 "SHA256:{}",
                 base64::engine::general_purpose::STANDARD_NO_PAD.encode([9_u8; 32])
             ),
-            credential_ref: crate::device_config::credential_reference_for_device("remote-device").unwrap(),
+            credential_ref: crate::device_config::credential_reference_for_device("remote-device")
+                .unwrap(),
             transport_credential_ref: None,
         }),
     };
     atomic_json(&path, &serde_json::to_value(&remote).unwrap()).unwrap();
     let rows = inventory(&fixture.context).unwrap();
-    let issue = rows
-        .iter()
-        .find(|row| row["resource_id"] == "device-runtime")
-        .unwrap();
-    assert_eq!(issue["can_start"], false);
-    assert!(issue["error"]
-        .as_str()
-        .unwrap()
-        .contains("受信连接尚未准备就绪"));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["resource_id"] == "device-runtime"),
+        "远程配对可以在零本地组件工作区等待连接"
+    );
 
     let local = DeviceConfig {
+        mode: RunMode::Local,
+        broadcast_enabled: false,
         desired_role: Role::Standalone,
         host: None,
         ..remote

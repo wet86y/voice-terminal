@@ -15,6 +15,14 @@ interface Window {
     endpoint_revision?: number
     /** business_ready（业务接口门禁）：宿主尚未就绪或会话失效时禁止产品请求。 */
     business_ready?: boolean
+    /** remote_mode（本设备以远程配对身份运行）。 */
+    remote_mode?: boolean
+    /** host_id（当前配对服务端设备编号）。 */
+    host_id?: string | null
+    /** management_connected（服务端受限管理通道状态）。 */
+    management_connected?: boolean
+    /** remote_business_ready（服务端产品业务读取状态）。 */
+    remote_business_ready?: boolean
   }
   /** __TAURI_INTERNALS__（Tauri 原生命令桥）：仅桌面入口使用。 */
   __TAURI_INTERNALS__?: {
