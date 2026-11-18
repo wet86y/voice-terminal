@@ -8,7 +8,7 @@
 | --- | --- |
 | 模型编号 | `minimax-female-shaonv-zh`（通用中文少女基底） |
 | 不可变版本 | `48b877fd21567ec74fc41410`（本机构建身份） |
-| 任务现场 | `.local/tmp/aniflive-tasks/m-4m8zbgsd`（正式配置入口生成） |
+| 任务现场 | 原始临时现场已于 2026-11-18 回收；执行结果保留于本记录 |
 | 输入 | 固定原始 GPT／SoVITS（语义／声音还原）权重和离线少女声参考，未复制测试分支引擎或上次诊断计算图 |
 | 导出 | 五个独立阶段，九张 ONNX（计算图），105 项官方数值校验全部通过 |
 | 编译 | 九个 TensorRT 11（推理引擎）从本次计算图在本机生成 |
@@ -42,7 +42,7 @@ Myelin（TensorRT 内部执行模块）／CUDA（显卡计算平台）流捕获�
 - `.local/cache/reports/aniflive-unattended-base-runtime/report.json`（托管服务、播放器和资源报告）。
 - `.local/cache/aniflive-unattended-base-retry.log`（最终转换及登记结果）。
 - `.local/cache/aniflive-unattended-base-reuse.log`（重复执行复用结果）。
-- `.local/tmp/aniflive-tasks/m-4m8zbgsd`（完整构建与验证现场）。
+- 原完整构建与验证现场已于 2026-11-18 回收；验证结论保留于本记录。
 
 相关后端测试 79 项通过；Rust（原生组件）测试沿用修订 5 的 195 项通过结果，13 项既有手工测试保持忽略。
 

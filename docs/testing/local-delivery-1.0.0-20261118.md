@@ -39,7 +39,7 @@
 
 ## 独立 B（远程客户端）启动
 
-- 使用统一程序包正式入口，把完整程序安装到受管临时工作区 `.local/tmp/distributed-client-b-installed-product-54be91eeaeeed684`；安装退出码为 0，没有 UAC 对话框。较早失败的暂存目录 .local/tmp/distributed-client-b-installed-product-0ff23ea32f104fc4 已保留供诊断。B 的 `Verify-Package.ps1`（正式包完整性校验）通过。
+- 使用统一程序包正式入口，把完整程序安装到受管临时工作区；安装退出码为 0，没有 UAC 对话框。B 的 `Verify-Package.ps1`（正式包完整性校验）通过。验证后，最新安装目录及较早失败的暂存目录均于 2026-11-18 回收，验证结论保留于本记录。
 - B 使用 `--mode remote`（远程配对模式）启动；新工作区配置为 schema 3（配置格式第 3 版）、`remote`（远程配对）及 `remote_client`（远程客户端），拥有独立设备编号，未配置服务端身份。
 - B 没有 Python（后端解释器）、模型文件、DSH（后台执行宿主）运行时或组件安装收据；启动进程树有桌面宿主及 WebView2（网页运行引擎），没有 Python 或 `--worker-host`（工作进程宿主）进程。
 - `data/state/workspace-ready.json`（产品页真实挂载记录）在启动期间曾确认 `ready=true`、`role=product`（正式产品页）且 `management_ready=false`（并非组件管理页）。这验证远程静态产品页通过桌面预检并实际挂载；Tauri 根路径 `/` 与 `/index.html` 均作为受控远程入口处理；B 正式退出后该启动记录当前不存在。

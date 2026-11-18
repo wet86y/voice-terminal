@@ -46,7 +46,7 @@
 - A（本机实例）使用 `--mode local --broadcast off` 正式启动。设备配置为 schema 3/local/broadcast=false（第 3 版、本地模式、广播关闭）；健康状态为 `IDLE`（空闲）、`can_start=true`（可启动）、`startup_errors=[]`（无启动错误）。audio/kws/asr/llm/tts/shadow_agent/analysis（音频、唤醒、识别、语言模型、语音合成、影子代理、分析）均为 READY（就绪），`input_owner=none`（没有设备占用输入租约）。
 - B（远程实例）从同一程序归档解出到独立临时目录后，以 `--mode remote` 实际启动。配置为 schema 3/remote/remote_client（第 3 版、远程模式、远程客户端）；B 工作区不存在 `runtimes/python`（Python 运行时）、`models`（模型目录）和 `runtimes/dsh`（DSH 运行时），组件收据为 0，进程树没有 `--worker-host`（工作进程宿主参数）。这是零组件远程启动验证；B 未配对，没有连接服务端或执行远程产品操作。
 - 真实桌面截图遇到 Windows PIN（个人识别码）输入画面；没有输入或绕过 PIN，因此未完成产品窗口、设置页及远程界面的可视验收。广播保持关闭，本轮未改变防火墙规则。
-- 收尾清理：A（`.local/VoiceTerminal.exe`）和 B 临时副本均已通过正式 `--exit`（程序退出参数）正常退出，所属 worker（工作进程）和 WebView（网页视图）进程均已确认退出。按固定清理流程回收 B 副本时，Windows 文件操作自动审查拒绝对精确路径执行递归删除；没有尝试其他删除方式绕过拒绝。B 目录暂留于 `.local/tmp/distributed-client-b-product-4ae83f2a70ecf810`，已确认没有活动进程。这是未回收的临时测试目录，不是产品缺陷。
+- 收尾清理：A（`.local/VoiceTerminal.exe`）和 B 临时副本均已通过正式 `--exit`（程序退出参数）正常退出，所属 worker（工作进程）和 WebView（网页视图）进程均已确认退出。首次回收 B 副本时，Windows 文件操作自动审查拒绝了该精确路径；当时没有尝试绕过拒绝。该临时测试目录随后于 2026-11-18 经项目安全删除器回收，不是产品缺陷。
 
 ## 范围修订与剩余验收
 

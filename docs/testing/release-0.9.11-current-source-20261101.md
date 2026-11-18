@@ -35,6 +35,6 @@
 | `update.json`（更新清单） | 3,064 | `7e4cf0cfa24bab14d3191672a75ef8721c677298d565cf60ad2d6279f9511703` |
 | `SHA256SUMS.txt`（摘要列表） | 247 | `5b20b09be50ca4651654efeb55d12aaf2548fa6ba30ac884e9a44aff0fff1c44` |
 
-新发行正文与合并后的版本说明完全一致；GitHub latest（最新发行）入口为 `v0.9.11`，`git ls-remote`（远程引用查询）确认 `main` 和 `v0.9.11` 标签均指向 `99248053521d01f6436bf583ed89def3dcba442b`。`gh release download`（发行资产下载）在内置核验及单独重试时均未完成：首轮返回 `unexpected EOF`（意外结束），重试长时间停留在零字节安装器下载。为避免再次上传，改用四项资产的公开 HTTPS（加密传输）下载地址取回完整文件，再将大小及 SHA-256 分别与本机文件和 GitHub 资产元数据摘要核对，全部一致。失败暂存保留于 `.local/tmp/release-public-cea18678a668443180d14303d3537808` 和 `.local/tmp/release-public-2f716d1cafc54aff9080c23112631269`；直接回下载及校验结果记录于 `.local/cache/reports/release-public-latest.json`（最近公开发行核验报告）。
+新发行正文与合并后的版本说明完全一致；GitHub latest（最新发行）入口为 `v0.9.11`，`git ls-remote`（远程引用查询）确认 `main` 和 `v0.9.11` 标签均指向 `99248053521d01f6436bf583ed89def3dcba442b`。`gh release download`（发行资产下载）在内置核验及单独重试时均未完成：首轮返回 `unexpected EOF`（意外结束），重试长时间停留在零字节安装器下载。为避免再次上传，改用四项资产的公开 HTTPS（加密传输）下载地址取回完整文件，再将大小及 SHA-256 分别与本机文件和 GitHub 资产元数据摘要核对，全部一致。失败下载暂存已于 2026-11-18 回收；直接回下载及校验结果记录于 `.local/cache/reports/release-public-latest.json`（最近公开发行核验报告）。
 
 核验后，本文件与[当前交付记录](../releases/current-release.md)作为纯文档补录另行提交和推送；`v0.9.11` 标签仍绑定实际构建提交 `99248053521d01f6436bf583ed89def3dcba442b`。

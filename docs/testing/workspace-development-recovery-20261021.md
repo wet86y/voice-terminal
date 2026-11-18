@@ -18,7 +18,7 @@
 4. 修复 `runtime.json`（运行环境登记）的 `groups`（依赖组）字段：补回源码要求的 `torch-cpu`（基础张量兼容依赖组），保留 `gpu_profile=cu128`（显卡依赖组合）。显卡版张量库同时提供处理器运算，不额外安装另一份处理器版包。
 5. 依据当前有效配置重建用户唤醒词文件，并补齐离线诊断使用的默认词表；依据源码固定摘要重建三项分析模型兼容清单。修复整句精修模型安装收据与总清单不一致的问题。
 6. 实机原生组件管理发现唤醒词模型与 SmartTurn（语音结束判断）缺少安装收据，总清单中的本机生成文件会被旧兼容路径误判为待更新。重新核验全部模型文件后，使用项目现有收据生成函数补齐这两份收据，重新生成模型总清单及正式程序组件绑定。
-7. 首次修复前的 Python（解释器）清单、运行登记、模型总清单及程序发行清单保存在 `.local/tmp/recovery-metadata-before-independent-repair/`（原始元数据留档）。独立物理文件审计结果保存在 `.local/cache/recovery-independent-audit.json`（恢复审计报告）。
+7. 首次修复前的 Python（解释器）清单、运行登记、模型总清单及程序发行清单曾保存在 `.local/tmp/recovery-metadata-before-independent-repair/`（原始元数据留档）。该本机临时目录已于 2026-11-18 按用户要求回收；独立物理文件审计结果仍保存在 `.local/cache/recovery-independent-audit.json`（恢复审计报告）。
 
 ## 已完成的开发验证
 

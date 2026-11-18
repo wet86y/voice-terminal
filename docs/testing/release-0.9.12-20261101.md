@@ -33,7 +33,7 @@ GitHub（代码托管平台）`v0.9.12` 于 2026-11-01 22:18:16（香港时间�
 
 GitHub 官方资产摘要及大小与本机构建文件逐项匹配，四项资产状态均为已上传；发行正文、应用更新说明、最新入口、标签源码、远程 `main` 以及 `SHA256SUMS.txt` 内容也核对通过。因此目前证据指向大文件完整传输路径速度过低或停滞，不能据此认定资产缺失或所有用户网络都无法下载。本轮仍不记录为完整回下载验收通过。
 
-失败诊断现场保留于 `.local/tmp/release-public-b465c966c0f74edc85ae422af2d02d4c` 和 `.local/tmp/release-direct-v0.9.12-91984eca0db8454a9ec5cbddf7bf1a2a`；摘要及入口核验结果保存在 `.local/cache/reports/release-public-latest.json`（最近公开核验报告）。
+失败诊断现场已于 2026-11-18 回收；摘要及入口核验结果保存在 `.local/cache/reports/release-public-latest.json`（最近公开核验报告）。
 
 ## 相关回归结果
 
