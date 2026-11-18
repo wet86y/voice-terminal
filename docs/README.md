@@ -62,7 +62,7 @@
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
 - [分布式运行本机覆盖与 SSH 模拟验收（2026-11-17）](testing/local-delivery-1.0.0-20261117.md)
-- [分布式运行候选包与 OpenSSH 验收（2026-11-18）](testing/local-delivery-1.0.0-20261118.md)
+- [本机覆盖、分发器与 OpenSSH 验收（2026-11-18）](testing/local-delivery-1.0.0-20261118.md)
 - [当前已知问题](testing/known-issues.md)
 - [AnifLive 模型导入匹配审计（2026-11-08）](testing/aniflive-import-audit-20261108.md)
 - [v1.0.0 修订重发验收（2026-11-08）](testing/release-1.0.0-reissue-20261108.md)
