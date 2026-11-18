@@ -224,10 +224,11 @@ pub async fn start_pairing_listener(
         let stopping = stopping.clone();
         let wake = wake.clone();
         tasks.push(tokio::spawn(async move {
+            let mut expiry_poll = tokio::time::interval(Duration::from_millis(250));
             loop {
                 tokio::select! {
                     _ = wake.notified() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    _ = expiry_poll.tick() => {
                         if !window.lock().map(|window| window.as_ref().is_some_and(PairingCodeWindow::is_open)).unwrap_or(false) { break; }
                     }
                     accepted = listener.accept() => {
@@ -236,11 +237,17 @@ pub async fn start_pairing_listener(
                         let register_identity = register_identity.clone();
                         tokio::select! {
                             _ = wake.notified() => break,
-                            _ = accept_pairing_connection(stream, &window, &server_info,
-                                move |identity| register_identity(identity)) => {}
+                            _ = accept_pairing_connection_async(stream, &window, &server_info,
+                                move |identity| async move {
+                                    tokio::task::spawn_blocking(move || register_identity(&identity)).await
+                                        .map_err(|_| "服务端公钥登记任务无法完成。".to_string())?
+                                }) => {}
                         }
                     }
                 }
+            }
+            if let Ok(mut current) = window.lock() {
+                if current.as_ref().is_some_and(|value| !value.is_open()) { current.take(); }
             }
         }));
     }
@@ -373,13 +380,29 @@ impl PairingCodeWindow {
 
 /// accept_pairing_connection（接收配对 TCP 会话）：认证、加密身份绑定并在登记后返回服务端资料。
 pub async fn accept_pairing_connection<F>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     window: &std::sync::Arc<std::sync::Mutex<Option<PairingCodeWindow>>>,
     server_info: &PairingServerInfo,
     register_identity: F,
 ) -> Result<PairingIdentity, String>
 where
     F: FnOnce(&PairingIdentity) -> Result<(), String>,
+{
+    accept_pairing_connection_async(stream, window, server_info, |identity| async move {
+        register_identity(&identity)
+    })
+    .await
+}
+
+async fn accept_pairing_connection_async<F, R>(
+    mut stream: TcpStream,
+    window: &Arc<Mutex<Option<PairingCodeWindow>>>,
+    server_info: &PairingServerInfo,
+    register_identity: F,
+) -> Result<PairingIdentity, String>
+where
+    F: FnOnce(PairingIdentity) -> R,
+    R: std::future::Future<Output = Result<(), String>>,
 {
     let request = read_frame(&mut stream).await?;
     let (attempt, response) = window
@@ -405,7 +428,7 @@ where
     write_frame(&mut stream, &encrypt_payload(&session_key, &challenge)?).await?;
     let identity: PairingIdentity = decrypt_payload(&session_key, &read_frame(&mut stream).await?)?;
     verify_pairing_identity(&identity, &server_nonce)?;
-    if let Err(_error) = register_identity(&identity) {
+    if let Err(_error) = register_identity(identity.clone()).await {
         let reply = PairingReply::Rejected {
             reason: "服务端未能安全登记本次设备；请检查服务端配对状态后重试。".into(),
         };
@@ -455,7 +478,11 @@ where
         signature: sign_challenge(&proof)?,
     };
     write_frame(&mut stream, &encrypt_payload(&session_key, &identity)?).await?;
-    let reply: PairingReply = decrypt_payload(&session_key, &read_frame(&mut stream).await?)?;
+    // 身份已认证后允许服务端完成只读复核和 UAC（管理员授权）；普通握手帧仍限制 15 秒。
+    let reply: PairingReply = decrypt_payload(
+        &session_key,
+        &read_frame_with_timeout(&mut stream, Duration::from_secs(5 * 60)).await?,
+    )?;
     match reply {
         PairingReply::Accepted(info) => {
             validate_server_info(&info)?;
@@ -688,7 +715,14 @@ async fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> Result<(), String>
 }
 
 async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    read_frame_with_timeout(stream, Duration::from_secs(15)).await
+}
+
+async fn read_frame_with_timeout(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(timeout, async {
         let mut length = [0u8; 4];
         stream.read_exact(&mut length).await?;
         let length = u32::from_be_bytes(length) as usize;
@@ -764,7 +798,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_tcp_pairing_binds_the_client_key_and_server_identity() {
+    async fn encrypted_pairing_waits_for_registration_beyond_normal_frame_timeout_and_binds_identity(
+    ) {
         let (window, opened) = PairingCodeWindow::open().unwrap();
         let window = Arc::new(Mutex::new(Some(window)));
         let host_private = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -791,10 +826,17 @@ mod tests {
         let accepted_slot = accepted.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            accept_pairing_connection(stream, &server_window, &server_info, |identity| {
-                *accepted_slot.lock().unwrap() = Some(identity.clone());
-                Ok(())
-            })
+            accept_pairing_connection_async(
+                stream,
+                &server_window,
+                &server_info,
+                |identity| async move {
+                    // 管理员确认可能超过普通帧的 15 秒；客户端仍应等待已认证的最终登记结果。
+                    tokio::time::sleep(Duration::from_secs(16)).await;
+                    *accepted_slot.lock().unwrap() = Some(identity.clone());
+                    Ok(())
+                },
+            )
             .await
             .unwrap()
         });

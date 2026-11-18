@@ -20,7 +20,9 @@ const props = defineProps<{
 }>()
 const { voice, settings, loading: settingsLoading, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, saveAudioEnhancement, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
-const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
+const remoteTarget = computed(() => props.resourceController?.remoteMode.value ?? application.snapshot.value?.remote_mode === true)
+const businessReadable = computed(() => !remoteTarget.value || application.businessReady.value)
+const tts = useLocalTtsStatus(() => businessReadable.value && application.snapshot.value?.startup_complete === true)
 watch(() => props.resourceController?.resourceJobs.value.map(job => `${job.job_id}:${job.state}`).join('|'), () => {
   if (props.resourceController?.resourceJobs.value.some(job => job.job_id.startsWith('reset-tts-aniflive-') && job.state === 'complete')) void tts.refresh(true)
 })
@@ -116,7 +118,8 @@ function providerSettings(provider: FixedProviderId): LocalProviderSettings {
     usage: async () => (await productApi.fixedProviderUsage(provider)).data,
   }
 }
-onMounted(() => { void readProviderConfiguration() })
+onMounted(() => { if (businessReadable.value) void readProviderConfiguration() })
+watch(businessReadable, ready => { if (ready) void readProviderConfiguration() })
 const resources = computed(() => componentResources(application.snapshot.value, computeStatus.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
 function managedResource(resourceId: string): ManagedResourceRow | undefined {
@@ -423,7 +426,16 @@ const model = computed<LocalComponentsModel>(() => {
   const snapshot = application.snapshot.value
   const hardware = computeStatus.value?.hardware
   const usableTts = rows.value.some(row => row.category === 'tts' && row.state === 'ready' && row.available)
-  const failed = rows.value.some(row => row.state === 'failed' && (row.category === 'tts' ? !usableTts
+  const waitingRemote = remoteTarget.value && !businessReadable.value
+  // 原生管理连接不依赖语音核心；即使核心尚未恢复，也要保留已盘点资源的单项安装入口。
+  const waitingRows: LocalComponentRow[] = snapshot?.management_connected ? rows.value
+    .filter(row => row.resource || row.resourceChoices?.length || row.runtimeDependencies?.length)
+    .map(row => ({ ...row, state: 'loading', status: '等待服务端业务状态', available: false, busy: false,
+      location: '服务端', retryable: false, error: undefined, device: undefined, provider: undefined,
+      inference: undefined, enhancement: undefined, facts: [], runtime: '', description: '安装状态来自服务端组件管理，运行状态等待语音核心恢复。',
+      residentMemory: undefined, privateMemory: undefined, vram: undefined, resourceBytes: undefined,
+    })) : []
+  const failed = !waitingRemote && rows.value.some(row => row.state === 'failed' && (row.category === 'tts' ? !usableTts
     : row.id.startsWith('capability:') ? row.facts.some(fact => fact.label === '语音门禁')
       : row.resource?.required === true))
   const loading = rows.value.some(row => row.state === 'loading')
@@ -433,7 +445,12 @@ const model = computed<LocalComponentsModel>(() => {
     integrityReady: props.resourceController?.integrity.value.installer_ready === true,
     integrityBusy: ['checking', 'downloading', 'handing_off'].includes(props.resourceController?.integrity.value.state ?? ''),
     integrityMessage: props.resourceController?.integrity.value.error || props.resourceController?.integrity.value.phase || undefined,
-    status: failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常', state: failed ? 'failed' : loading ? 'loading' : 'ready',
+    status: waitingRemote ? snapshot?.remote_connection_state === 'unpaired' ? '等待配对服务端'
+      : snapshot?.management_connected ? snapshot.core_phase === 'failed' ? '服务端语音核心不可用' : '服务端组件准备中'
+        : snapshot?.remote_connection_state === 'paused' ? '自动重连已暂停' : '等待服务端连接'
+      : failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常',
+    state: waitingRemote ? snapshot?.management_connected && snapshot.core_phase === 'failed' ? 'failed' : 'loading'
+      : failed ? 'failed' : loading ? 'loading' : 'ready',
     sampledAt: snapshot?.sampled_at == null ? '—' : new Date(snapshot.sampled_at * 1000).toLocaleString('zh-CN', { hour12: false }),
     resources: [
       { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
@@ -472,17 +489,22 @@ const model = computed<LocalComponentsModel>(() => {
     resourceLoading: Boolean(props.resourceController?.loading.value || props.resourceController?.refreshing.value
       || props.resourceController?.inventoryRefreshing.value || props.resourceController?.preparingDownloadBundle.value),
     resourceError: props.resourceController?.resourceError.value || undefined,
+    resourceNotice: props.resourceController?.connectionNotice.value || undefined,
     resourceEventError: props.resourceController?.eventError.value || undefined,
     resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
       || props.resourceController?.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
     resourceBatchRetry: props.resourceController?.resourceJobs.value.some(job => job.resource_id === 'batch' && job.state === 'failed') ?? false,
-    rows: rows.value, error: enhancementError.value || application.error.value, refreshing: refreshing.value,
+    rows: waitingRemote ? waitingRows : remoteTarget.value ? rows.value.map(row => ({ ...row, location: '服务端', retryable: false })) : rows.value,
+    error: enhancementError.value || application.error.value, refreshing: refreshing.value,
   }
 })
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
-  try { await Promise.allSettled([application.refresh(), refreshComputeStatus(true), props.resourceController?.refresh(), tts.refresh()]) }
+  try {
+    await application.refresh()
+    await Promise.allSettled([props.resourceController?.refresh(), ...(businessReadable.value ? [refreshComputeStatus(true), tts.refresh()] : [])])
+  }
   finally { refreshing.value = false }
 }
 async function retry(id: string) {

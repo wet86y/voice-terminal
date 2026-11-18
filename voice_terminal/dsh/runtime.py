@@ -309,7 +309,8 @@ class DshRuntimeManager:
             if not source.is_file():
                 continue
             target = profile / source.relative_to(template)
-            if target.name == "cordis.patch.yml" and target.exists():
+            # 只保护配置档根部的用户补丁；插件包内同名加载清单必须随程序更新。
+            if source.relative_to(template) == Path("cordis.patch.yml") and target.exists():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.relative_to(template) == Path("package.json") and target.is_file():

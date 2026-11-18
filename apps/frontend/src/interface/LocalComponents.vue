@@ -489,6 +489,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
     </div>
 
     <p v-if="model.error" class="local-error" role="alert">{{ model.error }}</p>
+    <p v-if="model.resourceNotice" class="local-detail-note" role="status">{{ model.resourceNotice }}</p>
     <p v-if="model.resourceError" class="local-error" role="alert">{{ model.resourceError }}</p>
     <p v-for="error in model.errors" :key="error.id" class="local-error" role="alert" :data-error-source="error.id">{{ error.message }}</p>
     <p v-if="model.resourceEventError" class="local-error" role="status">{{ model.resourceEventError }}</p>

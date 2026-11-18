@@ -3,6 +3,7 @@ import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nativeDeviceApi, type DeviceConfigStatus, type DiscoveredDevice, type DeviceConfig, type ManagedResourceJob, type OpenSshServerStatus, type RemoteManagementOperation, type RemoteManagementResponse, type RemoteSshSystemFeatureSnapshot, type RemoteSshSystemFeatureJob } from '../product/native-device-api'
 import DeviceSettings from './DeviceSettings.vue'
+import { recordDeviceSettingsError } from '../product/device-settings-operation'
 
 const foundHost: DiscoveredDevice = {
   host_id: 'server-a', display_name: '服务端 A', hostname: 'voice-terminal-server-a.local.',
@@ -94,6 +95,7 @@ describe('DeviceSettings（设备设置）', () => {
   }
 
   beforeEach(() => {
+    recordDeviceSettingsError('')
     currentStatus = makeConfig('local', false)
     sshReady = true
     sshConnected = false
@@ -202,6 +204,19 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).toContain('服务端 A')
   })
 
+  it('未配对远程角色不报告本机核心缺失，任务和语音明确等待配对', async () => {
+    currentStatus = makeConfig('remote', false)
+    currentStatus.device_runtime!.actual_mode = null
+    currentStatus.device_runtime!.switch_phase = 'waiting_for_remote'
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.text()).toContain('管理连接和服务端语音核心就绪状态分别显示')
+    expect(wrapper.text()).not.toContain('本机语音核心尚未就绪')
+    expect(wrapper.text()).toContain('服务端任务：等待配对')
+    expect(wrapper.text()).toContain('服务端语音：等待配对')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+  })
+
   it('模式选远程后自动保存；配对码保持前导零并自动建立连接通道', async () => {
     wrapper = mount(DeviceSettings)
     await flushPromises()
@@ -273,7 +288,6 @@ describe('DeviceSettings（设备设置）', () => {
     currentStatus = makeConfig('local', false)
     wrapper = mount(DeviceSettings)
     await flushPromises()
-    vi.mocked(nativeDeviceApi.openSshServerStatus).mockClear()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
     const checkbox = wrapper.get('input[aria-label="广播并接受配对"]')
     await checkbox.setValue(true)
@@ -288,12 +302,138 @@ describe('DeviceSettings（设备设置）', () => {
       mode: 'local', broadcast_enabled: true, desired_role: 'shared_host',
     }), false)
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalled()
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledTimes(2)
     expect(vi.mocked(nativeDeviceApi.openSshServerStatus).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(nativeDeviceApi.saveDeviceConfig).mock.invocationCallOrder[0]!)
     expect(nativeDeviceApi.openPairingWindow).toHaveBeenCalledOnce()
     expect(clipboardWrite).toHaveBeenCalledWith('000042')
     expect(wrapper.get('.pairing-code-box output').text()).toBe('000042')
+  })
+
+  it('历史 SSH 失败不覆盖当前就绪状态，进入页面只查询一次系统状态', async () => {
+    vi.mocked(nativeDeviceApi.resourceJobs).mockResolvedValue([
+      { ...makeLocalSshJob('failed'), error: '旧版本的状态查询失败' },
+    ])
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledOnce()
+    expect(wrapper.text()).not.toContain('旧版本的状态查询失败')
+    expect(wrapper.text()).toContain('广播已关闭')
+  })
+
+  it('首次慢速 SSH 查询不锁住运行模式，切到远程后丢弃旧查询结果', async () => {
+    let finishStatus!: (value: OpenSshServerStatus) => void
+    vi.mocked(nativeDeviceApi.openSshServerStatus).mockImplementationOnce(() => new Promise(resolve => { finishStatus = resolve }))
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('正在读取 SSH 状态')
+    await wrapper.get('select').setValue('remote')
+    await flushPromises()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
+    expect(currentStatus.device_config?.mode).toBe('remote')
+    finishStatus(makeSshStatus())
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('官方程序：微软签名已验证')
+  })
+
+  it('切换页面后接续未完成保存进度，不重复保存或授权，完成后恢复可用', async () => {
+    vi.useFakeTimers()
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    let finishSave!: () => void
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockImplementationOnce(async config => {
+      await new Promise<void>(resolve => { finishSave = resolve })
+      currentStatus = makeConfig('local', true)
+      currentStatus.device_config = config
+      return currentStatus
+    })
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+    wrapper.unmount()
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.text()).toContain('切换页面不会取消任务')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').attributes('disabled')).toBeDefined()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
+    finishSave()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toContain('广播已运行')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+  })
+
+  it('页面重建从宿主恢复授权阶段与失败终态，广播未保存时也继续补查', async () => {
+    vi.useFakeTimers()
+    currentStatus.device_runtime!.operation = { active: true, revision: 2, phase: 'preparing_access',
+      state_revision: 4, message: '等待 Windows 管理员授权', target_mode: 'local', target_broadcast: true, error: null }
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toBe('等待 Windows 管理员授权')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    currentStatus = structuredClone(currentStatus)
+    currentStatus.device_runtime!.operation = { ...currentStatus.device_runtime!.operation!, active: false,
+      state_revision: 3, phase: 'failed', error: '过期任务错误' }
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toBe('等待 Windows 管理员授权')
+    expect(wrapper.text()).not.toContain('过期任务错误')
+    currentStatus.device_runtime!.operation = { ...currentStatus.device_runtime!.operation!,
+      state_revision: 5, error: 'Windows 管理员授权已取消。' }
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.text()).toContain('Windows 管理员授权已取消。')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+  })
+
+  it('广播保存期间立即显示准备状态，晚到的发布结果只通过轻量状态补查更新', async () => {
+    vi.useFakeTimers()
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    let finishSave!: () => void
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockImplementationOnce(async config => {
+      await new Promise<void>(resolve => { finishSave = resolve })
+      currentStatus = makeConfig('local', true)
+      currentStatus.device_config = config
+      currentStatus.device_runtime!.broadcast_actual = false
+      currentStatus.device_runtime!.device_gateway.ready = false
+      return currentStatus
+    })
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toContain('正在应用设备设置')
+    finishSave()
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toContain('正在准备设备网关')
+    vi.mocked(nativeDeviceApi.openSshServerStatus).mockClear()
+    currentStatus.device_runtime!.broadcast_actual = true
+    currentStatus.device_runtime!.device_gateway.ready = true
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(wrapper.get('.broadcast-status').text()).toContain('广播已运行')
+    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
+  })
+
+  it('公告发布失败后重读已保存的开关并显示实际故障', async () => {
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockImplementationOnce(async config => {
+      currentStatus = makeConfig('local', true)
+      currentStatus.device_config = config
+      currentStatus.device_runtime!.broadcast_actual = false
+      currentStatus.device_runtime!.error = '局域网公告发布失败'
+      throw new Error('本地运行模式已保存，但局域网广播尚未实际发布')
+    })
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', true)
+    expect(wrapper.get('.broadcast-status').text()).toContain('广播尚未就绪')
+    expect(wrapper.text()).toContain('局域网公告发布失败')
   })
 
   it('广播开启前 SSH 未就绪时获准后等待系统任务完成再保存', async () => {

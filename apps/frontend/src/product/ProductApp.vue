@@ -168,7 +168,7 @@ function exportLogs() {
     <template #banner>
       <div v-if="applicationSnapshot?.remote_mode" class="remote-host-banner" role="status">
         <strong>正在管理：{{ applicationSnapshot.host_name || '已配对服务端' }}</strong>
-        <span>{{ applicationSnapshot.management_connected ? '管理通道已连接' : '正在等待服务端连接' }}</span>
+        <span>{{ applicationSnapshot.management_connected ? '管理通道已连接' : applicationSnapshot.remote_connection_state === 'unpaired' ? '请在设备与角色中搜索并配对服务端' : applicationSnapshot.remote_connection_state === 'paused' ? '自动重连已暂停，可在设备与角色中恢复连接' : '正在等待服务端连接' }}</span>
         <span>{{ remoteVoiceStatusLabel }}</span>
         <span v-if="remoteVoiceStatusError">{{ remoteVoiceStatusError }}</span>
         <span v-if="!applicationSnapshot.remote_business_ready">{{ applicationSnapshot.remote_error || '服务端业务状态暂不可用' }}</span>
@@ -177,7 +177,7 @@ function exportLogs() {
         <span v-else>服务端语音核心不可用</span>
       </div>
       <div
-        v-if="applicationSnapshot?.state === 'degraded' || application.runtimeFailure.value"
+        v-if="!applicationSnapshot?.remote_mode && (applicationSnapshot?.state === 'degraded' || application.runtimeFailure.value)"
         class="application-degraded"
         role="status"
       >

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { matchesRemoteManagementEnvelope, nativeDeviceApi, parseRemoteSshSystemFeatureSnapshot, type DeviceConfig, type DeviceConfigStatus, type DiscoveredDevice, type ManagedResourceJob, type OpenSshServerStatus, type RemoteSshSystemFeatureSnapshot } from '../product/native-device-api'
 import { ensureRemoteClientRuntime } from '../product/remote-client-runtime'
+import { deviceSettingsOperation, recordDeviceSettingsError, runDeviceSettingsOperation, setDeviceSettingsPhase } from '../product/device-settings-operation'
 
 const status = ref<DeviceConfigStatus | null>(null)
 const mode = ref<DeviceConfig['mode']>('local')
@@ -40,7 +41,12 @@ const openSshJob = ref<ManagedResourceJob | null>(null)
 const openSshBusy = ref(false)
 const openSshStatusLoading = ref(false)
 const openSshLongWaitNotice = ref(false) // openSshLongWaitNotice（本机 SSH 准备任务超过前台等待时间后仍在后台跟踪）。
+const openingPairing = ref(false) // openingPairing（配对码生成阶段，与广播启停分别显示）。
 const broadcastPreflightBusy = ref(false) // broadcastPreflightBusy（开启本机广播前检查 SSH 并等待准备任务）。
+const runtimeStatusTimer = ref<ReturnType<typeof setTimeout> | null>(null) // runtimeStatusTimer（轻量设备状态补查，不查询 Windows 功能）。
+let runtimeStatusReading = false // runtimeStatusReading（防止设备状态补查重叠）。
+let disposed = false // disposed（页面销毁后不再启动补查）。
+let sshStatusGeneration = 0 // sshStatusGeneration（拒绝模式切换或新检查前发出的旧系统快照）。
 const openSshJobTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const remoteOpenSshSnapshot = ref<RemoteSshSystemFeatureSnapshot | null>(null) // remoteOpenSshSnapshot（配对服务端只读 SSH 快照）。
 const remoteOpenSshHostId = ref<string | null>(null) // remoteOpenSshHostId（当前快照绑定的服务端编号）。
@@ -50,8 +56,6 @@ const remoteOpenSshPollTimer = ref<ReturnType<typeof setTimeout> | null>(null) /
 let remoteOpenSshGeneration = 0 // remoteOpenSshGeneration（配对目标或服务端状态操作代次）。
 const pairingExpiryTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 const pairingStatusTimer = ref<ReturnType<typeof setInterval> | null>(null)
-const reconnectTimer = ref<ReturnType<typeof setTimeout> | null>(null)
-const reconnectAttempt = ref(0)
 const loading = ref(false)
 const busy = ref(false)
 const error = ref('')
@@ -67,8 +71,30 @@ const remoteOpenSshCanEnable = computed(() => {
     && connection.value === 'connected' && !remoteOpenSshBusy.value
     && !remoteOpenSshJobPending.value && remoteOpenSshSnapshot.value?.status.ready === false
 })
-const isBroadcasting = computed(() => mode.value === 'local' && broadcastEnabled.value)
+const isBroadcasting = computed(() => mode.value === 'local' && status.value?.device_config?.broadcast_enabled === true)
+const deviceOperationPending = computed(() => deviceSettingsOperation.active || status.value?.device_runtime?.operation?.active === true)
+const deviceOperationError = computed(() => error.value || deviceSettingsOperation.error || status.value?.device_runtime?.operation?.error || '')
+const controlsLocked = computed(() => loading.value || busy.value || openSshBusy.value || openSshJobPending.value || deviceOperationPending.value)
+const broadcastRuntimeError = computed(() => {
+  const runtime = status.value?.device_runtime
+  if (!isBroadcasting.value || (runtime?.broadcast_actual && runtime.device_gateway.ready)) return ''
+  return runtime?.device_gateway.error || runtime?.error || ''
+})
+const broadcastPhaseLabel = computed(() => {
+  if (status.value?.device_runtime?.operation?.active) return status.value.device_runtime.operation.message
+  if (deviceSettingsOperation.active) return deviceSettingsOperation.phase
+  if (broadcastPreflightBusy.value) return '正在检查本机 SSH 服务，请稍候…'
+  if (openingPairing.value) return '正在生成配对码…'
+  if (busy.value) return '正在应用设备设置；如出现 Windows 管理员授权，请完成授权。'
+  if (!isBroadcasting.value) return '广播已关闭'
+  if (broadcastRuntimeError.value) return '广播尚未就绪'
+  if (!status.value?.device_runtime?.device_gateway.ready) return '正在准备设备网关，本地语音继续运行…'
+  return status.value.device_runtime.broadcast_actual ? '广播已运行，可以获取配对码' : '正在发布局域网设备公告…'
+})
+const visibleOpenSshJob = computed(() => openSshJobPending.value || openSshBusy.value || !openSshStatus.value?.ready
+  ? openSshJob.value : null) // visibleOpenSshJob（已就绪时不把历史终态当作当前失败）。
 const canSave = computed(() => !loading.value && !busy.value && !openSshBusy.value && !broadcastPreflightBusy.value && !openSshJobPending.value
+  && !status.value?.device_runtime?.operation?.active
   && !!status.value && (mode.value === 'remote' || localCoreAvailable.value))
 
 /** localOpenSshJobStateLabel（本机 SSH 任务状态中文说明）：长任务仍在后台运行时明确呈现状态。 */
@@ -110,7 +136,8 @@ async function refresh() {
     }
     if (mode.value === 'local') {
       clearRemoteOpenSshSnapshot()
-      await Promise.all([refreshOpenSshStatus(), refreshOpenSshJob()])
+      // 设备配置已取得即可操作运行模式；慢速系统检查单独显示进度。
+      void Promise.all([refreshOpenSshStatus(), refreshOpenSshJob(false)])
       connection.value = 'disconnected'
       taskChannel.value = 'stopped'
       mediaChannel.value = 'stopped'
@@ -173,7 +200,46 @@ async function refresh() {
   }
 }
 
+function stopRuntimeStatusWatch() {
+  if (runtimeStatusTimer.value !== null) clearTimeout(runtimeStatusTimer.value)
+  runtimeStatusTimer.value = null
+}
+
+function scheduleRuntimeStatusWatch() {
+  stopRuntimeStatusWatch()
+  if (disposed || runtimeStatusReading) return
+  runtimeStatusTimer.value = setTimeout(async () => {
+    runtimeStatusTimer.value = null
+    runtimeStatusReading = true
+    try {
+      const next = await nativeDeviceApi.deviceConfigStatus()
+      if (disposed) return
+      if ((next.device_runtime?.revision ?? 0) < (status.value?.device_runtime?.revision ?? 0)) return
+      if ((next.device_runtime?.operation?.state_revision ?? 0) < (status.value?.device_runtime?.operation?.state_revision ?? 0)) return
+      if (!busy.value && !broadcastPreflightBusy.value && !loading.value && !deviceSettingsOperation.active) {
+        status.value = { ...next }
+        if (next.device_config) {
+          mode.value = next.device_config.mode
+          broadcastEnabled.value = next.device_config.broadcast_enabled
+          clientOnlineTtsLocal.value = next.device_config.client_online_tts_local
+          audioCompression.value = next.device_config.audio_compression
+        }
+      } else if (status.value) {
+        status.value = { ...status.value, device_runtime: next.device_runtime }
+      }
+    } catch { /* 短暂断开时保留最后状态，下一轮补查；不触发系统功能查询。 */ }
+    finally {
+      runtimeStatusReading = false
+      scheduleRuntimeStatusWatch()
+    }
+  }, 1500)
+}
+
+watch([mode, busy, broadcastPreflightBusy, isBroadcasting], scheduleRuntimeStatusWatch)
+
 async function refreshOpenSshStatus() {
+  if (disposed) return
+  const generation = ++sshStatusGeneration
   if (mode.value !== 'local') {
     openSshStatus.value = null
     openSshStatusError.value = ''
@@ -181,13 +247,16 @@ async function refreshOpenSshStatus() {
   }
   openSshStatusLoading.value = true
   try {
-    openSshStatus.value = await nativeDeviceApi.openSshServerStatus()
+    const next = await nativeDeviceApi.openSshServerStatus()
+    if (disposed || mode.value !== 'local' || generation !== sshStatusGeneration) return
+    openSshStatus.value = next
     openSshStatusError.value = ''
   } catch (failure) {
+    if (disposed || mode.value !== 'local' || generation !== sshStatusGeneration) return
     openSshStatus.value = null
     openSshStatusError.value = failure instanceof Error ? failure.message : String(failure)
   } finally {
-    openSshStatusLoading.value = false
+    if (generation === sshStatusGeneration) openSshStatusLoading.value = false
   }
 }
 
@@ -215,18 +284,21 @@ async function refreshPairingWindowStatus() {
   } catch { /* 状态读取失败时保留当前码，直到有效期计时器到期。 */ }
 }
 
-async function refreshOpenSshJob() {
-  if (mode.value !== 'local') return
+async function refreshOpenSshJob(refreshTerminalStatus = true) {
+  if (disposed || mode.value !== 'local') return
   try {
+    const wasPending = openSshJobPending.value
     openSshJob.value = (await nativeDeviceApi.resourceJobs())
       .find(item => item.job_id === 'system-feature-openssh-server') || null
+    if (disposed || mode.value !== 'local') return
     if (openSshJobPending.value) {
       if (openSshJobTimer.value === null) openSshJobTimer.value = setInterval(() => { void refreshOpenSshJob() }, 1500)
       return
     }
     stopOpenSshJobWatch()
     const job = openSshJob.value
-    if (job?.state === 'complete' || job?.state === 'failed') await refreshOpenSshStatus()
+    if (refreshTerminalStatus && (wasPending || openSshLongWaitNotice.value)
+      && (job?.state === 'complete' || job?.state === 'failed')) await refreshOpenSshStatus()
     if (openSshLongWaitNotice.value) {
       openSshLongWaitNotice.value = false
       if (!job) {
@@ -368,7 +440,7 @@ async function enableRemoteOpenSshServer() {
 const delay = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds))
 
 async function ensureOpenSshServerReady(): Promise<OpenSshServerStatus> {
-  let current = await nativeDeviceApi.openSshServerStatus()
+  let current = openSshStatus.value?.ready ? openSshStatus.value : await nativeDeviceApi.openSshServerStatus()
   openSshStatus.value = current
   if (current.ready) return current
   const details = [
@@ -418,7 +490,7 @@ async function checkOpenSshServer() {
   openSshStatusError.value = ''
   notice.value = ''
   try {
-    const current = await nativeDeviceApi.openSshServerStatus()
+    const current = await nativeDeviceApi.openSshServerStatus(true)
     openSshStatus.value = current
     if (current.ready) {
       notice.value = `微软 OpenSSH Server 已就绪：${current.source_version || '版本未报告'}，实际监听端口 ${current.effective_port}。未重新安装或重启服务。`
@@ -435,8 +507,9 @@ async function checkOpenSshServer() {
 }
 
 async function openPairingWindow() {
-  if (busy.value || !isBroadcasting.value || !openSshStatus.value?.ready) return
-  busy.value = true; error.value = ''; notice.value = ''
+  if (controlsLocked.value || !isBroadcasting.value || !status.value?.device_runtime?.broadcast_actual) return
+  openingPairing.value = true
+  busy.value = true; error.value = ''; notice.value = '正在获取本机 SSH 公钥并生成配对码…'
   try {
     const result = await nativeDeviceApi.openPairingWindow()
     pairingCode.value = result.pairing_code
@@ -456,8 +529,8 @@ async function openPairingWindow() {
     } catch {
       notice.value = '配对窗口已开启。剪贴板不可用，请手动抄录六位配对码。'
     }
-  } catch (failure) { error.value = failure instanceof Error ? failure.message : String(failure) }
-  finally { busy.value = false }
+  } catch (failure) { notice.value = ''; error.value = failure instanceof Error ? failure.message : String(failure) }
+  finally { busy.value = false; openingPairing.value = false }
 }
 
 async function copyPairingCode() {
@@ -494,6 +567,7 @@ async function saveConfig(preserveInvalid = false): Promise<boolean> {
   }
   if (preserveInvalid && !window.confirm('先将当前无法识别的设备配置原件归档，再保存这份新配置？')) return false
   busy.value = true; error.value = ''; notice.value = ''
+  setDeviceSettingsPhase('正在应用设备设置；如出现 Windows 管理员授权，请完成授权。')
   try {
     const config: DeviceConfig = {
       schema_version: 3,
@@ -508,11 +582,15 @@ async function saveConfig(preserveInvalid = false): Promise<boolean> {
       paired_host: savedConfig?.paired_host ?? savedConfig?.host ?? null,
     }
     await nativeDeviceApi.saveDeviceConfig(config, preserveInvalid)
-    notice.value = preserveInvalid ? '新配置已保存；无法识别的原件已归档并保留。' : '设备配置已保存并开始切换。'
+    notice.value = preserveInvalid ? '新配置已保存；无法识别的原件已归档并保留。' : '设备配置已保存。'
     await refresh()
     return true
   } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : String(failure)
+    const message = failure instanceof Error ? failure.message : String(failure)
+    // 原生层可能已保存配置后才在公告发布阶段失败；重读权威配置，避免开关误回退。
+    await refresh()
+    error.value = message
+    recordDeviceSettingsError(message)
     return false
   } finally { busy.value = false }
 }
@@ -609,12 +687,20 @@ async function onRemotePreferenceChanged() {
 }
 
 async function onModeChanged() {
+  await runDeviceSettingsOperation(changeMode)
+}
+
+async function changeMode() {
   const savedMode = status.value?.device_config?.mode
   if (!status.value || savedMode === mode.value) return
   if (!await saveConfig()) mode.value = savedMode || (localCoreAvailable.value ? 'local' : 'remote')
 }
 
 async function onBroadcastChanged() {
+  await runDeviceSettingsOperation(changeBroadcast)
+}
+
+async function changeBroadcast() {
   const savedValue = status.value?.device_config?.broadcast_enabled ?? false
   if (broadcastEnabled.value && !savedValue) {
     if (broadcastPreflightBusy.value || openSshBusy.value || openSshJobPending.value) {
@@ -623,22 +709,26 @@ async function onBroadcastChanged() {
       return
     }
     broadcastPreflightBusy.value = true
+    setDeviceSettingsPhase('正在检查本机 SSH 服务，请稍候…')
     openSshStatusError.value = ''
+    error.value = ''
+    notice.value = ''
     try {
       await ensureOpenSshServerReady()
     } catch (failure) {
       broadcastEnabled.value = savedValue
       openSshStatusError.value = failure instanceof Error ? failure.message : String(failure)
+      recordDeviceSettingsError(openSshStatusError.value)
       return
     } finally {
       broadcastPreflightBusy.value = false
     }
-    if (!window.confirm('开启后将创建本程序专用的局域网规则，只允许当前活动私有子网访问微软 SSH 服务和六位码配对端口。可能需要 Windows 管理员授权。继续吗？')) {
+    if (!window.confirm('开启后将创建本程序专用的局域网规则，只允许当前活动私有或域子网访问微软 SSH 服务、六位码配对端口和多播设备发现端口。可能需要 Windows 管理员授权。继续吗？')) {
       broadcastEnabled.value = savedValue
       return
     }
   }
-  if (!await saveConfig()) broadcastEnabled.value = savedValue
+  if (!await saveConfig()) broadcastEnabled.value = status.value?.device_config?.broadcast_enabled ?? savedValue
 }
 
 async function searchForDevices() {
@@ -682,6 +772,7 @@ async function activateRemoteChannels() {
 async function pairWithSelectedDevice() {
   if (busy.value || !selectedHostId.value || !/^[0-9]{6}$/.test(pairingCodeInput.value)) return
   busy.value = true; error.value = ''; notice.value = ''
+  notice.value = '正在验证配对并登记受限公钥；服务端可能需要 Windows 管理员确认，请在服务端完成授权。'
   try {
     const result = await nativeDeviceApi.pairWithDiscoveredDevice(selectedHostId.value, pairingCodeInput.value)
     pairingCodeInput.value = ''
@@ -692,7 +783,6 @@ async function pairWithSelectedDevice() {
       return
     }
     connection.value = 'connected'
-    reconnectAttempt.value = 0
     notice.value = `已连接到 ${result.display_name}。正在准备任务与语音通道。`
     await activateRemoteChannels()
     await refresh()
@@ -714,7 +804,6 @@ async function connectHost(automatic = false) {
     const runtime = await ensureRemoteClientRuntime()
     if (runtime.state === 'waiting') throw new Error('当前设备尚未完成远程配对，不能连接服务端。')
     connection.value = 'connected'
-    reconnectAttempt.value = 0
     if (runtime.state === 'ready') {
       taskChannel.value = runtime.task.state
       taskChannelError.value = runtime.task.error || ''
@@ -737,40 +826,26 @@ async function connectHost(automatic = false) {
   } catch (failure) {
     connection.value = 'disconnected'
     if (!automatic) error.value = failure instanceof Error ? failure.message : String(failure)
-    scheduleReconnect()
   } finally {
     busy.value = false
     await refresh()
   }
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer.value !== null) clearTimeout(reconnectTimer.value)
-  if (mode.value !== 'remote' || !status.value?.device_config?.paired_host
-      || status.value.device_config.reconnect_suspended_reason) return
-  const delays = [1000, 2000, 4000, 8000, 15000]
-  const wait = delays[Math.min(reconnectAttempt.value, delays.length - 1)]
-  reconnectAttempt.value = Math.min(reconnectAttempt.value + 1, delays.length - 1)
-  reconnectTimer.value = setTimeout(() => { void connectHost(true) }, wait)
-}
-
 async function disconnectHost() {
   if (busy.value) return
   busy.value = true; error.value = ''; notice.value = ''
   try {
+    // 先保存暂停意图，后台唯一监督器不能在通道关闭间隙自动重连。
+    const saved = status.value?.device_config
+    if (saved) await nativeDeviceApi.saveDeviceConfig({ ...saved, reconnect_suspended_reason: 'user_disconnected' })
     if (mediaChannel.value === 'running') await nativeDeviceApi.remoteMediaChannel('stop')
     if (taskChannel.value === 'running') await nativeDeviceApi.remoteTaskChannel('stop')
     await nativeDeviceApi.disconnectSshHost()
-    const saved = status.value?.device_config
-    if (saved) {
-      await nativeDeviceApi.saveDeviceConfig({ ...saved, reconnect_suspended_reason: 'user_disconnected' })
-    }
     connection.value = 'disconnected'
     taskChannel.value = 'stopped'
     mediaChannel.value = 'stopped'
     mediaCaptureActive.value = null
-    if (reconnectTimer.value !== null) clearTimeout(reconnectTimer.value)
-    reconnectTimer.value = null
     notice.value = '已断开服务端连接。点击“连接服务端”可重新连接。'
     await refresh()
   } catch (failure) { error.value = failure instanceof Error ? failure.message : String(failure) }
@@ -779,18 +854,17 @@ async function disconnectHost() {
 
 onMounted(async () => {
   await refresh()
-  if (mode.value === 'remote' && status.value?.device_config?.paired_host
-      && !status.value.device_config.reconnect_suspended_reason && connection.value !== 'connected') {
-    await connectHost(true)
-  }
+  scheduleRuntimeStatusWatch()
 })
 
 onUnmounted(() => {
+  disposed = true
+  sshStatusGeneration++
+  stopRuntimeStatusWatch()
   stopOpenSshJobWatch()
   stopRemoteOpenSshStatusWatch()
   if (pairingExpiryTimer.value !== null) clearTimeout(pairingExpiryTimer.value)
   stopPairingStatusWatch()
-  if (reconnectTimer.value !== null) clearTimeout(reconnectTimer.value)
 })
 </script>
 
@@ -801,15 +875,16 @@ onUnmounted(() => {
       <span class="role-state" :data-state="status?.runtime.config_state || 'loading'">{{ status?.runtime.config_state === 'valid' ? '配置有效' : status?.runtime.config_state === 'invalid' ? '配置需处理' : localCoreAvailable ? '本地运行' : '远程待配对' }}</span>
     </header>
 
-    <p v-if="error" class="device-message error" role="alert">{{ error }}</p>
+    <p v-if="deviceOperationError" class="device-message error" role="alert">{{ deviceOperationError }}</p>
+    <p v-if="deviceOperationPending" class="device-message" role="status">{{ broadcastPhaseLabel }} 切换页面不会取消任务。</p>
     <p v-if="notice" class="device-message" role="status">{{ notice }}</p>
     <p v-if="status?.runtime.error" class="device-message warning">{{ status.runtime.error }} 原文件已保留，未自动覆盖。</p>
     <p v-if="!localCoreAvailable && mode === 'local'" class="device-message warning">当前工作区未配置本机核心运行组件。请选择“远程配对”；无组件客户端不会启动本机语音核心。</p>
     <p v-if="status?.device_runtime" class="device-message" role="status">
-      目标模式：{{ status.device_runtime.expected_mode === 'remote' ? '远程配对' : '本地运行' }}；实际模式：{{ status.device_runtime.actual_mode === 'remote' ? '远程配对' : status.device_runtime.actual_mode === 'local' ? '本地运行' : '尚未就绪' }}；阶段：{{ status.device_runtime.switch_phase || '未知' }}。{{ status.device_runtime.actual_mode === 'remote' ? '管理连接和语音核心就绪状态分别显示。' : status.device_runtime.core_ready ? '本机语音核心已就绪。' : '本机语音核心尚未就绪。' }}
+      目标模式：{{ status.device_runtime.expected_mode === 'remote' ? '远程配对' : '本地运行' }}；实际模式：{{ status.device_runtime.actual_mode === 'remote' ? '远程配对' : status.device_runtime.actual_mode === 'local' ? '本地运行' : '尚未就绪' }}；阶段：{{ ({ ready: '已就绪', waiting_for_remote: '等待服务端', starting_local: '正在启动本地服务', stopped: '未运行', failed: '启动失败' })[status.device_runtime.switch_phase || 'stopped'] }}。{{ status.device_runtime.expected_mode === 'remote' ? '管理连接和服务端语音核心就绪状态分别显示。' : status.device_runtime.core_ready ? '本机语音核心已就绪。' : '本机语音核心尚未就绪。' }}
     </p>
 
-    <fieldset :disabled="loading || busy || openSshBusy || openSshJobPending">
+    <fieldset :disabled="controlsLocked">
       <label>运行模式
         <select v-model="mode" @change="onModeChanged">
           <option value="local" :disabled="!localCoreAvailable">本地运行</option>
@@ -820,19 +895,24 @@ onUnmounted(() => {
     </fieldset>
     <section v-if="mode === 'local'" class="device-card">
       <h3>局域网连接</h3>
+      <p class="broadcast-status" role="status" aria-live="polite" :aria-busy="busy || broadcastPreflightBusy">
+        <span class="connection-state" :data-state="broadcastRuntimeError ? 'error' : status?.device_runtime?.broadcast_actual ? 'connected' : 'disconnected'">{{ broadcastPhaseLabel }}</span>
+      </p>
+      <p v-if="broadcastRuntimeError && !busy && !broadcastPreflightBusy" class="device-message error" role="alert">{{ broadcastRuntimeError }}</p>
       <label class="device-toggle"><span><strong>广播并接受配对</strong><small>开启后本机出现在局域网搜索结果中，并接受六位码配对。</small></span>
-        <input v-model="broadcastEnabled" type="checkbox" aria-label="广播并接受配对" :disabled="broadcastPreflightBusy || busy || loading || openSshBusy || openSshJobPending" @change="onBroadcastChanged" />
+        <input v-model="broadcastEnabled" type="checkbox" aria-label="广播并接受配对" :disabled="broadcastPreflightBusy || controlsLocked" @change="onBroadcastChanged" />
       </label>
       <div class="button-row">
-        <button class="outline-button" :disabled="busy || loading || broadcastPreflightBusy || openSshBusy || openSshStatusLoading || openSshJobPending" @click="checkOpenSshServer">检查 SSH 服务</button>
-        <button v-if="isBroadcasting" class="primary-button" :disabled="busy || loading || !openSshStatus?.ready || !openSshStatus.project_access_valid || !openSshStatus.pairing_access_valid" @click="openPairingWindow">获取配对码</button>
-        <button v-if="pairingCode" class="outline-button" :disabled="busy" @click="closePairingWindow">关闭配对窗口</button>
+        <button class="outline-button" :disabled="controlsLocked || broadcastPreflightBusy || openSshStatusLoading" @click="checkOpenSshServer">{{ openSshStatusLoading ? '正在读取 SSH 状态…' : '检查 SSH 服务' }}</button>
+        <button v-if="isBroadcasting" class="primary-button" :disabled="controlsLocked || broadcastPreflightBusy || !status?.device_runtime?.broadcast_actual" @click="openPairingWindow">获取配对码</button>
+        <button v-if="pairingCode" class="outline-button" :disabled="controlsLocked" @click="closePairingWindow">关闭配对窗口</button>
       </div>
       <p v-if="openSshStatus" class="small-text" role="status">
         官方程序：{{ openSshStatus.official_binary ? '微软签名已验证' : '未验证' }}；版本：{{ openSshStatus.source_version || '未检测到' }}；路径：{{ openSshStatus.source_path || '未检测到' }}。
         服务：{{ openSshStatus.service_present ? (openSshStatus.service_state || '状态未知') : '不存在' }}；有效端口：{{ openSshStatus.effective_port ?? '未验证' }}；实际监听：{{ openSshStatus.listening_ports?.join(', ') || '无' }}。
       </p>
       <p v-if="openSshStatus" class="small-text">当前账户公钥：{{ openSshStatus.authorized_keys_exists ? openSshStatus.authorized_keys_path : '尚未创建' }}；本程序 SSH 规则：{{ openSshStatus.project_access_valid ? openSshStatus.project_network_scope.join(', ') : openSshStatus.project_access_enabled ? '已启用但范围或端口未通过复核' : '未启用' }}；配对规则：{{ openSshStatus.pairing_access_valid ? '已通过程序、端口和子网复核' : openSshStatus.pairing_access_enabled ? '已启用但未通过复核' : '未启用' }}。</p>
+      <p v-if="openSshStatus" class="small-text">多播发现规则：{{ openSshStatus.discovery_access_valid ? '已通过程序、端口和子网复核' : openSshStatus.discovery_access_enabled ? '已启用但未通过复核' : '未启用' }}。</p>
       <details v-if="openSshStatus?.existing_ssh_inbound_rules.length" class="device-message warning ssh-rule-details">
         <summary>检测到 {{ openSshStatus.existing_ssh_inbound_rules.length }} 条可能涉及 SSH 的其他入站规则。本程序只读报告，不会修改原规则。展开查看摘要。</summary>
         <ul>
@@ -843,7 +923,7 @@ onUnmounted(() => {
       <p v-if="status?.device_runtime" class="small-text">广播意图：{{ status.device_runtime.broadcast_requested ? '开启' : '关闭' }}；mDNS 公告：{{ status.device_runtime.broadcast_actual ? '已发布' : '未发布' }}。</p>
       <p class="small-text">“检查 SSH 服务”先只读检查。服务未就绪时会说明缺口，并在你同意后通过 Windows 官方功能安装或启动；误取消后可再次点击。</p>
       <p v-if="openSshStatusError" :class="['device-message', openSshLongWaitNotice ? 'warning' : 'error']" :role="openSshLongWaitNotice ? 'status' : 'alert'">{{ openSshStatusError }}</p>
-      <p v-if="openSshJob" class="small-text" role="status">任务状态：{{ localOpenSshJobStateLabel(openSshJob.state) }}；{{ openSshJob.phase }}<span v-if="openSshJob.error">：{{ openSshJob.error }}</span></p>
+      <p v-if="visibleOpenSshJob" class="small-text" role="status">任务状态：{{ localOpenSshJobStateLabel(visibleOpenSshJob.state) }}；{{ visibleOpenSshJob.phase }}<span v-if="visibleOpenSshJob.error">：{{ visibleOpenSshJob.error }}</span></p>
       <div v-if="pairingCode" class="pairing-code-box" role="status">
         <span>本机六位配对码 · 有效至 {{ new Date(pairingExpiresAt).toLocaleTimeString() }}</span>
         <output>{{ pairingCode }}</output>
@@ -934,8 +1014,8 @@ onUnmounted(() => {
       <div class="button-row">
         <span class="connection-state" :data-state="connection">管理连接：{{ connection === 'connected' ? '已连接' : connection === 'unavailable' ? '当前构建不支持' : '已断开' }}</span>
         <span class="connection-state" :data-state="remoteCoreState">语音核心：{{ remoteCoreState === 'ready' ? '就绪' : remoteCoreState === 'starting' ? '准备中' : remoteCoreState === 'unavailable' ? '暂不可用' : '状态未知' }}</span>
-        <span class="connection-state" :data-state="taskChannel">服务端任务：{{ taskChannel === 'running' ? '已就绪' : taskChannel === 'error' ? '错误' : '准备中' }}</span>
-        <span class="connection-state" :data-state="mediaChannel">服务端语音：{{ mediaChannel === 'running' ? '已就绪' : mediaChannel === 'error' ? '错误' : '准备中' }}</span>
+        <span class="connection-state" :data-state="taskChannel">服务端任务：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : taskChannel === 'running' ? '已就绪' : taskChannel === 'error' ? '错误' : '准备中' }}</span>
+        <span class="connection-state" :data-state="mediaChannel">服务端语音：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : mediaChannel === 'running' ? '已就绪' : mediaChannel === 'error' ? '错误' : '准备中' }}</span>
         <span v-if="mediaChannel === 'running'" class="interaction-state">{{ mediaCaptureActive ? '服务端已请求麦克风采集' : '当前未采集麦克风' }}</span>
       </div>
       <p v-if="taskChannelError || mediaChannelError" class="device-message warning">{{ taskChannelError || mediaChannelError }}</p>
@@ -954,6 +1034,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.broadcast-status{margin:14px 0}.broadcast-status .connection-state{display:inline-block;white-space:normal}.connection-state[data-state=error]{color:#ffc5b8;border-color:#825333}.device-settings label.device-toggle{flex-direction:row;align-items:center;justify-content:space-between;gap:20px}.device-toggle>span{display:grid;gap:5px}.device-toggle small{color:#9aa9bf;line-height:1.6}.device-settings .device-toggle input[type=checkbox]{width:18px;height:18px;flex:0 0 18px;margin:0;padding:0;accent-color:#8ba5f5}
 .system-feature-status{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}.system-feature-status div{display:grid;gap:6px;padding:12px;border:1px solid #344157;border-radius:9px;background:rgba(17,26,41,.6)}.system-feature-status span{font-size:11px;color:#9aa9bf}.system-feature-status strong{font-size:13px;color:#dce5f4;overflow-wrap:anywhere}@media(max-width:700px){.system-feature-status{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .device-settings{padding:24px;max-width:900px;margin:0 auto;color:var(--text,#e5eaf3)}.device-heading{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:20px}.eyebrow{font-size:11px;letter-spacing:.14em;color:#8c9bb4}.device-heading h2{margin:5px 0 8px;font-size:24px}.device-heading p{max-width:640px;color:#aab4c5;line-height:1.65}.role-state,.connection-state{border:1px solid #344157;border-radius:999px;padding:7px 12px;color:#aebad0;font-size:12px;white-space:nowrap}.role-state[data-state=valid],.connection-state[data-state=connected]{color:#8ee0c0;border-color:#286c5a}.role-state[data-state=invalid]{color:#ffbe8b;border-color:#825333}.device-settings fieldset,.device-card{border:1px solid #273348;border-radius:14px;padding:18px;margin:14px 0;background:rgba(18,25,38,.54)}fieldset{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.device-settings label{display:flex;flex-direction:column;gap:7px;font-size:13px;color:#b8c4d6;margin:12px 0}.device-settings input,.device-settings select,.device-settings textarea{width:100%;border:1px solid #35435a;border-radius:8px;background:#111a29;color:#e8edf6;padding:10px 11px;min-width:0}.device-settings textarea{resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}.device-card h3{margin:4px 0 8px;font-size:16px}.device-card p{color:#aab4c5;line-height:1.65}.device-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(120px,1fr);gap:14px}.button-row{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}.device-settings button{border-radius:8px;padding:9px 13px;cursor:pointer}.device-settings button:disabled{opacity:.48;cursor:not-allowed}.primary-button{background:#6686df;color:white;border:1px solid #7b9aeb}.outline-button,.quiet-button{background:transparent;color:#cdd7e8;border:1px solid #3a4962}.quiet-button{color:#aab4c5}.candidate-box{display:grid;gap:8px;padding:12px;border:1px solid #785f35;border-radius:10px;background:#211e18;color:#e1c78e}.candidate-box code,.fingerprint code,.small-text code,.remote-device-title code{overflow-wrap:anywhere}.small-text{font-size:12px}.fingerprint{font-size:13px;color:#d9e4f5}.device-footer{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding-top:12px}.device-footer .button-row{margin:0}.device-message{padding:11px 14px;border-radius:9px;background:#1c2b3e;color:#c7d7f0}.device-message.error{background:#422727;color:#ffc5b8}.device-message.warning{background:#392f1d;color:#efce8b}.remote-device-list{margin-top:20px;border-top:1px solid #273348;padding-top:16px}.remote-list-heading,.remote-device-title{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.remote-list-heading{justify-content:space-between}.remote-list-heading h3{margin:0}.remote-list-heading span,.device-generation{font-size:12px;color:#9aa9bf}.remote-device-row{padding:13px 0;border-bottom:1px solid #273348}.remote-device-title strong{font-size:14px}.remote-device-title code{font-size:12px;color:#aab4c5}.remote-device-title .connection-state{margin-left:auto}.interaction-state,.remote-device-capabilities span{border:1px solid #355a54;border-radius:999px;padding:4px 9px;color:#9bdec6;font-size:11px}.remote-device-capabilities{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0}.remote-device-capabilities span{border-color:#344157;color:#c4d0e2}.device-generation{display:block}.pairing-code-box{display:grid;gap:8px;border:1px solid #785f35;border-radius:10px;padding:14px;background:#211e18;color:#e1c78e}.pairing-code-box output{font:700 28px ui-monospace,Consolas,monospace;letter-spacing:.18em;color:#fff}.pairing-code-box small{color:#cdbb97}.pairing-duration{max-width:180px}.pairing-duration input{max-width:140px}@media(max-width:700px){.device-settings{padding:16px}fieldset{grid-template-columns:1fr}.device-heading{display:block}.device-grid{grid-template-columns:1fr}.device-footer{align-items:flex-start;flex-direction:column}}
 .ssh-rule-details{overflow-wrap:anywhere;word-break:break-word}.ssh-rule-details>summary{cursor:pointer;font-weight:600;line-height:1.5}.ssh-rule-details ul{max-height:120px;overflow:auto;margin:8px 0 0;padding-left:20px}.ssh-rule-details li{font-size:12px;line-height:1.5;overflow-wrap:anywhere;word-break:break-word}.ssh-rule-details p{margin:8px 0 0;font-size:12px}

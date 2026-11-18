@@ -96,6 +96,18 @@ class WebTests(unittest.TestCase):
         self.assertFalse(self.app._shared_host_role_is_saved())
         self.assertEqual(path.read_bytes(), original)
 
+    def test_current_broadcast_role_is_independent_of_launch_flag_and_keeps_saved_remote_host(self):
+        path = self.app.paths.config / "device-runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = {"schema_version": 3, "device_id": "host-a", "desired_role": "shared_host",
+                 "mode": "local", "broadcast_enabled": True, "audio_mode": "pcm",
+                 "paired_host": {"host_id": "previous-remote-host"}}
+        path.write_text(json.dumps(value), encoding="utf-8")
+        standalone = ApplicationHost(Path(self.directory.name))
+        self.assertTrue(standalone._shared_host_role_is_saved())
+        path.write_text(json.dumps({**value, "broadcast_enabled": False}), encoding="utf-8")
+        self.assertFalse(standalone._shared_host_role_is_saved())
+
     def test_saved_shared_host_configuration_requires_explicit_gateway_launch_flag(self):
         path = self.app.paths.config / "device-runtime.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1177,3 +1189,19 @@ time.sleep(60)
                 if owner.poll() is None:
                     owner.kill()
                     owner.wait(timeout=5)
+
+
+
+def test_startup_snapshot_cleanup_only_removes_the_current_instance(tmp_path):
+    from voice_terminal.application.launch import remove_owned_startup_result
+    import os
+    path = tmp_path / "startup-result.json"
+    path.write_text(json.dumps({"pid": os.getpid(), "instance_id": "old"}), encoding="utf-8")
+    remove_owned_startup_result(path, "new")
+    assert path.exists()
+    path.write_text(json.dumps({"pid": os.getpid(), "instance_id": "new"}), encoding="utf-8")
+    remove_owned_startup_result(path, "new")
+    assert not path.exists()
+    path.write_bytes(b"{broken")
+    remove_owned_startup_result(path, "new")
+    assert path.read_bytes() == b"{broken"

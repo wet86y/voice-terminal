@@ -3,7 +3,24 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { nativeDeviceApi } from './native-device-api'
 
 afterEach(() => {
+  vi.restoreAllMocks()
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+})
+
+describe('远程管理会话生命周期', () => {
+  it('断开后的迟到管理状态不能复活旧会话', async () => {
+    let complete!: (value: unknown) => void
+    const pending = new Promise(resolve => { complete = resolve })
+    const invoke = vi.fn(async (command: string) => command === 'device_config_status'
+      ? { runtime: { mode: 'remote' }, device_config: { mode: 'remote', paired_host: { host_id: 'server-a' } } }
+      : command === 'device_ssh_management_request' ? pending : { state: 'disconnected', disconnected: true, fields: {} })
+    window.__TAURI_INTERNALS__ = { invoke: invoke as never }
+    const result = nativeDeviceApi.remoteManagementRequest('management.status', {})
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    await nativeDeviceApi.disconnectSshHost()
+    complete({ status: 200, fields: {} })
+    await expect(result).rejects.toThrow('已丢弃旧管理状态')
+  })
 })
 
 describe('nativeDeviceApi.enableOpenSshServer（本机 SSH 准备确认）', () => {

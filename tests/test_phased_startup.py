@@ -25,29 +25,14 @@ def runtime(tmp_path, monkeypatch):
 
 
 def test_device_gateway_listener_is_opt_in_and_port_conflict_does_not_abort_core(monkeypatch):
-    from apps.server import main as server
-    listener = Mock()
-    bind = Mock(return_value=(listener, 18_765))
-    monkeypatch.setattr(server, "bind_loopback", bind)
-
-    disabled, error = server._bind_device_gateway_listener(False)
-    assert disabled is None and error is None
+    from voice_terminal.server import device_gateway
+    bind = Mock()
+    monkeypatch.setattr(device_gateway, "bind_loopback", bind)
+    runtime = SimpleNamespace(_device_gateway_enabled=False, _device_gateway_bind_error=None)
+    gateway = device_gateway.DeviceGateway(Mock(), runtime)
     bind.assert_not_called()
-
-    bound, error = server._bind_device_gateway_listener(True)
-    assert bound is listener and error is None
-    bind.assert_called_once_with(18_765, host="127.0.0.1")
-
-    occupied = Mock()
-    bind.reset_mock()
-    bind.return_value = (occupied, 18_766)
-    bound, error = server._bind_device_gateway_listener(True)
-    assert bound is None and error == "设备回环网关端口已占用。"
-    occupied.close.assert_called_once_with()
-
-    bind.side_effect = OSError(10048, "occupied")
-    bound, error = server._bind_device_gateway_listener(True)
-    assert bound is None and error == "设备回环网关不可用：OSError"
+    assert asyncio.run(gateway.set_enabled(False)) == {"enabled": False, "ready": False, "error": None}
+    bind.assert_not_called()
 
 
 def test_health_payload_reports_device_gateway_readiness(runtime):
@@ -361,4 +346,78 @@ def test_reinitialize_reports_asr_session_when_other_voice_core_services_are_mis
         assert services["llm"] == "ERROR"
         assert services["tts"] == "ERROR"
 
+    asyncio.run(run())
+
+
+def test_gateway_toggle_keeps_core_and_lifespan_and_closes_its_connections():
+    from voice_terminal.server.device_gateway import DeviceGateway
+    from voice_terminal.application.ports import bind_loopback
+    listener, port = bind_loopback(0)
+    listener.close()
+    events = []
+    runtime = SimpleNamespace(_device_gateway_enabled=False, _device_gateway_bind_error=None)
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            events.append("unexpected-model-lifecycle")
+            raise AssertionError("网关不得重新初始化或关闭语音核心")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"same-core"})
+    async def run():
+        gateway = DeviceGateway(app, runtime, port=port)
+        try:
+            assert (await gateway.set_enabled(True))["ready"]
+            original_task = gateway.task
+            assert (await gateway.set_enabled(True))["ready"]
+            assert gateway.task is original_task
+            async with httpx.AsyncClient() as client:
+                assert (await client.get(f"http://127.0.0.1:{port}/health")).text == "same-core"
+            assert (await gateway.set_enabled(False)) == {"enabled": False, "ready": False, "error": None}
+            assert original_task.done()
+            assert runtime._device_gateway_listener_socket is None
+            with pytest.raises(OSError):
+                await asyncio.open_connection("127.0.0.1", port)
+            assert (await gateway.set_enabled(True))["ready"]
+        finally:
+            await gateway.set_enabled(False)
+        assert not events
+    asyncio.run(run())
+
+
+def test_gateway_port_conflict_can_retry_without_restarting_core():
+    from voice_terminal.server.device_gateway import DeviceGateway
+    from voice_terminal.application.ports import bind_loopback
+    occupied, port = bind_loopback(0)
+    runtime = SimpleNamespace(_device_gateway_enabled=False, _device_gateway_bind_error=None)
+    async def app(scope, receive, send):
+        raise AssertionError("冲突失败不应初始化业务")
+    async def run():
+        gateway = DeviceGateway(app, runtime, port=port)
+        blocked = await gateway.set_enabled(True)
+        assert not blocked["ready"] and "占用" in blocked["error"]
+        assert gateway.socket is None and gateway.task is None
+        occupied.close()
+        assert (await gateway.set_enabled(True))["ready"]
+        await gateway.set_enabled(False)
+    try:
+        asyncio.run(run())
+    finally:
+        occupied.close()
+
+
+def test_gateway_control_requires_private_host_token_and_bounded_fields(runtime, monkeypatch):
+    runtime._device_gateway = SimpleNamespace(set_enabled=AsyncMock(return_value={"enabled": True, "ready": True, "error": None}))
+    monkeypatch.setenv("VOICE_APP_INTERNAL_TOKEN", "isolated-test-token")
+    app = create_app(runtime)
+    async def run():
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            path = "/internal/application/device-gateway"
+            assert (await client.post(path, json={"enabled": True, "host_id": "host-a"})).status_code == 403
+            headers = {"authorization": "Bearer isolated-test-token"}
+            for value in ({"enabled": "true", "host_id": "host-a"}, {"enabled": True, "host_id": "bad id"}, {"enabled": True}):
+                assert (await client.post(path, json=value, headers=headers)).status_code == 422
+            result = await client.post(path, json={"enabled": True, "host_id": "host-a"}, headers=headers)
+            assert result.status_code == 200 and result.json()["ready"]
+            assert runtime.device_host_id == "host-a"
+            runtime._device_gateway.set_enabled.assert_awaited_once_with(True)
     asyncio.run(run())

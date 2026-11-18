@@ -23,7 +23,10 @@ const lastOwnedInteraction = new Map<string, LastOwnedInteraction>()
 function remoteClientScope(hostId: string, deviceId: string) { return `${hostId}\u0000${deviceId}` }
 
 async function suspendTakenOverClient(config: NonNullable<Awaited<ReturnType<typeof nativeDeviceApi.deviceConfigStatus>>['device_config']>) {
-  await nativeDeviceApi.saveDeviceConfig({ ...config, reconnect_suspended_reason: 'device_taken_over' })
+  const current = (await nativeDeviceApi.deviceConfigStatus()).device_config
+  if (!current || current.mode !== 'remote' || current.device_id !== config.device_id
+    || current.paired_host?.host_id !== config.paired_host?.host_id) return
+  await nativeDeviceApi.saveDeviceConfig({ ...current, reconnect_suspended_reason: 'device_taken_over' })
   lastOwnedInteraction.delete(remoteClientScope(config.paired_host?.host_id ?? '', config.device_id))
   // stop（停止）在管道租约可能已过期时允许失败；先持久化暂停原因，避免清理错误触发自动重连。
   await Promise.allSettled([

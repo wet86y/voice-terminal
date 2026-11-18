@@ -82,6 +82,7 @@ pub fn app_integrity_download(
         &state.workspace_busy,
         &state.app_update.busy,
         true,
+        Some(&state.device_operation),
     )?;
     state.app_update.cancel.store(false, Ordering::Release);
     let action = MaintenanceAction::DownloadIntegrity;
@@ -142,6 +143,7 @@ pub fn app_integrity_check(
         &state.workspace_busy,
         &state.app_update.busy,
         true,
+        Some(&state.device_operation),
     )?;
     state.app_update.cancel.store(false, Ordering::Release);
     let action = MaintenanceAction::CheckIntegrity;

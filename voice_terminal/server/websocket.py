@@ -3405,7 +3405,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             "wake_keyword": self.config.wake.keyword,
             "wake_keywords": list(self.config.wake.keywords),
             "runtime": dict(self.build_info),
-            "device_gateway": {
+            "device_gateway": self._device_gateway.status() if getattr(self, "_device_gateway", None) is not None else {
                 "enabled": getattr(self, "_device_gateway_enabled", False) is True,
                 "ready": gateway_socket is not None,
                 "error": gateway_error,

@@ -89,6 +89,13 @@ class DesktopControl:
             with self._pending_device_calls_lock:
                 self._pending_device_calls.pop(request_id, None)
 
+    async def _set_device_gateway(self, request_id: int, enabled: bool) -> None:
+        try:
+            result = await self.application.set_device_gateway(enabled)
+            self.send("device_gateway_result", request_id=request_id, ok=True, status=result)
+        except Exception as exc:
+            self.send("device_gateway_result", request_id=request_id, ok=False, error=str(exc)[:240])
+
     def _settle_device_helper(self, message: dict) -> None:
         request_id = message.get("request_id")
         if not isinstance(request_id, str):
@@ -135,6 +142,11 @@ class DesktopControl:
                 if kind == "shutdown":
                     self.stop(int(message.get("budget_ms", 14000)))
                     return
+                if kind == "set_device_gateway":
+                    if type(message.get("request_id")) is int and type(message.get("enabled")) is bool:
+                        asyncio.run_coroutine_threadsafe(
+                            self._set_device_gateway(message["request_id"], message["enabled"]), self.application.loop)
+                    continue
                 if kind == "device_helper_response":
                     loop = self.application.loop
                     if loop is not None:

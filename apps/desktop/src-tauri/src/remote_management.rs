@@ -297,6 +297,11 @@ impl RemoteManagementService {
             };
             let request: RemoteManagementRequest = serde_json::from_slice(&bytes)
                 .map_err(|_| "远程管理操作 JSON 格式无效；连接已关闭。")?;
+            if request.session_generation != open_response.session_generation {
+                return Err("管理操作代次不属于当前已认证连接，已拒绝请求。".into());
+            }
+            // 持续管理通道每次操作重新确认当前构建与设备信任，撤销后不能继续使用旧连接。
+            self.validate_bridge_identity(&prelude)?;
             let response = self.dispatch_request(request);
             write_json_line(
                 &mut writer
@@ -310,118 +315,13 @@ impl RemoteManagementService {
 
     /// dispatch_request（分派固定资源操作）：不转发到 Python 网关或任意 URL。
     pub fn dispatch_request(&self, request: RemoteManagementRequest) -> RemoteManagementResponse {
-        let invalid = request.validate().err();
-        if let Some(error) = invalid {
-            return response(&request, 400, error_body(error));
-        }
-        if request.target_host_id != self.target_host_id {
-            return response(
-                &request,
-                403,
-                error_body("请求目标服务端与当前原生管理服务不匹配。"),
-            );
-        }
-        let client_device_id = {
-            let Ok(mut state) = self.state.lock() else {
-                return response(&request, 503, error_body("远程管理会话状态不可用。"));
-            };
-            loop {
-                prune_state(&mut state);
-                let Some(session) = state.sessions.get(&request.session_generation) else {
-                    return response(
-                        &request,
-                        410,
-                        error_body("管理会话代次不存在或已过期，请重新建立管理会话。"),
-                    );
-                };
-                if session.expires_at <= Instant::now() {
-                    return response(
-                        &request,
-                        410,
-                        error_body("管理会话已过期，请重新建立管理会话。"),
-                    );
-                }
-                if session.client_device_id.is_empty() {
-                    return response(&request, 403, error_body("管理会话缺少已认证客户端身份。"));
-                }
-                let client_device_id = session.client_device_id.clone();
-                if let Some(previous) = state.requests.get(&request.request_id) {
-                    if previous.client_device_id == client_device_id
-                        && same_operation(&previous.request, &request)
-                    {
-                        return response(
-                            &request,
-                            previous.response.status,
-                            previous.response.body.clone(),
-                        );
-                    }
-                    return response(
-                        &request,
-                        409,
-                        error_body("同一操作编号已用于不同请求参数。"),
-                    );
-                }
-                if let Some(previous) = state.inflight.get(&request.request_id) {
-                    if previous.client_device_id != client_device_id
-                        || !same_operation(&previous.request, &request)
-                    {
-                        return response(
-                            &request,
-                            409,
-                            error_body("同一执行中操作编号已用于不同请求参数。"),
-                        );
-                    }
-                    state = match self.requests_changed.wait(state) {
-                        Ok(state) => state,
-                        Err(_) => {
-                            return response(&request, 503, error_body("远程管理请求状态不可用。"))
-                        }
-                    };
-                    continue;
-                }
-                if state.requests.len().saturating_add(state.inflight.len()) >= MAX_REQUEST_RESULTS
-                {
-                    return response(&request, 429, error_body("远程管理操作幂等记录容量已满。"));
-                }
-                state.inflight.insert(
-                    request.request_id.clone(),
-                    InFlightRequest {
-                        request: request.clone(),
-                        client_device_id: client_device_id.clone(),
-                    },
-                );
-                break client_device_id;
-            }
-        };
-
-        let (status, body) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.dispatch_resource_operation(&request, &client_device_id)
-        }))
-        .unwrap_or_else(|_| {
-            (
-                500,
-                error_body("原生资源操作异常退出；请查询原任务后再决定是否重试。"),
-            )
-        });
-        let result = response(&request, status, body);
-        if let Ok(mut state) = self.state.lock() {
-            state.inflight.remove(&request.request_id);
-            prune_state(&mut state);
-            if state.requests.len() < MAX_REQUEST_RESULTS {
-                let request_id = request.request_id.clone();
-                state.requests.insert(
-                    request_id,
-                    RequestResult {
-                        request,
-                        response: result.clone(),
-                        client_device_id,
-                        expires_at: Instant::now() + REQUEST_RESULT_TTL,
-                    },
-                );
-            }
-            self.requests_changed.notify_all();
-        }
-        result
+        dispatch_with_ledger(
+            &self.target_host_id,
+            &self.state,
+            &self.requests_changed,
+            request,
+            |request, client| self.dispatch_resource_operation(request, client),
+        )
     }
 
     fn validate_bridge_identity(&self, prelude: &DeviceBridgePrelude) -> Result<(), String> {
@@ -501,7 +401,7 @@ impl RemoteManagementService {
             OpenResult {
                 request,
                 response: response.clone(),
-                expires_at: now + REQUEST_RESULT_TTL,
+                expires_at,
             },
         );
         Ok(response)
@@ -518,7 +418,7 @@ impl RemoteManagementService {
                 (200, self.manager.remote_management_status())
             }
             "system.ssh.status" if exact_keys(args, &[], &[]) => {
-                match self.manager.open_ssh_server_status() {
+                match self.manager.open_ssh_server_status(false) {
                     Ok(status) => (
                         200,
                         ssh_status_payload(json!(status), ssh_server_job(&self.manager)),
@@ -535,7 +435,7 @@ impl RemoteManagementService {
                         error_body("启用 OpenSSH Server 必须提供 confirmed: true 的明确用户确认。"),
                     );
                 }
-                let status = match self.manager.open_ssh_server_status() {
+                let status = match self.manager.open_ssh_server_status(true) {
                     Ok(status) => status,
                     Err(error) => return (503, error_body(error)),
                 };
@@ -980,6 +880,146 @@ fn same_operation(left: &RemoteManagementRequest, right: &RemoteManagementReques
         && left.arguments == right.arguments
 }
 
+/// dispatch_with_ledger（管理请求准入与幂等账本）：只读状态不挤占写入记录。
+fn dispatch_with_ledger(
+    target_host_id: &str,
+    state_lock: &Mutex<ServiceState>,
+    requests_changed: &Condvar,
+    request: RemoteManagementRequest,
+    dispatch: impl FnOnce(&RemoteManagementRequest, &str) -> (u16, Value),
+) -> RemoteManagementResponse {
+    let invalid = request.validate().err();
+    if let Some(error) = invalid {
+        return response(&request, 400, error_body(error));
+    }
+    if request.target_host_id != target_host_id {
+        return response(
+            &request,
+            403,
+            error_body("请求目标服务端与当前原生管理服务不匹配。"),
+        );
+    }
+    let cache_result = !read_only_operation(&request.operation);
+    let client_device_id = {
+        let Ok(mut state) = state_lock.lock() else {
+            return response(&request, 503, error_body("远程管理会话状态不可用。"));
+        };
+        loop {
+            prune_state(&mut state);
+            let Some(session) = state.sessions.get(&request.session_generation) else {
+                return response(
+                    &request,
+                    410,
+                    error_body("管理会话代次不存在或已过期，请重新建立管理会话。"),
+                );
+            };
+            if session.expires_at <= Instant::now() {
+                return response(
+                    &request,
+                    410,
+                    error_body("管理会话已过期，请重新建立管理会话。"),
+                );
+            }
+            if session.client_device_id.is_empty() {
+                return response(&request, 403, error_body("管理会话缺少已认证客户端身份。"));
+            }
+            let client_device_id = session.client_device_id.clone();
+            if let Some(previous) = state.requests.get(&request.request_id) {
+                if previous.client_device_id == client_device_id
+                    && same_operation(&previous.request, &request)
+                {
+                    return response(
+                        &request,
+                        previous.response.status,
+                        previous.response.body.clone(),
+                    );
+                }
+                return response(
+                    &request,
+                    409,
+                    error_body("同一操作编号已用于不同请求参数。"),
+                );
+            }
+            if let Some(previous) = state.inflight.get(&request.request_id) {
+                if previous.client_device_id != client_device_id
+                    || !same_operation(&previous.request, &request)
+                {
+                    return response(
+                        &request,
+                        409,
+                        error_body("同一执行中操作编号已用于不同请求参数。"),
+                    );
+                }
+                state = match requests_changed.wait(state) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return response(&request, 503, error_body("远程管理请求状态不可用。"))
+                    }
+                };
+                continue;
+            }
+            // 只读补查必须读取最新状态，也不能占满有副作用操作的幂等结果表。
+            if !cache_result {
+                break client_device_id;
+            }
+            if state.requests.len().saturating_add(state.inflight.len()) >= MAX_REQUEST_RESULTS {
+                return response(&request, 429, error_body("远程管理操作幂等记录容量已满。"));
+            }
+            state.inflight.insert(
+                request.request_id.clone(),
+                InFlightRequest {
+                    request: request.clone(),
+                    client_device_id: client_device_id.clone(),
+                },
+            );
+            break client_device_id;
+        }
+    };
+
+    let (status, body) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch(&request, &client_device_id)
+    }))
+    .unwrap_or_else(|_| {
+        (
+            500,
+            error_body("原生资源操作异常退出；请查询原任务后再决定是否重试。"),
+        )
+    });
+    let result = response(&request, status, body);
+    if cache_result {
+        if let Ok(mut state) = state_lock.lock() {
+            state.inflight.remove(&request.request_id);
+            prune_state(&mut state);
+            if state.requests.len() < MAX_REQUEST_RESULTS {
+                let request_id = request.request_id.clone();
+                state.requests.insert(
+                    request_id,
+                    RequestResult {
+                        request,
+                        response: result.clone(),
+                        client_device_id,
+                        expires_at: Instant::now() + REQUEST_RESULT_TTL,
+                    },
+                );
+            }
+            requests_changed.notify_all();
+        }
+    }
+    result
+}
+
+/// read_only_operation（无副作用的状态读取）：计划生成、授权及写入仍保留幂等结果。
+fn read_only_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "management.status"
+            | "resource.inventory"
+            | "resource.jobs"
+            | "resource.job.read"
+            | "system.ssh.status"
+    )
+}
+
 fn response(
     request: &RemoteManagementRequest,
     status: u16,
@@ -1123,6 +1163,106 @@ fn write_json_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_stays_fresh_beyond_ledger_capacity_and_preserves_write_replay() {
+        let ledger = Mutex::new(ServiceState {
+            next_generation: 10,
+            sessions: HashMap::from([(
+                9,
+                ManagedSession {
+                    client_device_id: "client-a".into(),
+                    expires_at: Instant::now() + SESSION_TTL,
+                },
+            )]),
+            opens: HashMap::new(),
+            inflight: HashMap::new(),
+            requests: HashMap::new(),
+        });
+        let changed = Condvar::new();
+        let request = |id: usize, operation: &str| RemoteManagementRequest {
+            protocol_version: 1,
+            request_id: format!("{id:032x}"),
+            target_host_id: "server-a".into(),
+            session_generation: 9,
+            operation: operation.into(),
+            arguments: json!({}),
+            fields: std::collections::BTreeMap::from([
+                ("protocol_version".into(), "协议版本".into()),
+                ("request_id".into(), "请求编号".into()),
+                ("target_host_id".into(), "服务端编号".into()),
+                ("session_generation".into(), "管理代次".into()),
+                ("operation".into(), "固定操作".into()),
+                ("arguments".into(), "操作参数".into()),
+            ]),
+        };
+        for revision in 1..=700 {
+            let result = dispatch_with_ledger(
+                "server-a",
+                &ledger,
+                &changed,
+                request(revision, "management.status"),
+                |_, _| (200, json!({"revision":revision})),
+            );
+            assert_eq!(result.status, 200);
+            assert_eq!(result.body["revision"], revision);
+        }
+        assert!(ledger.lock().unwrap().requests.is_empty());
+        for id in 1..=MAX_REQUEST_RESULTS {
+            let result = dispatch_with_ledger(
+                "server-a",
+                &ledger,
+                &changed,
+                request(id, "resource.install.start"),
+                |_, client| {
+                    assert_eq!(client, "client-a");
+                    (202, json!({"job_id":id}))
+                },
+            );
+            assert_eq!(result.status, 202);
+        }
+        let replay = dispatch_with_ledger(
+            "server-a",
+            &ledger,
+            &changed,
+            request(1, "resource.install.start"),
+            |_, _| panic!("同一写入请求不可再次执行"),
+        );
+        assert_eq!(replay.body["job_id"], 1);
+        let full = dispatch_with_ledger(
+            "server-a",
+            &ledger,
+            &changed,
+            request(900, "resource.install.start"),
+            |_, _| panic!("容量耗尽时不可启动新写入"),
+        );
+        assert_eq!(full.status, 429);
+        let status = dispatch_with_ledger(
+            "server-a",
+            &ledger,
+            &changed,
+            request(900, "resource.jobs"),
+            |_, _| (200, json!([])),
+        );
+        assert_eq!(status.status, 200);
+        let conflict = dispatch_with_ledger(
+            "server-a",
+            &ledger,
+            &changed,
+            request(1, "management.status"),
+            |_, _| panic!("不可把旧写入编号改作其他请求"),
+        );
+        assert_eq!(conflict.status, 409);
+        let mut expired = request(901, "resource.jobs");
+        expired.session_generation = 8;
+        assert_eq!(
+            dispatch_with_ledger("server-a", &ledger, &changed, expired, |_, _| panic!(
+                "不可执行旧代次"
+            ))
+            .status,
+            410
+        );
+    }
 
     #[test]
     fn open_request_requires_bridge_identity_and_chinese_field_notes() {

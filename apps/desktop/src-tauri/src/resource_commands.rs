@@ -411,10 +411,12 @@ impl ResourceManager {
             return json!({
                 "core_state":"unavailable",
                 "resource_management_ready":true,
+                "persistent_management":true,
                 "revision":revision,
                 "fields": {
                     "core_state":"语音核心的真实状态：ready、starting 或 unavailable",
                     "resource_management_ready":"原生 ResourceManager 是否可响应组件和任务请求",
+                    "persistent_management":"连续管理请求逐次核验当前设备信任及连接代次，可复用通道",
                     "revision":"核心服务代次与当前状态编码的修订号",
                 }
             });
@@ -451,10 +453,12 @@ impl ResourceManager {
         json!({
             "core_state":core_state,
             "resource_management_ready":true,
+            "persistent_management":true,
             "revision":epoch.saturating_mul(1_u64 << 32).saturating_add(state_revision.min(u64::from(u32::MAX))),
             "fields": {
                 "core_state":"语音核心的真实状态：ready、starting 或 unavailable",
                 "resource_management_ready":"原生 ResourceManager 已就绪，不依赖 Python 核心",
+                "persistent_management":"连续管理请求逐次核验当前设备信任及连接代次，可复用通道",
                 "revision":"核心服务代次与当前状态编码的修订号",
             }
         })
@@ -961,9 +965,10 @@ impl ResourceManager {
     /// open_ssh_server_status（读取 OpenSSH Server 状态）：只读且仅限本地运行设备。
     pub fn open_ssh_server_status(
         &self,
+        refresh: bool, // refresh（显式检查按钮强制读取，其他请求合并短时快照）。
     ) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
         self.require_local_runtime()?;
-        voice_desktop_common::system_feature::open_ssh_server_status()
+        voice_desktop_common::system_feature::cached_open_ssh_server_runtime_status(refresh)
     }
 
     /// enable_open_ssh_server（启动受管主机功能任务）：使用固定任务编号，不进入普通文件下载器。
@@ -4771,12 +4776,15 @@ pub async fn resource_system_feature_status(
     window: WebviewWindow,
     desktop: State<'_, Arc<super::Desktop>>,
     manager: State<'_, Arc<ResourceManager>>,
+    refresh: Option<bool>, // refresh（是否绕过同进程短时快照）。
 ) -> Result<voice_desktop_common::system_feature::OpenSshServerStatus, String> {
     command_allowed(&window, &desktop)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.open_ssh_server_status())
-        .await
-        .map_err(|_| "OpenSSH Server 状态查询任务无法启动。".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.open_ssh_server_status(refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|_| "OpenSSH Server 状态查询任务无法启动。".to_string())?
 }
 
 /// resource_system_feature_enable（启动系统功能任务）：只接受固定 OpenSSH Server 主机功能任务。

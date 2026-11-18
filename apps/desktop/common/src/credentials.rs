@@ -471,6 +471,207 @@ pub fn delete_device_ssh_key(reference: &str) -> Result<(), String> {
     SystemVault.delete(reference)
 }
 
+fn project_device_key_path(data: &Path, reference: &str) -> Result<std::path::PathBuf, String> {
+    use sha2::{Digest, Sha256};
+    if !valid_device_key_reference(reference)
+        || fs::symlink_metadata(data)
+            .is_ok_and(|metadata| crate::workspace::metadata_reparse(&metadata))
+    {
+        return Err("项目设备密钥根目录或引用无效。".into());
+    }
+    let digest = format!("{:x}", Sha256::digest(reference.as_bytes()));
+    crate::workspace::safe_path(data, &format!("state/device-keys/{digest}.json"))
+}
+
+#[cfg(windows)]
+fn protect_device_secret(
+    bytes: &[u8],
+    reference: &str,
+    encrypt: bool,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::Cryptography::{
+            CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
+    };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let entropy = CRYPT_INTEGER_BLOB {
+        cbData: reference.len() as u32,
+        pbData: reference.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        if encrypt {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                &entropy,
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                &entropy,
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    if success == 0 {
+        return Err(
+            "当前 Windows 账户无法加密或解密项目设备私钥；换设备或账户后请重新配对。".into(),
+        );
+    }
+    let result = unsafe {
+        Zeroizing::new(std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec())
+    };
+    unsafe {
+        // decrypted buffer（解密缓冲区）在归还系统分配器前清零。
+        std::ptr::write_bytes(output.pbData, 0, output.cbData as usize);
+        LocalFree(output.pbData.cast());
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn protect_device_secret(_: &[u8], _: &str, _: bool) -> Result<Zeroizing<Vec<u8>>, String> {
+    Err("项目设备私钥目前只支持 Windows 账户加密。".into())
+}
+
+fn read_project_device_key(
+    path: &Path,
+    reference: &str,
+) -> Result<Option<Zeroizing<String>>, String> {
+    use base64::Engine;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法读取项目设备密钥：{error}")),
+    };
+    if !metadata.is_file()
+        || crate::workspace::metadata_reparse(&metadata)
+        || metadata.len() > 128 * 1024
+    {
+        return Err("项目设备密钥不是有界普通文件。".into());
+    }
+    let value: Value = serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
+        .map_err(|_| "项目设备密钥记录损坏；已保留原件。")?;
+    if value["schema"] != 1 || value["protection"] != "windows-user-dpapi" {
+        return Err("项目设备密钥格式不受支持；已保留原件。".into());
+    }
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(
+            value["ciphertext"]
+                .as_str()
+                .ok_or("项目设备密钥缺少密文。")?,
+        )
+        .map_err(|_| "项目设备密钥密文编码无效。")?;
+    let bytes = protect_device_secret(&encrypted, reference, false)?;
+    let secret = Zeroizing::new(
+        String::from_utf8(bytes.to_vec()).map_err(|_| "项目设备私钥解密内容无效。")?,
+    );
+    if secret.is_empty() || secret.len() > 64 * 1024 {
+        return Err("项目设备私钥大小无效。".into());
+    }
+    Ok(Some(secret))
+}
+
+/// store_device_ssh_key_at（项目密钥落盘）：只保存当前账户加密密文，不创建系统凭据条目。
+pub fn store_device_ssh_key_at(
+    data: Option<&Path>,
+    reference: &str,
+    private_key: &str,
+) -> Result<(), String> {
+    use base64::Engine;
+    let Some(data) = data else {
+        return store_device_ssh_key(reference, private_key);
+    };
+    let path = project_device_key_path(data, reference)?;
+    if private_key.is_empty() || private_key.len() > 64 * 1024 {
+        return Err("设备 SSH 私钥大小无效。".into());
+    }
+    let encrypted = protect_device_secret(private_key.as_bytes(), reference, true)?;
+    // atomic_json（同盘换入）只写密文；临时路径同样不得穿过联接。
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    if fs::symlink_metadata(&temporary)
+        .is_ok_and(|metadata| crate::workspace::metadata_reparse(&metadata))
+    {
+        return Err("项目设备密钥临时路径无效。".into());
+    }
+    let result = crate::workspace::atomic_json(
+        &path,
+        &json!({"schema":1,"protection":"windows-user-dpapi",
+        "ciphertext":base64::engine::general_purpose::STANDARD.encode(encrypted.as_slice()),
+        "fields":{"schema":"项目私钥记录格式","protection":"仅当前 Windows 账户解密","ciphertext":"设备私钥加密密文"}}),
+    );
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result?;
+    let verified =
+        read_project_device_key(&path, reference)?.ok_or("项目设备密钥写入后未找到。")?;
+    if verified.as_str() != private_key {
+        return Err("项目设备密钥写入后核验失败。".into());
+    }
+    // 同一引用若曾由旧版本写入系统凭据库，项目密文验证完成后才清除旧条目。
+    delete_device_ssh_key(reference)?;
+    Ok(())
+}
+
+/// load_device_ssh_key_at（项目内读取与兼容迁移）：密文写入并核验成功后，才删除对应旧系统凭据。
+pub fn load_device_ssh_key_at(
+    data: Option<&Path>,
+    reference: &str,
+) -> Result<Zeroizing<String>, String> {
+    let Some(data) = data else {
+        return load_device_ssh_key(reference);
+    };
+    let path = project_device_key_path(data, reference)?;
+    if let Some(secret) = read_project_device_key(&path, reference)? {
+        // 若上次迁移在清除旧条目前中断，按同一引用补做；不会删除其他凭据。
+        delete_device_ssh_key(reference)?;
+        return Ok(secret);
+    }
+    let legacy = load_device_ssh_key(reference)?;
+    store_device_ssh_key_at(Some(data), reference, &legacy)?;
+    delete_device_ssh_key(reference)?;
+    Ok(legacy)
+}
+
+pub fn has_device_ssh_key_at(data: Option<&Path>, reference: &str) -> Result<bool, String> {
+    let Some(data) = data else {
+        return has_device_ssh_key(reference);
+    };
+    let path = project_device_key_path(data, reference)?;
+    if read_project_device_key(&path, reference)?.is_some() {
+        return Ok(true);
+    }
+    has_device_ssh_key(reference)
+}
+
+pub fn delete_device_ssh_key_at(data: Option<&Path>, reference: &str) -> Result<(), String> {
+    let Some(data) = data else {
+        return delete_device_ssh_key(reference);
+    };
+    let path = project_device_key_path(data, reference)?;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("项目设备私钥删除失败：{error}")),
+    }
+    delete_device_ssh_key(reference)
+}
+
 fn load_provider_credential_with_vault(
     data: &Path,
     provider: &str,
@@ -634,6 +835,44 @@ impl Vault for SystemVault {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[cfg(windows)]
+    #[test]
+    fn project_device_keys_are_encrypted_migrate_exact_legacy_entry_and_keep_corruption() {
+        use sha2::{Digest, Sha256};
+        let root = std::env::temp_dir().join(format!(
+            "project-device-keys-{}",
+            crate::workspace::new_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let reference = format!(
+            "VoiceTerminal/device/{:x}",
+            Sha256::digest(root.to_string_lossy().as_bytes())
+        );
+        let secret = "isolated-test-private-key-never-in-plaintext-file";
+        // 仅创建本测试独占的旧凭据条目；生产用户条目不参与此测试。
+        store_device_ssh_key(&reference, secret).unwrap();
+        assert_eq!(
+            load_device_ssh_key_at(Some(&root), &reference)
+                .unwrap()
+                .as_str(),
+            secret
+        );
+        assert!(SystemVault.get(&reference).unwrap().is_none());
+        let path = project_device_key_path(&root, &reference).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        assert!(has_device_ssh_key_at(Some(&root), &reference).unwrap());
+        assert!(protect_device_secret(b"invalid-ciphertext", &reference, false).is_err());
+        fs::write(&path, b"{broken").unwrap();
+        assert!(load_device_ssh_key_at(Some(&root), &reference).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{broken");
+        delete_device_ssh_key_at(Some(&root), &reference).unwrap();
+        assert!(!path.exists());
+        assert!(project_device_key_path(&root, "../other").is_err());
+        crate::workspace::remove_owned(&root, root.parent().unwrap()).unwrap();
+    }
+
     #[derive(Default)]
     struct MemoryVault(RefCell<BTreeMap<String, String>>); // MemoryVault（内存凭据库）：验证事务，不触碰用户密钥。
     impl Vault for MemoryVault {

@@ -501,6 +501,24 @@ class ApplicationHost:
         return await self.http(self.state.value["voice_api_url"] + "/internal/application/control",
                                action=action, payload=payload, timeout=timeout)
 
+    async def set_device_gateway(self, enabled: bool) -> dict:
+        """set_device_gateway（热交接设备网关）：现有核心内开关监听，不重建模型或会话。"""
+        if type(enabled) is not bool or self.state.snapshot().get("stopping"):
+            raise RuntimeError("当前应用状态不能交接设备网关。")
+        voice_url = self.state.snapshot().get("voice_api_url")
+        if not voice_url:
+            raise RuntimeError("本地语音服务入口尚未建立，请等待后重试广播。")
+        if enabled and not self._shared_host_role_is_saved():
+            raise RuntimeError("本机尚未保存有效的局域网广播配置。")
+        config = json.loads((self.paths.config / "device-runtime.json").read_text(encoding="utf-8")) if enabled else {}
+        result = await self.http(voice_url + "/internal/application/device-gateway",
+                                 payload={"enabled": enabled, "host_id": config.get("device_id")}, timeout=8)
+        self.share_device_gateway = enabled
+        self.state.update(device_gateway_enabled=result.get("enabled") is True,
+                          device_gateway_ready=result.get("ready") is True,
+                          device_gateway_error=str(result.get("error") or "")[:240])
+        return result
+
     def create_wake_task(self, payload: dict) -> dict:
         """create_wake_task（手动创建任务）：仅由已校验桌面会话的网页线程调用。"""
         snapshot = self.state.snapshot()
@@ -557,8 +575,6 @@ class ApplicationHost:
 
     def _shared_host_role_is_saved(self) -> bool:
         """_shared_host_role_is_saved（本机共享角色门禁）：只接受有效且明确保存的设备配置。"""
-        if not self.share_device_gateway:
-            return False
         path = self.paths.config / "device-runtime.json"
         try:
             config_directory = path.parent
@@ -587,15 +603,19 @@ class ApplicationHost:
             value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
             return (
                 isinstance(value, dict)
-                and set(value) == {"schema_version", "device_id", "desired_role", "audio_mode", "host"}
-                and type(value.get("schema_version")) is int and value["schema_version"] == 2
+                and type(value.get("schema_version")) is int
+                and (value["schema_version"] != 2 or self.share_device_gateway)
+                and ((value["schema_version"] == 2 and set(value) == {"schema_version", "device_id", "desired_role", "audio_mode", "host"})
+                     or (value["schema_version"] == 3 and value.get("mode") == "local" and value.get("broadcast_enabled") is True
+                         and set(value) <= {"schema_version", "device_id", "mode", "broadcast_enabled", "client_online_tts_local",
+                                            "audio_compression", "reconnect_suspended_reason", "desired_role", "audio_mode", "paired_host", "host"}))
                 and isinstance(value.get("device_id"), str)
                 and 1 <= len(value["device_id"]) <= 128
                 and value["device_id"].strip() == value["device_id"]
                 and not any(ord(char) < 32 or ord(char) == 127 for char in value["device_id"])
                 and value.get("desired_role") == "shared_host"
                 and value.get("audio_mode") in {"pcm", "opus_experimental"}
-                and value.get("host") is None
+                and (value["schema_version"] == 3 or value.get("host") is None)
             )
         except (OSError, UnicodeError, ValueError, TypeError):
             return False

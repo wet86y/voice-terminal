@@ -114,6 +114,8 @@ pub struct OpenSshServerStatus {
     pub pairing_access_enabled: bool, // pairing_access_enabled（本程序配对端口规则是否启用）。
     pub pairing_access_valid: bool, // pairing_access_valid（程序、固定端口、协议和精确局域网范围均匹配）。
     pub pairing_network_scope: Vec<String>, // pairing_network_scope（配对端口规则允许的活动局域网子网）。
+    pub discovery_access_enabled: bool, // discovery_access_enabled（程序 mDNS（多播发现）规则是否启用）。
+    pub discovery_access_valid: bool, // discovery_access_valid（UDP（数据报协议）5353 发现规则是否精确匹配）。
     pub existing_ssh_inbound_rules: Vec<String>, // existing_ssh_inbound_rules（非本程序拥有的启用 SSH 入站候选规则，只读列出）。
     pub local_lan_addresses: Vec<String>, // local_lan_addresses（活动物理局域网接口上的私有地址）。
     pub local_lan_scopes: Vec<String>, // local_lan_scopes（活动物理局域网接口对应的精确 CIDR 子网）。
@@ -349,11 +351,15 @@ impl OpenSshServerStatus {
             pairing_access_enabled,
             pairing_access_valid,
             pairing_network_scope,
+            discovery_access_enabled: value["discovery_access_enabled"].as_bool().unwrap_or(false),
+            discovery_access_valid: value["discovery_access_valid"].as_bool().unwrap_or(false),
             existing_ssh_inbound_rules,
             local_lan_addresses,
             local_lan_scopes,
             fields: [
                 ("feature_id".into(), "Windows 系统功能固定编号".into()),
+                ("discovery_access_enabled".into(), "本程序多播发现规则是否启用".into()),
+                ("discovery_access_valid".into(), "发现规则的程序、UDP 5353 端口和精确局域网范围是否匹配".into()),
                 ("capability_state".into(), "OpenSSH Server 可选功能状态；Unknown 表示本次只读查询未提权".into()),
                 ("service_present".into(), "sshd 系统服务是否存在".into()),
                 ("service_state".into(), "sshd 当前运行状态".into()),
@@ -445,6 +451,41 @@ pub fn require_local_runtime(
 
 /// open_ssh_server_status（检查主机功能）：仅查询 capability、服务存在性和当前服务状态。
 pub fn open_ssh_server_status() -> Result<OpenSshServerStatus, String> {
+    open_ssh_server_status_with_details(true)
+}
+
+/// open_ssh_server_runtime_status（运行所需检查）：只检查官方服务与项目规则，不枚举全机防火墙。
+static RUNTIME_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, OpenSshServerStatus)>> =
+    std::sync::Mutex::new(None);
+
+pub fn open_ssh_server_runtime_status() -> Result<OpenSshServerStatus, String> {
+    cached_open_ssh_server_runtime_status(false)
+}
+
+/// cached_open_ssh_server_runtime_status（合并同时检查）：短时复用同进程快照；显式刷新绕过缓存。
+pub fn cached_open_ssh_server_runtime_status(refresh: bool) -> Result<OpenSshServerStatus, String> {
+    let mut cache = RUNTIME_STATUS_CACHE
+        .lock()
+        .map_err(|_| "SSH 状态检查锁不可用。")?;
+    if !refresh {
+        if let Some((checked, status)) = cache.as_ref() {
+            if checked.elapsed() < std::time::Duration::from_secs(10) {
+                return Ok(status.clone());
+            }
+        }
+    }
+    let status = open_ssh_server_status_with_details(false)?;
+    *cache = Some((std::time::Instant::now(), status.clone()));
+    Ok(status)
+}
+
+fn remember_runtime_status(status: &OpenSshServerStatus) {
+    if let Ok(mut cache) = RUNTIME_STATUS_CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), status.clone()));
+    }
+}
+
+fn open_ssh_server_status_with_details(details: bool) -> Result<OpenSshServerStatus, String> {
     #[cfg(windows)]
     {
         let product_executable =
@@ -459,6 +500,7 @@ $env:PSModulePath = $systemModuleRoot
 $PSModuleAutoLoadingPreference = 'All'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+{PROJECT_RULE_HELPERS}
 $systemOpenSsh = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
 $sourcePath = $null; $sourceVersion = $null; $signatureStatus = 'NotFound'; $signatureSubject = $null
 $officialBinary = $false
@@ -487,12 +529,16 @@ if ($null -ne $service) {
     }
 }
 $capabilityState = 'Unknown'
-try { $capabilityState = [string](Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop).State } catch { }
+if (-not $officialBinary -or $null -eq $service) {
+    try { $capabilityState = [string](Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop).State } catch { }
+}
 $physicalInterfaces = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } |
     Select-Object -ExpandProperty ifIndex -Unique)
+$privateInterfaces = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+    Where-Object { [string]$_.NetworkCategory -in @('Private','DomainAuthenticated') } | Select-Object -ExpandProperty InterfaceIndex -Unique)
 $localLanAddresses = @(); $localLanScopes = @()
 foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -Type Unicast -ErrorAction SilentlyContinue)) {
-    if ($physicalInterfaces -notcontains $address.InterfaceIndex -or $address.PrefixLength -le 0) { continue }
+    if ($physicalInterfaces -notcontains $address.InterfaceIndex -or $privateInterfaces -notcontains $address.InterfaceIndex -or $address.PrefixLength -le 0) { continue }
     $ip = [System.Net.IPAddress]::Parse([string]$address.IPAddress)
     if ([System.Net.IPAddress]::IsLoopback($ip) -or $ip.IsIPv6LinkLocal -or $ip.IsIPv6Multicast -or
         ([string]$address.IPAddress -like '169.254.*')) { continue }
@@ -597,46 +643,36 @@ $authorizedKeysPath = if ($accountIsAdmin) {
     Join-Path $profile.LocalPath '.ssh/authorized_keys'
 } else { $null }
 $authorizedKeysExists = $authorizedKeysPath -and (Test-Path -LiteralPath $authorizedKeysPath -PathType Leaf)
-$projectRule = Get-NetFirewallRule -Name 'VoiceTerminal-OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-$pairingRule = Get-NetFirewallRule -Name 'VoiceTerminal-Device-Pairing-TCP-In' -ErrorAction SilentlyContinue
+# 只取项目三条规则；批量管道复用提供程序，避免三次规则枚举和重复过滤器查询。
+$ownedRules = @(Get-NetFirewallRule -Name @('VoiceTerminal-OpenSSH-Server-In-TCP','VoiceTerminal-Device-Pairing-TCP-In','VoiceTerminal-Device-Discovery-UDP-In') -ErrorAction SilentlyContinue)
+$projectRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-OpenSSH-Server-In-TCP' } | Select-Object -First 1
+$pairingRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-Device-Pairing-TCP-In' } | Select-Object -First 1
+$discoveryRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-Device-Discovery-UDP-In' } | Select-Object -First 1
+$script:ProjectRuleFilters = @{}
+foreach ($rule in $ownedRules) { $script:ProjectRuleFilters[[string]$rule.InstanceID] = @{} }
+foreach ($filter in @($ownedRules | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)) {
+    $script:ProjectRuleFilters[[string]$filter.InstanceID]['Application'] = $filter
+}
+foreach ($filter in @($ownedRules | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)) {
+    $script:ProjectRuleFilters[[string]$filter.InstanceID]['Port'] = $filter
+}
+foreach ($filter in @($ownedRules | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue)) {
+    $script:ProjectRuleFilters[[string]$filter.InstanceID]['Address'] = $filter
+}
 $expectedDesktopPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{PRODUCT_EXE_B64}'))
 $projectScope = @()
 $pairingScope = @()
 if ($null -ne $projectRule) {
-    $projectScope = @(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $projectRule -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.RemoteAddress } | Where-Object { $_ -and $_ -ne 'Any' })
+    $projectScope = @($script:ProjectRuleFilters[[string]$projectRule.InstanceID]['Address'].RemoteAddress | Where-Object { $_ -and $_ -ne 'Any' })
 }
 if ($null -ne $pairingRule) {
-    $pairingScope = @(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $pairingRule -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.RemoteAddress } | Where-Object { $_ -and $_ -ne 'Any' })
+    $pairingScope = @($script:ProjectRuleFilters[[string]$pairingRule.InstanceID]['Address'].RemoteAddress | Where-Object { $_ -and $_ -ne 'Any' })
 }
-$projectAccessValid = $false
-if ($null -ne $projectRule -and $projectRule.Enabled -eq 'True' -and $null -ne $effectivePort) {
-    $appFilter = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $projectRule -ErrorAction SilentlyContinue
-    $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $projectRule -ErrorAction SilentlyContinue
-    $profiles = @($projectRule.Profile | ForEach-Object { [string]$_ })
-    $remote = @(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $projectRule -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.RemoteAddress } | Where-Object { $_ } | Sort-Object -Unique)
-    $expectedScopes = @($localLanScopes | Sort-Object -Unique)
-    $projectAccessValid = $null -ne $appFilter -and [string]::Equals([IO.Path]::GetFullPath([string]$appFilter.Program), [IO.Path]::GetFullPath($systemOpenSsh), [StringComparison]::OrdinalIgnoreCase) -and
-        [string]$portFilter.Protocol -eq 'TCP' -and @($portFilter.LocalPort) -contains $effectivePort -and
-        $profiles -notcontains 'Any' -and $profiles -notcontains 'Public' -and
-        [string]::Join(',', $remote) -eq [string]::Join(',', $expectedScopes)
-}
-$pairingAccessValid = $false
-if ($null -ne $pairingRule -and $pairingRule.Enabled -eq 'True') {
-    $appFilter = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $pairingRule -ErrorAction SilentlyContinue
-    $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $pairingRule -ErrorAction SilentlyContinue
-    $profiles = @($pairingRule.Profile | ForEach-Object { [string]$_ })
-    $remote = @(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $pairingRule -ErrorAction SilentlyContinue |
-        ForEach-Object { $_.RemoteAddress } | Where-Object { $_ } | Sort-Object -Unique)
-    $expectedScopes = @($localLanScopes | Sort-Object -Unique)
-    $pairingAccessValid = $null -ne $appFilter -and [string]::Equals([IO.Path]::GetFullPath([string]$appFilter.Program), [IO.Path]::GetFullPath($expectedDesktopPath), [StringComparison]::OrdinalIgnoreCase) -and
-        [string]$portFilter.Protocol -eq 'TCP' -and @($portFilter.LocalPort) -contains '{DEVICE_PAIRING_PORT}' -and
-        $profiles -notcontains 'Any' -and $profiles -notcontains 'Public' -and
-        [string]::Join(',', $remote) -eq [string]::Join(',', $expectedScopes)
-}
+$projectAccessValid = Test-ProjectFirewallRule $projectRule $systemOpenSsh $effectivePort $localLanScopes
+$pairingAccessValid = Test-ProjectFirewallRule $pairingRule $expectedDesktopPath {DEVICE_PAIRING_PORT} $localLanScopes
+$discoveryAccessValid = Test-ProjectFirewallRule $discoveryRule $expectedDesktopPath 5353 $localLanScopes 'UDP'
 $otherSshInboundRules = @()
+if ({INCLUDE_EXTERNAL_RULES}) {
 $sshProbePort = if ($null -ne $effectivePort) { [string]$effectivePort } else { '22' }
 $enabledInboundRules = @(Get-NetFirewallRule -Direction Inbound -Enabled True -ErrorAction SilentlyContinue)
 $portFiltersByRule = @{}
@@ -678,6 +714,7 @@ foreach ($candidate in $enabledInboundRules) {
     $otherSshInboundRules += "$($candidate.Name) (Profile=$candidateProfile; LocalPort=$($candidatePorts -join ','); RemoteAddress=$candidateRemote)"
     if ($otherSshInboundRules.Count -ge {MAX_EXISTING_SSH_RULES}) { break }
 }
+}
 @{
     capability_state = $capabilityState
     service_present = ($null -ne $service)
@@ -705,11 +742,15 @@ foreach ($candidate in $enabledInboundRules) {
     pairing_access_enabled = ($null -ne $pairingRule -and $pairingRule.Enabled -eq 'True')
     pairing_access_valid = [bool]$pairingAccessValid
     pairing_network_scope = @($pairingScope)
+    discovery_access_enabled = ($null -ne $discoveryRule -and $discoveryRule.Enabled -eq 'True')
+    discovery_access_valid = [bool]$discoveryAccessValid
     existing_ssh_inbound_rules = @($otherSshInboundRules)
     local_lan_addresses = @($localLanAddresses)
     local_lan_scopes = @($localLanScopes)
 } | ConvertTo-Json -Compress
 "#.replace("{OPENSSH_CAPABILITY}", OPENSSH_CAPABILITY)
+            .replace("{INCLUDE_EXTERNAL_RULES}", if details { "$true" } else { "$false" })
+            .replace("{PROJECT_RULE_HELPERS}", FIREWALL_VALIDATION_SCRIPT)
             .replace("{PRODUCT_EXE_B64}", &product_executable_b64)
             .replace("{DEVICE_PAIRING_PORT}", &DEVICE_PAIRING_PORT.to_string())
             .replace("{MAX_EXISTING_SSH_RULES}", &MAX_EXISTING_SSH_RULES.to_string());
@@ -738,11 +779,13 @@ where
 {
     #[cfg(windows)]
     {
-        prepare_open_ssh_server_with_progress(
+        let status = prepare_open_ssh_server_with_progress(
             open_ssh_server_status,
             run_elevated_powershell_with_progress,
             on_wait,
-        )
+        )?;
+        remember_runtime_status(&status);
+        Ok(status)
     }
     #[cfg(not(windows))]
     {
@@ -898,222 +941,249 @@ pub struct OpenSshServerIdentity {
     pub fingerprint_sha256: String, // fingerprint_sha256（主机公钥 SHA-256 指纹）。
 }
 
-/// open_ssh_server_identity（读取微软主机身份）：只接受官方数据目录内的普通 Ed25519 公钥文件。
+/// open_ssh_server_identity（读取运行中主机公钥）：回环握手不认证、不读系统密钥文件、不请求授权。
 #[cfg(feature = "ssh-device")]
-pub fn open_ssh_server_identity() -> Result<OpenSshServerIdentity, String> {
-    #[cfg(windows)]
-    {
-        use russh::keys::{Algorithm, HashAlg, PublicKey};
-        let program_data =
-            std::env::var_os("ProgramData").ok_or("Windows ProgramData 路径不可用。")?;
-        let path = std::path::PathBuf::from(program_data).join("ssh/ssh_host_ed25519_key.pub");
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("无法读取微软 OpenSSH 主机公钥：{error}"))?;
-        if crate::workspace::metadata_reparse(&metadata)
-            || !metadata.is_file()
-            || metadata.len() > 16 * 1024
-        {
-            return Err("微软 OpenSSH 主机公钥路径、文件类型或大小无效。".into());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|error| format!("读取微软 OpenSSH 主机公钥失败：{error}"))?;
-        let public_key = raw.trim();
-        let parsed = PublicKey::from_openssh(public_key)
-            .map_err(|_| "微软 OpenSSH 主机公钥不是有效 OpenSSH 格式。".to_string())?;
-        if parsed.algorithm() != Algorithm::Ed25519 {
-            return Err(
-                "微软 OpenSSH 主机公钥不是 Ed25519；本期固定配对协议不接受其他算法。".into(),
-            );
-        }
-        Ok(OpenSshServerIdentity {
-            public_key: parsed
-                .to_openssh()
-                .map_err(|_| "无法规范编码微软 OpenSSH 主机公钥。".to_string())?,
-            fingerprint_sha256: parsed.fingerprint(HashAlg::Sha256).to_string(),
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        Err("微软 OpenSSH 主机身份只支持 Windows 主机。".into())
-    }
+pub async fn open_ssh_server_identity(port: u16) -> Result<OpenSshServerIdentity, String> {
+    let public_key =
+        crate::ssh_device::probe_loopback_host_public_key(port, std::time::Duration::from_secs(3))
+            .await?;
+    Ok(OpenSshServerIdentity {
+        fingerprint_sha256: public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string(),
+        public_key: public_key
+            .to_openssh()
+            .map_err(|_| "无法规范编码微软 OpenSSH 主机公钥。".to_string())?,
+    })
 }
 
-/// set_open_ssh_project_access（设置本程序入站范围）：只创建或调整本程序独占防火墙规则。
+// Windows 防火墙会把 CIDR（前缀子网）规范为点分掩码；统一语义后仍要求精确范围。
+#[cfg(any(windows, test))]
+const FIREWALL_VALIDATION_SCRIPT: &str = r#"
+function ConvertTo-ProjectNetworkScope([string]$value) {
+    $parts = $value.Split('/')
+    if ($parts.Length -ne 2) { throw '必须是精确子网' }
+    $address = [Net.IPAddress]::Parse($parts[0])
+    $bytes = $address.GetAddressBytes()
+    $prefix = 0
+    if ($parts[1] -match '^\d+$') { $prefix = [int]$parts[1] }
+    elseif ($bytes.Length -eq 4) {
+        $mask = [Net.IPAddress]::Parse($parts[1]).GetAddressBytes()
+        if ($mask.Length -ne 4) { throw '掩码地址族不匹配' }
+        $zeroSeen = $false
+        foreach ($byte in $mask) {
+            for ($bit = 7; $bit -ge 0; $bit--) {
+                if (($byte -band (1 -shl $bit)) -ne 0) {
+                    if ($zeroSeen) { throw '掩码不连续' }
+                    $prefix++
+                } else { $zeroSeen = $true }
+            }
+        }
+    } else { throw '子网前缀无效' }
+    if ($prefix -le 0 -or $prefix -gt $bytes.Length * 8) { throw '子网前缀越界' }
+    $remaining = $prefix
+    for ($index = 0; $index -lt $bytes.Length; $index++) {
+        $take = [Math]::Min(8, [Math]::Max(0, $remaining))
+        $maskByte = if ($take -eq 0) { 0 } else { 256 - [Math]::Pow(2, 8 - $take) }
+        $bytes[$index] = [byte]([int]$bytes[$index] -band [int]$maskByte)
+        $remaining -= $take
+    }
+    return "$([Net.IPAddress]::new($bytes).ToString())/$prefix"
+}
+function Test-ProjectFirewallRule($rule, [string]$program, $port, $scopes, [string]$protocol = 'TCP') {
+    try {
+        if ($null -eq $rule -or [string]$rule.Enabled -ne 'True' -or
+            [string]$rule.Direction -ne 'Inbound' -or [string]$rule.Action -ne 'Allow' -or
+            $null -eq $port -or [int]$port -le 0) { return $false }
+        $profiles = @(([string]$rule.Profile -split ',') | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
+        if (($profiles -join ',') -ne 'Domain,Private') { return $false }
+        if ($null -ne $script:ProjectRuleFilters) {
+            $cached = $script:ProjectRuleFilters[[string]$rule.InstanceID]
+            if ($null -eq $cached) { return $false }
+            $app = $cached['Application']; $filter = $cached['Port']; $remote = $cached['Address']
+        } else {
+            $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+            $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+            $remote = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+        }
+        if ($null -eq $app -or $null -eq $filter -or $null -eq $remote -or
+            -not [string]::Equals([IO.Path]::GetFullPath([string]$app.Program), [IO.Path]::GetFullPath($program), [StringComparison]::OrdinalIgnoreCase) -or
+            [string]$filter.Protocol -notin @($protocol, $(if ($protocol -eq 'TCP') { '6' } else { '17' })) -or @($filter.LocalPort).Count -ne 1 -or
+            [string]$filter.LocalPort -ne [string]$port) { return $false }
+        $actual = @($remote.RemoteAddress | ForEach-Object { ConvertTo-ProjectNetworkScope ([string]$_) } | Sort-Object -Unique)
+        $expected = @($scopes | ForEach-Object { ConvertTo-ProjectNetworkScope ([string]$_) } | Sort-Object -Unique)
+        return $expected.Count -gt 0 -and ($actual -join ',') -eq ($expected -join ',')
+    } catch { return $false }
+}
+"#;
+
+/// set_open_ssh_project_access（设置程序 SSH 入站范围）：只维护本程序独占规则。
 pub fn set_open_ssh_project_access(enabled: bool) -> Result<OpenSshServerStatus, String> {
+    configure_project_access(enabled, true, false, false)
+}
+
+/// set_device_pairing_access（设置配对端口范围）：只维护本程序固定配对规则。
+pub fn set_device_pairing_access(enabled: bool) -> Result<OpenSshServerStatus, String> {
+    configure_project_access(enabled, false, true, false)
+}
+
+/// set_device_broadcast_access（设置广播网络规则）：一次授权维护 SSH、配对与多播发现规则。
+pub fn set_device_broadcast_access(enabled: bool) -> Result<OpenSshServerStatus, String> {
+    configure_project_access(enabled, true, true, true)
+}
+
+fn configure_project_access(
+    enabled: bool,   // enabled（是否启用所选程序规则）。
+    ssh: bool,       // ssh（是否维护 SSH 规则）。
+    pairing: bool,   // pairing（是否维护配对规则）。
+    discovery: bool, // discovery（是否维护多播发现规则）。
+) -> Result<OpenSshServerStatus, String> {
     #[cfg(windows)]
     {
-        let before = open_ssh_server_status()?;
-        if enabled && !before.ready {
-            return Err("请先通过“检查 SSH 服务”安装并启动官方服务。".into());
+        let before = open_ssh_server_runtime_status()?;
+        if enabled {
+            if !before.ready {
+                return Err("请先通过“检查 SSH 服务”确认微软 OpenSSH Server 基础就绪。".into());
+            }
+            if before.account_is_entra || before.account_ssh_username.is_none() {
+                return Err(
+                    "当前 Windows 账户没有可用的受管 OpenSSH 登录名；未创建入站规则。".into(),
+                );
+            }
+            if before.local_lan_scopes.is_empty() || before.local_lan_addresses.is_empty() {
+                return Err("没有可用于受限访问的私有或域物理局域网；请检查网络连接及 Windows 网络配置文件。".into());
+            }
+            if (!ssh || before.project_access_valid)
+                && (!pairing || before.pairing_access_valid)
+                && (!discovery || before.discovery_access_valid)
+            {
+                return Ok(before);
+            }
+        } else if (!ssh || !before.project_access_enabled)
+            && (!pairing || !before.pairing_access_enabled)
+            && (!discovery || !before.discovery_access_enabled)
+        {
+            return Ok(before);
         }
-        if enabled && before.account_is_entra {
-            return Err(
-                "当前 Windows OpenSSH 不支持此 Microsoft Entra 账户；未创建入站规则。".into(),
-            );
+        let executable =
+            std::env::current_exe().map_err(|error| format!("无法定位本程序正式入口：{error}"))?;
+        let script = project_access_script(enabled, ssh, pairing, discovery, &before, &executable);
+        let outcome = (|| {
+            run_elevated_powershell(&script)?;
+            let mut after = before.clone();
+            if ssh {
+                after.project_access_enabled = enabled;
+                after.project_access_valid = enabled;
+                after.project_network_scope = if enabled {
+                    before.local_lan_scopes.clone()
+                } else {
+                    vec![]
+                };
+            }
+            if pairing {
+                after.pairing_access_enabled = enabled;
+                after.pairing_access_valid = enabled;
+                after.pairing_network_scope = if enabled {
+                    before.local_lan_scopes.clone()
+                } else {
+                    vec![]
+                };
+            }
+            if discovery {
+                after.discovery_access_enabled = enabled;
+                after.discovery_access_valid = enabled;
+            }
+            remember_runtime_status(&after);
+            Ok(after)
+        })();
+        if let Err(error) = outcome {
+            if let Ok(mut cache) = RUNTIME_STATUS_CACHE.lock() {
+                *cache = None;
+            }
+            return Err(format!("本程序局域网防火墙规则配置失败：{error}"));
         }
-        let port = before.effective_port.unwrap_or(22);
-        if enabled && before.effective_port.is_none() {
-            return Err("微软 OpenSSH 有效端口尚未验证。".into());
-        }
-        let desired = if enabled { "$true" } else { "$false" };
-        let script = format!(
-            r###"
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$ruleName = 'VoiceTerminal-OpenSSH-Server-In-TCP'
-if (-not {desired}) {{
-        $port = {port}
-        $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-    if ($null -ne $rule) {{ Set-NetFirewallRule -Name $ruleName -Enabled False -ErrorAction Stop }}
-    exit 0
-}}
-$interfaces = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {{ $_.Status -eq 'Up' }} |
-    Select-Object -ExpandProperty ifIndex -Unique)
-$scopes = @()
-foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -Type Unicast -ErrorAction Stop)) {{
-    if ($interfaces -notcontains $address.InterfaceIndex -or $address.PrefixLength -le 0) {{ continue }}
-    $ip = [System.Net.IPAddress]::Parse([string]$address.IPAddress)
-    if ([System.Net.IPAddress]::IsLoopback($ip) -or $ip.IsIPv6LinkLocal -or $ip.IsIPv6Multicast -or
-        ([string]$address.IPAddress -like '169.254.*')) {{ continue }}
-    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
-        [string]$address.IPAddress -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)') {{ continue }}
-    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 -and
-        [string]$address.IPAddress -notmatch '^(?i:fc|fd)') {{ continue }}
-    $bytes = $ip.GetAddressBytes()
-    $remaining = [int]$address.PrefixLength
-    for ($index=0; $index -lt $bytes.Length; $index++) {{
-        $take = [Math]::Min(8, [Math]::Max(0, $remaining))
-        $mask = if ($take -eq 0) {{ 0 }} else {{ 256 - [Math]::Pow(2, 8 - $take) }}
-        $bytes[$index] = [byte]([int]$bytes[$index] -band [int]$mask)
-        $remaining -= $take
-    }}
-    $scopes += "$([System.Net.IPAddress]::new($bytes).ToString())/$($address.PrefixLength)"
-}}
-$scopes = @($scopes | Sort-Object -Unique)
-if ($scopes.Count -eq 0) {{ throw '没有发现可用于受限 SSH 访问的活动局域网地址。' }}
-$sshd = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
-if (-not (Test-Path -LiteralPath $sshd -PathType Leaf)) {{ throw '微软官方 OpenSSH Server 程序文件不存在。' }}
-$rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-if ($null -eq $rule) {{
-        New-NetFirewallRule -Name $ruleName -DisplayName 'Voice Terminal OpenSSH (局域网受限)' `
-        -Group 'Voice Terminal' -Program $sshd -Direction Inbound -Protocol TCP -LocalPort $port `
-        -RemoteAddress $scopes -Profile Private,Domain -Action Allow -Enabled True -ErrorAction Stop | Out-Null
-}} else {{
-    Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Private,Domain -ErrorAction Stop
-    Set-NetFirewallPortFilter -InputObject (Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule) `
-        -Protocol TCP -LocalPort $port -ErrorAction Stop
-    Set-NetFirewallAddressFilter -InputObject (Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule) `
-        -RemoteAddress $scopes -ErrorAction Stop
-}}
-exit 0
-"###
-        );
-        run_elevated_powershell(&script)?;
-        let status = open_ssh_server_status()?;
-        if enabled && !status.project_access_valid {
-            return Err(
-                "已授权配置局域网访问，但程序、端口、配置文件或精确子网复核未通过。".into(),
-            );
-        }
-        Ok(status)
+        outcome
     }
     #[cfg(not(windows))]
     {
-        let _ = enabled;
+        let _ = (enabled, ssh, pairing, discovery);
         Err("OpenSSH Server 系统功能管理只支持 Windows 主机。".into())
     }
 }
 
-/// set_device_pairing_access（配置配对端口范围）：只改本程序独占规则和固定 18766 端口。
-pub fn set_device_pairing_access(enabled: bool) -> Result<OpenSshServerStatus, String> {
-    #[cfg(windows)]
-    {
-        let before = open_ssh_server_status()?;
-        if enabled && !before.ready {
-            return Err("请先通过“检查 SSH 服务”确认微软 OpenSSH Server 基础就绪。".into());
-        }
-        let current_exe =
-            std::env::current_exe().map_err(|error| format!("无法定位配对服务程序：{error}"))?;
-        let program = current_exe.to_string_lossy().to_string();
-        let scopes = before.local_lan_scopes.clone();
-        if enabled && (scopes.is_empty() || before.local_lan_addresses.is_empty()) {
-            return Err("没有可用于受限配对入口的活动物理局域网子网。".into());
-        }
-        let program_b64 = base64::engine::general_purpose::STANDARD.encode(program.as_bytes());
-        let scope_value = scopes.join(",");
-        let scope_b64 = base64::engine::general_purpose::STANDARD.encode(scope_value.as_bytes());
-        let script = format!(
-            r#"
+#[cfg(any(windows, test))]
+fn project_access_script(
+    enabled: bool,                // enabled（规则目标启用状态）。
+    ssh: bool,                    // ssh（包含 SSH 规则）。
+    pairing: bool,                // pairing（包含配对规则）。
+    discovery: bool,              // discovery（包含多播发现规则）。
+    status: &OpenSshServerStatus, // status（本轮只读复核结果）。
+    executable: &std::path::Path, // executable（正式桌面程序）。
+) -> String {
+    let mut rules = Vec::new();
+    if ssh {
+        rules.push(format!("@{{ Name='VoiceTerminal-OpenSSH-Server-In-TCP'; Program=(Join-Path $env:SystemRoot 'System32/OpenSSH/sshd.exe'); Port={}; Protocol='TCP' }}", status.effective_port.unwrap_or(22)));
+    }
+    if pairing {
+        rules.push(format!("@{{ Name='VoiceTerminal-Device-Pairing-TCP-In'; Program=$desktopProgram; Port={DEVICE_PAIRING_PORT}; Protocol='TCP' }}"));
+    }
+    if discovery {
+        rules.push("@{ Name='VoiceTerminal-Device-Discovery-UDP-In'; Program=$desktopProgram; Port=5353; Protocol='UDP' }".into());
+    }
+    let program_b64 =
+        base64::engine::general_purpose::STANDARD.encode(executable.to_string_lossy().as_bytes());
+    let scope_b64 = base64::engine::general_purpose::STANDARD
+        .encode(status.local_lan_scopes.join(",").as_bytes());
+    let enabled = if enabled { "$true" } else { "$false" };
+    let rules = rules.join("\n");
+    format!(
+        r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ruleName = 'VoiceTerminal-Device-Pairing-TCP-In'
-if (-not {enabled}) {{
-    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-    if ($null -ne $rule) {{ Set-NetFirewallRule -Name $ruleName -Enabled False -ErrorAction Stop }}
-    exit 0
-}}
-$programPath = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{program_b64}'))
+{helpers}
+$desktopProgram = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{program_b64}'))
 $remoteScope = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{scope_b64}')) -split ','
-$rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-if ($null -eq $rule) {{
-    New-NetFirewallRule -Name $ruleName -DisplayName 'Voice Terminal Device Pairing (局域网受限)' `
-        -Group 'Voice Terminal' -Program $programPath -Direction Inbound -Protocol TCP `
-        -LocalPort {DEVICE_PAIRING_PORT} -RemoteAddress $remoteScope -Profile Private,Domain `
-        -Action Allow -Enabled True -ErrorAction Stop | Out-Null
-}} else {{
-    Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Private,Domain -ErrorAction Stop
-    Set-NetFirewallApplicationFilter -InputObject (Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule) `
-        -Program $programPath -ErrorAction Stop
-    Set-NetFirewallPortFilter -InputObject (Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule) `
-        -Protocol TCP -LocalPort {DEVICE_PAIRING_PORT} -ErrorAction Stop
-    Set-NetFirewallAddressFilter -InputObject (Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule) `
-        -RemoteAddress $remoteScope -ErrorAction Stop
+$rules = @(
+{rules}
+)
+$newlyEnabled = @()
+try {{
+foreach ($spec in $rules) {{
+    $rule = Get-NetFirewallRule -Name $spec.Name -ErrorAction SilentlyContinue
+    if (-not {enabled}) {{
+        if ($null -ne $rule) {{
+            Set-NetFirewallRule -Name $spec.Name -Enabled False -ErrorAction Stop
+            $disabled = Get-NetFirewallRule -Name $spec.Name -ErrorAction Stop
+            if ([string]$disabled.Enabled -ne 'False') {{ throw '程序规则关闭后的复核未通过' }}
+        }}
+        continue
+    }}
+    if ($spec.Port -le 0 -or $spec.Port -gt 65535) {{ throw '程序规则端口无效' }}
+    if ($null -eq $rule -or [string]$rule.Enabled -ne 'True') {{ $newlyEnabled += $spec.Name }}
+    if ($null -eq $rule) {{
+        New-NetFirewallRule -Name $spec.Name -DisplayName $spec.Name -Group 'Voice Terminal' `
+            -Program $spec.Program -Direction Inbound -Protocol $spec.Protocol -LocalPort $spec.Port `
+            -RemoteAddress $remoteScope -Profile Private,Domain -Action Allow -Enabled True -ErrorAction Stop | Out-Null
+    }} else {{
+        Set-NetFirewallRule -Name $spec.Name -Enabled True -Direction Inbound -Action Allow -Profile Private,Domain -ErrorAction Stop
+        Set-NetFirewallApplicationFilter -InputObject (Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule) `
+            -Program $spec.Program -ErrorAction Stop
+        Set-NetFirewallPortFilter -InputObject (Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule) `
+            -Protocol $spec.Protocol -LocalPort $spec.Port -ErrorAction Stop
+        Set-NetFirewallAddressFilter -InputObject (Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule) `
+            -RemoteAddress $remoteScope -ErrorAction Stop
+    }}
+    $updated = Get-NetFirewallRule -Name $spec.Name -ErrorAction Stop
+    if (-not (Test-ProjectFirewallRule $updated $spec.Program $spec.Port $remoteScope $spec.Protocol)) {{ throw '程序规则配置后的程序、端口或子网复核未通过' }}
 }}
-exit 0
-"#
-        );
-        run_elevated_powershell(&script)?;
-        let after = open_ssh_server_status()?;
-        if enabled && !after.pairing_access_valid {
-            return Err("已授权启用配对入口，但程序、固定端口或精确子网复核未通过。".into());
-        }
-        Ok(after)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = enabled;
-        Err("Windows 配对入站规则只支持 Windows 主机。".into())
-    }
-}
-
-/// set_device_broadcast_access（设置广播所需网络规则）：只变更程序专属 SSH 与配对规则。
-pub fn set_device_broadcast_access(enabled: bool) -> Result<OpenSshServerStatus, String> {
-    if enabled {
-        set_device_pairing_access(true)?;
-        match set_open_ssh_project_access(true) {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                let _ = set_open_ssh_project_access(false);
-                let _ = set_device_pairing_access(false);
-                Err(format!(
-                    "本程序受限 SSH 入站规则未能准备完成；已尝试关闭本轮配对和 SSH 规则：{error}"
-                ))
-            }
-        }
-    } else {
-        let ssh_result = set_open_ssh_project_access(false);
-        let pairing_result = set_device_pairing_access(false);
-        match (ssh_result, pairing_result) {
-            (Ok(status), Ok(_)) => Ok(status),
-            (Err(ssh_error), Ok(_)) => Err(format!("本程序 SSH 入站规则未能关闭：{ssh_error}")),
-            (Ok(_), Err(pairing_error)) => {
-                Err(format!("本程序配对入站规则未能关闭：{pairing_error}"))
-            }
-            (Err(ssh_error), Err(pairing_error)) => Err(format!(
-                "本程序 SSH 和配对规则均未能关闭：{ssh_error}；{pairing_error}"
-            )),
-        }
-    }
+}} catch {{
+    # 回收也在同一授权进程内完成，失败后不会再弹出第二轮 UAC（管理员授权）。
+    foreach ($name in $newlyEnabled) {{ Set-NetFirewallRule -Name $name -Enabled False -ErrorAction Continue }}
+    throw
+}}
+"#,
+        helpers = FIREWALL_VALIDATION_SCRIPT
+    )
 }
 
 /// install_project_device_key（登记受限项目公钥）：只增删带工作区和设备标记的授权行。
@@ -1189,7 +1259,7 @@ fn manage_project_device_key(
             return Err("项目 authorized_keys 的来源必须是实际活动局域网子网。".into());
         }
     }
-    let status = open_ssh_server_status()?;
+    let status = open_ssh_server_runtime_status()?;
     if !status.ready {
         return Err("微软 OpenSSH Server 尚未通过基础就绪检查。".into());
     }
@@ -1322,6 +1392,7 @@ fn valid_private_cidr(value: &str) -> bool {
 const AUTHORIZED_KEYS_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$temp = $null
 try {
     $action = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@ACTION@@'))
     $expectedSid = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@EXPECTED_SID@@'))
@@ -1331,7 +1402,7 @@ try {
     $adminExpected = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@ADMIN@@')) -eq 'true'
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if ([string]$identity.User.Value -ne $expectedSid) { throw '当前登录账户 SID 与受限公钥目标不匹配。' }
-    if ([string]$identity.Name -match '^(?i:AzureAD)\') { throw 'Microsoft Entra 账户不受当前 Windows OpenSSH 支持。' }
+    if ([string]$identity.Name -match '^(?i:AzureAD)\\') { throw 'Microsoft Entra 账户不受当前 Windows OpenSSH 支持。' }
     $groups = @($identity.Groups | ForEach-Object { $_.Value })
     $isAdmin = $groups -contains 'S-1-5-32-544'
     if ($isAdmin -ne $adminExpected) { throw '管理员公钥存储与当前账户组身份不匹配。' }
@@ -1371,12 +1442,14 @@ try {
         $text = ''
         $rows = @()
     }
-    $beforeHash = [Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData($oldBytes))
+    # Windows PowerShell 5.1 使用 .NET Framework（系统运行库），不提供静态 HashData（摘要计算）。
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { $beforeHash = [Convert]::ToBase64String($sha256.ComputeHash($oldBytes)) } finally { $sha256.Dispose() }
     $prefix = 'VoiceTerminal:'
     $owned = @($rows | Where-Object { $_.EndsWith(" $marker", [StringComparison]::Ordinal) })
     $otherRows = @($rows | Where-Object { -not $_.EndsWith(" $marker", [StringComparison]::Ordinal) })
     if ($action -eq 'add') {
-        if ($otherRows | Where-Object { $_.Contains($publicKey, [StringComparison]::Ordinal) }) { throw '该公钥已在非本程序授权行中出现；为避免通用 SSH 权限，未登记。' }
+        if ($otherRows | Where-Object { $_.IndexOf($publicKey, [StringComparison]::Ordinal) -ge 0 }) { throw '该公钥已在非本程序授权行中出现；为避免通用 SSH 权限，未登记。' }
         $rows = @($otherRows + $line)
     } elseif ($action -eq 'remove') {
         $rows = $otherRows
@@ -1395,12 +1468,18 @@ try {
     if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue; throw '无法设置微软 OpenSSH 要求的授权公钥 ACL。' }
     if (Test-Path -LiteralPath $fullPath) {
         $currentBytes = [IO.File]::ReadAllBytes($fullPath)
-        $currentHash = [Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData($currentBytes))
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try { $currentHash = [Convert]::ToBase64String($sha256.ComputeHash($currentBytes)) } finally { $sha256.Dispose() }
         if ($currentHash -ne $beforeHash) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue; throw '授权公钥文件在写入前发生变化，拒绝覆盖。' }
-        [IO.File]::Replace($temp, $fullPath, $null)
+        # NullString（真正的空字符串引用）避免 PowerShell 5.1 把 $null 转为空路径。
+        [IO.File]::Replace($temp, $fullPath, [System.Management.Automation.Language.NullString]::Value)
     } else { [IO.File]::Move($temp, $fullPath) }
     Write-Output 'VoiceTerminalAuthorizedKeyUpdated'
-} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+} catch {
+    $failure = $_.Exception.Message
+    if ($temp -and [IO.File]::Exists($temp)) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+    [Console]::Error.WriteLine($failure); exit 1
+}
 "#;
 
 #[cfg(windows)]
@@ -1428,6 +1507,8 @@ fn powershell_executable() -> Result<std::path::PathBuf, String> {
 #[cfg(windows)]
 fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, String> {
     use std::{
+        io::Read,
+        os::windows::process::CommandExt,
         process::{Command, Stdio},
         thread,
         time::Instant,
@@ -1438,6 +1519,7 @@ fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, 
         std::env::var_os("SystemRoot").ok_or("Windows SystemRoot 环境变量不可用。")?,
     )
     .join("System32/WindowsPowerShell/v1.0/Modules");
+    let script = format!("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n{script}");
     let mut child = Command::new(executable)
         .args([
             "-NoProfile",
@@ -1450,24 +1532,47 @@ fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（不创建控制台窗口，避免 Windows Terminal 空窗）。
         .env("PSModulePath", system_module_path)
         .spawn()
         .map_err(|error| format!("无法启动 Windows PowerShell：{error}"))?;
+    // 同时排空两个管道，避免系统模块的诊断或进度输出填满管道后把查询卡住。
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("PowerShell 标准输出管道不可用。")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("PowerShell 错误输出管道不可用。")?;
+    let output_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let error_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
     let started = Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("无法读取 PowerShell 任务状态：{error}"))?
         {
-            let output = child
-                .wait_with_output()
+            let output = output_reader
+                .join()
+                .map_err(|_| "PowerShell 输出读取线程异常。")?
                 .map_err(|error| format!("无法读取 PowerShell 状态回执：{error}"))?;
+            let diagnostic_bytes = error_reader
+                .join()
+                .map_err(|_| "PowerShell 错误读取线程异常。")?
+                .map_err(|error| format!("无法读取 PowerShell 错误回执：{error}"))?;
             if !status.success() {
                 let exit_code = status
                     .code()
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "未知".into());
-                let diagnostic = String::from_utf8_lossy(&output.stderr)
+                let diagnostic = String::from_utf8_lossy(&diagnostic_bytes)
                     .chars()
                     .filter(|character| !character.is_control() || *character == ' ')
                     .take(240)
@@ -1484,7 +1589,7 @@ fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, 
                     "OpenSSH Server 状态查询失败（PowerShell 退出码 {exit_code}）{detail}。"
                 ));
             }
-            return String::from_utf8(output.stdout)
+            return String::from_utf8(output)
                 .map(|value| value.trim().to_owned())
                 .map_err(|_| "OpenSSH Server 状态结果不是 UTF-8。".into());
         }
@@ -1499,7 +1604,12 @@ fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, 
 
 #[cfg(windows)]
 fn run_elevated_powershell(script: &str) -> Result<(), String> {
-    run_elevated_powershell_with_progress(script, &mut |_| {})
+    let exit_code = run_elevated_powershell_process(script, &mut |_| {})?;
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!("程序网络规则或设备公钥配置未完成（PowerShell 退出码 {exit_code}）；请检查 Windows 授权及系统策略。"))
+    }
 }
 
 #[cfg(windows)]
@@ -1507,6 +1617,15 @@ fn run_elevated_powershell_with_progress(
     script: &str,
     on_wait: &mut dyn FnMut(std::time::Duration),
 ) -> Result<(), String> {
+    elevated_exit_result(run_elevated_powershell_process(script, on_wait)?)
+}
+
+/// run_elevated_powershell_process（执行管理员任务）：调用方按安装或网络配置解释退出码。
+#[cfg(windows)]
+fn run_elevated_powershell_process(
+    script: &str,
+    on_wait: &mut dyn FnMut(std::time::Duration),
+) -> Result<u32, String> {
     use std::{mem::size_of, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -1525,7 +1644,9 @@ fn run_elevated_powershell_with_progress(
 
     let executable = wide(powershell_executable()?.as_os_str());
     let verb = wide(std::ffi::OsStr::new("runas"));
-    let encoded = encode_powershell(script);
+    // 所有管理员脚本使用系统模块路径，避免继承 PowerShell 7（新版命令行）模块。
+    let script = format!("$env:PSModulePath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules'\n$PSModuleAutoLoadingPreference = 'All'\n{script}");
+    let encoded = encode_powershell(&script);
     let parameters = wide(std::ffi::OsStr::new(&format!(
         "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
     )));
@@ -1579,7 +1700,7 @@ fn run_elevated_powershell_with_progress(
     if exit_read == 0 {
         return Err("无法读取 OpenSSH Server 管理任务退出状态；请刷新状态确认结果。".into());
     }
-    elevated_exit_result(exit_code)
+    Ok(exit_code)
 }
 
 #[cfg(test)]
@@ -2128,6 +2249,213 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn broadcast_rules_use_verified_ports_for_create_update_and_disable() {
+        // 在独立进程内替换全部防火墙命令，验证实际脚本参数，不修改系统规则。
+        let mut status = OpenSshServerStatus::from_json(complete_server_status()).unwrap();
+        status.local_lan_scopes = vec!["192.168.1.0/24".into()];
+        for (enabled, existing, fail) in [
+            (true, false, false),
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let setup = format!(
+                r#"
+$script:existing = {existing}
+$script:failValidation = {fail}
+$script:created = @{{}}
+$script:disabled = @{{}}
+$script:calls = @()
+function Get-NetFirewallRule {{ param($Name,$ErrorAction) if ($script:existing -or $script:created.ContainsKey($Name)) {{ return @{{Name=$Name;Enabled=$(if ($script:disabled.ContainsKey($Name)) {{'False'}} else {{'True'}});Direction='Inbound';Action='Allow';Profile='Domain, Private'}} }} }}
+function New-NetFirewallRule {{
+    param($Name,$DisplayName,$Group,$Program,$Direction,$Protocol,$LocalPort,$RemoteAddress,$Profile,$Action,$Enabled,$ErrorAction)
+    if (-not $LocalPort) {{ throw 'Mock rejected empty LocalPort' }}
+    $script:calls += @{{name=$Name;port=$LocalPort;scope=($RemoteAddress -join ',');program=$Program}}
+    $script:created[$Name]=$true
+}}
+function Set-NetFirewallRule {{ param($Name,$Enabled,$Direction,$Action,$Profile,$ErrorAction)
+    if ([string]$Enabled -eq 'False') {{ $script:disabled[$Name]=$true; $script:calls += @{{name=$Name;disabled=$true}} }}
+}}
+function Get-NetFirewallApplicationFilter {{ param($AssociatedNetFirewallRule,$ErrorAction) return @{{Program=$(if ($AssociatedNetFirewallRule.Name -like '*OpenSSH*') {{Join-Path $env:SystemRoot 'System32/OpenSSH/sshd.exe'}} else {{$desktopProgram}})}} }}
+function Get-NetFirewallPortFilter {{ param($AssociatedNetFirewallRule,$ErrorAction) return @{{Name=$AssociatedNetFirewallRule.Name;Protocol=$(if ($AssociatedNetFirewallRule.Name -like '*UDP*') {{'UDP'}} else {{'TCP'}});LocalPort=$(if ($AssociatedNetFirewallRule.Name -like '*OpenSSH*') {{'22'}} elseif ($AssociatedNetFirewallRule.Name -like '*UDP*') {{'5353'}} else {{'18766'}})}} }}
+function Get-NetFirewallAddressFilter {{ param($AssociatedNetFirewallRule,$ErrorAction) return @{{RemoteAddress=@($(if ($script:failValidation -and $AssociatedNetFirewallRule.Name -like '*Pairing*') {{'Any'}} else {{'192.168.1.0/255.255.255.0'}}))}} }}
+function Set-NetFirewallApplicationFilter {{ param($InputObject,$Program,$ErrorAction) }}
+function Set-NetFirewallAddressFilter {{ param($InputObject,$RemoteAddress,$ErrorAction) }}
+function Set-NetFirewallPortFilter {{ param($InputObject,$Protocol,$LocalPort,$ErrorAction)
+    if (-not $LocalPort) {{ throw 'Mock rejected empty LocalPort' }}
+    $script:calls += @{{name=$InputObject.Name;port=$LocalPort}}
+}}
+"#,
+                existing = if existing { "$true" } else { "$false" },
+                fail = if fail { "$true" } else { "$false" }
+            );
+            let script = setup + "\ntry {\n"
+                + &project_access_script(
+                    enabled,
+                    true,
+                    true,
+                    true,
+                    &status,
+                    std::path::Path::new("C:/Program Files/Voice Terminal/Desktop.exe"),
+                )
+                + "\n} catch { $script:failed=$true }\n@{failed=[bool]$script:failed;calls=@($script:calls)} | ConvertTo-Json -Compress -Depth 4";
+            let output = run_powershell(&script, std::time::Duration::from_secs(10)).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let calls = value["calls"].as_array().unwrap();
+            assert_eq!(value["failed"], fail, "{value}");
+            if fail {
+                // 同一管理员脚本内回收新入口；已有启用规则必须保留，不发起第二次授权。
+                let disabled = calls
+                    .iter()
+                    .filter(|call| call["disabled"] == true)
+                    .collect::<Vec<_>>();
+                assert_eq!(disabled.len(), if existing { 0 } else { 2 }, "{value}");
+                if !existing {
+                    assert_eq!(disabled[0]["name"], "VoiceTerminal-OpenSSH-Server-In-TCP");
+                    assert_eq!(disabled[1]["name"], "VoiceTerminal-Device-Pairing-TCP-In");
+                }
+                continue;
+            }
+            assert_eq!(calls.len(), 3, "{value}");
+            assert_eq!(calls[0]["name"], "VoiceTerminal-OpenSSH-Server-In-TCP");
+            assert_eq!(calls[1]["name"], "VoiceTerminal-Device-Pairing-TCP-In");
+            assert_eq!(calls[2]["name"], "VoiceTerminal-Device-Discovery-UDP-In");
+            if enabled {
+                assert_eq!(calls[0]["port"], 22);
+                assert_eq!(calls[1]["port"], DEVICE_PAIRING_PORT);
+                assert_eq!(calls[2]["port"], 5353);
+                if !existing {
+                    assert_eq!(calls[0]["scope"], "192.168.1.0/24");
+                    assert_eq!(calls[1]["scope"], "192.168.1.0/24");
+                    assert_eq!(
+                        calls[1]["program"],
+                        "C:/Program Files/Voice Terminal/Desktop.exe"
+                    );
+                }
+            } else {
+                assert_eq!(calls[0]["disabled"], true);
+                assert_eq!(calls[1]["disabled"], true);
+                assert_eq!(calls[2]["disabled"], true);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn firewall_validation_normalizes_masks_and_rejects_broader_or_wrong_rules() {
+        let script = FIREWALL_VALIDATION_SCRIPT.to_owned()
+            + r#"
+$ErrorActionPreference = 'Stop'
+$rule = @{Enabled='True';Direction='Inbound';Action='Allow';Profile='Domain, Private'}
+$script:program='C:\中文 程序\桌面.exe';$script:protocol='TCP';$script:ports=@('18766');$script:scope=@('192.168.253.0/255.255.255.0','fd12:3456::/64')
+function Get-NetFirewallApplicationFilter { param($AssociatedNetFirewallRule,$ErrorAction) return @{Program=$script:program} }
+function Get-NetFirewallPortFilter { param($AssociatedNetFirewallRule,$ErrorAction) return @{Protocol=$script:protocol;LocalPort=$script:ports} }
+function Get-NetFirewallAddressFilter { param($AssociatedNetFirewallRule,$ErrorAction) return @{RemoteAddress=$script:scope} }
+$expected=@('fd12:3456:0:0::/64','192.168.253.0/24')
+if (-not (Test-ProjectFirewallRule $rule $script:program 18766 $expected)) { throw 'equivalent mask or IPv6 forms rejected' }
+foreach ($bad in @('Any','LocalSubnet','192.168.0.0/16','192.168.253.0/255.0.255.0')) {
+    $script:scope=@($bad,'fd12:3456::/64')
+    if (Test-ProjectFirewallRule $rule $script:program 18766 $expected) { throw 'broader or invalid scope accepted' }
+}
+$script:scope=@('192.168.253.0/24','fd12:3456::/64')
+$script:ports=@('18766','22')
+if (Test-ProjectFirewallRule $rule $script:program 18766 $expected) { throw 'extra port accepted' }
+$script:ports=@('18766')
+foreach ($field in @('Direction','Action','Profile')) {
+    $old=$rule[$field];$rule[$field]=@{Direction='Outbound';Action='Block';Profile='Any'}[$field]
+    if (Test-ProjectFirewallRule $rule $script:program 18766 $expected) { throw 'wrong rule type accepted' }
+    $rule[$field]=$old
+}
+$script:protocol='17';$script:ports=@('5353')
+if (-not (Test-ProjectFirewallRule $rule $script:program 5353 $expected 'UDP')) { throw 'UDP protocol number rejected' }
+Write-Output 'Validated'
+"#;
+        assert_eq!(
+            run_powershell(&script, std::time::Duration::from_secs(10)).unwrap(),
+            "Validated"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_51_key_registration_preserves_other_lines_and_supports_unicode_paths() {
+        // 仅在临时目录写测试公钥；系统身份仍用真实 SID（安全标识符），ACL（访问控制）命令全部替换。
+        let temp_owner = std::env::temp_dir();
+        let temp = temp_owner.join(format!("voice-ssh-key-{}", crate::workspace::new_id()));
+        let parent = temp.join("中文 空格账户");
+        std::fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("authorized_keys");
+        let original = "# 保留其他用户配置\nssh-ed25519 OTHER unrelated\n";
+        let sid = current_user_sid().unwrap();
+        let target_b64 =
+            base64::engine::general_purpose::STANDARD.encode(target.to_string_lossy().as_bytes());
+        for admin in [false, true] {
+            std::fs::write(&target, original).unwrap();
+            for (index, action) in ["add", "add", "remove"].into_iter().enumerate() {
+                let target_expression = format!(
+                    "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{target_b64}'))"
+                );
+                let mut script = AUTHORIZED_KEYS_SCRIPT
+                    .replace(
+                        "$isAdmin = $groups -contains 'S-1-5-32-544'",
+                        if admin {
+                            "$isAdmin = $true"
+                        } else {
+                            "$isAdmin = $false"
+                        },
+                    )
+                    .replace(
+                        "Join-Path $env:USERPROFILE '.ssh/authorized_keys'",
+                        &target_expression,
+                    )
+                    .replace(
+                        "Join-Path $env:ProgramData 'ssh/administrators_authorized_keys'",
+                        &target_expression,
+                    );
+                let line = format!(
+                    "command=build-{index} ssh-ed25519 TEST VoiceTerminal:workspace:device"
+                );
+                for (name, value) in [
+                    ("ACTION", action),
+                    ("EXPECTED_SID", sid.as_str()),
+                    ("MARKER", "VoiceTerminal:workspace:device"),
+                    ("PUBLIC_KEY", "ssh-ed25519 TEST"),
+                    ("LINE", line.as_str()),
+                    ("ADMIN", if admin { "true" } else { "false" }),
+                ] {
+                    script = script.replace(
+                        &format!("@@{name}@@"),
+                        &base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+                    );
+                }
+                let setup = format!(
+                    r#"
+function Get-Acl {{ param($LiteralPath) return @{{Access=@('{acl_owner}','S-1-5-18') | ForEach-Object {{ @{{IdentityReference=[Security.Principal.SecurityIdentifier]::new($_);IsInherited=$false}} }} }} }}
+function icacls.exe {{ $global:LASTEXITCODE=0 }}
+"#,
+                    acl_owner = if admin { "S-1-5-32-544" } else { sid.as_str() }
+                );
+                let result =
+                    run_powershell(&(setup + &script), std::time::Duration::from_secs(10)).unwrap();
+                assert_eq!(result, "VoiceTerminalAuthorizedKeyUpdated");
+                let text = std::fs::read_to_string(&target).unwrap();
+                assert!(text.starts_with(original));
+                assert_eq!(
+                    text.matches("VoiceTerminal:workspace:device").count(),
+                    usize::from(action == "add")
+                );
+                if action == "add" {
+                    assert!(text.contains(&line));
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        }
+        crate::workspace::remove_owned(&temp, &temp_owner).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn generated_install_script_parses_without_executing_system_commands() {
         use base64::Engine as _;
         use std::process::Command;
@@ -2504,6 +2832,30 @@ $command = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue
             "PowerShell command probe: {value}"
         );
         assert_eq!(value["signature_status"], "Valid");
+    }
+
+    #[cfg(all(windows, feature = "ssh-device"))]
+    #[tokio::test]
+    #[ignore = "人工只读验收：读取实际服务与回环公钥，不写系统密钥或防火墙"]
+    async fn current_service_public_key_is_obtainable_without_protected_file_access() {
+        let started = std::time::Instant::now();
+        let status = open_ssh_server_runtime_status().unwrap();
+        eprintln!("运行必要检查耗时: {:?}", started.elapsed());
+        assert!(status.ready);
+        assert!(status.existing_ssh_inbound_rules.is_empty());
+        let cached_started = std::time::Instant::now();
+        assert_eq!(
+            open_ssh_server_runtime_status().unwrap().effective_port,
+            status.effective_port
+        );
+        eprintln!("同轮复用检查耗时: {:?}", cached_started.elapsed());
+        let started = std::time::Instant::now();
+        let identity = open_ssh_server_identity(status.effective_port.unwrap())
+            .await
+            .unwrap();
+        eprintln!("回环公钥握手耗时: {:?}", started.elapsed());
+        assert!(identity.public_key.starts_with("ssh-ed25519 "));
+        assert!(identity.fingerprint_sha256.starts_with("SHA256:"));
     }
 
     #[cfg(windows)]

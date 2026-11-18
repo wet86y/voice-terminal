@@ -79,6 +79,7 @@ export interface ApplicationSnapshot {
   remote_error?: string | null // remote_error（远程目标暂不可用的原因）。
   remote_voice_error?: string | null // remote_voice_error（本机远程语音 WebSocket 转发错误）。
   remote_runtime_state?: string // remote_runtime_state（服务端实际语音核心状态）。
+  remote_connection_state?: 'unpaired' | 'paused' | 'connecting' | 'connected' // remote_connection_state（配对、重连暂停、连接中或管理已连接）。
   /** revision（状态版本）。 */
   revision: number
   /** endpoint_revision（语音端点版本）：地址不变但服务进程重启时仍触发重连。 */
@@ -174,7 +175,8 @@ export function applicationOverlay(value: ApplicationSnapshot | null, options: {
 
 /** applicationRuntimeFailure（运行期故障）：启动完成后核心能力才失败，据此显示横幅。 */
 export function applicationRuntimeFailure(value: ApplicationSnapshot | null): boolean {
-  return Boolean(value?.startup_complete) && applicationCorePhase(value) === 'failed'
+  return Boolean(value?.startup_complete) && (!value?.remote_mode || value.management_connected === true)
+    && applicationCorePhase(value) === 'failed'
 }
 
 // product/main（产品入口）只会在 Host 配置通过预检后加载，因此产品永远由宿主管理。
@@ -323,12 +325,12 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
     return null
   }
   const hostId = local.device_config?.paired_host?.host_id ?? null
-  const hostName = local.device_config?.paired_host?.display_name ?? '已配对服务端'
+  const hostName = local.device_config?.paired_host?.display_name ?? (hostId ? '已配对服务端' : '尚未配对服务端')
   let sshConnected = false
   let management: RemoteManagementResponse | null = null
   let remoteError: string | null = null
   try {
-    sshConnected = (await nativeDeviceApi.sshHostStatus()).connected
+    sshConnected = Boolean(hostId) && (await nativeDeviceApi.sshHostStatus()).connected
     if (sshConnected) management = await nativeDeviceApi.remoteManagementRequest('management.status', {})
   } catch (failure) {
     remoteError = failure instanceof Error ? failure.message : '远程连接状态暂不可读。'
@@ -348,21 +350,29 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
   }
   let product: ProductSnapshot | null = null
   let remoteBusinessReady = false
+  let taskReady = false
+  let taskGeneration: number | undefined // taskGeneration（核心任务连接代次）：核心重建时更新实时端点，独立于管理租约。
   if (managementConnected && remoteCoreState === 'ready') {
     try {
-      const result: RemoteManagementResponse = await nativeDeviceApi.remoteManagementRequest('product.snapshot', {})
-      const productEnvelopeValid = matchesRemoteManagementEnvelope(result, hostId, 'product.snapshot')
-      if (result.status === 200 && productEnvelopeValid && result.body && typeof result.body === 'object'
-        && typeof result.body.runtime === 'object' && result.body.runtime !== null) {
-        product = result.body as unknown as ProductSnapshot
-        remoteBusinessReady = true
-        remoteError = null
-      } else {
-        const detail = result.body && typeof result.body.detail === 'string' ? result.body.detail : ''
-        remoteBusinessReady = false
-        remoteError = detail || (result.status === 200 && !productEnvelopeValid
-          ? '服务端产品状态的目标或通道代次不匹配，已丢弃该状态。'
-          : `服务端产品状态暂不可用（HTTP ${result.status}）。`)
+      const task = await nativeDeviceApi.remoteTaskChannel('status')
+      taskReady = task.state === 'running' && task.device_id === local.runtime.device_id
+        && Number.isSafeInteger(task.connection_generation) && (task.connection_generation ?? 0) > 0
+      if (taskReady) taskGeneration = task.connection_generation
+      if (taskReady) {
+        const result: RemoteManagementResponse = await nativeDeviceApi.remoteManagementRequest('product.snapshot', {})
+        const productEnvelopeValid = matchesRemoteManagementEnvelope(result, hostId, 'product.snapshot')
+        if (result.status === 200 && productEnvelopeValid && result.body && typeof result.body === 'object'
+          && typeof result.body.runtime === 'object' && result.body.runtime !== null) {
+          product = result.body as unknown as ProductSnapshot
+          remoteBusinessReady = true
+          remoteError = null
+        } else {
+          const detail = result.body && typeof result.body.detail === 'string' ? result.body.detail : ''
+          remoteBusinessReady = false
+          remoteError = detail || (result.status === 200 && !productEnvelopeValid
+            ? '服务端产品状态的目标或通道代次不匹配，已丢弃该状态。'
+            : `服务端产品状态暂不可用（HTTP ${result.status}）。`)
+        }
       }
     } catch (failure) {
       remoteBusinessReady = false
@@ -387,24 +397,31 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
       shared_with: null, retry_allowed: false, retrying: false, external: false,
     }
   })
-  const coreAvailable = product?.runtime?.can_start === true
-  const loadingRemoteCore = Boolean(services && Object.values(services).some(value => {
-    const state = typeof value === 'string' ? value : value && typeof value === 'object'
-      ? String((value as Record<string, unknown>).state ?? '') : ''
-    return /starting|loading/i.test(state)
-  }))
-  const corePhase: 'ready' | 'starting' | 'failed' = coreAvailable ? 'ready'
-    : remoteCoreState === 'starting' || loadingRemoteCore ? 'starting' : 'failed'
+  const readyServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED', 'DISABLED'])
+  const loadingServices = new Set(['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'])
+  const serviceState = (value: unknown) => (typeof value === 'string' ? value : value && typeof value === 'object'
+    ? String((value as Record<string, unknown>).state ?? '') : '').toUpperCase()
+  const blockingServices = Object.entries(services ?? {}).filter(([id]) => ['audio', 'asr', 'llm', 'tts', 'kws'].includes(id))
+  const failedRemoteCore = blockingServices.some(([, value]) => !readyServices.has(serviceState(value))
+    && !loadingServices.has(serviceState(value)))
+  const loadingRemoteCore = blockingServices.some(([, value]) => {
+    return loadingServices.has(serviceState(value))
+  })
+  // can_start（允许开始监听）在监听、思考、播报期间为假，不能作为核心能力故障证据。
+  const corePhase: 'ready' | 'starting' | 'failed' = !managementConnected ? 'starting'
+    : remoteCoreState === 'unavailable' || failedRemoteCore ? 'failed'
+      : remoteCoreState === 'starting' || loadingRemoteCore || !product ? 'starting' : 'ready'
+  const coreAvailable = product !== null && corePhase === 'ready'
   let voiceWsUrl = ''
   let remoteVoiceError: string | null = null
-  if (managementConnected && remoteCoreState === 'ready' && hostId) {
+  if (managementConnected && remoteCoreState === 'ready' && taskReady && hostId) {
     try { voiceWsUrl = await ensureRemoteVoiceForwarder(hostId) }
     catch (failure) { remoteVoiceError = failure instanceof Error ? failure.message : '远程语音本机转发不可用。' }
   } else {
     await stopRemoteVoiceForwarder()
   }
-  const unavailableCapabilities: ApplicationCapability[] = coreAvailable ? [] : [{
-    id: 'voice', label: '语音核心', state: corePhase, blocking: true,
+  const unavailableCapabilities: ApplicationCapability[] = !managementConnected || coreAvailable ? [] : [{
+    id: 'voice', label: '服务端语音核心', state: corePhase === 'starting' ? 'STARTING' : 'ERROR', blocking: true,
     phase: remoteError || (managementConnected ? '服务端语音核心仍在准备' : '等待远程服务端连接'),
     error: remoteError ?? '', retry: null,
   }]
@@ -412,8 +429,10 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
   return {
     instance_id: hostId ?? `remote-${local.runtime.device_id ?? 'unpaired'}`,
     revision: remoteApplicationRevision,
-    endpoint_revision: managementConnected ? management?.session_generation : undefined,
+    endpoint_revision: taskGeneration,
     remote_mode: true,
+    remote_connection_state: !hostId ? 'unpaired' : local.device_config?.reconnect_suspended_reason ? 'paused'
+      : managementConnected ? 'connected' : 'connecting',
     host_id: hostId,
     host_name: hostName,
     management_connected: managementConnected,

@@ -218,6 +218,34 @@ class DshRuntimeTests(unittest.TestCase):
 
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_refresh_updates_plugin_loader_patch_and_preserves_user_patch(self) -> None:
+        """旧配置升级时同步设备服务加载行，并逐字保留根部用户设置。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = root / "config/dsh/profile"
+            profile = root / "home/profiles/web"
+            plugin = Path("node_modules/@voice-terminal/dsh-plugin")
+            (template / plugin).mkdir(parents=True)
+            (profile / plugin).mkdir(parents=True)
+            defaults = "- id: agent-preset-registry\n  config:\n    default: shadow-agent\n- id: session-log-deepseek\n  disabled: true\n"
+            (template / "cordis.patch.yml").write_text(defaults, encoding="utf-8")
+            user_patch = (defaults + "# 用户自己的模型与工作区设置\n").encode("utf-8")
+            (profile / "cordis.patch.yml").write_bytes(user_patch)
+            old_loader = "- insert:\n    - id: voice-terminal-shadow-bridge\n"
+            new_loader = "- insert:\n    - id: voice-terminal-device-control\n      name: '@voice-terminal/dsh-plugin/device-control'\n    - id: voice-terminal-shadow-bridge\n"
+            (profile / plugin / "cordis.patch.yml").write_text(old_loader, encoding="utf-8")
+            (template / plugin / "cordis.patch.yml").write_text(new_loader, encoding="utf-8")
+            config = DshConfig(home_dir=root / "home", profile_patch=template / "cordis.patch.yml")
+            manager = DshRuntimeManager(config)
+            manager.repo_root = root
+            with patch.object(manager, "_remove_legacy_modules_link"):
+                await manager._prepare_profile(modules_target=None)
+                await manager._prepare_profile(modules_target=None)
+            self.assertEqual((profile / plugin / "cordis.patch.yml").read_text(encoding="utf-8"), new_loader)
+            preserved = (profile / "cordis.patch.yml").read_bytes()
+            self.assertTrue(preserved.startswith(user_patch))
+            self.assertEqual(preserved.count(b"- id: plugin-manager"), 1)
+
     async def test_release_refresh_preserves_native_task_selection_and_patch(self) -> None:
         """更新程序默认配置时保留官方会话任务选择及其用户补丁。"""
         with tempfile.TemporaryDirectory() as directory:

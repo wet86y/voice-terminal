@@ -1956,6 +1956,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         authorize_application(request)
         return await runtime.application_delegated_status()
 
+    @app.post("/internal/application/device-gateway")
+    async def application_device_gateway(request: Request) -> dict:
+        """application_device_gateway（交接回环入口）：仅接收本次受管宿主的显式开关。"""
+        authorize_application(request)
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {"enabled", "host_id"} or type(payload["enabled"]) is not bool:
+            raise HTTPException(status_code=422, detail="设备网关开关字段无效。")
+        gateway = getattr(runtime, "_device_gateway", None)
+        if gateway is None or getattr(runtime, "_application_stopping", False):
+            raise HTTPException(status_code=503, detail="设备回环网关控制器不可用。")
+        host_id = payload["host_id"]
+        if payload["enabled"]:
+            if not isinstance(host_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", host_id):
+                raise HTTPException(status_code=422, detail="设备网关主机编号无效。")
+            runtime.device_host_id = host_id
+        return await gateway.set_enabled(payload["enabled"])
+
     @app.post("/internal/application/control")
     async def application_control(request: Request) -> dict:
         authorize_application(request)

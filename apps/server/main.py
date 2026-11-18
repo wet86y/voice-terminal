@@ -39,20 +39,6 @@ if __name__ == "__main__":
     worker_imports_ready("voice")
 
 
-def _bind_device_gateway_listener(enabled: bool):
-    """_bind_device_gateway_listener（仅按明确共享角色请求绑定设备回环网关）。"""
-    if not enabled:
-        return None, None
-    try:
-        candidate, candidate_port = bind_loopback(18_765, host="127.0.0.1")
-        if candidate_port == 18_765:
-            return candidate, None
-        candidate.close()
-        return None, "设备回环网关端口已占用。"
-    except OSError as exc:
-        return None, f"设备回环网关不可用：{type(exc).__name__}"
-
-
 def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | int]:
     """Small, non-secret identity payload for logs and ``/health``.
 
@@ -120,7 +106,6 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
         )
         config = replace(config, server=replace(config.server, host="127.0.0.1", port=actual_port))
         report_endpoint("voice", endpoint_url("voice", actual_port))
-        device_gateway_socket, device_gateway_bind_error = _bind_device_gateway_listener(enable_device_gateway)
     runtime = SessionRuntime(
         config,
         product_settings=product_settings,
@@ -173,9 +158,12 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
                         and not os.environ.get("VOICE_APP_ORIGIN")):
                     runtime.begin_dsh_start()
                 application_report("voice", "初始化完成，等待服务监听")
+            if enable_device_gateway:
+                await runtime._device_gateway.set_enabled(True)
             yield
         finally:
             runtime.begin_application_shutdown()
+            await runtime._device_gateway.set_enabled(False)
             try:
                 await runtime.close_background_services()
             finally:
@@ -191,6 +179,8 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
         product_settings=product_settings,
     )
 
+    from voice_terminal.server.device_gateway import DeviceGateway
+    runtime._device_gateway = DeviceGateway(app, runtime)
     return app, runtime
 
 
@@ -214,8 +204,7 @@ def main() -> None:
             enable_device_gateway=args.device_gateway)
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
     bound_socket = runtime._application_listener_socket
-    device_gateway_socket = runtime._device_gateway_listener_socket
-    sockets = [sock for sock in (bound_socket, device_gateway_socket) if sock is not None]
+    sockets = [bound_socket] if bound_socket is not None else []
     try:
         run_uvicorn(app, sock=sockets, host=runtime.config.server.host,
             port=runtime.config.server.port, log_level="info", timeout_graceful_shutdown=10,

@@ -105,6 +105,7 @@ beforeEach(() => {
 afterEach(() => {
   mounted.splice(0).forEach(wrapper => wrapper.unmount())
   Reflect.deleteProperty(window, '__VOICE_APPLICATION__')
+  Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
@@ -799,6 +800,7 @@ describe('正式界面的真实控件交互', () => {
   })
 
   it('远程配对模式通过独立管理和文件通道操作服务端资源，不调用客户端本机资源接口', async () => {
+    application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true } as ApplicationSnapshot
     const inventoryRead = vi.fn(async () => [])
     const workspaceRead = vi.fn(async () => ({ root: 'D:/客户端', data_dir: 'D:/客户端/data', version: '1.0', can_manage: true }))
     const localImport = vi.fn(async () => ({ job_id: 'client-local-import' }))
@@ -847,6 +849,42 @@ describe('正式界面的真实控件交互', () => {
       && (args as Record<string, unknown>)?.operation === 'resource.inventory')).toBe(true)
     wrapper.unmount()
     Reflect.deleteProperty(window, '__TAURI_INTERNALS__')
+  })
+
+  it('远程尚未配对时组件页显示等待，连接恢复后自动读取，不访问客户端资源', async () => {
+    window.__VOICE_APPLICATION__!.remote_mode = true
+    application.snapshot.value = { remote_mode: true, remote_connection_state: 'unpaired', startup_complete: true,
+      management_connected: false, core_phase: 'starting', components: [] } as unknown as ApplicationSnapshot
+    const inventory = vi.fn(async () => [])
+    const manager = vi.fn(async () => [])
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true, resourceInventory: inventory,
+      listen: async () => () => undefined } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    const native = await import('./native-device-api')
+    vi.spyOn(native.nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => {
+      await manager()
+      return { status: 200, body: (operation === 'resource.inventory' ? [{ resource_id: 'paraformer-streaming',
+        label: 'Paraformer（流式识别）', installation_state: 'missing', required: true, can_start: false }] : []) as never, fields: {}, operation }
+    })
+    let resources!: ReturnType<typeof useWorkspaceResources>
+    const wrapper = render({ setup() {
+      const controls = useProductControls(); provideProductContext(controls)
+      resources = useWorkspaceResources()
+      return () => h(ComputeSettings, { resourceController: resources })
+    } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('等待配对服务端')
+    expect(wrapper.findAll('[role="alert"]')).toHaveLength(0)
+    expect(resources.resourcesCanManage.value).toBe(false)
+    expect(manager).not.toHaveBeenCalled()
+    application.snapshot.value = { ...application.snapshot.value!, host_id: 'server-a',
+      remote_connection_state: 'connected', management_connected: true }
+    await flushPromises()
+    expect(resources.resourcesCanManage.value).toBe(true)
+    expect(manager).toHaveBeenCalledTimes(2)
+    const card = await expandComponent(wrapper, 'paraformer', 'speech')
+    await flushPromises()
+    expect(card.get('button[aria-label="Paraformer（流式识别）：下载"]').attributes('disabled')).toBeUndefined()
+    expect(inventory).not.toHaveBeenCalled()
   })
 
   it('运行中的组件页把随包更新显示为必需更新操作，并复用既有下载计划', async () => {

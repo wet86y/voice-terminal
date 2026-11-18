@@ -88,11 +88,22 @@ export interface DeviceConfigStatus {
   runtime: { config_state: 'missing' | 'valid' | 'invalid'; device_id: string | null; mode?: DeviceConfig['mode'] | null; broadcast_enabled?: boolean; desired_role: DeviceConfig['desired_role'] | null; audio_mode: DeviceConfig['audio_mode'] | null; error: string | null }
   device_config: DeviceConfig | null
   device_runtime?: {
+    operation?: {
+      active: boolean // active（宿主仍在执行设备设置，页面切换不会取消）。
+      revision: number // revision（设备设置任务序号）。
+      state_revision?: number // state_revision（任务进度快照递增号，用于拒绝迟到回执）。
+      phase: string // phase（宿主执行阶段）。
+      message: string // message（阶段中文说明）。
+      target_mode: 'local' | 'remote' // target_mode（本次任务目标运行模式）。
+      target_broadcast: boolean // target_broadcast（本次任务目标广播开关）。
+      error: string | null // error（上次任务失败的非敏感说明）。
+    } | null // operation（跨页面接续的原生设备任务）。
     mode?: DeviceConfig['mode'] | null // mode（实际选择的本地或远程模式）。
     broadcast_enabled?: boolean // broadcast_enabled（已保存的广播意图）。
     expected_mode?: DeviceConfig['mode'] | null // expected_mode（已保存的目标运行模式）。
     actual_mode?: DeviceConfig['mode'] | null // actual_mode（当前真实运行模式；未就绪时为空）。
-    switch_phase?: 'ready' | 'waiting_for_remote' | 'starting_local' | 'stopped' // switch_phase（运行模式切换阶段）。
+    switch_phase?: 'ready' | 'waiting_for_remote' | 'starting_local' | 'stopped' | 'failed' // switch_phase（运行模式切换阶段）。
+    error?: string | null // error（模式切换或广播发布的最近故障）。
     broadcast_requested?: boolean // broadcast_requested（已保存的局域网广播意图）。
     broadcast_actual?: boolean // broadcast_actual（广播网关实际就绪状态）。
     revision?: number // revision（运行状态修订号）。
@@ -111,6 +122,8 @@ export interface DeviceConfigStatus {
 
 /** OpenSshServerStatus（OpenSSH Server 状态）：只读字段；不会代表 SSH 已从其他设备可达。 */
 export interface OpenSshServerStatus {
+  discovery_access_enabled?: boolean // discovery_access_enabled（本程序多播发现规则是否启用）。
+  discovery_access_valid?: boolean // discovery_access_valid（UDP 5353 发现端口的程序和子网复核是否通过）。
   feature_id: string // feature_id（固定 Windows 系统功能编号）。
   capability_state: 'Installed' | 'NotPresent' | 'InstallPending' | 'UninstallPending' | 'Staged' | 'Unknown' // capability_state（Windows 可选功能状态；Unknown 表示只读查询未提权）。
   service_present: boolean // service_present（sshd 系统服务是否存在）。
@@ -247,6 +260,8 @@ function isOpenSshServerStatus(value: unknown): value is OpenSshServerStatus {
     && typeof value.project_access_enabled === 'boolean' && typeof value.project_access_valid === 'boolean'
     && isStringArray(value.project_network_scope)
     && typeof value.pairing_access_enabled === 'boolean' && typeof value.pairing_access_valid === 'boolean'
+    && (value.discovery_access_enabled === undefined || typeof value.discovery_access_enabled === 'boolean')
+    && (value.discovery_access_valid === undefined || typeof value.discovery_access_valid === 'boolean')
     && isStringArray(value.pairing_network_scope) && isStringArray(value.existing_ssh_inbound_rules)
     && isStringArray(value.local_lan_addresses) && isStringArray(value.local_lan_scopes)
     && typeof value.ready === 'boolean' && isStringMap(value.fields)
@@ -369,7 +384,7 @@ export const nativeDeviceApi = {
     'device_pairing_connect', { hostId, pairingCode },
   ),
   /** openSshServerStatus（读取 OpenSSH Server 状态）：仅共享主机管理页显式读取。 */
-  openSshServerStatus: () => call<OpenSshServerStatus>('resource_system_feature_status'),
+  openSshServerStatus: (refresh = false) => call<OpenSshServerStatus>('resource_system_feature_status', { refresh }),
   /** enableOpenSshServer（启动本机 SSH 系统功能任务）：把用户的明确确认值传给原生端复核。 */
   enableOpenSshServer: (confirmed: boolean) => call<{ job_id: string; fields: Record<string, string> }>(
     'resource_system_feature_enable', { confirmed },
@@ -411,8 +426,7 @@ export const nativeDeviceApi = {
     'device_ssh_transport_identity_delete', { credentialRef },
   ),
   connectSshHost: async (timeoutMs?: number) => {
-    activeRemoteManagementSession = null
-    activeRemoteTaskSession = null
+    resetRemoteManagementSession()
     return await call<{ state: 'ready'; device_id: string; address: string; port: number; host_key_sha256: string; gateway_port: number; fields: Record<string, string> }>(
       'device_ssh_connect', { timeoutMs },
     )
@@ -513,8 +527,7 @@ export const nativeDeviceApi = {
     fields: Record<string, string> // fields（字段中文说明）。
   }>('device_ssh_media_channel', { action }),
   disconnectSshHost: async () => {
-    activeRemoteManagementSession = null
-    activeRemoteTaskSession = null
+    resetRemoteManagementSession()
     return await call<{
       state: 'disconnected'; disconnected: boolean; media_channel_stopped?: boolean; task_channel_stopped?: boolean; fields: Record<string, string>
     }>('device_ssh_disconnect')
@@ -648,6 +661,14 @@ interface ActiveRemoteTaskSession {
 let activeRemoteManagementSession: ActiveRemoteManagementSession | null = null
 let activeRemoteTaskSession: ActiveRemoteTaskSession | null = null
 let remoteManagementStatusInFlight: Promise<RemoteManagementResponse> | null = null
+let remoteSessionRevision = 0 // remoteSessionRevision（显式连接/断开代次）：阻止旧状态复活已断开的会话。
+
+function resetRemoteManagementSession() {
+  remoteSessionRevision++
+  activeRemoteManagementSession = null
+  activeRemoteTaskSession = null
+  remoteManagementStatusInFlight = null
+}
 
 function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const native = locateNativeInvoker()
@@ -681,10 +702,12 @@ function readRemoteManagementStatus(): Promise<RemoteManagementResponse> {
       activeRemoteManagementSession = null
       throw new Error('远程管理状态要求本机处于已配对远程模式。')
     }
+    const revision = remoteSessionRevision
     const requestId = newRemoteManagementRequestId()
     const response = await call<RemoteManagementResponse>('device_ssh_management_request', {
       operation: 'management.status', arguments: {}, request_id: requestId,
     })
+    if (revision !== remoteSessionRevision) throw new Error('服务端连接已切换，已丢弃旧管理状态。')
     if (response.status === 200 && matchesRemoteManagementEnvelope(response, hostId, 'management.status', undefined, undefined, requestId)) {
       if (activeRemoteManagementSession?.host_id !== hostId
         || activeRemoteManagementSession.session_generation !== response.session_generation) {

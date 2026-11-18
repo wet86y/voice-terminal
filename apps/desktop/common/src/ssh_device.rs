@@ -193,10 +193,10 @@ pub struct RemoteDeviceTaskResult {
     pub result: serde_json::Value, // result（有限 JSON 操作结果或明确错误）。
 }
 
-/// SshDeviceIdentity（SSH 设备身份）：私钥只进入本机凭据库，界面仅接收公钥。
+/// SshDeviceIdentity（SSH 设备身份）：私钥由当前项目目录加密维护，界面仅接收公钥。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshDeviceIdentity {
-    pub credential_ref: String, // credential_ref（本机 Windows 凭据引用）。
+    pub credential_ref: String, // credential_ref（项目内加密私钥引用）。
     pub public_key: String,     // public_key（供主机接受登记的 OpenSSH 公钥）。
     pub fingerprint: String,    // fingerprint（本设备公钥 SHA-256 指纹）。
 }
@@ -238,22 +238,26 @@ struct ConnectedDeviceSession {
     transport_key_for_test: Option<Zeroizing<String>>, // transport_key_for_test（只在 SSH 媒体集成测试中代替系统凭据库）。
 }
 
-fn load_session_signing_key(session: &ConnectedDeviceSession) -> Result<Zeroizing<String>, String> {
+fn load_session_signing_key(
+    manager: &SshDeviceManager,
+    session: &ConnectedDeviceSession,
+) -> Result<Zeroizing<String>, String> {
     #[cfg(any(test, feature = "ssh-device-test-support"))]
     if let Some(private_key) = &session.signing_key_for_test {
         return Ok(Zeroizing::new(private_key.to_string()));
     }
-    crate::credentials::load_device_ssh_key(&session.identity_credential_ref)
+    manager.load_key(&session.identity_credential_ref)
 }
 
 fn load_session_transport_key(
+    manager: &SshDeviceManager,
     session: &ConnectedDeviceSession,
 ) -> Result<Zeroizing<String>, String> {
     #[cfg(any(test, feature = "ssh-device-test-support"))]
     if let Some(private_key) = &session.transport_key_for_test {
         return Ok(Zeroizing::new(private_key.to_string()));
     }
-    crate::credentials::load_device_ssh_key(&session.transport_credential_ref)
+    manager.load_key(&session.transport_credential_ref)
 }
 
 trait AsyncDeviceStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -1090,6 +1094,14 @@ pub fn device_credential_reference(device_id: &str) -> Result<String, String> {
 
 /// create_device_identity（生成设备 SSH 身份）：使用操作系统熵源生成 Ed25519 密钥。
 pub fn create_device_identity(device_id: &str) -> Result<SshDeviceIdentity, String> {
+    create_device_identity_in(None, device_id)
+}
+
+/// create_device_identity_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn create_device_identity_in(
+    data: Option<&Path>,
+    device_id: &str,
+) -> Result<SshDeviceIdentity, String> {
     let credential_ref = device_credential_reference(device_id)?;
     let mut rng = rand::rng();
     let private_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)
@@ -1105,7 +1117,7 @@ pub fn create_device_identity(device_id: &str) -> Result<SshDeviceIdentity, Stri
         .public_key()
         .fingerprint(HashAlg::Sha256)
         .to_string();
-    crate::credentials::store_device_ssh_key(&credential_ref, private_openssh.as_str())?;
+    crate::credentials::store_device_ssh_key_at(data, &credential_ref, private_openssh.as_str())?;
     Ok(SshDeviceIdentity {
         credential_ref,
         public_key,
@@ -1115,13 +1127,21 @@ pub fn create_device_identity(device_id: &str) -> Result<SshDeviceIdentity, Stri
 
 /// device_identity_status（读取本机 SSH 公钥）：不返回私钥，不修改凭据库。
 pub fn device_identity_status(device_id: &str) -> Result<Option<SshDeviceIdentity>, String> {
+    device_identity_status_in(None, device_id)
+}
+
+/// device_identity_status_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn device_identity_status_in(
+    data: Option<&Path>,
+    device_id: &str,
+) -> Result<Option<SshDeviceIdentity>, String> {
     let credential_ref = device_credential_reference(device_id)?;
-    if !crate::credentials::has_device_ssh_key(&credential_ref)? {
+    if !crate::credentials::has_device_ssh_key_at(data, &credential_ref)? {
         return Ok(None);
     }
-    let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+    let private_key = crate::credentials::load_device_ssh_key_at(data, &credential_ref)?;
     let private_key = PrivateKey::from_openssh(private_key.as_str())
-        .map_err(|_| "系统凭据中的设备 SSH 私钥无法读取。".to_string())?;
+        .map_err(|_| "本机存储中的设备 SSH 私钥无法读取。".to_string())?;
     let public_key = private_key
         .public_key()
         .to_openssh()
@@ -1139,8 +1159,17 @@ pub fn device_identity_status(device_id: &str) -> Result<Option<SshDeviceIdentit
 
 /// sign_device_pairing_challenge（签署 OPAQUE 配对挑战）：仅由原生层读取本机设备密钥。
 pub fn sign_device_pairing_challenge(device_id: &str, message: &[u8]) -> Result<String, String> {
+    sign_device_pairing_challenge_in(None, device_id, message)
+}
+
+/// sign_device_pairing_challenge_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn sign_device_pairing_challenge_in(
+    data: Option<&Path>,
+    device_id: &str,
+    message: &[u8],
+) -> Result<String, String> {
     let credential_ref = device_credential_reference(device_id)?;
-    let private_key_text = crate::credentials::load_device_ssh_key(&credential_ref)?;
+    let private_key_text = crate::credentials::load_device_ssh_key_at(data, &credential_ref)?;
     let private_key = PrivateKey::from_openssh(private_key_text.as_str())
         .map_err(|_| "本机设备 SSH 私钥无法读取。".to_string())?;
     if private_key.algorithm() != Algorithm::Ed25519 || private_key.is_encrypted() {
@@ -1156,8 +1185,13 @@ pub fn sign_device_pairing_challenge(device_id: &str, message: &[u8]) -> Result<
 
 /// delete_device_identity（撤销本机 SSH 身份）：只移除对应凭据库条目。
 pub fn delete_device_identity(device_id: &str) -> Result<(), String> {
+    delete_device_identity_in(None, device_id)
+}
+
+/// delete_device_identity_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn delete_device_identity_in(data: Option<&Path>, device_id: &str) -> Result<(), String> {
     let reference = device_credential_reference(device_id)?;
-    crate::credentials::delete_device_ssh_key(&reference)
+    crate::credentials::delete_device_ssh_key_at(data, &reference)
 }
 
 fn parse_transport_private_key(private_key_openssh: &str) -> Result<PrivateKey, String> {
@@ -1245,6 +1279,14 @@ fn read_transport_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
 
 /// import_transport_identity（导入 SSH 登录身份）：私钥只在原生层读取并保存到当前用户凭据库。
 pub fn import_transport_identity(path: &Path) -> Result<SshTransportIdentity, String> {
+    import_transport_identity_in(None, path)
+}
+
+/// import_transport_identity_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn import_transport_identity_in(
+    data: Option<&Path>,
+    path: &Path,
+) -> Result<SshTransportIdentity, String> {
     #[cfg(windows)]
     {
         let bytes = read_transport_key_file(path)?;
@@ -1265,7 +1307,11 @@ pub fn import_transport_identity(path: &Path) -> Result<SshTransportIdentity, St
                 .to_openssh(LineEnding::LF)
                 .map_err(|_| "SSH 登录私钥规范化失败。".to_string())?,
         );
-        crate::credentials::store_device_ssh_key(&credential_ref, private_key_openssh.as_str())?;
+        crate::credentials::store_device_ssh_key_at(
+            data,
+            &credential_ref,
+            private_key_openssh.as_str(),
+        )?;
         Ok(SshTransportIdentity {
             credential_ref,
             public_key,
@@ -1283,13 +1329,21 @@ pub fn import_transport_identity(path: &Path) -> Result<SshTransportIdentity, St
 pub fn transport_identity_status(
     credential_ref: &str,
 ) -> Result<Option<SshTransportIdentity>, String> {
+    transport_identity_status_in(None, credential_ref)
+}
+
+/// transport_identity_status_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn transport_identity_status_in(
+    data: Option<&Path>,
+    credential_ref: &str,
+) -> Result<Option<SshTransportIdentity>, String> {
     if !credential_ref.starts_with("VoiceTerminal/ssh-transport/") {
         return Err("SSH 登录密钥凭据引用无效。".into());
     }
-    if !crate::credentials::has_device_ssh_key(credential_ref)? {
+    if !crate::credentials::has_device_ssh_key_at(data, credential_ref)? {
         return Ok(None);
     }
-    let private_key_text = crate::credentials::load_device_ssh_key(credential_ref)?;
+    let private_key_text = crate::credentials::load_device_ssh_key_at(data, credential_ref)?;
     let private_key = parse_transport_private_key(private_key_text.as_str())?;
     let fingerprint = private_key
         .public_key()
@@ -1311,6 +1365,14 @@ pub fn transport_identity_status(
 
 /// delete_transport_identity（删除 SSH 登录密钥）：仅删除指定本机凭据条目。
 pub fn delete_transport_identity(credential_ref: &str) -> Result<(), String> {
+    delete_transport_identity_in(None, credential_ref)
+}
+
+/// delete_transport_identity_in（项目数据目录内的设备身份操作；None 只用于旧调用兼容）。
+pub fn delete_transport_identity_in(
+    data: Option<&Path>,
+    credential_ref: &str,
+) -> Result<(), String> {
     let suffix = credential_ref.strip_prefix("VoiceTerminal/ssh-transport/");
     if !suffix.is_some_and(|suffix| {
         suffix.len() == 64
@@ -1320,7 +1382,68 @@ pub fn delete_transport_identity(credential_ref: &str) -> Result<(), String> {
     }) {
         return Err("SSH 登录密钥凭据引用无效。".into());
     }
-    crate::credentials::delete_device_ssh_key(credential_ref)
+    crate::credentials::delete_device_ssh_key_at(data, credential_ref)
+}
+
+#[derive(Clone)]
+struct LoopbackHostKeyHandler {
+    observed: Arc<Mutex<Option<russh::keys::PublicKey>>>, // observed（本机运行服务在握手中证明持有的公钥）。
+}
+
+impl client::Handler for LoopbackHostKeyHandler {
+    type Error = russh::Error;
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        if key.public_key().algorithm() != Algorithm::Ed25519 {
+            return Ok(false);
+        }
+        if let Ok(mut observed) = self.observed.lock() {
+            *observed = Some(key.public_key().clone());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// probe_loopback_host_public_key（运行中服务公钥）：仅本机回环，固定 Ed25519，不认证或执行命令。
+pub async fn probe_loopback_host_public_key(
+    port: u16,
+    timeout: Duration,
+) -> Result<russh::keys::PublicKey, String> {
+    if port == 0 || timeout.is_zero() || timeout > Duration::from_secs(10) {
+        return Err("本机 SSH 主机身份探测端口或时限无效。".into());
+    }
+    let observed = Arc::new(Mutex::new(None));
+    let handler = LoopbackHostKeyHandler {
+        observed: observed.clone(),
+    };
+    let mut config = client::Config::default();
+    config.preferred.key = std::borrow::Cow::Owned(vec![Algorithm::Ed25519]);
+    config.preferred.host_key_certificates = std::borrow::Cow::Borrowed(&[]);
+    let handle = tokio::time::timeout(
+        timeout,
+        client::connect(Arc::new(config), ("127.0.0.1", port), handler),
+    )
+    .await
+    .map_err(|_| "读取本机 SSH 主机公钥超时。".to_string())?
+    .map_err(|_| {
+        "无法从运行中的本机 SSH 服务取得 Ed25519 主机公钥；请检查服务实际监听和算法配置。"
+            .to_string()
+    })?;
+    // disconnect（协议断开）有界等待，密钥交换结束后不进入账户认证。
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        handle.disconnect(Disconnect::ByApplication, "", ""),
+    )
+    .await;
+    let key = observed
+        .lock()
+        .map_err(|_| "本机 SSH 主机公钥状态不可用。".to_string())?
+        .clone();
+    key.ok_or_else(|| "本机 SSH 服务没有提供受支持的主机公钥。".to_string())
 }
 
 #[derive(Clone)]
@@ -1419,6 +1542,10 @@ fn device_ssh_client_config() -> client::Config {
 pub struct SshDeviceConnection {
     handle: client::Handle<PinnedHostHandler>, // handle（已验证 SSH 会话）。
     target: SshDeviceTarget,                   // target（不可在会话中途替换的主机身份）。
+    management_open: Option<(RemoteManagementOpenRequest, std::time::Instant)>, // management_open（本条 SSH 连接复用的管理租约申请及本机到期时间）。
+    management_reuse_allowed: bool, // management_reuse_allowed（服务端明确声明连续请求逐次核验信任后才复用通道）。
+    management_channel:
+        tokio::sync::Mutex<Option<(Box<dyn AsyncDeviceStream>, RemoteManagementOpenResponse)>>, // management_channel（同一租约下持续复用的独立管理通道）。
 }
 
 impl SshDeviceConnection {
@@ -1433,12 +1560,12 @@ impl SshDeviceConnection {
             return Err("SSH 连接超时必须在 1 至 60 秒之间。".into());
         }
         if private_key_openssh.is_empty() || private_key_openssh.len() > 64 * 1024 {
-            return Err("系统凭据中的 SSH 私钥为空或超过大小上限。".into());
+            return Err("本机存储中的 SSH 私钥为空或超过大小上限。".into());
         }
         let private_key = PrivateKey::from_openssh(private_key_openssh)
-            .map_err(|_| "系统凭据中的 SSH 私钥格式无效或需要口令。".to_string())?;
+            .map_err(|_| "本机存储中的 SSH 私钥格式无效或需要口令。".to_string())?;
         if private_key.is_encrypted() {
-            return Err("SSH 私钥须在写入 Windows 凭据库前完成本机解锁。".into());
+            return Err("SSH 私钥须在写入本机加密存储前完成本机解锁。".into());
         }
 
         let handler = PinnedHostHandler {
@@ -1471,7 +1598,13 @@ impl SshDeviceConnection {
                 .await;
             return Err("SSH 公钥未获主机接受。".into());
         }
-        Ok(Self { handle, target })
+        Ok(Self {
+            handle,
+            target,
+            management_open: None,
+            management_reuse_allowed: false,
+            management_channel: tokio::sync::Mutex::new(None),
+        })
     }
 
     /// is_closed（检查认证 SSH 会话是否已被传输层关闭）：复用 russh（Rust SSH 库）连接代次事实。
@@ -1560,7 +1693,7 @@ impl SshDeviceConnection {
     /// management_exchange（独立管理请求）：一条固定 SSH 会话交换管理租约与单个请求行。
     async fn management_exchange(
         &mut self,
-        open_request: &RemoteManagementOpenRequest,
+        proposed_open: &RemoteManagementOpenRequest,
         request: &RemoteManagementRequest,
         timeout: Duration,
     ) -> Result<RemoteManagementResponse, String> {
@@ -1568,20 +1701,49 @@ impl SshDeviceConnection {
         if timeout.is_zero() || timeout > Duration::from_secs(600) {
             return Err("独立管理请求超时必须在 1 至 600 秒之间。".into());
         }
-        let operation = async {
-            let mut stream = self.open_fixed_bridge(MANAGEMENT_BRIDGE_MARKER).await?;
-            write_management_line(&mut *stream, open_request, MAX_REQUEST_BYTES).await?;
-            let opened: RemoteManagementOpenResponse =
-                read_management_line(&mut *stream, MAX_RESPONSE_BYTES).await?;
-            if opened.protocol_version != DEVICE_MANAGEMENT_PROTOCOL_VERSION
-                || opened.request_id != open_request.request_id
-                || opened.target_host_id != open_request.target_host_id
-                || opened.client_device_id != open_request.client_device_id
-                || opened.session_generation == 0
-                || opened.expires_at_ms <= unix_timestamp_ms()?
+        let open_request = match &self.management_open {
+            Some((request, deadline))
+                if *deadline > std::time::Instant::now()
+                    && request.target_host_id == proposed_open.target_host_id
+                    && request.client_device_id == proposed_open.client_device_id =>
             {
-                return Err("服务端管理会话回执与请求身份或时效不匹配。".into());
+                request.clone()
             }
+            _ => proposed_open.clone(),
+        };
+        let cached = self
+            .management_channel
+            .get_mut()
+            .take()
+            .filter(|(_, opened)| opened.request_id == open_request.request_id);
+        let operation = async {
+            let (mut stream, opened) = if let Some(cached) = cached {
+                cached
+            } else {
+                let mut stream = self.open_fixed_bridge(MANAGEMENT_BRIDGE_MARKER).await?;
+                write_management_line(&mut *stream, &open_request, MAX_REQUEST_BYTES).await?;
+                let opened: RemoteManagementOpenResponse =
+                    read_management_line(&mut *stream, MAX_RESPONSE_BYTES).await?;
+                if opened.protocol_version != DEVICE_MANAGEMENT_PROTOCOL_VERSION
+                    || opened.request_id != open_request.request_id
+                    || opened.target_host_id != open_request.target_host_id
+                    || opened.client_device_id != open_request.client_device_id
+                    || opened.session_generation == 0
+                    || opened.expires_at_ms <= unix_timestamp_ms()?
+                {
+                    return Err("服务端管理会话回执与请求身份或时效不匹配。".into());
+                }
+                // 提前十秒换租约，不在有副作用请求失败后自动重发。
+                let remaining_ms = opened.expires_at_ms.saturating_sub(unix_timestamp_ms()?);
+                self.management_open = Some((
+                    open_request.clone(),
+                    std::time::Instant::now()
+                        + Duration::from_millis(
+                            remaining_ms.min(15 * 60 * 1000).saturating_sub(10_000),
+                        ),
+                ));
+                (stream, opened)
+            };
             let mut operation_request = request.clone();
             operation_request.session_generation = opened.session_generation;
             write_management_line(&mut *stream, &operation_request, MAX_REQUEST_BYTES).await?;
@@ -1595,6 +1757,13 @@ impl SshDeviceConnection {
                 || !(100..=599).contains(&response.status)
             {
                 return Err("服务端管理回执与请求编号、目标、会话或操作不匹配。".into());
+            }
+            if request.operation == "management.status" {
+                self.management_reuse_allowed =
+                    response.status == 200 && response.body["persistent_management"] == true;
+            }
+            if self.management_reuse_allowed {
+                *self.management_channel.get_mut() = Some((stream, opened));
             }
             Ok(response)
         };
@@ -1645,12 +1814,30 @@ impl SshDeviceConnection {
 /// SshDeviceManager（SSH 设备管理器）：串行管理一条当前信任主机连接。
 #[derive(Default)]
 pub struct SshDeviceManager {
+    key_root: Mutex<Option<PathBuf>>, // key_root（当前工作区的项目私钥目录根；不使用用户目录）。
     connection: tokio::sync::Mutex<Option<ConnectedDeviceSession>>, // connection（当前 SSH 与产品设备身份绑定会话）。
     active_lease: tokio::sync::Mutex<Option<RemoteDeviceSessionLease>>, // active_lease（当前任务通道确认的设备连接与执行器代次）。
 }
 
 impl SshDeviceManager {
-    /// connect（连接）：私钥从本机凭据库加载，不经过前端参数或日志。
+    pub fn set_key_root(&self, data: &Path) -> Result<(), String> {
+        *self
+            .key_root
+            .lock()
+            .map_err(|_| "项目密钥目录状态不可用。")? = Some(data.to_path_buf());
+        Ok(())
+    }
+
+    fn load_key(&self, reference: &str) -> Result<Zeroizing<String>, String> {
+        let root = self
+            .key_root
+            .lock()
+            .map_err(|_| "项目密钥目录状态不可用。")?
+            .clone();
+        crate::credentials::load_device_ssh_key_at(root.as_deref(), reference)
+    }
+
+    /// connect（连接）：私钥从当前项目的加密记录加载，不经过前端参数或日志。
     pub async fn connect(
         &self,
         identity_credential_ref: &str,
@@ -1664,10 +1851,9 @@ impl SshDeviceManager {
             return Err("产品设备身份凭据引用与当前设备编号不匹配。".into());
         }
         {
-            let signing_private_key =
-                crate::credentials::load_device_ssh_key(identity_credential_ref)?;
+            let signing_private_key = self.load_key(identity_credential_ref)?;
             let signing_private_key = PrivateKey::from_openssh(signing_private_key.as_str())
-                .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
+                .map_err(|_| "本机存储中的产品设备签名身份无法读取。".to_string())?;
             if signing_private_key.algorithm() != Algorithm::Ed25519
                 || signing_private_key.is_encrypted()
             {
@@ -1680,7 +1866,7 @@ impl SshDeviceManager {
         {
             return Err("SSH 登录凭据必须引用本机产品身份或已导入的传输密钥。".into());
         }
-        let login_private_key = crate::credentials::load_device_ssh_key(login_credential_ref)?;
+        let login_private_key = self.load_key(login_credential_ref)?;
         let connection =
             SshDeviceConnection::connect(target.clone(), login_private_key.as_str(), timeout)
                 .await?;
@@ -1831,7 +2017,7 @@ impl SshDeviceManager {
                     session.transport_credential_ref.clone(),
                 )
             };
-            let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+            let private_key = self.load_key(&credential_ref)?;
             let connection = SshDeviceConnection::connect(
                 target.clone(),
                 private_key.as_str(),
@@ -1919,7 +2105,7 @@ impl SshDeviceManager {
                 session.transport_credential_ref.clone(),
             )
         };
-        let private_key = crate::credentials::load_device_ssh_key(&transport_credential_ref)?;
+        let private_key = self.load_key(&transport_credential_ref)?;
         let mut connection =
             SshDeviceConnection::connect(target, private_key.as_str(), Duration::from_secs(20))
                 .await?;
@@ -1989,9 +2175,9 @@ impl SshDeviceManager {
         if challenge.protocol_version != 1 || challenge.expires_at_ms == 0 {
             return Err("主机设备签名挑战版本或时效无效。".into());
         }
-        let private_key_text = load_session_signing_key(session)?;
+        let private_key_text = load_session_signing_key(self, session)?;
         let private_key = PrivateKey::from_openssh(private_key_text.as_str())
-            .map_err(|_| "系统凭据中的设备签名身份无法读取。".to_string())?;
+            .map_err(|_| "本机存储中的设备签名身份无法读取。".to_string())?;
         let timestamp_ms = unix_timestamp_ms()?;
         let auth = sign_device_gateway_request(
             &private_key,
@@ -2073,7 +2259,7 @@ impl SshDeviceManager {
             let session = slot.as_mut().ok_or("当前没有已认证的 SSH 主机连接。")?;
             let device_id = session.device_id.clone();
             let target = session.target.clone();
-            let transport_private_key = load_session_transport_key(session)?;
+            let transport_private_key = load_session_transport_key(self, session)?;
             let mut body = serde_json::json!({
                 "protocol_version": MEDIA_PROTOCOL_VERSION,
                 "stream_id": stream_id,
@@ -2114,9 +2300,9 @@ impl SshDeviceManager {
             if timestamp_ms > challenge.expires_at_ms {
                 return Err("主机设备媒体挑战已过期。".into());
             }
-            let signing_private_key = load_session_signing_key(session)?;
+            let signing_private_key = load_session_signing_key(self, session)?;
             let signing_private_key = PrivateKey::from_openssh(signing_private_key.as_str())
-                .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
+                .map_err(|_| "本机存储中的产品设备签名身份无法读取。".to_string())?;
             let auth = sign_device_gateway_request_for_method(
                 &signing_private_key,
                 "GET",
@@ -2224,7 +2410,7 @@ impl SshDeviceManager {
             )
             .await?;
         crate::device_files::validate_transfer_source(local_path, maximum_bytes)?;
-        let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+        let private_key = self.load_key(&credential_ref)?;
         let mut connection = SshDeviceConnection::connect(
             target,
             private_key.as_str(),
@@ -2284,7 +2470,7 @@ impl SshDeviceManager {
             )
             .await?;
         crate::device_files::validate_transfer_target_parent(local_path)?;
-        let private_key = crate::credentials::load_device_ssh_key(&credential_ref)?;
+        let private_key = self.load_key(&credential_ref)?;
         let mut connection = SshDeviceConnection::connect(
             target,
             private_key.as_str(),
@@ -2430,9 +2616,9 @@ impl SshDeviceManager {
         if timestamp_ms > challenge.expires_at_ms {
             return Err("固定 FILE 签名挑战已过期。".into());
         }
-        let signing_key_text = load_session_signing_key(session)?;
+        let signing_key_text = load_session_signing_key(self, session)?;
         let signing_key = PrivateKey::from_openssh(signing_key_text.as_str())
-            .map_err(|_| "系统凭据中的产品设备签名身份无法读取。".to_string())?;
+            .map_err(|_| "本机存储中的产品设备签名身份无法读取。".to_string())?;
         let signed_body =
             serde_json::to_value(&begin).map_err(|_| "固定 FILE 签名正文无法编码。")?;
         let signed = sign_device_gateway_request(
@@ -2931,7 +3117,7 @@ impl SshDeviceManager {
         }
     }
 
-    /// submit_pairing_request（签名配对申请）：私钥只从 Windows 凭据库读取，不经界面传输。
+    /// submit_pairing_request（签名配对申请）：私钥只从当前项目加密记录读取，不经界面传输。
     pub async fn submit_pairing_request(
         &self,
         device_id: &str,
@@ -2948,12 +3134,12 @@ impl SshDeviceManager {
         if session.device_id != device_id {
             return Err("配对请求设备编号与当前 SSH 客户端身份不匹配。".into());
         }
-        let private_key_text = load_session_signing_key(session)?;
+        let private_key_text = load_session_signing_key(self, session)?;
         if private_key_text.is_empty() || private_key_text.len() > 64 * 1024 {
-            return Err("系统凭据中的设备私钥为空或超过大小上限。".into());
+            return Err("本机存储中的设备私钥为空或超过大小上限。".into());
         }
         let private_key = PrivateKey::from_openssh(private_key_text.as_str())
-            .map_err(|_| "系统凭据中的设备私钥无法读取。".to_string())?;
+            .map_err(|_| "本机存储中的设备私钥无法读取。".to_string())?;
         let body = signed_pairing_request(&private_key, device_id, pairing_code)?;
         session
             .connection
@@ -3485,6 +3671,147 @@ mod tests {
     use super::*;
 
     static PYTHON_GATEWAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn management_reuses_a_pinned_ssh_channel_and_rotates_only_after_lease_expiry() {
+        assert_management_reuse(true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_management_keeps_lease_identity_but_revalidates_each_new_channel() {
+        assert_management_reuse(false).await;
+    }
+
+    async fn assert_management_reuse(persistent: bool) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::TcpListener;
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_address = gateway.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let generations = if persistent {
+                vec![7, 8]
+            } else {
+                vec![7, 7, 8]
+            };
+            let mut first_open = None;
+            for generation in generations {
+                let (stream, _) = gateway.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let open: RemoteManagementOpenRequest = serde_json::from_str(&line).unwrap();
+                if let Some(first) = &first_open {
+                    assert_eq!(open.request_id == *first, generation == 7);
+                } else {
+                    first_open = Some(open.request_id.clone());
+                }
+                let opened = RemoteManagementOpenResponse {
+                    protocol_version: 1,
+                    request_id: open.request_id,
+                    target_host_id: open.target_host_id,
+                    client_device_id: open.client_device_id,
+                    session_generation: generation,
+                    expires_at_ms: unix_timestamp_ms().unwrap() + 900_000,
+                    fields: BTreeMap::new(),
+                };
+                write_management_line(stream.get_mut(), &opened, MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                // 前两次请求必须共用同一通道和同一代次；第三次在过期后使用新通道。
+                for _ in 0..if persistent && generation == 7 { 2 } else { 1 } {
+                    line.clear();
+                    stream.read_line(&mut line).await.unwrap();
+                    let request: RemoteManagementRequest = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request.session_generation, generation);
+                    let response = RemoteManagementResponse {
+                        protocol_version: 1,
+                        request_id: request.request_id,
+                        target_host_id: request.target_host_id,
+                        session_generation: generation,
+                        operation: request.operation,
+                        status: 200,
+                        body: serde_json::json!({"core_state":"ready","persistent_management":persistent}),
+                        fields: BTreeMap::new(),
+                    };
+                    write_management_line(stream.get_mut(), &response, MAX_RESPONSE_BYTES)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let host_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ssh_server = tokio::spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut server = LoopbackForwardSshServer {
+                gateway: gateway_address,
+            };
+            let running = russh::server::Server::run_on_socket(&mut server, host_config, &listener);
+            ready_tx.send((address, running.handle())).ok();
+            running.await
+        });
+        let (address, handle) = ready_rx.await.unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .to_openssh(LineEnding::LF)
+            .unwrap();
+        let manager = SshDeviceManager::default();
+        manager
+            .connect_with_test_credentials(
+                "test-device",
+                SshDeviceTarget {
+                    address: "127.0.0.1".into(),
+                    port: address.port(),
+                    username: "test-device".into(),
+                    host_key_sha256: fingerprint,
+                    gateway_port: DEFAULT_GATEWAY_PORT,
+                },
+                key.as_str(),
+                key.as_str(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        for id in 1..=3 {
+            if id == 3 {
+                manager
+                    .connection
+                    .lock()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .connection
+                    .management_open
+                    .as_mut()
+                    .unwrap()
+                    .1 = std::time::Instant::now();
+            }
+            let result = manager
+                .management_request(
+                    &format!("{id:032x}"),
+                    "server-a",
+                    "management.status",
+                    serde_json::json!({}),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.session_generation, if id == 3 { 8 } else { 7 });
+        }
+        served.await.unwrap();
+        manager.disconnect().await.unwrap();
+        handle.shutdown("management reuse test completed".into());
+        ssh_server.await.unwrap().unwrap();
+    }
 
     #[test]
     fn device_ssh_client_uses_bounded_keepalive_to_detect_lost_sessions() {

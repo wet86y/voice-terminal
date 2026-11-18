@@ -350,6 +350,10 @@ async def run(args, root):
     # registry（实例登记）字段：pid（进程标识）、created_at（进程创建时间）、url（受管界面地址）、instance_id（实例标识）。
     atomic_json(registry, {"pid": os.getpid(), "created_at": host_created_at,
         "url": app.frontend_origin, "instance_id": app.state.value["instance_id"]})
+    # startup-result（启动结果）只属于当前活动实例，退出后不留陈旧的 ready（就绪）快照。
+    startup_result_path = app.paths.application_state.parent / "startup-result.json"
+    if not startup_result_path.is_symlink() and not getattr(startup_result_path, "is_junction", lambda: False)():
+        startup_result_path.unlink(missing_ok=True)
     pairing_console_task = None
     try:
         if getattr(args, "desktop_managed", False):
@@ -393,7 +397,7 @@ async def run(args, root):
                     "device_gateway_error": status["device_gateway_error"],
                     "created_at": host_created_at, "url": app.frontend_origin, "checked_at": time.time()}
                 # startup-result（启动结果快照）是启动结束时的历史快照，不能视作实时运行状态。
-                atomic_json(app.paths.application_state.parent / "startup-result.json", result)
+                atomic_json(startup_result_path, result)
                 if desktop:
                     desktop.send("startup_result", **result)
                 reported_startup = True
@@ -421,6 +425,19 @@ async def run(args, root):
         await asyncio.sleep(.3)  # 让 SSE（服务器推送事件）把已退出状态送达已打开页面。
         host.close()
         registry.unlink(missing_ok=True)
+        remove_owned_startup_result(startup_result_path, app.state.value["instance_id"])
+
+
+def remove_owned_startup_result(path: Path, instance_id: str) -> None:
+    """remove_owned_startup_result（清理瞬时快照）：只移除本实例的有界普通文件，保护新实例和异常原件。"""
+    try:
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)() or not path.is_file() or path.stat().st_size > 16_384:
+            return
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict) and value.get("instance_id") == instance_id and value.get("pid") == os.getpid():
+            path.unlink(missing_ok=True)
+    except (OSError, UnicodeError, ValueError):
+        pass
 
 
 def parse_args(argv=None):

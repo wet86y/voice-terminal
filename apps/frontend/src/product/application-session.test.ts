@@ -328,6 +328,8 @@ describe('远程 Host 管理代次', () => {
     window.__TAURI_INTERNALS__ = { invoke: vi.fn().mockResolvedValue({ runtime_recovery: { revision: 0, suspended: false, operation: null } }) }
     vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockResolvedValue(remoteDeviceStatus)
     vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockResolvedValue({ state: 'connected', connected: true, fields: {} })
+    vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockResolvedValue({ state: 'running', device_id: 'client-a',
+      connection_generation: 12, executor_generation: 1, fields: {} })
   })
 
   it('只接受当前配对主机和同一管理代次的产品状态', async () => {
@@ -342,7 +344,7 @@ describe('远程 Host 管理代次', () => {
     await host.refresh()
 
     expect(host.snapshot.value?.host_id).toBe('server-a')
-    expect(host.snapshot.value?.endpoint_revision).toBe(5)
+    expect(host.snapshot.value?.endpoint_revision).toBe(12)
     expect(host.snapshot.value?.remote_business_ready).toBe(true)
     expect(host.snapshot.value?.voice_api_ready).toBe(true)
     expect(host.snapshot.value?.voice_ws_url).toBe(url)
@@ -365,6 +367,50 @@ describe('远程 Host 管理代次', () => {
     expect(window.__VOICE_APPLICATION__?.business_ready).toBe(false)
     expect(management).toHaveBeenCalledOnce()
     expect(forwarder).not.toHaveBeenCalledWith('start')
+    expect(host.corePhase.value).toBe('starting')
+    expect(host.runtimeFailure.value).toBe(false)
+    expect(host.snapshot.value?.unavailable_capabilities?.[0].state).toBe('STARTING')
+  })
+
+  it('服务端核心已就绪但任务通道仍建立时等待，不提前发产品请求或显示错误', async () => {
+    vi.mocked(nativeDeviceApi.remoteTaskChannel).mockResolvedValue({ state: 'stopped', fields: {} })
+    const manager = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockResolvedValue(
+      remoteManagementResponse('management.status', { core_state: 'ready' }))
+    const forwarder = vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder')
+    await host.refresh()
+    expect(host.snapshot.value?.remote_error).toBeNull()
+    expect(host.corePhase.value).toBe('starting')
+    expect(host.runtimeFailure.value).toBe(false)
+    expect(manager).toHaveBeenCalledOnce()
+    expect(forwarder).not.toHaveBeenCalledWith('start')
+  })
+
+  it('未配对和已配对但断线时只显示等待，不伪造组件失败', async () => {
+    const status = vi.mocked(nativeDeviceApi.deviceConfigStatus)
+    status.mockResolvedValueOnce({ ...remoteDeviceStatus, device_config: { ...remoteDeviceStatus.device_config!, paired_host: null } })
+    vi.mocked(nativeDeviceApi.sshHostStatus).mockResolvedValue({ state: 'disconnected', connected: false, fields: {} })
+    const manager = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest')
+    await host.refresh()
+    expect(host.snapshot.value?.remote_connection_state).toBe('unpaired')
+    expect(host.snapshot.value?.host_name).toBe('尚未配对服务端')
+    expect(host.snapshot.value?.unavailable_capabilities).toEqual([])
+    expect(host.runtimeFailure.value).toBe(false)
+    await host.refresh()
+    expect(host.snapshot.value?.remote_connection_state).toBe('connecting')
+    expect(host.runtimeFailure.value).toBe(false)
+    expect(manager).not.toHaveBeenCalled()
+  })
+
+  it.each(['LISTENING', 'THINKING', 'SPEAKING'])('服务端 %s 期间不能再次开始监听不代表组件故障', async state => {
+    vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockResolvedValue({ state: 'running', url: 'ws://127.0.0.1:43127/random_token_123/ws', fields: {} })
+    vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' })
+      : remoteManagementResponse(operation, { ...remoteProductStatus, runtime: { state, can_start: false,
+        services: { audio: 'RUNNING', asr: 'STREAMING', llm: 'CONNECTED', tts: 'READY', kws: 'DISABLED' } } }))
+    await host.refresh()
+    expect(host.snapshot.value?.core_available).toBe(true)
+    expect(host.runtimeFailure.value).toBe(false)
+    expect(host.corePhase.value).toBe('ready')
   })
 
   it('管理和语音通道状态独立，实时产品投影与语音命令走远程 WebSocket', async () => {
@@ -460,7 +506,7 @@ describe('远程 Host 管理代次', () => {
 
     expect(request).toHaveBeenCalledTimes(2)
     expect(host.snapshot.value?.management_connected).toBe(true)
-    expect(host.snapshot.value?.endpoint_revision).toBe(5)
+    expect(host.snapshot.value?.endpoint_revision).toBe(12)
     expect(host.snapshot.value?.remote_business_ready).toBe(false)
     expect(host.snapshot.value?.voice_api_ready).toBe(false)
     expect(host.snapshot.value?.remote_error).toContain('目标或通道代次')
