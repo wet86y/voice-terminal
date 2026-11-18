@@ -13,6 +13,7 @@
 
 - [系统架构与生命周期](architecture/architecture.md)
 - [分布式设备运行架构与开发进度](architecture/distributed-device-runtime.md)
+- [分布式运行实施跟踪](development/distributed-device-implementation-plan.md)
 - [项目进程管理与系统显示身份](architecture/process-management.md)
 - [兼容性组件与更新交接](architecture/compatibility-component.md)
 - [Bridge 2.0（第二版桥接协议）](architecture/bridge-2.0-protocol.md)
@@ -60,6 +61,8 @@
 ## 测试
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [分布式运行本机覆盖与 SSH 模拟验收（2026-11-17）](testing/local-delivery-1.0.0-20261117.md)
+- [分布式运行候选包与 OpenSSH 验收（2026-11-18）](testing/local-delivery-1.0.0-20261118.md)
 - [当前已知问题](testing/known-issues.md)
 - [AnifLive 模型导入匹配审计（2026-11-08）](testing/aniflive-import-audit-20261108.md)
 - [v1.0.0 修订重发验收（2026-11-08）](testing/release-1.0.0-reissue-20261108.md)
