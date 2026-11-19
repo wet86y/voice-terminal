@@ -3,7 +3,6 @@ import { locateNativeInvoker } from '../runtime/desktop-preflight'
 import { startupWasSkipped, rememberStartupSkip } from '../runtime/startup-choice'
 import { desktopPort } from './desktop-port'
 import { matchesRemoteManagementEnvelope, nativeDeviceApi, type RemoteManagementResponse } from './native-device-api'
-import type { ProductSnapshot } from './types'
 import type { RuntimeOperation } from '../runtime/runtime-operations'
 
 /** DesktopRecovery（原生恢复快照）：独立于可能离线的网页宿主。 */
@@ -76,10 +75,8 @@ export interface ApplicationSnapshot {
   host_name?: string | null // host_name（当前远程服务端显示名称）。
   management_connected?: boolean // management_connected（SSH 管理及任务会话是否就绪）。
   remote_business_ready?: boolean // remote_business_ready（服务端产品业务接口是否可访问）。
-  remote_media_ready?: boolean // remote_media_ready（本设备媒体通道及任务代次是否一致）。
   remote_error?: string | null // remote_error（远程目标暂不可用的原因）。
   remote_voice_error?: string | null // remote_voice_error（本机远程语音 WebSocket 转发错误）。
-  remote_runtime_state?: string // remote_runtime_state（服务端实际语音核心状态）。
   remote_connection_state?: 'unpaired' | 'paused' | 'connecting' | 'connected' // remote_connection_state（配对、重连暂停、连接中或管理已连接）。
   /** revision（状态版本）。 */
   revision: number
@@ -206,15 +203,11 @@ let remoteApplicationRevision = 0 // remoteApplicationRevision（远程桌面状
 let remoteApplicationStartedAt: number | null = null // remoteApplicationStartedAt（本窗口首次读取远程状态的时间）。
 let remoteVoiceForwarderHostId: string | null = null // remoteVoiceForwarderHostId（本机回环转发绑定的服务端编号）。
 let remoteVoiceForwarderUrl = '' // remoteVoiceForwarderUrl（当前固定地址，只保留已认证连接）。
-let remoteVoiceProbeFailedAt: number | null = null // remoteVoiceProbeFailedAt（瞬时探测失败起点）。
-let remoteVoiceTaskGeneration: number | undefined // remoteVoiceTaskGeneration（最近确认的核心连接代次）。
 
 async function stopRemoteVoiceForwarder() {
   if (!remoteVoiceForwarderHostId) return
   remoteVoiceForwarderHostId = null
   remoteVoiceForwarderUrl = ''
-  remoteVoiceProbeFailedAt = null
-  remoteVoiceTaskGeneration = undefined
   try { await nativeDeviceApi.remoteVoiceForwarder('stop') } catch { /* SSH 断开时本机转发仍由原生生命周期回收。 */ }
 }
 
@@ -357,96 +350,29 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
   } else if (sshConnected && management?.status === 200 && !managementEnvelopeValid) {
     remoteError = '服务端管理回执的目标主机或连接代次无效，已丢弃该状态。'
   }
-  let product: ProductSnapshot | null = null
-  let remoteBusinessReady = false
-  let taskReady = false
-  let mediaReady = false
-  let taskGeneration: number | undefined // taskGeneration（核心任务连接代次）：核心重建时更新实时端点，独立于管理租约。
-  if (managementConnected && remoteCoreState === 'ready') {
-    try {
-      const task = await nativeDeviceApi.remoteTaskChannel('status')
-      taskReady = task.state === 'running' && task.device_id === local.runtime.device_id
-        && Number.isSafeInteger(task.connection_generation) && (task.connection_generation ?? 0) > 0
-      if (taskReady) taskGeneration = task.connection_generation
-      if (taskReady) {
-        try {
-          const media = await nativeDeviceApi.remoteMediaChannel('status')
-          mediaReady = media.state === 'running' && media.device_id === local.runtime.device_id
-            && media.connection_generation === task.connection_generation
-            && media.executor_generation === task.executor_generation
-        } catch { /* 只影响监听入口，保留管理与设置访问。 */ }
-        const result: RemoteManagementResponse = await nativeDeviceApi.remoteManagementRequest('product.snapshot', {})
-        const productEnvelopeValid = matchesRemoteManagementEnvelope(result, hostId, 'product.snapshot')
-        if (result.status === 200 && productEnvelopeValid && result.body && typeof result.body === 'object'
-          && typeof result.body.runtime === 'object' && result.body.runtime !== null) {
-          product = result.body as unknown as ProductSnapshot
-          remoteBusinessReady = true
-          remoteError = null
-        } else {
-          const detail = result.body && typeof result.body.detail === 'string' ? result.body.detail : ''
-          remoteBusinessReady = false
-          remoteError = detail || (result.status === 200 && !productEnvelopeValid
-            ? '服务端产品状态的目标或通道代次不匹配，已丢弃该状态。'
-            : `服务端产品状态暂不可用（HTTP ${result.status}）。`)
-        }
-      }
-    } catch (failure) {
-      remoteBusinessReady = false
-      remoteError = failure instanceof Error ? failure.message : '无法读取服务端产品状态。'
-    }
-  }
-  if (remoteApplicationStartedAt === null) remoteApplicationStartedAt = Date.now() / 1000
-  remoteApplicationRevision += 1
-  const services = product?.runtime?.services as unknown as Record<string, unknown> | undefined
-  const serviceLabels: Record<string, string> = {
-    audio: '音频', kws: '关键词唤醒', asr: '语音识别', speaker: '声纹', llm: '语言模型', tts: '语音合成',
-    analysis: '分析', web_search: '网页搜索', shadow_agent: '影子代理',
-  }
-  const components: ApplicationComponent[] = Object.entries(services ?? {}).map(([id, raw]) => {
-    const rawState = typeof raw === 'string' ? raw : raw && typeof raw === 'object'
-      ? String((raw as Record<string, unknown>).state ?? 'unavailable') : 'unavailable'
-    const state = rawState.toLowerCase()
-    return {
-      id, name: serviceLabels[id] ?? id, state, phase: state, error: '', pid: null,
-      created_at: null, uptime_seconds: null, memory_rss_bytes: null, memory_private_commit_bytes: null,
-      gpu_dedicated_bytes: null, thread_count: null, cpu_percent: null, sampled_at: null,
-      shared_with: null, retry_allowed: false, retrying: false, external: false,
-    }
-  })
-  const readyServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED', 'DISABLED'])
-  const loadingServices = new Set(['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'])
-  const serviceState = (value: unknown) => (typeof value === 'string' ? value : value && typeof value === 'object'
-    ? String((value as Record<string, unknown>).state ?? '') : '').toUpperCase()
-  const blockingServices = Object.entries(services ?? {}).filter(([id]) => ['audio', 'asr', 'llm', 'tts', 'kws'].includes(id))
-  const failedRemoteCore = blockingServices.some(([, value]) => !readyServices.has(serviceState(value))
-    && !loadingServices.has(serviceState(value)))
-  const loadingRemoteCore = blockingServices.some(([, value]) => {
-    return loadingServices.has(serviceState(value))
-  })
-  // can_start（允许开始监听）在监听、思考、播报期间为假，不能作为核心能力故障证据。
-  const corePhase: 'ready' | 'starting' | 'failed' = !managementConnected ? 'starting'
-    : remoteCoreState === 'unavailable' || failedRemoteCore ? 'failed'
-      : remoteCoreState === 'starting' || loadingRemoteCore || !product ? 'starting' : 'ready'
-  const coreAvailable = product !== null && corePhase === 'ready'
+  let taskGeneration: number | undefined
   let voiceWsUrl = ''
   let remoteVoiceError: string | null = null
-  if (managementConnected && remoteCoreState === 'ready' && taskReady && hostId) {
-    try { voiceWsUrl = await ensureRemoteVoiceForwarder(hostId) }
-    catch (failure) { remoteVoiceError = failure instanceof Error ? failure.message : '远程语音本机转发不可用。' }
-    remoteVoiceProbeFailedAt = null
-    remoteVoiceTaskGeneration = taskGeneration
+  if (sshConnected && hostId && !local.device_config?.reconnect_suspended_reason) {
+    try {
+      const task = await nativeDeviceApi.remoteTaskChannel('status')
+      if (task.state === 'running' && task.device_id === local.runtime.device_id) {
+        taskGeneration = task.connection_generation
+        voiceWsUrl = await ensureRemoteVoiceForwarder(hostId)
+      }
+    } catch (failure) {
+      remoteVoiceError = failure instanceof Error ? failure.message : '远程语音本机转发不可用。'
+    }
   } else {
-    const transientProbeFailure = sshConnected && hostId === remoteVoiceForwarderHostId
-      && !local.device_config?.reconnect_suspended_reason
-      && (management === null || management.status === 503 || managementConnected && remoteCoreState === 'starting')
-    if (transientProbeFailure && remoteVoiceForwarderUrl) {
-      remoteVoiceProbeFailedAt ??= Date.now()
-      if (Date.now() - remoteVoiceProbeFailedAt < 6000) {
-        voiceWsUrl = remoteVoiceForwarderUrl
-        taskGeneration = remoteVoiceTaskGeneration
-      } else await stopRemoteVoiceForwarder()
-    } else await stopRemoteVoiceForwarder()
+    await stopRemoteVoiceForwarder()
   }
+  const taskReady = taskGeneration !== undefined
+  const remoteBusinessReady = taskReady && managementConnected
+  const corePhase: 'ready' | 'starting' | 'failed' = taskReady ? 'ready' : !managementConnected
+    || remoteCoreState !== 'unavailable' ? 'starting' : 'failed'
+  const coreAvailable = corePhase === 'ready'
+  if (remoteApplicationStartedAt === null) remoteApplicationStartedAt = Date.now() / 1000
+  remoteApplicationRevision += 1
   const unavailableCapabilities: ApplicationCapability[] = !managementConnected || coreAvailable ? [] : [{
     id: 'voice', label: '服务端语音核心', state: corePhase === 'starting' ? 'STARTING' : 'ERROR', blocking: true,
     phase: remoteError || (managementConnected ? '服务端语音核心仍在准备' : '等待远程服务端连接'),
@@ -464,29 +390,27 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
     host_name: hostName,
     management_connected: managementConnected,
     remote_business_ready: remoteBusinessReady,
-    remote_media_ready: mediaReady,
     remote_error: remoteError,
     remote_voice_error: remoteVoiceError,
-    remote_runtime_state: product?.runtime?.state,
     state: managementConnected ? 'running' : 'waiting',
     core_phase: corePhase,
     unavailable_capabilities: unavailableCapabilities,
-    phase: managementConnected ? `${hostName} · ${product ? '已连接' : '服务端业务准备中'}` : `${hostName} · 等待连接`,
+    phase: managementConnected ? `${hostName} · ${taskReady ? '已连接' : '服务端业务准备中'}` : `${hostName} · 等待连接`,
     started_at: remoteApplicationStartedAt,
     startup_complete: true,
     core_available: coreAvailable,
     stopping: false,
     voice_api_url: '',
-    voice_api_ready: product !== null,
+    voice_api_ready: remoteBusinessReady,
     voice_ws_url: voiceWsUrl,
-    capabilities: Object.fromEntries(components.map(row => [row.id, row.state])),
-    sampled_at: product ? now : null,
+    capabilities: {},
+    sampled_at: managementConnected ? now : null,
     total_memory_rss_bytes: null,
     total_memory_private_commit_bytes: null,
     total_gpu_dedicated_bytes: null,
-    completed_components: components.length,
-    total_components: components.length,
-    components,
+    completed_components: 0,
+    total_components: 0,
+    components: [],
   }
 }
 

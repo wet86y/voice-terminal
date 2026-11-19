@@ -228,6 +228,11 @@ impl MiniMaxTtsCancellation {
     pub fn request_cancel(&self) {
         let _ = self.cancel.send(true);
     }
+
+    /// is_cancelled（查询取消信号）：播放储备等待可以在合成结束前退出。
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
 }
 
 impl MiniMaxTtsHandle {

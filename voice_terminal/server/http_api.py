@@ -24,8 +24,7 @@ from ..application.ports import validate_endpoint_url
 from ..devices.clock_sync import DeviceClockMapper, MediaClockSync, media_clock
 from ..devices.diagnostics import device_event
 from ..devices.media_protocol import (
-    PROTOCOL_VERSION as MEDIA_PROTOCOL_VERSION, MediaProtocolError, decode_client_tts_audio_frame,
-    decode_frame, parse_tts_control,
+    PROTOCOL_VERSION as MEDIA_PROTOCOL_VERSION, MediaFrame, MediaProtocolError, decode_uplink, parse_tts_control,
 )
 from ..devices.pcm_stream import PcmInputStream
 from ..devices.remote_capture import RemoteAudioCapture
@@ -311,7 +310,7 @@ except ImportError:  # pragma: no cover - optional during doctor/setup
 
 # _GATEWAY_WEBSOCKET_PATHS（回环网关放行的 WebSocket 路径）：媒体通道与语音控制通道；
 # 其余 WebSocket 一律以 1008（策略违规）关闭，避免网关端口变成通用业务入口。
-_GATEWAY_WEBSOCKET_PATHS = frozenset({"/v1/media", "/ws"})
+_GATEWAY_WEBSOCKET_PATHS = frozenset({"/v1/media", "/v1/voice"})
 
 
 class LoopbackDeviceGatewayGuard:
@@ -528,7 +527,7 @@ async def _device_gateway_challenge_payload(request: Any) -> dict[str, Any]:
             or payload.get("protocol_version") != 1
             or not isinstance(payload.get("device_id"), str)
             or not ((method == "POST" and path in allowed_post_paths)
-                    or (method == "GET" and path == "/v1/media"))):
+                    or (method == "GET" and path in _GATEWAY_WEBSOCKET_PATHS))):
         raise HTTPException(status_code=422, detail="设备签名挑战字段或协议版本无效。")
     return payload
 
@@ -595,7 +594,7 @@ def _device_media_open_payload(websocket: Any) -> dict[str, Any]:
             or set(values) - required - codec_fields - {downlink_pre_skip_field}
             or present_codec_fields not in (set(), codec_fields)
             or (downlink_pre_skip_field in values and present_codec_fields != codec_fields)):
-        raise HTTPException(status_code=422, detail="设备媒体握手字段不符合协议版本 2。")
+        raise HTTPException(status_code=422, detail="设备媒体握手字段不符合当前协议。")
     stream_id = values["stream_id"]
     if (not stream_id or len(stream_id) > 128
             or any(not (char.isascii() and (char.isalnum() or char in "._:-")) for char in stream_id)):
@@ -661,8 +660,7 @@ def _device_media_clock_response(message: Any, *, sync_id: str) -> tuple[int, in
     payload = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
     required = {"type", "protocol_version", "sync_id", "device_receive_us", "device_send_us"}
     if (not isinstance(payload, dict)
-            or not required.issubset(payload) or set(payload) - required - {"runtime_controls"}
-            or ("runtime_controls" in payload and type(payload["runtime_controls"]) is not bool)
+            or set(payload) != required
             or payload.get("type") != "clock.sync.response"
             or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != MEDIA_PROTOCOL_VERSION
             or payload.get("sync_id") != sync_id
@@ -674,21 +672,18 @@ def _device_media_clock_response(message: Any, *, sync_id: str) -> tuple[int, in
 
 
 def _device_media_playback_acceptance(
-    message: Any, *, lease: Any, core_session_id: str, stream_id: str,
-) -> tuple[int, bool]:
+    value: dict[str, Any], *, lease: Any, core_session_id: str, stream_id: str,
+) -> tuple[int, str | None]:
     """_device_media_playback_acceptance（设备帧回执）：区分已入队与因原键停止而丢弃。"""
-    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
-        raise ValueError("设备播放接纳回执必须是 JSON 控制消息。")
-    encoded = message["text"].encode("utf-8")
-    if not 0 < len(encoded) <= 1024:
-        raise ValueError("设备播放接纳回执超过控制消息上限。")
-    value = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
     expected = {
         "type", "protocol_version", "device_id", "delivery_device_id", "core_session_id",
         "connection_generation", "executor_generation", "interaction_generation", "stream_id",
         "sequence", "fields",
     }
-    if (not isinstance(value, dict) or set(value) != expected
+    cancelled = value.get("type") == "playback.cancelled"
+    if cancelled:
+        expected.add("reason")
+    if (set(value) != expected
             or value.get("type") not in {"playback.accepted", "playback.cancelled"}
             or type(value.get("protocol_version")) is not int or value["protocol_version"] != MEDIA_PROTOCOL_VERSION
             or value.get("device_id") != lease.device_id
@@ -703,21 +698,18 @@ def _device_media_playback_acceptance(
             or value.get("stream_id") != stream_id
             or type(value.get("sequence")) is not int or value["sequence"] < 0
             or value["sequence"] > (1 << 53) - 1
-            or not isinstance(value.get("fields"), dict)):
+            or not isinstance(value.get("fields"), dict)
+            or cancelled and (not isinstance(value.get("reason"), str) or value["reason"] not in {
+                "stopped", "superseded", "replacement_target_mismatch", "replacement_not_bound", "output_unavailable",
+            })):
         raise ValueError("设备播放接纳回执与固定媒体租约不匹配。")
-    return value["sequence"], value["type"] == "playback.cancelled"
+    return value["sequence"], value.get("reason")
 
 
 def _device_media_playback_progress(
-    message: Any, *, lease: Any, core_session_id: str, stream_id: str,
+    value: dict[str, Any], *, lease: Any, core_session_id: str, stream_id: str,
 ) -> dict[str, Any]:
     """_device_media_playback_progress（设备时钟快照）：只描述实际输出观察值。"""
-    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
-        raise ValueError("设备播放快照必须是 JSON 控制消息。")
-    encoded = message["text"].encode("utf-8")
-    if not 0 < len(encoded) <= 16 * 1024:
-        raise ValueError("设备播放快照超过控制消息上限。")
-    value = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_json_fields)
     expected = {
         "type", "protocol_version", "device_id", "delivery_device_id", "core_session_id",
         "connection_generation", "executor_generation", "interaction_generation", "stream_id",
@@ -751,9 +743,6 @@ def _device_media_playback_progress(
         item = value[name]
         if type(item) is not int or not 0 <= item <= (1 << 53) - 1:
             raise ValueError(f"设备播放快照字段 {name}（进度数值）无效。")
-    if (value["receipt_sequence"] < 1 or value["played_ms"] > value["enqueued_ms"]
-            or value["output_estimated_ms"] > value["enqueued_ms"] or value["buffered_ms"] > 2_000):
-        raise ValueError("设备播放快照超出有效时序或队列范围。")
     return {name: value[name] for name in expected if name != "fields"}
 
 
@@ -946,7 +935,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                  "/v1/session/open", "/v1/session/poll", "/v1/session/complete",
                                  "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
                                  "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management",
-                                 "/v1/file-transfer", "/v1/media", "/ws"}),
+                                 "/v1/file-transfer", "/v1/media", "/v1/voice"}),
     )
 
     @app.get("/health")
@@ -1161,115 +1150,64 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=409, detail="远程管理会话已失效，请重新连接并读取最新状态。")
         operation = payload["operation"]
         response_status = 200
-        if operation == "voice.command":
-            arguments = payload["arguments"]
-            command = arguments.get("command")
-            voice_commands = {"session.start", "session.stop", "session.reset", "session.clear"}
-            if command == "session.reasoning_mode":
-                if set(arguments) != {"command", "mode"} or arguments.get("mode") not in {"fast", "deep"}:
-                    raise HTTPException(status_code=422, detail="语音推理模式操作参数无效。")
-            elif command not in voice_commands or set(arguments) != {"command"}:
-                raise HTTPException(status_code=422, detail="语音会话操作不在固定白名单中。")
-            if command in {"session.start", "session.stop"} and not runtime.remote_media_control_ready(device_id, generation):
-                raise HTTPException(status_code=409, detail="本设备媒体输入尚未就绪或已被接管，请恢复语音连接后重试。")
-            if (getattr(runtime, "application_initializing", False) is True
-                    and command in {"session.start", "session.reset", "session.clear"}):
-                response_status = 503
-                response_body = {"detail": "服务端语音核心仍在启动。"}
-            else:
-                try:
-                    if command == "session.start":
-                        await runtime.start_listening()
-                    elif command == "session.stop":
-                        await runtime.stop_listening()
-                    elif command == "session.reset":
-                        await runtime.reset_session()
-                    elif command == "session.clear":
-                        await runtime.clear_session()
-                    else:
-                        if not await runtime.set_reasoning_mode(arguments["mode"]):
-                            raise ValueError("服务端没有接受该语音推理模式。")
-                    runtime_state = runtime.snapshot().payload
-                    result = "completed"
-                    if command == "session.start" and not runtime.state.listening:
-                        pending = (runtime_operations(runtime).holds
-                                   or getattr(runtime, "_listen_resume_requested", False)
-                                   or getattr(runtime, "_tts_resume_requested", False)
-                                   or getattr(runtime, "_enhancement_resume_requested", False))
-                        result = "deferred" if pending else "failed"
-                        response_status = 202 if pending else 503
-                    response_body = {"result": result, "runtime": runtime_state}
-                    if result == "failed":
-                        reason = runtime.state.can_start_reason or {}
-                        response_body["detail"] = reason.get("message") or "服务端未能开始监听，请检查能力状态后重试。"
-                    device_event(logger, "device.voice_command", device_id=device_id, command=command, result=result,
-                                 connection_generation=generation)
-                except ValueError as exc:
-                    response_status = 422
-                    response_body = {"detail": str(exc)[:320]}
-                except Exception as exc:
-                    logger.exception("remote voice command failed operation=%s", command)
-                    response_status = 503
-                    response_body = {"detail": "服务端没有完成该语音操作，请读取最新状态后重试。"}
-        else:
-            try:
-                method, internal_path, internal_body = _remote_management_request_spec(
-                    operation, payload["arguments"],
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            if operation in {
-                "tts.assets.import.prepare", "tts.assets.import.commit", "tts.assets.import.abort",
-                "tts.assets.audio.read",
-            }:
-                if "file_transfer" not in connection.capabilities:
-                    raise HTTPException(status_code=403, detail="远程设备未获准使用文件传输能力。")
-                internal_body = {
-                    **(internal_body or {}),
-                    "_authenticated_device_id": device_id,
-                    "_connection_generation": connection.connection_generation,
-                    "_executor_generation": connection.executor_generation,
-                }
-            try:
-                import httpx
+        try:
+            method, internal_path, internal_body = _remote_management_request_spec(
+                operation, payload["arguments"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if operation in {
+            "tts.assets.import.prepare", "tts.assets.import.commit", "tts.assets.import.abort",
+            "tts.assets.audio.read",
+        }:
+            if "file_transfer" not in connection.capabilities:
+                raise HTTPException(status_code=403, detail="远程设备未获准使用文件传输能力。")
+            internal_body = {
+                **(internal_body or {}),
+                "_authenticated_device_id": device_id,
+                "_connection_generation": connection.connection_generation,
+                "_executor_generation": connection.executor_generation,
+            }
+        try:
+            import httpx
 
-                transport = httpx.ASGITransport(app=app)
-                internal_headers = {"Accept": "application/json"}
-                if internal_path == "/internal/application/wake-tasks":
-                    # 复用内部应用路由原有宿主授权；令牌留在服务端进程，不进入远端请求与响应。
-                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
-                    if application_token:
-                        internal_headers["Authorization"] = "Bearer " + application_token
-                if internal_path.startswith("/internal/application/tts-assets/"):
-                    # TTS 素材导入端点只接受本进程 ASGI 转发；令牌留在服务端进程。
-                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
-                    if application_token:
-                        internal_headers["Authorization"] = "Bearer " + application_token
-                if internal_path == "/internal/application/dsh-approval":
-                    # DSH approval decisions use the same host-only authorization as the local product endpoint.
-                    application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
-                    if not application_token:
-                        raise HTTPException(status_code=503, detail="本次应用宿主权限转发凭据不可用。")
+            transport = httpx.ASGITransport(app=app)
+            internal_headers = {"Accept": "application/json"}
+            if internal_path == "/internal/application/wake-tasks":
+                # 复用内部应用路由原有宿主授权；令牌留在服务端进程，不进入远端请求与响应。
+                application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                if application_token:
                     internal_headers["Authorization"] = "Bearer " + application_token
-                async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18764") as client:
-                    response = await client.request(
-                        method,
-                        internal_path,
-                        json=internal_body,
-                        headers=internal_headers,
-                    )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                logger.warning("远程业务处理器暂不可用：%s", type(exc).__name__)
-                raise HTTPException(status_code=503, detail="服务端现有业务处理器暂不可用。") from exc
-            if len(response.content) > 2_097_152:
-                raise HTTPException(status_code=502, detail="服务端业务回执超过大小上限。")
-            response_status = response.status_code
-            try:
-                response_body = response.json()
-            except ValueError:
-                response_body = {"detail": "服务端业务回执不是 JSON。"}
+            if internal_path.startswith("/internal/application/tts-assets/"):
+                # TTS 素材导入端点只接受本进程 ASGI 转发；令牌留在服务端进程。
+                application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                if application_token:
+                    internal_headers["Authorization"] = "Bearer " + application_token
+            if internal_path == "/internal/application/dsh-approval":
+                # DSH approval decisions use the same host-only authorization as the local product endpoint.
+                application_token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+                if not application_token:
+                    raise HTTPException(status_code=503, detail="本次应用宿主权限转发凭据不可用。")
+                internal_headers["Authorization"] = "Bearer " + application_token
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18764") as client:
+                response = await client.request(
+                    method,
+                    internal_path,
+                    json=internal_body,
+                    headers=internal_headers,
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("远程业务处理器暂不可用：%s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="服务端现有业务处理器暂不可用。") from exc
+        if len(response.content) > 2_097_152:
+            raise HTTPException(status_code=502, detail="服务端业务回执超过大小上限。")
+        response_status = response.status_code
+        try:
+            response_body = response.json()
+        except ValueError:
+            response_body = {"detail": "服务端业务回执不是 JSON。"}
         return JSONResponse({
             "protocol_version": 1,
             "request_id": payload["request_id"],
@@ -1514,23 +1452,24 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         """device_gateway_interaction_prepare（准备语音设备切换）：切换由用户显式请求。"""
         _require_device_gateway_port(request)
         payload = await _device_gateway_json(request, label="语音设备切换请求")
-        if (set(payload) != {"protocol_version", "expected_interaction_generation"}
-                or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
-                or type(payload.get("expected_interaction_generation")) is not int
-                or payload["expected_interaction_generation"] < 0):
-            raise HTTPException(status_code=422, detail="语音设备切换请求字段无效。")
+        generation = payload.get("connection_generation")
+        if (set(payload) != {"protocol_version", "connection_generation"} or payload["protocol_version"] != 1
+                or type(generation) is not int or generation < 1):
+            raise HTTPException(status_code=422, detail="语音设备申请格式无效。")
         _authorize_device_gateway_request(runtime, request, payload)
         if getattr(runtime, "application_initializing", False) is True:
             raise HTTPException(status_code=503, detail="语音核心仍在启动。")
         device_id = request.headers.get("x-voice-terminal-device-id", "")
         try:
             lease = await runtime.prepare_interaction_switch(
-                device_id, payload["expected_interaction_generation"],
+                device_id, None, automatic_connection=generation,
             )
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=409, detail="语音设备状态已变化或切换目标无效。") from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail="语音设备未就绪或另一个切换事务正在进行。") from exc
+        if lease is None:
+            return JSONResponse({"protocol_version": 1, "result": "standby"}, headers={"Cache-Control": "no-store"})
         return JSONResponse({
             "protocol_version": 1,
             "result": "active" if runtime.device_registry.accepts(lease) else "pending_media",
@@ -1571,10 +1510,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                             "interaction_generation": "原待切换语音占用代次"}},
                                 headers={"Cache-Control": "no-store"})
         aborted = await runtime.abort_interaction_switch(lease)
+        if aborted:
+            await runtime.recover_local_after_remote_media_loss(lease)
         return JSONResponse({"protocol_version": 1,
                              "result": "aborted" if aborted else "already_finished",
                              "interaction_generation": payload["interaction_generation"],
-                             "fields": {"result": "切换已放弃；旧设备不会自动恢复",
+                              "fields": {"result": "切换已放弃或已处理，已撤销的旧租约不会重新启用",
                                         "interaction_generation": "原待切换语音占用代次"}},
                             headers={"Cache-Control": "no-store"})
 
@@ -1623,6 +1564,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             return
 
         await websocket.accept()
+        media_tasks: set[asyncio.Task] = set()
         opened_at = media_clock()
         close_reason = "对端关闭"  # close_reason（连接结束原因）：正常关闭也进入诊断。
         media_context = dict(device_id=device_id, core_session_id=runtime.core_session_id,
@@ -1632,33 +1574,35 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         device_event(logger, "device.media_opened", **media_context)
         mapper = DeviceClockMapper()
         clock_sync = MediaClockSync(mapper)
-        runtime_controls_enabled = False  # runtime_controls_enabled（客户端已明确支持续测及输入重建）。
+
+        async def send_control(value: dict[str, Any]) -> None:
+            async with asyncio.timeout(1.5):
+                await websocket.send_json(value)
 
         async def request_clock(sync_id: str) -> None:
-            await websocket.send_json({
+            await send_control({
                 "type": "clock.sync.request", "protocol_version": MEDIA_PROTOCOL_VERSION,
                 "sync_id": sync_id,
                 "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
-                           "sync_id": "本次往返时钟测量编号", "runtime_controls": "支持运行期续测和输入流重建"},
+                           "sync_id": "本次往返时钟测量编号"},
             })
 
-        def observe_clock(message: dict, received_at: float) -> None:
-            nonlocal runtime_controls_enabled
+        def observe_clock(message: dict, received_at: float) -> bool:
             control = json.loads(message.get("text", ""), object_pairs_hook=_unique_json_fields)
             sync_id = control.get("sync_id") if isinstance(control, dict) else None
             if not isinstance(sync_id, str) or not 0 < len(sync_id) <= 128:
                 raise MediaProtocolError("设备时钟响应缺少有效测量编号。")
             device_receive, device_send = _device_media_clock_response(message, sync_id=sync_id)
-            runtime_controls_enabled |= control.get("runtime_controls") is True
             sent_at = clock_sync.pending.get(sync_id)
             try:
-                clock_sync.observe(sync_id, device_receive_us=device_receive,
-                                   device_send_us=device_send, host_receive=received_at)
+                return clock_sync.observe(sync_id, device_receive_us=device_receive,
+                                          device_send_us=device_send, host_receive=received_at)
             except ValueError as exc:
                 device_event(logger, "device.clock_sample_rejected", level=logging.WARNING,
                              **media_context, sync_id=sync_id, host_send=sent_at,
                              host_receive=received_at, device_receive_us=device_receive,
                              device_send_us=device_send, reason=str(exc))
+                return False
 
         audio_meter = getattr(runtime, "audio_meter", None)
 
@@ -1675,6 +1619,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
         capture = RemoteAudioCapture(
             input_stream(payload["stream_id"]),
+            restart_stream=input_stream,
             on_audio_frame=(
                 (lambda pcm: audio_meter.feed("input", pcm, 16_000, 1))
                 if audio_meter is not None else None
@@ -1699,11 +1644,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             await runtime.attach_remote_playback_outbox(lease, playback)
             if client_tts is not None:
                 await runtime.attach_remote_client_tts_outbox(lease, client_tts)
-            for _sample_index in range(5):
+            for _sample_index in range(3):
                 host_send = media_clock()
                 sync_id = clock_sync.request(host_send, force=True)
                 await request_clock(sync_id)
-                deadline = asyncio.get_running_loop().time() + clock_sync.TIMEOUT_SECONDS
+                deadline = asyncio.get_running_loop().time() + 0.75
+                usable = False
                 try:
                     while sync_id in clock_sync.pending:
                         remaining = deadline - asyncio.get_running_loop().time()
@@ -1714,16 +1660,19 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         )
                         if message.get("type") == "websocket.disconnect":
                             raise WebSocketDisconnect()
-                        observe_clock(message, media_clock())
+                        usable = observe_clock(message, media_clock())
+                        if usable:
+                            break
                 except asyncio.TimeoutError:
                     clock_sync.pending.pop(sync_id, None)
                     device_event(logger, "device.clock_sample_timeout", level=logging.WARNING,
                                  **media_context, sync_id=sync_id)
+                else:
+                    if usable:
+                        break
 
             # 在授予交互租约前确认至少一个可信样本，不能把全失败的握手标成媒体就绪。
             mapper.estimate(now=media_clock())
-            if runtime_controls_enabled:
-                capture.enable_restart(input_stream)
             await runtime.complete_remote_interaction_switch(capture, lease)
             refresh_client_tts = getattr(runtime, "refresh_client_tts_service", None)
             if callable(refresh_client_tts):
@@ -1744,8 +1693,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "uplink_codec": payload.get("uplink_codec", "pcm"),
                 "downlink_codec": payload.get("downlink_codec", "pcm"),
                 "client_tts_enabled": client_tts is not None,
-                "runtime_controls": runtime_controls_enabled,
                 "encoder_pre_skip_samples": payload.get("encoder_pre_skip_samples", 0),
+                "downlink_encoder_pre_skip_samples": payload.get("downlink_encoder_pre_skip_samples", 0),
                 "clock_uncertainty_us": int(round(estimate.uncertainty_seconds * 1_000_000)),
                 "capture_active": capture.running,
                 "fields": {
@@ -1763,23 +1712,30 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     "uplink_codec": "协商后的设备上行负载编码",
                     "downlink_codec": "协商后的设备下行负载编码",
                     "client_tts_enabled": "本设备是否提供本机凭据在线合成能力",
-                    "runtime_controls": "客户端是否支持时钟续测和输入重建",
                     "encoder_pre_skip_samples": "上行 Opus 编码器预延迟样本数",
                     "downlink_encoder_pre_skip_samples": "下行 Opus 编码器预延迟样本数",
                     "clock_uncertainty_us": "最近设备时钟映射误差估计，微秒",
                     "capture_active": "核心当前是否已启动该设备采集",
                 },
             }
-            if "downlink_encoder_pre_skip_samples" in payload:
-                media_ready["downlink_encoder_pre_skip_samples"] = payload["downlink_encoder_pre_skip_samples"]
-            await websocket.send_json(media_ready)
+            await send_control(media_ready)
+            runtime.device_state_changed()
             device_event(logger, "device.media_ready", **media_context, capture_active=capture.running,
                          client_tts_enabled=client_tts is not None,
                          uncertainty_us=int(round(estimate.uncertainty_seconds * 1_000_000)))
 
             last_capture_state = (capture.running, capture.stream_id)
-            last_heartbeat = time.monotonic()
-            client_tts_task = asyncio.create_task(client_tts.next_control()) if client_tts is not None else None
+            last_recording_phase = capture.recording_phase
+
+            def watch(awaitable):
+                task = asyncio.create_task(awaitable)
+                media_tasks.add(task)
+                return task
+
+            receive_task = watch(websocket.receive())
+            playback_task = watch(playback.next_frame())
+            capture_task = watch(capture.changed.wait())
+            client_tts_task = watch(client_tts.next_control()) if client_tts is not None else None
             while True:
                 if not runtime.device_registry.accepts(lease):
                     raise MediaProtocolError("活跃语音租约已撤销。")
@@ -1787,12 +1743,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 for expired_id in clock_sync.expire(now):
                     device_event(logger, "device.clock_sample_timeout", level=logging.WARNING,
                                  **media_context, sync_id=expired_id)
-                sync_id = clock_sync.request(now) if runtime_controls_enabled else None
+                sync_id = clock_sync.request(now)
                 if sync_id is not None:
                     await request_clock(sync_id)
+                recording_phase = capture.recording_phase
+                if recording_phase != last_recording_phase:
+                    device_event(logger, "device.recording_phase", **media_context, phase=recording_phase)
+                    runtime.device_state_changed()
+                    last_recording_phase = recording_phase
                 capture_state = (capture.running, capture.stream_id)
                 if capture_state != last_capture_state:
-                    await websocket.send_json({
+                    await send_control({
                         "type": "media.capture_state", "protocol_version": MEDIA_PROTOCOL_VERSION,
                         "device_id": device_id, "stream_id": payload["stream_id"],
                         "capture_active": capture.running, "capture_stream_id": capture.stream_id,
@@ -1803,59 +1764,46 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     device_event(logger, "device.capture_state", **media_context,
                                  capture_active=capture.running, capture_stream_id=capture.stream_id)
                     last_capture_state = capture_state
-                if time.monotonic() - last_heartbeat >= 10.0:
-                    await runtime.heartbeat_remote_device_session(
-                        device_id, lease.connection_generation, lease.executor_generation,
-                    )
-                    last_heartbeat = time.monotonic()
-                receive_task = asyncio.create_task(websocket.receive())
-                playback_task = asyncio.create_task(playback.next_frame())
-                wait_tasks = {receive_task, playback_task}
-                if client_tts_task is not None:
-                    wait_tasks.add(client_tts_task)
-                done, pending_tasks = await asyncio.wait(
-                    wait_tasks, timeout=0.25,
-                    return_when=asyncio.FIRST_COMPLETED,
+                done, _ = await asyncio.wait(
+                    media_tasks, timeout=0.25, return_when=asyncio.FIRST_COMPLETED,
                 )
-                for pending_task in pending_tasks:
-                    if pending_task is not client_tts_task:
-                        pending_task.cancel()
-                cancelled_pending = [task for task in pending_tasks if task is not client_tts_task]
-                if cancelled_pending:
-                    await asyncio.gather(*cancelled_pending, return_exceptions=True)
+                media_tasks.difference_update(done)
+                if capture_task in done:
+                    capture.changed.clear()
+                    capture_task = watch(capture.changed.wait())
                 if not done:
                     continue
                 if receive_task in done:
                     message = receive_task.result()
                     if message.get("type") == "websocket.disconnect":
                         break
+                    receive_task = watch(websocket.receive())
                 else:
                     message = None
                 if client_tts_task is not None and client_tts_task in done:
                     control = client_tts_task.result()
                     if control is None:
                         raise MediaProtocolError("客户端合成控制队列已关闭。")
-                    await websocket.send_json(control)
-                    client_tts_task = asyncio.create_task(client_tts.next_control())
+                    await send_control(control)
+                    client_tts_task = watch(client_tts.next_control())
                 if playback_task in done:
                     playback_frame = playback_task.result()
                     if playback_frame is None:
                         raise MediaProtocolError("下行播放队列已关闭。")
-                    await websocket.send_bytes(encode_playback_frame(playback_frame))
+                    async with asyncio.timeout(1.5):
+                        await websocket.send_bytes(encode_playback_frame(playback_frame))
+                    playback_task = watch(playback.next_frame())
                 if message is None:
                     continue
                 frame_bytes = message.get("bytes")
                 if frame_bytes is not None:
-                    if not isinstance(frame_bytes, bytes) or len(frame_bytes) > 4 + 4096 + 256 * 1024:
-                        raise MediaProtocolError("设备媒体二进制消息超过长度上限。")
-                    try:
-                        tts_frame = decode_client_tts_audio_frame(frame_bytes)
-                    except MediaProtocolError:
-                        capture.accept_frame(decode_frame(frame_bytes))
+                    frame = decode_uplink(frame_bytes)
+                    if isinstance(frame, MediaFrame):
+                        capture.accept_frame(frame)
+                    elif client_tts is not None:
+                        await client_tts.accept_audio(frame)
                     else:
-                        if client_tts is None:
-                            raise MediaProtocolError("设备没有协商客户端在线合成能力。")
-                        await client_tts.accept_audio(tts_frame)
+                        raise MediaProtocolError("设备没有协商客户端在线合成能力。")
                     continue
                 text_message = message.get("text")
                 if isinstance(text_message, str) and len(text_message.encode("utf-8")) <= 16 * 1024:
@@ -1871,7 +1819,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         control = parse_tts_control(text_message)
                         if client_tts is None:
                             raise MediaProtocolError("设备没有协商客户端在线合成能力。")
-                        client_tts.accept_control(control)
+                        try:
+                            client_tts.accept_control(control)
+                        except MediaProtocolError as exc:
+                            logger.debug("device.client_tts_receipt_dropped reason=%s", exc)
+                            continue
                         if control_type in {
                             "media.tts.output_progress", "media.tts.completed",
                             "media.tts.cancelled", "media.tts.failed",
@@ -1885,38 +1837,53 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 host_output_time, uncertainty = mapper.map_time(
                                     int(snapshot["device_time_us"]), now=media_clock(),
                                 )
-                                recorded = await record_client_tts(
+                                await record_client_tts(
                                     lease, payload["stream_id"], playback_key,
                                     {**snapshot, "host_output_time": host_output_time,
                                      "clock_uncertainty_us": int(round(uncertainty * 1_000_000))},
                                 )
-                                if not recorded:
-                                    raise MediaProtocolError("客户端直放输出证据属于旧播放代次或进度倒退。")
                         continue
                     if isinstance(control, dict) and control.get("type") in {"playback.accepted", "playback.cancelled"}:
-                        sequence, cancelled = _device_media_playback_acceptance(
-                            message, lease=lease, core_session_id=runtime.core_session_id,
-                            stream_id=payload["stream_id"],
-                        )
-                        if playback is None or not playback.acknowledge(sequence, cancelled=cancelled):
-                            raise MediaProtocolError("设备播放帧回执重复、迟到或越序。")
+                        try:
+                            sequence, reason = _device_media_playback_acceptance(
+                                control, lease=lease, core_session_id=runtime.core_session_id,
+                                stream_id=payload["stream_id"],
+                            )
+                        except ValueError as exc:
+                            logger.debug("device.playback_acceptance_dropped reason=%s", exc)
+                            continue
+                        playback.acknowledge(sequence, cancelled=reason is not None, reason=reason)
+                        continue
+                    if isinstance(control, dict) and control.get("type") == "playback.buffer":
+                        next_sequence = control.get("next_sequence")
+                        buffered_ms = control.get("buffered_ms")
+                        paused = control.get("paused")
+                        if (type(next_sequence) is int and type(buffered_ms) is int
+                                and buffered_ms >= 0 and type(paused) is bool):
+                            playback.record_buffer(next_sequence, buffered_ms, paused)
+                        continue
+                    if isinstance(control, dict) and control.get("type") == "playback.failed":
+                        playback_key = control.get("playback_key")
+                        if isinstance(playback_key, str):
+                            playback.fail(playback_key, "客户端播放设备不可用，本轮播放已结束。")
                         continue
                     if isinstance(control, dict) and control.get("type") == "playback.progress":
                         if playback is None:
                             raise MediaProtocolError("媒体通道没有绑定远端播放队列。")
-                        progress = _device_media_playback_progress(
-                            message, lease=lease, core_session_id=runtime.core_session_id,
-                            stream_id=payload["stream_id"],
-                        )
-                        host_output_time, uncertainty = mapper.map_time(
-                            progress["device_time_us"], now=media_clock(),
-                        )
+                        try:
+                            progress = _device_media_playback_progress(
+                                control, lease=lease, core_session_id=runtime.core_session_id,
+                                stream_id=payload["stream_id"],
+                            )
+                            host_output_time, uncertainty = mapper.map_time(
+                                progress["device_time_us"], now=media_clock(),
+                            )
+                        except ValueError as exc:
+                            logger.debug("device.playback_progress_dropped reason=%s", exc)
+                            continue
                         progress["host_output_time"] = host_output_time
                         progress["clock_uncertainty_us"] = int(round(uncertainty * 1_000_000))
-                        if not await runtime.record_remote_playback_progress(
-                            lease, payload["stream_id"], progress,
-                        ):
-                            raise MediaProtocolError("设备播放快照回执重复、迟到或采样进度倒退。")
+                        await runtime.record_remote_playback_progress(lease, payload["stream_id"], progress)
                         continue
                     if (isinstance(control, dict)
                             and set(control) == {"type", "protocol_version", "sequence"}
@@ -1925,7 +1892,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             and control["protocol_version"] == MEDIA_PROTOCOL_VERSION
                             and type(control.get("sequence")) is int
                             and control["sequence"] >= 0):
-                        await websocket.send_json({
+                        await send_control({
                             "type": "media.pong", "protocol_version": MEDIA_PROTOCOL_VERSION,
                             "sequence": control["sequence"],
                             "fields": {"type": "控制消息类型", "protocol_version": "设备媒体协议版本",
@@ -1948,9 +1915,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         finally:
             device_event(logger, "device.media_closed", **media_context, reason=close_reason,
                          duration_ms=int(max(0.0, media_clock() - opened_at) * 1000))
-            if "client_tts_task" in locals() and client_tts_task is not None and not client_tts_task.done():
-                client_tts_task.cancel()
-                await asyncio.gather(client_tts_task, return_exceptions=True)
+            for task in media_tasks:
+                task.cancel()
+            await asyncio.gather(*media_tasks, return_exceptions=True)
             if capture is not None and lease is not None:
                 try:
                     if client_tts is not None:
@@ -1958,6 +1925,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     if playback is not None:
                         await runtime.detach_remote_playback_outbox(lease, playback)
                     await runtime.clear_remote_capture(capture, lease)
+                    runtime.device_state_changed()
                     await runtime.abort_interaction_switch(lease)
                     recover_local = getattr(runtime, "recover_local_after_remote_media_loss", None)
                     if callable(recover_local):
@@ -2230,12 +2198,19 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "warnings": restore_warnings,
         }
 
+    previous_devices: dict[str, Any] = {}
+    device_revision = 0
+
     def device_snapshot() -> dict[str, Any]:
         """device_snapshot（设备状态快照）：界面与已授权代理使用同一来源。"""
         registry = getattr(runtime, "device_registry", None)
         if registry is None:
             raise HTTPException(status_code=503, detail="设备管理器尚未就绪。")
+        nonlocal previous_devices, device_revision
         snapshot, interaction_generation, active = registry.state_snapshot()
+        state = runtime.state
+        pending = registry.pending
+        listen_intent = runtime.listening_intent_pending()
         devices = [{"device_id": item.device_id, "name": "本机" if item.device_id == "local" else item.device_id,
                     "connected": item.connected, "connection_generation": item.connection_generation,
                     "executor_generation": item.executor_generation,
@@ -2244,9 +2219,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                         and getattr(runtime, "_local_desktop_transport", None) is not None else set())
                                      | ({"screen_capture"} if item.device_id == "local"
                                         and runtime.history.screen_capture.available_for("local") else set())),
-                    "error": None, "interaction_active": bool(active and active.device_id == item.device_id)}
+                    "error": None, "interaction_active": bool(active and active.device_id == item.device_id),
+                     "media_ready": item.device_id != "local" and runtime.remote_media_control_ready(
+                         item.device_id, item.connection_generation),
+                     "recording_phase": runtime.remote_recording_phase(item.device_id)
+                                        if active and active.device_id == item.device_id else "idle"}
                    for item in snapshot]
-        return {"devices": devices,
+        value = {"devices": devices,
+                 "core_session_id": runtime.core_session_id,
+                 "can_start": bool(state.can_start and not getattr(runtime, "application_initializing", False)),
+                 "listening_requested": listen_intent,
+                 "pending_device_id": pending.device_id if pending else None,
                 "active_device_id": active.device_id if active is not None else None,
                 "interaction_generation": interaction_generation,
                 "capability_labels": {
@@ -2261,7 +2244,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                            "connected": "设备是否连接", "connection_generation": "连接代次",
                            "executor_generation": "执行器代次", "capabilities": "当前可用能力",
                            "error": "设备错误；当前尚无错误记录", "capability_labels": "能力编号中文说明",
-                           "interaction_active": "是否为当前语音交互设备"}}
+                           "interaction_active": "是否为当前语音交互设备",
+                            "core_session_id": "本次语音核心运行编号", "revision": "核心内设备状态版本",
+                            "can_start": "服务端语音核心当前是否允许开始", "listening_requested": "还有待执行的监听意图",
+                            "pending_device_id": "已选中并等待媒体就绪的设备",
+                            "media_ready": "已取得语音输入租约且媒体通道就绪",
+                            "recording_phase": "空闲、等待首帧、正在录制或输入暂不可用"}}
+        if value != previous_devices:
+            previous_devices = value
+            device_revision += 1
+        return {**value, "revision": device_revision}
 
     @app.get("/api/v1/devices")
     async def get_devices() -> JSONResponse:
@@ -2278,7 +2270,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=422, detail="语音设备切换请求字段无效。")
         try:
             lease = await runtime.prepare_interaction_switch(
-                payload["device_id"], payload["expected_interaction_generation"],
+                payload["device_id"], payload["expected_interaction_generation"], explicit=True,
             )
             if lease.device_id == "local" and runtime.device_registry.pending == lease:
                 await runtime.complete_local_interaction_switch(lease)
@@ -4651,16 +4643,81 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             detail="当前版本使用本地固定的 DeepSeek（语言模型）和 MiniMax（语音合成）配置，仅支持更新接口密钥。",
         )
 
+    @app.websocket("/v1/voice")
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
+        device = None
+        if websocket.url.path == "/v1/voice":
+            try:
+                _require_device_gateway_port(websocket)
+                generation = int(websocket.query_params.get("connection_generation", ""))
+                executor = int(websocket.query_params.get("executor_generation", ""))
+                _authorize_device_gateway_request(runtime, websocket, {
+                    "protocol_version": 1, "connection_generation": generation, "executor_generation": executor,
+                }, method="GET")
+                device = runtime.device_registry.connection(websocket.headers.get("x-voice-terminal-device-id", ""))
+                if (device is None or not device.connected or device.connection_generation != generation
+                        or device.executor_generation != executor):
+                    raise ValueError("设备任务会话已失效。")
+            except (HTTPException, ValueError):
+                await websocket.close(code=1008)
+                return
         await websocket.accept()
         logger.info("websocket.connected peer=%s", websocket.client)
         sequencer = ProtocolSequencer(lambda: runtime.conversation.conversation_id)
         subscription = runtime.bus.subscribe()
         connection_id = uuid4().hex
         debug_events: asyncio.Queue[VoiceEvent] = asyncio.Queue()
-        event_task = asyncio.create_task(_forward_events(websocket, subscription, sequencer), name="websocket-events")
-        debug_task = asyncio.create_task(_forward_debug_events(websocket, debug_events, sequencer), name="websocket-shadow-debug")
+        writer = _VoiceSocketWriter(websocket)
+        changed = asyncio.Event()
+        runtime.device_state_waiters.add(changed)
+        last_revision = 0
+
+        async def follow_devices() -> None:
+            nonlocal last_revision
+            try:
+                while True:
+                    await changed.wait()
+                    changed.clear()
+                    if device and runtime.device_registry.connection(device.device_id) != device:
+                        await writer.close(code=1008)
+                        return
+                    value = device_snapshot()
+                    if value["revision"] != last_revision:
+                        await writer.send_json(sequencer.envelope(event(
+                            "devices.snapshot", **value, self_device_id=device.device_id if device else "local",
+                        )))
+                        last_revision = value["revision"]
+            except Exception:
+                await writer.close(code=1013)
+
+        async def remote_listening(command: str, request_id: str, lease: Any, stop_revision: int) -> None:
+            result = "accepted"
+            detail = None
+            try:
+                if command == "session.start":
+                    await runtime.start_listening(remote_lease=lease, expected_stop_revision=stop_revision)
+                    if (not runtime.state.listening and not runtime.listening_intent_pending()
+                            and stop_revision == runtime._listen_stop_revision):
+                        result = "rejected"
+                        detail = (runtime.state.can_start_reason or {}).get("message") or "服务端未能开始录制。"
+                else:
+                    await runtime.stop_listening()
+            except Exception:
+                logger.exception("device.voice_command_failed command=%s", command)
+                result, detail = "rejected", "服务端未能完成录制操作。"
+            finally:
+                runtime.device_state_changed()
+            device_event(logger, "device.voice_command", device_id=device.device_id,
+                         connection_generation=device.connection_generation, command=command, result=result)
+            await writer.send_json(sequencer.envelope(event(
+                "device.intent", request_id=request_id, result=result, detail=detail,
+            )))
+
+        event_task = asyncio.create_task(_forward_events(writer, subscription, sequencer), name="websocket-events")
+        debug_task = asyncio.create_task(_forward_debug_events(writer, debug_events, sequencer), name="websocket-shadow-debug")
+        device_task = asyncio.create_task(follow_devices(), name="websocket-device-state")
+        start_task = None
         # Let the forwarding task register its queue before a fast
         # session.start command can publish the first turn event.
         await asyncio.sleep(0)
@@ -4670,37 +4727,61 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 parsed = _valid_command(message)
                 if parsed is None:
                     logger.warning("websocket.invalid_command peer=%s", websocket.client)
-                    await _send_error(websocket, sequencer, "INVALID_COMMAND", "命令格式无效。", None, True)
+                    await _send_error(writer, sequencer, "INVALID_COMMAND", "命令格式无效。", None, True)
                     continue
                 command, _payload = parsed
                 logger.info("websocket.command peer=%s command=%s", websocket.client, command)
+                if device and runtime.device_registry.connection(device.device_id) != device:
+                    await writer.close(code=1008)
+                    return
                 if (getattr(runtime, "application_initializing", False) is True
                         and command in {"session.start", "session.reset", "session.clear", "shadow.debug.wake"}):
-                    await _send_error(websocket, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True,
+                    await _send_error(writer, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True,
                                       request_id=message["request_id"])
                     continue
                 if command == "subscribe":
-                    await websocket.send_json(sequencer.envelope(runtime.snapshot()))
+                    await writer.send_json(sequencer.envelope(runtime.snapshot()))
+                    changed.set()
                 elif command == "conversation.image.read":
                     cid = _payload.get("conversation_id")
                     aid = _payload.get("attachment_id")
                     item = runtime.history.screen_attachment(cid, aid) if cid == runtime.conversation.conversation_id and isinstance(aid, str) else None
                     if item is None:
-                        await websocket.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
+                        await writer.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
                             conversation_id=cid, attachment_id=aid, error="图片不属于当前会话或已失效")))
                     else:
                         encoded = item["base64"]
                         chunk_size = 64 * 1024
                         total = (len(encoded) + chunk_size - 1) // chunk_size
                         for index in range(total):
-                            await websocket.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
+                            await writer.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
                                 conversation_id=cid, attachment_id=aid, index=index, total=total,
                                 mime_type=item["mime_type"], data=encoded[index * chunk_size:(index + 1) * chunk_size])))
                             await asyncio.sleep(0)
-                elif command == "session.start":
-                    await runtime.start_listening()
-                elif command == "session.stop":
-                    await runtime.stop_listening()
+                elif command in {"session.start", "session.stop"}:
+                    if device is None:
+                        await (runtime.start_listening() if command == "session.start" else runtime.stop_listening())
+                        runtime.device_state_changed()
+                        continue
+                    request_id = message["request_id"]
+                    lease = runtime.device_registry.active
+                    stop_revision = runtime._listen_stop_revision
+                    if (lease is None or runtime.device_registry.connection(device.device_id) != device
+                            or not runtime.remote_media_control_ready(device.device_id, device.connection_generation)):
+                        await writer.send_json(sequencer.envelope(event(
+                            "device.intent", request_id=request_id, result="rejected",
+                            detail="本设备尚未取得可用的语音输入。",
+                        )))
+                    elif command == "session.stop":
+                        await remote_listening(command, request_id, lease, stop_revision)
+                    elif start_task is None or start_task.done():
+                        if start_task is not None:
+                            start_task.result()
+                        start_task = asyncio.create_task(remote_listening(command, request_id, lease, stop_revision))
+                    else:
+                        await writer.send_json(sequencer.envelope(event(
+                            "device.intent", request_id=request_id, result="rejected", detail="正在启动录制。",
+                        )))
                 elif command in {"session.reset", "session.clear"}:
                     operation = "reset" if command == "session.reset" else "clear"
                     try:
@@ -4708,18 +4789,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             await runtime.reset_session()
                         else:
                             await runtime.clear_session()
-                        await websocket.send_json(sequencer.envelope(event("session.operation",
+                        await writer.send_json(sequencer.envelope(event("session.operation",
                             request_id=message["request_id"], operation=operation, status="completed")))
                     except Exception:
                         logger.exception("handoff.manual_%s_failed", operation)
-                        await _send_error(websocket, sequencer,
+                        await _send_error(writer, sequencer,
                             "HANDOFF_RESET_FAILED" if operation == "reset" else "SESSION_CLEAR_FAILED",
                             "会话操作未完成，已保存的材料与归档已保留，可重试以完成会话切换。", None, True,
                             request_id=message["request_id"])
                 elif command == "session.reasoning_mode":
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
-                        await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "运行模式必须是 fast（快速）或 deep（深度）。", None, True)
+                        await _send_error(writer, sequencer, "INVALID_REASONING_MODE", "运行模式必须是 fast（快速）或 deep（深度）。", None, True)
                 elif command == "shadow.debug.wake":
                     async def debug_sink(items: list[ShadowEvent]) -> None:
                         for item in items:
@@ -4737,11 +4818,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         ))
                     except ValueError as exc:
                         code = str(exc)
-                        await _send_error(websocket, sequencer,
+                        await _send_error(writer, sequencer,
                                           code if code in {"SHADOW_DEBUG_DISABLED", "SHADOW_UNAVAILABLE"} else "INVALID_SHADOW_DEBUG_WAKE",
                                           "影子调试唤醒不可受理。", None, True)
                 else:
-                    await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True,
+                    await _send_error(writer, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True,
                                       request_id=message["request_id"])
         except WebSocketDisconnect:
             pass
@@ -4749,12 +4830,36 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             logger.info("WebSocket closed: %s", exc)
         finally:
             logger.info("websocket.disconnected peer=%s", websocket.client)
-            event_task.cancel()
-            debug_task.cancel()
-            await asyncio.gather(event_task, debug_task, return_exceptions=True)
+            runtime.device_state_waiters.discard(changed)
+            tasks = [event_task, debug_task, device_task]
+            for task in tasks:
+                task.cancel()
+            # 已接纳的操作由核心执行，观察连接结束不改变用户意图。
+            if start_task is not None:
+                tasks.append(start_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
             await runtime.close_shadow_debug(connection_id)
 
     return app
+
+
+class _VoiceSocketWriter:
+    """Serialize WebSocket（双向实时连接） envelopes and bound network backpressure."""
+
+    def __init__(self, websocket: Any) -> None:
+        self.websocket = websocket
+        self.lock = asyncio.Lock()
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        async with self.lock, asyncio.timeout(3.0):
+            await self.websocket.send_json(payload)
+
+    async def close(self, *, code: int) -> None:
+        try:
+            async with self.lock, asyncio.timeout(3.0):
+                await self.websocket.close(code=code)
+        except Exception:
+            pass
 
 
 async def _forward_events(websocket: Any, subscription: Any, sequencer: ProtocolSequencer) -> None:

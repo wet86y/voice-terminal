@@ -45,7 +45,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
         connection = await runtime.open_remote_device_session(device_id, ["audio_stream"])
         lease = await runtime.prepare_interaction_switch(device_id, runtime.device_registry.generation)
         app = create_app(runtime, product_settings=settings)
-        handshake = {"protocol_version": 2, "stream_id": "media-continuity",
+        handshake = {"protocol_version": 4, "stream_id": "media-continuity",
                      "connection_generation": connection.connection_generation,
                      "executor_generation": connection.executor_generation,
                      "interaction_generation": lease.interaction_generation}
@@ -71,7 +71,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
 
         async def ping(sequence):
             await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                "type": "media.ping", "protocol_version": 2, "sequence": sequence})})
+                "type": "media.ping", "protocol_version": 4, "sequence": sequence})})
             assert await asyncio.wait_for(pong.get(), 2) == sequence
 
         async def drive():
@@ -106,10 +106,10 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
                 measurements.append(clock[0])
                 device_time = int((clock[0] - 90) * 1_000_000)
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "clock.sync.response", "protocol_version": 2, "sync_id": body["sync_id"],
-                    "device_receive_us": device_time, "device_send_us": device_time, "runtime_controls": True})})
+                    "type": "clock.sync.response", "protocol_version": 4, "sync_id": body["sync_id"],
+                    "device_receive_us": device_time, "device_send_us": device_time})})
             elif body["type"] == "media.ready":
-                assert body["runtime_controls"] is True
+                assert len(measurements) == 1
                 driver = asyncio.create_task(drive())
             elif body["type"] == "media.pong":
                 await pong.put(body["sequence"])
@@ -122,7 +122,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
             await asyncio.wait_for(app(scope, incoming.get, send), 5)
             assert driver is not None
             await driver
-            assert len(measurements) >= 65
+            assert len(measurements) >= 61
             assert runtime.device_registry.active.device_id == "local"
         finally:
             if driver is not None:

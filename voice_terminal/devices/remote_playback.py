@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 import json
 import struct
 import time
@@ -14,6 +15,9 @@ _PREFIX = struct.Struct("!I")  # _PREFIX（四字节网络字节序帧头长度�
 _ALLOWED_RATES = frozenset({16_000, 24_000, 32_000, 48_000})  # _ALLOWED_RATES（合成输出采样率）。
 MAX_PLAYBACK_QUEUE_FRAMES = 64  # MAX_PLAYBACK_QUEUE_FRAMES（设备下行队列帧数上限，最多 1.28 秒）。
 MAX_PLAYBACK_CHUNK_MS = 2_000  # MAX_PLAYBACK_CHUNK_MS（单次进入下行队列的 PCM 时长上限）。
+MAX_DEVICE_PLAYBACK_BUFFER_MS = 600  # MAX_DEVICE_PLAYBACK_BUFFER_MS（设备储备与已发送未观测音频的共同上限）。
+PLAYBACK_BUFFER_REPORT_TIMEOUT = 3.0  # PLAYBACK_BUFFER_REPORT_TIMEOUT（未收到设备储备回执的等待上限，秒）。
+PLAYBACK_OUTPUT_STALL_SECONDS = 6.0  # PLAYBACK_OUTPUT_STALL_SECONDS（设备停止消费后的等待上限）。
 
 
 @dataclass(frozen=True)
@@ -291,11 +295,19 @@ class RemotePlaybackOutbox:
         self._queue: asyncio.Queue[PlaybackMediaFrame | None] = asyncio.Queue(maxsize=max_frames)
         self._capacity = asyncio.Semaphore(max_frames)  # _capacity（等待设备接纳后才复用的有界发送窗口）。
         self._max_frames = max_frames  # _max_frames（未确认帧的最大数量）。
-        self._pending_sequences: set[int] = set()  # _pending_sequences（已分配但设备尚未接纳的帧）。
-        self._pending_frames: dict[int, PlaybackMediaFrame] = {}  # _pending_frames（未收到设备接纳回执的帧）。
-        self._sent_sequences: set[int] = set()  # _sent_sequences（已写入 WebSocket、等待设备回执的帧）。
+        self._pending_frames: dict[int, PlaybackMediaFrame] = {}  # _pending_frames（已发送、未收到设备接纳回执的帧）。
+        self._pending_samples: dict[str, int] = {}  # _pending_samples（每个播放键排队及在途的采样数）。
+        self._next_wire_sequence = 0  # _next_wire_sequence（只给实际下发的帧分配连续序号）。
+        self._buffer_report_sequence = 0
+        self._buffer_report_at = 0.0
+        self._buffer_progress_at = 0.0
+        self.paused = False  # paused（设备已确认暂停，暂不按输出停滞处理）。
+        self._buffered_us = 0
+        self._inflight_us = 0
+        self._unreported_frames: deque[tuple[int, int]] = deque()
+        self._buffer_changed = asyncio.Event()
+        self._failed_keys: dict[str, str] = {}
         self._last_acknowledged = -1  # _last_acknowledged（最近连续收到的设备接纳回执序号）。
-        self._sequence = 0
         self._samples_by_key: dict[str, int] = {}
         self._accepted_samples_by_key: dict[str, int] = {}  # _accepted_samples_by_key（设备确认接纳的可播放采样数）。
         self._rates_by_key: dict[str, int] = {}
@@ -320,6 +332,8 @@ class RemotePlaybackOutbox:
         if samples * 1_000 > sample_rate * MAX_PLAYBACK_CHUNK_MS:
             raise ValueError("单次远端播放数据不得超过 2000 毫秒。")
         async with self._key_lock(playback_key):
+            if error := self.failure(playback_key):
+                raise RuntimeError(error)
             if self._closed:
                 raise RuntimeError("远端播放媒体通道已经关闭。")
             if playback_key in self._finished_keys:
@@ -340,6 +354,9 @@ class RemotePlaybackOutbox:
         offset = 0
         while offset < samples:
             await self._capacity.acquire()
+            if error := self.failure(playback_key):
+                self._capacity.release()
+                raise RuntimeError(error)
             if self._closed:
                 self._capacity.release()
                 raise RuntimeError("远端播放媒体通道已经关闭。")
@@ -355,8 +372,8 @@ class RemotePlaybackOutbox:
                 executor_generation=self.executor_generation,
                 interaction_generation=self.interaction_generation,
                 stream_id=self.stream_id, playback_key=playback_key,
-                sequence=self._sequence, start_sample=start_sample, sample_count=count,
-                sample_rate=sample_rate, host_send_time_us=time.monotonic_ns() // 1_000,
+                sequence=0, start_sample=start_sample, sample_count=count,
+                sample_rate=sample_rate, host_send_time_us=0,
                 payload=pcm[offset * 2:(offset + count) * 2],
             )
             self._publish_frame(frame)
@@ -371,6 +388,9 @@ class RemotePlaybackOutbox:
         stream.push(pcm)
         while len(stream.pcm_buffer) >= stream.FRAME_SAMPLES * 2:
             await self._capacity.acquire()
+            if error := self.failure(playback_key):
+                self._capacity.release()
+                raise RuntimeError(error)
             if self._closed:
                 self._capacity.release()
                 raise RuntimeError("远端播放媒体通道已经关闭。")
@@ -389,8 +409,8 @@ class RemotePlaybackOutbox:
                 executor_generation=self.executor_generation,
                 interaction_generation=self.interaction_generation,
                 stream_id=self.stream_id, playback_key=playback_key,
-                sequence=self._sequence, start_sample=start_sample, sample_count=count,
-                sample_rate=48_000, host_send_time_us=time.monotonic_ns() // 1_000,
+                sequence=0, start_sample=start_sample, sample_count=count,
+                sample_rate=48_000, host_send_time_us=0,
                 payload=packet, audio_codec="opus",
             )
             self._publish_frame(frame)
@@ -402,40 +422,97 @@ class RemotePlaybackOutbox:
         except asyncio.QueueFull as exc:
             self._capacity.release()
             raise RuntimeError("远端播放媒体队列容量与发送窗口状态不一致。") from exc
-        self._pending_sequences.add(self._sequence)
-        self._pending_frames[self._sequence] = frame
-        self._sequence += 1
+        self._pending_samples[frame.playback_key] = (
+            self._pending_samples.get(frame.playback_key, 0) + frame.sample_count
+        )
         self._samples_by_key[frame.playback_key] = frame.start_sample + frame.sample_count
 
     async def next_frame(self) -> PlaybackMediaFrame | None:
-        """next_frame（取出待发送帧）：队列为空时等待媒体生产者。"""
-        frame = await self._queue.get()
-        if frame is not None:
-            self._sent_sequences.add(frame.sequence)
-        return frame
+        """next_frame（取出待发送帧）：设备储备和在途音频共用发送额度。"""
+        loop = asyncio.get_running_loop()
+        while not self._closed:
+            frame = await self._queue.get()
+            if frame is None or self._closed:
+                return None
+            duration_us = (frame.sample_count * 1_000_000 + frame.sample_rate - 1) // frame.sample_rate
+            wait_started = loop.time()
+            while (not self._closed and not self.failure(frame.playback_key)
+                   and self._buffered_us + self._inflight_us + duration_us > MAX_DEVICE_PLAYBACK_BUFFER_MS * 1_000):
+                report_deadline = max(wait_started, self._buffer_report_at) + PLAYBACK_BUFFER_REPORT_TIMEOUT
+                progress_deadline = max(wait_started, self._buffer_progress_at) + PLAYBACK_OUTPUT_STALL_SECONDS
+                deadline = report_deadline if self.paused else min(report_deadline, progress_deadline)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    self.fail(frame.playback_key, "客户端播放储备没有释放，已结束本轮播放。")
+                    break
+                self._buffer_changed.clear()
+                try:
+                    await asyncio.wait_for(self._buffer_changed.wait(), remaining)
+                except TimeoutError:
+                    pass
+            if self._closed:
+                return None
+            if self.failure(frame.playback_key):
+                self._release_frame(frame)
+                continue
+            sequence = self._next_wire_sequence
+            self._next_wire_sequence += 1
+            frame = replace(frame, sequence=sequence, host_send_time_us=time.monotonic_ns() // 1_000)
+            self._pending_frames[sequence] = frame
+            self._unreported_frames.append((sequence, duration_us))
+            self._inflight_us += duration_us
+            return frame
+        return None
 
-    def acknowledge(self, sequence: int, *, cancelled: bool = False) -> bool:
+    def record_buffer(self, next_sequence: int, buffered_ms: int, paused: bool = False) -> bool:
+        """record_buffer（更新设备储备）：报告序号之前的帧已经反映在端点快照中。"""
+        if not self._buffer_report_sequence <= next_sequence <= self._last_acknowledged + 1:
+            return False
+        self._buffer_report_at = asyncio.get_running_loop().time()
+        if (next_sequence > self._buffer_report_sequence
+                or buffered_ms * 1_000 < self._buffered_us or self.paused != paused):
+            self._buffer_progress_at = self._buffer_report_at
+        self._buffer_report_sequence = next_sequence
+        self._buffered_us = buffered_ms * 1_000
+        self.paused = paused
+        while self._unreported_frames and self._unreported_frames[0][0] < next_sequence:
+            _, duration = self._unreported_frames.popleft()
+            self._inflight_us -= duration
+        self._buffer_changed.set()
+        return True
+
+    def fail(self, playback_key: str, reason: str) -> None:
+        """fail（结束单轮播放）：已失败的键不再分配发送序号。"""
+        if playback_key in self._source_rates_by_key:
+            self._failed_keys.setdefault(playback_key, reason)
+            self._buffer_changed.set()
+
+    def failure(self, playback_key: str) -> str | None:
+        return self._failed_keys.get(playback_key)
+
+    def _release_frame(self, frame: PlaybackMediaFrame) -> None:
+        self._pending_samples[frame.playback_key] -= frame.sample_count
+        self._capacity.release()
+
+    def acknowledge(self, sequence: int, *, cancelled: bool = False, reason: str | None = None) -> bool:
         """acknowledge（设备回执）：按序释放发送额度，取消帧不计为可播放音频。"""
         if type(sequence) is not int or sequence < 0 or sequence <= self._last_acknowledged:
             return False
         if type(cancelled) is not bool:
             return False
-        if sequence not in self._sent_sequences or sequence not in self._pending_sequences:
-            return False
         if sequence != self._last_acknowledged + 1:
             return False
-        frame = self._pending_frames.get(sequence)
+        frame = self._pending_frames.pop(sequence, None)
         if frame is None:
             return False
-        self._sent_sequences.remove(sequence)
-        self._pending_sequences.remove(sequence)
-        self._pending_frames.pop(sequence, None)
         self._last_acknowledged = sequence
+        if reason == "output_unavailable":
+            self.fail(frame.playback_key, "客户端播放设备不可用，本轮播放已结束。")
         if not cancelled:
             self._accepted_samples_by_key[frame.playback_key] = (
                 self._accepted_samples_by_key.get(frame.playback_key, 0) + frame.sample_count
             )
-        self._capacity.release()
+        self._release_frame(frame)
         return True
 
     def pending_frames(self) -> int:
@@ -462,9 +539,11 @@ class RemotePlaybackOutbox:
         rate = self._rates_by_key.get(playback_key)
         if not rate:
             return 0
-        samples = sum(frame.sample_count for frame in self._pending_frames.values()
-                      if frame.playback_key == playback_key)
+        samples = self._pending_samples.get(playback_key, 0)
         return samples * 1_000 // rate
+
+    def has_pending_audio(self, playback_key: str) -> bool:
+        return self._pending_samples.get(playback_key, 0) > 0
 
     def record_progress(self, receipt: dict[str, Any]) -> bool:
         """record_progress（保存实际输出快照）：只接纳已发送帧后的单调设备时钟事实。"""
@@ -484,7 +563,7 @@ class RemotePlaybackOutbox:
         if any(type(value) is not int or value < 0 or value > (1 << 53) - 1 for value in counters):
             return False
         enqueued_ms, played_ms, buffered_ms, output_estimated_ms, _device_time_us = counters
-        if played_ms > enqueued_ms or output_estimated_ms > enqueued_ms or buffered_ms > 2_000:
+        if played_ms > enqueued_ms or output_estimated_ms > played_ms:
             return False
         if type(receipt.get("started")) is not bool or receipt.get("precision") not in {
             "callback", "device_time", "estimated", "unknown",
@@ -521,6 +600,9 @@ class RemotePlaybackOutbox:
             stream.finish_input()
             while stream.output_cursor < stream.total_samples:
                 await self._capacity.acquire()
+                if self.failure(playback_key):
+                    self._capacity.release()
+                    break
                 if self._closed:
                     self._capacity.release()
                     raise RuntimeError("远端播放媒体通道已经关闭。")
@@ -536,8 +618,8 @@ class RemotePlaybackOutbox:
                     executor_generation=self.executor_generation,
                     interaction_generation=self.interaction_generation,
                     stream_id=self.stream_id, playback_key=playback_key,
-                    sequence=self._sequence, start_sample=start_sample, sample_count=count,
-                    sample_rate=48_000, host_send_time_us=time.monotonic_ns() // 1_000,
+                    sequence=0, start_sample=start_sample, sample_count=count,
+                    sample_rate=48_000, host_send_time_us=0,
                     payload=packet, audio_codec="opus",
                 )
                 self._publish_frame(frame)
@@ -548,10 +630,13 @@ class RemotePlaybackOutbox:
         """forget_settled_key（回收已结算播放键）：有未确认帧时拒绝清理。"""
         if not isinstance(playback_key, str) or not playback_key:
             return False
-        if playback_key not in self._finished_keys:
+        if (playback_key in self._source_rates_by_key and playback_key not in self._finished_keys
+                and not self.failure(playback_key)):
             return False
-        if any(frame.playback_key == playback_key for frame in self._pending_frames.values()):
+        if self.has_pending_audio(playback_key):
             return False
+        self._pending_samples.pop(playback_key, None)
+        self._failed_keys.pop(playback_key, None)
         self._samples_by_key.pop(playback_key, None)
         self._accepted_samples_by_key.pop(playback_key, None)
         self._rates_by_key.pop(playback_key, None)
@@ -569,10 +654,11 @@ class RemotePlaybackOutbox:
         if self._closed:
             return
         self._closed = True
-        outstanding = len(self._pending_sequences)
-        self._pending_sequences.clear()
         self._pending_frames.clear()
-        self._sent_sequences.clear()
+        self._pending_samples.clear()
+        self._failed_keys.clear()
+        self._unreported_frames.clear()
+        self._buffer_changed.set()
         self._progress_by_key.clear()
         self._samples_by_key.clear()
         self._accepted_samples_by_key.clear()
@@ -583,7 +669,7 @@ class RemotePlaybackOutbox:
         self._opus_streams_by_key.clear()
         self._key_locks.clear()
         self._finished_keys.clear()
-        for _ in range(outstanding + self._max_frames):
+        for _ in range(self._max_frames):
             self._capacity.release()
         while True:
             try:

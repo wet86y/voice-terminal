@@ -11,6 +11,7 @@ import { settingsSections } from '../interface/settings'
 import { productApi, ProductApiError } from './api'
 import { useProductAdapter } from './useProductAdapter'
 import { useProductControls } from './useProductControls'
+import { nativeDeviceApi } from './native-device-api'
 import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
@@ -585,6 +586,72 @@ describe('正式界面的真实控件交互', () => {
     expect(value.resetSession()).toBe(false)
     expect(value.setReasoningMode('deep')).toBe(false)
     expect(value.wakeForm.keywords).toEqual(['保留的业务设置草稿'])
+  })
+
+  it('远程录制按钮在后台产品与组件状态刷新期间仍能启停', async () => {
+    application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true,
+      remote_business_ready: true, voice_ws_url: window.__VOICE_APPLICATION__?.voice_ws_url, core_phase: 'ready',
+      startup_complete: true, state: 'running', components: [] } as unknown as ApplicationSnapshot
+    const product = deferred<Awaited<ReturnType<typeof productApi.snapshot>>>()
+    const compute = deferred<Awaited<ReturnType<typeof productApi.computeStatus>>>()
+    vi.spyOn(productApi, 'snapshot').mockReturnValue(product.promise)
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+    vi.spyOn(productApi, 'computeStatus').mockReturnValue(compute.promise)
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+    const sent = vi.fn()
+    let socket!: { onopen: () => void; onmessage: (value: { data: string }) => void }
+    vi.stubGlobal('WebSocket', class {
+      readyState = 1
+      send = sent
+      close() {}
+      constructor() { socket = this as unknown as typeof socket }
+    })
+    application.businessReady.value = true
+    const wrapper = render(ProductApp)
+    const action = () => wrapper.get<HTMLButtonElement>('.voice-session-action')
+    await flushPromises()
+
+    socket.onopen()
+    let sequence = 0
+    const receive = (type: string, payload: Record<string, unknown>) => socket.onmessage({
+      data: JSON.stringify({ type, seq: ++sequence, timestamp: '2026-11-19', conversation_id: 'voice-test', payload }),
+    })
+    const device = (revision: number, phase: string, mediaReady = true) => receive('devices.snapshot', {
+      core_session_id: 'server-core', self_device_id: 'client-a', revision, listening_requested: false,
+      can_start: phase === 'idle', devices: [{ device_id: 'client-a', media_ready: mediaReady, recording_phase: phase }],
+    })
+    device(1, 'idle')
+    await flushPromises()
+    expect(productApi.snapshot).toHaveBeenCalledOnce()
+    expect(action().element.disabled).toBe(false)
+    await action().trigger('click')
+    const start = JSON.parse(sent.mock.lastCall![0])
+    expect(start.command).toBe('session.start')
+    expect(action().text()).toContain('取消启动录制')
+    device(2, 'recording')
+    receive('device.intent', { request_id: start.request_id, result: 'accepted' })
+
+    product.resolve({
+      settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
+      runtime: { state: 'IDLE', listening: false, can_start: true },
+    } as never)
+    await flushPromises()
+    expect(productApi.computeStatus).toHaveBeenCalled()
+    expect(action().element.disabled).toBe(false)
+    expect(action().text()).toContain('停止当前会话')
+    await action().trigger('click')
+    const stop = JSON.parse(sent.mock.lastCall![0])
+    expect(stop.command).toBe('session.stop')
+    receive('device.intent', { request_id: stop.request_id, result: 'accepted' })
+    device(3, 'idle')
+    await flushPromises()
+    expect(action().text()).toContain('开始语音会话')
+    device(4, 'idle', false)
+    await flushPromises()
+    expect(action().element.disabled).toBe(true)
+    vi.unstubAllGlobals()
+    compute.resolve({} as never)
   })
 
   it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {

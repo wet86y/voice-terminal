@@ -24,6 +24,7 @@ _MAX_AUTHORIZATIONS = 8  # _MAX_AUTHORIZATIONS（一个媒体租约内的临时�
 _MIN_OUTPUT_MS = 80  # _MIN_OUTPUT_MS（设备必须真实输出的最短有效音频时长）。
 _CONTROL_QUEUE_SIZE = 32  # _CONTROL_QUEUE_SIZE（主机至客户端的有界控制消息数）。
 _OUTPUT_PROGRESS_INTERVAL = 0.1  # _OUTPUT_PROGRESS_INTERVAL（客户端输出进度轮询秒数）。
+_SEGMENT_STALL_SECONDS = 12.0  # _SEGMENT_STALL_SECONDS（合成与播放均无进展时的分段等待上限）。
 
 
 class RemoteClientTtsError(RuntimeError):
@@ -649,7 +650,7 @@ class RemoteClientTtsSession:
         if not isinstance(text, str) or not text.strip():
             raise RemoteClientTtsError("客户端拒绝空文本分段。")
         if self._requests and not self._requests[-1].finished.is_set():
-            await self._requests[-1].finished.wait()
+            await self._await_segment(self._requests[-1])
         if self._requests:
             previous = self._requests[-1]
             if previous.error:
@@ -713,16 +714,7 @@ class RemoteClientTtsSession:
         if type(previous_count) is not int or previous_count < 0 or previous_count >= len(self._requests):
             raise ValueError("客户端文本段回执索引无效。")
         state = self._requests[previous_count]
-        while not state.finished.is_set():
-            if state.error:
-                raise RemoteClientTtsError(state.error)
-            if state.cancelled:
-                raise RemoteClientTtsError("客户端确认取消了当前播放事务分段。")
-            await asyncio.sleep(_OUTPUT_PROGRESS_INTERVAL)
-        if state.error:
-            raise RemoteClientTtsError(state.error)
-        if state.cancelled:
-            raise RemoteClientTtsError("客户端确认取消了当前播放事务分段。")
+        await self._await_segment(state)
         if state.end_sample is None:
             raise RemoteClientTtsError("客户端没有提供有效的文本分段输出边界。")
         if self.first_audio_ready_at is None:
@@ -736,6 +728,27 @@ class RemoteClientTtsSession:
             "end_sample": state.end_sample,
         }
 
+    async def _await_segment(self, state: _RequestState) -> None:
+        loop = asyncio.get_running_loop()
+        last_position = None
+        deadline = loop.time() + _SEGMENT_STALL_SECONDS
+        while not state.finished.is_set():
+            position = (state.reported_generated_samples, self.playback_progress()["played_samples"])
+            if position != last_position:
+                last_position = position
+                deadline = loop.time() + _SEGMENT_STALL_SECONDS
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RemoteClientTtsError("客户端合成与播放没有继续推进，本段输出结果未知。")
+            try:
+                await asyncio.wait_for(state.finished.wait(), min(_OUTPUT_PROGRESS_INTERVAL, remaining))
+            except TimeoutError:
+                pass
+        if state.error:
+            raise RemoteClientTtsError(state.error)
+        if state.cancelled:
+            raise RemoteClientTtsError("客户端确认取消了当前播放事务分段。")
+
     async def audio_chunks(self):
         """audio_chunks（拒绝音频读取）：直放会话不能把 PCM 暴露给服务端流水线。"""
         raise RemoteClientTtsError("客户端直放会话禁止读取或回传 PCM 音频。")
@@ -746,11 +759,7 @@ class RemoteClientTtsSession:
         if self._audio_eof:
             return
         for state in self._requests:
-            await state.finished.wait()
-            if state.error:
-                raise RemoteClientTtsError(state.error)
-            if state.cancelled:
-                raise RemoteClientTtsError("客户端确认取消了尚未结算的播放文本段。")
+            await self._await_segment(state)
             if state.end_sample is None:
                 raise RemoteClientTtsError("客户端完成回执缺少设备输出边界。")
         self._audio_eof = True
@@ -807,6 +816,9 @@ class RemoteClientTtsSession:
             progress = self.playback_progress()
             if not progress["accepted_samples"]:
                 await unbind(self.playback_key, self.lease)
+        finish_stream = getattr(self.runtime, "finish_remote_playback", None)
+        if self._started and callable(finish_stream):
+            await finish_stream(self.playback_key)
 
 
 def _validate_id(value: Any, field_name: str) -> None:

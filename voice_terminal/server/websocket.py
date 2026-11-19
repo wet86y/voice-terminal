@@ -23,7 +23,7 @@ from ..devices.router import DeviceOutcomeUnknown, DeviceRouter, DeviceUnavailab
 from ..devices.registry import DeviceConnection, DeviceRegistry, InteractionLease
 from ..devices.remote_capture import RemoteAudioCapture
 from ..devices.diagnostics import device_event, lease_context
-from ..devices.remote_playback import RemotePlaybackOutbox
+from ..devices.remote_playback import MAX_PLAYBACK_CHUNK_MS, PLAYBACK_OUTPUT_STALL_SECONDS, RemotePlaybackOutbox
 from ..devices.client_tts import RemoteClientTtsOutbox
 from ..devices.remote_session import RemoteDeviceSessionHub, RemoteDeviceTask
 from ..devices.file_transfer import DeviceFileTransferStore
@@ -119,10 +119,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
 
     @capture.setter
     def capture(self, value: CapturePort | None) -> None:
-        self._local_audio().capture = value
         route = self.__dict__.get("_capture_router")
         if route is not None:
             route.set_local_port(value)
+        self._local_audio().capture = value
 
     @property
     def audio_processor(self) -> ProcessingPort | None:
@@ -161,7 +161,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             else None
         )  # device_host_id（原生宿主绑定的稳定服务端设备身份）。
         self.core_session_id = uuid4().hex  # core_session_id（本次权威核心运行编号）。
-        self.device_registry = DeviceRegistry()  # device_registry（本次核心运行的设备与交互租约）。
+        self.device_state_waiters: set[asyncio.Event] = set()
+        self.preferred_voice_device: str | None = None  # preferred_voice_device（服务端明确选择或首次分配的语音输入）。
+        self.device_registry = DeviceRegistry(self.device_state_changed)  # device_registry（本次核心运行的设备与交互租约）。
         self._pending_interaction_switch: tuple[InteractionLease, bool] | None = None  # pending_interaction_switch（设备已准备且旧输入已撤销，尚待新设备就绪的切换事务）。
         self._pending_interaction_switch_task: asyncio.Task[None] | None = None  # pending_interaction_switch_task（超时撤销未完成的切换，避免卡住后续选择）。
         self._aborted_remote_interaction_switch: tuple[InteractionLease, bool] | None = None  # _aborted_remote_interaction_switch（待媒体故障接管复用的原监听意图）。
@@ -228,7 +230,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._pending_product_settings: dict[str, Any] | None = None
         self._product_settings_lock = asyncio.Lock()  # 产品设置应用互斥，防止并行换入模型。
         self.state = RuntimeState()
-        self.bus = EventBus()
+        self.bus = EventBus(self._observe_device_state)
         self.history = SessionLedger(limit=10)
         self.history.screen_capture = ScreenCaptureRouter(self.history.screen_capture, self.device_registry)
         self._conversation_tasks: set[asyncio.Task] = set()
@@ -244,6 +246,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._application_session_ready = False
         # _listen_resume_requested（挂起的开始监听意图）：能力加载中被拦截的用户意图，就绪后自动执行。
         self._listen_resume_requested: bool | None = None
+        self._tts_resume_requested: bool | None = None
+        self._enhancement_resume_requested = False
+        self._listen_stops_pending = 0  # 已提交但尚未完成的停止请求，采集开始前必须让行。
+        self._listen_stop_revision = 0  # 停止请求代次，防止回退过程中复用已撤销的意图。
         self._application_startup_lock = asyncio.Lock()
         # compute_status（计算状态）记录 Voice Server 内 KWS 与 FSMN-VAD 的实际设备。
         self._compute_models: dict[str, dict[str, Any]] = {}
@@ -718,26 +724,31 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 if previous != (lease.device_id, outbox):
                     raise RuntimeError("已有播放事务不能更换固定送达设备。")
                 return True
-            if len(self._remote_playback_bindings) >= 256:
-                removable = next((old_key for old_key, (old_device, old_outbox)
-                                  in self._remote_playback_bindings.items()
-                                  if old_key in self._remote_playback_finished
-                                  and (old_progress := self._remote_playback_progress.get(old_key)) is not None
-                                  and old_progress.get("precision") in {"device_time", "estimated"}
-                                  and old_progress.get("buffered_ms") == 0
-                                  and old_progress.get("output_estimated_ms", 0) >= old_progress.get("enqueued_ms", 1)
-                                  and old_outbox.pending_ms_for_key(old_key) == 0), None)
-                if removable is None:
-                    raise RuntimeError("远端播放事务数量达到上限；未结算目标不能被改绑。")
-                old_outbox = self._remote_playback_bindings[removable][1]
-                if not old_outbox.forget_settled_key(removable):
-                    raise RuntimeError("远端播放事务仍有未确认帧；未回收原播放键。")
-                self._remote_playback_bindings.pop(removable, None)
-                self._remote_playback_progress.pop(removable, None)
-                self._remote_client_tts_progress.pop(removable, None)
-                self._remote_playback_finished.discard(removable)
+            self._reserve_remote_playback_binding()
             self._remote_playback_bindings[playback_key] = (lease.device_id, outbox)
             return True
+
+    def _reserve_remote_playback_binding(self) -> None:
+        """_reserve_remote_playback_binding（回收已经结束的旧播放键）：保留正在输出的固定路由。"""
+        if len(self._remote_playback_bindings) < 256:
+            return
+        for key, (_, outbox) in self._remote_playback_bindings.items():
+            progress = self._remote_playback_progress.get(key) or {}
+            settled = key in self._remote_playback_finished and (
+                not outbox.has_audio_for_key(key)
+                or progress.get("precision") in {"device_time", "estimated"}
+                and progress.get("buffered_ms") == 0
+                and progress.get("output_estimated_ms", 0) >= progress.get("enqueued_ms", 1)
+            )
+            if not outbox.closed:
+                if not (settled or outbox.failure(key)) or not outbox.forget_settled_key(key):
+                    continue
+            self._remote_playback_bindings.pop(key)
+            self._remote_playback_progress.pop(key, None)
+            self._remote_client_tts_progress.pop(key, None)
+            self._remote_playback_finished.discard(key)
+            return
+        raise RuntimeError("远端播放事务数量达到上限；未结算目标不能被改绑。")
 
     async def detach_remote_playback_outbox(
         self, lease: InteractionLease, outbox: RemotePlaybackOutbox,
@@ -777,24 +788,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 outbox = self._remote_playback_outboxes.get(active.device_id)
                 if outbox is None or outbox.interaction_generation != active.interaction_generation:
                     raise RuntimeError("当前语音设备没有绑定对应代次的下行播放队列。")
-                if len(self._remote_playback_bindings) >= 256:
-                    removable = next((old_key for old_key, (old_device, old_outbox)
-                                      in self._remote_playback_bindings.items()
-                                      if old_key in self._remote_playback_finished
-                                      and (old_progress := self._remote_playback_progress.get(old_key)) is not None
-                                      and old_progress.get("precision") in {"device_time", "estimated"}
-                                      and old_progress.get("buffered_ms") == 0
-                                      and old_progress.get("output_estimated_ms", 0) >= old_progress.get("enqueued_ms", 1)
-                                      and old_outbox.pending_ms_for_key(old_key) == 0), None)
-                    if removable is None:
-                        raise RuntimeError("远端播放事务数量达到上限；未结算目标不能被改绑。")
-                    old_outbox = self._remote_playback_bindings[removable][1]
-                    if not old_outbox.forget_settled_key(removable):
-                        raise RuntimeError("远端播放事务仍有未确认帧；未回收原播放键。")
-                    self._remote_playback_bindings.pop(removable, None)
-                    self._remote_playback_progress.pop(removable, None)
-                    self._remote_client_tts_progress.pop(removable, None)
-                    self._remote_playback_finished.discard(removable)
+                self._reserve_remote_playback_binding()
                 binding = (active.device_id, outbox)
                 self._remote_playback_bindings[playback_key] = binding
             elif playback_key in self._remote_playback_finished:
@@ -813,11 +807,15 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if binding is None:
                 return False
             outbox = binding[1]
-            if not await outbox.finish_key(playback_key):
+        finished = await outbox.finish_key(playback_key)
+        async with self._remote_playback_lock:
+            if outbox.closed or self._remote_playback_bindings.get(playback_key) != binding:
+                return False
+            if not finished:
                 # A known empty TTS result is a completed zero-sample stream;
                 # it must not wait for a device receipt for audio never sent.
                 if (outbox.has_audio_for_key(playback_key)
-                        or outbox.pending_ms_for_key(playback_key) != 0
+                        or outbox.has_pending_audio(playback_key)
                         or self._remote_playback_progress.get(playback_key) is not None):
                     return False
             self._remote_playback_finished.add(playback_key)
@@ -870,7 +868,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if (not self.device_registry.accepts(lease) or outbox is None
                     or outbox.stream_id != stream_id or outbox.interaction_generation != lease.interaction_generation
                     or binding != (lease.device_id, outbox)):
-                raise RuntimeError("远端播放回执不属于当前固定设备、流或播放事务。")
+                return False
             previous = self._remote_playback_progress.get(playback_key)
             if previous is not None and receipt["receipt_sequence"] <= previous["receipt_sequence"]:
                 return False
@@ -918,7 +916,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                     or connection is None or not connection.connected
                     or connection.connection_generation != lease.connection_generation
                     or connection.executor_generation != lease.executor_generation):
-                raise RuntimeError("客户端直放证据不属于当前固定设备、媒体流或播放事务。")
+                return False
             previous = self._remote_client_tts_progress.get(playback_key)
             if previous is not None:
                 if (rate != previous["sample_rate"] or accepted < previous["accepted_samples"]
@@ -1009,11 +1007,16 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             raise PlaybackOutcomeUnknown("远端播放目标绑定不存在，不能确认输出完成。",
                                          operation="wait_until_output_complete")
         device_id, outbox = binding
-        deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_seconds)
+        last_played_ms = -1
+        stall_deadline = loop.time() + PLAYBACK_OUTPUT_STALL_SECONDS
         while True:
             if outbox.closed:
                 raise PlaybackOutcomeUnknown("远端媒体连接已关闭，播放输出结果未知。",
                                              device_id=device_id, operation="wait_until_output_complete")
+            if error := outbox.failure(playback_key):
+                raise PlaybackOutcomeUnknown(error, device_id=device_id, operation="wait_until_output_complete")
             if (playback_key in self._remote_playback_finished
                     and (self.device_registry.connection(device_id) is None
                          or self.device_registry.connection(device_id).connection_generation != outbox.connection_generation
@@ -1037,7 +1040,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             snapshot = self._remote_playback_progress.get(playback_key)
             if (playback_key in self._remote_playback_finished and expected_ms == 0
                     and not outbox.has_audio_for_key(playback_key)
-                    and outbox.pending_ms_for_key(playback_key) == 0
+                    and not outbox.has_pending_audio(playback_key)
                     and (snapshot is None or (snapshot.get("started") is not True
                          and snapshot.get("buffered_ms") == 0
                          and snapshot.get("output_estimated_ms", 0) == 0))):
@@ -1045,18 +1048,41 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if (playback_key in self._remote_playback_finished and snapshot is not None
                     and snapshot.get("enqueued_ms", 0) >= expected_ms
                     and snapshot.get("started") is True
-                    and outbox.pending_ms_for_key(playback_key) == 0
+                    and not outbox.has_pending_audio(playback_key)
                     and snapshot.get("buffered_ms") == 0
                     and snapshot.get("output_estimated_ms", 0) >= expected_ms):
                 if snapshot.get("precision") not in {"device_time", "estimated"}:
                     raise PlaybackOutcomeUnknown("远端输出快照精度不足，播放结算结果未知。",
                                                  device_id=device_id, operation="wait_until_output_complete")
                 return
-            remaining = deadline - asyncio.get_running_loop().time()
+            played_ms = snapshot.get("output_estimated_ms", 0) if snapshot is not None else 0
+            if played_ms > last_played_ms or outbox.paused:
+                last_played_ms = played_ms
+                stall_deadline = loop.time() + PLAYBACK_OUTPUT_STALL_SECONDS
+            remaining = min(deadline, stall_deadline) - loop.time()
             if remaining <= 0:
                 raise PlaybackOutcomeUnknown("远端设备未在期限内确认完整输出，播放结果未知。",
                                              device_id=device_id, operation="wait_until_output_complete")
             await asyncio.sleep(min(0.025, remaining))
+
+    def device_state_changed(self) -> None:
+        for waiter in self.device_state_waiters:
+            waiter.set()
+
+    def _observe_device_state(self, value: VoiceEvent) -> None:
+        if value.type in {"session.state", "runtime.snapshot", "status", "error"}:
+            self.device_state_changed()
+
+    def remote_recording_phase(self, device_id: str) -> str:
+        capture = self._remote_media_captures.get(device_id)
+        return capture.recording_phase if capture is not None else "idle"
+
+    def listening_intent_pending(self) -> bool:
+        pending = self._pending_interaction_switch
+        operations = runtime_operations(self)
+        return bool((operations.holds or operations.restoring) and operations.resume_requested
+                    or self._listen_resume_requested or self._tts_resume_requested
+                    or getattr(self, "_enhancement_resume_requested", False) or (pending and pending[1]))
 
     def remote_media_control_ready(self, device_id: str, connection_generation: int) -> bool:
         """remote_media_control_ready（远端监听目标可用）：控制入口只能启停本设备仍有效的媒体输入。"""
@@ -1096,22 +1122,37 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         device_event(logger, "device.capture_selected", **lease_context(lease), stream_id=capture.stream_id)
 
     async def prepare_interaction_switch(
-        self, device_id: str, expected_generation: int, *, _resume_intent: bool | None = None,
-    ) -> InteractionLease:
+        self, device_id: str, expected_generation: int | None, *, _resume_intent: bool | None = None,
+        _stop_revision: int | None = None, explicit: bool = False, automatic_connection: int | None = None,
+    ) -> InteractionLease | None:
         """prepare_interaction_switch（准备手动切换）：先撤销旧输入并关闭旧采集。"""
-        if type(expected_generation) is not int or not isinstance(device_id, str) or not device_id:
+        if (expected_generation is not None and type(expected_generation) is not int) or not device_id:
             raise ValueError("交互设备或预期占用代次无效。")
         if _resume_intent is not None and type(_resume_intent) is not bool:
             raise ValueError("恢复监听意图必须为布尔值。")
         async with self._session_lock:
+            active = self.device_registry.active
+            pending = self.device_registry.pending
+            if automatic_connection is not None:
+                connection = self.device_registry.connection(device_id)
+                if connection is None or connection.connection_generation != automatic_connection:
+                    raise ValueError("设备任务会话已被替换。")
+                if pending is not None:
+                    return pending if pending.device_id == device_id else None
+                if active is not None and active.device_id == device_id:
+                    return active
+                if (self.preferred_voice_device not in (None, device_id)
+                        or active is not None and active.device_id != "local"):
+                    return None
             if self._pending_interaction_switch is not None:
                 raise RuntimeError("另一个交互设备切换尚未完成。")
-            if expected_generation != self.device_registry.generation:
+            if automatic_connection is None and expected_generation != self.device_registry.generation:
                 raise ValueError("交互设备状态已变化，请刷新后重试。")
             if _resume_intent is None:
                 self._aborted_remote_interaction_switch = None
-            active = self.device_registry.active
             if active is not None and active.device_id == device_id:
+                if explicit:
+                    self.preferred_voice_device = device_id
                 return active
             if device_id != "local":
                 connection = self.device_registry.connection(device_id)
@@ -1122,8 +1163,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                         )):
                     raise RuntimeError("目标设备未连接或未登记音频流能力。")
             previous = self.device_registry.active
-            lease = self.device_registry.prepare_switch(device_id, expected_generation)
-            was_listening = self.state.listening if _resume_intent is None else _resume_intent
+            lease = self.device_registry.prepare_switch(device_id, self.device_registry.generation)
+            was_listening = (self.state.listening or self._listen_resume_requested is True) if _resume_intent is None else _resume_intent
+            if self._listen_stops_pending or (_stop_revision is not None and _stop_revision != self._listen_stop_revision):
+                was_listening = False
             try:
                 if was_listening and self.controller is not None:
                     await self.controller.stop_listening()
@@ -1132,6 +1175,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             except Exception:
                 self.device_registry.abort_switch(lease)
                 raise
+            if explicit or automatic_connection is not None:
+                self.preferred_voice_device = device_id
             self._pending_interaction_switch = (lease, was_listening)
             device_event(logger, "device.interaction_prepare", **lease_context(lease), resume_intent=was_listening)
             self._pending_interaction_switch_task = asyncio.create_task(
@@ -1144,7 +1189,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         """_expire_interaction_switch（限时撤销待处理切换）：不恢复旧设备租约。"""
         try:
             await asyncio.sleep(INTERACTION_SWITCH_TIMEOUT_SECONDS)
-            await self.abort_interaction_switch(lease)
+            if await self.abort_interaction_switch(lease) and lease.device_id != "local":
+                await self.recover_local_after_remote_media_loss(lease)
         except asyncio.CancelledError:
             raise
 
@@ -1173,9 +1219,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             resume = pending[1]
             self._pending_interaction_switch = None
             self._cancel_interaction_switch_expiry()
-            if resume and self.controller is not None:
+            if resume and not self._listen_stops_pending and self.controller is not None:
                 await self.controller.start_listening()
-                if not self.state.listening:
+                if not self.state.listening and not self._listen_stops_pending:
                     self._listen_resume_requested = True  # 能力恢复后沿用既有自动恢复；用户停止会撤销此意图。
                     reason = self.state.can_start_reason or {}
                     device_event(logger, "device.interaction_listening_deferred", level=logging.WARNING,
@@ -1202,10 +1248,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             resume = pending[1]
             self._pending_interaction_switch = None
             self._cancel_interaction_switch_expiry()
-            if resume and self.controller is not None:
+            if resume and not self._listen_stops_pending and self.controller is not None:
                 await self.controller.start_listening()
-                if not self.state.listening:
-                    raise RuntimeError("本机已获得交互租约，但核心未能恢复监听。")
+                if not self.state.listening and not self._listen_stops_pending:
+                    self._listen_resume_requested = True
             return resume
 
     async def abort_interaction_switch(self, lease: InteractionLease) -> bool:
@@ -1291,13 +1337,14 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 return False
 
             resume_intent = aborted[1] if aborted_matches and aborted is not None else self.state.listening
+            stop_revision = self._listen_stop_revision
             self._aborted_remote_interaction_switch = None
             local_lease: InteractionLease | None = None
 
             try:
                 local_lease = await self.prepare_interaction_switch(
                     "local", self.device_registry.generation,
-                    _resume_intent=resume_intent,
+                    _resume_intent=resume_intent, _stop_revision=stop_revision,
                 )
                 if (self._capture_router is not None
                         and self._capture_router.active_device_id == lost_lease.device_id):
@@ -1494,7 +1541,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             self._record_error("audio", str(exc))
 
         try:
-            self.audio_processor = self._local_audio().create_processor(
+            previous_processor = self.audio_processor
+            processor = self._local_audio().create_processor(
                 sample_rate=self.config.audio.sample_rate,
                 channels=self.config.audio.channels,
                 reverse_sample_rate=self.config.tts.sample_rate,
@@ -1504,6 +1552,13 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 enable_ns=self.config.audio.noise_suppression,
                 enable_agc=self.config.audio.automatic_gain_control,
             )
+            self.audio_processor = processor
+            if self.controller is not None:
+                self.controller.audio_processor = processor
+            if self.player is not None and hasattr(self.player, "on_audio_rendered"):
+                self.player.on_audio_rendered = processor.push_reverse
+            if previous_processor is not None and previous_processor is not processor:
+                previous_processor.close()
             if self.audio_processor.enabled and self.audio_processor.status in {"ERROR", "DEGRADED"}:
                 logger.warning("audio.processing_status status=%s error=%s", self.audio_processor.status, self.audio_processor.error)
             self.state.current.update(
@@ -1578,17 +1633,32 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
     async def _initialize_asr(self) -> None:
         """_initialize_asr（识别工作进程连接）：能力级恢复可单独重建。"""
         application_report("voice", "连接语音识别与分析服务")
-        self.asr = AsrWorkerClient(self.config.asr.worker_url)
+        candidate = AsrWorkerClient(self.config.asr.worker_url)
         try:
-            await self.asr.connect()
-            await self.asr.health()
+            if self.vad is None and self.controller is not None:
+                await self._initialize_vad()
             if self.vad is None:
-                # 语音活动检测缺失时识别链路不可用：显式失败，不能停留在“加载中”。
                 self._record_error("asr", "语音活动检测未加载，识别链路不可用")
                 return
+            await candidate.connect()
+            await candidate.health()
+            previous = self.asr
+            if self.controller is not None:
+                candidate.on_result = self.controller._on_asr_result
+                self.controller.asr = candidate
+                self.controller.vad = self.vad
+            self.asr = candidate
+            if previous is not None and previous is not candidate:
+                previous.on_result = None
+                try:
+                    await previous.close()
+                except Exception:
+                    logger.warning("已替换的识别连接未正常关闭", exc_info=True)
             self.state.set_service("asr", "READY")
             self._clear_service_error("asr")
         except Exception as exc:
+            if self.asr is not candidate:
+                await candidate.close()
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
@@ -1812,9 +1882,11 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if active is None or active.device_id == "local":
                 return False
             device_id = active.device_id
-        await self.enqueue_remote_playback(
-            playback_key, sample_rate, pcm, delivery_device_id=device_id,
-        )
+        chunk_bytes = sample_rate * 2 * MAX_PLAYBACK_CHUNK_MS // 1_000
+        for offset in range(0, len(pcm), chunk_bytes):
+            await self.enqueue_remote_playback(
+                playback_key, sample_rate, pcm[offset:offset + chunk_bytes], delivery_device_id=device_id,
+            )
         return True
 
     def _player_is_idle(self) -> bool:
@@ -1923,7 +1995,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             audio_processor=self.audio_processor,
             aec_failure_policy=self.config.audio.aec_failure_policy,
             barge_in_gate=BargeInGate(enabled=True),
-            listening_start_allowed=runtime_operations(self).listening_start_allowed,
+            listening_start_allowed=lambda: (
+                not self._listen_stops_pending and self._pending_interaction_switch is None
+                and runtime_operations(self).listening_start_allowed()
+            ),
             conversation=self.conversation,
             speaker_client=self.speaker,
             speaker_router=self.speaker_router,
@@ -2768,8 +2843,16 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self.state.input_owner = "none"
         self.state.set_state(TerminalState.STARTING, listening=False)
 
-    async def start_listening(self) -> None:
+    async def start_listening(self, *, remote_lease: InteractionLease | None = None,
+                              expected_stop_revision: int | None = None) -> None:
+        stop_revision = self._listen_stop_revision if expected_stop_revision is None else expected_stop_revision
+
+        def start_allowed() -> bool:
+            return (stop_revision == self._listen_stop_revision and not self._listen_stops_pending
+                    and (remote_lease is None or self.device_registry.accepts(remote_lease)))
         if getattr(self, "_closed", False) or getattr(self, "_application_stopping", False):
+            return
+        if not start_allowed():
             return
         operations = runtime_operations(self)
         if operations.holds:
@@ -2797,6 +2880,17 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._tts_resume_requested = None  # 新的主动启动撤销更早的停止意图。
         async with self._session_lock:
             if getattr(self, "_closed", False) or getattr(self, "_application_stopping", False):
+                return
+            if not start_allowed():
+                return
+            if self._pending_interaction_switch is not None:
+                lease, _ = self._pending_interaction_switch
+                self._pending_interaction_switch = (lease, True)
+                await self.bus.publish(event("status", code="INPUT_SWITCH_PENDING", message="采集设备就绪后开始监听。"))
+                return
+            if self._capture_router is not None and self._capture_router.active_device_id is None:
+                await self.bus.publish(event("error", code="INPUT_ROUTE_UNAVAILABLE",
+                                             message="当前采集设备尚未就绪。", recoverable=True))
                 return
             if operations.holds:
                 operations.intent(True)
@@ -2847,6 +2941,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if operations.holds:
                 operations.intent(True)
                 return
+            if not start_allowed():
+                return
             await self.controller.start_listening()
             pending_buffer = getattr(self, "_shadow_pending", None)
             pending = pending_buffer.drain() if pending_buffer is not None else []
@@ -2859,11 +2955,22 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._enhancement_resume_requested = False
         self._tts_resume_requested = False  # 用户主动停止优先于后台切换的恢复意图。
         self._listen_resume_requested = False  # 用户主动停止也撤销能力加载中的挂起意图。
-        async with self._session_lock:
-            if isinstance(self.shadow_session, DshShadowAgentSession):
-                self.shadow_session.approvals.revoke()
-            if self.controller is not None:
-                await self.controller.stop_listening()
+        self._listen_stops_pending += 1
+        self._listen_stop_revision += 1
+        try:
+            async with self._session_lock:
+                if self._pending_interaction_switch is not None:
+                    lease, _ = self._pending_interaction_switch
+                    self._pending_interaction_switch = (lease, False)
+                if self._aborted_remote_interaction_switch is not None:
+                    lease, _ = self._aborted_remote_interaction_switch
+                    self._aborted_remote_interaction_switch = (lease, False)
+                if isinstance(self.shadow_session, DshShadowAgentSession):
+                    self.shadow_session.approvals.revoke()
+                if self.controller is not None:
+                    await self.controller.stop_listening()
+        finally:
+            self._listen_stops_pending -= 1
 
     async def _rotate_session(self, *, _lock_held: bool = False, _strict_shadow: bool = False,
                               target_voice_session_id: str | None = None,

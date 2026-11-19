@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from .events import VoiceEvent
 
@@ -9,11 +9,14 @@ from .events import VoiceEvent
 class EventBus:
     """Small in-process fan-out bus used by the controller and WebSocket clients."""
 
-    def __init__(self) -> None:
+    def __init__(self, observe: Callable[[VoiceEvent], None] | None = None) -> None:
+        self._observe = observe
         self._subscribers: set[asyncio.Queue[VoiceEvent]] = set()
         self._lock = asyncio.Lock()
 
     async def publish(self, value: VoiceEvent) -> None:
+        if self._observe is not None:
+            self._observe(value)
         async with self._lock:
             subscribers = tuple(self._subscribers)
         for queue in subscribers:

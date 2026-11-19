@@ -615,7 +615,7 @@ class DevicePairingManager:
 _DEVICE_REQUEST_PATHS = frozenset({
     "/v1/status", "/v1/devices", "/v1/session/open", "/v1/session/poll",
     "/v1/session/complete", "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
-    "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer", "/v1/media",
+    "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer",
 })
 _CORE_SESSION_ID = re.compile(r"^[a-f0-9]{32}$")
 _CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -623,8 +623,8 @@ _CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 def _valid_device_request_target(method: str, path: str) -> bool:
     """_valid_device_request_target（设备签名目标）：业务请求仅 POST，媒体升级仅 GET。"""
-    return ((method == "POST" and path in _DEVICE_REQUEST_PATHS and path != "/v1/media")
-            or (method == "GET" and path == "/v1/media"))
+    return ((method == "POST" and path in _DEVICE_REQUEST_PATHS)
+            or (method == "GET" and path in {"/v1/media", "/v1/voice"}))
 
 
 def device_request_proof_message(

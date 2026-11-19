@@ -44,6 +44,22 @@ def _outbox() -> RemoteClientTtsOutbox:
     return RemoteClientTtsOutbox(lease=_lease(), core_session_id="core-a", stream_id="media-a")
 
 
+def test_client_tts_segment_with_no_terminal_receipt_expires(monkeypatch) -> None:
+    monkeypatch.setattr("voice_terminal.devices.client_tts._SEGMENT_STALL_SECONDS", 0.01)
+
+    async def scenario() -> None:
+        session = object.__new__(RemoteClientTtsSession)
+        session.outbox = _outbox()
+        session.playback_key = "speech-stalled"
+        state = SimpleNamespace(finished=asyncio.Event(), reported_generated_samples=0, error=None, cancelled=False)
+        session._requests = [state]
+        with pytest.raises(RemoteClientTtsError, match="没有继续推进"):
+            await asyncio.wait_for(session.wait_for_segment(0), 0.5)
+        assert not state.finished.is_set(), "超时后仍需允许正常终态回执或取消请求收尾"
+
+    asyncio.run(scenario())
+
+
 def test_v2_authorization_is_separate_and_request_has_no_credential() -> None:
     async def scenario():
         outbox = _outbox()
@@ -52,7 +68,7 @@ def test_v2_authorization_is_separate_and_request_has_no_credential() -> None:
         )
         grant = await outbox.next_control()
         assert grant["type"] == "media.tts.authorize"
-        assert grant["protocol_version"] == 2
+        assert grant["protocol_version"] == 4
         assert grant["credential"] == "unit-test-server-key"
         assert grant["fields"]["credential"]
         outbox.accept_control(_receipt(
@@ -66,7 +82,7 @@ def test_v2_authorization_is_separate_and_request_has_no_credential() -> None:
         )
         request = await outbox.next_control()
         assert request["type"] == "media.tts.request"
-        assert request["protocol_version"] == 2
+        assert request["protocol_version"] == 4
         assert request["playback_key"] == "speech:1"
         assert request["request_id"] == state.request_id
         assert "credential" not in request

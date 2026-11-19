@@ -169,7 +169,8 @@ impl Pcm16CaptureConverter {
                 self.discontinuity_pending = true;
             } else {
                 self.reset_at(device_position);
-                self.discontinuity_pending = force_discontinuity;
+                // 首包没有同一流的先前采样位置。端点重建走上方保留连续性证据的分支。
+                self.discontinuity_pending = false;
             }
         }
         self.expected_device_position = Some(device_position.saturating_add(frames as u64));

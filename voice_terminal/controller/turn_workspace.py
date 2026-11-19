@@ -16,6 +16,7 @@ class AudioFrame:
     clock_uncertainty_seconds: float | None = None  # clock_uncertainty_seconds（采集时间映射误差；本机无需映射）。
     audio_processing: AudioProcessingStatus | None = None  # audio_processing（远端设备对同帧 PCM 的处理健康快照）。
     processing_identity: AudioProcessingIdentity | None = None  # processing_identity（设备、连接、执行器、交互代次及媒体流编号）。
+    discontinuity_before: bool = False  # discontinuity_before（帧前需要重新建立识别连续性）。
 
     @property
     def end_sample(self) -> int:

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-PROTOCOL_VERSION = 2  # PROTOCOL_VERSION（设备媒体协议版本；客户端 TTS 不回传 PCM）。
+PROTOCOL_VERSION = 4  # PROTOCOL_VERSION（设备媒体协议版本；客户端 TTS 不回传 PCM）。
 MAX_HEADER_BYTES = 4096  # MAX_HEADER_BYTES（音频帧头最大字节数）。
 MAX_PAYLOAD_BYTES = 256 * 1024  # MAX_PAYLOAD_BYTES（音频帧负载最大字节数）。
 MAX_CONTROL_BYTES = 16 * 1024  # MAX_CONTROL_BYTES（媒体控制消息最大字节数）。
@@ -30,7 +30,7 @@ _PROCESSING_LABELS = {
 _TTS_BASE_FIELDS = frozenset({
     "type", "protocol_version", "device_id", "core_session_id", "connection_generation",
     "executor_generation", "interaction_generation", "stream_id",
-})  # _TTS_BASE_FIELDS（媒体 v2 客户端直放共用身份字段）。
+})  # _TTS_BASE_FIELDS（媒体 v3 客户端直放共用身份字段）。
 _TTS_CONTROL_FIELDS: dict[str, frozenset[str]] = {
     "media.tts.authorize": frozenset({"authorization_id", "playback_key", "provider", "ttl_ms", "credential"}),
     "media.tts.authorization_accepted": frozenset({"authorization_id", "playback_key"}),
@@ -55,12 +55,12 @@ _TTS_CONTROL_FIELDS: dict[str, frozenset[str]] = {
                                       "accepted_samples", "played_samples", "buffered_samples",
                                       "output_complete", "device_time_us"}),
     "media.tts.failed": frozenset({"authorization_id", "playback_key", "request_id", "segment_index", "error"}),
-}  # _TTS_CONTROL_FIELDS（媒体 v2 TTS 控制类型的精确字段集）。
+}  # _TTS_CONTROL_FIELDS（媒体 v3 TTS 控制类型的精确字段集）。
 _TTS_PROGRESS_FIELDS = frozenset({
     "accepted_samples", "played_samples", "buffered_samples", "output_complete", "device_time_us",
 })  # _TTS_PROGRESS_FIELDS（客户端原生设备时钟输出证据字段集）。
 _TTS_FIELD_LABELS = {
-    "type": "设备媒体控制消息类型", "protocol_version": "设备媒体协议版本，必须为 2",
+    "type": "设备媒体控制消息类型", "protocol_version": "设备媒体协议版本，必须为 3",
     "device_id": "固定目标设备编号", "core_session_id": "权威核心运行编号",
     "connection_generation": "SSH 设备连接代次", "executor_generation": "设备工作进程代次",
     "interaction_generation": "主机授予的语音占用代次", "stream_id": "SSH 连续媒体流编号",
@@ -84,7 +84,7 @@ _TTS_FIELD_LABELS = {
     "device_time_us": "客户端原生设备时钟单调微秒值", "total_samples": "MiniMax 合成确认的本段 PCM 样本数",
     "playback_end_sample": "设备时钟确认完成的播放事务累计采样位置",
     "error": "不含凭据或请求正文的错误摘要",
-}  # _TTS_FIELD_LABELS（媒体 v2 TTS 字段中文说明）。
+}  # _TTS_FIELD_LABELS（媒体 v3 TTS 字段中文说明）。
 
 
 class MediaProtocolError(ValueError):
@@ -238,26 +238,15 @@ def encode_client_tts_audio_frame(frame: ClientTtsAudioFrame) -> bytes:
 
 def decode_client_tts_audio_frame(message: bytes) -> ClientTtsAudioFrame:
     """decode_client_tts_audio_frame（拒绝旧版合成帧）：版本 2 不解析也不保存合成 PCM。"""
-    if not isinstance(message, bytes) or len(message) < _PREFIX.size:
-        raise MediaProtocolError("客户端合成消息缺少长度前缀。")
-    if len(message) > _PREFIX.size + MAX_HEADER_BYTES + MAX_PAYLOAD_BYTES:
-        raise MediaProtocolError("客户端合成消息超过总长度上限。")
-    header_size = _PREFIX.unpack_from(message)[0]
-    if not 0 < header_size <= MAX_HEADER_BYTES or len(message) <= _PREFIX.size + header_size:
-        raise MediaProtocolError("客户端合成帧头或 PCM 负载长度无效。")
-    try:
-        header = json.loads(
-            message[_PREFIX.size:_PREFIX.size + header_size].decode("utf-8"),
-            object_pairs_hook=_unique_object,
-            parse_constant=lambda _value: (_ for _ in ()).throw(MediaProtocolError("帧头不允许非有限数值。")),
-        )
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise MediaProtocolError("客户端合成帧头不是有效 JSON（结构化数据）。") from exc
+    header, payload = _decode_audio_message(message)
+    return _decode_client_tts_payload(header, payload)
+
+
+def _decode_client_tts_payload(header: dict, payload: bytes) -> ClientTtsAudioFrame:
     if (not isinstance(header, dict) or set(header) != _CLIENT_TTS_AUDIO_HEADER_FIELDS
             or type(header["protocol_version"]) is not int or header["protocol_version"] != PROTOCOL_VERSION
             or header["direction"] != "tts_audio"):
         raise MediaProtocolError("客户端合成帧版本、方向或字段不符合版本 1。")
-    payload = message[_PREFIX.size + header_size:]
     frame = ClientTtsAudioFrame(
         device_id=header["device_id"], core_session_id=header["core_session_id"],
         connection_generation=header["connection_generation"], executor_generation=header["executor_generation"],
@@ -318,7 +307,7 @@ def parse_tts_control(payload: str | bytes) -> dict[str, Any]:
 
 
 def validate_tts_control(value: Any) -> None:
-    """validate_tts_control（校验媒体 v2 客户端 TTS 控制消息）：拒绝未知字段和不完整字段说明。"""
+    """validate_tts_control（校验媒体 v3 客户端 TTS 控制消息）：拒绝未知字段和不完整字段说明。"""
     if not isinstance(value, dict):
         raise MediaProtocolError("客户端直放控制消息必须为 JSON 对象。")
     kind = value.get("type")
@@ -486,7 +475,19 @@ def encode_frame(frame: MediaFrame) -> bytes:
 
 
 def decode_frame(message: bytes) -> MediaFrame:
-    """decode_frame（解码帧）：先核对消息大小，再解析受限帧头。"""
+    """decode_frame（解码普通上行帧）。"""
+    return _decode_capture_payload(*_decode_audio_message(message))
+
+
+def decode_uplink(message: bytes) -> MediaFrame | ClientTtsAudioFrame:
+    """decode_uplink（解码设备上行）：同一个帧头只解析一次。"""
+    header, payload = _decode_audio_message(message)
+    if header.get("direction") == "tts_audio":
+        return _decode_client_tts_payload(header, payload)
+    return _decode_capture_payload(header, payload)
+
+
+def _decode_audio_message(message: bytes) -> tuple[dict, bytes]:
     if not isinstance(message, bytes) or len(message) < _PREFIX.size:
         raise MediaProtocolError("音频消息缺少长度前缀。")
     if len(message) > _PREFIX.size + MAX_HEADER_BYTES + MAX_PAYLOAD_BYTES:
@@ -500,10 +501,14 @@ def decode_frame(message: bytes) -> MediaFrame:
                             parse_constant=lambda _value: (_ for _ in ()).throw(MediaProtocolError("不支持非有限数值。")))
     except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise MediaProtocolError("音频帧头不是有效 JSON（结构化数据）。") from exc
-    _validate_header(header)
     payload = message[_PREFIX.size + header_size:]
-    if len(payload) > MAX_PAYLOAD_BYTES:
-        raise MediaProtocolError("音频负载过大。")
+    if not isinstance(header, dict) or len(payload) > MAX_PAYLOAD_BYTES:
+        raise MediaProtocolError("音频帧头类型或负载长度无效。")
+    return header, payload
+
+
+def _decode_capture_payload(header: dict, payload: bytes) -> MediaFrame:
+    _validate_header(header)
     audio_codec = header.get("audio_codec", "pcm")
     if audio_codec == "pcm" and len(payload) != header["sample_count"] * 2:
         raise MediaProtocolError("PCM 音频负载必须与有效采样数一致。")

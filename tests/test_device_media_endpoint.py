@@ -54,17 +54,18 @@ def test_media_endpoint_releases_cancelled_frame_without_claiming_playback() -> 
         device_id="client-media", connection_generation=2,
         executor_generation=3, interaction_generation=4,
     )
-    message = {"text": json.dumps({
-        "type": "playback.cancelled", "protocol_version": 2,
+    message = {
+        "type": "playback.cancelled", "protocol_version": 4,
         "device_id": "client-media", "delivery_device_id": "client-media",
         "core_session_id": "core-media", "connection_generation": 2,
         "executor_generation": 3, "interaction_generation": 4,
         "stream_id": "stream-media", "sequence": 7,
+        "reason": "stopped",
         "fields": {"sequence": "停止后丢弃的帧序号"},
-    })}
+    }
     assert _device_media_playback_acceptance(
         message, lease=lease, core_session_id="core-media", stream_id="stream-media",
-    ) == (7, True)
+    ) == (7, "stopped")
 
     def get(self, _reference: str) -> str | None:
         return None
@@ -165,7 +166,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
             server_http_api, "time",
             SimpleNamespace(monotonic=monotonic_clock, time=time.time),
         )
-        # 媒体时钟独立于系统时钟注入：五轮往返测量必须使用同一可重放的确定性时钟。
+        # 媒体时钟独立于系统时钟注入，测试使用可重放的确定性时钟。
         monkeypatch.setattr(server_http_api, "media_clock", monotonic_clock)
         config = AppConfig(
             model_dir=tmp_path / "models",
@@ -234,16 +235,8 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         private_key = Ed25519PrivateKey.generate()
         _simulate_native_trust_write(runtime, "client-media", _ssh_public_key(private_key))
         connection = await runtime.open_remote_device_session("client-media", ["audio_stream", "client_tts"])
-        expected_generation = runtime.device_registry.generation
-        stale = await _signed_gateway_post(app, private_key, "client-media", "/v1/interaction/prepare", {
-            "protocol_version": 1,
-            "expected_interaction_generation": expected_generation - 1,
-        })
-        assert stale.status_code == 409
-        assert runtime.device_registry.pending is None
         prepare = await _signed_gateway_post(app, private_key, "client-media", "/v1/interaction/prepare", {
-            "protocol_version": 1,
-            "expected_interaction_generation": expected_generation,
+            "protocol_version": 1, "connection_generation": connection.connection_generation,
         })
         assert prepare.status_code == 200
         prepared = prepare.json()
@@ -259,7 +252,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
                 downlink_pre_skip = encoder.lookahead_samples
 
         handshake = {
-            "protocol_version": 2,
+            "protocol_version": 4,
             "stream_id": "stream-media-1",
             "connection_generation": connection.connection_generation,
             "executor_generation": connection.executor_generation,
@@ -295,7 +288,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
             (b"x-voice-terminal-signature", base64.b64encode(private_key.sign(proof))),
         ]
         query = (
-            "protocol_version=2&stream_id=stream-media-1"
+            "protocol_version=4&stream_id=stream-media-1"
             f"&connection_generation={connection.connection_generation}"
             f"&executor_generation={connection.executor_generation}"
             f"&interaction_generation={lease_generation}"
@@ -332,7 +325,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
                 receipt_sequence += 1
                 enqueued_ms = acknowledged_samples * 1_000 // playback_frame.sample_rate
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "playback.accepted", "protocol_version": 2,
+                    "type": "playback.accepted", "protocol_version": 4,
                     "device_id": "client-media", "delivery_device_id": "client-media",
                     "core_session_id": runtime.core_session_id,
                     "connection_generation": connection.connection_generation,
@@ -342,7 +335,11 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
                     "fields": {"sequence": "已加入本机播放队列的帧序号"},
                 })})
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "playback.progress", "protocol_version": 2,
+                    "type": "playback.buffer", "next_sequence": playback_frame.sequence + 1,
+                    "buffered_ms": 0, "paused": False,
+                })})
+                await incoming.put({"type": "websocket.receive", "text": json.dumps({
+                    "type": "playback.progress", "protocol_version": 4,
                     "device_id": "client-media", "delivery_device_id": "client-media",
                     "core_session_id": runtime.core_session_id,
                     "connection_generation": connection.connection_generation,
@@ -370,8 +367,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
                 )
                 device_receive_us = 1_000_000 + sample_index * 10_000
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
-                    "type": "clock.sync.response", "protocol_version": 2,
-                    "runtime_controls": True,
+                    "type": "clock.sync.response", "protocol_version": 4,
                     "sync_id": body["sync_id"],
                     "device_receive_us": device_receive_us,
                     "device_send_us": device_receive_us + ((100_000 if downlink_codec == "pcm" else -1_000)
@@ -464,7 +460,8 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
 
         sent_json = [json.loads(item["text"]) for item in sent
                      if item.get("type") == "websocket.send" and isinstance(item.get("text"), str)]
-        assert sum(item.get("type") == "clock.sync.request" for item in sent_json) == 5
+        # 第一轮故意返回坏样本，第二轮成功后立即进入媒体流。
+        assert sum(item.get("type") == "clock.sync.request" for item in sent_json) == 2
         ready = next((item for item in sent_json if item.get("type") == "media.ready"), None)
         assert ready is not None, sent
         assert "device.clock_sample_rejected" in caplog.text
@@ -519,6 +516,7 @@ def test_unfinished_interaction_switch_expires_without_restoring_old_lease(tmp_p
         runtime._capture_router = SelectableCapturePort(_LocalCapture())
         await runtime._capture_router.start()
         await runtime.open_remote_device_session("client-expiry", ["audio_stream"])
+        old_lease = runtime.device_registry.active
 
         lease = await runtime.prepare_interaction_switch(
             "client-expiry", runtime.device_registry.generation,
@@ -526,7 +524,10 @@ def test_unfinished_interaction_switch_expires_without_restoring_old_lease(tmp_p
         assert runtime.device_registry.pending == lease
         await asyncio.sleep(0.04)
         assert runtime.device_registry.pending is None
-        assert runtime.device_registry.active is None
+        assert not runtime.device_registry.accepts(old_lease)
+        assert not runtime.device_registry.accepts(lease)
+        assert runtime.device_registry.active.device_id == "local"
+        assert runtime._capture_router.active_device_id == "local"
         await runtime.device_remote_sessions.close_all()
 
     asyncio.run(scenario())

@@ -1,4 +1,6 @@
+import { watch } from 'vue'
 import { matchesRemoteManagementEnvelope, nativeDeviceApi } from './native-device-api'
+import { deviceState } from './device-state'
 
 export type RemoteClientRuntimeState =
   | { state: 'ready'; core_state: 'ready'; task: Awaited<ReturnType<typeof nativeDeviceApi.remoteTaskChannel>>; media: Awaited<ReturnType<typeof nativeDeviceApi.remoteMediaChannel>> }
@@ -7,77 +9,8 @@ export type RemoteClientRuntimeState =
 
 let startupInFlight: Promise<RemoteClientRuntimeState> | null = null
 let supervisorStop: (() => void) | null = null
-interface LastOwnedInteraction {
-  connection_generation: number // connection_generation（上次确认所有权时的设备连接代次）。
-  executor_generation: number // executor_generation（上次确认所有权时的设备执行器代次）。
-  interaction_generation: number // interaction_generation（上次确认所有权时的语音占用代次）。
-}
-
-interface RemoteDeviceOwnership {
-  state: 'owned' | 'taken_over' // state（当前租约是否仍属于本客户端）。
-  interaction_generation: number // interaction_generation（本次快照中的语音占用代次）。
-}
-
-const lastOwnedInteraction = new Map<string, LastOwnedInteraction>()
-
-function remoteClientScope(hostId: string, deviceId: string) { return `${hostId}\u0000${deviceId}` }
-
-async function suspendTakenOverClient(config: NonNullable<Awaited<ReturnType<typeof nativeDeviceApi.deviceConfigStatus>>['device_config']>) {
-  const current = (await nativeDeviceApi.deviceConfigStatus()).device_config
-  if (!current || current.mode !== 'remote' || current.device_id !== config.device_id
-    || current.paired_host?.host_id !== config.paired_host?.host_id) return
-  await nativeDeviceApi.saveDeviceConfig({ ...current, reconnect_suspended_reason: 'device_taken_over' })
-  lastOwnedInteraction.delete(remoteClientScope(config.paired_host?.host_id ?? '', config.device_id))
-  // stop（停止）在管道租约可能已过期时允许失败；先持久化暂停原因，避免清理错误触发自动重连。
-  await Promise.allSettled([
-    nativeDeviceApi.remoteMediaChannel('stop'),
-    nativeDeviceApi.remoteTaskChannel('stop'),
-  ])
-  await nativeDeviceApi.disconnectSshHost().catch(() => undefined)
-}
-
-async function remoteDeviceSnapshot(hostId: string, deviceId: string, taskConnectionGeneration: number,
-  taskExecutorGeneration: number, taskWasAlreadyRunning: boolean,
-  mediaInteractionGeneration?: number): Promise<RemoteDeviceOwnership> {
-  const snapshot = await nativeDeviceApi.remoteDeviceSnapshot()
-  const ownDevice = snapshot.devices.find(row => row.device_id === deviceId)
-  if (!ownDevice || !ownDevice.connected || !Number.isSafeInteger(ownDevice.connection_generation)
-    || ownDevice.connection_generation < 1 || !Number.isSafeInteger(ownDevice.executor_generation)
-    || ownDevice.executor_generation < 1 || !Number.isSafeInteger(snapshot.interaction_generation)
-    || snapshot.interaction_generation < 0) {
-    throw new Error('服务端设备租约快照尚未登记本客户端。')
-  }
-  const scope = remoteClientScope(hostId, deviceId)
-  const lastOwned = lastOwnedInteraction.get(scope)
-  const connectionGenerationReplaced = ownDevice.connection_generation > taskConnectionGeneration
-  const executorGenerationReplaced = ownDevice.executor_generation > taskExecutorGeneration
-  if (connectionGenerationReplaced || executorGenerationReplaced) {
-    return { state: 'taken_over', interaction_generation: snapshot.interaction_generation }
-  }
-  if (ownDevice.connection_generation !== taskConnectionGeneration
-    || ownDevice.executor_generation !== taskExecutorGeneration) {
-    throw new Error('服务端设备快照的连接或执行器代次落后于本地任务通道。')
-  }
-
-  const anotherRemoteDeviceActive = snapshot.active_device_id !== null
-    && snapshot.active_device_id !== 'local' && snapshot.active_device_id !== deviceId
-  const previousLeaseGeneration = mediaInteractionGeneration ?? lastOwned?.interaction_generation
-  const previouslyOwned = taskWasAlreadyRunning || lastOwned !== undefined
-  const anotherClientAdvancedLease = anotherRemoteDeviceActive && previousLeaseGeneration !== undefined
-    && snapshot.interaction_generation > previousLeaseGeneration
-  if (anotherRemoteDeviceActive && (previouslyOwned || anotherClientAdvancedLease)) {
-    return { state: 'taken_over', interaction_generation: snapshot.interaction_generation }
-  }
-
-  if (snapshot.active_device_id === deviceId) {
-    lastOwnedInteraction.set(scope, {
-      connection_generation: taskConnectionGeneration,
-      executor_generation: taskExecutorGeneration,
-      interaction_generation: snapshot.interaction_generation,
-    })
-  }
-  return { state: 'owned', interaction_generation: snapshot.interaction_generation }
-}
+// 上次待机申请对应的任务会话和语音租约代次。切换或重连后才重新申请。
+let standby: { host: string; connection: number | undefined; executor: number | undefined; interaction: number | undefined } | null = null
 
 /** ensureRemoteClientRuntime（准备已配对远端客户端）：单例化连接、任务与语音通道启动。 */
 export function ensureRemoteClientRuntime(): Promise<RemoteClientRuntimeState> {
@@ -94,85 +27,39 @@ export function ensureRemoteClientRuntime(): Promise<RemoteClientRuntimeState> {
     const host = await nativeDeviceApi.sshHostStatus()
     if (!host.connected) await nativeDeviceApi.connectSshHost()
 
-    const manager = await nativeDeviceApi.remoteManagementRequest('management.status', {})
-    if (manager.status !== 200 || !manager.body || typeof manager.body !== 'object'
-      || !matchesRemoteManagementEnvelope(manager, config.paired_host.host_id, 'management.status')) {
-      throw new Error(typeof manager.body?.detail === 'string' ? manager.body.detail : '服务端原生管理服务尚未就绪。')
-    }
-    const coreState = manager.body.core_state
-    if (coreState !== 'ready') {
-      return { state: 'management_only', core_state: coreState === 'starting' ? 'starting' : 'unavailable' } as const
-    }
-
-    const taskStatus = await nativeDeviceApi.remoteTaskChannel('status')
-    const taskWasAlreadyRunning = taskStatus.state === 'running'
-    const task = taskStatus.state === 'running'
-      ? taskStatus
-      : await nativeDeviceApi.remoteTaskChannel('start')
-    if (task.state !== 'running') throw new Error(task.error || '远程服务端任务通道尚未就绪。')
-    if (task.device_id !== config.device_id) {
-      throw new Error('远程服务端任务通道返回了不匹配的设备编号。')
-    }
-    const taskConnectionGeneration = task.connection_generation
-    const taskExecutorGeneration = task.executor_generation
-    if (typeof taskConnectionGeneration !== 'number' || !Number.isSafeInteger(taskConnectionGeneration)
-      || taskConnectionGeneration < 1 || typeof taskExecutorGeneration !== 'number'
-      || !Number.isSafeInteger(taskExecutorGeneration) || taskExecutorGeneration < 1) {
-      throw new Error('远程服务端任务通道没有返回有效连接或执行器代次。')
-    }
-
-    // 已运行客户端再次恢复时，若服务端已将租约授予其他设备，或连接/执行器代次已被替换，
-    // 先持久暂停自动重连，避免下一次媒体启动把租约抢回来。首次连接仍按最新就绪客户端规则取得租约。
-    const taskOwner = await remoteDeviceSnapshot(
-      config.paired_host.host_id, config.device_id, taskConnectionGeneration,
-      taskExecutorGeneration, taskWasAlreadyRunning,
-    )
-    if (taskOwner.state === 'taken_over') {
-      await suspendTakenOverClient(config)
-      return { state: 'waiting', reason: 'reconnect_suspended' } as const
-    }
-
-    const mediaStatus = await nativeDeviceApi.remoteMediaChannel('status')
-    const media = mediaStatus.state === 'running'
-      ? mediaStatus
-      : await nativeDeviceApi.remoteMediaChannel('start')
-    if (media.state !== 'running') throw new Error(media.error || '远程服务端语音通道尚未就绪。')
-    const mediaGenerations = media as typeof media & {
-      connection_generation?: number // connection_generation（媒体回执声明的设备连接代次）。
-      executor_generation?: number // executor_generation（媒体回执声明的设备执行器代次）。
-    }
-    const mediaConnectionGeneration = mediaGenerations.connection_generation
-    const mediaExecutorGeneration = mediaGenerations.executor_generation
-    const mediaInteractionGeneration = media.interaction_generation
-    if (media.device_id !== config.device_id || mediaConnectionGeneration !== undefined
-      && (typeof mediaConnectionGeneration !== 'number' || !Number.isSafeInteger(mediaConnectionGeneration)
-        || mediaConnectionGeneration !== taskConnectionGeneration)
-      || mediaExecutorGeneration !== undefined && (typeof mediaExecutorGeneration !== 'number'
-        || !Number.isSafeInteger(mediaExecutorGeneration) || mediaExecutorGeneration !== taskExecutorGeneration)
-      || typeof mediaInteractionGeneration !== 'number'
-      || !Number.isSafeInteger(mediaInteractionGeneration) || mediaInteractionGeneration < 1) {
-      throw new Error('远程服务端语音通道返回了不匹配的设备或租约代次。')
-    }
-    const mediaOwner = await remoteDeviceSnapshot(
-      config.paired_host.host_id, config.device_id, taskConnectionGeneration,
-      taskExecutorGeneration, taskWasAlreadyRunning, mediaInteractionGeneration,
-    )
-    if (mediaOwner.state === 'taken_over') {
-      await suspendTakenOverClient(config)
-      return { state: 'waiting', reason: 'reconnect_suspended' } as const
-    }
-    // start（启动）会以最新快照准备租约；代次多跳表示检查后另一个设备先接管，再被本次启动抢回。
-    if (mediaStatus.state !== 'running') {
-      const expectedInteractionGeneration = taskOwner.interaction_generation + 1
-      if (mediaInteractionGeneration > expectedInteractionGeneration) {
-        await suspendTakenOverClient(config)
-        return { state: 'waiting', reason: 'reconnect_suspended' } as const
+    let task = await nativeDeviceApi.remoteTaskChannel('status')
+    if (task.state !== 'running') {
+      const manager = await nativeDeviceApi.remoteManagementRequest('management.status', {})
+      if (manager.status !== 200 || !matchesRemoteManagementEnvelope(manager, config.paired_host.host_id, 'management.status')) {
+        throw new Error(typeof manager.body?.detail === 'string' ? manager.body.detail : '服务端原生管理服务尚未就绪。')
       }
-      if (!Number.isSafeInteger(expectedInteractionGeneration)
-        || mediaInteractionGeneration !== expectedInteractionGeneration) {
-        throw new Error('远程服务端语音租约代次与启动前快照不连续。')
+      const core = manager.body.core_state
+      if (core !== 'ready') {
+        return { state: 'management_only', core_state: core === 'starting' ? 'starting' : 'unavailable' } as const
       }
+      task = await nativeDeviceApi.remoteTaskChannel('start')
     }
+    if (task.state !== 'running' || task.device_id !== config.device_id) {
+      throw new Error(task.error || '远程服务端任务通道尚未就绪。')
+    }
+
+    let media = await nativeDeviceApi.remoteMediaChannel('status')
+    const snapshot = deviceState.value?.self_device_id === config.device_id ? deviceState.value : null
+    const scope = {
+      host: config.paired_host.host_id, connection: task.connection_generation,
+      executor: task.executor_generation, interaction: snapshot?.interaction_generation,
+    }
+    if (media.state !== 'running') {
+      if (standby?.host === scope.host && standby.connection === scope.connection
+          && standby.executor === scope.executor && standby.interaction === scope.interaction) {
+        media = { state: 'standby', fields: { state: '等待服务端选择本设备' } }
+      } else {
+        media = await nativeDeviceApi.remoteMediaChannel('start')
+      }
+      if (media.state === 'standby') standby = scope
+      else if (media.state !== 'running') throw new Error(media.error || '远程服务端语音通道尚未就绪。')
+    }
+    if (media.state === 'running') standby = null
     return { state: 'ready', core_state: 'ready', task, media } as const
   })().finally(() => { startupInFlight = null })
   return startupInFlight
@@ -207,7 +94,12 @@ export function startRemoteClientRuntimeSupervisor(): () => void {
       schedule(delay)
     }
   }
+  const unsubscribe = watch(() => deviceState.value?.pending_device_id, deviceId => {
+    if (deviceId && deviceId === deviceState.value?.self_device_id) schedule(0)
+  })
   const stop = () => {
+    unsubscribe()
+    standby = null
     if (stopped) return
     stopped = true
     if (timer !== null) clearTimeout(timer)

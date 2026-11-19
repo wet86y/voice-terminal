@@ -5,17 +5,20 @@ import asyncio
 import json
 import struct
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from voice_terminal.devices.media_protocol import MediaProtocolError
 from voice_terminal.devices.opus_codec import OpusDecoder, OpusEncoder, find_opus_library
 from voice_terminal.devices.remote_playback import (
+    MAX_DEVICE_PLAYBACK_BUFFER_MS,
     PlaybackMediaFrame,
     RemotePlaybackOutbox,
     decode_playback_frame,
     encode_playback_frame,
 )
+from voice_terminal.devices.registry import InteractionLease
 from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.devices.contracts import PlaybackOutcomeUnknown
 
@@ -39,6 +42,96 @@ def _frame(**overrides) -> PlaybackMediaFrame:
     }
     values.update(overrides)
     return PlaybackMediaFrame(**values)
+
+
+def test_device_acceptance_does_not_free_playback_buffer_credit() -> None:
+    async def scenario() -> None:
+        outbox = RemotePlaybackOutbox(
+            device_id="device-a", core_session_id="core-a", connection_generation=2,
+            executor_generation=3, interaction_generation=4, stream_id="media-a",
+        )
+        await outbox.enqueue("speech-a", 16_000, bytes(32_000))
+        count = MAX_DEVICE_PLAYBACK_BUFFER_MS // 20
+        for index in range(count):
+            frame = await outbox.next_frame()
+            assert frame.sequence == index
+            assert outbox.acknowledge(index)
+        incoming = asyncio.create_task(outbox.next_frame())
+        await asyncio.sleep(0)
+        assert not incoming.done()
+        assert outbox.record_buffer(count, MAX_DEVICE_PLAYBACK_BUFFER_MS)
+        await asyncio.sleep(0)
+        assert not incoming.done()
+        assert outbox.record_buffer(count, MAX_DEVICE_PLAYBACK_BUFFER_MS - 20)
+        frame = await asyncio.wait_for(incoming, 0.5)
+        assert frame.sequence == count
+        assert outbox.acknowledge(frame.sequence, cancelled=True, reason="output_unavailable")
+        assert outbox.failure("speech-a")
+        assert outbox.record_buffer(count + 1, 0)
+        await outbox.enqueue("speech-b", 16_000, bytes(640))
+        frame = await asyncio.wait_for(outbox.next_frame(), 0.5)
+        assert frame.playback_key == "speech-b"
+        assert frame.sequence == count + 1
+        await outbox.close()
+
+    asyncio.run(scenario())
+
+
+def test_remote_preview_slices_at_frame_aligned_chunk_boundaries() -> None:
+    runtime = object.__new__(SessionRuntime)
+    runtime._remote_playback_bindings = {}
+    runtime.device_registry = SimpleNamespace(active=SimpleNamespace(device_id="device-a"))
+    runtime.enqueue_remote_playback = AsyncMock()
+    pcm = b"\x01\x02" * 48_000
+    assert asyncio.run(runtime._enqueue_player_audio("preview", 16_000, pcm))
+    calls = runtime.enqueue_remote_playback.await_args_list
+    assert [len(call.args[2]) for call in calls] == [64_000, 32_000]
+    assert b"".join(call.args[2] for call in calls) == pcm
+    assert all(call.kwargs == {"delivery_device_id": "device-a"} for call in calls)
+
+
+def test_opus_finish_keeps_receiving_playback_progress_while_waiting_for_credit() -> None:
+    library = find_opus_library()
+    if library is None:
+        pytest.skip("固定 libopus 运行库未准备")
+    with OpusEncoder(48_000, 64_000, library_path=library) as encoder:
+        pre_skip = encoder.lookahead_samples
+
+    async def scenario() -> None:
+        lease = InteractionLease("device-a", interaction_generation=4, connection_generation=2, executor_generation=3)
+        key = "speech-opus"
+        outbox = RemotePlaybackOutbox(
+            device_id=lease.device_id, core_session_id="core-a", connection_generation=2,
+            executor_generation=3, interaction_generation=4, stream_id="media-a",
+            downlink_codec="opus", downlink_encoder_pre_skip_samples=pre_skip, max_frames=1,
+        )
+        runtime = object.__new__(SessionRuntime)
+        runtime._remote_playback_bindings = {key: (lease.device_id, outbox)}
+        runtime._remote_playback_outboxes = {lease.device_id: outbox}
+        runtime._remote_playback_progress = {}
+        runtime._remote_playback_finished = set()
+        runtime._remote_playback_lock = asyncio.Lock()
+        runtime.device_registry = SimpleNamespace(accepts=lambda candidate: candidate == lease)
+        runtime.player = None
+
+        enqueue = asyncio.create_task(outbox.enqueue(key, 48_000, bytes(3840)))
+        first = await outbox.next_frame()
+        assert outbox.acknowledge(first.sequence)
+        second = await outbox.next_frame()
+        await enqueue
+        finish = asyncio.create_task(runtime.finish_remote_playback(key))
+        await asyncio.sleep(0)
+        assert not finish.done()
+        assert await asyncio.wait_for(runtime.record_remote_playback_progress(lease, "media-a", {
+            "playback_key": key, "receipt_sequence": 1, "sequence": first.sequence,
+            "enqueued_ms": 13, "played_ms": 4, "buffered_ms": 9, "output_estimated_ms": 4,
+            "device_time_us": 100_000, "precision": "device_time", "started": True,
+        }), 0.5)
+        assert outbox.acknowledge(second.sequence)
+        assert await asyncio.wait_for(finish, 0.5)
+        await outbox.close()
+
+    asyncio.run(scenario())
 
 
 def test_playback_media_frame_round_trip_preserves_fixed_delivery_and_pcm() -> None:
@@ -147,7 +240,13 @@ def test_opus_downlink_resamples_and_maps_encoder_delay_and_tail_samples() -> No
         expected_samples = stream.total_samples
         assert expected_samples == 48_000
 
-        frames = [await outbox.next_frame() for _ in range(outbox._sequence)]
+        assert outbox.enqueued_ms_for_key("speech-opus") == 0
+        frames = []
+        for _ in range(outbox.pending_frames()):
+            frame = await outbox.next_frame()
+            assert frame is not None and outbox.acknowledge(frame.sequence)
+            assert outbox.record_buffer(frame.sequence + 1, 0)
+            frames.append(frame)
         assert frames and all(frame is not None for frame in frames)
         valid_samples = 0
         next_sample = 0
@@ -168,9 +267,6 @@ def test_opus_downlink_resamples_and_maps_encoder_delay_and_tail_samples() -> No
                     assert frame.sample_count == 960 - pre_skip
         assert valid_samples == expected_samples
         assert decoded_sample_count - pre_skip >= valid_samples
-        assert outbox.enqueued_ms_for_key("speech-opus") == 0
-        for frame in frames:
-            assert frame is not None and outbox.acknowledge(frame.sequence)
         assert outbox.enqueued_ms_for_key("speech-opus") == 1_000
         await outbox.close()
 

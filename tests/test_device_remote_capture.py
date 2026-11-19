@@ -81,7 +81,24 @@ def test_remote_capture_refuses_unstarted_stopped_and_old_lease_frames():
         asyncio.run(capture.start())
 
 
-def test_remote_capture_rejects_duplicate_frame_and_clears_stale_preroll():
+def test_capture_recovers_gaps_and_drops_late_audio_without_ending_media():
+    capture, stream = _capture()
+    asyncio.run(capture.start())
+    assert capture.recording_phase == "starting"
+    assert capture.accept_frame(_frame(0)) is not None
+    assert capture.recording_phase == "recording"
+    assert capture.accept_frame(_frame(0)) is None
+    assert capture.accept_frame(replace(_frame(1), device_time_us=0)) is None
+    recovered = capture.accept_frame(_frame(3))
+    assert recovered.discontinuity_before and recovered.start_sample == 960
+    assert capture.pending_frame_count() == 1  # 整理缺口前积压帧和预录，不拼进下一段。
+    assert capture.preroll(80) == _frame(3).payload
+    assert capture.accept_frame(_frame(2)) is None
+    assert not capture.accept_frame(_frame(4)).discontinuity_before
+    assert capture.running and not stream.closed
+
+
+def test_remote_capture_drops_duplicate_frame_without_duplicating_preroll():
     observed = []
     capture, stream = _capture(on_audio_frame=observed.append)
     asyncio.run(capture.start())
@@ -89,12 +106,10 @@ def test_remote_capture_rejects_duplicate_frame_and_clears_stale_preroll():
     capture.accept_frame(frame)
     assert capture.preroll(20) == frame.payload
 
-    with pytest.raises(MediaProtocolError, match="帧序号不连续"):
-        capture.accept_frame(frame)
-
-    assert capture.running is False and stream.closed is True
-    assert capture.pending_frame_count() == 0
-    assert capture.preroll(20) == b""
+    assert capture.accept_frame(frame) is None
+    assert capture.running and not stream.closed
+    assert capture.pending_frame_count() == 1
+    assert capture.preroll(20) == frame.payload
     assert observed == [frame.payload]
     assert capture.diagnostics["blocks"] == 1
 

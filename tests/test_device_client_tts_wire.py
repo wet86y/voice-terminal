@@ -30,7 +30,7 @@ def test_authorization_control_v2_round_trips_with_field_explanations() -> None:
     encoded = json.dumps(control, ensure_ascii=True, separators=(",", ":"))
     decoded = parse_tts_control(encoded)
     assert decoded == control
-    assert decoded["protocol_version"] == 2
+    assert decoded["protocol_version"] == 4
     assert decoded["fields"]["credential"] == "服务端临时授权的供应商密钥"
 
 

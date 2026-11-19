@@ -151,6 +151,7 @@ fn remote_device_task_status(
 struct RemoteDeviceMediaChannel {
     stop: Arc<AtomicBool>,       // stop（停止媒体发送与接收的信号）。
     running: Arc<AtomicBool>,    // running（媒体通道是否仍在运行）。
+    capture_active: Arc<AtomicBool>, // capture_active（远端物理麦克风是否实际启动）。
     device_id: String,           // device_id（当前选为语音设备的本机编号）。
     stream_id: String,           // stream_id（当前连续音频流编号）。
     connection_generation: u64,  // connection_generation（主机登记的设备连接代次）。
@@ -169,7 +170,7 @@ struct RemoteVoiceForwarder {
 
 #[cfg(feature = "ssh-device")]
 enum MediaWriteCommand {
-    Binary(Vec<u8>), // binary（有界设备音频帧）。
+    Binary(Arc<Vec<u8>>), // binary（有界设备音频帧）。
     Text(String),    // text（有界媒体确认控制消息）。
     Pong(Vec<u8>),   // pong（回应主机 WebSocket 保活探测）。
     Close,           // close（关闭媒体 WebSocket）。
@@ -191,6 +192,20 @@ struct PlaybackSnapshotBaseline {
 }
 
 #[cfg(feature = "ssh-device")]
+impl PlaybackSnapshotBaseline {
+    fn measure(self, current: PlaybackSnapshotView, accepted_ms: u64) -> (u64, u64, bool) {
+        let submitted = current.played_ms.saturating_sub(self.played_ms);
+        let output = current.output_estimated_ms.saturating_sub(self.output_estimated_ms);
+        let drained = self.isolated && current.buffered_ms == 0
+            && output >= current.enqueued_ms.saturating_sub(self.enqueued_ms);
+        if drained {
+            return (accepted_ms, accepted_ms, current.started);
+        }
+        (submitted.min(accepted_ms), output.min(submitted).min(accepted_ms), output > 0)
+    }
+}
+
+#[cfg(feature = "ssh-device")]
 #[derive(Clone, Copy)]
 struct PlaybackSnapshotView {
     enqueued_ms: u64,         // enqueued_ms（设备累计接受时长）。
@@ -206,6 +221,7 @@ struct PlaybackSnapshotView {
 struct ClientTtsPlaybackLedger {
     sample_rate: u32,                   // sample_rate（固定播放事务的 PCM 采样率）。
     accepted_samples: u64,              // accepted_samples（该事务已加入原生播放器的累计样本数）。
+    played_samples: u64,                // played_samples（该事务已经确认输出的累计样本数）。
     baseline: PlaybackSnapshotBaseline, // baseline（首次入队前采集的设备时钟基线）。
 }
 
@@ -331,13 +347,14 @@ impl RemotePlaybackControlState {
             return Err("播放键采样率无效".into());
         }
         let enqueued_ms = sample_count.saturating_mul(1_000) / u64::from(sample_rate);
+        let (played_ms, output_estimated_ms, started) = baseline.measure(current, enqueued_ms);
         Ok(serde_json::json!({
             "playback_key":playback_key,
             "enqueued_ms":enqueued_ms,
-            "played_ms":current.played_ms.saturating_sub(baseline.played_ms),
+            "played_ms":played_ms,
             "buffered_ms":current.buffered_ms,
-            "output_estimated_ms":current.output_estimated_ms.saturating_sub(baseline.output_estimated_ms),
-            "started":baseline.isolated && !self.control_uncertain && current.started,
+            "output_estimated_ms":output_estimated_ms,
+            "started":baseline.isolated && !self.control_uncertain && started,
             "device_time_us":current.device_time_us,
             "precision":if baseline.isolated && !self.control_uncertain{"device_time"}else{"unknown"},
         }))
@@ -531,6 +548,7 @@ struct Desktop {
     remote_media_channel: Mutex<Option<RemoteDeviceMediaChannel>>, // remote_media_channel（当前远端语音媒体连接）。
     #[cfg(feature = "ssh-device")]
     remote_media_channel_starting: AtomicBool, // remote_media_channel_starting（防止并行切换语音媒体流）。
+    remote_media_stop_revision: AtomicU64, // remote_media_stop_revision（拒绝在停止后发布迟到的媒体连接）。
     #[cfg(feature = "ssh-device")]
     remote_media_channel_error: Mutex<Option<String>>, // remote_media_channel_error（最近一次音频通道错误）。
     #[cfg(feature = "ssh-device")]
@@ -3324,7 +3342,6 @@ fn remote_business_operation_allowed(operation: &str) -> bool {
         "model.delete",
         "model.hide",
         "model.restore",
-        "voice.command",
         "hotwords.import",
         "hotwords.preview",
         "tts.minimax.voice_name",
@@ -5754,7 +5771,9 @@ fn encode_worker_media_packet(
         sample_count: 320,
         device_time_us,
         audio_codec,
-        discontinuity_before: false,
+        discontinuity_before: frame.get("discontinuity_before")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or("设备采集帧缺少间断标记。")?,
         audio_processing,
     };
     voice_desktop_common::device_protocol::encode_frame(&header, &payload)
@@ -5776,13 +5795,6 @@ fn decode_worker_capture_pcm(
         .get("device_time_us")
         .and_then(serde_json::Value::as_u64)
         .ok_or("设备采集帧缺少 QPC 时钟")?;
-    if frame
-        .get("discontinuity_before")
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
-    {
-        return Err("设备采集出现缺口，必须结束当前媒体流并重新同步。".into());
-    }
     let raw_pcm = frame
         .get("pcm_le_bytes")
         .and_then(serde_json::Value::as_array)
@@ -6002,7 +6014,7 @@ async fn ensure_client_tts_playback_ledger(
         enqueued_ms: snapshot.enqueued_ms,
         played_ms: snapshot.played_ms,
         output_estimated_ms: snapshot.output_estimated_ms,
-        isolated: snapshot.buffered_ms == 0 && snapshot.enqueued_ms == snapshot.played_ms,
+        isolated: snapshot.buffered_ms == 0,
     };
     let mut rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
     if rows.len() >= MAX_REMOTE_PLAYBACK_KEYS {
@@ -6012,6 +6024,7 @@ async fn ensure_client_tts_playback_ledger(
         .or_insert(ClientTtsPlaybackLedger {
             sample_rate,
             accepted_samples: 0,
+            played_samples: 0,
             baseline,
         });
     Ok(())
@@ -6028,29 +6041,34 @@ async fn client_tts_device_progress(
         .await?;
     let value = device_worker_action(state, |worker| worker.playback_snapshot()).await?;
     let snapshot = decode_client_tts_playback_snapshot(&value)?;
-    let entry = ledger
+    let mut rows = ledger
         .lock()
-        .map_err(|_| "客户端直放播放台账不可用。")?
-        .get(&playback_key)
-        .copied()
+        .map_err(|_| "客户端直放播放台账不可用。")?;
+    let entry = rows.get_mut(&playback_key)
         .ok_or("客户端直放播放键已经清除。")?;
+    if entry.accepted_samples > 0 && value.get("playing").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err("客户端直放的原输出端点已关闭。".into());
+    }
     let output_ms = snapshot
         .output_estimated_ms
         .saturating_sub(entry.baseline.output_estimated_ms);
-    let played_samples = ((u128::from(output_ms) * u128::from(entry.sample_rate)) / 1_000)
-        .min(u128::from(entry.accepted_samples)) as u64;
+    let output_complete = entry.accepted_samples > 0
+        && entry.baseline.isolated
+        && snapshot.started
+        && snapshot.device_time_us > 0
+        && snapshot.buffered_ms == 0
+        && output_ms >= snapshot.enqueued_ms.saturating_sub(entry.baseline.enqueued_ms);
+    let played_samples = if output_complete {
+        entry.accepted_samples
+    } else {
+        ((u128::from(output_ms) * u128::from(entry.sample_rate)) / 1_000)
+            .min(u128::from(entry.accepted_samples)) as u64
+    }.max(entry.played_samples);
+    entry.played_samples = played_samples;
     let buffered_samples =
         ((u128::from(snapshot.buffered_ms) * u128::from(entry.sample_rate)) / 1_000).min(
             u128::from(entry.accepted_samples.saturating_sub(played_samples)),
         ) as u64;
-    let device_clock_advanced = snapshot.device_time_us > 0
-        && snapshot.output_estimated_ms > entry.baseline.output_estimated_ms;
-    let output_complete = entry.accepted_samples > 0
-        && played_samples >= entry.accepted_samples
-        && buffered_samples == 0
-        && entry.baseline.isolated
-        && snapshot.started
-        && device_clock_advanced;
     let progress = voice_desktop_common::device_protocol::ClientTtsPlaybackProgress {
         playback_key,
         accepted_samples: entry.accepted_samples,
@@ -6107,13 +6125,18 @@ fn client_tts_playback_callbacks(
                     sample_rate,
                 )
                 .await?;
-                if !started.swap(true, Ordering::AcqRel) {
+                let first_audio = ledger.lock()
+                    .map_err(|_| "客户端直放播放台账不可用。")?
+                    .get(&playback_key)
+                    .is_some_and(|entry| entry.accepted_samples == 0);
+                if first_audio || !started.load(Ordering::Acquire) {
                     if let Err(error) =
                         device_worker_action(state.clone(), |worker| worker.playback_start()).await
                     {
                         started.store(false, Ordering::Release);
                         return Err(error);
                     }
+                    started.store(true, Ordering::Release);
                 }
                 let sample_count =
                     u64::try_from(pcm.len() / 2).map_err(|_| "客户端直放样本数溢出。")?;
@@ -6187,46 +6210,6 @@ fn client_tts_playback_callbacks(
 }
 
 #[cfg(feature = "ssh-device")]
-async fn remote_playback_progress_message(
-    state: Arc<Desktop>,
-    device_id: &str,
-    core_session_id: &str,
-    stream_id: &str,
-    connection_generation: u64,
-    executor_generation: u64,
-    interaction_generation: u64,
-    playback_key: &str,
-    sequence: u64,
-    receipt_sequence: u64,
-    baseline: PlaybackSnapshotBaseline,
-) -> Option<String> {
-    let playback = state.remote_playback_control.lock().await;
-    if playback.stopped_keys.contains(playback_key) {
-        return None;
-    }
-    let value = device_worker_action(state.clone(), |worker| worker.playback_snapshot())
-        .await
-        .ok()?;
-    let snapshot = decode_worker_playback_snapshot(&value).ok()?;
-    Some(
-        remote_playback_progress_value(
-            device_id,
-            core_session_id,
-            stream_id,
-            connection_generation,
-            executor_generation,
-            interaction_generation,
-            playback_key,
-            sequence,
-            receipt_sequence,
-            baseline,
-            snapshot,
-        )
-        .to_string(),
-    )
-}
-
-#[cfg(feature = "ssh-device")]
 fn remote_playback_progress_value(
     device_id: &str,
     core_session_id: &str,
@@ -6239,7 +6222,9 @@ fn remote_playback_progress_value(
     receipt_sequence: u64,
     baseline: PlaybackSnapshotBaseline,
     snapshot: PlaybackSnapshotView,
+    accepted_ms: u64,
 ) -> serde_json::Value {
+    let (played_ms, output_estimated_ms, started) = baseline.measure(snapshot, accepted_ms);
     serde_json::json!({
         "type":"playback.progress", "protocol_version":voice_desktop_common::device_protocol::MEDIA_PROTOCOL_VERSION,
         "device_id":device_id, "delivery_device_id":device_id,
@@ -6249,11 +6234,11 @@ fn remote_playback_progress_value(
         "interaction_generation":interaction_generation,
         "stream_id":stream_id, "playback_key":playback_key,
         "receipt_sequence":receipt_sequence, "sequence":sequence,
-        "enqueued_ms":snapshot.enqueued_ms.saturating_sub(baseline.enqueued_ms),
-        "played_ms":snapshot.played_ms.saturating_sub(baseline.played_ms),
+        "enqueued_ms":accepted_ms,
+        "played_ms":played_ms,
         "buffered_ms":snapshot.buffered_ms,
-        "output_estimated_ms":snapshot.output_estimated_ms.saturating_sub(baseline.output_estimated_ms),
-        "started":baseline.isolated && snapshot.started,
+        "output_estimated_ms":output_estimated_ms,
+        "started":baseline.isolated && started,
         "device_time_us":snapshot.device_time_us,
         "precision":if baseline.isolated{"device_time"}else{"unknown"},
         "fields":{"type":"控制消息类型","protocol_version":"设备媒体协议版本",
@@ -6354,8 +6339,7 @@ where
                 enqueued_ms: snapshot.enqueued_ms,
                 played_ms: snapshot.played_ms,
                 output_estimated_ms: snapshot.output_estimated_ms,
-                isolated: snapshot.buffered_ms == 0
-                    && snapshot.output_estimated_ms >= snapshot.enqueued_ms,
+                isolated: snapshot.buffered_ms == 0,
             })
             .unwrap_or(PlaybackSnapshotBaseline {
                 enqueued_ms: 0,
@@ -6387,11 +6371,10 @@ where
 enum RemotePlaybackFrameOutcome {
     Cancelled {
         message: String,
+        error: Option<String>,
     }, // message（播放键已停止后的丢弃回执）。
     Accepted {
         message: String,      // message（帧已加入播放队列的接纳回执）。
-        playback_key: String, // playback_key（固定播放事务编号）。
-        sequence: u64,        // sequence（本次媒体通道的播放帧序号）。
     },
 }
 
@@ -6418,7 +6401,17 @@ fn cancel_remote_playback_frame(
             "reason":"设备拒收该帧的稳定原因编号"}
     })
     .to_string();
-    RemotePlaybackFrameOutcome::Cancelled { message }
+    RemotePlaybackFrameOutcome::Cancelled { message, error: None }
+}
+
+#[cfg(feature = "ssh-device")]
+fn fail_remote_playback(control: &mut RemotePlaybackControlState, key: &str) {
+    remember_remote_stopped_key(control, key);
+    control.samples.remove(key);
+    control.baselines.remove(key);
+    if control.active_key.as_deref() == Some(key) {
+        control.active_key = None;
+    }
 }
 
 #[cfg(feature = "ssh-device")]
@@ -6489,7 +6482,7 @@ where
         playback_baselines,
     );
     if playback_control.control_uncertain {
-        return Err("播放控制结果未知，设备输出已隔离；不能继续接纳 PCM。".into());
+        return Ok(cancel_remote_playback_frame(&header, "output_unavailable", next_playback_sequence));
     }
     let pcm = match header.audio_codec {
         voice_desktop_common::device_protocol::AudioCodec::Pcm => encoded_payload,
@@ -6592,7 +6585,7 @@ where
         .checked_add(u64::from(header.sample_count))
         .ok_or("主机下行播放帧采样位置溢出")?;
 
-    enqueue_remote_playback_to_worker(
+    let enqueue_result = enqueue_remote_playback_to_worker(
         playback_control,
         playback_baselines,
         playback_started,
@@ -6603,7 +6596,15 @@ where
         read_snapshot,
         enqueue,
     )
-    .await?;
+    .await;
+    if let Err(error) = enqueue_result {
+        fail_remote_playback(playback_control, &header.playback_key);
+        let mut receipt = cancel_remote_playback_frame(&header, "output_unavailable", next_playback_sequence);
+        if let RemotePlaybackFrameOutcome::Cancelled { error: reason, .. } = &mut receipt {
+            *reason = Some(error);
+        }
+        return Ok(receipt);
+    }
     playback_sample_positions.insert(header.playback_key.clone(), next_sample);
     playback_latest_sequences.insert(header.playback_key.clone(), header.sequence);
     if let Some(replacement) = playback_control
@@ -6634,8 +6635,6 @@ where
     .to_string();
     Ok(RemotePlaybackFrameOutcome::Accepted {
         message,
-        playback_key: header.playback_key,
-        sequence: header.sequence,
     })
 }
 
@@ -6651,6 +6650,7 @@ async fn run_remote_media_channel(
     state: Arc<Desktop>,
     channel: voice_desktop_common::ssh_device::SshMediaChannel,
     stop: Arc<AtomicBool>,
+    physical_capture: Arc<AtomicBool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     use voice_desktop_common::ssh_device::{SshMediaMessage, SshMediaWriter};
@@ -6703,6 +6703,7 @@ async fn run_remote_media_channel(
         "interaction_generation":interaction_generation,"state":"ready"}));
     let (mut reader, writer, guard) = channel.into_parts();
     let (write_sender, mut write_receiver) = tokio::sync::mpsc::channel::<MediaWriteCommand>(6);
+    let (audio_sender, mut audio_receiver) = tokio::sync::watch::channel::<Option<Arc<Vec<u8>>>>(None);
     let (read_sender, mut read_receiver) = tokio::sync::mpsc::channel::<MediaReadEvent>(16);
     let (writer_error_sender, mut writer_error_receiver) = tokio::sync::mpsc::channel::<String>(1);
     let reader_writer = write_sender.clone();
@@ -6747,9 +6748,25 @@ async fn run_remote_media_channel(
 
     let writer_log_state = state.clone();
     let mut writer: SshMediaWriter = writer;
-    let writer_task = tauri::async_runtime::spawn(async move {
-        while let Some(command) = write_receiver.recv().await {
-            let result = match command {
+    let mut writer_task = tauri::async_runtime::spawn(async move {
+        loop {
+            let command = tokio::select! {
+                biased;
+                command = write_receiver.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+                changed = audio_receiver.changed() => {
+                    if changed.is_err() { break; }
+                    match audio_receiver.borrow_and_update().clone() {
+                        Some(bytes) => MediaWriteCommand::Binary(bytes),
+                        None => continue,
+                    }
+                }
+            };
+            let closing = matches!(&command, MediaWriteCommand::Close);
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                match command {
                 MediaWriteCommand::Binary(bytes) => writer.send_binary(&bytes).await,
                 MediaWriteCommand::Text(value) => {
                     let result = writer.send_text(&value).await;
@@ -6765,18 +6782,14 @@ async fn run_remote_media_channel(
                     result
                 },
                 MediaWriteCommand::Pong(payload) => writer.send_pong(&payload).await,
-                MediaWriteCommand::Close => {
-                    let result = writer.send_close().await;
-                    if let Err(error) = result {
-                        let _ = writer_error_sender.send(error).await;
-                    }
-                    break;
+                    MediaWriteCommand::Close => writer.send_close().await,
                 }
-            };
+            }).await.unwrap_or_else(|_| Err("语音媒体写入超时。".into()));
             if let Err(error) = result {
                 let _ = writer_error_sender.send(error).await;
                 break;
             }
+            if closing { break; }
         }
     });
 
@@ -6788,6 +6801,7 @@ async fn run_remote_media_channel(
     let mut playback_baselines: HashMap<String, PlaybackSnapshotBaseline> = HashMap::new();
     let mut playback_receipt_sequence = 1_u64;
     let mut last_playback_snapshot_at = Instant::now(); // last_playback_snapshot_at（最近设备时钟采样时刻）。
+    let mut last_buffer_report = (0_u64, 0_u64, false); // last_buffer_report（上次上报的接收边界、设备储备和暂停状态）。
     let tts_identity = client_tts_relay::MediaIdentity {
         device_id: device_id.clone(),
         core_session_id: core_session_id.clone(),
@@ -6797,7 +6811,7 @@ async fn run_remote_media_channel(
         stream_id: stream_id.clone(),
     };
     let mut client_tts_authorizations = client_tts_relay::ClientTtsAuthorizationStore::default();
-    let mut client_tts_seen = HashSet::new(); // client_tts_seen（去重已接纳的客户端合成请求编号）。
+    let mut revoked_client_tts_keys = HashSet::new(); // revoked_client_tts_keys（撤销后等待当前分段退出的播放键）。
     let client_tts_playback_ledger =
         Arc::new(Mutex::new(HashMap::<String, ClientTtsPlaybackLedger>::new()));
     let client_tts_playback_started = Arc::new(AtomicBool::new(false));
@@ -6820,19 +6834,23 @@ async fn run_remote_media_channel(
     let (client_tts_finished_sender, mut client_tts_finished_receiver) =
         tokio::sync::mpsc::unbounded_channel::<String>();
     let mut outcome = Ok(());
-    if capture_active {
-        if let Err(error) =
-            device_worker_action(state.clone(), |worker| worker.capture_start().map(|_| ())).await
-        {
-            outcome = Err(error);
-        } else {
-            capture_started = true;
-        }
-    }
+    let mut capture_retry_at = Instant::now();
+    let mut capture_failure = None::<String>;
+    let mut capture_sequence_base = 0_u64;
+    let mut capture_sample_base = 0_u64;
+    let mut next_capture_sequence = 0_u64;
+    let mut next_capture_sample = 0_u64;
+    let mut capture_gap_pending = false;
 
     while outcome.is_ok() && !stop.load(Ordering::Acquire) {
         while let Ok(request_id) = client_tts_finished_receiver.try_recv() {
-            client_tts_cancellations.remove(&request_id);
+            if let Some((_, key, _, _)) = client_tts_cancellations.remove(&request_id) {
+                if revoked_client_tts_keys.remove(&key) {
+                    if let Ok(mut rows) = client_tts_playback_ledger.lock() {
+                        rows.remove(&key);
+                    }
+                }
+            }
             if let Some(task) = client_tts_tasks.remove(&request_id) {
                 let _ = task.await;
             }
@@ -6915,7 +6933,7 @@ async fn run_remote_media_channel(
                     };
                     drop(playback_control);
                     match frame_outcome {
-                        RemotePlaybackFrameOutcome::Cancelled { message } => {
+                        RemotePlaybackFrameOutcome::Cancelled { message, error } => {
                             if write_sender
                                 .send(MediaWriteCommand::Text(message))
                                 .await
@@ -6924,12 +6942,18 @@ async fn run_remote_media_channel(
                                 outcome = Err("无法提交设备播放丢弃回执。".into());
                                 break;
                             }
+                            if let Some(error) = error {
+                                let _ = device_worker_action(state.clone(), |worker| worker.playback_stop()).await;
+                                playback_started = false;
+                                client_event(&state, "client.playback_failed", serde_json::json!({
+                                    "device_id":device_id,"stream_id":stream_id,"reason":error,
+                                }));
+                            }
                             continue;
                         }
                         RemotePlaybackFrameOutcome::Accepted {
                             message,
-                            playback_key,
-                            sequence,
+                            ..
                         } => {
                             if write_sender
                                 .send(MediaWriteCommand::Text(message))
@@ -6938,39 +6962,6 @@ async fn run_remote_media_channel(
                             {
                                 outcome = Err("无法提交设备播放接纳回执。".into());
                                 break;
-                            }
-                            if sequence % 5 == 0 {
-                                if let Some(baseline) =
-                                    playback_baselines.get(&playback_key).copied()
-                                {
-                                    if let Some(progress) = remote_playback_progress_message(
-                                        state.clone(),
-                                        &device_id,
-                                        &core_session_id,
-                                        &stream_id,
-                                        connection_generation,
-                                        executor_generation,
-                                        interaction_generation,
-                                        &playback_key,
-                                        sequence,
-                                        playback_receipt_sequence,
-                                        baseline,
-                                    )
-                                    .await
-                                    {
-                                        if write_sender
-                                            .send(MediaWriteCommand::Text(progress))
-                                            .await
-                                            .is_err()
-                                        {
-                                            outcome = Err("无法提交设备播放时钟回执。".into());
-                                            break;
-                                        }
-                                        playback_receipt_sequence =
-                                            playback_receipt_sequence.saturating_add(1);
-                                        last_playback_snapshot_at = Instant::now();
-                                    }
-                                }
                             }
                         }
                     }
@@ -7022,46 +7013,30 @@ async fn run_remote_media_channel(
                             let input_changed = next_stream_id != capture_stream_id;
                             if desired != capture_active || input_changed {
                                 if capture_started && (!desired || input_changed) {
-                                    if let Err(error) = device_worker_action(state.clone(), |worker| worker.capture_stop()).await {
-                                        outcome = Err(error); break;
-                                    }
+                                    let _ = device_worker_action(state.clone(), |worker| worker.capture_stop()).await;
                                     capture_started = false;
+                                    physical_capture.store(false, Ordering::Release);
                                 }
-                                if desired {
+                                if input_changed {
                                     #[cfg(feature = "native-audio")]
-                                    if input_changed && uplink_codec == voice_desktop_common::device_protocol::AudioCodec::Opus {
+                                    if desired && uplink_codec == voice_desktop_common::device_protocol::AudioCodec::Opus {
                                         uplink_encoder = match OpusEncoderWorker::start(encoder_pre_skip_samples) {
                                             Ok(encoder) => Some(encoder),
                                             Err(error) => { outcome = Err(error); break; }
                                         };
                                     }
-                                    if let Err(error) =
-                                        device_worker_action(state.clone(), |worker| {
-                                            worker.capture_start().map(|_| ())
-                                        })
-                                        .await
-                                    {
-                                        outcome = Err(error);
-                                        break;
-                                    }
-                                    capture_started = true;
-                                } else if capture_started {
-                                    if let Err(error) =
-                                        device_worker_action(state.clone(), |worker| {
-                                            worker.capture_stop()
-                                        })
-                                        .await
-                                    {
-                                        outcome = Err(error);
-                                        break;
-                                    }
-                                    capture_started = false;
+                                    next_capture_sequence = 0;
+                                    next_capture_sample = 0;
+                                    capture_gap_pending = false;
                                 }
+                                audio_sender.send_replace(None);
+                                capture_retry_at = Instant::now();
+                                capture_failure = None;
                                 capture_active = desired;
                                 capture_stream_id = next_stream_id;
                                 client_event(&state, "client.capture_state", serde_json::json!({
                                     "device_id":device_id,"stream_id":stream_id,"capture_stream_id":capture_stream_id,
-                                    "state":if desired {"started"} else {"stopped"}}));
+                                    "state":if desired {"requested"} else {"stopped"}}));
                             }
                         }
                         Some("media.pong") => {}
@@ -7108,6 +7083,7 @@ async fn run_remote_media_channel(
                             match client_tts_authorizations.revoke(&authorization_id, &playback_key)
                             {
                                 Ok(Some(revoked_key)) => {
+                                    let mut active = false;
                                     for (active_authorization, active_key, _, cancellation) in
                                         client_tts_cancellations.values()
                                     {
@@ -7115,10 +7091,15 @@ async fn run_remote_media_channel(
                                             && active_key == &revoked_key
                                         {
                                             cancellation.request_cancel();
+                                            active = true;
                                         }
                                     }
-                                    let _ =
-                                        (client_tts_playback.stop_and_snapshot)(revoked_key).await;
+                                    if active {
+                                        let _ = (client_tts_playback.stop_and_snapshot)(revoked_key.clone()).await;
+                                        revoked_client_tts_keys.insert(revoked_key);
+                                    } else if let Ok(mut rows) = client_tts_playback_ledger.lock() {
+                                        rows.remove(&revoked_key);
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
@@ -7144,13 +7125,6 @@ async fn run_remote_media_channel(
                                 "device_id":device_id,"stream_id":stream_id,"playback_key":playback_key,
                                 "request_id":request_id,"state":"received"}));
                             let failure_request = parsed.clone();
-                            if client_tts_seen.len() >= client_tts_relay::MAX_SEEN_REQUESTS
-                                || !client_tts_seen.insert(request_id.clone())
-                            {
-                                outcome =
-                                    Err("客户端合成请求编号重复或超过本连接去重上限。".into());
-                                break;
-                            }
                             if client_tts_tasks.len() >= client_tts_relay::MAX_ACTIVE_REQUESTS {
                                 let _ = client_tts_relay::send_start_failure(
                                     &write_sender,
@@ -7242,8 +7216,16 @@ async fn run_remote_media_channel(
         if outcome.is_err() {
             break;
         }
-        if playback_started && last_playback_snapshot_at.elapsed() >= Duration::from_millis(100) {
-            let snapshots: Vec<(String, u64, PlaybackSnapshotBaseline)> = {
+        let stop_epoch = state.remote_playback_stop_epoch.load(Ordering::Acquire);
+        if stop_epoch != playback_stop_epoch {
+            playback_started = false;
+            playback_stop_epoch = stop_epoch;
+        }
+        if last_playback_snapshot_at.elapsed() >= Duration::from_millis(80)
+            && (next_playback_sequence != last_buffer_report.0
+                || last_buffer_report.1 > 0 || !playback_latest_sequences.is_empty())
+        {
+            let (buffered_ms, paused, progress, failed) = {
                 let mut control = state.remote_playback_control.lock().await;
                 prune_remote_playback_tracking(
                     &control,
@@ -7257,42 +7239,74 @@ async fn run_remote_media_channel(
                     &playback_latest_sequences,
                     &playback_baselines,
                 );
-                playback_baselines
-                    .iter()
-                    .filter(|(key, _)| !remote_playback_key_is_terminal(&control, key))
-                    .filter_map(|(key, baseline)| {
-                        playback_latest_sequences
-                            .get(key)
-                            .map(|sequence| (key.clone(), *sequence, *baseline))
-                    })
-                    .collect()
-            };
-            for (key, sequence, baseline) in snapshots {
-                if let Some(progress) = remote_playback_progress_message(
-                    state.clone(),
-                    &device_id,
-                    &core_session_id,
-                    &stream_id,
-                    connection_generation,
-                    executor_generation,
-                    interaction_generation,
-                    &key,
-                    sequence,
-                    playback_receipt_sequence,
-                    baseline,
-                )
-                .await
-                {
-                    if write_sender
-                        .send(MediaWriteCommand::Text(progress))
-                        .await
-                        .is_err()
-                    {
-                        outcome = Err("无法提交设备周期性播放时钟回执。".into());
-                        break;
+                if !playback_started {
+                    (0, false, None, None)
+                } else {
+                    let result = device_worker_action(state.clone(), |worker| worker.playback_snapshot())
+                        .await.and_then(|value| decode_worker_playback_snapshot(&value));
+                    match result {
+                        Ok(snapshot) => {
+                            let progress = control.active_key.as_ref().and_then(|key| {
+                                let sequence = *playback_latest_sequences.get(key)?;
+                                let baseline = *playback_baselines.get(key)?;
+                                let (rate, samples) = control.samples.get(key)?;
+                                let accepted_ms = samples.saturating_mul(1_000) / u64::from(*rate);
+                                let value = remote_playback_progress_value(
+                                    &device_id, &core_session_id, &stream_id, connection_generation,
+                                    executor_generation, interaction_generation, key, sequence,
+                                    playback_receipt_sequence, baseline, snapshot, accepted_ms,
+                                );
+                                if snapshot.buffered_ms == 0 {
+                                    playback_latest_sequences.remove(key);
+                                }
+                                Some(value)
+                            });
+                            (snapshot.buffered_ms, control.paused, progress, None)
+                        }
+                        Err(error) => {
+                            playback_started = false;
+                            let failed = control.active_key.clone().map(|key| {
+                                fail_remote_playback(&mut control, &key);
+                                (key, error)
+                            });
+                            (0, false, None, failed)
+                        }
                     }
-                    playback_receipt_sequence = playback_receipt_sequence.saturating_add(1);
                 }
+            };
+            let buffer_report = (next_playback_sequence, buffered_ms, paused);
+            if buffer_report != last_buffer_report || buffered_ms > 0 {
+                let buffer = serde_json::json!({
+                    "type":"playback.buffer",
+                    "next_sequence":next_playback_sequence, "buffered_ms":buffered_ms, "paused":paused,
+                    "fields":{"type":"播放储备回执", "next_sequence":"下一播放帧序号",
+                        "buffered_ms":"未输出的内容时长，毫秒", "paused":"设备是否已确认暂停"},
+                });
+                if write_sender.send(MediaWriteCommand::Text(buffer.to_string())).await.is_err() {
+                    outcome = Err("无法提交设备播放储备回执。".into());
+                    break;
+                }
+                last_buffer_report = buffer_report;
+            }
+            if let Some((key, error)) = failed {
+                client_event(&state, "client.playback_failed", serde_json::json!({
+                    "device_id":device_id,"stream_id":stream_id,"reason":error,
+                }));
+                let failure = serde_json::json!({
+                    "type":"playback.failed", "playback_key":key,
+                    "fields":{"type":"设备播放失败回执", "playback_key":"受影响的播放事务编号"},
+                });
+                if write_sender.send(MediaWriteCommand::Text(failure.to_string())).await.is_err() {
+                    outcome = Err("无法提交设备播放故障回执。".into());
+                    break;
+                }
+            }
+            if let Some(progress) = progress {
+                if write_sender.send(MediaWriteCommand::Text(progress.to_string())).await.is_err() {
+                    outcome = Err("无法提交设备播放时钟回执。".into());
+                    break;
+                }
+                playback_receipt_sequence = playback_receipt_sequence.saturating_add(1);
             }
             last_playback_snapshot_at = Instant::now();
         }
@@ -7300,20 +7314,66 @@ async fn run_remote_media_channel(
             break;
         }
         if !capture_active {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
             continue;
+        }
+        if !capture_started {
+            if Instant::now() < capture_retry_at {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            match device_worker_action(state.clone(), |worker| worker.capture_start().map(|_| ())).await {
+                Ok(()) => {
+                    capture_started = true;
+                    physical_capture.store(true, Ordering::Release);
+                    capture_failure = None;
+                    capture_sequence_base = next_capture_sequence;
+                    capture_sample_base = next_capture_sample;
+                    client_event(&state, "client.capture_state", serde_json::json!({
+                        "device_id":device_id,"stream_id":stream_id,"capture_stream_id":capture_stream_id,"state":"started"}));
+                }
+                Err(error) => {
+                    if capture_failure.as_ref() != Some(&error) {
+                        client_event(&state, "client.capture_unavailable", serde_json::json!({
+                            "device_id":device_id,"stream_id":stream_id,"capture_stream_id":capture_stream_id,"reason":error}));
+                    }
+                    capture_failure = Some(error);
+                    capture_retry_at = Instant::now() + Duration::from_secs(1);
+                    continue;
+                }
+            }
         }
         let next_state = state.clone();
         let frame = match device_worker_action(next_state, |worker| worker.capture_next(20)).await {
             Ok(frame) => frame,
             Err(error) => {
-                outcome = Err(error);
-                break;
+                let _ = device_worker_action(state.clone(), |worker| worker.capture_stop()).await;
+                physical_capture.store(false, Ordering::Release);
+                capture_started = false;
+                audio_sender.send_replace(None);
+                capture_gap_pending = true;
+                capture_retry_at = Instant::now() + Duration::from_secs(1);
+                client_event(&state, "client.capture_unavailable", serde_json::json!({
+                    "device_id":device_id,"stream_id":stream_id,"capture_stream_id":capture_stream_id,"reason":error}));
+                continue;
             }
         };
-        let Some(frame) = frame else {
+        let Some(mut frame) = frame else {
             continue;
         };
+        if let Some(sequence) = frame["sequence"].as_u64() {
+            let sequence = sequence.saturating_add(capture_sequence_base);
+            frame["sequence"] = serde_json::json!(sequence);
+            next_capture_sequence = sequence.saturating_add(1);
+        }
+        if let Some(sample) = frame["start_sample"].as_u64() {
+            let sample = sample.saturating_add(capture_sample_base);
+            frame["start_sample"] = serde_json::json!(sample);
+            next_capture_sample = sample.saturating_add(320);
+        }
+        if std::mem::take(&mut capture_gap_pending) {
+            frame["discontinuity_before"] = serde_json::json!(true);
+        }
         #[cfg(feature = "native-audio")]
         let binary_result = match uplink_codec {
             voice_desktop_common::device_protocol::AudioCodec::Pcm => encode_worker_media_frame(
@@ -7365,13 +7425,9 @@ async fn run_remote_media_channel(
                 break;
             }
         };
-        if write_sender
-            .try_send(MediaWriteCommand::Binary(binary))
-            .is_err()
-        {
-            outcome = Err("SSH 媒体发送队列已满；为保持采样连续性已停止当前流。".into());
-        }
+        audio_sender.send_replace(Some(Arc::new(binary)));
     }
+    physical_capture.store(false, Ordering::Release);
 
     if capture_started {
         if let Err(error) =
@@ -7408,7 +7464,8 @@ async fn run_remote_media_channel(
         ledger.clear();
     }
     client_tts_playback_started.store(false, Ordering::Release);
-    let _ = write_sender.send(MediaWriteCommand::Close).await;
+    audio_sender.send_replace(None);
+    let _ = write_sender.try_send(MediaWriteCommand::Close);
     drop(write_sender);
     let mut reader_task = reader_task;
     if tokio::time::timeout(Duration::from_secs(2), &mut reader_task)
@@ -7418,8 +7475,11 @@ async fn run_remote_media_channel(
         reader_task.abort();
         let _ = reader_task.await;
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
-    if let Err(error) = guard.close().await {
+    if tokio::time::timeout(Duration::from_secs(2), &mut writer_task).await.is_err() {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
+    if let Ok(Err(error)) = tokio::time::timeout(Duration::from_secs(2), guard.close()).await {
         if outcome.is_ok() {
             outcome = Err(error);
         }
@@ -7450,11 +7510,11 @@ async fn run_remote_media_channel(
 
 #[cfg(feature = "ssh-device")]
 async fn stop_remote_media_channel(state: &Arc<Desktop>) -> Result<bool, String> {
-    let channel = state
-        .remote_media_channel
-        .lock()
-        .map_err(|error| error.to_string())?
-        .take();
+    let channel = {
+        let mut slot = state.remote_media_channel.lock().map_err(|error| error.to_string())?;
+        state.remote_media_stop_revision.fetch_add(1, Ordering::AcqRel);
+        slot.take()
+    };
     let Some(channel) = channel else {
         return Ok(false);
     };
@@ -7692,6 +7752,7 @@ async fn device_ssh_media_channel(
         return Err("只有正式程序可以管理远端语音媒体通道。".into());
     }
     let desktop = state.inner().clone();
+    let stop_revision = desktop.remote_media_stop_revision.load(Ordering::Acquire);
     match action.as_str() {
         "status" => {
             let slot = desktop
@@ -7707,6 +7768,8 @@ async fn device_ssh_media_channel(
             let executor_generation = slot.as_ref().map(|channel| channel.executor_generation);
             let interaction_generation =
                 slot.as_ref().map(|channel| channel.interaction_generation);
+            let capture_active = slot.as_ref()
+                .is_some_and(|channel| channel.capture_active.load(Ordering::Acquire));
             let error = desktop
                 .remote_media_channel_error
                 .lock()
@@ -7715,11 +7778,12 @@ async fn device_ssh_media_channel(
             return Ok(
                 serde_json::json!({"state":if running{"running"}else if error.is_some(){"error"}else{"stopped"},
                 "device_id":device_id,"stream_id":stream_id,"connection_generation":connection_generation,
-                "executor_generation":executor_generation,"interaction_generation":interaction_generation,"error":error,
+                "executor_generation":executor_generation,"interaction_generation":interaction_generation,
+                "capture_active":capture_active,"error":error,
                 "fields":{"state":"受管远端语音媒体通道状态","device_id":"当前远端语音设备编号",
                     "stream_id":"当前连续音频流编号","connection_generation":"主机授予的设备连接代次",
                     "executor_generation":"主机授予的设备执行器代次","interaction_generation":"主机授予的语音交互代次",
-                    "error":"最近一次媒体通道错误"}}),
+                    "capture_active":"本机麦克风已实际打开","error":"最近一次媒体通道错误"}}),
             );
         }
         "stop" => {
@@ -7743,26 +7807,22 @@ async fn device_ssh_media_channel(
         return Err("远端语音媒体通道正在建立。".into());
     }
     let _starting = ResetFlag(&desktop.remote_media_channel_starting);
-    if desktop
-        .remote_media_channel
-        .lock()
-        .map_err(|error| error.to_string())?
-        .as_ref()
-        .is_some_and(|channel| channel.running.load(Ordering::Acquire))
     {
-        return Ok(
-            serde_json::json!({"state":"running","fields":{"state":"受管远端语音媒体通道状态"}}),
-        );
+        let slot = desktop.remote_media_channel.lock().map_err(|error| error.to_string())?;
+        if let Some(channel) = slot.as_ref().filter(|channel| channel.running.load(Ordering::Acquire)) {
+            return Ok(serde_json::json!({"state":"running","device_id":channel.device_id,
+                "stream_id":channel.stream_id,"connection_generation":channel.connection_generation,
+                "executor_generation":channel.executor_generation,"interaction_generation":channel.interaction_generation,
+                "capture_active":channel.capture_active.load(Ordering::Acquire),
+                "fields":{"state":"受管远端语音媒体通道状态","device_id":"本机稳定设备编号","stream_id":"媒体连接编号",
+                    "connection_generation":"设备连接代次","executor_generation":"设备执行器代次",
+                    "interaction_generation":"语音占用代次","capture_active":"本机麦克风已实际打开"}}));
+        }
     }
-    let task_active = desktop
-        .remote_task_channel
-        .lock()
-        .map_err(|error| error.to_string())?
-        .as_ref()
-        .is_some_and(|channel| channel.running.load(Ordering::Acquire));
-    if !task_active {
-        return Err("请先启动已登记音频流能力的远端设备任务会话。".into());
-    }
+    let task_connection = desktop.remote_task_channel.lock().map_err(|error| error.to_string())?
+        .as_ref().filter(|channel| channel.running.load(Ordering::Acquire))
+        .map(|channel| channel.connection_generation)
+        .ok_or("请先启动已登记音频流能力的远端设备任务会话。")?;
     let context = desktop.context().ok_or("缺少正式工作区")?;
     let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
         voice_desktop_common::device_config::LoadResult::Valid(config) => config,
@@ -7803,48 +7863,7 @@ async fn device_ssh_media_channel(
             }
         };
     let device_id = config.device_id.clone();
-    let devices_response = desktop
-        .ssh_device
-        .post_json(
-            "/v1/devices",
-            &serde_json::json!({"protocol_version":1}),
-            Duration::from_secs(10),
-        )
-        .await?;
-    if devices_response.status != 200 {
-        return Err("共享主机未返回可信设备快照。".into());
-    }
-    let device_snapshot = devices_response.body;
-    let expected_interaction_generation = device_snapshot
-        .get("interaction_generation")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("共享主机设备快照缺少交互代次。")?;
-    let local_device = device_snapshot
-        .get("devices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|devices| {
-            devices.iter().find(|item| {
-                item.get("device_id").and_then(serde_json::Value::as_str)
-                    == Some(device_id.as_str())
-            })
-        })
-        .ok_or("共享主机尚未登记本机设备；请先启动设备任务会话。")?;
-    if local_device
-        .get("capabilities")
-        .and_then(serde_json::Value::as_array)
-        .is_none_or(|items| {
-            !items
-                .iter()
-                .any(|item| item.as_str() == Some("audio_stream"))
-        })
-    {
-        return Err("共享主机没有登记本设备的 audio_stream（音频流）能力。".into());
-    }
-
-    let prepare_body = serde_json::json!({
-        "protocol_version":1,
-        "expected_interaction_generation":expected_interaction_generation,
-    });
+    let prepare_body = serde_json::json!({"protocol_version":1, "connection_generation":task_connection});
     let prepared = desktop
         .ssh_device
         .post_json(
@@ -7857,6 +7876,10 @@ async fn device_ssh_media_channel(
         return Err("共享主机拒绝语音设备切换；请刷新设备状态后重试。".into());
     }
     let lease = prepared.body;
+    if lease["result"] == "standby" {
+        return Ok(serde_json::json!({"state":"standby",
+            "fields":{"state":"已连接，等待服务端选择本设备作为语音输入"}}));
+    }
     let interaction_generation = lease
         .get("interaction_generation")
         .and_then(serde_json::Value::as_u64)
@@ -7950,61 +7973,64 @@ async fn device_ssh_media_channel(
         abort_remote_interaction_switch(&desktop, interaction_generation).await;
         return Err("共享主机在交互租约准备后重启；拒绝跨核心代次建立媒体流。".into());
     }
-    if let Err(error) = media
-        .synchronize_clock(|| async { voice_desktop_common::wasapi_capture::monotonic_device_time_us() })
-        .await
-    {
+    let synchronized = tokio::time::timeout(
+        Duration::from_secs(4),
+        media.synchronize_clock(|| async { voice_desktop_common::wasapi_capture::monotonic_device_time_us() }),
+    ).await.unwrap_or_else(|_| Err("远端语音媒体时钟握手超时。".into()));
+    if let Err(error) = synchronized {
         client_event(&desktop, "client.media_failed", serde_json::json!({"device_id":config.device_id,
             "stream_id":stream_id,"reason":error,"state":"clock_sync"}));
         let _ = media.close().await;
         abort_remote_interaction_switch(&desktop, interaction_generation).await;
         return Err(error);
     }
-    let capture_active = media.capture_active;
-
     let stop = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(true));
-    let task_stop = stop.clone();
-    let task_running = running.clone();
-    let task_state = desktop.clone();
-    let task_app = window.app_handle().clone();
-    let task_handle = tauri::async_runtime::spawn(async move {
-        let outcome =
-            run_remote_media_channel(task_state.clone(), media, task_stop.clone(), task_app).await;
-        task_stop.store(true, Ordering::Release);
-        task_running.store(false, Ordering::Release);
-        if let Err(error) = outcome {
-            if let Ok(mut slot) = task_state.remote_media_channel_error.lock() {
-                *slot = Some(error.chars().take(240).collect());
-            }
+    let capture_active = Arc::new(AtomicBool::new(false));
+    let mut pending_media = Some(media);
+    {
+        let mut slot = desktop.remote_media_channel.lock().map_err(|error| error.to_string())?;
+        if desktop.remote_media_stop_revision.load(Ordering::Acquire) == stop_revision {
+            *desktop.remote_media_channel_error.lock().map_err(|error| error.to_string())? = None;
+            let task_stop = stop.clone();
+            let task_running = running.clone();
+            let task_capture = capture_active.clone();
+            let task_state = desktop.clone();
+            let task_app = window.app_handle().clone();
+            let media = pending_media.take().expect("media pending");
+            let task = tauri::async_runtime::spawn(async move {
+                let outcome = run_remote_media_channel(
+                    task_state.clone(), media, task_stop.clone(), task_capture, task_app,
+                ).await;
+                task_stop.store(true, Ordering::Release);
+                task_running.store(false, Ordering::Release);
+                if let Err(error) = outcome {
+                    if let Ok(mut slot) = task_state.remote_media_channel_error.lock() {
+                        *slot = Some(error.chars().take(240).collect());
+                    }
+                }
+            });
+            *slot = Some(RemoteDeviceMediaChannel {
+                stop, running, capture_active: capture_active.clone(),
+                device_id: device_id.clone(), stream_id: stream_id.clone(),
+                connection_generation, executor_generation, interaction_generation, task,
+            });
         }
-    });
-    *desktop
-        .remote_media_channel
-        .lock()
-        .map_err(|error| error.to_string())? = Some(RemoteDeviceMediaChannel {
-        stop,
-        running,
-        device_id: device_id.clone(),
-        stream_id: stream_id.clone(),
-        connection_generation,
-        executor_generation,
-        interaction_generation,
-        task: task_handle,
-    });
-    *desktop
-        .remote_media_channel_error
-        .lock()
-        .map_err(|error| error.to_string())? = None;
+    }
+    if let Some(media) = pending_media {
+        let _ = tokio::time::timeout(Duration::from_secs(2), media.close()).await;
+        abort_remote_interaction_switch(&desktop, interaction_generation).await;
+        return Err("远端媒体启动已取消。".into());
+    }
     Ok(
         serde_json::json!({"state":"running","device_id":device_id,"stream_id":stream_id,
         "connection_generation":connection_generation,"executor_generation":executor_generation,
         "interaction_generation":interaction_generation,
-        "capture_active":capture_active,
+        "capture_active":capture_active.load(Ordering::Acquire),
         "fields":{"state":"受管远端语音媒体通道状态","device_id":"本机稳定设备编号",
             "stream_id":"本次连续音频流编号","connection_generation":"设备连接代次",
             "executor_generation":"设备执行器代次","interaction_generation":"语音占用代次",
-            "capture_active":"媒体通道已建立，核心采集状态由服务端控制"}}),
+            "capture_active":"本机麦克风已实际打开"}}),
     )
 }
 
@@ -10035,6 +10061,7 @@ fn run() -> Result<(), String> {
         remote_media_channel: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         remote_media_channel_starting: AtomicBool::new(false),
+        remote_media_stop_revision: AtomicU64::new(0),
         #[cfg(feature = "ssh-device")]
         remote_media_channel_error: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
@@ -10998,6 +11025,7 @@ mod tests {
             remote_task_channel_error: std::sync::Mutex::new(None),
             remote_media_channel: std::sync::Mutex::new(None),
             remote_media_channel_starting: AtomicBool::new(false),
+            remote_media_stop_revision: AtomicU64::new(0),
             remote_media_channel_error: std::sync::Mutex::new(None),
             remote_voice_forwarder: std::sync::Mutex::new(None),
             remote_playback_control: tokio::sync::Mutex::new(
@@ -12681,11 +12709,7 @@ mod tests {
             ))
             .unwrap();
 
-        let RemotePlaybackFrameOutcome::Accepted {
-            message,
-            playback_key,
-            sequence,
-        } = outcome
+        let RemotePlaybackFrameOutcome::Accepted { message } = outcome
         else {
             panic!("模拟播放端点应接纳有效帧");
         };
@@ -12696,8 +12720,6 @@ mod tests {
         assert_eq!(accepted["executor_generation"], 3);
         assert_eq!(accepted["interaction_generation"], 4);
         assert_eq!(accepted["sequence"], 0);
-        assert_eq!(playback_key, "speech-a");
-        assert_eq!(sequence, 0);
         assert_eq!(next_sequence, 1);
         assert_eq!(sample_positions["speech-a"], 320);
         assert_eq!(latest_sequences["speech-a"], 0);
@@ -12729,6 +12751,7 @@ mod tests {
                 started: true,
                 device_time_us: 9_020_000,
             },
+            20,
         );
         assert_eq!(progress["type"], "playback.progress");
         assert_eq!(progress["delivery_device_id"], "device-a");
@@ -12929,7 +12952,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let RemotePlaybackFrameOutcome::Cancelled { message } = old_result else {
+        let RemotePlaybackFrameOutcome::Cancelled { message, .. } = old_result else {
             panic!("旧播放键必须被拒绝")
         };
         let old_ack: serde_json::Value = serde_json::from_str(&message).unwrap();
@@ -12971,7 +12994,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let RemotePlaybackFrameOutcome::Cancelled { message } = unbound_result else {
+        let RemotePlaybackFrameOutcome::Cancelled { message, .. } = unbound_result else {
             panic!("未绑定后继键必须被拒绝")
         };
         let unbound_ack: serde_json::Value = serde_json::from_str(&message).unwrap();

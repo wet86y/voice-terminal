@@ -542,11 +542,11 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         if processed != frame.pcm:
             frame = AudioFrame(
                 processed, frame.start_sample, frame.captured_at, frame.clock_uncertainty_seconds,
-                frame.audio_processing, frame.processing_identity,
+                frame.audio_processing, frame.processing_identity, frame.discontinuity_before,
             )
         if getattr(self, "_input_resetting", False):
             return  # 原生音频处理等待期间可能开始重置。
-        if not _wake_replay and await self._buffer_wake_frame(frame):
+        if not _wake_replay and not frame.discontinuity_before and await self._buffer_wake_frame(frame):
             return
         expected_start_sample = self._last_frame.end_sample if self._last_frame else None
         if self._asr_queue_overflow:
@@ -556,7 +556,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 expected_start_sample=expected_start_sample,
             )
             return
-        if expected_start_sample is not None and frame.start_sample != expected_start_sample:
+        if frame.discontinuity_before or (expected_start_sample is not None and frame.start_sample != expected_start_sample):
             await self._recover_input_continuity(
                 frame,
                 reason="capture_gap",

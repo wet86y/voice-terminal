@@ -17,6 +17,40 @@ from voice_terminal.server.websocket import SessionRuntime
 from tests.test_device_media_endpoint import _LocalCapture
 
 
+@pytest.mark.parametrize("abort_first", [False, True])
+def test_user_stop_revokes_resume_during_remote_handoff(tmp_path, abort_first):
+    async def run():
+        config = AppConfig(model_dir=tmp_path / "models", persona=PersonaConfig(directory=tmp_path / "persona"))
+        runtime = SessionRuntime(config, product_settings=ProductSettingsStore(path=tmp_path / "settings.json", config=config),
+                                 runtime_data_dir=tmp_path / "runtime")
+        runtime._capture_router = SelectableCapturePort(_LocalCapture())
+        runtime.state.listening = True
+        runtime.controller = Mock(start_listening=AsyncMock(), stop_listening=AsyncMock())
+        runtime.controller.stop_listening.side_effect = lambda: setattr(runtime.state, "listening", False)
+        await runtime.open_remote_device_session("client-stop", ["audio_stream"])
+        lease = await runtime.prepare_interaction_switch("client-stop", runtime.device_registry.generation)
+        if abort_first:
+            assert await runtime.abort_interaction_switch(lease)
+        await runtime.stop_listening()
+        try:
+            if abort_first:
+                assert await runtime.recover_local_after_remote_media_loss(lease)
+                assert runtime.device_registry.active.device_id == "local"
+            else:
+                capture = RemoteAudioCapture(PcmInputStream(
+                    stream_id="stop-audit", core_session_id=runtime.core_session_id, lease=lease,
+                    registry=runtime.device_registry, map_device_time=lambda value: (value / 1_000_000, .001)))
+                await runtime.select_remote_capture(capture, lease)
+                assert not await runtime.complete_remote_interaction_switch(capture, lease)
+                assert not capture.running
+            assert not runtime.state.listening
+            runtime.controller.start_listening.assert_not_awaited()
+        finally:
+            await runtime.device_remote_sessions.close_all()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("client_tts", [False, True])
 def test_old_media_cleanup_cannot_recover_local_over_a_new_stream_with_the_same_lease(tmp_path, client_tts):
     async def run():

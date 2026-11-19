@@ -1,6 +1,7 @@
 """Capability recovery（能力级恢复）：只重建一个能力，不重启语音服务进程。"""
 import asyncio
 from dataclasses import replace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -130,6 +131,36 @@ def test_status_payload_exposes_capability_rows(runtime):
     payload = runtime.application_component_status()
     assert {row["id"] for row in payload["capabilities"]} >= {"audio", "asr", "llm", "tts"}
     assert all(row["blocking"] for row in payload["capabilities"] if row["id"] in {"audio", "asr", "llm", "tts"})
+
+
+def test_real_single_capability_retry_rebinds_active_controller(runtime):
+    async def run():
+        _session_ready(runtime)
+        runtime.vad = Mock()
+        old_asr = Mock(close=AsyncMock())
+        new_asr = Mock(connect=AsyncMock(), health=AsyncMock())
+        old_processor = Mock()
+        new_processor = Mock(enabled=False, status="READY", error="")
+        runtime.asr = old_asr
+        runtime.audio_processor = old_processor
+        runtime.controller = Mock(asr=old_asr, audio_processor=old_processor)
+        with patch("voice_terminal.server.websocket.AsrWorkerClient", return_value=new_asr):
+            assert (await runtime.retry_capability("asr"))["ok"]
+        assert runtime.controller.asr is new_asr
+        assert new_asr.on_result is runtime.controller._on_asr_result
+        assert old_asr.on_result is None
+        old_asr.close.assert_awaited_once()
+
+        from tests.test_device_media_endpoint import _LocalCapture
+        with (
+            patch.object(runtime._local_audio(), "create_capture", return_value=_LocalCapture()),
+            patch.object(runtime._local_audio(), "create_processor", return_value=new_processor),
+        ):
+            assert (await runtime.retry_capability("audio"))["ok"]
+        assert runtime.controller.audio_processor is new_processor
+        old_processor.close.assert_called_once()
+
+    asyncio.run(run())
 
 
 def test_health_payload_carries_can_start_reason(runtime):

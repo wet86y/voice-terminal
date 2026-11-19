@@ -517,7 +517,7 @@ export const nativeDeviceApi = {
     return result
   },
   remoteMediaChannel: (action: 'start' | 'status' | 'stop') => call<{
-    state: 'running' | 'stopped' | 'error' // state（远端语音媒体通道状态）。
+    state: 'running' | 'standby' | 'stopped' | 'error' // state（语音媒体连接状态，standby 表示等待主机选择）。
     stopped?: boolean // stopped（本次是否关闭原媒体流）。
     device_id?: string | null // device_id（当前语音交互设备编号）。
     stream_id?: string | null // stream_id（连续音频流编号）。
@@ -592,7 +592,7 @@ export type RemoteManagementOperation =
   | 'settings.audio_enhancements.save' | 'settings.screen_capture.save' | 'settings.tts.save' | 'settings.inference.save'
   | 'models.registry.read' | 'models.scan' | 'models.validate' | 'models.providers.add'
   | 'models.assignments.apply' | 'models.credentials.read' | 'models.credentials.save'
-  | 'provider.usage' | 'model.update' | 'model.delete' | 'model.hide' | 'model.restore' | 'voice.command'
+  | 'provider.usage' | 'model.update' | 'model.delete' | 'model.hide' | 'model.restore'
   | 'hotwords.import' | 'hotwords.preview' | 'tts.minimax.voice_name'
   | 'tts.operation.preview' | 'tts.operation.minimax_preview' | 'tts.operation.play' | 'tts.operation.transcribe'
   | 'tts.operation.read' | 'tts.operation.cancel' | 'tts.voices.read' | 'tts.voices.create'

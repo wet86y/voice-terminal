@@ -22,7 +22,8 @@ import type {
 import { validWakeTriggerCount, wakeIntervalParts, wakeIntervalSeconds } from '../interface/wake-task-interval'
 import { isRecord } from '../record'
 import { desktopPort } from './desktop-port'
-import { nativeDeviceApi, matchesRemoteManagementEnvelope } from './native-device-api'
+import { nativeDeviceApi } from './native-device-api'
+import { deviceState } from './device-state'
 import { modelComponentOwners } from './component-resources'
 import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
@@ -381,15 +382,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     snapshotRequest = productApi.snapshot().then(async value => {
       if (adapterDisposed) return
       applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision, requestedInstructionRevision)
-      if (application.snapshot.value?.remote_mode) {
-        voice.state.value = value.runtime.state
-        voice.listening.value = value.runtime.listening
-        voice.canStart.value = value.runtime.can_start
-        voice.wakeAlwaysOn.value = value.runtime.wake_always_on
-        voice.inputOwner.value = value.runtime.input_owner === 'kws' || value.runtime.input_owner === 'asr'
-          ? value.runtime.input_owner : 'none'
-        voice.reasoningMode.value = value.runtime.reasoning_mode
-      }
       await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
       lastError.value = ''
     }).catch(setError).finally(() => {
@@ -951,12 +943,16 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const managementConnected = computed(() => remoteMode.value
     && application.snapshot.value?.management_connected === true) // managementConnected（服务端管理通道连接状态）。
   const voiceConnected = computed(() => voice.connection.value === 'connected') // voiceConnected（实时语音 WebSocket 状态）。
-  const voiceReady = computed(() => remoteMode.value
-    ? managementConnected.value && voiceConnected.value : connected.value) // voiceReady（语音操作所需的管理与实时通道均已就绪）。
-  const remoteControlPending = ref(false) // remoteControlPending（管理通道正在执行监听操作）。
+  const voiceReady = computed(() => voiceConnected.value)
+  const recordingPhase = computed(() => voice.ownDevice.value?.recording_phase ?? 'idle')
+  const sessionListening = computed(() => remoteMode.value ? recordingPhase.value === 'recording' : voice.listening.value)
+  const remoteListeningRequested = computed(() => voice.deviceIntent.value?.enable === true
+    || recordingPhase.value !== 'idle' || voice.ownDevice.value?.media_ready === true && voice.devices.value?.listening_requested === true)
   const listeningControlReady = computed(() => remoteMode.value
-    ? managementConnected.value && application.snapshot.value?.remote_media_ready === true
-    : voiceReady.value) // listeningControlReady（远端启停须有本设备媒体；能力是否就绪由服务端返回实际结果）。
+    ? voiceConnected.value && voice.ownDevice.value?.media_ready === true
+    : voiceReady.value)
+  watch(voice.devices, value => { deviceState.value = value }, { flush: 'sync' })
+  watch(voice.deviceIntentError, value => { if (value) setError(new Error(value)) })
   // corePhase（核心能力阶段）：以宿主发布的 core_phase 为准；旧宿主缺少该字段时按 core_available 回落。
   const corePhase = computed(() => application.snapshot.value?.core_phase
     ?? (application.snapshot.value?.core_available ? 'ready' : 'failed'))
@@ -1140,36 +1136,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const latencyRunning = computed(() => connected.value && !remoteMode.value && voice.perceptualLatencyRunning.value)
 
   function setListening(enabled: boolean) {
-    if (!listeningControlReady.value || remoteControlPending.value || application.snapshot.value?.startup_complete === false) return false
-    if (!remoteMode.value) return voice.setListening(enabled)
-    const hostId = application.snapshot.value?.host_id
-    remoteControlPending.value = true
-    void (async () => {
-      try {
-        const response = await nativeDeviceApi.remoteManagementRequest('voice.command', { command: enabled ? 'session.start' : 'session.stop' })
-        if (adapterDisposed || application.snapshot.value?.host_id !== hostId) return
-        if (!matchesRemoteManagementEnvelope(response, hostId ?? null, 'voice.command') || ![200, 202].includes(response.status)) {
-          throw new Error(typeof response.body?.detail === 'string' ? response.body.detail : '服务端未确认监听操作，请刷新状态。')
-        }
-        if (snapshotRequest) await snapshotRequest
-        await loadSnapshot()
-        if (response.body?.result === 'deferred') setNotice('服务端已收到开始请求，监听仍在等待能力恢复。')
-      } catch (failure) { if (!adapterDisposed) setError(failure) }
-      finally { remoteControlPending.value = false }
-    })()
-    return true
+    return remoteMode.value ? voice.setDeviceListening(enabled)
+      : listeningControlReady.value && application.snapshot.value?.startup_complete !== false && voice.setListening(enabled)
   }
 
   function runtimeAction() {
+    if (remoteMode.value) return setListening(!remoteListeningRequested.value)
     if (voice.inputPaused.value) return false
-    if (remoteMode.value) {
-      if (application.snapshot.value?.startup_complete === false || !listeningControlReady.value) return false
-      if (coreUnavailable.value && !voice.listening.value) {
-        setError(new Error('服务端语音能力尚未就绪，请稍后重试。'))
-        return false
-      }
-      return setListening(!voice.listening.value)
-    }
     if (!application.businessReady.value) return false
     if (application.snapshot.value?.startup_complete === false) return false
     if (!connected.value) {
@@ -1632,7 +1605,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   function retry() {
     if (remoteMode.value) {
-      if (application.snapshot.value?.management_connected && application.snapshot.value?.voice_ws_url
+      if (application.snapshot.value?.voice_ws_url
         && voice.connection.value === 'offline') voice.connect()
       if (application.businessReady.value) void loadSnapshot()
       return
@@ -1644,7 +1617,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   function connect() {
     if (remoteMode.value) {
-      if (application.snapshot.value?.management_connected && application.snapshot.value?.voice_ws_url) voice.connect()
+      if (application.snapshot.value?.voice_ws_url) voice.connect()
       if (application.businessReady.value) void loadSnapshot()
       return
     }
@@ -1672,9 +1645,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     connect()
     reconnectTimer = window.setInterval(() => {
       if (remoteMode.value) {
-        if (application.snapshot.value?.management_connected && application.snapshot.value?.voice_ws_url
+        if (application.snapshot.value?.voice_ws_url
           && voice.connection.value === 'offline') voice.connect()
-        if (application.businessReady.value) void loadSnapshot()
         return
       }
       if (!application.businessReady.value) return
@@ -1692,18 +1664,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   watch([
     () => application.snapshot.value?.remote_mode === true,
-    () => application.snapshot.value?.management_connected === true,
     () => application.snapshot.value?.voice_ws_url ?? '',
     () => application.snapshot.value?.endpoint_revision,
-  ], ([remote, management, url, endpointRevision], [wasRemote, wasManagement, oldUrl, oldEndpointRevision]) => {
+  ], ([remote, url, endpointRevision], [wasRemote, oldUrl, oldEndpointRevision]) => {
     if (remote) {
       if (!url) {
         if (voice.connection.value !== 'offline') voice.disconnect()
         return
       }
-      if (!management) return // 短暂管理探测失败保留实时连接；管理写入仍由门禁拒绝。
-      const endpointChanged = wasRemote && (wasManagement !== management || oldUrl !== url
-        || oldEndpointRevision !== endpointRevision)
+      const endpointChanged = wasRemote && (oldUrl !== url || oldEndpointRevision !== endpointRevision)
       if (endpointChanged && voice.connection.value !== 'offline') voice.disconnect()
       if (voice.connection.value === 'offline') voice.connect()
       return
@@ -1720,11 +1689,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     () => application.snapshot.value?.voice_ws_url,
   ], (current, previous) => {
     if (!previous.some(value => value !== undefined && value !== '')) return
+    if (remoteMode.value) return
     if (!application.businessReady.value) {
       voice.disconnect()
       return
     }
-    if (remoteMode.value) { if (application.businessReady.value) void loadSnapshot(); return }
     voice.disconnect()
     voice.connect()
     void loadSnapshot()
@@ -1797,7 +1766,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     voiceConnected,
     voiceReady,
     listeningControlReady,
-    remoteControlPending,
+    sessionListening,
+    remoteListeningRequested,
+    recordingPhase,
     runtimeState,
     coreUnavailable,
     coreStarting,

@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { matchesRemoteManagementEnvelope, nativeDeviceApi, parseRemoteSshSystemFeatureSnapshot, type DeviceConfig, type DeviceConfigStatus, type DiscoveredDevice, type ManagedResourceJob, type OpenSshServerStatus, type RemoteSshSystemFeatureSnapshot } from '../product/native-device-api'
 import { ensureRemoteClientRuntime } from '../product/remote-client-runtime'
 import { deviceSettingsOperation, recordDeviceSettingsError, runDeviceSettingsOperation, setDeviceSettingsPhase } from '../product/device-settings-operation'
+import { productApi, type ProductDeviceSnapshot } from '../product/api'
+import { deviceState } from '../product/device-state'
 
 const status = ref<DeviceConfigStatus | null>(null)
 const mode = ref<DeviceConfig['mode']>('local')
@@ -20,10 +22,19 @@ const connection = ref<'connected' | 'disconnected' | 'unavailable'>('disconnect
 const taskChannel = ref<'running' | 'stopped' | 'error'>('stopped')
 const taskChannelError = ref('')
 const taskDesktopControl = ref<{ available: boolean; error: string } | null>(null)
-const mediaChannel = ref<'running' | 'stopped' | 'error'>('stopped')
+const mediaChannel = ref<'running' | 'standby' | 'stopped' | 'error'>('stopped')
 const mediaChannelError = ref('')
 const mediaCaptureActive = ref<boolean | null>(null)
 const remoteCoreState = ref<'ready' | 'starting' | 'unavailable' | 'unknown'>('unknown')
+const inboundDevices = ref<ProductDeviceSnapshot | null>(null) // 入站设备、连接代次和当前语音设备。
+let inboundRefresh = false
+let devicePoll: ReturnType<typeof setInterval> | undefined
+const ownDevice = computed(() => deviceState.value?.self_device_id === status.value?.device_config?.device_id
+  ? deviceState.value?.devices.find(row => row.device_id === deviceState.value?.self_device_id) : undefined)
+watch(deviceState, value => {
+  if (mode.value === 'local' && value?.self_device_id === 'local') inboundDevices.value = value
+})
+const inboundClients = computed(() => inboundDevices.value?.devices.filter(device => device.device_id !== 'local') ?? [])
 const openSshStatus = ref<OpenSshServerStatus | null>(null)
 const maxVisibleSshRuleDetails = 5 // maxVisibleSshRuleDetails（展开时最多显示的入站规则摘要条数）。
 const maxSshRuleDisplayChars = 180 // maxSshRuleDisplayChars（单条规则摘要最大显示字符数）。
@@ -154,9 +165,11 @@ async function refresh() {
       taskChannel.value = 'stopped'
       mediaChannel.value = 'stopped'
       mediaCaptureActive.value = null
+      void refreshDeviceChannels()
     } else {
+      inboundDevices.value = null
       const ssh = await nativeDeviceApi.sshHostStatus()
-      connection.value = ssh.connected ? 'disconnected' : ssh.state
+      if (!ssh.connected) connection.value = ssh.state
       if (ssh.connected) {
         let managementReady = false
         try {
@@ -164,7 +177,7 @@ async function refresh() {
           const hostId = status.value?.device_config?.paired_host?.host_id
           managementReady = management.status === 200
             && matchesRemoteManagementEnvelope(management, hostId, 'management.status')
-          connection.value = managementReady ? 'connected' : 'disconnected'
+          if (managementReady) connection.value = 'connected'
           if (managementReady) {
             const coreState = management.body?.core_state
             remoteCoreState.value = coreState === 'ready' || coreState === 'starting' ? coreState : 'unavailable'
@@ -187,12 +200,8 @@ async function refresh() {
           mediaChannel.value = media.state
           mediaChannelError.value = media.error || ''
           mediaCaptureActive.value = media.capture_active ?? null
-        } else {
+        } else if (connection.value !== 'connected') {
           clearRemoteOpenSshSnapshot()
-          taskChannel.value = 'stopped'
-          mediaChannel.value = 'stopped'
-          mediaChannelError.value = ''
-          mediaCaptureActive.value = null
         }
       } else {
         clearRemoteOpenSshSnapshot()
@@ -208,6 +217,26 @@ async function refresh() {
     error.value = failure instanceof Error ? failure.message : String(failure)
   } finally {
     loading.value = false
+  }
+}
+
+async function refreshDeviceChannels() {
+  if (inboundRefresh) return
+  inboundRefresh = true
+  const scope = status.value?.device_config?.device_id
+  try {
+    if (mode.value === 'local' && isBroadcasting.value) {
+      if (deviceState.value?.self_device_id === 'local') {
+        inboundDevices.value = deviceState.value
+        return
+      }
+      const devices = await productApi.deviceSnapshot()
+      if (mode.value === 'local' && isBroadcasting.value && status.value?.device_config?.device_id === scope
+          && deviceState.value?.self_device_id !== 'local') inboundDevices.value = devices
+    }
+  } catch { /* 读状态失败时保留最后一次状态，服务端实时通道恢复后会推送最新快照。 */
+  } finally {
+    inboundRefresh = false
   }
 }
 
@@ -864,11 +893,13 @@ async function disconnectHost() {
 }
 
 onMounted(async () => {
+  devicePoll = setInterval(() => { if (!deviceState.value && !busy.value && !loading.value) void refreshDeviceChannels() }, 10000)
   await refresh()
   scheduleRuntimeStatusWatch()
 })
 
 onUnmounted(() => {
+  if (devicePoll !== undefined) clearInterval(devicePoll)
   disposed = true
   sshStatusGeneration++
   stopRuntimeStatusWatch()
@@ -1019,6 +1050,19 @@ onUnmounted(() => {
       <p v-if="remoteOpenSshError" class="device-message error" role="alert">{{ remoteOpenSshError }}</p>
     </section>
 
+    <section v-if="isBroadcasting" class="device-card" aria-label="入站客户端">
+      <h3>入站客户端</h3>
+      <p v-if="inboundDevices === null">正在等待服务端设备状态。</p>
+      <p v-else-if="!inboundClients.length">暂无已登记客户端。</p>
+      <div v-for="device in inboundClients" :key="device.device_id" class="remote-device-row">
+        <div class="remote-device-title">
+          <strong>{{ device.name }}</strong>
+          <span v-if="device.interaction_active" class="interaction-state">当前语音设备</span>
+          <span class="connection-state" :data-state="device.connected ? 'connected' : 'disconnected'">{{ device.connected ? '在线' : '离线' }}</span>
+        </div>
+      </div>
+    </section>
+
     <section v-if="isRemote" class="device-card remote-channel-status">
       <h3>服务端连接状态</h3>
       <p>连接、任务和语音通道由程序自动准备；断线时不会把操作改投本机。</p>
@@ -1028,8 +1072,8 @@ onUnmounted(() => {
         <span class="connection-state" :data-state="taskChannel">服务端任务：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : taskChannel === 'running' ? '已就绪' : taskChannel === 'error' ? '错误' : '准备中' }}</span>
         <span v-if="connection === 'connected' && taskChannel === 'running' && taskDesktopControl"
           class="connection-state" :data-state="taskDesktopControl.available ? 'ready' : 'unavailable'">桌面控制：{{ taskDesktopControl.available ? '已登记' : '暂不可用' }}</span>
-        <span class="connection-state" :data-state="mediaChannel">服务端语音：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : mediaChannel === 'running' ? '已就绪' : mediaChannel === 'error' ? '错误' : '准备中' }}</span>
-        <span v-if="mediaChannel === 'running'" class="interaction-state">{{ mediaCaptureActive ? '服务端已请求麦克风采集' : '当前未采集麦克风' }}</span>
+        <span class="connection-state" :data-state="mediaChannel">服务端语音：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : ownDevice?.media_ready ? '已就绪' : ownDevice?.connected || mediaChannel === 'standby' ? '已连接，等待语音输入授权' : mediaChannel === 'error' ? '错误' : '准备中' }}</span>
+        <span v-if="ownDevice?.media_ready" class="interaction-state">{{ ownDevice.recording_phase === 'recording' ? '服务端正在接收本机音频' : ownDevice.recording_phase === 'starting' ? '等待首帧音频' : ownDevice.recording_phase === 'interrupted' ? '正在恢复本机麦克风' : '录制未开始' }}</span>
       </div>
       <p v-if="taskChannelError || mediaChannelError" class="device-message warning">{{ taskChannelError || mediaChannelError }}</p>
       <p v-if="connection === 'connected' && taskChannel === 'running' && taskDesktopControl?.error"
@@ -1037,7 +1081,7 @@ onUnmounted(() => {
     </section>
 
     <footer class="device-footer">
-      <div class="connection-state" :data-state="connection">服务端管理连接：{{ connection === 'connected' ? '已连接' : connection === 'unavailable' ? '当前构建不支持' : '已断开' }}</div>
+      <div v-if="isRemote" class="connection-state" :data-state="connection">服务端管理连接：{{ connection === 'connected' ? '已连接' : connection === 'unavailable' ? '当前构建不支持' : '已断开' }}</div>
       <div class="button-row">
         <button v-if="status?.runtime.config_state === 'invalid'" class="outline-button" :disabled="!canSave || busy" @click="saveConfig(true)">归档原件并修复</button>
         <button v-if="isRemote && status?.device_config?.paired_host && connection !== 'connected'" class="primary-button" :disabled="busy || !status || status.runtime.config_state === 'invalid'" @click="connectHost(false)">连接服务端</button>

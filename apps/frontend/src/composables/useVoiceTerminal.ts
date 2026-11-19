@@ -35,6 +35,7 @@ import type {
 import { TERMINAL_STATES } from '../types'
 import { ConversationLog, readConversationEntry } from '../conversation-log'
 import { isRecord } from '../record'
+import type { DeviceState } from '../product/device-state'
 import { MAX_SHADOW_ACTIVITIES, trimShadowActivities, isNonNegativeInteger, isAgentTrace, isSpeechOutput, isTerminalState, readString, readDelivery, createEmptyCurrentTurn, createEmptyLatency, createOfflineStatuses, createEmptyShadowProduct, readShadowActivity, readShadowProduct, parseServerMessage, copyLatencyValues } from './voiceTerminalProjection'
 
 const OPEN_READY_STATE = 1
@@ -74,6 +75,24 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const listeningRequested = ref(false) // listeningRequested（恢复监听意图）。
   const runtimeOperations = ref<import('../runtime/runtime-operations').RuntimeOperation[]>([])
   const canStart = ref(false)
+  const devices = shallowRef<DeviceState | null>(null)
+  const ownDevice = computed(() => devices.value?.devices.find(device => device.device_id === devices.value?.self_device_id))
+  const deviceIntent = shallowRef<{ requestId: string; enable: boolean; accepted: boolean } | null>(null)
+  const deviceIntentError = ref('')
+  let deviceIntentTimer: ReturnType<typeof setTimeout> | undefined
+
+  function clearDeviceIntent() {
+    clearTimeout(deviceIntentTimer)
+    deviceIntentTimer = undefined
+    deviceIntent.value = null
+  }
+
+  function settleDeviceIntent() {
+    const intent = deviceIntent.value
+    if (!intent?.accepted || !devices.value) return
+    const enabled = ownDevice.value?.recording_phase !== 'idle' || devices.value.listening_requested
+    if (enabled === intent.enable || !ownDevice.value?.media_ready) clearDeviceIntent()
+  }
   const serverSessionOperation = ref<SessionOperation | null>(null) // serverSessionOperation（后端会话操作，重连时从快照恢复）。
   const pendingSessionOperation = ref<SessionOperation | null>(null) // pendingSessionOperation（本机等待回执的会话操作）。
   let sessionOperationRequestId: string | null = null // sessionOperationRequestId（当前操作请求标识）。
@@ -546,6 +565,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function resetConnectionData() {
+    devices.value = null
+    deviceIntentError.value = ''
+    clearDeviceIntent()
     clearAudioLevels()
     clearShadowActivityQueue()
     currentTurnId.value = null
@@ -985,6 +1007,30 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (lastSequence.value !== null && message.seq <= lastSequence.value) return
     lastSequence.value = message.seq
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'devices.snapshot') {
+      if (typeof payload.core_session_id === 'string' && typeof payload.self_device_id === 'string'
+          && isNonNegativeInteger(payload.revision) && Array.isArray(payload.devices)) {
+        const value = payload as unknown as DeviceState
+        if (devices.value?.core_session_id !== value.core_session_id || devices.value.revision < value.revision) {
+          devices.value = value
+          settleDeviceIntent()
+        }
+      }
+      return
+    }
+    if (message.type === 'device.intent') {
+      const intent = deviceIntent.value
+      if (intent && payload.request_id === intent.requestId) {
+        if (payload.result === 'accepted') {
+          deviceIntent.value = { ...intent, accepted: true }
+          settleDeviceIntent()
+        } else {
+          deviceIntentError.value = readString(payload, 'detail') ?? '服务端未接纳该录制操作。'
+          clearDeviceIntent()
+        }
+      }
+      return
+    }
     if (message.type === 'conversation.image') { void acceptImageChunk(payload); return }
     if (message.type === 'audio.levels') {
       // source（来源）、levels（音量值）、generation（轮代）必须与实际状态一致。
@@ -1228,6 +1274,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id ?? null)
         break
       case 'error': {
+        if (deviceIntent.value && payload.request_id === deviceIntent.value.requestId) {
+          deviceIntentError.value = readString(payload, 'message') ?? '服务端未接纳该录制操作。'
+          clearDeviceIntent()
+        }
         if (sessionOperationRequestId && payload.request_id === sessionOperationRequestId) {
           pendingSessionOperation.value = null
           sessionOperationRequestId = null
@@ -1269,8 +1319,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   function connect() {
     if (connection.value === 'connecting' || connection.value === 'connected') return
     const application = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
-    const remoteVoiceReady = application?.remote_mode === true
-      && application.management_connected === true && Boolean(application.voice_ws_url)
+    const remoteVoiceReady = application?.remote_mode === true && Boolean(application.voice_ws_url)
     if (application?.business_ready === false && !remoteVoiceReady) {
       connectionError.value = '应用宿主尚未允许业务连接。'
       return
@@ -1353,6 +1402,21 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     return sendCommand('session.start')
   }
 
+  function setDeviceListening(enable: boolean) {
+    if (!ownDevice.value?.media_ready || deviceIntent.value?.enable === false || sessionOperation.value) return false
+    if (enable && (deviceIntent.value || !devices.value?.can_start)) return false
+    const requestId = `req_${String(requestSequence + 1).padStart(6, '0')}`
+    if (!sendCommand(enable ? 'session.start' : 'session.stop')) return false
+    clearDeviceIntent()
+    deviceIntentError.value = ''
+    deviceIntent.value = { requestId, enable, accepted: false }
+    deviceIntentTimer = setTimeout(() => {
+      clearDeviceIntent()
+      deviceIntentError.value = '暂未收到录制操作确认，等待服务端状态同步。'
+    }, 8000)
+    return true
+  }
+
   function toggleListening() {
     return setListening(!(inputPaused.value ? listeningRequested.value : listening.value))
   }
@@ -1414,6 +1478,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     listeningRequested,
     runtimeOperations,
     canStart,
+    devices,
+    ownDevice,
+    deviceIntent,
+    deviceIntentError,
+    setDeviceListening,
     sessionOperation,
     wakeAlwaysOn,
     inputOwner,

@@ -72,7 +72,9 @@ export function useProductControls() {
     voiceConnected,
     voiceReady,
     listeningControlReady,
-    remoteControlPending,
+    sessionListening,
+    remoteListeningRequested,
+    recordingPhase,
     runtimeState,
     coreUnavailable,
     coreStarting,
@@ -267,7 +269,8 @@ export function useProductControls() {
     );
   }
   const reasoningMode = voice.reasoningMode;
-  const listening = voice.listening;
+  const listening = sessionListening;
+  const isRemote = computed(() => applicationSnapshot.value?.remote_mode === true);
   const waitingForWake = computed(
     () =>
       listening.value &&
@@ -1527,6 +1530,7 @@ export function useProductControls() {
     return activePage.value === "home" ? "工作台" : "设置";
   }
   function runtimeAction() {
+    if (isRemote.value) return performRuntimeAction();
     if (voice.inputPaused.value) return false;
     if (coreUnavailable.value) {
       applicationHost.inspect();
@@ -1538,6 +1542,7 @@ export function useProductControls() {
     return performRuntimeAction();
   }
   function floatingSessionAction(action: FloatingSessionAction) {
+    if (isRemote.value) return setRemoteAwareListening(action === 'start');
     if (action === 'silence') return setRemoteAwareListening(false);
     if (action !== 'start' || voice.listening.value || coreUnavailable.value || coreStarting.value
       || !applicationHost.businessReady.value || applicationSnapshot.value?.startup_complete === false) return false;
@@ -1594,29 +1599,46 @@ export function useProductControls() {
     return conversation;
   });
   const workbenchModel = computed<WorkbenchModel>(() => {
+    const remoteDisabled = !listeningControlReady.value || voice.deviceIntent.value?.enable === false
+      || Boolean(voice.sessionOperation.value)
+      || !remoteListeningRequested.value && voice.devices.value?.can_start !== true;
     return {
       state: runtimeState.value,
+      controlReady: isRemote.value ? !remoteDisabled : undefined,
       audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
-      sessionActive: listeningControlReady.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
+      sessionActive: listeningControlReady.value && (isRemote.value ? remoteListeningRequested.value
+        : listening.value || voice.inputPaused.value && voice.listeningRequested.value),
       sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
-      description: runtimeMeta.value.description,
-      action: voice.inputPaused.value
+      description: isRemote.value && recordingPhase.value === 'interrupted'
+        ? "本设备暂时没有送达音频，正在恢复麦克风采集。"
+        : runtimeMeta.value.description,
+      action: isRemote.value
+        ? voice.deviceIntent.value?.enable === false
+          ? "正在停止录制"
+          : !listeningControlReady.value
+            ? voice.devices.value?.active_device_id && voice.devices.value.active_device_id !== voice.devices.value.self_device_id
+              ? "语音输入由其他设备使用"
+              : "等待本设备语音通道"
+            : remoteListeningRequested.value
+              ? recordingPhase.value === 'idle' || recordingPhase.value === 'starting' ? "取消启动录制" : "停止当前会话"
+              : "开始语音会话"
+        : voice.inputPaused.value
         ? "系统切换中"
         : applicationSnapshot.value?.startup_complete === false || coreStarting.value
         ? "组件启动中"
         : coreUnavailable.value
         ? "查看本地组件"
         : !listeningControlReady.value && applicationSnapshot.value?.remote_mode
-          ? "等待服务端语音实时通道"
+          ? "等待本设备语音通道"
         : listeningControlReady.value
           ? listening.value
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: voice.inputPaused.value || remoteControlPending.value || Boolean(voice.sessionOperation.value) || loading.value || coreStarting.value
-        || applicationSnapshot.value?.startup_complete === false
-        || applicationSnapshot.value?.remote_mode === true && !listeningControlReady.value,
+      disabled: isRemote.value ? remoteDisabled
+        : voice.inputPaused.value || Boolean(voice.sessionOperation.value) || coreStarting.value
+          || applicationSnapshot.value?.startup_complete === false || loading.value,
       modeDisabled: !voiceReady.value || Boolean(voice.sessionOperation.value) || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false,
       canReset: voiceReady.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,

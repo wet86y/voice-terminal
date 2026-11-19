@@ -2,6 +2,7 @@ import type { ReasoningMode, SessionOperation } from "../types";
 
 /** WorkbenchModel（工作台呈现数据）：样例数据和业务状态使用同一模板。 */
 export interface WorkbenchModel {
+  controlReady?: boolean // controlReady（远程工作台与悬浮窗共用录制权限）。
   state: string; // state（运行状态）。
   sessionActive?: boolean; // sessionActive（会话是否进行中，等待阶段也保持开启）。
   audioLevels?: readonly number[]; // audioLevels（五个音频频带的归一化音量，范围 0 至 1；无数据时保持安静）。

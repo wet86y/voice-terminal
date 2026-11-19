@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
+from collections.abc import Callable
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,8 @@ class InteractionLease:
 class DeviceRegistry:
     """DeviceRegistry（设备注册表）：进程内串行化设备连接和手动切换。"""
 
-    def __init__(self) -> None:
+    def __init__(self, changed: Callable[[], None] = lambda: None) -> None:
+        self._changed = changed
         self._lock = RLock()
         self._devices: dict[str, DeviceConnection] = {}
         self._interaction_generation = 0
@@ -62,6 +64,7 @@ class DeviceRegistry:
                                           tuple(sorted(capabilities)))
             self._devices[device_id] = connection
             self._invalidate_device(device_id)
+            self._changed()
             return connection
 
     def disconnect(self, device_id: str, connection_generation: int) -> bool:
@@ -73,6 +76,7 @@ class DeviceRegistry:
             self._devices[device_id] = DeviceConnection(device_id, current.connection_generation,
                                                         current.executor_generation, False, current.capabilities)
             self._invalidate_device(device_id)
+            self._changed()
             return True
 
     def restart_executor(self, device_id: str, connection_generation: int) -> DeviceConnection:
@@ -85,6 +89,7 @@ class DeviceRegistry:
                                        True, current.capabilities)
             self._devices[device_id] = current
             self._invalidate_device(device_id)
+            self._changed()
             return current
 
     def _invalidate_device(self, device_id: str) -> None:
@@ -151,6 +156,7 @@ class DeviceRegistry:
             self._active = None
             self._pending = InteractionLease(device_id, self._interaction_generation,
                                              target.connection_generation, target.executor_generation)
+            self._changed()
             return self._pending
 
     def commit_switch(self, lease: InteractionLease) -> bool:
@@ -164,6 +170,7 @@ class DeviceRegistry:
                     or current.executor_generation != lease.executor_generation):
                 return False
             self._active, self._pending = lease, None
+            self._changed()
             return True
 
     def abort_switch(self, lease: InteractionLease) -> bool:
@@ -173,6 +180,7 @@ class DeviceRegistry:
                 return False
             self._pending = None
             self._interaction_generation += 1
+            self._changed()
             return True
 
     def accepts(self, lease: InteractionLease) -> bool:

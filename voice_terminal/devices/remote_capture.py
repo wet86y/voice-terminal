@@ -34,6 +34,8 @@ class RemoteAudioCapture:
     SAMPLE_RATE = 16_000  # SAMPLE_RATE（固定上行采样率，每秒采样数）。
     CHANNELS = 1  # CHANNELS（固定声道数）。
     FRAME_SAMPLES = 320  # FRAME_SAMPLES（20 毫秒帧的最大采样数）。
+    INITIAL_AUDIO_GRACE = 3.0
+    AUDIO_GAP_GRACE = 1.5
     QUEUE_FRAMES = 6  # QUEUE_FRAMES（远端待处理帧数上限）。
 
     def __init__(
@@ -59,6 +61,9 @@ class RemoteAudioCapture:
         self.ring_buffer = PcmRingBuffer(
             self.SAMPLE_RATE * self.CHANNELS * 2 * ring_buffer_ms // 1000
         )
+        self.changed = asyncio.Event()  # changed（采集指令或录制阶段变更，可合并）。
+        self._started_at = 0.0
+        self._last_audio_at: float | None = None
         self._running = False
         self._started = False
         self._stopped = asyncio.Event()
@@ -94,9 +99,15 @@ class RemoteAudioCapture:
         """closed（媒体输入已销毁）：监听暂停本身不销毁媒体连接。"""
         return self._closed
 
-    def enable_restart(self, factory: Callable[[str], PcmInputStream]) -> None:
-        """enable_restart（启用已协商的输入重建）：旧客户端继续采用原媒体控制契约。"""
-        self._restart_stream = factory
+    @property
+    def recording_phase(self) -> str:
+        """recording_phase（录制阶段）：首帧确认，短暂丢帧不改变界面。"""
+        if not self._running:
+            return "idle"
+        now = time.monotonic()
+        if self._last_audio_at is None:
+            return "starting" if now - self._started_at < self.INITIAL_AUDIO_GRACE else "interrupted"
+        return "recording" if now - self._last_audio_at < self.AUDIO_GAP_GRACE else "interrupted"
 
     @property
     def diagnostics(self) -> dict[str, int | float | str | None]:
@@ -133,6 +144,9 @@ class RemoteAudioCapture:
         self._stopped.clear()
         self._running = True
         self._started = True
+        self._started_at = time.monotonic()
+        self._last_audio_at = None
+        self.changed.set()
 
     async def stop(self) -> None:
         """stop（停止接收）：关闭租约绑定的流并清空尚未处理的旧帧。"""
@@ -140,6 +154,7 @@ class RemoteAudioCapture:
         self._stream.close()
         self._clear_pending_frames()
         self._stopped.set()
+        self.changed.set()
 
     async def close(self) -> None:
         """close（销毁媒体输入）：与可恢复的监听停止分开，旧连接永不重新启用。"""
@@ -148,9 +163,10 @@ class RemoteAudioCapture:
 
     def accept_frame(self, frame: MediaFrame) -> AudioFrame | None:
         """accept_frame（接纳帧）：先核验核心租约与设备时钟，再入队。"""
-        if self._restart_stream is not None and not self._closed and self._same_lease(frame):
-            if frame.stream_id in self._retired_streams or (not self._running and self._started
-                                                          and frame.stream_id == self.stream_id):
+        if (self._restart_stream is not None and not self._closed
+                and (frame.stream_id in self._retired_streams or (not self._running and self._started
+                                                                 and frame.stream_id == self.stream_id))):
+            if self._same_lease(frame):
                 return None  # 已结束输入的在途帧只能丢弃，不送入新一轮识别，也不误杀新流。
         if not self._running:
             raise RemoteAudioCaptureError("远端音频采集尚未启动或已停止。")
@@ -164,7 +180,14 @@ class RemoteAudioCapture:
             if (isinstance(audio.captured_at, bool) or not isinstance(audio.captured_at, (int, float))
                     or not math.isfinite(audio.captured_at)):
                 raise MediaProtocolError("远端音频采集时间无效。")
+            if audio.discontinuity_before:
+                self._clear_pending_frames()
+                self.ring_buffer.clear()
             self.ring_buffer.append(audio.pcm)
+            now = time.monotonic()
+            if self._last_audio_at is None or now - self._last_audio_at >= self.AUDIO_GAP_GRACE:
+                self.changed.set()
+            self._last_audio_at = now
             self._frames_received += 1
             self._bytes_received += len(audio.pcm)
             if self._on_audio_frame is not None:
@@ -190,6 +213,7 @@ class RemoteAudioCapture:
             self._clear_pending_frames()
             self.ring_buffer.clear()
             self._stopped.set()
+            self.changed.set()
             raise
 
     def _same_lease(self, frame: MediaFrame) -> bool:

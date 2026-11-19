@@ -96,6 +96,7 @@ class PcmPlayer:
         self._buffered_bytes = 0
         self._enqueued_bytes = 0
         self._played_bytes = 0
+        self._playback_generation = 0  # _playback_generation（清空或换轨后的播放代次）。
         self._last_callback_played_bytes = 0
         self._allowed_key: str | None = None
         self._held_key: str | None = None
@@ -700,7 +701,7 @@ class PcmPlayer:
         elapsed_ms = max(0.0, (time.monotonic() - self._last_callback_at) * 1000)
         submitted = self._last_callback_played_bytes or played
         output = submitted - self.device_latency_ms * bytes_per_ms + elapsed_ms * bytes_per_ms
-        return max(0, min(self._enqueued_bytes, int(output)))
+        return max(0, min(submitted, int(output)))
 
     def _empty_snapshot_unlocked(self, key: str | None) -> PlaybackSnapshot:
         return PlaybackSnapshot(key, 0, 0, 0, 0, False, time.monotonic(), "unknown", None)
@@ -976,6 +977,7 @@ class PcmPlayer:
         logger.info("audio.player_cleared turn_id=%s", turn_id)
 
     def _clear_unlocked(self) -> None:
+        self._playback_generation += 1
         self._chunks.clear()
         self._policy_blocked_key = None
         self._user_initiated_key = None
@@ -1012,6 +1014,7 @@ class PcmPlayer:
         """Wait for callback data and configured device tail to be output."""
         with self._queue_lock:
             active = self._active_turn
+            generation = self._playback_generation
         remote_key = self._remote_active_key or active
         if remote_key is not None and self._remote_is_bound is not None and self._remote_is_bound(remote_key):
             if self._remote_output_waiter is None:
@@ -1019,21 +1022,19 @@ class PcmPlayer:
                                              operation="wait_until_output_complete")
             await self._remote_output_waiter(remote_key, timeout_seconds)
             return
-        # Keep ``wait_until_empty`` as the compatibility seam used by older
-        # providers/tests, then account for the hardware tail when one is
-        # configured.  The queue becoming empty alone is still not treated as
-        # the device having finished.
-        await self.wait_until_empty(timeout_seconds)
-        if not self.device_latency_ms:
-            return
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
-        while asyncio.get_running_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
             with self._queue_lock:
+                if generation != self._playback_generation:
+                    raise AudioPlayerError("播放在输出完成前已停止或替换。")
                 remaining = self._enqueued_bytes - self._output_estimated_bytes_unlocked(self._played_bytes)
-            if remaining <= 0:
+                buffered = self._buffered_bytes
+            if not buffered and remaining <= 0:
                 return
+            if loop.time() >= deadline:
+                raise TimeoutError("播放未在期限内完成设备输出。")
             await asyncio.sleep(0.02)
-        raise TimeoutError("PCM playback did not reach the estimated device output position")
 
     def stop(self) -> None:
         self.clear()

@@ -81,8 +81,10 @@ class PcmInputStream:
                     or frame.executor_generation != self.lease.executor_generation
                     or frame.interaction_generation != self.lease.interaction_generation):
                 raise MediaProtocolError("音频帧设备、核心或交互代次不匹配。")
-            if frame.stream_id != self.stream_id or frame.sequence != self._next_sequence:
-                raise MediaProtocolError("音频流编号或帧序号不连续。")
+            if frame.stream_id != self.stream_id:
+                raise MediaProtocolError("音频流编号不匹配。")
+            if frame.sequence < self._next_sequence:
+                return None
             if frame.audio_codec != self.audio_codec:
                 raise MediaProtocolError("音频帧编解码模式与签名媒体握手不一致。")
             if not isinstance(frame.audio_processing, AudioProcessingStatus):
@@ -90,7 +92,7 @@ class PcmInputStream:
             processing = AudioProcessingStatus.from_wire(frame.audio_processing.to_wire())
             if (self._last_reverse_generation is not None
                     and processing.reverse_generation < self._last_reverse_generation):
-                raise MediaProtocolError("设备播放反向参考代次倒退，拒绝迟到处理状态。")
+                return None
             if (type(frame.start_sample) is not int or frame.start_sample < 0
                     or type(frame.sample_count) is not int or not 0 < frame.sample_count <= 320
                     or type(frame.device_time_us) is not int or frame.device_time_us < 0
@@ -102,13 +104,16 @@ class PcmInputStream:
             if self.audio_codec == "opus" and (frame.sample_count != 320
                     or not 0 < len(frame.payload) <= 1275):
                 raise MediaProtocolError("Opus 帧必须包含一个有效的 20 ms 单声道包。")
-            if frame.discontinuity_before:
-                raise MediaProtocolError("设备采集帧前存在采样缺口，必须重建音频流。")
-            if self._next_sample is not None and frame.start_sample != self._next_sample:
-                raise MediaProtocolError("音频采样位置不连续。")
+            gap = (frame.discontinuity_before or frame.sequence != self._next_sequence
+                   or self._next_sample is not None and frame.start_sample != self._next_sample)
+            if frame.device_time_us == 0 or self._next_sample is not None and frame.start_sample < self._next_sample:
+                return None
             if self._last_device_time is not None and frame.device_time_us <= self._last_device_time:
-                raise MediaProtocolError("设备采集时钟不连续。")
-            mapped = self._map_device_time(frame.device_time_us)
+                return None
+            try:
+                mapped = self._map_device_time(frame.device_time_us)
+            except ValueError:
+                return None  # 等待时钟续测，保留媒体及下行播放。
             uncertainty = None
             if isinstance(mapped, tuple):
                 if len(mapped) != 2:
@@ -119,11 +124,11 @@ class PcmInputStream:
                     raise MediaProtocolError("设备时钟误差无效。")
             else:
                 host_time = mapped
-            if (isinstance(host_time, bool) or not isinstance(host_time, (float, int))
-                    or not math.isfinite(host_time)
-                    or (self._last_host_time is not None and host_time <= self._last_host_time)):
+            if isinstance(host_time, bool) or not isinstance(host_time, (float, int)) or not math.isfinite(host_time):
                 raise MediaProtocolError("设备时钟无法映射到可信的主机时间。")
-            self._next_sequence += 1
+            if self._last_host_time is not None and host_time <= self._last_host_time:
+                return None
+            self._next_sequence = frame.sequence + 1
             self._next_sample = frame.start_sample + frame.sample_count
             self._last_device_time = frame.device_time_us
             self._last_host_time = float(host_time)
@@ -139,8 +144,16 @@ class PcmInputStream:
             if self._opus_decoder is None:
                 return AudioFrame(
                     frame.payload, frame.start_sample, float(host_time), self.clock_uncertainty_seconds,
-                    processing, processing_identity,
+                    processing, processing_identity, gap,
                 )
+            if gap and frame.sequence:
+                self._opus_decoder.close()
+                self._opus_decoder = OpusDecoder(16_000)
+                self._opus_pre_skip_remaining = 0
+                self._opus_buffer.clear()
+                self._opus_processing_chunks.clear()
+                self._opus_stream_start_sample = None
+                self._opus_output_samples = 0
             decoded = self._opus_decoder.decode(frame.payload)
             if not isinstance(decoded, bytes) or len(decoded) % 2:
                 raise MediaProtocolError("Opus 解码器返回了不完整的 PCM 采样。")
@@ -167,7 +180,7 @@ class PcmInputStream:
             output_processing = self._consume_opus_processing(320)
             return AudioFrame(
                 pcm, start_sample, captured_at, self._opus_uncertainty,
-                output_processing, processing_identity,
+                output_processing, processing_identity, gap,
             )
         except Exception:
             self.close()

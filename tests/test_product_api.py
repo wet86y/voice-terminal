@@ -198,7 +198,7 @@ class ProductApiTests(unittest.TestCase):
             assert device["connection_generation"] == device["executor_generation"] == 1
             assert set(device) == {
                 "device_id", "name", "connected", "connection_generation", "executor_generation",
-                "capabilities", "error", "interaction_active",
+                "capabilities", "error", "interaction_active", "media_ready", "recording_phase",
             }
             assert not any("key" in key.lower() or "credential" in key.lower() for key in payload)
             assert response.headers["cache-control"] == "no-store"
@@ -346,6 +346,96 @@ class ProductApiTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_realtime_device_status_and_stop_supersede_a_waiting_start(self) -> None:
+        async def scenario():
+            from unittest.mock import Mock
+
+            key = Ed25519PrivateKey.generate()
+            device_id = "voice-device"
+            self.runtime.device_trust_store.approve(device_id, self._ssh_public_key(key))
+            connection = await self.runtime.open_remote_device_session(device_id, ["audio_stream"])
+            query = {
+                "connection_generation": connection.connection_generation,
+                "executor_generation": connection.executor_generation,
+            }
+            path = "/v1/voice"
+            response = await self._gateway_request("POST", "/v1/challenge", json={
+                "protocol_version": 1, "device_id": device_id, "method": "GET", "path": path,
+            })
+            assert response.status_code == 200
+            challenge = response.json()
+            timestamp = time.time_ns() // 1_000_000
+            proof = device_request_proof_message(
+                method="GET", path=path, device_id=device_id, core_session_id=challenge["core_session_id"],
+                challenge=challenge["challenge"], timestamp_ms=timestamp, payload={"protocol_version": 1, **query},
+            )
+            headers = {
+                "host": "127.0.0.1:18765", "x-voice-terminal-device-id": device_id,
+                "x-voice-terminal-core-session-id": challenge["core_session_id"],
+                "x-voice-terminal-challenge": challenge["challenge"], "x-voice-terminal-timestamp-ms": str(timestamp),
+                "x-voice-terminal-signature": base64.b64encode(key.sign(proof)).decode("ascii"),
+            }
+            incoming = asyncio.Queue()
+            outgoing = asyncio.Queue()
+            scope = {
+                "type": "websocket", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "scheme": "ws", "root_path": "", "path": path, "raw_path": path.encode(),
+                "query_string": "&".join(f"{name}={value}" for name, value in query.items()).encode(),
+                "headers": [(key.encode(), value.encode()) for key, value in headers.items()],
+                "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 18765), "subprotocols": [],
+            }
+
+            async def command(name, request_id):
+                await incoming.put({"type": "websocket.receive", "text": json.dumps({
+                    "type": "command", "request_id": request_id, "command": name, "payload": {},
+                })})
+
+            async def receive(kind, request_id=None):
+                while True:
+                    raw = await asyncio.wait_for(outgoing.get(), timeout=2)
+                    assert raw["type"] == "websocket.send", raw
+                    message = json.loads(raw["text"])
+                    if message["type"] == kind and (request_id is None or message["payload"]["request_id"] == request_id):
+                        return message["payload"]
+
+            await incoming.put({"type": "websocket.connect"})
+            task = asyncio.create_task(self.app(scope, incoming.get, outgoing.put))
+            try:
+                assert (await asyncio.wait_for(outgoing.get(), timeout=2))["type"] == "websocket.accept"
+                await command("subscribe", "subscribe")
+                initial = await receive("devices.snapshot")
+                assert initial["self_device_id"] == device_id
+                assert next(row for row in initial["devices"] if row["device_id"] == device_id)["connected"]
+                await command("session.start", "standby")
+                assert (await receive("device.intent", "standby"))["result"] == "rejected"
+
+                registry = self.runtime.device_registry
+                lease = registry.prepare_switch(device_id, registry.generation)
+                assert registry.commit_switch(lease)
+                controller = Mock(start_listening=AsyncMock(), stop_listening=AsyncMock())
+                with patch.object(self.runtime, "remote_media_control_ready", return_value=True), \
+                     patch.object(self.runtime, "controller", controller):
+                    self.runtime.device_state_changed()
+                    selected = await receive("devices.snapshot")
+                    assert selected["active_device_id"] == device_id
+                    assert selected["revision"] > initial["revision"]
+                    revision = self.runtime._listen_stop_revision
+                    async with self.runtime._session_lock:
+                        await command("session.start", "start")
+                        await command("session.stop", "stop")
+                        async with asyncio.timeout(2):
+                            while self.runtime._listen_stop_revision == revision:
+                                await asyncio.sleep(0)
+                    assert (await receive("device.intent", "stop"))["result"] == "accepted"
+                    controller.stop_listening.assert_awaited_once()
+                    controller.start_listening.assert_not_awaited()
+                    assert not self.runtime.listening_intent_pending()
+            finally:
+                await incoming.put({"type": "websocket.disconnect", "code": 1000})
+                await asyncio.wait_for(task, timeout=2)
+
+        asyncio.run(scenario())
+
     def test_signed_remote_management_routes_allowlisted_reads_and_existing_settings_writes(self) -> None:
         async def scenario():
             private_key = Ed25519PrivateKey.generate()
@@ -407,32 +497,8 @@ class ProductApiTests(unittest.TestCase):
 
             with patch.object(self.runtime, "start_listening", new=AsyncMock()) as start_listening:
                 rejected = await management("voice.command", {"command": "session.start"})
-            assert rejected.status_code == 409  # 管理连通不能隐式打开本机或别的设备输入。
+            assert rejected.status_code == 422  # 远程录制控制使用已认证的实时连接。
             start_listening.assert_not_awaited()
-
-            async def start_accepted():
-                self.runtime.state.listening = True
-
-            with patch.object(self.runtime, "remote_media_control_ready", return_value=True) as media_ready, \
-                 patch.object(self.runtime, "start_listening", new=AsyncMock(side_effect=start_accepted)) as start_listening:
-                started = await management("voice.command", {"command": "session.start"})
-            assert started.status_code == 200
-            assert started.json()["status"] == 200
-            assert started.json()["body"]["result"] == "completed"
-            start_listening.assert_awaited_once_with()
-            media_ready.assert_called_once_with(device_id, generation)
-            self.runtime.state.listening = False
-            with patch.object(self.runtime, "remote_media_control_ready", return_value=True), \
-                 patch.object(self.runtime, "_listen_resume_requested", True), \
-                 patch.object(self.runtime, "start_listening", new=AsyncMock()):
-                deferred = await management("voice.command", {"command": "session.start"})
-            assert deferred.json()["status"] == 202
-            assert deferred.json()["body"]["result"] == "deferred"
-            with patch.object(self.runtime, "remote_media_control_ready", return_value=True), \
-                 patch.object(self.runtime, "start_listening", new=AsyncMock()):
-                failed_start = await management("voice.command", {"command": "session.start"})
-            assert failed_start.json()["status"] == 503
-            assert failed_start.json()["body"]["result"] == "failed"
 
             manual_task_body = {
                 "text": "远程服务端提醒", "at": "2026-11-17T12:00:00+08:00",

@@ -24,7 +24,8 @@ pub(super) const MAX_ACTIVE_REQUESTS: usize = 1; // MAX_ACTIVE_REQUESTS（每个
 pub(super) const MAX_SEEN_REQUESTS: usize = 4096; // MAX_SEEN_REQUESTS（单媒体租约去重的请求编号上限）。
 const MIN_AUDIO_OUTPUT_MS: u64 = 80; // MIN_AUDIO_OUTPUT_MS（有效音频输出的最短设备确认时长）。
 const OUTPUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100); // OUTPUT_PROGRESS_INTERVAL（实际输出进度回执间隔）。
-const OUTPUT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120); // OUTPUT_COMPLETION_TIMEOUT（等待真实设备输出完成的时限）。
+const OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(6); // OUTPUT_STALL_TIMEOUT（端点无输出进度的等待上限）。
+const OUTPUT_BUFFER_MS: u64 = 600; // OUTPUT_BUFFER_MS（客户端直放的目标储备，毫秒）。
 const MAX_CONTROL_BYTES: usize = 16 * 1024; // MAX_CONTROL_BYTES（含单次凭据的媒体直放控制消息上限）。
 const MAX_ALIGNMENT_BYTES: usize = 2048; // MAX_ALIGNMENT_BYTES（单条对齐数据的字节上限）。
 
@@ -603,6 +604,8 @@ async fn forward_events(
     if initial_progress.accepted_samples != request.playback_start_sample {
         return Err("客户端播放器接纳位置与固定播放事务的分段起点不一致。".into());
     }
+    let cancellation = handle.cancellation_handle();
+    let mut pending_samples = initial_progress.accepted_samples - initial_progress.played_samples;
 
     while !provider_terminal {
         tokio::select! {
@@ -619,7 +622,10 @@ async fn forward_events(
                         let samples = u64::try_from(pcm.len() / 2).map_err(|_| "MiniMax PCM 样本数溢出。")?;
                         generated_samples = generated_samples.checked_add(samples).ok_or("MiniMax PCM 样本位置溢出。")?;
                         for frame in framer.push(&pcm)? {
-                            enqueue_frame(playback, request, frame.sample_rate, frame.pcm).await?;
+                            if !enqueue_frame(playback, request, &cancellation, &mut pending_samples,
+                                frame.sample_rate, frame.pcm).await? {
+                                break;
+                            }
                         }
                     }
                     ClientTtsEvent::ProviderEvent { task_id, event, sample_cursor, sentence_index,
@@ -652,7 +658,10 @@ async fn forward_events(
                             return Err("MiniMax 文本段完成位置与实际 PCM 采样数不一致。".into());
                         }
                         if let Some(frame) = framer.finish() {
-                            enqueue_frame(playback, request, frame.sample_rate, frame.pcm).await?;
+                            if !enqueue_frame(playback, request, &cancellation, &mut pending_samples,
+                                frame.sample_rate, frame.pcm).await? {
+                                continue;
+                            }
                         }
                         if end_sample < minimum_samples(request.request.sample_rate) {
                             return Err("MiniMax 合成音频短于最小有效设备输出时长。".into());
@@ -691,8 +700,9 @@ async fn forward_events(
             }
             _ = progress_tick.tick() => {
                 if generated_samples > 0 {
-                    send_output_progress(playback, writer, identity, request, generated_samples,
+                    let progress = send_output_progress(playback, writer, identity, request, generated_samples,
                         &mut progress_sequence, &mut last_progress).await?;
+                    pending_samples = progress.accepted_samples - progress.played_samples;
                 }
             }
         }
@@ -703,9 +713,9 @@ async fn forward_events(
         .playback_start_sample
         .checked_add(total_samples)
         .ok_or("客户端播放事务结束采样位置溢出。")?;
-    let deadline = Instant::now() + OUTPUT_COMPLETION_TIMEOUT;
-    let mut last_device_progress = None;
-    loop {
+    let mut deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
+    let mut played_samples = request.playback_start_sample;
+    let progress = loop {
         let progress = send_output_progress(
             playback,
             writer,
@@ -721,15 +731,17 @@ async fn forward_events(
             && progress.buffered_samples == 0
             && progress.output_complete
         {
-            last_device_progress = Some(progress);
-            break;
+            break progress;
+        }
+        if progress.played_samples > played_samples {
+            played_samples = progress.played_samples;
+            deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
         }
         if Instant::now() >= deadline {
             return Err("客户端设备没有在时限内确认完整播放输出。".into());
         }
         tokio::time::sleep(OUTPUT_PROGRESS_INTERVAL).await;
-    }
-    let progress = last_device_progress.ok_or("客户端缺少设备输出进度回执。")?;
+    };
     let final_sample = permit.complete(total_samples)?;
     let mut completed = progress_json(&progress);
     completed["total_samples"] = json!(total_samples);
@@ -760,13 +772,42 @@ async fn forward_events(
 async fn enqueue_frame(
     playback: &DirectPlaybackCallbacks,
     request: &ParsedRequest,
+    cancellation: &MiniMaxTtsCancellation,
+    pending_samples: &mut u64,
     sample_rate: u32,
     pcm: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if pcm.is_empty() || pcm.len() % 2 != 0 {
         return Err("客户端拒绝空或不完整 PCM 帧，不创建静音补帧。".into());
     }
-    (playback.enqueue_pcm)(request.playback_key.clone(), sample_rate, pcm).await
+    let samples = (pcm.len() / 2) as u64;
+    let limit = u64::from(sample_rate) * OUTPUT_BUFFER_MS / 1_000;
+    let mut deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
+    while pending_samples.saturating_add(samples) > limit {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let progress = (playback.progress)(request.playback_key.clone(), sample_rate).await?;
+        validate_progress(&progress, &request.playback_key)?;
+        let pending = progress.accepted_samples - progress.played_samples;
+        if pending < *pending_samples {
+            deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
+        }
+        *pending_samples = pending;
+        if pending.saturating_add(samples) <= limit {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("客户端本轮播放储备未释放。".into());
+        }
+        tokio::time::sleep(OUTPUT_PROGRESS_INTERVAL).await;
+    }
+    if cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    (playback.enqueue_pcm)(request.playback_key.clone(), sample_rate, pcm).await?;
+    *pending_samples += samples;
+    Ok(true)
 }
 
 async fn send_output_progress(
@@ -895,7 +936,7 @@ fn base_message(identity: &MediaIdentity, kind: &str) -> Value {
 fn base_labels() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         ("type", "设备媒体控制消息类型"),
-        ("protocol_version", "设备媒体协议版本，必须为 2"),
+        ("protocol_version", "设备媒体协议版本，必须为 3"),
         ("device_id", "固定目标设备编号"),
         ("core_session_id", "权威核心运行编号"),
         ("connection_generation", "SSH 设备连接代次"),
@@ -1076,7 +1117,7 @@ mod tests {
 
     fn authorization() -> Value {
         let mut value = json!({
-            "type":"media.tts.authorize","protocol_version":2,"device_id":"client-a",
+            "type":"media.tts.authorize","protocol_version":4,"device_id":"client-a",
             "core_session_id":"core-a","connection_generation":2,"executor_generation":3,
             "interaction_generation":4,"stream_id":"media-a","authorization_id":"auth-a",
             "playback_key":"speech-a","provider":"minimax","ttl_ms":120000,
@@ -1088,7 +1129,7 @@ mod tests {
 
     fn request() -> Value {
         let mut value = json!({
-            "type":"media.tts.request","protocol_version":2,"device_id":"client-a",
+            "type":"media.tts.request","protocol_version":4,"device_id":"client-a",
             "core_session_id":"core-a","connection_generation":2,"executor_generation":3,
             "interaction_generation":4,"stream_id":"media-a","authorization_id":"auth-a",
             "playback_key":"speech-a","request_id":"request-a","segment_index":0,

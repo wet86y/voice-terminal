@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-from voice_terminal.audio.player import PcmPlayer
+from voice_terminal.audio.player import AudioPlayerError, PcmPlayer
 
 
 class PcmPlayerTests(unittest.TestCase):
@@ -44,8 +45,27 @@ class PcmPlayerTests(unittest.TestCase):
         self.assertEqual(after["played_ms"], 500)
         self.assertEqual(after["buffered_ms"], 500)
 
+    def test_output_estimate_never_passes_audio_submitted_to_callback(self) -> None:
+        player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None, device_latency_ms=100)
+        player.enqueue("speech", bytes(32_000))
+        with patch("voice_terminal.audio.player.time.monotonic", return_value=100):
+            player._callback(bytearray(640), 320, None, None)
+        with patch("voice_terminal.audio.player.time.monotonic", return_value=102):
+            snapshot = player.stop_and_snapshot("speech")
+        self.assertEqual((snapshot.enqueued_ms, snapshot.played_ms, snapshot.output_estimated_ms), (1000, 20, 20))
+
 
 class PcmPlayerRemoteOutputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stopping_a_local_queue_does_not_complete_its_output(self) -> None:
+        player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
+        player.enqueue("speech", bytes(32_000))
+        waiting = asyncio.create_task(player.wait_until_output_complete(1.0))
+        await asyncio.sleep(0)
+        snapshot = player.stop_and_snapshot("speech")
+        with self.assertRaisesRegex(AudioPlayerError, "已停止或替换"):
+            await waiting
+        self.assertEqual(snapshot.played_ms, 0)
+
     async def test_confirmed_pause_and_resume_route_to_the_playback_key_device(self) -> None:
         player = PcmPlayer(sample_rate=16_000, channels=1, output_device=None)
         transactions = SimpleNamespace(

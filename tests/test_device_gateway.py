@@ -108,7 +108,7 @@ def test_gateway_listener_allows_only_registered_websockets():
 
     guarded = LoopbackDeviceGatewayGuard(
         application, gateway_port=18765,
-        allowed_paths=frozenset({"/v1/status", "/v1/media", "/ws"}),
+        allowed_paths=frozenset({"/v1/status", "/v1/media", "/v1/voice"}),
     )
 
     async def invoke(path: str):
@@ -123,9 +123,9 @@ def test_gateway_listener_allows_only_registered_websockets():
         await guarded(_scope(18765, path=path, kind="websocket"), receive, send)
         return messages
 
-    # /ws（语音控制通道）与 /v1/media（媒体通道）都必须按登记放行：
+    # /v1/voice（认证语音控制通道）与 /v1/media（媒体通道）都必须按登记放行：
     # 远端语音转发经 SSH 固定桥接落到 18765，若此处拒绝则转发永远握手失败。
-    assert asyncio.run(invoke("/ws")) == [
+    assert asyncio.run(invoke("/v1/voice")) == [
         {"type": "websocket.accept", "subprotocol": None, "headers": []},
     ]
     assert asyncio.run(invoke("/v1/media")) == [
@@ -135,7 +135,8 @@ def test_gateway_listener_allows_only_registered_websockets():
     assert asyncio.run(invoke("/api/v1/product/snapshot")) == [
         {"type": "websocket.close", "code": 1008},
     ]
-    assert calls == ["/ws", "/v1/media"]
+    assert calls == ["/v1/voice", "/v1/media"]
+    assert asyncio.run(invoke("/ws")) == [{"type": "websocket.close", "code": 1008}]
 
 
 def test_gateway_listener_requires_explicit_registration_even_for_voice_websocket():
@@ -235,10 +236,10 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
             self.scope = {"query_string": query}
 
     payload = _device_media_open_payload(WebSocket(
-        b"protocol_version=2&stream_id=stream-a&connection_generation=2&executor_generation=3&interaction_generation=4",
+        b"protocol_version=4&stream_id=stream-a&connection_generation=2&executor_generation=3&interaction_generation=4",
     ))
     assert payload == {
-        "protocol_version": 2,
+        "protocol_version": 4,
         "stream_id": "stream-a",
         "connection_generation": 2,
         "executor_generation": 3,
@@ -247,9 +248,9 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
 
     from fastapi import HTTPException
     for query in (
-        b"protocol_version=2&protocol_version=2&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
+        b"protocol_version=4&protocol_version=4&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
         b"protocol_version=02&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1",
-        b"protocol_version=2&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1&unexpected=x",
+        b"protocol_version=4&stream_id=s&connection_generation=1&executor_generation=1&interaction_generation=1&unexpected=x",
     ):
         try:
             _device_media_open_payload(WebSocket(query))
@@ -260,10 +261,10 @@ def test_device_media_open_payload_rejects_duplicate_or_noncanonical_query_field
 
 
 def test_device_media_clock_response_requires_a_unique_exact_control_envelope():
-    valid = {"text": '{"type":"clock.sync.response","protocol_version":2,"sync_id":"sync-a",'
+    valid = {"text": '{"type":"clock.sync.response","protocol_version":4,"sync_id":"sync-a",'
                      '"device_receive_us":1000,"device_send_us":1100}'}
     assert _device_media_clock_response(valid, sync_id="sync-a") == (1000, 1100)
-    invalid = {"text": '{"type":"clock.sync.response","protocol_version":2,"sync_id":"sync-a",'
+    invalid = {"text": '{"type":"clock.sync.response","protocol_version":4,"sync_id":"sync-a",'
                        '"device_receive_us":1000,"device_receive_us":1000,"device_send_us":1100}'}
     try:
         _device_media_clock_response(invalid, sync_id="sync-a")

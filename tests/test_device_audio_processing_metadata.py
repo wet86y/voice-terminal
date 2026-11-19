@@ -196,10 +196,16 @@ def test_opus_stream_preserves_the_processing_state_for_each_decoded_frame(monke
     assert second.audio_processing.reverse_generation == 5
     assert second.audio_processing.near_end_voice is True
 
-    with pytest.raises(MediaProtocolError, match="代次倒退"):
-        stream.accept(_frame(
-            sequence=2, status=_status(reverse_generation=4), codec="opus", payload=b"\x33",
-        ))
+    assert stream.accept(_frame(
+        sequence=2, status=_status(reverse_generation=4), codec="opus", payload=b"\x33",
+    )) is None
+    recovered = stream.accept(_frame(
+        sequence=3, status=_status(reverse_generation=5), codec="opus", payload=b"\x44",
+    ))
+    assert recovered.discontinuity_before
+    assert recovered.pcm == b"\x44\x00" * 320
+    assert recovered.audio_processing.reverse_generation == 5
+    assert not stream.closed
 
 
 def test_remote_pcm_bypasses_host_processor_and_uses_frame_barge_in_evidence() -> None:

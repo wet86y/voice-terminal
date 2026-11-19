@@ -12,12 +12,62 @@ pub const MAX_PACKET_MS: u64 = 2_000; // MAX_PACKET_MS（单次播放数据包�
 /// PlaybackSnapshot（播放快照）：只报告音频端点设备时钟及有界本地队列事实。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PlaybackSnapshot {
+    #[serde(skip)]
+    enqueued_frames: u64, // enqueued_frames（采样快照对应的累计受理帧数）。
     pub enqueued_ms: u64,         // enqueued_ms（已受理播放时长，毫秒）。
     pub played_ms: u64,           // played_ms（已提交给 WASAPI 端点的内容时长，毫秒）。
     pub buffered_ms: u64,         // buffered_ms（端点与本地排队时长，毫秒）。
     pub output_estimated_ms: u64, // output_estimated_ms（端点时钟输出估计，毫秒）。
-    pub started: bool,            // started（设备时钟是否已开始推进）。
+    pub started: bool,            // started（是否已有音频内容通过设备端点）。
     pub device_time_us: u64,      // device_time_us（设备时钟对应的 QPC 时刻，微秒）。
+}
+
+/// EndpointContent（端点内容进度）：用设备实际消费位置计算音频帧，排除补入的静音。
+#[cfg(any(windows, test))]
+struct EndpointContent {
+    written_frames: u64,
+    submitted_frames: u64,
+    output_frames: u64,
+    pending: VecDeque<(u64, u64)>,
+}
+
+#[cfg(any(windows, test))]
+impl EndpointContent {
+    fn with_initial_silence(frames: u64) -> Self {
+        Self {
+            written_frames: frames,
+            submitted_frames: 0,
+            output_frames: 0,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn advance(&mut self, padding_frames: u64) {
+        let consumed = self.written_frames.saturating_sub(padding_frames);
+        while let Some((start, end)) = self.pending.front_mut() {
+            let through = consumed.min(*end);
+            if through <= *start {
+                break;
+            }
+            self.output_frames += through - *start;
+            *start = through;
+            if through == *end {
+                self.pending.pop_front();
+            }
+        }
+    }
+
+    fn submit(&mut self, buffer_frames: u64, content_frames: u64) {
+        if content_frames > 0 {
+            let end = self.written_frames + content_frames;
+            match self.pending.back_mut() {
+                Some((_, previous_end)) if *previous_end == self.written_frames => *previous_end = end,
+                _ => self.pending.push_back((self.written_frames, end)),
+            }
+            self.submitted_frames += content_frames;
+        }
+        self.written_frames += buffer_frames;
+    }
 }
 
 /// PlaybackReplacementProgress（替换状态）：只跨 IPC 传编号、时钟与结算字段。
@@ -936,6 +986,7 @@ mod windows_render {
             let queue = Arc::new(Mutex::new(Pcm16RenderQueue::default()));
             let thread_queue = queue.clone();
             let snapshot = Arc::new(Mutex::new(PlaybackSnapshot {
+                enqueued_frames: 0,
                 enqueued_ms: 0,
                 played_ms: 0,
                 buffered_ms: 0,
@@ -946,8 +997,6 @@ mod windows_render {
             let thread_snapshot = snapshot.clone();
             let total_enqueued_frames = Arc::new(AtomicU64::new(0));
             let thread_total_enqueued_frames = total_enqueued_frames.clone();
-            let total_submitted_frames = Arc::new(AtomicU64::new(0));
-            let thread_total_submitted_frames = total_submitted_frames.clone();
             let terminal_error = Arc::new(Mutex::new(None));
             let thread_error = terminal_error.clone();
             let (control_sender, control_receiver) = mpsc::sync_channel(1);
@@ -963,7 +1012,6 @@ mod windows_render {
                         thread_queue,
                         thread_snapshot,
                         thread_total_enqueued_frames,
-                        thread_total_submitted_frames,
                         control_receiver,
                         thread_paused,
                         &ready_tx,
@@ -1072,10 +1120,16 @@ mod windows_render {
         /// snapshot（读取播放快照）：仅读取线程缓存，不同步查询 COM 或设备。
         pub fn snapshot(&self) -> Result<PlaybackSnapshot, String> {
             self.check_terminal_error()?;
-            self.snapshot
+            let mut snapshot = self.snapshot
                 .lock()
                 .map(|snapshot| *snapshot)
-                .map_err(|_| "播放快照状态不可用".into())
+                .map_err(|_| "播放快照状态不可用")?;
+            let enqueued = self.total_enqueued_frames.load(Ordering::Acquire);
+            let new_frames = enqueued.saturating_sub(snapshot.enqueued_frames);
+            let rate = u64::from(self.output_format.sample_rate);
+            snapshot.enqueued_ms = enqueued * 1_000 / rate;
+            snapshot.buffered_ms += (new_frames * 1_000).div_ceil(rate);
+            Ok(snapshot)
         }
 
         /// pause（暂停）：在 WASAPI 所属线程停止端点时钟并等待确认。
@@ -1251,7 +1305,6 @@ mod windows_render {
         event: AudioEvent,
         format: CaptureFormat,
         buffer_frames: u32,
-        clock_frequency: u64,
         endpoint_id: String, // endpoint_id（当前播放流绑定的 Windows 端点编号）。
     }
 
@@ -1260,7 +1313,6 @@ mod windows_render {
         queue: Arc<Mutex<Pcm16RenderQueue>>,
         snapshot: Arc<Mutex<PlaybackSnapshot>>,
         total_enqueued_frames: Arc<AtomicU64>,
-        total_submitted_frames: Arc<AtomicU64>,
         control_receiver: mpsc::Receiver<RenderControl>,
         paused: Arc<AtomicBool>,
         ready: &mpsc::SyncSender<Result<CaptureFormat, String>>,
@@ -1281,6 +1333,7 @@ mod windows_render {
             return Err("播放启动等待方已退出".into());
         }
         let mut result = Ok(());
+        let mut content = EndpointContent::with_initial_silence(u64::from(session.buffer_frames));
         let mut paused_on_audio_thread = false;
         let mut control_faulted = false;
         let mut next_endpoint_check = std::time::Instant::now() + Duration::from_millis(500);
@@ -1356,7 +1409,7 @@ mod windows_render {
                 &queue,
                 &snapshot,
                 &total_enqueued_frames,
-                &total_submitted_frames,
+                &mut content,
             ) {
                 result = Err(error);
                 break;
@@ -1421,10 +1474,8 @@ mod windows_render {
                 .map_err(|error| format!("获取 WASAPI 设备时钟失败：{error}"))?;
             let buffer_frames = unsafe { client.GetBufferSize() }
                 .map_err(|error| format!("读取 WASAPI 输出缓冲容量失败：{error}"))?;
-            let clock_frequency = unsafe { clock.GetFrequency() }
-                .map_err(|error| format!("读取 WASAPI 设备时钟频率失败：{error}"))?;
-            if clock_frequency == 0 || buffer_frames == 0 {
-                return Err("WASAPI 输出缓冲或设备时钟频率无效".into());
+            if buffer_frames == 0 {
+                return Err("WASAPI 输出缓冲容量无效".into());
             }
             if stop.load(Ordering::Acquire) {
                 return Err("WASAPI 播放启动已取消".into());
@@ -1437,7 +1488,6 @@ mod windows_render {
                 event,
                 format,
                 buffer_frames,
-                clock_frequency,
                 endpoint_id,
             };
             prime_silence(&mut session)?;
@@ -1477,11 +1527,12 @@ mod windows_render {
         queue: &Mutex<Pcm16RenderQueue>,
         snapshot: &Mutex<PlaybackSnapshot>,
         total_enqueued_frames: &AtomicU64,
-        total_submitted_frames: &AtomicU64,
+        content: &mut EndpointContent,
     ) -> Result<(), String> {
         let padding = unsafe { session.client.GetCurrentPadding() }.map_err(|error| {
             crate::device_audio::format_wasapi_error("读取 WASAPI 输出储备失败", error)
         })?;
+        content.advance(u64::from(padding));
         let available = session.buffer_frames.saturating_sub(padding);
         if available > 0 {
             let data = unsafe { session.renderer.GetBuffer(available) }.map_err(|error| {
@@ -1519,7 +1570,7 @@ mod windows_render {
                 });
             let filled_frames = fill_result?;
             released?;
-            total_submitted_frames.fetch_add(filled_frames as u64, Ordering::AcqRel);
+            content.submit(u64::from(available), filled_frames as u64);
         }
         let mut device_position = 0_u64;
         let mut qpc_position = 0_u64;
@@ -1532,23 +1583,21 @@ mod windows_render {
             crate::device_audio::format_wasapi_error("读取 WASAPI 设备时钟失败", error)
         })?;
         let output_rate = session.format.sample_rate as u64;
-        let played_ms = total_submitted_frames.load(Ordering::Acquire) * 1_000 / output_rate;
-        let output_estimated_ms = (device_position as u128 * 1_000
-            / session.clock_frequency as u128)
-            .min(u64::MAX as u128) as u64;
-        let queued_frames = {
+        let played_ms = content.submitted_frames * 1_000 / output_rate;
+        let output_estimated_ms = content.output_frames * 1_000 / output_rate;
+        let (queued_frames, enqueued_frames) = {
             let mut queue = queue.lock().map_err(|_| "播放队列状态不可用")?;
             queue.update_output_progress(output_estimated_ms, qpc_position / 10);
-            queue.queued_frames()
+            (queue.queued_frames(), total_enqueued_frames.load(Ordering::Acquire))
         };
-        let buffered_ms = (padding as u64 + queued_frames) * 1_000 / output_rate;
-        let enqueued_ms = total_enqueued_frames.load(Ordering::Acquire) * 1_000 / output_rate;
+        let buffered_frames = content.submitted_frames - content.output_frames + queued_frames;
         let next = PlaybackSnapshot {
-            enqueued_ms,
+            enqueued_frames,
+            enqueued_ms: enqueued_frames * 1_000 / output_rate,
             played_ms,
-            buffered_ms,
+            buffered_ms: (buffered_frames * 1_000).div_ceil(output_rate),
             output_estimated_ms,
-            started: output_estimated_ms > 0,
+            started: content.output_frames > 0,
             device_time_us: qpc_position / 10,
         };
         *snapshot.lock().map_err(|_| "播放快照状态不可用")? = next;
@@ -1562,6 +1611,26 @@ pub use windows_render::WasapiRenderStream;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_progress_counts_only_consumed_content_across_silence() {
+        let mut endpoint = EndpointContent::with_initial_silence(480);
+        endpoint.advance(240);
+        endpoint.submit(240, 100);
+        assert_eq!(endpoint.output_frames, 0);
+        endpoint.advance(200);
+        assert_eq!(endpoint.output_frames, 40);
+        endpoint.advance(0);
+        assert_eq!(endpoint.output_frames, 100);
+        endpoint.submit(240, 0);
+        endpoint.advance(0);
+        assert_eq!(endpoint.output_frames, 100);
+        endpoint.submit(240, 40);
+        endpoint.advance(200);
+        assert_eq!(endpoint.output_frames, 140);
+        assert_eq!(endpoint.submitted_frames, 140);
+        assert!(endpoint.pending.is_empty());
+    }
 
     fn format(rate: u32, channels: u16, encoding: SampleEncoding) -> CaptureFormat {
         let bytes = match encoding {

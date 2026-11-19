@@ -784,19 +784,12 @@ class EpisodeController(RealtimeController):
             open_input_scope = getattr(self.episode, "open_input_scope", None)
             if callable(open_input_scope):
                 open_input_scope()
-        # Warm the shared DeepSeek transport on session activation.  This is
-        # only a lightweight /models request (DNS/TCP/TLS/auth connection
-        # reuse); it never starts model inference or consumes a scheduler
-        # slot.  A slow/unavailable prewarm must not block microphone start.
         prewarm = getattr(self.llm, "prewarm", None)
-        if callable(prewarm):
-            try:
-                await asyncio.wait_for(prewarm(), timeout=2.0)
-                await self.episode.log("LLM_PREWARM_READY")
-            except asyncio.TimeoutError:
-                await self.episode.log("LLM_PREWARM_FALLBACK", reason="timeout")
-            except Exception as exc:
-                await self.episode.log("LLM_PREWARM_FALLBACK", reason=str(exc)[:200])
+        task = getattr(self, "_llm_prewarm_task", None)
+        if not was_listening and callable(prewarm) and (task is None or task.done()):
+            self._llm_prewarm_task = asyncio.create_task(
+                self._prewarm_listening_transport(prewarm, self.episode), name="voice-listening-prewarm",
+            )
         await super().start_listening()
         if not was_listening and self.state.listening:
             self._ensure_speaker_policy()
@@ -805,6 +798,16 @@ class EpisodeController(RealtimeController):
             if self.quiet_policy is not None:
                 self.quiet_policy.user_interaction = True
             await self.episode.arm_silence_window(f"manual-start-{uuid4().hex}", anchor_source="manual_start")
+
+    async def _prewarm_listening_transport(self, prewarm, episode) -> None:
+        """复用主模型连接，独立于麦克风启动。"""
+        try:
+            await asyncio.wait_for(prewarm(), timeout=2.0)
+            await episode.log("LLM_PREWARM_READY")
+        except asyncio.TimeoutError:
+            await episode.log("LLM_PREWARM_FALLBACK", reason="timeout")
+        except Exception as exc:
+            await episode.log("LLM_PREWARM_FALLBACK", reason=str(exc)[:200])
 
     async def accept_shadow_events(self, events) -> None:
         for item in events:
@@ -1802,6 +1805,10 @@ class EpisodeController(RealtimeController):
 
     async def close(self):
         self._input_resetting = True  # 关闭期间不允许建立新的用户输入。
+        prewarm = getattr(self, "_llm_prewarm_task", None)
+        if prewarm is not None:
+            prewarm.cancel()
+            await asyncio.gather(prewarm, return_exceptions=True)
         self._cancel_tts_hold_fallback()
         self._ensure_speaker_policy()
         self._activation_generation = getattr(self, "_activation_generation", 0) + 1

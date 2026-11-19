@@ -228,7 +228,7 @@ struct DeviceGatewayChallenge {
 
 struct ConnectedDeviceSession {
     connection: SshDeviceConnection, // connection（已固定主机身份的 SSH 通道，只发送控制、媒体与文件标记）。
-    management: Option<SshDeviceConnection>, // management（独立管理连接的专用 SSH 通道，只发送管理标记）：同一连接混用标记会被复用共用的原始命令挤占。
+    management: tokio::sync::Mutex<Option<SshDeviceConnection>>, // management（独立管理连接的专用 SSH 通道，只发送管理标记）：同一连接混用标记会被复用共用的原始命令挤占。
     device_id: String,               // device_id（当前远端客户端稳定编号）。
     identity_credential_ref: String, // identity_credential_ref（产品设备签名身份引用）。
     transport_credential_ref: String, // transport_credential_ref（独立文件传输连接复用的凭据引用）。
@@ -241,11 +241,13 @@ struct ConnectedDeviceSession {
 
 impl ConnectedDeviceSession {
     /// close（关闭）：控制通道与独立管理通道分别结束；管理连接关闭失败不改写控制通道的结论。
-    async fn close(self) -> Result<(), String> {
-        if let Some(management) = self.management {
+    async fn close(&self) -> Result<(), String> {
+        let result = self.connection.close().await;
+        let management = self.management.try_lock().ok().and_then(|mut slot| slot.take());
+        if let Some(management) = management {
             let _ = management.close().await;
         }
-        self.connection.close().await
+        result
     }
 }
 
@@ -349,27 +351,13 @@ pub struct SshMediaChannel {
     pub capture_active: bool,              // capture_active（主机当前是否已启动远端采集）。
 }
 
-/// media_ready_codecs（就绪回执编码协商）：旧 PCM 主机兼容，拒绝部分或类型错误的扩展字段。
+/// media_ready_codecs（就绪回执编码协商）：解析双方已签名约定的编解码参数。
 fn media_ready_codecs(
     value: &serde_json::Value,
 ) -> Result<(AudioCodec, AudioCodec, u32, u32), String> {
     let object = value
         .as_object()
         .ok_or("主机媒体就绪回执必须是 JSON 对象。")?;
-    let fields = ["uplink_codec", "downlink_codec", "encoder_pre_skip_samples"];
-    let present = fields
-        .iter()
-        .filter(|field| object.contains_key(**field))
-        .count();
-    if present == 0 {
-        if object.contains_key("downlink_encoder_pre_skip_samples") {
-            return Err("主机媒体就绪回执只包含下行编码预延迟字段。".into());
-        }
-        return Ok((AudioCodec::Pcm, AudioCodec::Pcm, 0, 0));
-    }
-    if present != fields.len() {
-        return Err("主机媒体就绪回执只包含部分编码协商字段。".into());
-    }
     let codec = |name: &str| -> Result<AudioCodec, String> {
         match object.get(name).and_then(serde_json::Value::as_str) {
             Some("pcm") => Ok(AudioCodec::Pcm),
@@ -384,13 +372,10 @@ fn media_ready_codecs(
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or("主机媒体就绪回执的 Opus 编码预延迟字段无效。")?;
-    let downlink_pre_skip = match object.get("downlink_encoder_pre_skip_samples") {
-        None => 0,
-        Some(value) => value
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("主机媒体就绪回执的下行 Opus 编码预延迟字段无效。")?,
-    };
+    let downlink_pre_skip = object.get("downlink_encoder_pre_skip_samples")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("主机媒体就绪回执的下行 Opus 编码预延迟字段无效。")?;
     if pre_skip > 320
         || (uplink == AudioCodec::Pcm && pre_skip != 0)
         || (uplink == AudioCodec::Opus && pre_skip == 0)
@@ -456,13 +441,14 @@ impl SshMediaChannel {
         self.websocket.receive_message().await
     }
 
-    /// synchronize_clock（同步设备时钟）：响应服务端五轮往返测量并核验媒体租约。
+    /// synchronize_clock（同步设备时钟）：首个可信样本后就绪，其余测量在运行期完成。
     pub async fn synchronize_clock<F, Fut>(&mut self, mut clock_now: F) -> Result<(), String>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<u64, String>>,
     {
-        for _ in 0..5 {
+        let mut samples = 0;
+        let ready = loop {
             let message = match self.receive().await? {
                 SshMediaMessage::Text(value) => {
                     serde_json::from_str::<serde_json::Value>(&value)
@@ -479,6 +465,11 @@ impl SshMediaChannel {
             let object = message
                 .as_object()
                 .ok_or("主机时钟同步控制消息必须是 JSON 对象。")?;
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("media.ready")
+                && samples > 0
+            {
+                break message;
+            }
             if object.get("type").and_then(serde_json::Value::as_str)
                     != Some("clock.sync.request")
                 || object
@@ -506,15 +497,7 @@ impl SshMediaChannel {
             }
             let _ = sync_id;
             self.send_text(&media_clock_response(&message, device_receive_us, device_send_us)?).await?;
-        }
-        let ready = match self.receive().await? {
-            SshMediaMessage::Text(value) => serde_json::from_str::<serde_json::Value>(&value)
-                .map_err(|_| "主机媒体就绪回执不是有效 JSON。".to_string())?,
-            SshMediaMessage::Closed => return Err("主机在媒体就绪前关闭通道。".into()),
-            SshMediaMessage::Binary(_) => return Err("主机在媒体就绪期间发送了二进制帧。".into()),
-            SshMediaMessage::Ping(_) | SshMediaMessage::Pong(_) => {
-                return Err("主机媒体就绪前连续发送了非控制负载帧。".into());
-            }
+            samples += 1;
         };
         let object = ready
             .as_object()
@@ -580,7 +563,7 @@ impl SshMediaChannel {
 
     /// close（关闭媒体通道）：先结束 WebSocket，再断开独立 SSH 会话。
     pub async fn close(mut self) -> Result<(), String> {
-        let _ = self.websocket.send_close().await;
+        let _ = tokio::time::timeout(Duration::from_millis(250), self.websocket.send_close()).await;
         self._connection.close().await
     }
 
@@ -611,11 +594,8 @@ pub fn media_clock_response(request: &serde_json::Value, device_receive_us: u64,
     }
     let sync_id = request.get("sync_id").and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 128).ok_or("媒体时钟测量编号无效。")?;
-    let mut response = serde_json::json!({"type":"clock.sync.response","protocol_version":MEDIA_PROTOCOL_VERSION,
+    let response = serde_json::json!({"type":"clock.sync.response","protocol_version":MEDIA_PROTOCOL_VERSION,
         "sync_id":sync_id,"device_receive_us":device_receive_us,"device_send_us":device_send_us});
-    if request.get("fields").and_then(|fields| fields.get("runtime_controls")).is_some() {
-        response["runtime_controls"] = serde_json::json!(true);
-    }
     Ok(response.to_string())
 }
 
@@ -1019,7 +999,7 @@ fn encode_websocket_upgrade_request(
 ) -> Result<Vec<u8>, String> {
     validate_gateway_auth_headers(auth)?;
     if path_and_query.len() > 2048
-        || !path_and_query.starts_with("/v1/media?")
+        || !(path_and_query.starts_with("/v1/media?") || path_and_query.starts_with("/v1/voice?"))
         || !path_and_query.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'/' | b'_' | b'-' | b'.' | b':' | b'?' | b'&' | b'=')
@@ -1665,7 +1645,7 @@ impl SshDeviceConnection {
 
     /// post_json（提交控制请求）：经固定 SSH exec（远程执行）桥接进入主机回环网关。
     pub async fn post_json(
-        &mut self,
+        &self,
         path: &str,
         body: &serde_json::Value,
         timeout: Duration,
@@ -1674,7 +1654,7 @@ impl SshDeviceConnection {
     }
 
     async fn post_json_with_auth(
-        &mut self,
+        &self,
         path: &str,
         body: &serde_json::Value,
         auth: Option<&DeviceGatewayAuthHeaders>,
@@ -1828,7 +1808,7 @@ impl SshDeviceConnection {
     }
 
     /// close（关闭）：显式关闭 SSH 会话，不迁移或重放未确认任务。
-    pub async fn close(self) -> Result<(), String> {
+    pub async fn close(&self) -> Result<(), String> {
         self.handle
             .disconnect(Disconnect::ByApplication, "device session closed", "")
             .await
@@ -1840,11 +1820,16 @@ impl SshDeviceConnection {
 #[derive(Default)]
 pub struct SshDeviceManager {
     key_root: Mutex<Option<PathBuf>>, // key_root（当前工作区的项目私钥目录根；不使用用户目录）。
-    connection: tokio::sync::Mutex<Option<ConnectedDeviceSession>>, // connection（当前 SSH 与产品设备身份绑定会话）。
+    connection: tokio::sync::Mutex<Option<Arc<ConnectedDeviceSession>>>, // connection（当前 SSH 与产品设备身份绑定会话）。
     active_lease: tokio::sync::Mutex<Option<RemoteDeviceSessionLease>>, // active_lease（当前任务通道确认的设备连接与执行器代次）。
 }
 
 impl SshDeviceManager {
+    async fn current_session(&self) -> Result<Arc<ConnectedDeviceSession>, String> {
+        self.connection.lock().await.clone()
+            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())
+    }
+
     pub fn set_key_root(&self, data: &Path) -> Result<(), String> {
         *self
             .key_root
@@ -1897,7 +1882,7 @@ impl SshDeviceManager {
                 .await?;
         let session = ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: device_id.to_string(),
             identity_credential_ref: identity_credential_ref.to_string(),
             transport_credential_ref: login_credential_ref.to_string(),
@@ -1909,7 +1894,7 @@ impl SshDeviceManager {
         };
         let old = {
             let mut slot = self.connection.lock().await;
-            slot.replace(session)
+            slot.replace(Arc::new(session))
         };
         if let Some(old) = old {
             let _ = old.close().await;
@@ -1939,7 +1924,7 @@ impl SshDeviceManager {
             SshDeviceConnection::connect(target.clone(), transport_private_key, timeout).await?;
         let session = ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: device_id.to_owned(),
             identity_credential_ref,
             transport_credential_ref: "test-only-transport-identity".into(),
@@ -1947,7 +1932,7 @@ impl SshDeviceManager {
             signing_key_for_test: Some(Zeroizing::new(signing_private_key.to_owned())),
             transport_key_for_test: Some(Zeroizing::new(transport_private_key.to_owned())),
         };
-        let old = self.connection.lock().await.replace(session);
+        let old = self.connection.lock().await.replace(Arc::new(session));
         if let Some(old) = old {
             let _ = old.close().await;
         }
@@ -1969,10 +1954,7 @@ impl SshDeviceManager {
         {
             return Err("远程管理请求编号或服务端目标编号无效。".into());
         }
-        let mut slot = self.connection.lock().await;
-        let session = slot
-            .as_mut()
-            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+        let session = self.current_session().await?;
         let open_request = RemoteManagementOpenRequest {
             protocol_version: DEVICE_MANAGEMENT_PROTOCOL_VERSION,
             request_id: random_hex_id(),
@@ -2008,26 +1990,16 @@ impl SshDeviceManager {
         // 独立管理连接：微软 Win32 OpenSSH 可能在同一条连接上沿用首个 SSH_ORIGINAL_COMMAND
         // （原始命令标记）；与管理租约共用连接会让后续控制通道被送进管理 JSON 解析器。
         // 这里只更换承载连接，管理租约、通道复用与逐次信任核验都保留在管理通道内。
-        let login_private_key = load_session_transport_key(self, session)?;
+        let login_private_key = load_session_transport_key(self, &session)?;
         let target = session.target.clone();
-        if session
-            .management
-            .as_ref()
-            .is_none_or(SshDeviceConnection::is_closed)
-        {
-            session.management = Some(
-                SshDeviceConnection::connect(target, login_private_key.as_str(), timeout).await?,
-            );
+        let mut slot = session.management.lock().await;
+        if slot.as_ref().is_none_or(SshDeviceConnection::is_closed) {
+            *slot = Some(SshDeviceConnection::connect(target, login_private_key.as_str(), timeout).await?);
         }
-        let management = session
-            .management
-            .as_mut()
-            .ok_or_else(|| "独立管理 SSH 连接不可用。".to_string())?;
-        let result = management
-            .management_exchange(&open_request, &request, timeout)
-            .await;
+        let management = slot.as_mut().ok_or("独立管理 SSH 连接不可用。")?;
+        let result = management.management_exchange(&open_request, &request, timeout).await;
         if management.is_closed() {
-            session.management = None;
+            *slot = None;
         }
         result
     }
@@ -2055,24 +2027,6 @@ impl SshDeviceManager {
             .set_nodelay(true)
             .map_err(|_| "无法配置本机语音 WebSocket 套接字。".to_string())?;
         let relay = async {
-            let (target, credential_ref) = {
-                let slot = self.connection.lock().await;
-                let session = slot
-                    .as_ref()
-                    .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
-                (
-                    session.target.clone(),
-                    session.transport_credential_ref.clone(),
-                )
-            };
-            let private_key = self.load_key(&credential_ref)?;
-            let connection = SshDeviceConnection::connect(
-                target.clone(),
-                private_key.as_str(),
-                Duration::from_secs(20),
-            )
-            .await?;
-            let mut upstream = connection.open_fixed_bridge(CONTROL_BRIDGE_MARKER).await?;
             let local_header = read_http_header_bounded(
                 &mut local_stream,
                 MAX_HEADER_BYTES,
@@ -2080,15 +2034,38 @@ impl SshDeviceManager {
             )
             .await?;
             let key = local_voice_upgrade_key(&local_header, token)?;
-            let request = format!(
-                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-                target.gateway_port, key,
-            );
+            let session = self.current_session().await?;
+            let lease = self.active_lease.lock().await.clone().ok_or("设备任务会话尚未就绪。")?;
+            if lease.device_id != session.device_id {
+                return Err("语音控制连接与任务设备不匹配。".into());
+            }
+            let transport_key = load_session_transport_key(self, &session)?;
+            let connection = SshDeviceConnection::connect(
+                session.target.clone(), transport_key.as_str(), Duration::from_secs(8),
+            ).await?;
+            let path = "/v1/voice";
+            let body = serde_json::json!({
+                "protocol_version": 1,
+                "connection_generation": lease.connection_generation,
+                "executor_generation": lease.executor_generation,
+            });
+            let (challenge, auth) = self.authorize_gateway(
+                &session, &connection, "GET", path, &body, Duration::from_secs(5),
+            ).await?.map_err(|_| "主机未签发语音实时连接挑战。".to_string())?;
+            if challenge.core_session_id != lease.core_session_id {
+                return Err("服务端语音核心已重启，正在等待新的任务会话。".into());
+            }
+            let request = encode_websocket_upgrade_request(
+                &format!("{path}?connection_generation={}&executor_generation={}",
+                    lease.connection_generation, lease.executor_generation),
+                &auth, &key, session.target.gateway_port,
+            )?;
+            let mut upstream = connection.open_fixed_bridge(CONTROL_BRIDGE_MARKER).await?;
             if request.len() > MAX_HEADER_BYTES {
                 return Err("固定服务端语音 WebSocket 握手超过长度上限。".into());
             }
             upstream
-                .write_all(request.as_bytes())
+                .write_all(&request)
                 .await
                 .map_err(|_| "SSH 语音 WebSocket 握手请求写入失败。".to_string())?;
             upstream
@@ -2154,7 +2131,7 @@ impl SshDeviceManager {
             )
         };
         let private_key = self.load_key(&transport_credential_ref)?;
-        let mut connection =
+        let connection =
             SshDeviceConnection::connect(target, private_key.as_str(), Duration::from_secs(20))
                 .await?;
         let transfer = async {
@@ -2185,10 +2162,6 @@ impl SshDeviceManager {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<GatewayResponse, String> {
-        let mut slot = self.connection.lock().await;
-        let session = slot
-            .as_mut()
-            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
         if !matches!(
             path,
             "/v1/status"
@@ -2205,40 +2178,40 @@ impl SshDeviceManager {
         ) {
             return Err("当前 SSH 客户端只开放已登记的设备状态和任务通道接口。".into());
         }
+        let session = self.current_session().await?;
+        let connection = &session.connection;
+        match self.authorize_gateway(&session, connection, "POST", path, body, timeout).await? {
+            Ok((_, auth)) => connection.post_json_with_auth(path, body, Some(&auth), timeout).await,
+            Err(response) => Ok(response),
+        }
+    }
+
+    async fn authorize_gateway(
+        &self, session: &ConnectedDeviceSession, connection: &SshDeviceConnection,
+        method: &str, path: &str, body: &serde_json::Value, timeout: Duration,
+    ) -> Result<Result<(DeviceGatewayChallenge, DeviceGatewayAuthHeaders), GatewayResponse>, String> {
         let challenge_body = serde_json::json!({
             "protocol_version": 1,
             "device_id": session.device_id,
-            "method": "POST",
+            "method": method,
             "path": path,
         });
-        let challenge_response = session
-            .connection
-            .post_json("/v1/challenge", &challenge_body, timeout)
-            .await?;
-        if challenge_response.status != 200 {
-            return Ok(challenge_response);
+        let response = connection.post_json("/v1/challenge", &challenge_body, timeout).await?;
+        if response.status != 200 {
+            return Ok(Err(response));
         }
-        let challenge: DeviceGatewayChallenge = serde_json::from_value(challenge_response.body)
+        let challenge: DeviceGatewayChallenge = serde_json::from_value(response.body)
             .map_err(|_| "主机设备签名挑战格式无效。".to_string())?;
         if challenge.protocol_version != 1 || challenge.expires_at_ms == 0 {
             return Err("主机设备签名挑战版本或时效无效。".into());
         }
-        let private_key_text = load_session_signing_key(self, session)?;
-        let private_key = PrivateKey::from_openssh(private_key_text.as_str())
+        let key = load_session_signing_key(self, session)?;
+        let key = PrivateKey::from_openssh(key.as_str())
             .map_err(|_| "本机存储中的设备签名身份无法读取。".to_string())?;
-        let timestamp_ms = unix_timestamp_ms()?;
-        let auth = sign_device_gateway_request(
-            &private_key,
-            &session.device_id,
-            path,
-            body,
-            &challenge,
-            timestamp_ms,
+        let auth = sign_device_gateway_request_for_method(
+            &key, method, &session.device_id, path, body, &challenge, unix_timestamp_ms()?,
         )?;
-        session
-            .connection
-            .post_json_with_auth(path, body, Some(&auth), timeout)
-            .await
+        Ok(Ok((challenge, auth)))
     }
 
     /// open_media_channel（开启 PCM 媒体通道）：新建独立固定主机 SSH 连接并签名升级 WebSocket。
@@ -2303,11 +2276,10 @@ impl SshDeviceManager {
             return Err("SSH 媒体流编号、设备代次或握手时限无效。".into());
         }
         let handshake = {
-            let mut slot = self.connection.lock().await;
-            let session = slot.as_mut().ok_or("当前没有已认证的 SSH 主机连接。")?;
+            let session = self.current_session().await?;
             let device_id = session.device_id.clone();
             let target = session.target.clone();
-            let transport_private_key = load_session_transport_key(self, session)?;
+            let transport_private_key = load_session_transport_key(self, &session)?;
             let mut body = serde_json::json!({
                 "protocol_version": MEDIA_PROTOCOL_VERSION,
                 "stream_id": stream_id,
@@ -2326,40 +2298,9 @@ impl SshDeviceManager {
                 body["downlink_encoder_pre_skip_samples"] =
                     serde_json::json!(downlink_encoder_pre_skip_samples);
             }
-            let challenge_body = serde_json::json!({
-                "protocol_version": 1,
-                "device_id": device_id,
-                "method": "GET",
-                "path": "/v1/media",
-            });
-            let challenge_response = session
-                .connection
-                .post_json("/v1/challenge", &challenge_body, timeout)
-                .await?;
-            if challenge_response.status != 200 {
-                return Err("主机未签发 SSH 媒体通道挑战。".into());
-            }
-            let challenge: DeviceGatewayChallenge = serde_json::from_value(challenge_response.body)
-                .map_err(|_| "主机设备媒体挑战格式无效。".to_string())?;
-            if challenge.protocol_version != 1 || challenge.expires_at_ms == 0 {
-                return Err("主机设备媒体挑战版本或有效期无效。".into());
-            }
-            let timestamp_ms = unix_timestamp_ms()?;
-            if timestamp_ms > challenge.expires_at_ms {
-                return Err("主机设备媒体挑战已过期。".into());
-            }
-            let signing_private_key = load_session_signing_key(self, session)?;
-            let signing_private_key = PrivateKey::from_openssh(signing_private_key.as_str())
-                .map_err(|_| "本机存储中的产品设备签名身份无法读取。".to_string())?;
-            let auth = sign_device_gateway_request_for_method(
-                &signing_private_key,
-                "GET",
-                &device_id,
-                "/v1/media",
-                &body,
-                &challenge,
-                timestamp_ms,
-            )?;
+            let (challenge, auth) = self.authorize_gateway(
+                &session, &session.connection, "GET", "/v1/media", &body, timeout,
+            ).await?.map_err(|_| "主机未签发 SSH 媒体通道挑战。".to_string())?;
             (
                 device_id,
                 target,
@@ -2459,7 +2400,7 @@ impl SshDeviceManager {
             .await?;
         crate::device_files::validate_transfer_source(local_path, maximum_bytes)?;
         let private_key = self.load_key(&credential_ref)?;
-        let mut connection = SshDeviceConnection::connect(
+        let connection = SshDeviceConnection::connect(
             target,
             private_key.as_str(),
             timeout.min(Duration::from_secs(60)),
@@ -2519,7 +2460,7 @@ impl SshDeviceManager {
             .await?;
         crate::device_files::validate_transfer_target_parent(local_path)?;
         let private_key = self.load_key(&credential_ref)?;
-        let mut connection = SshDeviceConnection::connect(
+        let connection = SshDeviceConnection::connect(
             target,
             private_key.as_str(),
             timeout.min(Duration::from_secs(60)),
@@ -2600,10 +2541,7 @@ impl SshDeviceManager {
         {
             return Err("文件任务连接或执行器代次与当前远端设备租约不匹配。".into());
         }
-        let mut slot = self.connection.lock().await;
-        let session = slot
-            .as_mut()
-            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+        let session = self.current_session().await?;
         if session.device_id != lease.device_id || session.connection.is_closed() {
             return Err("固定 FILE 连接的设备身份与当前任务租约不一致。".into());
         }
@@ -2664,7 +2602,7 @@ impl SshDeviceManager {
         if timestamp_ms > challenge.expires_at_ms {
             return Err("固定 FILE 签名挑战已过期。".into());
         }
-        let signing_key_text = load_session_signing_key(self, session)?;
+        let signing_key_text = load_session_signing_key(self, &session)?;
         let signing_key = PrivateKey::from_openssh(signing_key_text.as_str())
             .map_err(|_| "本机存储中的产品设备签名身份无法读取。".to_string())?;
         let signed_body =
@@ -3175,14 +3113,11 @@ impl SshDeviceManager {
         if pairing_code.len() != 6 || !pairing_code.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err("配对码必须是 6 位数字。".into());
         }
-        let mut slot = self.connection.lock().await;
-        let session = slot
-            .as_mut()
-            .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())?;
+        let session = self.current_session().await?;
         if session.device_id != device_id {
             return Err("配对请求设备编号与当前 SSH 客户端身份不匹配。".into());
         }
-        let private_key_text = load_session_signing_key(self, session)?;
+        let private_key_text = load_session_signing_key(self, &session)?;
         if private_key_text.is_empty() || private_key_text.len() > 64 * 1024 {
             return Err("本机存储中的设备私钥为空或超过大小上限。".into());
         }
@@ -3398,7 +3333,7 @@ fn device_request_proof_message_for_method(
                 | "/v1/management"
                 | "/v1/file-transfer"
         ))
-        || (method == "GET" && path == "/v1/media");
+        || (method == "GET" && matches!(path, "/v1/media" | "/v1/voice"));
     if !device_id_ok || !target_ok || !session_ok || !challenge_ok {
         return Err("设备业务请求签名字段无效。".into());
     }
@@ -3838,6 +3773,7 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .management
+                    .lock().await
                     .as_mut()
                     .unwrap()
                     .management_open
@@ -4184,16 +4120,16 @@ mod tests {
         .await
         .unwrap();
         let manager = SshDeviceManager::default();
-        *manager.connection.lock().await = Some(ConnectedDeviceSession {
+        *manager.connection.lock().await = Some(Arc::new(ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
             target,
             signing_key_for_test: Some(Zeroizing::new(login_key_text.clone())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text)),
-        });
+        }));
         assert!(manager.connected().await);
 
         ssh_handle.shutdown("connection liveness test completed".into());
@@ -4208,14 +4144,12 @@ mod tests {
     }
 
     #[test]
-    fn media_ready_accepts_legacy_pcm_and_requires_complete_typed_codec_state() {
-        assert_eq!(
-            media_ready_codecs(&serde_json::json!({"type":"media.ready"})).unwrap(),
-            (AudioCodec::Pcm, AudioCodec::Pcm, 0, 0),
-        );
+    fn media_ready_requires_complete_typed_codec_state() {
+        assert!(media_ready_codecs(&serde_json::json!({"type":"media.ready"})).is_err());
         assert_eq!(
             media_ready_codecs(&serde_json::json!({
                 "uplink_codec":"opus", "downlink_codec":"pcm", "encoder_pre_skip_samples":104,
+                "downlink_encoder_pre_skip_samples":0,
             }))
             .unwrap(),
             (AudioCodec::Opus, AudioCodec::Pcm, 104, 0),
@@ -4234,10 +4168,12 @@ mod tests {
         .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":7, "downlink_codec":"pcm", "encoder_pre_skip_samples":0,
+            "downlink_encoder_pre_skip_samples":0,
         }))
         .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
             "uplink_codec":"opus", "downlink_codec":"pcm", "encoder_pre_skip_samples":0,
+            "downlink_encoder_pre_skip_samples":0,
         }))
         .is_err());
         assert!(media_ready_codecs(&serde_json::json!({
@@ -4583,16 +4519,16 @@ mod tests {
         .await
         .unwrap();
         let manager = SshDeviceManager::default();
-        *manager.connection.lock().await = Some(ConnectedDeviceSession {
+        *manager.connection.lock().await = Some(Arc::new(ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
             target,
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
-        });
+        }));
 
         let lease = manager
             .open_remote_device_session_with_capabilities(
@@ -4728,16 +4664,16 @@ mod tests {
         .await
         .unwrap();
         let manager = SshDeviceManager::default();
-        *manager.connection.lock().await = Some(ConnectedDeviceSession {
+        *manager.connection.lock().await = Some(Arc::new(ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
             target,
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
-        });
+        }));
         let lease = manager
             .open_remote_device_session_with_capabilities(
                 vec!["audio_stream".into()],
@@ -4905,16 +4841,16 @@ mod tests {
         .await
         .unwrap();
         let manager = SshDeviceManager::default();
-        *manager.connection.lock().await = Some(ConnectedDeviceSession {
+        *manager.connection.lock().await = Some(Arc::new(ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
             target,
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
-        });
+        }));
         let first_lease = manager
             .open_remote_device_session_with_capabilities(
                 vec!["audio_stream".into()],
@@ -5111,16 +5047,16 @@ mod tests {
         .await
         .unwrap();
         let manager = SshDeviceManager::default();
-        *manager.connection.lock().await = Some(ConnectedDeviceSession {
+        *manager.connection.lock().await = Some(Arc::new(ConnectedDeviceSession {
             connection,
-            management: None,
+            management: tokio::sync::Mutex::new(None),
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
             target,
             signing_key_for_test: Some(Zeroizing::new(product_key_text.to_string())),
             transport_key_for_test: Some(Zeroizing::new(login_key_text.to_string())),
-        });
+        }));
         let lease = manager
             .open_remote_device_session_with_capabilities(
                 vec!["audio_stream".into()],
@@ -5129,14 +5065,12 @@ mod tests {
             .await
             .unwrap();
 
-        let generation = call_python_gateway_test_route("GET", "/__test__/device-generation").await;
-        assert_eq!(generation.status, 200, "{generation:?}");
         let prepared = manager
             .post_json(
                 "/v1/interaction/prepare",
                 &serde_json::json!({
                     "protocol_version":1,
-                    "expected_interaction_generation":generation.body["generation"],
+                    "connection_generation":lease.connection_generation,
                 }),
                 Duration::from_secs(10),
             )
@@ -5367,14 +5301,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_clock_response_negotiates_extensions_without_breaking_legacy_requests() {
-        let mut request = serde_json::json!({"type":"clock.sync.request","protocol_version":2,
-            "sync_id":"sample-a","fields":{"sync_id":"测量编号"},"diagnostic":"可扩展元数据"});
-        let legacy: serde_json::Value = serde_json::from_str(&media_clock_response(&request, 100, 101).unwrap()).unwrap();
-        assert!(legacy.get("runtime_controls").is_none());
-        request["fields"]["runtime_controls"] = serde_json::json!("支持运行期续测和输入流重建");
+    fn runtime_clock_response_uses_current_media_protocol() {
+        let mut request = serde_json::json!({"type":"clock.sync.request","protocol_version":MEDIA_PROTOCOL_VERSION,
+            "sync_id":"sample-a","fields":{"sync_id":"测量编号"}});
         let refreshed: serde_json::Value = serde_json::from_str(&media_clock_response(&request, 200, 201).unwrap()).unwrap();
-        assert_eq!(refreshed["runtime_controls"], true);
         assert_eq!(refreshed["sync_id"], "sample-a");
         assert!(media_clock_response(&request, 201, 200).is_err());
         request["protocol_version"] = serde_json::json!(99);

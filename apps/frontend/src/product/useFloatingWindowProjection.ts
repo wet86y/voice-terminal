@@ -5,7 +5,7 @@ import { isRecord } from '../record'
 import type { FloatingCaption, FloatingWindowProjection } from './floating-window'
 
 /** FloatingWorkbench（动效来源）：仅开放主页面动效与控件状态，不开放聊天列表。 */
-type FloatingWorkbench = Pick<WorkbenchModel, 'state' | 'sessionActive' | 'audioLevels' | 'disabled'>
+type FloatingWorkbench = Pick<WorkbenchModel, 'state' | 'sessionActive' | 'audioLevels' | 'disabled' | 'controlReady'>
 
 /** splitSurrogate（编码单元边界）：当前下标是否落在一个表情字符的中间。 */
 function splitSurrogate(text: string, index: number) {
@@ -98,9 +98,9 @@ export function useFloatingWindowProjection(voice: ReturnType<typeof useVoiceTer
       state: workbench.value.state,
       sessionActive: workbench.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(workbench.value.state),
       audioLevels: workbench.value.audioLevels ?? voice.audioLevels.value,
-      silenced: !voice.listening.value,
-      canControl: voice.connection.value === 'connected' && !workbench.value.disabled && !voice.inputPaused?.value
-        && (voice.listening.value || voice.canStart.value),
+      silenced: workbench.value.controlReady === undefined ? !voice.listening.value : !workbench.value.sessionActive,
+      canControl: workbench.value.controlReady ?? (voice.connection.value === 'connected' && !workbench.value.disabled
+        && !voice.inputPaused?.value && (voice.listening.value || voice.canStart.value)),
       caption,
     }
   })

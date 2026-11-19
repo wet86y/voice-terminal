@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1; // PROTOCOL_VERSION（设备控制协议版本，保持不变）。
-pub const MEDIA_PROTOCOL_VERSION: u32 = 2; // MEDIA_PROTOCOL_VERSION（设备媒体协议版本）。
+pub const MEDIA_PROTOCOL_VERSION: u32 = 4; // MEDIA_PROTOCOL_VERSION（设备媒体协议版本）。
 pub const MAX_HEADER_BYTES: usize = 4096; // MAX_HEADER_BYTES（帧头最大字节数）。
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024; // MAX_PAYLOAD_BYTES（帧负载最大字节数）。
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024; // MAX_CONTROL_BYTES（JSON 控制消息最大字节数）。
@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn client_tts_audio_frame_decoder_rejects_unknown_header_fields() {
         let header = serde_json::json!({
-            "protocol_version":2,"direction":"tts_audio","device_id":"device-a",
+            "protocol_version":4,"direction":"tts_audio","device_id":"device-a",
             "core_session_id":"core-a","connection_generation":2,"executor_generation":3,
             "interaction_generation":4,"stream_id":"media-a","task_id":"speech-a",
             "request_id":"tts-request-a","sequence":0,"start_sample":0,
@@ -1205,7 +1205,7 @@ mod tests {
         header.sample_count = 321;
         assert!(encode_playback_frame(&header, &payload).is_err());
         let encoded = serde_json::json!({
-            "protocol_version":2,"direction":"playback","device_id":"device-a",
+            "protocol_version":4,"direction":"playback","device_id":"device-a",
             "delivery_device_id":"device-a","core_session_id":"core-a",
             "connection_generation":2,"executor_generation":3,"interaction_generation":4,
             "stream_id":"media-a","playback_key":"speech-a","sequence":0,
@@ -1222,12 +1222,12 @@ mod tests {
 
     #[test]
     fn python_json_header_is_accepted_and_duplicate_fields_rejected() {
-        let json = r#"{"protocol_version":2,"device_id":"B","core_session_id":"core","connection_generation":1,"executor_generation":1,"interaction_generation":1,"stream_id":"s","sequence":0,"start_sample":0,"sample_count":1,"device_time_us":0,"discontinuity_before":false,"audio_processing":{"state":"ready","near_end_voice":false,"protected_interruption_available":true,"reverse_generation":0,"error":null,"fields":{"state":"AEC、降噪与 VAD 健康状态","near_end_voice":"近端 VAD 判断汇总","protected_interruption_available":"是否允许受保护打断","reverse_generation":"播放参考格式代次","error":"前处理故障摘要"}}}"#;
+        let json = r#"{"protocol_version":4,"device_id":"B","core_session_id":"core","connection_generation":1,"executor_generation":1,"interaction_generation":1,"stream_id":"s","sequence":0,"start_sample":0,"sample_count":1,"device_time_us":0,"discontinuity_before":false,"audio_processing":{"state":"ready","near_end_voice":false,"protected_interruption_available":true,"reverse_generation":0,"error":null,"fields":{"state":"AEC、降噪与 VAD 健康状态","near_end_voice":"近端 VAD 判断汇总","protected_interruption_available":"是否允许受保护打断","reverse_generation":"播放参考格式代次","error":"前处理故障摘要"}}}"#;
         let mut message = (json.len() as u32).to_be_bytes().to_vec();
         message.extend_from_slice(json.as_bytes());
         message.extend_from_slice(&[0, 0]);
         assert_eq!(decode_frame(&message).unwrap().0.stream_id, "s");
-        let repeated = r#"{"protocol_version":2,"protocol_version":2,"device_id":"B","core_session_id":"core","connection_generation":1,"executor_generation":1,"interaction_generation":1,"stream_id":"s","sequence":0,"start_sample":0,"sample_count":1,"device_time_us":0,"discontinuity_before":false,"audio_processing":{"state":"ready","near_end_voice":false,"protected_interruption_available":true,"reverse_generation":0,"error":null,"fields":{"state":"AEC、降噪与 VAD 健康状态","near_end_voice":"近端 VAD 判断汇总","protected_interruption_available":"是否允许受保护打断","reverse_generation":"播放参考格式代次","error":"前处理故障摘要"}}}"#;
+        let repeated = r#"{"protocol_version":4,"protocol_version":4,"device_id":"B","core_session_id":"core","connection_generation":1,"executor_generation":1,"interaction_generation":1,"stream_id":"s","sequence":0,"start_sample":0,"sample_count":1,"device_time_us":0,"discontinuity_before":false,"audio_processing":{"state":"ready","near_end_voice":false,"protected_interruption_available":true,"reverse_generation":0,"error":null,"fields":{"state":"AEC、降噪与 VAD 健康状态","near_end_voice":"近端 VAD 判断汇总","protected_interruption_available":"是否允许受保护打断","reverse_generation":"播放参考格式代次","error":"前处理故障摘要"}}}"#;
         let mut malformed = (repeated.len() as u32).to_be_bytes().to_vec();
         malformed.extend_from_slice(repeated.as_bytes());
         malformed.push(1);
