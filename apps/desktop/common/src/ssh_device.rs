@@ -227,7 +227,8 @@ struct DeviceGatewayChallenge {
 }
 
 struct ConnectedDeviceSession {
-    connection: SshDeviceConnection, // connection（已固定主机身份的 SSH 通道）。
+    connection: SshDeviceConnection, // connection（已固定主机身份的 SSH 通道，只发送控制、媒体与文件标记）。
+    management: Option<SshDeviceConnection>, // management（独立管理连接的专用 SSH 通道，只发送管理标记）：同一连接混用标记会被复用共用的原始命令挤占。
     device_id: String,               // device_id（当前远端客户端稳定编号）。
     identity_credential_ref: String, // identity_credential_ref（产品设备签名身份引用）。
     transport_credential_ref: String, // transport_credential_ref（独立文件传输连接复用的凭据引用）。
@@ -236,6 +237,16 @@ struct ConnectedDeviceSession {
     signing_key_for_test: Option<Zeroizing<String>>, // signing_key_for_test（只在 SSH 集成测试中代替系统凭据库）。
     #[cfg(any(test, feature = "ssh-device-test-support"))]
     transport_key_for_test: Option<Zeroizing<String>>, // transport_key_for_test（只在 SSH 媒体集成测试中代替系统凭据库）。
+}
+
+impl ConnectedDeviceSession {
+    /// close（关闭）：控制通道与独立管理通道分别结束；管理连接关闭失败不改写控制通道的结论。
+    async fn close(self) -> Result<(), String> {
+        if let Some(management) = self.management {
+            let _ = management.close().await;
+        }
+        self.connection.close().await
+    }
 }
 
 fn load_session_signing_key(
@@ -468,8 +479,7 @@ impl SshMediaChannel {
             let object = message
                 .as_object()
                 .ok_or("主机时钟同步控制消息必须是 JSON 对象。")?;
-            if object.len() != 4
-                || object.get("type").and_then(serde_json::Value::as_str)
+            if object.get("type").and_then(serde_json::Value::as_str)
                     != Some("clock.sync.request")
                 || object
                     .get("protocol_version")
@@ -494,10 +504,8 @@ impl SshMediaChannel {
             if device_send_us < device_receive_us {
                 return Err("设备时钟读取顺序倒退。".into());
             }
-            self.send_text(&serde_json::json!({
-                "type":"clock.sync.response", "protocol_version":MEDIA_PROTOCOL_VERSION, "sync_id":sync_id,
-                "device_receive_us":device_receive_us, "device_send_us":device_send_us,
-            }).to_string()).await?;
+            let _ = sync_id;
+            self.send_text(&media_clock_response(&message, device_receive_us, device_send_us)?).await?;
         }
         let ready = match self.receive().await? {
             SshMediaMessage::Text(value) => serde_json::from_str::<serde_json::Value>(&value)
@@ -592,6 +600,23 @@ impl SshMediaChannel {
             },
         )
     }
+}
+
+/// media_clock_response（时钟响应）：初始测量与运行期续测共用格式，不经过音频工作进程排队。
+pub fn media_clock_response(request: &serde_json::Value, device_receive_us: u64, device_send_us: u64) -> Result<String, String> {
+    if request.get("type").and_then(serde_json::Value::as_str) != Some("clock.sync.request")
+        || request.get("protocol_version").and_then(serde_json::Value::as_u64) != Some(u64::from(MEDIA_PROTOCOL_VERSION))
+        || device_send_us < device_receive_us {
+        return Err("媒体时钟请求版本或设备读数无效。".into());
+    }
+    let sync_id = request.get("sync_id").and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128).ok_or("媒体时钟测量编号无效。")?;
+    let mut response = serde_json::json!({"type":"clock.sync.response","protocol_version":MEDIA_PROTOCOL_VERSION,
+        "sync_id":sync_id,"device_receive_us":device_receive_us,"device_send_us":device_send_us});
+    if request.get("fields").and_then(|fields| fields.get("runtime_controls")).is_some() {
+        response["runtime_controls"] = serde_json::json!(true);
+    }
+    Ok(response.to_string())
 }
 
 /// SshMediaReader（SSH 媒体读取端）：单独消费服务端 WebSocket 帧。
@@ -1872,6 +1897,7 @@ impl SshDeviceManager {
                 .await?;
         let session = ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: device_id.to_string(),
             identity_credential_ref: identity_credential_ref.to_string(),
             transport_credential_ref: login_credential_ref.to_string(),
@@ -1886,7 +1912,7 @@ impl SshDeviceManager {
             slot.replace(session)
         };
         if let Some(old) = old {
-            let _ = old.connection.close().await;
+            let _ = old.close().await;
         }
         *self.active_lease.lock().await = None;
         Ok(())
@@ -1913,6 +1939,7 @@ impl SshDeviceManager {
             SshDeviceConnection::connect(target.clone(), transport_private_key, timeout).await?;
         let session = ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: device_id.to_owned(),
             identity_credential_ref,
             transport_credential_ref: "test-only-transport-identity".into(),
@@ -1922,7 +1949,7 @@ impl SshDeviceManager {
         };
         let old = self.connection.lock().await.replace(session);
         if let Some(old) = old {
-            let _ = old.connection.close().await;
+            let _ = old.close().await;
         }
         *self.active_lease.lock().await = None;
         Ok(())
@@ -1978,10 +2005,31 @@ impl SshDeviceManager {
                 ("arguments".into(), "与固定操作对应的 JSON 对象参数".into()),
             ]),
         };
-        session
-            .connection
+        // 独立管理连接：微软 Win32 OpenSSH 可能在同一条连接上沿用首个 SSH_ORIGINAL_COMMAND
+        // （原始命令标记）；与管理租约共用连接会让后续控制通道被送进管理 JSON 解析器。
+        // 这里只更换承载连接，管理租约、通道复用与逐次信任核验都保留在管理通道内。
+        let login_private_key = load_session_transport_key(self, session)?;
+        let target = session.target.clone();
+        if session
+            .management
+            .as_ref()
+            .is_none_or(SshDeviceConnection::is_closed)
+        {
+            session.management = Some(
+                SshDeviceConnection::connect(target, login_private_key.as_str(), timeout).await?,
+            );
+        }
+        let management = session
+            .management
+            .as_mut()
+            .ok_or_else(|| "独立管理 SSH 连接不可用。".to_string())?;
+        let result = management
             .management_exchange(&open_request, &request, timeout)
-            .await
+            .await;
+        if management.is_closed() {
+            session.management = None;
+        }
+        result
     }
 
     /// relay_voice_websocket（转发产品语音 WebSocket）：仅接受本机随机票据路径，并经固定 control（控制）强制桥接。
@@ -3153,7 +3201,7 @@ impl SshDeviceManager {
         let connection = self.connection.lock().await.take();
         match connection {
             Some(connection) => {
-                connection.connection.close().await?;
+                connection.close().await?;
                 Ok(true)
             }
             None => Ok(false),
@@ -3789,7 +3837,9 @@ mod tests {
                     .await
                     .as_mut()
                     .unwrap()
-                    .connection
+                    .management
+                    .as_mut()
+                    .unwrap()
                     .management_open
                     .as_mut()
                     .unwrap()
@@ -3811,6 +3861,277 @@ mod tests {
         manager.disconnect().await.unwrap();
         handle.shutdown("management reuse test completed".into());
         ssh_server.await.unwrap().unwrap();
+    }
+
+    /// 回归：微软 Win32 OpenSSH 已报告同一连接上的后续命令可能沿用首个 SSH_ORIGINAL_COMMAND
+    /// （原始命令标记）。管理与控制必须各用一条 SSH 连接，否则控制请求会被送进管理 JSON 解析。
+    #[tokio::test]
+    async fn control_requests_keep_their_lane_when_the_server_replays_the_first_command() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        const MANAGEMENT_MARKER_BYTES: &[u8] = b"voice-terminal-v1-management";
+        const CORE_STATE_JSON: &[u8] = br#"{"core_state":"ready"}"#;
+
+        // 控制网关：一次连接服务一个 HTTP（超文本传输协议）请求，回执后立即结束，与真实桥接收尾一致。
+        let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = control.local_addr().unwrap();
+        let control_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_task = {
+            let hits = control_hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = control.accept().await {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        CORE_STATE_JSON.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(CORE_STATE_JSON).await;
+                    let _ = stream.flush().await;
+                }
+            })
+        };
+
+        // 管理服务：一次连接先交换会话申请，再接收一个请求行；复用通道期间保持连接。
+        let management = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let management_address = management.local_addr().unwrap();
+        let management_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let management_task = {
+            let hits = management_hits.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = management.accept().await {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        if stream.read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        let Ok(open) = serde_json::from_str::<serde_json::Value>(&line) else {
+                            return;
+                        };
+                        let opened = serde_json::json!({
+                            "protocol_version": 1,
+                            "request_id": open["request_id"].clone(),
+                            "target_host_id": open["target_host_id"].clone(),
+                            "client_device_id": open["client_device_id"].clone(),
+                            "session_generation": 7,
+                            "expires_at_ms": unix_timestamp_ms().unwrap() + 900_000,
+                            "fields": {},
+                        });
+                        let mut bytes = serde_json::to_vec(&opened).unwrap();
+                        bytes.push(b'\n');
+                        if stream.get_mut().write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                        line.clear();
+                        if stream.read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                            return;
+                        };
+                        let response = serde_json::json!({
+                            "protocol_version": 1,
+                            "request_id": request["request_id"].clone(),
+                            "target_host_id": request["target_host_id"].clone(),
+                            "session_generation": 7,
+                            "operation": request["operation"].clone(),
+                            "status": 200,
+                            "body": {"core_state": "ready", "persistent_management": true},
+                            "fields": {},
+                        });
+                        let mut bytes = serde_json::to_vec(&response).unwrap();
+                        bytes.push(b'\n');
+                        if stream.get_mut().write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                        // 保持复用通道直到对端结束，避免服务端提前关闭。
+                        let mut sink = [0_u8; 256];
+                        let _ = stream.read(&mut sink).await;
+                    });
+                }
+            })
+        };
+
+        /// ReplayedMarkerSshServer（沿用首个标记的测试 SSH 服务）：按连接记录首个 exec 命令并重复使用。
+        struct ReplayedMarkerSshServer {
+            control: std::net::SocketAddr, // control（控制网关回环地址）。
+            management: std::net::SocketAddr, // management（管理服务回环地址）。
+            channels: Arc<
+                tokio::sync::Mutex<
+                    std::collections::HashMap<russh::ChannelId, russh::Channel<russh::server::Msg>>,
+                >,
+            >, // channels（本连接已接受的会话通道）。
+            first_marker: Option<Vec<u8>>, // first_marker（本连接首个 exec 命令，后续沿用）。
+        }
+
+        impl russh::server::Server for ReplayedMarkerSshServer {
+            type Handler = Self;
+
+            fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> Self::Handler {
+                ReplayedMarkerSshServer {
+                    control: self.control,
+                    management: self.management,
+                    channels: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                    first_marker: None,
+                }
+            }
+        }
+
+        impl russh::server::Handler for ReplayedMarkerSshServer {
+            type Error = russh::Error;
+
+            async fn auth_publickey(
+                &mut self,
+                _user: &str,
+                _key: russh::server::VerifiedPublicKey<'_>,
+            ) -> Result<russh::server::Auth, Self::Error> {
+                Ok(russh::server::Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                channel: russh::Channel<russh::server::Msg>,
+                reply: russh::server::ChannelOpenHandle,
+                _session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                let channel_id = channel.id();
+                self.channels.lock().await.insert(channel_id, channel);
+                reply.accept().await;
+                Ok(())
+            }
+
+            async fn exec_request(
+                &mut self,
+                channel_id: russh::ChannelId,
+                command: &[u8],
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                if self.first_marker.is_none() {
+                    self.first_marker = Some(command.to_vec());
+                }
+                let effective = self.first_marker.clone().unwrap_or_default();
+                let target = if effective == MANAGEMENT_MARKER_BYTES {
+                    self.management
+                } else {
+                    self.control
+                };
+                let Some(channel) = self.channels.lock().await.remove(&channel_id) else {
+                    let _ = session.channel_failure(channel_id);
+                    return Ok(());
+                };
+                let Ok(upstream) = tokio::net::TcpStream::connect(target).await else {
+                    let _ = session.channel_failure(channel_id);
+                    return Ok(());
+                };
+                let _ = session.channel_success(channel_id);
+                tokio::spawn(async move {
+                    let mut channel = channel.into_stream();
+                    let mut upstream = upstream;
+                    let _ = tokio::io::copy_bidirectional(&mut channel, &mut upstream).await;
+                });
+                Ok(())
+            }
+        }
+
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let host_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ssh_server = tokio::spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut server = ReplayedMarkerSshServer {
+                control: control_address,
+                management: management_address,
+                channels: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                first_marker: None,
+            };
+            let running = russh::server::Server::run_on_socket(&mut server, host_config, &listener);
+            ready_tx.send((address, running.handle())).ok();
+            running.await
+        });
+        let (address, handle) = ready_rx.await.unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap()
+            .to_openssh(LineEnding::LF)
+            .unwrap();
+        let manager = SshDeviceManager::default();
+        manager
+            .connect_with_test_credentials(
+                "test-device",
+                SshDeviceTarget {
+                    address: "127.0.0.1".into(),
+                    port: address.port(),
+                    username: "test-device".into(),
+                    host_key_sha256: fingerprint,
+                    gateway_port: DEFAULT_GATEWAY_PORT,
+                },
+                key.as_str(),
+                key.as_str(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        // 与现场一致：先建立管理通道，再在同一设备会话上发起核心控制请求。
+        let management_result = manager
+            .management_request(
+                &format!("{:032x}", 1),
+                "server-a",
+                "management.status",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(management_result.status, 200);
+        assert_eq!(management_result.session_generation, 7);
+        let control_result = {
+            let mut slot = manager.connection.lock().await;
+            slot.as_mut()
+                .unwrap()
+                .connection
+                .post_json(
+                    "/v1/status",
+                    &serde_json::json!({}),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(control_result.status, 200);
+        assert_eq!(control_result.body["core_state"], "ready");
+        assert_eq!(
+            control_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "控制请求必须到达控制网关"
+        );
+        assert_eq!(
+            management_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "管理标记不得被复用到控制通道"
+        );
+        manager.disconnect().await.unwrap();
+        handle.shutdown("replayed marker test completed".into());
+        ssh_server.await.unwrap().unwrap();
+        control_task.abort();
+        management_task.abort();
     }
 
     #[test]
@@ -3865,6 +4186,7 @@ mod tests {
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
@@ -4263,6 +4585,7 @@ mod tests {
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
@@ -4407,6 +4730,7 @@ mod tests {
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
@@ -4583,6 +4907,7 @@ mod tests {
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
@@ -4788,6 +5113,7 @@ mod tests {
         let manager = SshDeviceManager::default();
         *manager.connection.lock().await = Some(ConnectedDeviceSession {
             connection,
+            management: None,
             device_id: "test-device".into(),
             identity_credential_ref: "test-only-device-key".into(),
             transport_credential_ref: "test-only-login-key".into(),
@@ -5038,6 +5364,21 @@ mod tests {
         value = target();
         value.gateway_port = 0;
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_clock_response_negotiates_extensions_without_breaking_legacy_requests() {
+        let mut request = serde_json::json!({"type":"clock.sync.request","protocol_version":2,
+            "sync_id":"sample-a","fields":{"sync_id":"测量编号"},"diagnostic":"可扩展元数据"});
+        let legacy: serde_json::Value = serde_json::from_str(&media_clock_response(&request, 100, 101).unwrap()).unwrap();
+        assert!(legacy.get("runtime_controls").is_none());
+        request["fields"]["runtime_controls"] = serde_json::json!("支持运行期续测和输入流重建");
+        let refreshed: serde_json::Value = serde_json::from_str(&media_clock_response(&request, 200, 201).unwrap()).unwrap();
+        assert_eq!(refreshed["runtime_controls"], true);
+        assert_eq!(refreshed["sync_id"], "sample-a");
+        assert!(media_clock_response(&request, 201, 200).is_err());
+        request["protocol_version"] = serde_json::json!(99);
+        assert!(media_clock_response(&request, 200, 201).is_err());
     }
 
     #[test]

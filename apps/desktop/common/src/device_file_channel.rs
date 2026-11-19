@@ -63,20 +63,35 @@ pub fn serve_file_channel_listener(
                 {
                     continue;
                 }
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10 * 60)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10 * 60)));
                 let shutdown_stream = match stream.try_clone() {
                     Ok(stream) => stream,
                     Err(_) => continue,
                 };
+                let stream = match crate::device_socket::CancellableSocket::new(
+                    stream,
+                    shutdown.clone(),
+                    std::time::Duration::from_secs(10 * 60),
+                    std::time::Duration::from_secs(10 * 60),
+                ) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        receiver.connection_error(&format!("无法配置文件通道可取消读取：{error}"));
+                        continue;
+                    }
+                };
                 let connection_id = next_connection_id;
                 next_connection_id = next_connection_id.wrapping_add(1).max(1);
                 let receiver = receiver.clone();
+                let connection_shutdown = shutdown.clone();
                 let worker = std::thread::Builder::new()
                     .name(format!("voice-file-channel-{connection_id}"))
                     .spawn(move || {
-                        let _ = serve_file_channel_connection(stream, receiver.as_ref());
+                        if let Err(error) = serve_file_channel_connection(stream, receiver.as_ref())
+                        {
+                            if !connection_shutdown.load(Ordering::Acquire) {
+                                receiver.connection_error(&error);
+                            }
+                        }
                     });
                 match worker {
                     Ok(worker) => {
@@ -349,6 +364,9 @@ pub struct DeviceFileTransferReceipt {
 
 /// FileReceiver（原生文件接收器）：协调器持有票据并负责文件落盘与导入提交。
 pub trait FileReceiver: Send + Sync + 'static {
+    /// connection_error（连接结束诊断）：只接收固定协议错误，不接收传输正文或凭据。
+    fn connection_error(&self, _error: &str) {}
+
     /// begin（开始上传）：必须将签发来源编号与桥接认证对端绑定。
     /// Returns the original result（返回原结果）when the same request already committed.
     fn begin(&self, peer: &FileChannelPeer, request: UploadBegin) -> Result<Option<Value>, String>;
@@ -2840,6 +2858,7 @@ mod tests {
             stream
                 .write_all(&(bytes.len() as u32).to_be_bytes())
                 .unwrap();
+            thread::sleep(Duration::from_millis(100));
             stream.write_all(&bytes).unwrap();
             stream.flush().unwrap();
         }
@@ -2872,7 +2891,12 @@ mod tests {
             .unwrap();
         let mut prelude_bytes = serde_json::to_vec(&prelude()).unwrap();
         prelude_bytes.push(b'\n');
-        client.write_all(&prelude_bytes).unwrap();
+        // 真实非阻塞监听入口必须等待首包及后续分段，不能把 WouldBlock（暂时无数据）当作断线。
+        thread::sleep(Duration::from_millis(150));
+        let split = prelude_bytes.len() / 2;
+        client.write_all(&prelude_bytes[..split]).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        client.write_all(&prelude_bytes[split..]).unwrap();
         write_wire_frame(
             &mut client,
             &serde_json::json!({
@@ -2887,7 +2911,7 @@ mod tests {
 
         shutdown.store(true, AtomicOrdering::Release);
         let service_result = service.join().unwrap();
-        assert!(service_result.is_ok());
+        assert!(service_result.is_ok(), "{service_result:?}");
         assert_eq!(receiver.aborted.load(AtomicOrdering::Acquire), 1);
         let _ = client.shutdown(Shutdown::Both);
     }

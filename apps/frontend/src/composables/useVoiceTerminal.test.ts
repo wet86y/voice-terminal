@@ -28,6 +28,27 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('握手超时与错误都会进入可恢复离线状态，旧连接关闭不能影响新连接', () => {
+    vi.useFakeTimers()
+    const sockets: FakeSocket[] = []
+    const terminal = useVoiceTerminal({ webSocketUrl: 'ws://test.invalid/ws', connectTimeoutMs: 100,
+      webSocketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket } })
+    try {
+      terminal.connect()
+      vi.advanceTimersByTime(101)
+      expect(terminal.connection.value).toBe('offline')
+      expect(terminal.connectionError.value).toContain('超时')
+      terminal.connect()
+      sockets[1]!.onerror?.()
+      expect(terminal.connection.value).toBe('offline')
+      terminal.connect()
+      sockets[2]!.open()
+      sockets[0]!.onclose?.()
+      expect(terminal.connection.value).toBe('connected')
+      vi.advanceTimersByTime(1000)
+      expect(terminal.connection.value).toBe('connected')
+    } finally { terminal.dispose(); vi.useRealTimers() }
+  })
   it('业务 API 暂不可用时仍可连接已就绪的远程语音回环套接字', () => {
     vi.stubGlobal('window', { __VOICE_APPLICATION__: {
       managed: true, origin: '', voice_api_url: '',

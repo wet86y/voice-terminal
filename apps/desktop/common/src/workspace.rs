@@ -1758,6 +1758,19 @@ pub fn normalize_layout(root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+/// valid_workspace_id（安全工作区编号）：兼容现有生成、分发及旧版身份，限定为有界命令参数。
+/// 只校验格式；授权入口仍须与当前安装的 workspace_id（工作区编号）逐字匹配。
+pub fn valid_workspace_id(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 pub fn new_id() -> String {
     // Windows（操作系统）时钟粒度可能使并行调用取到相同时间；保留已发布编号格式并保证进程内单调唯一。
     static LAST: AtomicU64 = AtomicU64::new(0);

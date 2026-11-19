@@ -65,6 +65,9 @@ const openSshJobPending = computed(() => !!openSshJob.value && ['queued', 'runni
 const remoteOpenSshJobPending = computed(() => !!remoteOpenSshSnapshot.value?.job
   && ['queued', 'running', 'cancelling'].includes(remoteOpenSshSnapshot.value.job.state))
 const isRemote = computed(() => mode.value === 'remote')
+// canDisconnect（允许断开）：底层 SSH（安全远程连接）已认证时，管理握手失败也必须保留恢复入口。
+const canDisconnect = computed(() => isRemote.value && !!status.value?.device_config?.paired_host
+  && (connection.value === 'connected' || status.value?.device_runtime?.remote_client_connected === true))
 const remoteOpenSshCanEnable = computed(() => {
   const hostId = status.value?.device_config?.paired_host?.host_id
   return isRemote.value && !!hostId && remoteOpenSshHostId.value === hostId
@@ -776,6 +779,7 @@ async function pairWithSelectedDevice() {
   try {
     const result = await nativeDeviceApi.pairWithDiscoveredDevice(selectedHostId.value, pairingCodeInput.value)
     pairingCodeInput.value = ''
+    notice.value = ''
     if (!result.connected) {
       status.value = await nativeDeviceApi.deviceConfigStatus()
       connection.value = 'disconnected'
@@ -786,7 +790,10 @@ async function pairWithSelectedDevice() {
     notice.value = `已连接到 ${result.display_name}。正在准备任务与语音通道。`
     await activateRemoteChannels()
     await refresh()
-  } catch (failure) { error.value = failure instanceof Error ? failure.message : String(failure) }
+  } catch (failure) {
+    notice.value = ''
+    error.value = failure instanceof Error ? failure.message : String(failure)
+  }
   finally { busy.value = false }
 }
 
@@ -1026,7 +1033,7 @@ onUnmounted(() => {
       <div class="button-row">
         <button v-if="status?.runtime.config_state === 'invalid'" class="outline-button" :disabled="!canSave || busy" @click="saveConfig(true)">归档原件并修复</button>
         <button v-if="isRemote && status?.device_config?.paired_host && connection !== 'connected'" class="primary-button" :disabled="busy || !status || status.runtime.config_state === 'invalid'" @click="connectHost(false)">连接服务端</button>
-        <button v-if="connection === 'connected'" class="quiet-button" :disabled="busy" @click="disconnectHost">断开</button>
+        <button v-if="canDisconnect" class="quiet-button" :disabled="busy" @click="disconnectHost">断开</button>
         <button class="quiet-button" :disabled="loading || busy" @click="refresh">刷新</button>
       </div>
     </footer>

@@ -44,11 +44,12 @@ struct RunningServices {
 }
 
 struct ValidatingFileReceiver {
+    diagnostic_root: std::path::PathBuf, // diagnostic_root（受管安装根目录，仅用于有界连接日志）。
     coordinator: Arc<RemoteImportCoordinator>, // coordinator（唯一远程导入票据和提交协调器）。
-    data_root: PathBuf,                        // data_root（验证信任登记的当前工作区数据根目录）。
-    workspace_id: String,                      // workspace_id（本机正式工作区身份）。
-    owner_sid: String,                         // owner_sid（本次正式程序当前 Windows 账户 SID）。
-    build: String,                             // build（当前正式程序构建编号）。
+    data_root: PathBuf,                  // data_root（验证信任登记的当前工作区数据根目录）。
+    workspace_id: String,                // workspace_id（本机正式工作区身份）。
+    owner_sid: String,                   // owner_sid（本次正式程序当前 Windows 账户 SID）。
+    build: String,                       // build（当前正式程序构建编号）。
     file_gateways: Mutex<HashMap<String, TcpStream>>, // file_gateways（每条 FILE 会话复用的固定 loopback HTTP keep-alive 连接）。
 }
 
@@ -121,6 +122,7 @@ impl RemoteServices {
             .ok_or("正式程序缺少有效构建编号。")?
             .to_owned();
         let receiver: Arc<dyn FileReceiver> = Arc::new(ValidatingFileReceiver {
+            diagnostic_root: context.install.clone(),
             coordinator,
             data_root: data_root.to_path_buf(),
             workspace_id: context.workspace_id.clone(),
@@ -224,6 +226,14 @@ impl ValidatingFileReceiver {
 }
 
 impl FileReceiver for ValidatingFileReceiver {
+    fn connection_error(&self, error: &str) {
+        let _ = voice_desktop_common::logs::record_device_channel_error(
+            &self.diagnostic_root,
+            "file",
+            error,
+        );
+    }
+
     fn begin(
         &self,
         peer: &FileChannelPeer,

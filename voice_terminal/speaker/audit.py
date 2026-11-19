@@ -122,6 +122,7 @@ def audit(kind: str, *, content: bool = False, **fields) -> None:
         record = {"record_type": "speaker_audit", "version": 1, "kind": kind,
                   "at": time.time(), "at_monotonic": time.monotonic(), **fields}
         keys = set()
+        observed_values = set()  # observed_values（本条实际枚举值）：不逐行重复完整静态词典。
         def visit(value):
             if isinstance(value, dict):
                 for key, item in value.items():
@@ -130,6 +131,8 @@ def audit(kind: str, *, content: bool = False, **fields) -> None:
             elif isinstance(value, (list, tuple)):
                 for item in value:
                     visit(item)
+            elif isinstance(value, str):
+                observed_values.add(value)
         visit(record)
         record["field_labels"] = {key: LABELS.get(key, f"{key}（声纹诊断字段）") for key in sorted(keys)}
         # 枚举原值用于机器关联，中文对照用于导出日志人工查阅。
@@ -166,6 +169,7 @@ def audit(kind: str, *, content: bool = False, **fields) -> None:
             "wake": "唤醒激活", "speaker_recovery": "声纹准入恢复", "paraformer": "主识别器",
             "inference_in_progress": "已有推理在途", "not_speech": "没有新增人声", "busy": "推理繁忙",
         }
+        record["value_labels"] = {key: label for key, label in record["value_labels"].items() if key in observed_values}
         serialized = json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         content_logger.info(serialized)
         if not content:

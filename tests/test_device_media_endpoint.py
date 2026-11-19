@@ -165,6 +165,8 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
             server_http_api, "time",
             SimpleNamespace(monotonic=monotonic_clock, time=time.time),
         )
+        # 媒体时钟独立于系统时钟注入：五轮往返测量必须使用同一可重放的确定性时钟。
+        monkeypatch.setattr(server_http_api, "media_clock", monotonic_clock)
         config = AppConfig(
             model_dir=tmp_path / "models",
             persona=PersonaConfig(directory=tmp_path / "config" / "persona"),
@@ -369,9 +371,11 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
                 device_receive_us = 1_000_000 + sample_index * 10_000
                 await incoming.put({"type": "websocket.receive", "text": json.dumps({
                     "type": "clock.sync.response", "protocol_version": 2,
+                    "runtime_controls": True,
                     "sync_id": body["sync_id"],
                     "device_receive_us": device_receive_us,
-                    "device_send_us": device_receive_us,
+                    "device_send_us": device_receive_us + ((100_000 if downlink_codec == "pcm" else -1_000)
+                                                           if sample_index == 1 else 0),
                 })})
                 await asyncio.sleep(0)
             elif body.get("type") == "media.ready":
@@ -463,6 +467,9 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         assert sum(item.get("type") == "clock.sync.request" for item in sent_json) == 5
         ready = next((item for item in sent_json if item.get("type") == "media.ready"), None)
         assert ready is not None, sent
+        assert "device.clock_sample_rejected" in caplog.text
+        assert "device.media_ready" in caplog.text and "device.media_closed" in caplog.text
+        assert "media-endpoint-test-key" not in caplog.text
         assert ready["capture_active"] is True
         assert ready["interaction_generation"] == lease_generation
         assert ready["encoder_pre_skip_samples"] == 0

@@ -30,6 +30,7 @@ pub mod device_pairing; // device_pairing（原生 OPAQUE 六位码配对）：�
 pub mod device_protocol; // device_protocol（设备音频协议）：原生侧有界二进制封装。
 #[cfg(feature = "ssh-device")]
 pub mod device_receipts; // device_receipts（设备任务回执）：断线后保留结果并按原编号恢复结算。
+pub mod device_socket; // device_socket（设备同步套接字）：带停止检查和超时的系统就绪等待。
 pub mod device_terminal; // device_terminal（设备终端）：会话化、只读命令任务与增量输出。
 #[cfg(feature = "ssh-device")]
 pub mod device_trust; // device_trust（原生设备信任唯一写入者，兼容 Python 只读格式）。

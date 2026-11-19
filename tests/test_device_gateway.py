@@ -99,7 +99,46 @@ def test_main_application_port_keeps_existing_http_routes() -> None:
     assert calls == ["/api/v1/product/snapshot"]
 
 
-def test_gateway_listener_allows_only_the_audio_media_websocket():
+def test_gateway_listener_allows_only_registered_websockets():
+    calls: list[str] = []
+
+    async def application(scope, _receive, send):
+        calls.append(scope["path"])
+        await send({"type": "websocket.accept", "subprotocol": None, "headers": []})
+
+    guarded = LoopbackDeviceGatewayGuard(
+        application, gateway_port=18765,
+        allowed_paths=frozenset({"/v1/status", "/v1/media", "/ws"}),
+    )
+
+    async def invoke(path: str):
+        messages = []
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await guarded(_scope(18765, path=path, kind="websocket"), receive, send)
+        return messages
+
+    # /ws（语音控制通道）与 /v1/media（媒体通道）都必须按登记放行：
+    # 远端语音转发经 SSH 固定桥接落到 18765，若此处拒绝则转发永远握手失败。
+    assert asyncio.run(invoke("/ws")) == [
+        {"type": "websocket.accept", "subprotocol": None, "headers": []},
+    ]
+    assert asyncio.run(invoke("/v1/media")) == [
+        {"type": "websocket.accept", "subprotocol": None, "headers": []},
+    ]
+    # 未在 allowed_paths（允许路径）登记的业务 WebSocket 仍必须关闭。
+    assert asyncio.run(invoke("/api/v1/product/snapshot")) == [
+        {"type": "websocket.close", "code": 1008},
+    ]
+    assert calls == ["/ws", "/v1/media"]
+
+
+def test_gateway_listener_requires_explicit_registration_even_for_voice_websocket():
     calls: list[str] = []
 
     async def application(scope, _receive, send):
@@ -124,10 +163,7 @@ def test_gateway_listener_allows_only_the_audio_media_websocket():
         return messages
 
     assert asyncio.run(invoke("/ws")) == [{"type": "websocket.close", "code": 1008}]
-    assert asyncio.run(invoke("/v1/media")) == [
-        {"type": "websocket.accept", "subprotocol": None, "headers": []},
-    ]
-    assert calls == ["/v1/media"]
+    assert calls == []
 
 
 def test_device_gateway_payload_requires_bounded_exact_version_envelope() -> None:

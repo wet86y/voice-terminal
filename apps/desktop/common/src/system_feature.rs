@@ -627,8 +627,7 @@ if (-not $configurationValid -and $serviceProcessId -gt 0 -and $null -ne $servic
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $accountName = [string]$identity.Name
 $accountSid = [string]$identity.User.Value
-$groupSids = @($identity.Groups | ForEach-Object { $_.Value })
-$accountIsAdmin = $groupSids -contains 'S-1-5-32-544'
+$accountIsAdmin = Test-ProjectAdministratorAccount $identity
 $accountIsEntra = $accountName -match '^(?i:AzureAD)\\'
 $localAccount = $null
 if ($null -ne (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
@@ -754,6 +753,7 @@ foreach ($candidate in $enabledInboundRules) {
             .replace("{PRODUCT_EXE_B64}", &product_executable_b64)
             .replace("{DEVICE_PAIRING_PORT}", &DEVICE_PAIRING_PORT.to_string())
             .replace("{MAX_EXISTING_SSH_RULES}", &MAX_EXISTING_SSH_RULES.to_string());
+        let script = format!("{ACCOUNT_IDENTITY_SCRIPT}\n{script}");
         let output = run_powershell(&script, std::time::Duration::from_secs(60))?;
         let value = serde_json::from_str(&output)
             .map_err(|_| "OpenSSH Server 状态查询返回了无效 JSON。".to_owned())?;
@@ -1241,9 +1241,11 @@ fn manage_project_device_key(
     owner_sid: &str,
     network_scopes: &[String],
 ) -> Result<(), String> {
-    validate_ascii_id(workspace_id, 32, true, "工作区编号")?;
-    validate_ascii_id(device_id, 128, false, "设备编号")?;
-    validate_ascii_id(build, 128, false, "程序构建编号")?;
+    if !crate::workspace::valid_workspace_id(workspace_id) {
+        return Err("工作区编号格式无效。".into());
+    }
+    validate_ascii_id(device_id, 128, "设备编号")?;
+    validate_ascii_id(build, 128, "程序构建编号")?;
     validate_sid(owner_sid)?;
     if add {
         let key = russh::keys::PublicKey::from_openssh(public_key)
@@ -1314,7 +1316,7 @@ fn manage_project_device_key(
             },
         ),
     ];
-    let mut script = AUTHORIZED_KEYS_SCRIPT.to_owned();
+    let mut script = format!("{ACCOUNT_IDENTITY_SCRIPT}\n{AUTHORIZED_KEYS_SCRIPT}");
     for (name, value) in values {
         let encoded = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
         script = script.replace(&format!("@@{name}@@"), &encoded);
@@ -1331,23 +1333,12 @@ fn manage_project_device_key(
 }
 
 #[cfg(feature = "ssh-device")]
-fn validate_ascii_id(
-    value: &str,
-    maximum: usize,
-    hexadecimal: bool,
-    label: &str,
-) -> Result<(), String> {
+fn validate_ascii_id(value: &str, maximum: usize, label: &str) -> Result<(), String> {
     let valid = !value.is_empty()
         && value.len() <= maximum
-        && if hexadecimal {
-            value
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        } else {
-            value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-            })
-        };
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'));
     if valid {
         Ok(())
     } else {
@@ -1388,6 +1379,19 @@ fn valid_private_cidr(value: &str) -> bool {
     }
 }
 
+/// ACCOUNT_IDENTITY_SCRIPT（账户组归属）：同时读取有效组及 UAC（用户账户控制）仅拒绝组。
+/// 此判断只决定 SSH（安全远程连接）公钥存储位置，不代表当前进程已获管理员权限。
+#[cfg(windows)]
+const ACCOUNT_IDENTITY_SCRIPT: &str = r#"
+function Test-ProjectAdministratorAccount {
+    param($Identity)
+    $groupTypes = @([Security.Claims.ClaimTypes]::GroupSid, [Security.Claims.ClaimTypes]::DenyOnlySid)
+    return [bool](@($Identity.Claims | Where-Object {
+        $groupTypes -contains $_.Type -and $_.Value -eq 'S-1-5-32-544'
+    }).Count -gt 0)
+}
+"#;
+
 #[cfg(windows)]
 const AUTHORIZED_KEYS_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -1403,8 +1407,7 @@ try {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     if ([string]$identity.User.Value -ne $expectedSid) { throw '当前登录账户 SID 与受限公钥目标不匹配。' }
     if ([string]$identity.Name -match '^(?i:AzureAD)\\') { throw 'Microsoft Entra 账户不受当前 Windows OpenSSH 支持。' }
-    $groups = @($identity.Groups | ForEach-Object { $_.Value })
-    $isAdmin = $groups -contains 'S-1-5-32-544'
+    $isAdmin = Test-ProjectAdministratorAccount $identity
     if ($isAdmin -ne $adminExpected) { throw '管理员公钥存储与当前账户组身份不匹配。' }
     $path = if ($isAdmin) { Join-Path $env:ProgramData 'ssh/administrators_authorized_keys' }
         else { Join-Path $env:USERPROFILE '.ssh/authorized_keys' }
@@ -2379,6 +2382,117 @@ Write-Output 'Validated'
 
     #[cfg(windows)]
     #[test]
+    fn powershell_account_membership_includes_deny_only_groups_but_not_other_sid_claims() {
+        let script = format!("{ACCOUNT_IDENTITY_SCRIPT}\n")
+            + r#"
+$ErrorActionPreference = 'Stop'
+foreach ($type in @([Security.Claims.ClaimTypes]::GroupSid, [Security.Claims.ClaimTypes]::DenyOnlySid)) {
+    $identity = @{ Claims = @([Security.Claims.Claim]::new($type, 'S-1-5-32-544')) }
+    if (-not (Test-ProjectAdministratorAccount $identity)) { throw 'Administrator account group rejected' }
+}
+foreach ($claims in @(
+    @(),
+    @([Security.Claims.Claim]::new([Security.Claims.ClaimTypes]::GroupSid, 'S-1-5-32-545')),
+    @([Security.Claims.Claim]::new([Security.Claims.ClaimTypes]::PrimarySid, 'S-1-5-32-544')),
+    @([Security.Claims.Claim]::new([Security.Claims.ClaimTypes]::DenyOnlyWindowsDeviceGroup, 'S-1-5-32-544'))
+)) {
+    $identity = @{ Claims = $claims; Groups = @('S-1-5-32-544') }
+    if (Test-ProjectAdministratorAccount $identity) { throw 'Non-account-group claim accepted' }
+}
+Write-Output 'Validated'
+"#;
+        assert_eq!(
+            run_powershell(&script, std::time::Duration::from_secs(10)).unwrap(),
+            "Validated"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_account_membership_selects_the_authorized_key_store_without_system_writes() {
+        // SAM（本机账户库）作独立只读参照；登记脚本保留真实身份判断，仅重定向文件与 ACL（访问控制）。
+        let probe = format!("{ACCOUNT_IDENTITY_SCRIPT}\n")
+            + r#"
+$ErrorActionPreference = 'Stop'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$directMember = @((Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop) | ForEach-Object { $_.SID.Value }) -contains $identity.User.Value
+$denyOnly = @($identity.Claims | Where-Object { $_.Type -eq [Security.Claims.ClaimTypes]::DenyOnlySid -and $_.Value -eq 'S-1-5-32-544' }).Count -gt 0
+@{account_admin=(Test-ProjectAdministratorAccount $identity);sam_direct_member=$directMember;deny_only_admin=$denyOnly;
+  fields=@{account_admin='真实账户身份判断';sam_direct_member='本机账户库直接成员身份';deny_only_admin='令牌中管理员仅拒绝组'}} | ConvertTo-Json -Compress
+"#;
+        let output = run_powershell(&probe, std::time::Duration::from_secs(10)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let admin = value["account_admin"].as_bool().unwrap();
+        if value["sam_direct_member"] == true || value["deny_only_admin"] == true {
+            assert!(admin, "未提权的真实管理员账户不能被降为普通账户：{value}");
+        }
+        let temp_owner =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp");
+        let temp = temp_owner.join(format!("ssh-account-store-{}", crate::workspace::new_id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let admin_path = temp.join("管理员公钥");
+        let user_path = temp.join("普通账户公钥");
+        for path in [&admin_path, &user_path] {
+            std::fs::write(path, "# 保留原有授权\n").unwrap();
+        }
+        let sid = current_user_sid().unwrap();
+        let mut script = format!("{ACCOUNT_IDENTITY_SCRIPT}\n{AUTHORIZED_KEYS_SCRIPT}");
+        for (source, path) in [
+            (
+                "Join-Path $env:ProgramData 'ssh/administrators_authorized_keys'",
+                &admin_path,
+            ),
+            (
+                "Join-Path $env:USERPROFILE '.ssh/authorized_keys'",
+                &user_path,
+            ),
+        ] {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(path.to_string_lossy().as_bytes());
+            script = script.replace(
+                source,
+                &format!(
+                    "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))"
+                ),
+            );
+        }
+        let line = "command=test ssh-ed25519 TEST VoiceTerminal:real-account:device";
+        for (name, value) in [
+            ("ACTION", "add"),
+            ("EXPECTED_SID", sid.as_str()),
+            ("MARKER", "VoiceTerminal:real-account:device"),
+            ("PUBLIC_KEY", "ssh-ed25519 TEST"),
+            ("LINE", line),
+            ("ADMIN", if admin { "true" } else { "false" }),
+        ] {
+            script = script.replace(
+                &format!("@@{name}@@"),
+                &base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+            );
+        }
+        let setup = format!(
+            r#"
+function Get-Acl {{ param($LiteralPath) return @{{Access=@('{owner}','S-1-5-18') | ForEach-Object {{ @{{IdentityReference=[Security.Principal.SecurityIdentifier]::new($_);IsInherited=$false}} }} }} }}
+function icacls.exe {{ $global:LASTEXITCODE=0 }}
+"#,
+            owner = if admin { "S-1-5-32-544" } else { sid.as_str() }
+        );
+        assert_eq!(
+            run_powershell(&(setup + &script), std::time::Duration::from_secs(10)).unwrap(),
+            "VoiceTerminalAuthorizedKeyUpdated"
+        );
+        let (selected, other) = if admin {
+            (&admin_path, &user_path)
+        } else {
+            (&user_path, &admin_path)
+        };
+        assert!(std::fs::read_to_string(selected).unwrap().contains(line));
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "# 保留原有授权\n");
+        crate::workspace::remove_owned(&temp, &temp_owner).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn powershell_51_key_registration_preserves_other_lines_and_supports_unicode_paths() {
         // 仅在临时目录写测试公钥；系统身份仍用真实 SID（安全标识符），ACL（访问控制）命令全部替换。
         let temp_owner = std::env::temp_dir();
@@ -2396,9 +2510,9 @@ Write-Output 'Validated'
                 let target_expression = format!(
                     "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{target_b64}'))"
                 );
-                let mut script = AUTHORIZED_KEYS_SCRIPT
+                let mut script = format!("{ACCOUNT_IDENTITY_SCRIPT}\n{AUTHORIZED_KEYS_SCRIPT}")
                     .replace(
-                        "$isAdmin = $groups -contains 'S-1-5-32-544'",
+                        "$isAdmin = Test-ProjectAdministratorAccount $identity",
                         if admin {
                             "$isAdmin = $true"
                         } else {

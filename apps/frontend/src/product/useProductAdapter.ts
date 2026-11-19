@@ -22,7 +22,7 @@ import type {
 import { validWakeTriggerCount, wakeIntervalParts, wakeIntervalSeconds } from '../interface/wake-task-interval'
 import { isRecord } from '../record'
 import { desktopPort } from './desktop-port'
-import { nativeDeviceApi } from './native-device-api'
+import { nativeDeviceApi, matchesRemoteManagementEnvelope } from './native-device-api'
 import { modelComponentOwners } from './component-resources'
 import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
@@ -953,6 +953,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const voiceConnected = computed(() => voice.connection.value === 'connected') // voiceConnected（实时语音 WebSocket 状态）。
   const voiceReady = computed(() => remoteMode.value
     ? managementConnected.value && voiceConnected.value : connected.value) // voiceReady（语音操作所需的管理与实时通道均已就绪）。
+  const remoteControlPending = ref(false) // remoteControlPending（管理通道正在执行监听操作）。
+  const listeningControlReady = computed(() => remoteMode.value
+    ? managementConnected.value && application.snapshot.value?.remote_media_ready === true
+    : voiceReady.value) // listeningControlReady（远端启停须有本设备媒体；能力是否就绪由服务端返回实际结果）。
   // corePhase（核心能力阶段）：以宿主发布的 core_phase 为准；旧宿主缺少该字段时按 core_available 回落。
   const corePhase = computed(() => application.snapshot.value?.core_phase
     ?? (application.snapshot.value?.core_available ? 'ready' : 'failed'))
@@ -1136,19 +1140,35 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const latencyRunning = computed(() => connected.value && !remoteMode.value && voice.perceptualLatencyRunning.value)
 
   function setListening(enabled: boolean) {
-    if (!voiceReady.value || application.snapshot.value?.startup_complete === false) return false
-    return voice.setListening(enabled)
+    if (!listeningControlReady.value || remoteControlPending.value || application.snapshot.value?.startup_complete === false) return false
+    if (!remoteMode.value) return voice.setListening(enabled)
+    const hostId = application.snapshot.value?.host_id
+    remoteControlPending.value = true
+    void (async () => {
+      try {
+        const response = await nativeDeviceApi.remoteManagementRequest('voice.command', { command: enabled ? 'session.start' : 'session.stop' })
+        if (adapterDisposed || application.snapshot.value?.host_id !== hostId) return
+        if (!matchesRemoteManagementEnvelope(response, hostId ?? null, 'voice.command') || ![200, 202].includes(response.status)) {
+          throw new Error(typeof response.body?.detail === 'string' ? response.body.detail : '服务端未确认监听操作，请刷新状态。')
+        }
+        if (snapshotRequest) await snapshotRequest
+        await loadSnapshot()
+        if (response.body?.result === 'deferred') setNotice('服务端已收到开始请求，监听仍在等待能力恢复。')
+      } catch (failure) { if (!adapterDisposed) setError(failure) }
+      finally { remoteControlPending.value = false }
+    })()
+    return true
   }
 
   function runtimeAction() {
     if (voice.inputPaused.value) return false
     if (remoteMode.value) {
-      if (application.snapshot.value?.startup_complete === false || !voiceReady.value) return false
-      if (coreUnavailable.value) {
+      if (application.snapshot.value?.startup_complete === false || !listeningControlReady.value) return false
+      if (coreUnavailable.value && !voice.listening.value) {
         setError(new Error('服务端语音能力尚未就绪，请稍后重试。'))
         return false
       }
-      return voice.toggleListening()
+      return setListening(!voice.listening.value)
     }
     if (!application.businessReady.value) return false
     if (application.snapshot.value?.startup_complete === false) return false
@@ -1677,10 +1697,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     () => application.snapshot.value?.endpoint_revision,
   ], ([remote, management, url, endpointRevision], [wasRemote, wasManagement, oldUrl, oldEndpointRevision]) => {
     if (remote) {
-      if (!management || !url) {
+      if (!url) {
         if (voice.connection.value !== 'offline') voice.disconnect()
         return
       }
+      if (!management) return // 短暂管理探测失败保留实时连接；管理写入仍由门禁拒绝。
       const endpointChanged = wasRemote && (wasManagement !== management || oldUrl !== url
         || oldEndpointRevision !== endpointRevision)
       if (endpointChanged && voice.connection.value !== 'offline') voice.disconnect()
@@ -1775,6 +1796,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     managementConnected,
     voiceConnected,
     voiceReady,
+    listeningControlReady,
+    remoteControlPending,
     runtimeState,
     coreUnavailable,
     coreStarting,

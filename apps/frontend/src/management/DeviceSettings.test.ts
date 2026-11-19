@@ -142,6 +142,7 @@ describe('DeviceSettings（设备设置）', () => {
     })
     vi.spyOn(nativeDeviceApi, 'disconnectSshHost').mockImplementation(async () => {
       sshConnected = false
+      if (currentStatus.device_runtime) currentStatus.device_runtime.remote_client_connected = false
       return { state: 'disconnected', disconnected: true, fields: {} }
     })
     vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockImplementation(async action => {
@@ -217,6 +218,22 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.find('[role="alert"]').exists()).toBe(false)
   })
 
+  it('SSH 已认证但管理失败时仍能断开并持久暂停重连，保留原配对身份', async () => {
+    prepareRemoteHost()
+    vi.mocked(nativeDeviceApi.remoteManagementRequest).mockRejectedValue(new Error('管理通道回执不可用'))
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.get('.device-footer .connection-state').text()).toContain('已断开')
+    const disconnect = wrapper.findAll('button').find(button => button.text().trim() === '断开')
+    expect(disconnect).toBeDefined()
+    await disconnect!.trigger('click')
+    await flushPromises()
+    expect(nativeDeviceApi.disconnectSshHost).toHaveBeenCalledOnce()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({ reconnect_suspended_reason: 'user_disconnected' }))
+    expect(currentStatus.device_config?.paired_host?.host_id).toBe(foundHost.host_id)
+    expect(wrapper.findAll('button').find(button => button.text().trim() === '断开')).toBeUndefined()
+  })
+
   it('模式选远程后自动保存；配对码保持前导零并自动建立连接通道', async () => {
     wrapper = mount(DeviceSettings)
     await flushPromises()
@@ -238,6 +255,49 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).toContain('服务端 A')
     expect(wrapper.find('input[placeholder*="192.168"]').exists()).toBe(false)
     expect(wrapper.find('input[placeholder*="SHA256"]').exists()).toBe(false)
+  })
+
+  it('配对登记失败后清除授权进度，保留真实错误并允许重试', async () => {
+    let rejectPairing!: (error: Error) => void
+    vi.mocked(nativeDeviceApi.pairWithDiscoveredDevice).mockImplementation(() => new Promise((_, reject) => {
+      rejectPairing = reject
+    }))
+    currentStatus = makeConfig('remote', false)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().trim() === '搜索设备')!.trigger('click')
+    await flushPromises()
+    await wrapper.get('input[placeholder="输入服务端显示的配对码"]').setValue('000042')
+    const connect = wrapper.findAll('button').find(button => button.text().trim() === '连接')!
+    await connect.trigger('click')
+    expect(wrapper.text()).toContain('正在验证配对并登记受限公钥')
+    rejectPairing(new Error('服务端未能安全登记本次设备；请检查服务端配对状态后重试。'))
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('服务端未能安全登记本次设备')
+    expect(wrapper.text()).not.toContain('正在验证配对并登记受限公钥')
+    expect(connect.attributes('disabled')).toBeUndefined()
+    expect(nativeDeviceApi.remoteTaskChannel).not.toHaveBeenCalledWith('start')
+    expect(nativeDeviceApi.remoteMediaChannel).not.toHaveBeenCalledWith('start')
+  })
+
+  it('配对成功但桥接失败时清除登记进度并显示连接错误', async () => {
+    vi.mocked(nativeDeviceApi.pairWithDiscoveredDevice).mockResolvedValue({
+      state: 'paired', device_id: 'device-a', host_id: foundHost.host_id,
+      display_name: foundHost.display_name, ssh_port: 22, address: foundHost.addresses[0],
+      connected: false, connection_error: 'SSH 桥接身份参数格式无效。', fields: {},
+    })
+    currentStatus = makeConfig('remote', false)
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().trim() === '搜索设备')!.trigger('click')
+    await flushPromises()
+    await wrapper.get('input[placeholder="输入服务端显示的配对码"]').setValue('000042')
+    await wrapper.findAll('button').find(button => button.text().trim() === '连接')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('配对和服务端身份保存成功，但 SSH 桥接连接失败')
+    expect(wrapper.get('[role="alert"]').text()).toContain('SSH 桥接身份参数格式无效')
+    expect(wrapper.text()).not.toContain('正在验证配对并登记受限公钥')
+    expect(nativeDeviceApi.remoteTaskChannel).not.toHaveBeenCalledWith('start')
   })
 
   it('远程连接开关即时保存并按需重建通道，不暴露手工通道控制', async () => {

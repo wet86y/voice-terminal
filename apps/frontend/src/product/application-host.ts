@@ -76,6 +76,7 @@ export interface ApplicationSnapshot {
   host_name?: string | null // host_name（当前远程服务端显示名称）。
   management_connected?: boolean // management_connected（SSH 管理及任务会话是否就绪）。
   remote_business_ready?: boolean // remote_business_ready（服务端产品业务接口是否可访问）。
+  remote_media_ready?: boolean // remote_media_ready（本设备媒体通道及任务代次是否一致）。
   remote_error?: string | null // remote_error（远程目标暂不可用的原因）。
   remote_voice_error?: string | null // remote_voice_error（本机远程语音 WebSocket 转发错误）。
   remote_runtime_state?: string // remote_runtime_state（服务端实际语音核心状态）。
@@ -204,10 +205,16 @@ let refreshRequest: Promise<void> | null = null
 let remoteApplicationRevision = 0 // remoteApplicationRevision（远程桌面状态投影修订号）。
 let remoteApplicationStartedAt: number | null = null // remoteApplicationStartedAt（本窗口首次读取远程状态的时间）。
 let remoteVoiceForwarderHostId: string | null = null // remoteVoiceForwarderHostId（本机回环转发绑定的服务端编号）。
+let remoteVoiceForwarderUrl = '' // remoteVoiceForwarderUrl（当前固定地址，只保留已认证连接）。
+let remoteVoiceProbeFailedAt: number | null = null // remoteVoiceProbeFailedAt（瞬时探测失败起点）。
+let remoteVoiceTaskGeneration: number | undefined // remoteVoiceTaskGeneration（最近确认的核心连接代次）。
 
 async function stopRemoteVoiceForwarder() {
   if (!remoteVoiceForwarderHostId) return
   remoteVoiceForwarderHostId = null
+  remoteVoiceForwarderUrl = ''
+  remoteVoiceProbeFailedAt = null
+  remoteVoiceTaskGeneration = undefined
   try { await nativeDeviceApi.remoteVoiceForwarder('stop') } catch { /* SSH 断开时本机转发仍由原生生命周期回收。 */ }
 }
 
@@ -217,15 +224,17 @@ async function ensureRemoteVoiceForwarder(hostId: string): Promise<string> {
     const started = await nativeDeviceApi.remoteVoiceForwarder('start')
     if (started.state !== 'running') throw new Error('远程语音本机转发未能启动。')
     remoteVoiceForwarderHostId = hostId
+    remoteVoiceForwarderUrl = started.url
     return started.url
   }
   try {
     const status = await nativeDeviceApi.remoteVoiceForwarder('status')
-    if (status.state === 'running') return status.url
+    if (status.state === 'running') { remoteVoiceForwarderUrl = status.url; return status.url }
   } catch { /* 状态补查失败后尝试重新确认或启动固定转发。 */ }
   const started = await nativeDeviceApi.remoteVoiceForwarder('start')
   if (started.state !== 'running') throw new Error('远程语音本机转发未能恢复。')
   remoteVoiceForwarderHostId = hostId
+  remoteVoiceForwarderUrl = started.url
   return started.url
 }
 
@@ -351,6 +360,7 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
   let product: ProductSnapshot | null = null
   let remoteBusinessReady = false
   let taskReady = false
+  let mediaReady = false
   let taskGeneration: number | undefined // taskGeneration（核心任务连接代次）：核心重建时更新实时端点，独立于管理租约。
   if (managementConnected && remoteCoreState === 'ready') {
     try {
@@ -359,6 +369,12 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
         && Number.isSafeInteger(task.connection_generation) && (task.connection_generation ?? 0) > 0
       if (taskReady) taskGeneration = task.connection_generation
       if (taskReady) {
+        try {
+          const media = await nativeDeviceApi.remoteMediaChannel('status')
+          mediaReady = media.state === 'running' && media.device_id === local.runtime.device_id
+            && media.connection_generation === task.connection_generation
+            && media.executor_generation === task.executor_generation
+        } catch { /* 只影响监听入口，保留管理与设置访问。 */ }
         const result: RemoteManagementResponse = await nativeDeviceApi.remoteManagementRequest('product.snapshot', {})
         const productEnvelopeValid = matchesRemoteManagementEnvelope(result, hostId, 'product.snapshot')
         if (result.status === 200 && productEnvelopeValid && result.body && typeof result.body === 'object'
@@ -417,8 +433,19 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
   if (managementConnected && remoteCoreState === 'ready' && taskReady && hostId) {
     try { voiceWsUrl = await ensureRemoteVoiceForwarder(hostId) }
     catch (failure) { remoteVoiceError = failure instanceof Error ? failure.message : '远程语音本机转发不可用。' }
+    remoteVoiceProbeFailedAt = null
+    remoteVoiceTaskGeneration = taskGeneration
   } else {
-    await stopRemoteVoiceForwarder()
+    const transientProbeFailure = sshConnected && hostId === remoteVoiceForwarderHostId
+      && !local.device_config?.reconnect_suspended_reason
+      && (management === null || management.status === 503 || managementConnected && remoteCoreState === 'starting')
+    if (transientProbeFailure && remoteVoiceForwarderUrl) {
+      remoteVoiceProbeFailedAt ??= Date.now()
+      if (Date.now() - remoteVoiceProbeFailedAt < 6000) {
+        voiceWsUrl = remoteVoiceForwarderUrl
+        taskGeneration = remoteVoiceTaskGeneration
+      } else await stopRemoteVoiceForwarder()
+    } else await stopRemoteVoiceForwarder()
   }
   const unavailableCapabilities: ApplicationCapability[] = !managementConnected || coreAvailable ? [] : [{
     id: 'voice', label: '服务端语音核心', state: corePhase === 'starting' ? 'STARTING' : 'ERROR', blocking: true,
@@ -437,6 +464,7 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
     host_name: hostName,
     management_connected: managementConnected,
     remote_business_ready: remoteBusinessReady,
+    remote_media_ready: mediaReady,
     remote_error: remoteError,
     remote_voice_error: remoteVoiceError,
     remote_runtime_state: product?.runtime?.state,

@@ -5,7 +5,9 @@ import asyncio
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Callable
+from uuid import uuid4
 
 from ..audio.ring_buffer import PcmRingBuffer
 from ..controller.turn_workspace import AudioFrame
@@ -40,6 +42,7 @@ class RemoteAudioCapture:
         *,
         ring_buffer_ms: int = 6_000,
         on_audio_frame: Callable[[bytes], None] | None = None,
+        restart_stream: Callable[[str], PcmInputStream] | None = None,
     ) -> None:
         if not isinstance(stream, PcmInputStream):
             raise TypeError("远端采集端口必须绑定已验证的 PCM 输入流。")
@@ -48,6 +51,9 @@ class RemoteAudioCapture:
         if on_audio_frame is not None and not callable(on_audio_frame):
             raise TypeError("音频帧观察回调无效。")
         self._stream = stream
+        self._restart_stream = restart_stream  # _restart_stream（显式恢复时为新编号建立输入流）。
+        self._retired_streams: deque[str] = deque(maxlen=4)  # _retired_streams（只丢弃本连接近期已结束的输入）。
+        self._closed = False  # _closed（媒体连接销毁或输入错误后不可恢复）。
         self._on_audio_frame = on_audio_frame
         self.queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=self.QUEUE_FRAMES)
         self.ring_buffer = PcmRingBuffer(
@@ -79,6 +85,20 @@ class RemoteAudioCapture:
         return self._stream.lease
 
     @property
+    def stream_id(self) -> str:
+        """stream_id（当前输入流编号）：暂停后重新开始使用新编号。"""
+        return self._stream.stream_id
+
+    @property
+    def closed(self) -> bool:
+        """closed（媒体输入已销毁）：监听暂停本身不销毁媒体连接。"""
+        return self._closed
+
+    def enable_restart(self, factory: Callable[[str], PcmInputStream]) -> None:
+        """enable_restart（启用已协商的输入重建）：旧客户端继续采用原媒体控制契约。"""
+        self._restart_stream = factory
+
+    @property
     def diagnostics(self) -> dict[str, int | float | str | None]:
         """diagnostics（有界诊断快照）：不包含音频内容、设备凭据或主机地址。"""
         return {
@@ -95,8 +115,14 @@ class RemoteAudioCapture:
         """start（开始接收）：每条连续流只启动一次，旧队列不会跨流保留。"""
         if self._running:
             return
-        if self._started or self._stream.closed:
+        if self._closed:
             raise RemoteAudioCaptureError("远端 PCM 流已关闭，必须为新连接建立新流。")
+        if self._started or self._stream.closed:
+            if self._restart_stream is None:
+                raise RemoteAudioCaptureError("远端 PCM 流已关闭，必须为新连接建立新流。")
+            self._retired_streams.append(self.stream_id)
+            self._stream.close()
+            self._stream = self._restart_stream(uuid4().hex)
         self._clear_pending_frames()
         self.ring_buffer.clear()
         self._frames_received = 0
@@ -115,8 +141,17 @@ class RemoteAudioCapture:
         self._clear_pending_frames()
         self._stopped.set()
 
+    async def close(self) -> None:
+        """close（销毁媒体输入）：与可恢复的监听停止分开，旧连接永不重新启用。"""
+        self._closed = True
+        await self.stop()
+
     def accept_frame(self, frame: MediaFrame) -> AudioFrame | None:
         """accept_frame（接纳帧）：先核验核心租约与设备时钟，再入队。"""
+        if self._restart_stream is not None and not self._closed and self._same_lease(frame):
+            if frame.stream_id in self._retired_streams or (not self._running and self._started
+                                                          and frame.stream_id == self.stream_id):
+                return None  # 已结束输入的在途帧只能丢弃，不送入新一轮识别，也不误杀新流。
         if not self._running:
             raise RemoteAudioCaptureError("远端音频采集尚未启动或已停止。")
         try:
@@ -149,12 +184,17 @@ class RemoteAudioCapture:
             return audio
         except Exception as error:
             self._last_error = str(error)[:300]
+            self._closed = True
             self._running = False
             self._stream.close()
             self._clear_pending_frames()
             self.ring_buffer.clear()
             self._stopped.set()
             raise
+
+    def _same_lease(self, frame: MediaFrame) -> bool:
+        """_same_lease（迟到帧身份）：丢弃例外仍要求原设备、核心和全部代次一致。"""
+        return self._stream.matches_current_lease(frame)
 
     def _clear_pending_frames(self) -> None:
         while True:

@@ -59,6 +59,14 @@ class PcmInputStream:
         self._opus_buffer.clear()
         self._opus_processing_chunks.clear()
 
+    def matches_current_lease(self, frame: MediaFrame) -> bool:
+        """matches_current_lease（迟到帧所属身份）：只供结束输入的丢弃判断，不替代正常帧校验。"""
+        return (self._registry.accepts(self.lease) and frame.device_id == self.lease.device_id
+                and frame.core_session_id == self.core_session_id
+                and frame.connection_generation == self.lease.connection_generation
+                and frame.executor_generation == self.lease.executor_generation
+                and frame.interaction_generation == self.lease.interaction_generation)
+
     def accept(self, frame: MediaFrame) -> AudioFrame | None:
         """accept（接纳帧）：PCM 即时返回；Opus 先剔除编码预延迟并累计有效样本。"""
         if self.closed:

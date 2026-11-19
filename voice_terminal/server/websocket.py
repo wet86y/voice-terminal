@@ -22,6 +22,7 @@ from ..devices.desktop_transport import LocalDesktopHelperTransport
 from ..devices.router import DeviceOutcomeUnknown, DeviceRouter, DeviceUnavailable
 from ..devices.registry import DeviceRegistry, InteractionLease
 from ..devices.remote_capture import RemoteAudioCapture
+from ..devices.diagnostics import device_event, lease_context
 from ..devices.remote_playback import RemotePlaybackOutbox
 from ..devices.client_tts import RemoteClientTtsOutbox
 from ..devices.remote_session import RemoteDeviceSessionHub, RemoteDeviceTask
@@ -165,6 +166,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._pending_interaction_switch_task: asyncio.Task[None] | None = None  # pending_interaction_switch_task（超时撤销未完成的切换，避免卡住后续选择）。
         self._aborted_remote_interaction_switch: tuple[InteractionLease, bool] | None = None  # _aborted_remote_interaction_switch（待媒体故障接管复用的原监听意图）。
         self._local_recovery_lock = asyncio.Lock()  # _local_recovery_lock（串行化远端故障后的显式本机接管）。
+        self._remote_media_captures: dict[str, RemoteAudioCapture] = {}  # _remote_media_captures（当前媒体输入所有者，隔离同租约新旧流）。
         self._remote_playback_outboxes: dict[str, RemotePlaybackOutbox] = {}  # _remote_playback_outboxes（当前媒体会话的有界下行播放队列）。
         self._remote_client_tts_outboxes: dict[str, RemoteClientTtsOutbox] = {}  # _remote_client_tts_outboxes（按设备媒体租约绑定的客户端合成中继）。
         self._remote_playback_bindings: dict[str, tuple[str, RemotePlaybackOutbox]] = {}  # _remote_playback_bindings（按播放键冻结的设备送达目标）。
@@ -499,6 +501,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             # new connection must still request a fresh interaction lease.
             await self.abort_interaction_switch(previous_lease)
             await self.recover_local_after_remote_media_loss(previous_lease)
+        device_event(logger, "device.session_opened", device_id=device_id, core_session_id=self.core_session_id,
+                     connection_generation=connection.connection_generation, executor_generation=connection.executor_generation,
+                     capabilities=",".join(capabilities))
         return connection
 
     async def poll_remote_device_task(self, device_id: str, connection_generation: int,
@@ -577,6 +582,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         ) if lease is not None and lease.device_id == device_id
             and lease.connection_generation == connection_generation), None)
         closed = await self.device_remote_sessions.close(device_id, connection_generation)
+        if closed:
+            device_event(logger, "device.session_closed", device_id=device_id, core_session_id=self.core_session_id,
+                         connection_generation=connection_generation)
         if closed and lost_lease is not None:
             # Registry.disconnect() may invalidate a pending lease before the media
             # handler observes the close. Retire its runtime transaction first so
@@ -1050,6 +1058,17 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                                              device_id=device_id, operation="wait_until_output_complete")
             await asyncio.sleep(min(0.025, remaining))
 
+    def remote_media_control_ready(self, device_id: str, connection_generation: int) -> bool:
+        """remote_media_control_ready（远端监听目标可用）：控制入口只能启停本设备仍有效的媒体输入。"""
+        lease = self.device_registry.active
+        capture = self._remote_media_captures.get(device_id)
+        playback = self._remote_playback_outboxes.get(device_id)
+        return bool(lease is not None and lease.device_id == device_id
+                    and lease.connection_generation == connection_generation
+                    and self.device_registry.accepts(lease) and capture is not None
+                    and capture.lease == lease and not capture.closed
+                    and playback is not None and not playback.closed)
+
     async def select_remote_capture(self, capture: RemoteAudioCapture, lease: InteractionLease) -> None:
         """select_remote_capture（选择远端采集端口）：只接受当前有效的远端语音租约。"""
         if not isinstance(capture, RemoteAudioCapture) or not isinstance(lease, InteractionLease):
@@ -1069,7 +1088,12 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             raise RuntimeError("远端音频设备未连接、未获交互授权或未登记音频流能力。")
         if self._capture_router is None:
             raise RuntimeError("核心采集接口尚未初始化。")
-        await self._capture_router.select(lease.device_id, capture)
+        async with self._local_recovery_lock:
+            if not (self.device_registry.accepts(lease) or self.device_registry.pending == lease):
+                raise RuntimeError("选择采集时交互租约已经失效。")
+            await self._capture_router.select(lease.device_id, capture)
+            self._remote_media_captures[lease.device_id] = capture
+        device_event(logger, "device.capture_selected", **lease_context(lease), stream_id=capture.stream_id)
 
     async def prepare_interaction_switch(
         self, device_id: str, expected_generation: int, *, _resume_intent: bool | None = None,
@@ -1109,6 +1133,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 self.device_registry.abort_switch(lease)
                 raise
             self._pending_interaction_switch = (lease, was_listening)
+            device_event(logger, "device.interaction_prepare", **lease_context(lease), resume_intent=was_listening)
             self._pending_interaction_switch_task = asyncio.create_task(
                 self._expire_interaction_switch(lease),
                 name=f"device-switch-expiry-{lease.interaction_generation}",
@@ -1151,7 +1176,15 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if resume and self.controller is not None:
                 await self.controller.start_listening()
                 if not self.state.listening:
-                    raise RuntimeError("远端设备已获得交互租约，但核心未能恢复监听。")
+                    self._listen_resume_requested = True  # 能力恢复后沿用既有自动恢复；用户停止会撤销此意图。
+                    reason = self.state.can_start_reason or {}
+                    device_event(logger, "device.interaction_listening_deferred", level=logging.WARNING,
+                                 **lease_context(lease), reason=str(reason.get("message") or capture.diagnostics.get("last_error")
+                                                                  or "核心尚未恢复监听，请查看能力状态"))
+                    await self.bus.publish(event("status", code="REMOTE_LISTENING_DEFERRED",
+                                                 message="远端媒体已连接，监听尚未恢复，请检查能力状态后重试。"))
+            device_event(logger, "device.interaction_complete", **lease_context(lease),
+                         resume_intent=resume, capture_active=capture.running)
             return resume
 
     async def complete_local_interaction_switch(self, lease: InteractionLease) -> bool:
@@ -1187,13 +1220,23 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             self._cancel_interaction_switch_expiry()
             if lease.device_id != "local":
                 self._aborted_remote_interaction_switch = (lease, pending[1])
+            device_event(logger, "device.interaction_abort", **lease_context(lease), resume_intent=pending[1])
             return self.device_registry.abort_switch(lease)
 
-    async def recover_local_after_remote_media_loss(self, lost_lease: InteractionLease) -> bool:
+    async def recover_local_after_remote_media_loss(
+        self, lost_lease: InteractionLease, *, capture: RemoteAudioCapture | None = None,
+    ) -> bool:
         """recover_local_after_remote_media_loss（远端故障后显式回本机）：保留监听意图且不抢占新租约。"""
         if not isinstance(lost_lease, InteractionLease) or lost_lease.device_id == "local":
             return False
         async with self._local_recovery_lock:
+            media_owner = self._remote_media_captures.get(lost_lease.device_id)
+            if (capture is not None and media_owner is not None and media_owner is not capture
+                    and not media_owner.closed and self._capture_router is not None
+                    and self._capture_router.is_selected(lost_lease.device_id, media_owner)):
+                device_event(logger, "device.media_cleanup_superseded", **lease_context(lost_lease),
+                             stream_id=capture.stream_id, reason="旧媒体处理器不再拥有当前输入，保留新流")
+                return False
             if (getattr(self, "_application_stopping", False)
                     or getattr(self, "_closed", False)):
                 return False
@@ -1277,6 +1320,10 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                     await self.abort_interaction_switch(local_lease)
                     return False
                 await self.complete_local_interaction_switch(local_lease)
+                self._remote_media_captures.pop(lost_lease.device_id, None)
+                device_event(logger, "device.interaction_fallback_local", level=logging.WARNING,
+                             **lease_context(lost_lease), resume_intent=resume_intent,
+                             reason="原远端媒体连接结束，本机获得新的交互租约；旧播放事务保持原目标")
                 return self.device_registry.active == local_lease
             except (RuntimeError, ValueError):
                 if (local_lease is not None
@@ -1292,9 +1339,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         if not isinstance(capture, RemoteAudioCapture) or not isinstance(lease, InteractionLease):
             return False
         if self._capture_router is None:
-            await capture.stop()
+            await capture.close()
             return False
-        await capture.stop()
+        await capture.close()
         return await self._capture_router.clear_if_selected(lease.device_id, capture)
 
     async def select_local_capture(self, lease: InteractionLease) -> None:
@@ -3428,6 +3475,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
     async def _asr_compute_health(self) -> dict[str, Any]:
         """在独立连接查询识别模型，避免排在设备切换命令后面。"""
         probe = AsrWorkerClient(self.asr.url)
+        probe.connection_log_level = logging.DEBUG
         try:
             await probe.connect()
             return await probe.health(timeout_s=2.0, allow_starting=True)

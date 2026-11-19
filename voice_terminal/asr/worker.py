@@ -529,7 +529,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
             return {"status": "READY", "model_loaded": engine.model_loaded,
                     "device": engine.device, "offline": engine.offline.status()}
     peer = getattr(websocket, "remote_address", None)
-    logger.info("asr.worker.connection_open peer=%s", peer)
+    logger.debug("asr.worker.connection_open peer=%s", peer)
     try:
         async for raw in websocket:
             if isinstance(raw, bytes):
@@ -718,4 +718,4 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
         await asyncio.gather(*remaining, return_exceptions=True)
         for turn_id in owned_turns:
             await engine.clear_turn(turn_id)
-        logger.info("asr.worker.connection_closed peer=%s", peer)
+        logger.debug("asr.worker.connection_closed peer=%s", peer)

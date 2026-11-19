@@ -20,6 +20,7 @@ from .environment import resolve_python
 from .windows import Job, ManagedProcess
 from ..core.state import SERVICE_LABELS, SERVICE_LOADING_STATES, SERVICE_READY_STATES
 from ..log_budget import enforce_log_budget
+from ..devices.diagnostics import device_event
 from ..resources import ResourcePolicy
 from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
 from .ports import validate_endpoint_report
@@ -142,7 +143,10 @@ class ApplicationHost:
         try:
             if voice is None or voice.poll() is not None:
                 log.info("能力恢复回落到整进程重建：组件=voice，能力=%s", capability)
-                await self.retry("voice")
+                if self.operation_lock.locked():
+                    self.enqueue(self.retry("voice"))  # 已持恢复锁时排队，避免递归等待同一把锁。
+                else:
+                    await self.retry("voice")
                 return
             log.info("开始能力级恢复：能力=%s", capability)
             response = await self.voice_control(
@@ -160,13 +164,14 @@ class ApplicationHost:
             self.state.component("voice", retrying=False, operation_failed=not recovered)
             self.state.finish()
 
-    def request_retry(self, key: str) -> bool:
+    def request_retry(self, key: str, *, trigger: str = "application") -> bool:
         with self.state.condition:
             snapshot = self.state.snapshot()
             row = next((c for c in snapshot["components"] if c["id"] == key), None)
             if not row or not row["retry_allowed"]:
                 return False
             self.state.component(key, retrying=True, phase="等待恢复操作")
+        device_event(log, "device.component_retry_requested", capability=key, trigger=trigger)
         self.enqueue(self.retry(key))
         return True
 
@@ -668,16 +673,22 @@ class ApplicationHost:
                            and services.get(name) not in SERVICE_LOADING_STATES]
             ready = not unavailable and not loading
             error = "核心能力未就绪：" + "、".join(unavailable) if unavailable else ""
+            health_state = (tuple(unavailable), tuple(loading))
+            if health_state != getattr(self, "_voice_capability_health", None):
+                self._voice_capability_health = health_state
+                device_event(log, "device.capability_health", result="failed" if unavailable else "starting" if loading else "ready",
+                             reason=error or ("能力加载中：" + "、".join(loading) if loading else "核心能力已就绪"))
             self.state.update(core_available=ready,
                 core_phase="failed" if unavailable else "starting" if loading else "ready",
                 capabilities=services, voice_api_ready=True)
             self.state.component("voice", error=error)
             if self.state.value["startup_complete"]:
                 self.state.component("voice",
-                    state="ready" if ready else "failed" if unavailable else "starting",
+                    # 进程和 HTTP（接口）存活不等于各能力可用；能力失败不能解锁整进程重启按钮。
+                    state="ready",
                     phase=("核心能力已就绪" if ready
-                           else "核心能力不可用" if unavailable
-                           else "核心能力加载中：" + "、".join(loading)),
+                           else "语音接口就绪，部分能力不可用" if unavailable
+                           else "语音接口就绪，能力加载中：" + "、".join(loading)),
                     error=error)
             return True
         return False
@@ -816,6 +827,14 @@ class ApplicationHost:
         )
         created = local_tts.get('created_at') if isinstance(local_tts, dict) else None
         self.local_tts_created_at = float(created) if type(created) in {int, float} and created > 0 else None
+        reported = data.get("capabilities", [])
+        # 兼容旧核心缺少字段；只采用已知能力的状态行，不因诊断附加字段拒绝整个状态请求。
+        known = {"audio", "asr", "llm", "tts", "kws", "speaker", "dsh", "analysis"}
+        self.capability_rows = [dict(row) for row in reported
+                                if isinstance(row, dict) and row.get("id") in known
+                                and isinstance(row.get("state"), str)] if isinstance(reported, list) else []
+        self.state.update(unavailable_capabilities=[dict(row) for row in self.capability_rows
+                          if row["state"] not in SERVICE_READY_STATES and row["state"] != "DISABLED"])
         for key in ("speaker", "dsh"):
             item = data[key]
             row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
@@ -1041,11 +1060,23 @@ class ApplicationHost:
                         await self.voice_control("pause")
                     if key == "voice":
                         alive = self.processes.get("voice")
+                        if alive is not None and alive.poll() is None:
+                            try:
+                                await self.delegated_status()
+                            except Exception:
+                                log.info("恢复前能力查询未完成，使用现有能力状态")
                         pending = self._pending_capability_row()
                         if alive is not None and alive.poll() is None and pending is not None:
                             # 进程仍在运行：先做能力级恢复，避免整进程重启拖垮其他能力。
                             log.info("语音进程存活，改用能力级恢复：能力=%s", pending.get("id"))
                             return await self.retry_capability(str(pending.get("id")))
+                        if alive is not None and alive.poll() is None and self.state.value.get("voice_api_ready"):
+                            # 旧核心没有分能力字段时也先复用存活进程恢复会话，不直接杀进程。
+                            response = await self.voice_control("reinitialize")
+                            if not response.get("ok"):
+                                raise RuntimeError(response.get("message") or "语音会话恢复失败")
+                            await self.probe("voice")
+                            return
                     old = self.processes.get(key)
                     if old:
                         old.request_stop(f"component-retry:{key}")
@@ -1053,6 +1084,8 @@ class ApplicationHost:
                         while old.poll() is None and time.monotonic() < deadline:
                             await asyncio.sleep(.1)
                         self.stop_group(key)
+                        device_event(log, "device.component_process_stopped", capability=key,
+                                     exit_code=old.poll(), trigger="component-retry")
                     await self.start_service(key)
                     if key == "voice":
                         await self.start_delegated()

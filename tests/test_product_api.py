@@ -405,11 +405,33 @@ class ProductApiTests(unittest.TestCase):
             assert self.runtime.product_settings.settings_only()["silence"]["seconds"] == updated
 
             with patch.object(self.runtime, "start_listening", new=AsyncMock()) as start_listening:
+                rejected = await management("voice.command", {"command": "session.start"})
+            assert rejected.status_code == 409  # 管理连通不能隐式打开本机或别的设备输入。
+            start_listening.assert_not_awaited()
+
+            async def start_accepted():
+                self.runtime.state.listening = True
+
+            with patch.object(self.runtime, "remote_media_control_ready", return_value=True) as media_ready, \
+                 patch.object(self.runtime, "start_listening", new=AsyncMock(side_effect=start_accepted)) as start_listening:
                 started = await management("voice.command", {"command": "session.start"})
             assert started.status_code == 200
             assert started.json()["status"] == 200
             assert started.json()["body"]["result"] == "completed"
             start_listening.assert_awaited_once_with()
+            media_ready.assert_called_once_with(device_id, generation)
+            self.runtime.state.listening = False
+            with patch.object(self.runtime, "remote_media_control_ready", return_value=True), \
+                 patch.object(self.runtime, "_listen_resume_requested", True), \
+                 patch.object(self.runtime, "start_listening", new=AsyncMock()):
+                deferred = await management("voice.command", {"command": "session.start"})
+            assert deferred.json()["status"] == 202
+            assert deferred.json()["body"]["result"] == "deferred"
+            with patch.object(self.runtime, "remote_media_control_ready", return_value=True), \
+                 patch.object(self.runtime, "start_listening", new=AsyncMock()):
+                failed_start = await management("voice.command", {"command": "session.start"})
+            assert failed_start.json()["status"] == 503
+            assert failed_start.json()["body"]["result"] == "failed"
 
             manual_task_body = {
                 "text": "远程服务端提醒", "at": "2026-11-17T12:00:00+08:00",

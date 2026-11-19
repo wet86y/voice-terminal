@@ -330,6 +330,58 @@ describe('远程 Host 管理代次', () => {
     vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockResolvedValue({ state: 'connected', connected: true, fields: {} })
     vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockResolvedValue({ state: 'running', device_id: 'client-a',
       connection_generation: 12, executor_generation: 1, fields: {} })
+    vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockResolvedValue({ state: 'running', device_id: 'client-a',
+      connection_generation: 12, executor_generation: 1, interaction_generation: 2, fields: {} })
+  })
+
+  it('实时页面未连但本设备媒体有效时通过管理入口启停，媒体失效后拒绝发起', async () => {
+    vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockResolvedValue({ state: 'running', url: 'ws://127.0.0.1:43127/token/ws', fields: {} })
+    const media = vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockResolvedValue({ state: 'running', device_id: 'client-a',
+      connection_generation: 12, executor_generation: 1, interaction_generation: 2, fields: {} })
+    const management = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' })
+      : operation === 'voice.command' ? remoteManagementResponse(operation, { result: 'completed' })
+        : remoteManagementResponse(operation, remoteProductStatus))
+    await host.refresh(); await flushPromises()
+    expect(adapter.voiceConnected.value).toBe(false)
+    expect(adapter.listeningControlReady.value).toBe(true)
+    expect(adapter.setListening(true)).toBe(true)
+    expect(adapter.setListening(true)).toBe(false)
+    await flushPromises()
+    expect(management).toHaveBeenCalledWith('voice.command', { command: 'session.start' })
+    expect(adapter.remoteControlPending.value).toBe(false)
+    media.mockResolvedValue({ state: 'stopped', fields: {} })
+    await host.refresh(); await flushPromises()
+    expect(adapter.listeningControlReady.value).toBe(false)
+    expect(adapter.setListening(true)).toBe(false)
+  })
+
+  it('单次管理探测失败保留语音连接，超出宽限后回收，信任拒绝立即回收', async () => {
+    const url = 'ws://127.0.0.1:43127/token/ws'
+    const forwarder = vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockImplementation(async action => action === 'stop'
+      ? { state: 'stopped', fields: {} } : { state: 'running', url, fields: {} })
+    const management = vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' }) : remoteManagementResponse(operation, remoteProductStatus))
+    await host.refresh(); await flushPromises()
+    FakeWebSocket.instances.at(-1)!.open()
+    management.mockRejectedValue(new Error('管理状态请求超时'))
+    await host.refresh(); await flushPromises()
+    expect(host.snapshot.value?.management_connected).toBe(false)
+    expect(host.snapshot.value?.voice_ws_url).toBe(url)
+    expect(adapter.voiceConnected.value).toBe(true)
+    expect(forwarder).not.toHaveBeenCalledWith('stop')
+    vi.setSystemTime(Date.now() + 7000)
+    await host.refresh(); await flushPromises()
+    expect(forwarder).toHaveBeenCalledWith('stop')
+    expect(adapter.voiceConnected.value).toBe(false)
+    management.mockImplementation(async operation => operation === 'management.status'
+      ? remoteManagementResponse(operation, { core_state: 'ready' }) : remoteManagementResponse(operation, remoteProductStatus))
+    await host.refresh(); await flushPromises()
+    forwarder.mockClear()
+    management.mockResolvedValue({ ...remoteManagementResponse('management.status', {}), status: 403 })
+    await host.refresh(); await flushPromises()
+    expect(forwarder).toHaveBeenCalledWith('stop')
+    expect(host.snapshot.value?.voice_ws_url).toBe('')
   })
 
   it('只接受当前配对主机和同一管理代次的产品状态', async () => {
@@ -413,7 +465,7 @@ describe('远程 Host 管理代次', () => {
     expect(host.corePhase.value).toBe('ready')
   })
 
-  it('管理和语音通道状态独立，实时产品投影与语音命令走远程 WebSocket', async () => {
+  it('管理和语音通道状态独立，实时投影走 WebSocket，监听启停走设备绑定管理入口', async () => {
     const url = 'ws://127.0.0.1:43127/random_token_123/ws'
     vi.spyOn(nativeDeviceApi, 'remoteVoiceForwarder').mockImplementation(async (action): Promise<RemoteVoiceForwarderResult> => action === 'stop'
       ? { state: 'stopped', fields: {} }
@@ -457,9 +509,11 @@ describe('远程 Host 管理代次', () => {
     expect(adapter.pendingSpeechRows.value[0]?.text).toBe('实时播报正文')
 
     expect(adapter.setListening(true)).toBe(true)
+    await flushPromises()
     socket.push('runtime.snapshot', 6, { state: 'LISTENING', listening: true, can_start: false,
       current: { turn_id: 'live-turn' } }, { turn_id: 'live-turn' })
     expect(adapter.setListening(false)).toBe(true)
+    await flushPromises()
     expect(adapter.setReasoningMode('deep')).toBe(true)
     socket.push('runtime.snapshot', 7, { state: 'IDLE', listening: false, can_start: true,
       session_operation: null, current: { turn_id: 'live-turn' } }, { turn_id: 'live-turn' })
@@ -470,9 +524,10 @@ describe('远程 Host 管理代次', () => {
     socket.push('runtime.snapshot', 10, { session_operation: null, can_start: true, conversation: { entries: [], latest_seq: 0 } })
     expect(adapter.clearSession()).toBe(true)
     expect(socket.sent.map(row => JSON.parse(row).command)).toEqual([
-      'subscribe', 'session.start', 'session.stop', 'session.reasoning_mode', 'session.reset', 'session.clear',
+      'subscribe', 'session.reasoning_mode', 'session.reset', 'session.clear',
     ])
-    expect(vi.mocked(nativeDeviceApi.remoteManagementRequest).mock.calls.some(([operation]) => operation === 'voice.command')).toBe(false)
+    expect(vi.mocked(nativeDeviceApi.remoteManagementRequest).mock.calls.filter(([operation]) => operation === 'voice.command')
+      .map(([, args]) => args.command)).toEqual(['session.start', 'session.stop'])
 
     adapter.wakeForm.keywords = ['断线期间保留设置草稿']
     socket.close()
@@ -481,7 +536,7 @@ describe('远程 Host 管理代次', () => {
     expect(adapter.voiceConnected.value).toBe(false)
     expect(adapter.voiceReady.value).toBe(false)
     expect(adapter.wakeForm.keywords).toEqual(['断线期间保留设置草稿'])
-    expect(adapter.setListening(true)).toBe(false)
+    expect(adapter.setListening(true)).toBe(true) // 实时投影离线不剥夺本设备有效媒体的控制入口。
   })
 
   it('拒绝错误目标的管理状态，不请求产品快照', async () => {

@@ -28,6 +28,7 @@ ResultCallback = Callable[[dict[str, Any]], Awaitable[None]]
 class AsrWorkerClient:
     def __init__(self, url: str, *, on_result: ResultCallback | None = None) -> None:
         self.url = url
+        self.connection_log_level = logging.INFO  # connection_log_level（连接边界日志级别）：短期健康探测改用调试级别。
         self._local_worker = urlsplit(url).hostname in {"localhost", "127.0.0.1", "::1"}  # local_worker（本机工作进程）。
         self.on_result = on_result
         self._socket: Any = None
@@ -53,7 +54,7 @@ class AsrWorkerClient:
 
             self._socket = await websockets.connect(self.url, open_timeout=5, ping_interval=20)
             self._receive_task = asyncio.create_task(self._receive_loop(), name="asr-worker-receive")
-            logger.info("asr.client.connected url=%s", self.url)
+            logger.log(self.connection_log_level, "asr.client.connected url=%s", self.url)
         except Exception as exc:
             self._socket = None
             logger.exception("asr.client.connect_failed url=%s", self.url)
@@ -157,7 +158,7 @@ class AsrWorkerClient:
                     self._fail_health_waiters(error)
                     if self.on_result is not None:
                         await self.on_result({"type": "error", "code": error.code, "message": str(error)})
-            logger.info("asr.client.disconnected url=%s", self.url)
+            logger.log(self.connection_log_level, "asr.client.disconnected url=%s", self.url)
 
     def _fail_health_waiters(self, error: BaseException) -> None:
         for waiter in tuple(self._health_waiters.values()):
@@ -343,4 +344,4 @@ class AsrWorkerClient:
         if socket is not None:
             await socket.close()
         self._health_waiters.clear()
-        logger.info("asr.client.closed url=%s", self.url)
+        logger.log(self.connection_log_level, "asr.client.closed url=%s", self.url)

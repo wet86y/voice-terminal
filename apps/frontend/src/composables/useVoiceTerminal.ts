@@ -56,10 +56,16 @@ export interface UseVoiceTerminalOptions {
   webSocketUrl?: string
   /** Injectable only for deterministic tests; production uses a monotonic clock. */
   now?: () => number
+  connectTimeoutMs?: number // connectTimeoutMs（连接握手等待上限，毫秒）。
 }
 
 export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const socket = shallowRef<VoiceSocket | null>(null)
+  let connectTimer: ReturnType<typeof setTimeout> | null = null // connectTimer（当前套接字握手计时器）。
+  function clearConnectTimer() {
+    if (connectTimer !== null) clearTimeout(connectTimer)
+    connectTimer = null
+  }
   const connection = ref<ConnectionState>('offline')
   const connectionError = ref('')
   const state = ref<TerminalState>('STARTING')
@@ -1290,6 +1296,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
       nextSocket.onopen = () => {
         if (socket.value !== nextSocket) return
+        clearConnectTimer()
         connection.value = 'connected'
         sendCommand('subscribe', { client: 'voice-terminal-web', version: '0.1.0' })
         resumeImageChannel()
@@ -1299,12 +1306,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       }
       nextSocket.onerror = () => {
         if (socket.value !== nextSocket) return
-        connectionError.value = '无法连接本地 Voice Server，请确认后端已启动。'
-        canStart.value = false
+        failConnection('语音实时通道连接失败，正在等待恢复。')
       }
       nextSocket.onclose = () => {
-        suspendImageChannel()
         if (socket.value !== nextSocket) return
+        clearConnectTimer()
+        suspendImageChannel()
         clearSessionOperation()
         socket.value = null
         connection.value = 'offline'
@@ -1315,6 +1322,21 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         Object.assign(services, createOfflineStatuses())
         if (!connectionError.value) connectionError.value = 'Voice Server 连接已关闭。'
       }
+      function failConnection(message: string) {
+        if (socket.value !== nextSocket) return
+        clearConnectTimer()
+        socket.value = null
+        connection.value = 'offline'
+        connectionError.value = message
+        canStart.value = listening.value = false
+        state.value = 'STARTING'
+        clearSessionOperation()
+        resetConnectionData()
+        Object.assign(services, createOfflineStatuses())
+        suspendImageChannel()
+        nextSocket.close()
+      }
+      connectTimer = setTimeout(() => failConnection('语音实时通道握手超时，正在等待恢复。'), options.connectTimeoutMs ?? 10000)
     } catch (error) {
       connection.value = 'offline'
       canStart.value = false
@@ -1363,6 +1385,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   configureImageChannel((conversationId, attachmentId) => sendCommand('conversation.image.read', { conversation_id: conversationId, attachment_id: attachmentId }))
 
   function disconnect() {
+    clearConnectTimer()
     suspendImageChannel()
     clearSessionOperation()
     const activeSocket = socket.value

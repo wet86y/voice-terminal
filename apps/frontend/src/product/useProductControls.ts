@@ -71,6 +71,8 @@ export function useProductControls() {
     managementConnected,
     voiceConnected,
     voiceReady,
+    listeningControlReady,
+    remoteControlPending,
     runtimeState,
     coreUnavailable,
     coreStarting,
@@ -1595,7 +1597,7 @@ export function useProductControls() {
     return {
       state: runtimeState.value,
       audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
-      sessionActive: voiceReady.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
+      sessionActive: listeningControlReady.value && (listening.value || voice.inputPaused.value && voice.listeningRequested.value),
       sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
@@ -1605,16 +1607,16 @@ export function useProductControls() {
         ? "组件启动中"
         : coreUnavailable.value
         ? "查看本地组件"
-        : !voiceReady.value && applicationSnapshot.value?.remote_mode
+        : !listeningControlReady.value && applicationSnapshot.value?.remote_mode
           ? "等待服务端语音实时通道"
-        : voiceReady.value
+        : listeningControlReady.value
           ? listening.value
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: voice.inputPaused.value || Boolean(voice.sessionOperation.value) || loading.value || coreStarting.value
+      disabled: voice.inputPaused.value || remoteControlPending.value || Boolean(voice.sessionOperation.value) || loading.value || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false
-        || applicationSnapshot.value?.remote_mode === true && !voiceConnected.value,
+        || applicationSnapshot.value?.remote_mode === true && !listeningControlReady.value,
       modeDisabled: !voiceReady.value || Boolean(voice.sessionOperation.value) || coreStarting.value
         || applicationSnapshot.value?.startup_complete === false,
       canReset: voiceReady.value && !listening.value && !voice.inputPaused.value && applicationSnapshot.value?.startup_complete !== false,

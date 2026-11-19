@@ -37,6 +37,10 @@ class SelectableCapturePort:
         """running（路由是否已启动且当前设备正在采集）。"""
         return self._running and self._active_port is not None and self._active_port.running
 
+    def is_selected(self, device_id: str, port: CapturePort) -> bool:
+        """is_selected（当前端口身份）：区分真正替换的新输入与已经结束的旧所有者缓存。"""
+        return self._active_device_id == device_id and self._active_port is port
+
     @property
     def diagnostics(self) -> dict:
         """diagnostics（当前端口的有界状态快照）。"""

@@ -411,7 +411,7 @@ class HostWeb:
                         self.data({"detail": "任务创建未确认，请刷新列表后检查；DSH（代理执行宿主）可能暂不可用。"}, 503)
                 elif path.startswith("/api/v1/application/components/") and path.endswith("/retry"):
                     key = path.split("/")[-2]
-                    if owner.application.request_retry(key):
+                    if owner.application.request_retry(key, trigger="component-api"):
                         self.data({"ok": True}, 202)
                     else:
                         self.data({"error": "组件当前不能重试"}, 409)

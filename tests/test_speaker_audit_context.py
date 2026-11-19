@@ -31,6 +31,15 @@ def test_full_text_audit_records_revisions_differences_and_chinese_fields(caplog
     assert record["field_labels"]["text"] == "完整文字"
 
 
+def test_audit_keeps_chinese_labels_for_actual_values_without_repeating_the_entire_dictionary(caplog):
+    caplog.set_level(logging.INFO, logger="voice_terminal.llm_context_audit")
+    audit("diagnostic", state="owner", reason="not_speech", nested={"source": "manual"})
+    record = next(json.loads(item.message) for item in caplog.records if item.name == "voice_terminal.llm_context_audit")
+    assert record["value_labels"] == {"owner": "主人", "not_speech": "没有新增人声", "manual": "手动激活"}
+    assert record["field_labels"]["state"] and record["nested"]["source"] == "manual"
+    assert len(json.dumps(record, ensure_ascii=False).encode("utf-8")) < 1500
+
+
 def test_parameter_audit_correlates_saved_values_and_actual_scoring(caplog):
     caplog.set_level(logging.INFO, logger="voice_terminal.llm_context_audit")
     p = SessionSpeakerPolicy(SpeakerConfig(), lambda _: .4)

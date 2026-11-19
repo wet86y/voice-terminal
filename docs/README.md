@@ -61,6 +61,14 @@
 ## 测试
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [远程媒体恢复与日志修订验证（2026-11-19）](testing/remote-device-recovery-20261119.md)
+- [SSH（安全远程连接）桥接收尾与重复检查修订（2026-11-18）](testing/ssh-bridge-lifecycle-20261118.md)
+- [管理与文件通道就绪等待修订（2026-11-18）](testing/device-channel-wait-20261118.md)
+- [配对工作区编号修订与验收（2026-11-18）](testing/device-pairing-workspace-id-20261118.md)
+- [SSH（安全远程连接）管理员账户识别修订（2026-11-18）](testing/ssh-account-membership-20261118.md)
+- [SSH（安全远程连接）广播生命周期与项目身份审计（2026-11-18）](testing/ssh-broadcast-lifecycle-20261118.md)
+- [SSH（安全远程连接）广播与配对兼容性修订记录（2026-11-18）](testing/ssh-broadcast-compatibility-20261118.md)
+- [远程客户端连接修订审计（2026-11-18）](testing/remote-client-connection-20261118.md)
 - [分布式运行本机覆盖与 SSH 模拟验收（2026-11-17）](testing/local-delivery-1.0.0-20261117.md)
 - [本机覆盖、分发器与 OpenSSH 验收（2026-11-18）](testing/local-delivery-1.0.0-20261118.md)
 - [当前已知问题](testing/known-issues.md)

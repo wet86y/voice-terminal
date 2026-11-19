@@ -561,7 +561,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     failed = app.state.snapshot()
                     voice = next(c for c in failed["components"] if c["id"] == "voice")
                     self.assertFalse(failed["core_available"])
-                    self.assertEqual(voice["state"], "failed")
+                    self.assertEqual(voice["state"], "ready")  # 接口存活，故障由分能力状态呈现。
+                    self.assertFalse(voice["retry_allowed"])
+                    self.assertEqual(failed["core_phase"], "failed")
                     self.assertEqual(voice["error"], "核心能力未就绪：" + label)
                     with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": True, "services": services})):
                         self.assertTrue(await app.probe("voice"))
@@ -584,7 +586,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             app.outer_job.close()
 
     async def test_loading_capability_reports_starting_instead_of_failure(self):
-        """加载中的能力是瞬态：组件显示启动中，整体状态不是启动失败。"""
+        """加载中的能力是瞬态：接口保持存活，能力与整体显示加载中。"""
         app = ApplicationHost(Path.cwd())
         try:
             for row in app.state.snapshot()["components"]:
@@ -600,7 +602,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(snapshot["core_available"])
             self.assertEqual(snapshot["core_phase"], "starting")
             self.assertEqual(snapshot["state"], "starting")
-            self.assertEqual(voice["state"], "starting")
+            self.assertEqual(voice["state"], "ready")  # 能力加载不把存活接口重新标为启动进程。
+            self.assertFalse(voice["retry_allowed"])
             self.assertEqual(voice["error"], "")
             self.assertFalse(voice["retry_allowed"])
             self.assertIn("TTS（语音合成）", voice["phase"])

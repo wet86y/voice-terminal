@@ -25,11 +25,7 @@ impl DeviceBridgePrelude {
     pub fn validate(&self) -> Result<(), String> {
         if self.message_type != "bridge.prelude"
             || self.protocol_version != 1
-            || self.workspace_id.len() != 32
-            || !self
-                .workspace_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !crate::workspace::valid_workspace_id(&self.workspace_id)
             || !valid_sid(&self.owner_sid)
             || !valid_host_id(&self.client_device_id)
             || self.build.is_empty()

@@ -29,6 +29,7 @@ const MAX_RESPONSE_LINE_BYTES: usize = 2 * 1024 * 1024; // MAX_RESPONSE_LINE_BYT
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60); // SESSION_TTL（管理会话存活时间）。
 const REQUEST_RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60); // REQUEST_RESULT_TTL（请求幂等结果保留时间）。
 const MAX_SESSIONS: usize = 256; // MAX_SESSIONS（服务进程内管理会话容量）。
+const MAX_SAFE_GENERATION: u64 = (1_u64 << 53) - 1; // MAX_SAFE_GENERATION（JavaScript（脚本语言）可精确表示的最大整数）。
 const MAX_REQUEST_RESULTS: usize = 512; // MAX_REQUEST_RESULTS（服务进程内操作结果容量）。
 const MAX_CONNECTIONS: usize = 64; // MAX_CONNECTIONS（同时打开的本机桥接连接上限）。
 
@@ -193,10 +194,18 @@ impl RemoteManagementService {
                                 *active_workers = pending;
                                 let connection_service = Arc::clone(&service);
                                 let connection_map = Arc::clone(&thread_connections);
+                                let connection_stop = Arc::clone(&thread_stop);
                                 if let Ok(worker) = thread::Builder::new()
                                     .name("remote-management-connection".into())
                                     .spawn(move || {
-                                        let _ = connection_service.serve_connection(stream, None);
+                                        if let Err(error) = connection_service.serve_connection(stream, None, connection_stop.clone()) {
+                                            if !connection_stop.load(Ordering::Acquire) {
+                                                let _ = voice_desktop_common::logs::record_device_channel_error(
+                                                    &connection_service.manager.context().install,
+                                                    "management", &error,
+                                                );
+                                            }
+                                        }
                                         if let Ok(mut active) = connection_map.lock() {
                                             active.remove(&connection_id);
                                         }
@@ -237,8 +246,9 @@ impl RemoteManagementService {
     /// serve_connection（处理单个 SSH 桥接连接）：先验证 bridge.prelude（桥接前导帧），再处理管理 JSON 行。
     pub fn serve_connection(
         &self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         authenticated_client_device_id: Option<String>,
+        stop: Arc<AtomicBool>,
     ) -> Result<(), String> {
         let peer = stream
             .peer_addr()
@@ -246,15 +256,7 @@ impl RemoteManagementService {
         if !peer.ip().is_loopback() {
             return Err("远程管理连接不是来自本机 SSH 桥接。".into());
         }
-        stream
-            .set_nodelay(true)
-            .map_err(|_| "无法配置远程管理连接。")?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .map_err(|_| "无法配置远程管理读取超时。")?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(|_| "无法配置远程管理写入超时。")?;
+        let stream = prepare_management_stream(stream, stop)?;
         let writer = stream
             .try_clone()
             .map_err(|_| "无法建立远程管理回写通道。")?;
@@ -275,8 +277,12 @@ impl RemoteManagementService {
 
         let open_bytes = read_line_bounded(&mut reader, MAX_OPEN_LINE_BYTES)?
             .ok_or("远程管理连接未发送会话申请。")?;
-        let open_request: RemoteManagementOpenRequest =
-            serde_json::from_slice(&open_bytes).map_err(|_| "远程管理会话申请 JSON 格式无效。")?;
+        let open_request: RemoteManagementOpenRequest = serde_json::from_slice(&open_bytes)
+            .map_err(|error| format!(
+                "远程管理会话申请 JSON 格式无效：类别={:?}，行={}，列={}，字节={}，UTF8（文本编码）有效={}。",
+                error.classify(), error.line(), error.column(), open_bytes.len(),
+                std::str::from_utf8(&open_bytes).is_ok(),
+            ))?;
         validate_open_request(
             &open_request,
             &self.target_host_id,
@@ -377,6 +383,7 @@ impl RemoteManagementService {
         state.next_generation = state
             .next_generation
             .checked_add(1)
+            .filter(|value| *value <= MAX_SAFE_GENERATION)
             .ok_or("管理会话代次耗尽；请重启本机服务。")?;
         let expires_at = now + SESSION_TTL;
         let expires_at_ms = unix_millis().saturating_add(SESSION_TTL.as_millis() as u64);
@@ -1085,15 +1092,8 @@ fn prune_state(state: &mut ServiceState) {
 }
 
 fn generation_seed() -> u64 {
-    let id = voice_desktop_common::workspace::new_id();
-    let digits = id
-        .bytes()
-        .filter(|byte| byte.is_ascii_hexdigit())
-        .take(16)
-        .collect::<Vec<_>>();
-    u64::from_str_radix(std::str::from_utf8(&digits).unwrap_or("1"), 16)
-        .unwrap_or(1)
-        .max(1)
+    // 随机 52 位种子区别服务实例，保留递增空间，跨原生 JSON（结构化数据）与前端后仍精确相等。
+    (rand::random::<u64>() & ((1_u64 << 52) - 1)).max(1)
 }
 
 fn unix_millis() -> u64 {
@@ -1102,6 +1102,20 @@ fn unix_millis() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+/// prepare_management_stream（准备同步管理读取）：系统就绪等待兼顾延迟数据、原有超时和停止请求。
+fn prepare_management_stream(
+    stream: TcpStream,
+    stop: Arc<AtomicBool>,
+) -> Result<voice_desktop_common::device_socket::CancellableSocket, String> {
+    voice_desktop_common::device_socket::CancellableSocket::new(
+        stream,
+        stop,
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+    )
+    .map_err(|_| "无法配置远程管理连接的可取消读取。".into())
 }
 
 fn read_line_bounded(reader: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>, String> {
@@ -1307,6 +1321,51 @@ mod tests {
         assert!(value["job"].is_null());
         assert!(value["fields"]["status"].as_str().is_some());
         assert!(value["fields"]["job"].as_str().is_some());
+    }
+
+    #[test]
+    fn accepted_nonblocking_listener_waits_for_delayed_fragmented_management_lines() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            for part in [b"{\"prelude\":".as_slice(), b"1}\n", b"{\"open\":2}\n"] {
+                thread::sleep(Duration::from_millis(150));
+                stream.write_all(part).unwrap();
+            }
+        });
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let accepted =
+            prepare_management_stream(accepted, Arc::new(AtomicBool::new(false))).unwrap();
+        let mut reader = BufReader::new(accepted);
+        assert_eq!(
+            read_line_bounded(&mut reader, 1024).unwrap(),
+            Some(b"{\"prelude\":1}".to_vec())
+        );
+        assert_eq!(
+            read_line_bounded(&mut reader, 1024).unwrap(),
+            Some(b"{\"open\":2}".to_vec())
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn management_generations_round_trip_through_browser_json_numbers() {
+        for _ in 0..64 {
+            let generation = generation_seed();
+            assert!(generation > 0 && generation <= MAX_SAFE_GENERATION);
+            let json_number = serde_json::to_value(generation).unwrap();
+            assert_eq!(json_number.as_f64().unwrap() as u64, generation);
+        }
     }
 
     #[test]

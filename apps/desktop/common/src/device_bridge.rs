@@ -7,8 +7,8 @@ use crate::{
 };
 use serde::Deserialize;
 use std::{
-    io::{self, Write},
-    net::IpAddr,
+    io::{self, Read, Write},
+    net::{IpAddr, TcpStream},
 };
 
 const CONTROL_MARKER: &str = "voice-terminal-v1-control"; // CONTROL_MARKER（固定控制通道标记）。
@@ -144,7 +144,7 @@ fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
     let owner_sid = &args[4];
     let device_id = &args[6];
     let build = &args[8];
-    if !valid_hex_id(workspace_id, 32)
+    if !crate::workspace::valid_workspace_id(workspace_id)
         || !valid_sid(owner_sid)
         || !valid_device_id(device_id)
         || !valid_ascii_token(build, 128)
@@ -162,6 +162,10 @@ fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
 fn verify_ssh_connection_scope(marker: &str) -> Result<(), String> {
     let connection = std::env::var("SSH_CONNECTION")
         .map_err(|_| "OpenSSH 未提供连接来源信息；桥接拒绝会话。".to_string())?;
+    validate_ssh_connection_scope(marker, &connection)
+}
+
+fn validate_ssh_connection_scope(marker: &str, connection: &str) -> Result<(), String> {
     let parts = connection.split_ascii_whitespace().collect::<Vec<_>>();
     if parts.len() != 4 {
         return Err("OpenSSH 连接来源字段无效。".into());
@@ -172,24 +176,32 @@ fn verify_ssh_connection_scope(marker: &str) -> Result<(), String> {
         .unwrap_or("")
         .parse::<IpAddr>()
         .map_err(|_| "SSH 客户端来源地址无效。".to_string())?;
+    let local_ip = parts[2]
+        .split('%')
+        .next()
+        .unwrap_or("")
+        .parse::<IpAddr>()
+        .map_err(|_| "SSH 服务端本机地址无效。".to_string())?;
     let local_port = parts[3]
         .parse::<u16>()
         .map_err(|_| "SSH 服务端端口字段无效。".to_string())?;
-    if remote_ip.is_loopback() {
-        return if local_port > 0 {
-            Ok(())
-        } else {
-            Err("SSH 本机连接端口无效。".into())
-        };
+    let remote_port = parts[1]
+        .parse::<u16>()
+        .map_err(|_| "SSH 客户端端口字段无效。".to_string())?;
+    if local_port == 0 || remote_port == 0 {
+        return Err("SSH 连接端口必须有效。".into());
     }
-    let status = crate::system_feature::open_ssh_server_status()?;
-    if status.effective_port != Some(local_port)
-        || !status
-            .local_lan_scopes
+    // SSH_CONNECTION（已接受连接端点）由微软 SSH 服务提供；精确来源子网由公钥的
+    // from（来源范围）限制和仅私有/域网络启用的专用防火墙规则在接受连接时执行。
+    // 每条请求只检查该可信元数据，不再启动 PowerShell（系统脚本）重复扫描系统、组件或防火墙。
+    let private_lan = |address| {
+        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
             .iter()
-            .any(|scope| ip_in_scope(remote_ip, scope))
-    {
-        return Err("SSH 来源地址或端口不属于本机当前受限局域网范围。".into());
+            .any(|scope| ip_in_scope(address, scope))
+    };
+    let loopback_pair = remote_ip.is_loopback() && local_ip.is_loopback();
+    if !loopback_pair && !(private_lan(remote_ip) && private_lan(local_ip)) {
+        return Err("SSH 连接端点不属于受限局域网或本机回环。".into());
     }
     if !matches!(
         marker,
@@ -247,25 +259,42 @@ fn relay_fixed_loopback(target: &str, prelude: Option<&DeviceBridgePrelude>) -> 
             .write_all(&bytes)
             .map_err(|_| "无法向本机受限服务提交 SSH 桥接前导帧。".to_string())?;
     }
+    relay_streams(upstream, io::stdin(), io::stdout().lock())
+}
+
+/// relay_streams（桥接双向字节流）：输出结束与客户端输入结束分别处理。
+fn relay_streams<I: Read + Send + 'static, O: Write>(
+    mut upstream: TcpStream,
+    mut input: I,
+    mut output: O,
+) -> Result<(), String> {
     let mut reader = upstream
         .try_clone()
         .map_err(|_| "无法建立本机桥接回读通道。".to_string())?;
     let input_task = std::thread::spawn(move || {
-        let mut input = io::stdin().lock();
         let _ = io::copy(&mut input, &mut upstream);
+        // shutdown（半关闭写入）：客户端结束输入后，仍允许服务端返回剩余回执。
+        let _ = upstream.shutdown(std::net::Shutdown::Write);
     });
-    let mut output = io::stdout().lock();
-    let copy_result =
-        io::copy(&mut reader, &mut output).map_err(|_| "桥接回读通道中断。".to_string());
-    let _ = input_task.join();
-    copy_result.map(|_| ())
-}
-
-fn valid_hex_id(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    let copy_result = (|| {
+        let mut bytes = [0_u8; 16 * 1024];
+        loop {
+            let count = reader.read(&mut bytes).map_err(|_| "桥接回读通道中断。")?;
+            if count == 0 {
+                return Ok(());
+            }
+            output
+                .write_all(&bytes[..count])
+                .map_err(|_| "桥接输出写入失败。")?;
+            // flush（刷新）：管理 JSON（数据行）、HTTP（控制回执）及二进制音频都不能等待下一个换行。
+            output.flush().map_err(|_| "桥接输出刷新失败。")?;
+        }
+    })();
+    let _ = reader.shutdown(std::net::Shutdown::Both);
+    // 此入口独占一个短生命周期进程。服务端输出结束即返回，让进程回收仍等待标准输入的线程；
+    // join（等待线程退出）会与等待 SSH EOF（通道输出结束）的客户端形成互等。
+    drop(input_task);
+    copy_result
 }
 
 fn valid_sid(value: &str) -> bool {
@@ -297,6 +326,246 @@ fn valid_ascii_token(value: &str, limit: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_ssh_metadata_is_bounded_without_repeating_system_scans() {
+        for connection in [
+            "192.168.253.122 55198 192.168.253.174 22",
+            "fd00::2 55198 fd00::1 22",
+            "127.0.0.1 55198 127.0.0.1 22",
+            "::1 55198 ::1 22",
+        ] {
+            assert!(validate_ssh_connection_scope(MANAGEMENT_MARKER, connection).is_ok());
+        }
+        for connection in [
+            "8.8.8.8 55198 192.168.253.174 22",
+            "192.168.253.122 55198 8.8.8.8 22",
+            "169.254.1.2 55198 192.168.253.174 22",
+            "127.0.0.1 55198 192.168.253.174 22",
+            "192.168.253.122 0 192.168.253.174 22",
+            "192.168.253.122 55198 192.168.253.174 0",
+            "192.168.253.122 55198 192.168.253.174 22 extra",
+        ] {
+            assert!(
+                validate_ssh_connection_scope(MANAGEMENT_MARKER, connection).is_err(),
+                "{connection}"
+            );
+        }
+        assert!(validate_ssh_connection_scope("shell", "127.0.0.1 55198 127.0.0.1 22").is_err());
+    }
+
+    struct HeldInput(std::sync::mpsc::Receiver<()>); // HeldInput（保持输入开放）：等待测试显式释放。
+    impl Read for HeldInput {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn upstream_eof_finishes_bridge_while_client_input_is_still_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (release, held) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let outcome = relay_streams(client, HeldInput(held), &mut output);
+            finished.send((outcome, output)).unwrap();
+        });
+        peer.write_all(b"response-without-newline").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let completed = result.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(()).unwrap(); // 即使回归失败，也先释放测试输入，避免留下工作线程。
+        worker.join().unwrap();
+        let (outcome, output) = completed.expect("服务端已结束输出时不能等待客户端输入结束");
+        outcome.unwrap();
+        assert_eq!(output, b"response-without-newline");
+    }
+
+    struct FlushOutput {
+        pending: Vec<u8>,                       // pending（尚未刷新的输出字节）。
+        sent: std::sync::mpsc::Sender<Vec<u8>>, // sent（测试观察到的实际刷新）。
+    }
+    impl Write for FlushOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.pending.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if !self.pending.is_empty() {
+                self.sent.send(std::mem::take(&mut self.pending)).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn binary_output_flushes_before_upstream_or_client_input_closes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (release, held) = std::sync::mpsc::channel();
+        let (sent, flushed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            relay_streams(
+                client,
+                HeldInput(held),
+                FlushOutput {
+                    pending: Vec::new(),
+                    sent,
+                },
+            )
+        });
+        peer.write_all(&[0, 255, 128, 1]).unwrap();
+        let output = flushed.recv_timeout(std::time::Duration::from_secs(1));
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(output.expect("二进制输出必须立即刷新"), [0, 255, 128, 1]);
+    }
+
+    #[test]
+    fn client_eof_half_closes_request_and_preserves_the_response_direction() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            relay_streams(client, io::Cursor::new(b"complete-request"), &mut output).unwrap();
+            output
+        });
+        let mut request = Vec::new();
+        let read = peer.read_to_end(&mut request);
+        peer.write_all(b"remaining-response").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let response = worker.join().unwrap();
+        read.expect("客户端结束输入后必须向服务端传递半关闭");
+        assert_eq!(request, b"complete-request");
+        assert_eq!(response, b"remaining-response");
+    }
+
+    #[test]
+    fn real_workspace_identities_pass_every_pairing_and_bridge_format_gate() {
+        let generated = crate::workspace::new_id();
+        for workspace_id in [
+            generated.as_str(),
+            "18dcc2d519a4a938-81ec",
+            "00112233445566778899aabbccddeeff",
+            "9525dfbd-5a17-4b2b-ba2c-3744d87d9014",
+            "device-client-00112233445566778899aabbccddeeff",
+        ] {
+            let args = [
+                "--ssh-device-bridge",
+                "--workspace-id",
+                workspace_id,
+                "--owner-sid",
+                "S-1-5-21-42",
+                "--device-id",
+                "device-a",
+                "--build",
+                "product-test",
+            ]
+            .map(str::to_owned);
+            let arguments = parse_arguments(&args).unwrap();
+            let prelude = DeviceBridgePrelude {
+                message_type: "bridge.prelude".into(),
+                protocol_version: 1,
+                workspace_id: arguments.workspace_id,
+                owner_sid: arguments.owner_sid,
+                client_device_id: arguments.device_id,
+                build: arguments.build,
+                fields: [
+                    ("type", "桥接消息类型"),
+                    ("protocol_version", "桥接协议版本"),
+                    ("workspace_id", "工作区编号"),
+                    ("owner_sid", "账户安全标识符"),
+                    ("client_device_id", "客户端设备编号"),
+                    ("build", "程序构建编号"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            };
+            prelude.validate().unwrap();
+            // 用无效公钥止于纯参数检查，不查询系统服务、不提权或修改实际授权。
+            let error = crate::system_feature::install_project_device_key(
+                "invalid-public-key",
+                workspace_id,
+                "device-a",
+                "product-test",
+                std::path::Path::new("unused.exe"),
+                "S-1-5-21-42",
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(
+                error, "项目授权公钥不是有效 OpenSSH 格式。",
+                "{workspace_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_identity_rejects_empty_oversized_and_command_characters() {
+        assert!(crate::workspace::valid_workspace_id(&"a".repeat(128)));
+        for workspace_id in [
+            "",
+            "-workspace",
+            "工作区",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a:b",
+            "a/b",
+            "a\\b",
+            "a\"b",
+            "a'b",
+            "a;b",
+            "a&b",
+            "a|b",
+            "a$b",
+            "a`b",
+            "a%b",
+            "a\0b",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                !crate::workspace::valid_workspace_id(workspace_id),
+                "{workspace_id:?}"
+            );
+            let args = [
+                "--ssh-device-bridge",
+                "--workspace-id",
+                workspace_id,
+                "--owner-sid",
+                "S-1-5-21-42",
+                "--device-id",
+                "device-a",
+                "--build",
+                "product-test",
+            ]
+            .map(str::to_owned);
+            assert!(parse_arguments(&args).is_err(), "{workspace_id:?}");
+            assert_eq!(
+                crate::system_feature::install_project_device_key(
+                    "invalid-public-key",
+                    workspace_id,
+                    "device-a",
+                    "product-test",
+                    std::path::Path::new("unused.exe"),
+                    "S-1-5-21-42",
+                    &[],
+                )
+                .unwrap_err(),
+                "工作区编号格式无效。"
+            );
+        }
+    }
 
     #[test]
     fn bridge_arguments_and_scope_checks_are_fixed_and_bounded() {

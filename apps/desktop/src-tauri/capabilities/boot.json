@@ -39,6 +39,7 @@
     "allow-device-ssh-status",
     "allow-device-ssh-task-channel",
     "allow-device-ssh-media-channel",
+    "allow-device-ssh-voice-forwarder",
     "allow-desktop-page-ready",
     "allow-skip-startup",
     "allow-exit-application",

@@ -1,5 +1,6 @@
 """远端 PCM 采集端口的队列、预录和租约回归。"""
 import asyncio
+from dataclasses import replace
 import pytest
 
 from voice_terminal.devices.media_protocol import MediaFrame, MediaProtocolError
@@ -8,19 +9,18 @@ from voice_terminal.devices.registry import DeviceRegistry
 from voice_terminal.devices.remote_capture import RemoteAudioCapture, RemoteAudioCaptureError
 
 
-def _capture(*, on_audio_frame=None):
+def _capture(*, on_audio_frame=None, restartable=False):
     registry = DeviceRegistry()
     registry.connect("device-remote", capabilities=("audio_stream",))
     lease = registry.prepare_switch("device-remote", registry.generation)
     assert registry.commit_switch(lease)
-    stream = PcmInputStream(
-        stream_id="stream-remote",
-        core_session_id="0123456789abcdef0123456789abcdef",
-        lease=lease,
-        registry=registry,
-        map_device_time=lambda value: (20.0 + value / 1_000_000, 0.004),
-    )
-    return RemoteAudioCapture(stream, ring_buffer_ms=1_000, on_audio_frame=on_audio_frame), stream
+    def make_stream(stream_id):
+        return PcmInputStream(stream_id=stream_id, core_session_id="0123456789abcdef0123456789abcdef",
+                              lease=lease, registry=registry,
+                              map_device_time=lambda value: (20.0 + value / 1_000_000, 0.004))
+    stream = make_stream("stream-remote")
+    return RemoteAudioCapture(stream, ring_buffer_ms=1_000, on_audio_frame=on_audio_frame,
+                              restart_stream=make_stream if restartable else None), stream
 
 
 def _frame(sequence: int, *, device_id: str = "device-remote") -> MediaFrame:
@@ -112,6 +112,33 @@ def test_remote_capture_stop_clears_unconsumed_audio_and_preroll():
     assert capture.preroll(20) == bytes([0, 0]) * 320
     with pytest.raises(RemoteAudioCaptureError, match="已停止"):
         asyncio.run(capture.read_frame())
+
+
+def test_remote_capture_restarts_ten_times_with_new_input_and_discards_only_its_old_frames():
+    capture, original = _capture(restartable=True)
+
+    async def run():
+        retired = []
+        for iteration in range(10):
+            await capture.start()
+            frame = replace(_frame(0), stream_id=capture.stream_id, device_time_us=(iteration + 1) * 20_000)
+            for old in retired[-2:]:
+                assert capture.accept_frame(old) is None
+            assert capture.accept_frame(frame) is not None
+            assert capture.pending_frame_count() == 1
+            retired.append(frame)
+            await capture.stop()
+            assert capture.accept_frame(frame) is None
+            assert capture.pending_frame_count() == 0
+        assert len({frame.stream_id for frame in retired}) == 10
+        assert original.closed
+        await capture.start()
+        with pytest.raises(MediaProtocolError, match="代次不匹配"):
+            capture.accept_frame(replace(retired[-1], device_id="device-forged"))
+        with pytest.raises(RemoteAudioCaptureError, match="必须为新连接"):
+            await capture.start()
+
+    asyncio.run(run())
 
 
 def test_remote_capture_observer_failure_does_not_discard_valid_pcm():

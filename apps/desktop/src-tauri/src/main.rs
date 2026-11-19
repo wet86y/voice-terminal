@@ -1860,6 +1860,11 @@ async fn save_device_config_inner(
             return Err(error);
         }
     };
+    client_event(&state, "client.settings_saved", serde_json::json!({
+        "device_id":config.device_id,"mode":if config.mode == voice_desktop_common::device_config::RunMode::Remote {"remote"}else{"local"},
+        "client_online_tts_local":config.client_online_tts_local,"audio_compression":config.audio_compression,
+        "previous_client_online_tts_local":old_config.as_ref().map(|value| value.client_online_tts_local),
+        "previous_audio_compression":old_config.as_ref().map(|value| value.audio_compression),"trigger":"device-config-save"}));
     if runtime_change {
         operation.phase("starting", "正在启动目标运行模式");
         state
@@ -1883,6 +1888,9 @@ async fn save_device_config_inner(
                 if let Some(previous) = old_config {
                     let restore =
                         voice_desktop_common::device_config::save(&context.data, &previous);
+                    client_event(&state, "client.settings_restored", serde_json::json!({
+                        "device_id":previous.device_id,"client_online_tts_local":previous.client_online_tts_local,
+                        "result":if restore.is_ok(){"restored"}else{"failed"},"reason":"目标模式启动失败"}));
                     if restore.is_ok()
                         && previous.mode == voice_desktop_common::device_config::RunMode::Local
                     {
@@ -3059,6 +3067,7 @@ async fn device_ssh_connect(
             state.device_operation.begin("remote", false)?
         };
         operation.phase("connecting", "正在验证已配对服务端并建立安全连接。");
+        client_event(&state, "client.connect_attempt", serde_json::json!({"state":"connecting"}));
         let outcome = async {
         let context = state.context().ok_or("缺少正式工作区")?;
         let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
@@ -3128,6 +3137,8 @@ async fn device_ssh_connect(
                 "transport_credential_ref":"单独用于 OpenSSH 账户登录的凭据引用；为空时沿用产品设备身份"}}),
         )
         }.await;
+        client_event(&state, if outcome.is_ok() { "client.connected" } else { "client.connect_failed" },
+            serde_json::json!({"reason":outcome.as_ref().err(),"state":if outcome.is_ok(){"connected"}else{"error"}}));
         operation.finish(outcome.as_ref().err().cloned());
         outcome
     }
@@ -6598,6 +6609,13 @@ where
     })
 }
 
+fn client_event(state: &Desktop, event: &str, details: serde_json::Value) {
+    if let Some(context) = state.context() {
+        // 诊断落盘失败不能中止连接或音频；日志只接收固定元数据，不接收报文正文。
+        let _ = voice_desktop_common::logs::record_client_event(&context.install, event, &details);
+    }
+}
+
 #[cfg(feature = "ssh-device")]
 async fn run_remote_media_channel(
     state: Arc<Desktop>,
@@ -6618,7 +6636,7 @@ async fn run_remote_media_channel(
     #[cfg(feature = "native-audio")]
     let encoder_pre_skip_samples = channel.encoder_pre_skip_samples;
     #[cfg(feature = "native-audio")]
-    let uplink_encoder = match uplink_codec {
+    let mut uplink_encoder = match uplink_codec {
         voice_desktop_common::device_protocol::AudioCodec::Pcm => None,
         voice_desktop_common::device_protocol::AudioCodec::Opus => {
             Some(OpusEncoderWorker::start(encoder_pre_skip_samples)?)
@@ -6647,6 +6665,12 @@ async fn run_remote_media_channel(
     }
     let mut playback_stop_epoch = state.remote_playback_stop_epoch.load(Ordering::Acquire);
     let mut capture_active = channel.capture_active;
+    let mut capture_stream_id = stream_id.clone(); // capture_stream_id（当前输入编号）：独立于固定播放媒体连接。
+    let media_started_at = Instant::now();
+    client_event(&state, "client.media_ready", serde_json::json!({
+        "device_id":device_id,"stream_id":stream_id,"core_session_id":core_session_id,
+        "connection_generation":connection_generation,"executor_generation":executor_generation,
+        "interaction_generation":interaction_generation,"state":"ready"}));
     let (mut reader, writer, guard) = channel.into_parts();
     let (write_sender, mut write_receiver) = tokio::sync::mpsc::channel::<MediaWriteCommand>(6);
     let (read_sender, mut read_receiver) = tokio::sync::mpsc::channel::<MediaReadEvent>(16);
@@ -6691,12 +6715,25 @@ async fn run_remote_media_channel(
         }
     });
 
+    let writer_log_state = state.clone();
     let mut writer: SshMediaWriter = writer;
     let writer_task = tauri::async_runtime::spawn(async move {
         while let Some(command) = write_receiver.recv().await {
             let result = match command {
                 MediaWriteCommand::Binary(bytes) => writer.send_binary(&bytes).await,
-                MediaWriteCommand::Text(value) => writer.send_text(&value).await,
+                MediaWriteCommand::Text(value) => {
+                    let result = writer.send_text(&value).await;
+                    if let Ok(control) = serde_json::from_str::<serde_json::Value>(&value) {
+                        let kind = control["type"].as_str().unwrap_or("");
+                        if matches!(kind, "media.tts.authorization_accepted" | "media.tts.started" | "media.tts.completed" | "media.tts.failed" | "media.tts.cancelled") {
+                            client_event(&writer_log_state, "client.tts_receipt", serde_json::json!({
+                                "device_id":control["device_id"],"stream_id":control["stream_id"],
+                                "playback_key":control["playback_key"],"request_id":control["request_id"],
+                                "state":kind,"result":if result.is_ok(){"sent"}else{"failed"}}));
+                        }
+                    }
+                    result
+                },
                 MediaWriteCommand::Pong(payload) => writer.send_pong(&payload).await,
                 MediaWriteCommand::Close => {
                     let result = writer.send_close().await;
@@ -6917,6 +6954,22 @@ async fn run_remote_media_channel(
                         }
                     };
                     match message.get("type").and_then(serde_json::Value::as_str) {
+                        Some("clock.sync.request") => {
+                            let response = (|| {
+                                let received = voice_desktop_common::wasapi_capture::monotonic_device_time_us()?;
+                                let sent = voice_desktop_common::wasapi_capture::monotonic_device_time_us()?;
+                                voice_desktop_common::ssh_device::media_clock_response(&message, received, sent)
+                            })();
+                            match response {
+                                Ok(response) => {
+                                    if write_sender.send(MediaWriteCommand::Text(response)).await.is_err() {
+                                        outcome = Err("无法发送媒体时钟续测回执。".into());
+                                        break;
+                                    }
+                                }
+                                Err(error) => { outcome = Err(error); break; }
+                            }
+                        }
                         Some("media.capture_state")
                             if message.get("device_id").and_then(serde_json::Value::as_str)
                                 == Some(device_id.as_str())
@@ -6930,8 +6983,28 @@ async fn run_remote_media_channel(
                                 outcome = Err("主机采集状态消息缺少布尔字段。".into());
                                 break;
                             };
-                            if desired != capture_active {
+                            let next_stream_id = message.get("capture_stream_id")
+                                .and_then(serde_json::Value::as_str).unwrap_or(&stream_id).to_owned();
+                            if next_stream_id.is_empty() || next_stream_id.len() > 128 {
+                                outcome = Err("主机输入流编号为空或超过长度上限。".into());
+                                break;
+                            }
+                            let input_changed = next_stream_id != capture_stream_id;
+                            if desired != capture_active || input_changed {
+                                if capture_started && (!desired || input_changed) {
+                                    if let Err(error) = device_worker_action(state.clone(), |worker| worker.capture_stop()).await {
+                                        outcome = Err(error); break;
+                                    }
+                                    capture_started = false;
+                                }
                                 if desired {
+                                    #[cfg(feature = "native-audio")]
+                                    if input_changed && uplink_codec == voice_desktop_common::device_protocol::AudioCodec::Opus {
+                                        uplink_encoder = match OpusEncoderWorker::start(encoder_pre_skip_samples) {
+                                            Ok(encoder) => Some(encoder),
+                                            Err(error) => { outcome = Err(error); break; }
+                                        };
+                                    }
                                     if let Err(error) =
                                         device_worker_action(state.clone(), |worker| {
                                             worker.capture_start().map(|_| ())
@@ -6955,6 +7028,10 @@ async fn run_remote_media_channel(
                                     capture_started = false;
                                 }
                                 capture_active = desired;
+                                capture_stream_id = next_stream_id;
+                                client_event(&state, "client.capture_state", serde_json::json!({
+                                    "device_id":device_id,"stream_id":stream_id,"capture_stream_id":capture_stream_id,
+                                    "state":if desired {"started"} else {"stopped"}}));
                             }
                         }
                         Some("media.pong") => {}
@@ -7033,6 +7110,9 @@ async fn run_remote_media_channel(
                             let authorization_id = parsed.authorization_id.clone();
                             let playback_key = parsed.playback_key.clone();
                             let segment_index = parsed.segment_index;
+                            client_event(&state, "client.tts_request", serde_json::json!({
+                                "device_id":device_id,"stream_id":stream_id,"playback_key":playback_key,
+                                "request_id":request_id,"state":"received"}));
                             let failure_request = parsed.clone();
                             if client_tts_seen.len() >= client_tts_relay::MAX_SEEN_REQUESTS
                                 || !client_tts_seen.insert(request_id.clone())
@@ -7209,7 +7289,7 @@ async fn run_remote_media_channel(
             voice_desktop_common::device_protocol::AudioCodec::Pcm => encode_worker_media_frame(
                 &device_id,
                 &core_session_id,
-                &stream_id,
+                &capture_stream_id,
                 connection_generation,
                 executor_generation,
                 interaction_generation,
@@ -7222,7 +7302,7 @@ async fn run_remote_media_channel(
                             Ok(packet) => encode_worker_media_packet(
                                 &device_id,
                                 &core_session_id,
-                                &stream_id,
+                                &capture_stream_id,
                                 connection_generation,
                                 executor_generation,
                                 interaction_generation,
@@ -7242,7 +7322,7 @@ async fn run_remote_media_channel(
         let binary_result = encode_worker_media_frame(
             &device_id,
             &core_session_id,
-            &stream_id,
+            &capture_stream_id,
             connection_generation,
             executor_generation,
             interaction_generation,
@@ -7322,6 +7402,11 @@ async fn run_remote_media_channel(
     if let Ok(mut slot) = state.remote_media_channel_error.lock() {
         *slot = error.clone();
     }
+    client_event(&state, "client.media_closed", serde_json::json!({
+        "device_id":device_id,"stream_id":stream_id,"core_session_id":core_session_id,
+        "connection_generation":connection_generation,"executor_generation":executor_generation,
+        "interaction_generation":interaction_generation,"state":final_state,"reason":error,
+        "duration_ms":media_started_at.elapsed().as_millis() as u64}));
     let _ = app.emit(
         "desktop://remote-media-channel",
         serde_json::json!({
@@ -7805,7 +7890,7 @@ async fn device_ssh_media_channel(
         if slot.is_none() {
             *slot = Some(voice_desktop_common::device_worker::ManagedWorker::start()?);
         }
-        slot.as_mut().expect("刚刚建立的设备工作进程").clock_now()
+        Ok::<(), String>(()) // 工作进程只在此预热；媒体计时不再以额外 IPC（进程通信）读数作准入条件。
     })
     .await;
     let worker_start = match worker_start {
@@ -7817,6 +7902,9 @@ async fn device_ssh_media_channel(
         return Err(error);
     }
 
+    client_event(&desktop, "client.media_opening", serde_json::json!({"device_id":config.device_id,
+        "stream_id":stream_id,"core_session_id":core_session_id,"connection_generation":connection_generation,
+        "executor_generation":executor_generation,"interaction_generation":interaction_generation}));
     let mut media = match desktop
         .ssh_device
         .open_media_channel_with_codecs(
@@ -7834,6 +7922,8 @@ async fn device_ssh_media_channel(
     {
         Ok(media) => media,
         Err(error) => {
+            client_event(&desktop, "client.media_failed", serde_json::json!({"device_id":config.device_id,
+                "stream_id":stream_id,"reason":error,"state":"opening"}));
             abort_remote_interaction_switch(&desktop, interaction_generation).await;
             return Err(error);
         }
@@ -7843,14 +7933,12 @@ async fn device_ssh_media_channel(
         abort_remote_interaction_switch(&desktop, interaction_generation).await;
         return Err("共享主机在交互租约准备后重启；拒绝跨核心代次建立媒体流。".into());
     }
-    let clock_state = desktop.clone();
     if let Err(error) = media
-        .synchronize_clock(move || {
-            let clock_state = clock_state.clone();
-            async move { device_worker_action(clock_state, |worker| worker.clock_now()).await }
-        })
+        .synchronize_clock(|| async { voice_desktop_common::wasapi_capture::monotonic_device_time_us() })
         .await
     {
+        client_event(&desktop, "client.media_failed", serde_json::json!({"device_id":config.device_id,
+            "stream_id":stream_id,"reason":error,"state":"clock_sync"}));
         let _ = media.close().await;
         abort_remote_interaction_switch(&desktop, interaction_generation).await;
         return Err(error);
@@ -8993,6 +9081,10 @@ fn start_service_for(
         *state.error.lock().unwrap() = None;
         let device_snapshot = voice_desktop_common::device_config::inspect(&context.data);
         if product_startup_kind(device_snapshot.mode) == ProductStartupKind::RemoteClient {
+            let build = voice_desktop_common::resources::load(&context.program.join("release.json")).ok()
+                .and_then(|value| value.get("build").cloned());
+            client_event(&state, "client.start", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),
+                "build":build,"device_id":device_snapshot.device_id,"mode":"remote"}));
             if resource_recovery {
                 return Err("当前处于远程配对模式；资源任务不能启动本机语音核心。".into());
             }
@@ -11858,7 +11950,6 @@ mod tests {
                         | "device_ssh_import_cancel"
                         | "device_ssh_tts_asset_import"
                         | "device_ssh_tts_asset_audio"
-                        | "device_ssh_voice_forwarder"
                 );
                 assert_eq!(
                     startup_access, startup_expected,
