@@ -1554,6 +1554,15 @@ class DshShadowAgentSession:
                 elif (voice_guard is not None and self.approvals.voice_confirmation
                       and self.approvals.continuous_voice and window == self.approvals.window_provider()):
                     self.approvals.grant_continuous(from_voice=True)
+                if continuous:
+                    # DSH 的 danger-full-access（批量授权）预设会把审批策略设为 never，
+                    # 而 never 会直接拒绝设备工具的一次性审批。连续授权期间恢复询问，
+                    # 后续审批由本链路逐条自动同意，避免“授权后反而全被拒”。
+                    try:
+                        await self.client.call("approval.policy", self._envelope(
+                            activation_id=self.activation_id, policy="ask"))
+                    except Exception:
+                        pass  # 策略纠正失败不撤销已确认的连续授权。
                 self._schedule_auto_approvals()
                 await self.notify_voice_approval()
                 await self._activity("approval_policy")

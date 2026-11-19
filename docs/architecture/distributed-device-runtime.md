@@ -136,7 +136,7 @@
 | 播放与结算 | [播放器](../../voice_terminal/audio/player.py)提供暂停、恢复、替换、停止快照和输出位置估算；[语音输出](../../voice_terminal/controller/episode_output.py)、[播放流水线](../../voice_terminal/controller/speech_pipeline.py)依赖这些语义 | 先完整盘点调用契约；远程控制命令与设备回执分离，不能只实现音频入队 |
 | 历史 | [会话台账](../../voice_terminal/session/ledger.py)维护传达与截图记录；[会话契约](../../voice_terminal/session/contracts.py)区分传达状态 | 保留既有结算入口，对远程回执增加身份、代次及重复检查 |
 | 声纹注册 | [注册录音](../../voice_terminal/speaker/enrollment_capture.py)通过 `TimedRecordingPort`（限时采集接口）及本机实现录音，复用现有前处理器并保留停止、取消和释放语义 | 接入指定设备能力；保留质量检查及与日常链路的一致性 |
-| 屏幕输入 | [截图服务](../../voice_terminal/screen_capture.py)、[屏幕输入调度](../../voice_terminal/agent/screen_input.py)及会话台账维护双图、消费状态和请求重试 | 路由实际观察设备，同时保留双图编码、附件和消费规则；主语音截图不只经过 DSH 工具 |
+| 屏幕输入 | [截图服务](../../voice_terminal/screen_capture.py)、[屏幕输入调度](../../voice_terminal/agent/screen_input.py)及会话台账维护双图、消费状态和请求重试 | 已按当前交互设备路由：本机用本地捕获，远端设备用其执行器的 `tree` 与 `shot` 取整屏和前台窗口范围，同时保留双图编码、附件、消费状态和请求重试；主语音截图不只经过 DSH 工具 |
 | 代理执行 | [DSH 锁](../../config/dsh/runtime.lock.json)固定 0.2.1-rc.5；[项目插件](../../integrations/dsh/voice-terminal/package.json)为 0.2.2；[代理预设](../../integrations/dsh/voice-terminal/preset/shadow-agent/agent.cordis.yml)已有本地命令和文件工具 | 本地工具保留；新增设备路由与远端工具，复用现有审批和后台任务归属 |
 | 组件就绪 | [能力资源检查](../../voice_terminal/application/resource_readiness.py)维持现有单机门禁；原生启动入口读取独立设备配置，未知配置保留原件，未实现的主机或客户端角色不会冒充单机核心启动 | 按角色计算启动需求，且在轻量客户端加载 Python（后端运行环境）前分流 |
 | 外壳与业务地址 | [应用宿主网页接口](../../voice_terminal/application/web.py)使用实例会话和一次性入口令牌；[前端接口](../../apps/frontend/src/product/api.ts)从宿主取得业务地址，也有本机管理请求 | 拆分本机管理与当前核心业务路由；不能全局替换一个地址完成角色切换 |

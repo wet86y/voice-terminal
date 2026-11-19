@@ -2217,8 +2217,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     "capabilities": sorted(set(item.capabilities)
                                      | ({"desktop_control", "terminal_control", "file_transfer"} if item.device_id == "local"
                                         and getattr(runtime, "_local_desktop_transport", None) is not None else set())
-                                     | ({"screen_capture"} if item.device_id == "local"
-                                        and runtime.history.screen_capture.available_for("local") else set())),
+                                     | ({"screen_capture"} if runtime.history.screen_capture.available_for(item.device_id) else set())),
                     "error": None, "interaction_active": bool(active and active.device_id == item.device_id),
                      "media_ready": item.device_id != "local" and runtime.remote_media_control_ready(
                          item.device_id, item.connection_generation),

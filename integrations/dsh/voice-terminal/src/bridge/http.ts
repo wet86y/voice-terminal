@@ -136,6 +136,19 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           if (!pending || pending.activationId !== existing.activationId || body.activation_id !== pending.activationId) response = result('stale')
           else if (body.decision !== 'allowed-once' && body.decision !== 'rejected') response = result('conflict')
           else { pending.settle(body.decision); response = result('accepted') }
+        } else if (path === 'approval.policy') {
+          // approval.policy（审批策略纠正）：语音侧确认连续授权后，把 DSH 的
+          // 「从不再询问」恢复为询问。never 会在设备工具显式请求一次性审批时
+          // 直接拒绝，连续授权应当由语音链路逐条自动同意，而不是让 DSH 静默拒绝。
+          const policy = String(body.policy ?? '')
+          const approval = ctx.get('approval')
+          if (policy !== 'ask' && policy !== 'never') response = result('conflict')
+          else if (body.activation_id !== existing.activationId) response = result('stale')
+          else if (!approval || !existing.handle?.agent) response = result('unavailable')
+          else {
+            approval.setPolicy(existing.handle.agent, policy)
+            response = result('accepted')
+          }
         } else if (path === 'context.snapshot' || path === 'context.update') {
           const revision = Number(body.context_revision)
           const isSnapshot = path.endsWith('snapshot')

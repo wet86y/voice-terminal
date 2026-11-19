@@ -13,7 +13,7 @@ from .router import (
 from .registry import DeviceConnection
 
 REMOTE_DESKTOP_CAPABILITY = "desktop_control"  # 远端桌面控制能力编号。
-REMOTE_CAPABILITIES = frozenset({"audio_stream", "client_tts", "desktop_control", "file_transfer", "terminal_control"})  # REMOTE_CAPABILITIES（首版远端受管能力清单）。
+REMOTE_CAPABILITIES = frozenset({"audio_stream", "client_tts", "desktop_control", "file_transfer", "screen_capture", "terminal_control"})  # REMOTE_CAPABILITIES（远端受管能力清单）。
 MAX_REMOTE_SESSION_TASKS = 32  # 单个设备会话有界排队任务数。
 MAX_REMOTE_SESSION_PENDING = 64  # 单个设备会话最大在途请求数。
 REMOTE_SESSION_IDLE_SECONDS = 90.0  # 最后一次客户端回执或轮询后的空闲失效时限。

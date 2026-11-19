@@ -232,7 +232,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self.state = RuntimeState()
         self.bus = EventBus(self._observe_device_state)
         self.history = SessionLedger(limit=10)
-        self.history.screen_capture = ScreenCaptureRouter(self.history.screen_capture, self.device_registry)
+        self.history.screen_capture = ScreenCaptureRouter(
+            self.history.screen_capture, self.device_registry, self.device_router,
+        )
         self._conversation_tasks: set[asyncio.Task] = set()
         # The conversation log is written from synchronous commit paths, so the
         # runtime owns the publication that follows every append.
