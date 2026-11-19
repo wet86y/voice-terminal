@@ -8,8 +8,6 @@ def require_writable_workspace(local: Path, data: Path) -> None:
     directories = [local / 'cache/aniflive-tts', local / 'tmp', local / 'models/aniflive-tts',
                    local / 'runtimes/aniflive-tts', data / 'config', data / 'state', data / 'tts/aniflive']
     release = local / 'app/release.json'
-    if release.exists():
-        directories.append(release.parent)
     for directory in directories:
         probe = directory / ('.aniflive-write-' + uuid4().hex)
         try:

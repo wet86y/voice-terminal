@@ -337,10 +337,6 @@ def _install_lock(root: Path) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     try:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
         handle.seek(0)
         try:
             if os.name == "nt":
@@ -428,12 +424,20 @@ class ResourceManager:
                 else:
                     metadata_path.unlink(missing_ok=True)
             self.transaction_marker.unlink(missing_ok=True)
-            shutil.rmtree(tx_dir, ignore_errors=True)
+            self._reclaim_transaction_dir(tx_dir)
             return True
         except ResourceError:
             raise
         except Exception as exc:
             raise ResourceError("recovery_failed", "发现未完成资源事务，恢复失败。") from exc
+
+    def _reclaim_transaction_dir(self, tx_dir: Path) -> None:
+        shutil.rmtree(tx_dir, ignore_errors=True)
+        if tx_dir.parent.parent == self.root / 'tmp/resource-transactions':
+            try:
+                tx_dir.parent.rmdir()
+            except OSError:
+                pass  # 其它子事务仍占用时保留父目录，空闲后由工作区维护回收。
 
     def _read_models_manifest(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         path = self.models_root / "manifest.json"
@@ -1106,7 +1110,7 @@ class ResourceManager:
                 self.transaction_marker.unlink(missing_ok=True)
                 if spec.kind == "dsh":
                     (self.root / "cache/component-validation/dsh.json").unlink(missing_ok=True)
-                shutil.rmtree(tx_dir, ignore_errors=True)
+                self._reclaim_transaction_dir(tx_dir)
             except ResourceError:
                 self.recover_pending_transaction()
                 raise

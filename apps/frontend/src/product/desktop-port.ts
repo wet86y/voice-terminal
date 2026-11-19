@@ -21,6 +21,16 @@ export interface WorkspaceChoice {
   root: string
 }
 
+/** WorkspaceCleanup（工作区清理盘点及执行结果）。 */
+export interface WorkspaceCleanup {
+  token: string // token（与本轮盘点绑定的确认值）。
+  total_bytes: number // total_bytes（候选文件逻辑字节数）。
+  entries: Array<{ path: string; bytes: number; reason: string }> // entries（相对路径、字节数和回收原因）。
+  removed_bytes: number // removed_bytes（已清理条目的逻辑字节数）。
+  removed_count: number // removed_count（已清理路径数）。
+  skipped: string[] // skipped（跳过的路径及原因）。
+}
+
 /** ResourceStatus（独立资源状态）：与运行进程及内存采样分开。 */
 export interface ResourceStatus {
   reset_available?: boolean // reset_available（维护异常允许手动重置）。
@@ -160,6 +170,8 @@ export interface DesktopWorkspacePort {
   linkWorkspace(targetRoot: string): Promise<{ job_id: string }>
   /** workspace_migrate（迁移工作区）：迁移完整数据并在成功后清理源位置。 */
   migrateWorkspace(targetRoot: string): Promise<{ job_id: string }>
+  /** workspace_cleanup（扫描可回收项，收到确认值后执行清理）。 */
+  cleanupWorkspace(confirmation?: string): Promise<WorkspaceCleanup>
   /** resource_inventory（资源清单）：返回固定模型与 DSH（代理执行宿主）的独立安装状态。 */
   resourceInventory(): Promise<ResourceStatus[]>
   /** resourceJobSnapshots（轻量任务快照）：定时补查进度，不执行环境扫描。 */
@@ -288,6 +300,7 @@ export function desktopPort(): DesktopPort {
     chooseWorkspace: () => call<WorkspaceChoice | null>('workspace_choose'),
     linkWorkspace: targetRoot => call<{ job_id: string }>('workspace_link', { target_root: targetRoot }),
     migrateWorkspace: targetRoot => call<{ job_id: string }>('workspace_migrate', { target_root: targetRoot }),
+    cleanupWorkspace: confirmation => call<WorkspaceCleanup>('workspace_cleanup', { confirmation }),
     resourceInventory: () => call<ResourceStatus[]>('resource_inventory'),
     resourceJobSnapshots: () => call<ResourceJob[]>('resource_jobs'),
     chooseAnifLiveImportFolder: () => call<string | null>('aniflive_import_choose_folder'),

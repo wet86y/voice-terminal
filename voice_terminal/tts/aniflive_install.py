@@ -192,6 +192,7 @@ class AnifLiveInstallTask:
                 current_by_role[role] = False
         if all(current_by_role.values()):
             emit('复用已登记的隔离运行与导出依赖')
+            self.clean_wheel_cache()
             return
         self.require_build_space()
         rows = {(r['name'], r['version']): r for r in self.lock['wheels']}
@@ -244,10 +245,25 @@ class AnifLiveInstallTask:
                 finally:
                     recover_dependencies(self.runtime)
         finally:
-            for row in pending:
-                stage = contained(self.runtime, self.runtime / row['stage'])
-                if stage.exists():
-                    shutil.rmtree(stage)
+            if not (self.runtime / 'dependency-transaction.json').exists():
+                for row in pending:
+                    stage = contained(self.runtime, self.runtime / row['stage'])
+                    if stage.exists():
+                        shutil.rmtree(stage)
+        self.clean_wheel_cache()
+
+    def clean_wheel_cache(self):
+        """已启用的依赖直接读取安装目录，释放固定锁声明的下载副本。"""
+        installed = {(name, version) for role in ('runtime', 'export') for name, version in self.lock[role].items()}
+        cache = self.local / 'cache/aniflive-wheels'
+        for row in self.lock['wheels']:
+            if (row['name'], row['version']) not in installed:
+                continue
+            for suffix in ('', '.part'):
+                try:
+                    contained(self.local, cache / (row['file'] + suffix)).unlink(missing_ok=True)
+                except (OSError, ValueError) as error:
+                    emit(f'依赖已启用，下载副本稍后可清理：{error}')
 
     def require_build_space(self):
         if shutil.disk_usage(self.local).free < 24 * 1024**3:
@@ -261,19 +277,25 @@ class AnifLiveInstallTask:
             raise RuntimeError('未收到受管显卡构建许可。')
         self._gpu_acknowledged = True
 
-    def command(self, role, *arguments):
+    def command(self, role, *arguments, job: Path):
         return [sys.executable, '-S', '-B', '-X', 'utf8', str(self.program / 'scripts/run-aniflive.py'),
-                '--root', str(self.local), '--role', role, '--', *map(str, arguments)]
+                '--root', str(self.local), '--role', role, '--scratch', str(job / 'process'),
+                '--', *map(str, arguments)]
 
     def run(self, command, report: Path, *, progress=None):
         report = contained(self.local, report)
         report.parent.mkdir(parents=True, exist_ok=True)
+        scratch = contained(self.local, report.parent / 'process')
+        cuda_cache = contained(self.local, report.parent / 'cuda')
+        scratch.mkdir(exist_ok=True)
+        cuda_cache.mkdir(exist_ok=True)
         from ..application.windows import Job, ManagedProcess
         from .aniflive_aliases import cleanup_aliases
         owner, process = Job(), None
         report.unlink(missing_ok=True)
         try:
-            process = ManagedProcess(command, cwd=self.program, env=dict(os.environ), output=report,
+            process = ManagedProcess(command, cwd=scratch, env={**os.environ,
+                'TEMP': str(scratch), 'TMP': str(scratch), 'CUDA_CACHE_PATH': str(cuda_cache)}, output=report,
                 outer_job=owner, event_name='Local\\VoiceTerminal.AnifLive.' + uuid4().hex,
                 key='aniflive-configure')
             previous, checked = None, 0.0
@@ -328,7 +350,7 @@ class AnifLiveInstallTask:
 
     def worker(self, role, operation, job: Path, **options):
         result = job / (operation + '-result.json')
-        command = self.command(role)[:-1] + ['--module', 'voice_terminal.tts.aniflive_worker', '--',
+        command = self.command(role, job=job)[:-1] + ['--module', 'voice_terminal.tts.aniflive_worker', '--',
                   operation, '--root', str(self.local), '--result', str(result)]
         for key, value in options.items():
             command.extend(['--' + key.replace('_', '-'), str(value)])
@@ -336,13 +358,37 @@ class AnifLiveInstallTask:
         return json.loads(result.read_text(encoding='utf-8'))
 
     def convert(self, input_path: Path, *, native_ack=False, name=None):
-        from .aniflive_models import AnifLiveModelRegistry, validate_model_id, BUILD_ADAPTER_FILES
         input_path = contained(self.local, Path(input_path).absolute())
-        values = json.loads(input_path.read_text(encoding='utf-8'))
-        model_id = validate_model_id(values['model_id'])
-        temporary = self.local / 'tmp/aniflive-tasks'
+        temporary = contained(self.local, self.local / 'tmp/aniflive-tasks')
         temporary.mkdir(parents=True, exist_ok=True)
         job = Path(tempfile.mkdtemp(prefix='m-', dir=temporary))
+        try:
+            return self._convert(input_path, job, native_ack=native_ack, name=name)
+        except Exception as error:
+            try:
+                logs = {}
+                for log in sorted(job.glob('*.log')):
+                    with log.open('rb') as stream:
+                        stream.seek(max(0, log.stat().st_size - 128 * 1024))
+                        logs[log.name] = stream.read(128 * 1024).decode('utf-8', 'replace')
+                report = contained(self.local, self.local / 'cache/logs/aniflive-build-latest.json')
+                atomic_json(report, {'error': str(error), 'logs': logs,
+                    'fields': {'error': '构建失败原因', 'logs': '本轮子进程日志末尾'}})
+                emit('已保存最近一次失败的构建诊断：aniflive-build-latest.json（构建日志摘要）')
+            except (OSError, ValueError) as diagnostic_error:
+                emit(f'无法保存构建诊断：{diagnostic_error}')
+            raise
+        finally:
+            if not (self.local / 'tmp/resource-transaction.json').exists():
+                try:
+                    shutil.rmtree(contained(temporary, job))
+                except (OSError, ValueError) as cleanup_error:
+                    emit(f'构建暂存稍后可清理：{cleanup_error}')
+
+    def _convert(self, input_path: Path, job: Path, *, native_ack, name):
+        from .aniflive_models import AnifLiveModelRegistry, validate_model_id, BUILD_ADAPTER_FILES
+        values = json.loads(input_path.read_text(encoding='utf-8'))
+        model_id = validate_model_id(values['model_id'])
         emit('准备模型共享资源')
         shared_root = self.local / 'models/aniflive-tts/shared'
         from . import aniflive_shared
@@ -417,7 +463,12 @@ class AnifLiveInstallTask:
                     '--output', candidate, '--shared-dir', shared_root,
                     '--source-dir', self.runtime / 'source/minimal_inference', '--max-len', build['max_len'],
                     '--stream-overlap-frames', build['stream_overlap_frames'], '--workspace-mib', build['workspace_mib'],
-                    '--optimization-level', build['optimization_level']), job / 'conversion.log', progress=progress)
+                    '--optimization-level', build['optimization_level'], job=job), job / 'conversion.log', progress=progress)
+        for path in candidate.iterdir():
+            if path.name.startswith('onnx.previous-'):
+                contained(candidate, path).rmdir()
+            if path.name.startswith(('.export-stages-', '.onnx.fp32-', '.onnx.fp16-', 'failed-onnx-', 'failed-precision-')):
+                raise ValueError(f'模型候选仍含构建暂存，已停止签收：{path.name}')
         emit('执行完整音频及流式合成验证')
         verified = self.worker('inference', 'validate', job, package=candidate)
         if verified.get('validation', {}).get('enqueue_verified') is not True or verified.get('streaming_verified') is not True:
@@ -445,7 +496,7 @@ class AnifLiveInstallTask:
         if (any(digest(self.program / path) != expected for path, expected in identity['adapter'].items())
                 or digest(self.lock_path) != identity['dependency_lock']
                 or digest(self.program / 'config/runtime/aniflive-shared-assets.lock.json') != identity['shared_lock']):
-            raise RuntimeError('构建期间桥接源码或依赖锁发生变化，候选保留且不登记。')
+            raise RuntimeError('构建期间桥接源码或依赖锁发生变化，候选不会登记。')
         emit('启用已验证模型版本')
         preset = next((r for r in self.presets['models'] if r['id'] == model_id), {})
         from ..resource_distribution import ResourceManager, ResourceSpec, ResourceFile

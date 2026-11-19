@@ -63,6 +63,7 @@ pub mod wasapi_capture; // wasapi_capture（WASAPI 采集流）：事件驱动�
 pub mod wasapi_render; // wasapi_render（WASAPI 播放流）：共享模式默认扬声器与有界 PCM 储备。
 pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
 pub mod workspace; // process_host（项目工作进程）：统一系统身份并复用现有解释器运行库。
+pub mod workspace_cleanup; // workspace_cleanup（工作区可再生资源盘点与回收）。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -465,6 +466,7 @@ impl LaunchContext {
         }
         values.insert("PYTHONUTF8".into(), "1".into());
         values.insert("PYTHONNOUSERSITE".into(), "1".into());
+        values.insert("CUDA_CACHE_MAXSIZE".into(), "1073741824".into()); // CUDA（显卡计算）即时编译缓存上限为 1 GiB（二进制吉字节）。
         if let Some(host) = process_host::current_host() {
             values.insert(
                 "VOICE_PROCESS_HOST".into(),

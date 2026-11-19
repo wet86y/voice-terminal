@@ -417,7 +417,7 @@ fn frontend_capability(
     let mut capability = if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-system-feature-status","allow-resource-system-feature-enable","allow-resource-system-feature-access","allow-device-discovery-search","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-choose-sources","allow-resource-import-start","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-workspace-cleanup","allow-resource-inventory","allow-resource-jobs","allow-resource-system-feature-status","allow-resource-system-feature-enable","allow-resource-system-feature-access","allow-device-discovery-search","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-choose-sources","allow-resource-import-start","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
     };
     if mode == FrontendMode::Product {
         if let Some(permissions) = capability["permissions"].as_array_mut() {
@@ -8473,6 +8473,51 @@ async fn workspace_migrate(
     workspace_operation(window, state.inner().clone(), app, target_root, "migrate").await
 }
 
+fn clean_workspace(
+    state: &Desktop,
+    manager: &ResourceManager,
+    context: &LaunchContext,
+    confirmation: Option<&str>,
+    manual: bool,
+) -> Result<serde_json::Value, String> {
+    let _gate = state
+        .maintenance_gate
+        .try_lock()
+        .map_err(|_| "另一项维护正在执行。")?;
+    if state.workspace_busy.load(Ordering::Acquire)
+        || state.app_update.busy.load(Ordering::Acquire)
+        || state.stopping.load(Ordering::Acquire)
+    {
+        return Err("工作区正在迁移、更新或退出，请稍后清理。".into());
+    }
+    manager.with_idle_cleanup(|| {
+        voice_desktop_common::workspace_cleanup::run(
+            context,
+            env!("CARGO_PKG_VERSION"),
+            confirmation,
+            manual,
+        )
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn workspace_cleanup(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    manager: tauri::State<'_, Arc<ResourceManager>>,
+    confirmation: Option<String>,
+) -> Result<serde_json::Value, String> {
+    require_workspace(&window, &state)?;
+    let context = state.context().ok_or("缺少工作区上下文")?;
+    let state = state.inner().clone();
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clean_workspace(&state, &manager, &context, confirmation.as_deref(), true)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn app_update_payload(
     state_name: &str,
     manifest: Option<&voice_desktop_common::app_update::AppUpdateManifest>,
@@ -10101,7 +10146,7 @@ fn run() -> Result<(), String> {
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
             model_credentials_status,model_credentials_save,inference_selection_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
-            workspace_info,workspace_choose,workspace_link,workspace_migrate,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
+            workspace_info,workspace_choose,workspace_link,workspace_migrate,workspace_cleanup,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
             resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_system_feature_access,resource_download,resource_download_required,resource_import,resource_import_choose_sources,resource_import_start,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
             aniflive_import_choose_folder,aniflive_import_start
         ])
@@ -11900,6 +11945,7 @@ mod tests {
         let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         let authority = context.runtime_authority_mut(); // authority（实际编译的桌面权限解析器）。
         for command in [
+            "workspace_cleanup",
             "resource_reset_plan",
             "resource_reset",
             "model_credentials_status",
@@ -12039,6 +12085,7 @@ mod tests {
                 .add_capability(frontend_capability(mode, "http://127.0.0.1:45001", 7).to_string())
                 .unwrap();
             for command in [
+                "workspace_cleanup",
                 "resource_reset_plan",
                 "resource_reset",
                 "model_credentials_status",

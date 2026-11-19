@@ -97,7 +97,7 @@ def merge_stages(work: Path, output: Path, validate: bool):
     """全部阶段通过后才汇总；任何漏项、额外图或校验失败均拒绝发布。"""
     expected = {'ssl.onnx', 'bert.onnx', 'gpt_encoder.onnx', 'gpt_step.onnx', 'vq_encoder.onnx',
                 'sovits.onnx', 'sovits_stream.onnx', 'spectrogram.onnx', 'sv_embedding.onnx'}
-    graphs, rows, names = set(), [], set()
+    graphs, rows, names, moves = set(), [], set(), []
     for stage in STAGES:
         folder = work / stage
         if validate:
@@ -114,6 +114,7 @@ def merge_stages(work: Path, output: Path, validate: bool):
             if name in names:
                 raise RuntimeError('阶段产物文件名冲突。')
             names.add(name)
+            moves.append((p, output / name))
             if p.suffix == '.onnx':
                 graphs.add(name)
     if graphs != expected or 'config.json' not in names:
@@ -121,21 +122,20 @@ def merge_stages(work: Path, output: Path, validate: bool):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError('导出候选目录必须为空，保留已有诊断。')
-    for stage in STAGES:
-        for p in (work/stage).rglob('*'):
-            if p.is_file() and p.name not in {'validation_report.json', 'stage-result.json'}:
-                target = output / p.relative_to(work/stage)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(p, target)
+    for source, target in moves:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
     if validate:
         (output/'validation_report.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def export_stages(local: Path, program: Path, script: Path, arguments: list[str]):
+def export_stages(local: Path, program: Path, script: Path, arguments: list[str], *, scratch: Path | None = None):
     """资源允许时最多两个阶段并行；明确内存失败后仅串行重试未完成阶段。"""
     from .aniflive_native import contained
     output = contained(local, Path(arguments[arguments.index('--output_dir')+1]).absolute())
-    work = Path(tempfile.mkdtemp(prefix='.export-stages-', dir=output.parent))
+    scratch = contained(local, scratch or local / 'tmp/aniflive-export')
+    scratch.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix='.export-stages-', dir=scratch))
     pending, running, done = list(STAGES), {}, []
     serial, retried = False, set()
     history = []
@@ -168,9 +168,9 @@ def export_stages(local: Path, program: Path, script: Path, arguments: list[str]
                 failure = json.loads(result.read_text(encoding='utf-8')) if result.is_file() else {}
                 if not ((failure.get('kind') == 'cpu_memory' and failure.get('stage') == stage)
                         or process_memory_failure(code)):
-                    raise RuntimeError(f'{stage}（导出阶段）失败，退出码 {code}；见 {work/stage}.log')
+                    raise RuntimeError(f'{stage}（导出阶段）失败，退出码 {code}；见构建诊断。')
                 if stage in retried:
-                    raise RuntimeError(f'{stage}（导出阶段）串行重试后仍内存不足；见 {work/stage}.log')
+                    raise RuntimeError(f'{stage}（导出阶段）串行重试后仍内存不足；见构建诊断。')
                 retried.add(stage); serial = True
                 interrupted = list(running)
                 stop()
@@ -190,17 +190,22 @@ def export_stages(local: Path, program: Path, script: Path, arguments: list[str]
                 if ready:
                     waiting_since = None; pending.pop(0)
                     folder = work/stage
-                    # 每次重试保留旧现场，绝不在同一个半成品目录继续。
+                    # 阶段日志已追加到同一个文件，重试不保留大型半成品。
                     if folder.exists():
-                        folder.rename(work/f'{stage}.failed-{time.time_ns()}')
+                        shutil.rmtree(contained(work, folder))
                     folder.mkdir()
+                    process_dir = work / (stage + '-process')
+                    if process_dir.exists():
+                        shutil.rmtree(contained(work, process_dir))
+                    process_dir.mkdir()
                     values = list(arguments); values[values.index('--output_dir')+1] = str(folder)
                     command = [sys.executable, '-S', '-B', '-X', 'utf8', str(program/'scripts/run-aniflive.py'),
-                               '--root', str(local), '--role', 'export', '--script', str(script), '--',
+                               '--root', str(local), '--role', 'export', '--scratch', str(process_dir),
+                               '--script', str(script), '--',
                                *values, '--export-stage', stage]
                     stream = (work/f'{stage}.log').open('ab')
                     try:
-                        process = subprocess.Popen(command, cwd=program, stdout=stream, stderr=subprocess.STDOUT,
+                        process = subprocess.Popen(command, cwd=process_dir, stdout=stream, stderr=subprocess.STDOUT,
                                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                     except BaseException:
                         stream.close(); raise
@@ -214,5 +219,16 @@ def export_stages(local: Path, program: Path, script: Path, arguments: list[str]
             time.sleep(.2)
         merge_stages(work, output, '--validate' in arguments)
         record('全部阶段通过并汇总', completed=done)
+    except Exception:
+        stop()
+        for log in sorted(work.glob('*.log')):
+            try:
+                with log.open('rb') as stream:
+                    stream.seek(max(0, log.stat().st_size - 16384))
+                    print(f'[AnifLive（本地语音）阶段日志] {log.name}\n{stream.read(16384).decode("utf-8", "replace")}', flush=True)
+            except OSError as error:
+                print(f'[AnifLive（本地语音）阶段日志读取失败] {error}', flush=True)
+        raise
     finally:
         stop()
+        shutil.rmtree(contained(scratch, work), ignore_errors=True)

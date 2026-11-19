@@ -449,6 +449,20 @@ export function useWorkspaceResources() {
     }
   }
 
+  async function cleanupWorkspace(confirmation?: string) {
+    if (!localResourceTargetAllowed() || !canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
+    workspaceOperationStarting.value = true
+    workspaceError.value = ''
+    try {
+      return await port.cleanupWorkspace(confirmation)
+    } catch (error) {
+      workspaceError.value = error instanceof Error ? error.message : '清理工作区失败。'
+      return null
+    } finally {
+      workspaceOperationStarting.value = false
+    }
+  }
+
   async function linkWorkspace(targetRoot: string) {
     if (!localResourceTargetAllowed()) return
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
@@ -734,6 +748,7 @@ export function useWorkspaceResources() {
     chooseWorkspace,
     linkWorkspace,
     migrateWorkspace,
+    cleanupWorkspace,
     downloadResource,
     downloadRequiredResources: () => startResourceJob('required-batch', 'required'),
     pendingResetPlan,

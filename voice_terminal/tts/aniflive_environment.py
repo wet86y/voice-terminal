@@ -47,7 +47,7 @@ def validate_versions(directories: list[Path], role: str) -> dict:
     return required
 
 
-def configure(local: Path, program: Path, role: str) -> dict:
+def configure(local: Path, program: Path, role: str, *, scratch: Path | None = None) -> dict:
     """configure（配置子进程）：必须在加载任何计算依赖前调用。"""
     if any(name in sys.modules for name in ("torch", "transformers", "tokenizers", "huggingface_hub", "tensorrt")):
         raise RuntimeError("计算依赖已加载，不能在当前进程切换 AnifLive 依赖角色。")
@@ -78,13 +78,17 @@ def configure(local: Path, program: Path, role: str) -> dict:
             native = contained(local, directory / 'lib/site-packages/MeCab')
             if native.is_dir():
                 _DLL_HANDLES.append(os.add_dll_directory(str(native)))
-    scratch = contained(local, local / 'tmp/aniflive-runtime')
+    temporary = contained(local, local / 'tmp')
+    compile_cache = (scratch / 'cache') if scratch else (local / 'cache')
+    scratch = contained(temporary, scratch or temporary / 'aniflive-runtime')
     scratch.mkdir(parents=True, exist_ok=True)
+    compile_cache = contained(local, compile_cache)
     os.environ.update({"PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
                        "TEMP": str(scratch), "TMP": str(scratch),
                        "HF_XET_CACHE": str(local / 'cache/huggingface/xet'), "HF_HUB_DISABLE_XET": "1",
-                       "MPLCONFIGDIR": str(local / 'cache/matplotlib'),
-                       "NUMBA_CACHE_DIR": str(local / 'cache/numba'),
+                       "MPLCONFIGDIR": str(compile_cache / 'matplotlib'),
+                       "NUMBA_CACHE_DIR": str(compile_cache / 'numba'),
+                       "TORCH_EXTENSIONS_DIR": str(compile_cache / 'torch/extensions'),
                        "NLTK_DATA": str(local / 'models/aniflive-tts/shared/nltk_data'),
                        "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                        "ANIFLIVE_TTS_SOURCE_DIR": str(source),

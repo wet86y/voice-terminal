@@ -1560,6 +1560,20 @@ impl ResourceManager {
             .map(|jobs| jobs.values().any(|job| !terminal(&job.snapshot.state)))
             .unwrap_or(true)
     }
+
+    pub(crate) fn with_idle_cleanup<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let jobs = self.jobs.try_lock().map_err(|_| "资源任务状态正在更新，请稍后清理。")?;
+        if !self.accepting_jobs.load(Ordering::Acquire)
+            || self.resetting.load(Ordering::Acquire)
+            || jobs.values().any(|job| !terminal(&job.snapshot.state))
+        {
+            return Err("组件任务正在处理，请等待结束后清理工作区。".into());
+        }
+        operation()
+    }
     pub fn configure_runtime(self: &Arc<Self>, group: String) -> Result<Value, String> {
         self.configure_runtime_child(group, None)
     }

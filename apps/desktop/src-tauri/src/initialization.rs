@@ -74,7 +74,25 @@ pub fn install_manager(
             super::remote_services::RemoteServices::new(manager.clone()),
         ));
     }
-    app.manage(manager);
+    app.manage(manager.clone());
+    let cleanup_state = Arc::downgrade(&state);
+    let cleanup_manager = Arc::downgrade(&manager);
+    let cleanup_context = context.clone();
+    thread::spawn(move || {
+        // 给更新分发器留出退出时间，盘点与启动就绪互不等待。
+        thread::sleep(Duration::from_secs(30));
+        while let (Some(state), Some(manager)) = (cleanup_state.upgrade(), cleanup_manager.upgrade()) {
+            if state.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if super::require_local_device_root(&cleanup_context.data).is_ok() {
+                let _ = super::clean_workspace(&state, &manager, &cleanup_context, None, false);
+            }
+            drop(state);
+            drop(manager);
+            thread::sleep(Duration::from_secs(60 * 60));
+        }
+    });
     // 页面真正加载后才登记就绪，迁移不能把窗口创建之前的阶段视为启动成功。
     Ok(())
 }

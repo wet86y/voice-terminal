@@ -91,6 +91,10 @@ def test_scheduler_retries_only_memory_and_keeps_completed_stages(tmp_path, monk
         def __init__(self, command, **kwargs):
             self.stage = command[command.index('--export-stage')+1]
             self.folder = Path(command[command.index('--output_dir')+1])
+            assert kwargs['cwd'].is_relative_to(local/'tmp')
+            assert not self.folder.is_relative_to(local/'package')
+            assert not list(kwargs['cwd'].iterdir())
+            (kwargs['cwd']/'phase-cache').touch()
             starts.append(self.stage)
             attempts[self.stage] = attempts.get(self.stage, 0)+1
             # 第二个并行阶段失败，迫使终止仍活动的第一阶段；其后仅串行执行。
@@ -117,8 +121,13 @@ def test_scheduler_retries_only_memory_and_keeps_completed_stages(tmp_path, monk
     monkeypatch.setattr(export.subprocess, 'Popen', Process)
     monkeypatch.setattr(export, 'memory_available', lambda: (64*export.GIB, 64*export.GIB))
     monkeypatch.setattr(export.time, 'sleep', lambda _: None)
+    package = local/'package'
+    package.mkdir()
+    output = package/'onnx'
+    arguments = ['--output_dir', str(output), '--validate']
     if failure == 'cpu_memory':
-        export.export_stages(local, tmp_path, tmp_path/'export_onnx.py', ['--output_dir', str(local/'output'), '--validate'])
+        export.export_stages(local, tmp_path, tmp_path/'export_onnx.py', arguments)
+        assert sorted(path.name for path in package.iterdir()) == ['onnx']
         assert attempts[failure_stage] == 2
         if failure_stage == 'bert':
             assert stops == ['ssl']
@@ -127,6 +136,7 @@ def test_scheduler_retries_only_memory_and_keeps_completed_stages(tmp_path, monk
             assert attempts['ssl'] == attempts['bert'] == 1
     else:
         with pytest.raises(RuntimeError, match='串行重试后仍内存不足' if failure == 'repeat_memory' else '失败，退出码'):
-            export.export_stages(local, tmp_path, tmp_path/'export_onnx.py', ['--output_dir', str(local/'output'), '--validate'])
+            export.export_stages(local, tmp_path, tmp_path/'export_onnx.py', arguments)
+        assert not output.exists()
         assert attempts[failure_stage] == (2 if failure == 'repeat_memory' else 1)
-        assert not (local/'output').exists()
+    assert not list((local/'tmp/aniflive-export').iterdir())

@@ -73,6 +73,7 @@ fn main() {
             "workspace_choose",
             "workspace_link",
             "workspace_migrate",
+            "workspace_cleanup",
             "app_integrity_status",
             "app_integrity_download",
             "app_integrity_check",

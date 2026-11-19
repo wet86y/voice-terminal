@@ -137,7 +137,8 @@ class AppPaths:
             values.update(TEMP=str(self.install_root / "tmp/process"), TMP=str(self.install_root / "tmp/process"),
                           npm_config_cache=str(self.cache / "npm"), npm_config_store_dir=str(self.cache / "pnpm/store"),
                           npm_config_userconfig=str(self.config / "npmrc"))
-            values.update(CUDA_CACHE_PATH=str(self.cache / "cuda"), TORCH_EXTENSIONS_DIR=str(self.cache / "torch/extensions"),
+            values.update(CUDA_CACHE_PATH=str(self.cache / "cuda"), CUDA_CACHE_MAXSIZE="1073741824",
+                          TORCH_EXTENSIONS_DIR=str(self.cache / "torch/extensions"),
                           MPLCONFIGDIR=str(self.cache / "matplotlib"), XDG_CACHE_HOME=str(self.cache),
                           PIP_CONFIG_FILE=str(self.config / "pip.ini"))
             for name, folder in (("MODELSCOPE_CACHE", "modelscope"), ("HF_HOME", "huggingface"),

@@ -508,8 +508,16 @@ pub fn worker(
         &format!("tmp/process/worker-{}.json", crate::workspace::new_id()),
     )?;
     fs::create_dir_all(output_path.parent().unwrap()).map_err(|e| e.to_string())?;
-    let output = fs::File::create(&output_path).map_err(|e| e.to_string())?;
+    struct WorkerOutput<'a>(&'a Path, &'a Path);
+    impl Drop for WorkerOutput<'_> {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0);
+            let _ = fs::remove_file(self.1);
+        }
+    }
     let error_path = output_path.with_extension("stderr");
+    let _cleanup = WorkerOutput(&output_path, &error_path);
+    let output = fs::File::create(&output_path).map_err(|e| e.to_string())?;
     let diagnostic = fs::File::create(&error_path).map_err(|e| e.to_string())?;
     let mut command = crate::process_host::python_command(python);
     context.configure_command(&mut command);
@@ -521,7 +529,7 @@ pub fn worker(
         .stdin(Stdio::null())
         .stdout(output)
         .stderr(diagnostic)
-        .current_dir(&context.program);
+        .current_dir(output_path.parent().unwrap());
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     #[cfg(windows)]
@@ -545,8 +553,6 @@ pub fn worker(
         if resources::check_cancel(cancel).is_err() || Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = fs::remove_file(&output_path);
-            let _ = fs::remove_file(&error_path);
             return Err("工作进程已取消或超时".into());
         }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -556,8 +562,6 @@ pub fn worker(
     };
     let bytes = fs::read(&output_path);
     let diagnostic = fs::read(&error_path).unwrap_or_default();
-    let _ = fs::remove_file(output_path);
-    let _ = fs::remove_file(error_path);
     worker_result(
         &bytes.map_err(|e| e.to_string())?,
         &diagnostic,
@@ -678,7 +682,7 @@ fn prepare_cpu_overlay(
     stage: &Path,
     cancel: Arc<AtomicBool>,
     progress: &mut Progress,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let base = lock(context)?;
     let site = stage.join("Lib/cpu-packages");
     let mut names = vec!["torch", "torchaudio"];
@@ -749,7 +753,24 @@ fn prepare_cpu_overlay(
     if checked["ready"] != true {
         return Err(format!("独立处理器依赖校验失败：{}", checked["errors"]));
     }
-    Ok(())
+    Ok(wheels)
+}
+
+struct EnvironmentStage<'a>(&'a Path); // EnvironmentStage（依赖候选目录回收）。
+impl Drop for EnvironmentStage<'_> {
+    fn drop(&mut self) {
+        if !self.0.join("tmp/native-install.json").exists() {
+            crate::workspace_cleanup::reclaim_cache(self.0, "tmp/voice-environment/stage");
+        }
+    }
+}
+
+fn reclaim_wheels(context: &LaunchContext, paths: &[String]) {
+    for name in paths.iter().filter_map(|path| Path::new(path).file_name().and_then(|name| name.to_str())) {
+        for suffix in ["", ".part", ".part.identity"] {
+            crate::workspace_cleanup::reclaim_cache(&context.install, &format!("cache/dependencies/wheels/{name}{suffix}"));
+        }
+    }
 }
 struct RuntimeWheel {
     file: Option<DownloadFile>, // file（需要网络下载的固定依赖；有效缓存或内置包为空）。
@@ -1027,6 +1048,7 @@ fn configure_inner_reported(
     }
     let stage = safe_path(&context.install, "tmp/voice-environment/stage")?;
     remove_owned(&stage, &context.install)?;
+    let _cleanup = EnvironmentStage(&context.install);
     fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
     let site = stage.join("Lib/site-packages");
     fs::create_dir_all(&site).map_err(|e| e.to_string())?;
@@ -1202,7 +1224,7 @@ fn configure_inner_reported(
         return Err(format!("运行依赖加载失败：{}", checked["errors"]));
     }
     if gpu || compatible_gpu {
-        prepare_cpu_overlay(context, &stage, cancel.clone(), progress)?;
+        downloaded.extend(prepare_cpu_overlay(context, &stage, cancel.clone(), progress)?);
     }
     resources::check_cancel(&cancel)?;
     let mut packages: std::collections::BTreeSet<String> = reused.into_iter().collect();
@@ -1228,6 +1250,10 @@ fn configure_inner_reported(
     totals.report(progress, "启用私有语音环境", 0);
     resources::check_cancel(&cancel)?;
     enable(&stage, "runtimes/python")?;
+    reclaim_wheels(context, &downloaded);
+    if embedded {
+        crate::workspace_cleanup::reclaim_cache(&context.install, "cache/dependencies/python-3.12.10.zip");
+    }
     Ok(installed_resources(gpu))
 }
 fn installed_resources(gpu: bool) -> Vec<String> {

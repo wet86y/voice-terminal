@@ -15,9 +15,6 @@ def task_guard(local: Path):
     path = contained(local, local / 'tmp/aniflive-task.lock')
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+b') as stream:
-        stream.seek(0, 2)
-        if stream.tell() == 0:
-            stream.write(b'0'); stream.flush()
         waiting_reported = False
         while True:
             try:

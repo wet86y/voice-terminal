@@ -70,7 +70,9 @@ class AnifLiveTtsServer:
                 '--package', str(package), '--library', str(self.library), '--nonce', nonce)
             self._state, self.error = 'loading', None
             try:
-                self._process = await asyncio.create_subprocess_exec(*command, cwd=self.program,
+                scratch = contained(self.local, self.local / 'tmp/aniflive-runtime')
+                scratch.mkdir(parents=True, exist_ok=True)
+                self._process = await asyncio.create_subprocess_exec(*command, cwd=scratch,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                     env={**os.environ, 'VOICE_RESOURCE_ROLE': 'voice'},
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))

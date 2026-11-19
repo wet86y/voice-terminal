@@ -4,9 +4,11 @@ withDefaults(defineProps<{
   /** canManage（是否允许迁移工作区）。 */ canManage?: boolean
   /** disabled（正在执行互斥操作）。 */ disabled?: boolean
   /** choosing（正在选择迁移目标）。 */ choosing?: boolean
-}>(), { canManage: false, disabled: false, choosing: false })
+  /** cleaning（正在扫描或清理）。 */ cleaning?: boolean
+}>(), { canManage: false, disabled: false, choosing: false, cleaning: false })
 const emit = defineEmits<{
   /** migrate（选择目录并确认迁移工作区）。 */ migrate: []
+  /** cleanup（检查工作区可回收资源）。 */ cleanup: []
 }>()
 </script>
 
@@ -19,7 +21,10 @@ const emit = defineEmits<{
         <dl class="workspace-paths"><div><dt>工作区根目录</dt><dd :title="root">{{ root }}</dd></div></dl>
       </div>
     </div>
-    <button v-if="canManage" class="outline-button workspace-migrate-action" type="button" :disabled="disabled" @click="emit('migrate')">{{ choosing ? '正在选择…' : '迁移工作区' }}</button>
+    <div v-if="canManage" class="workspace-actions">
+      <button class="outline-button workspace-cleanup-action" type="button" :disabled="disabled" @click="emit('cleanup')">{{ cleaning ? '处理中…' : '清理' }}</button>
+      <button class="outline-button workspace-migrate-action" type="button" :disabled="disabled" @click="emit('migrate')">{{ choosing ? '正在选择…' : '迁移工作区' }}</button>
+    </div>
   </section>
 </template>
 
@@ -33,6 +38,8 @@ const emit = defineEmits<{
 .workspace-paths>div{display:grid;gap:5px;min-width:0}
 .workspace-paths dt{font-size:var(--font-body);font-weight:600;color:var(--text)}
 .workspace-paths dd{margin:0;font-size:var(--font-body);line-height:1.55;color:var(--muted);overflow-wrap:anywhere;word-break:break-word}
-.workspace-migrate-action{flex:none;min-height:var(--compact-control-height);padding:8px 16px;font-size:var(--font-body);white-space:nowrap}
-@media(max-width:560px){.workspace-card{padding:16px;gap:12px}.workspace-icon{display:none}.workspace-migrate-action{padding:8px 12px}}
+.workspace-actions{display:flex;gap:8px;flex:none}
+.workspace-actions button{min-height:var(--compact-control-height);padding:8px 16px;font-size:var(--font-body);white-space:nowrap}
+@media(max-width:560px){.workspace-card{padding:16px;gap:12px}.workspace-icon{display:none}.workspace-actions button{padding:8px 12px}}
+@media(max-width:360px){.workspace-card{align-items:flex-start;flex-direction:column}.workspace-actions{align-self:flex-end}}
 </style>

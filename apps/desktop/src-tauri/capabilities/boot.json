@@ -66,6 +66,7 @@
     "allow-workspace-choose",
     "allow-workspace-link",
     "allow-workspace-migrate",
+    "allow-workspace-cleanup",
     "allow-resource-inventory",
     "allow-resource-jobs",
     "allow-resource-system-feature-status",

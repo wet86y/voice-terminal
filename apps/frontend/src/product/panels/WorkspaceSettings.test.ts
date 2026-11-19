@@ -25,6 +25,7 @@ function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResourc
     chooseWorkspace: vi.fn(),
     linkWorkspace: vi.fn(),
     migrateWorkspace: vi.fn(),
+    cleanupWorkspace: vi.fn(),
     cancelJob: vi.fn(),
   } as unknown as ReturnType<typeof useWorkspaceResources>
 }
@@ -52,10 +53,11 @@ describe('WorkspaceSettings（关于页面）', () => {
     expect(paths[0].find('dd').text()).toBe('D:\\ExampleWorkspace\\VoiceTerminal\\.local')
     expect(wrapper.get('.workspace-card').text()).not.toMatch(/数据目录|应用版本|正式程序/)
     expect(wrapper.find('.workspace-migrate-action').exists()).toBe(false)
+    expect(wrapper.find('.workspace-cleanup-action').exists()).toBe(false)
     wrapper.unmount()
   })
 
-  it('工作区卡片提供唯一的迁移按钮，项目仓库按钮连接桌面操作', async () => {
+  it('工作区卡片的清理位于迁移左侧，项目仓库按钮连接桌面操作', async () => {
     const wrapper = mount(WorkspaceSettings, {
       props: {
         controller: controller({
@@ -72,10 +74,28 @@ describe('WorkspaceSettings（关于页面）', () => {
     expect(paths[0].find('dt').text()).toBe('工作区根目录')
     expect(paths[0].find('dd').text()).toBe('D:\\测试\\语音工作区')
     expect(wrapper.get('.workspace-migrate-action').text()).toBe('迁移工作区')
-    expect(wrapper.get('.workspace-card').findAll('button')).toHaveLength(1)
+    expect(wrapper.get('.workspace-card').findAll('button').map(button => button.text())).toEqual(['清理', '迁移工作区'])
     expect(wrapper.text()).not.toMatch(/链接并切换|选择工作区位置|数据目录/)
     await wrapper.get('.update-repository').trigger('click')
     expect(wrapper.props('controller').openProjectRepository).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('展示可回收清单，并在确认后提交同一轮清理确认值', async () => {
+    const actions = controller({ root: 'D:\\测试工作区', data_dir: 'D:\\测试工作区\\data', version: '1.0.0', can_manage: true }, true)
+    const plan = { token: 'scan-1', total_bytes: 7, entries: [{ path: 'tmp/resource-downloads/example', bytes: 7, reason: '可重新下载' }], removed_bytes: 0, removed_count: 0, skipped: [] }
+    vi.mocked(actions.cleanupWorkspace).mockResolvedValueOnce(plan).mockResolvedValueOnce({ ...plan, removed_count: 1, removed_bytes: 7 })
+    const wrapper = mount(WorkspaceSettings, { props: { controller: actions }, attachTo: document.body })
+    await wrapper.get('.workspace-cleanup-action').trigger('click')
+    await flushPromises()
+    expect(actions.cleanupWorkspace).toHaveBeenCalledExactlyOnceWith()
+    expect(document.body.textContent).toContain('tmp/resource-downloads/example')
+    const confirm = [...document.querySelectorAll('button')].find(button => button.textContent === '清理所列项目')
+    expect(confirm).toBeDefined()
+    confirm?.click()
+    await flushPromises()
+    expect(actions.cleanupWorkspace).toHaveBeenLastCalledWith('scan-1')
+    expect(wrapper.text()).toContain('已清理 1 项')
     wrapper.unmount()
   })
 

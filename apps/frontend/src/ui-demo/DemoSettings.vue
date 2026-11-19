@@ -305,7 +305,7 @@ function cancelTask(item: DemoWakeTask) {
     <template v-else-if="tab === 'workspace'">
       <SettingsPageHeader section="workspace" />
       <AppUpdateCard :status="updatePreview" :integrity="integrityPreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消下载')" @download-integrity="integrityReady = true; feedback('模拟已下载本地 v0.9.0 对应构建的校验程序')" @check-integrity="feedback('模拟关闭程序，由对应版本分发器校验并修复工作区')" @repository="feedback('项目仓库：https://github.com/wet86y/voice-terminal')" />
-      <WorkspaceLocationCard :root="scene === 'long' ? `D:\\语音终端\\${longIdentifier}\\工作区` : 'D:\\语音终端\\工作区'" can-manage @migrate="feedback('模拟选择目标目录并确认工作区迁移')" />
+      <WorkspaceLocationCard :root="scene === 'long' ? `D:\\语音终端\\${longIdentifier}\\工作区` : 'D:\\语音终端\\工作区'" can-manage @cleanup="feedback('模拟检查工作区的可回收文件')" @migrate="feedback('模拟选择目标目录并确认工作区迁移')" />
     </template>
     <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">
       <section role="dialog" aria-modal="true" aria-labelledby="demo-bundle-title" class="demo-bundle-dialog">

@@ -57,6 +57,7 @@ pub(super) fn configure(
     }
     let stage = safe_path(&context.install, "tmp/voice-environment/stage")?;
     remove_owned(&stage, &context.install)?;
+    let _cleanup = EnvironmentStage(&context.install);
     fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
     let base = lock(context)?;
     let cache = safe_path(&context.install, "cache/dependencies/wheels")?;
@@ -109,6 +110,7 @@ pub(super) fn configure(
     }
     progress("本次总下载量已确认", 0, total);
     crate::download::download_batch(&transfers, cancel.clone(), progress)?;
+    let used_wheels = installs.iter().flat_map(|(_, paths)| paths.iter().cloned()).collect::<Vec<_>>();
     for (relative, paths) in installs {
         if !paths.is_empty() {
             resources::check_cancel(&cancel)?;
@@ -237,8 +239,7 @@ pub(super) fn configure(
     ) {
         eprintln!("依赖更新已完成，但诊断记录写入失败：{error}");
     }
-    // 这里只回收本任务的稀疏暂存，现用依赖已由事务单独提交。
-    remove_owned(&stage, &context.install)?;
+    reclaim_wheels(context, &used_wheels);
     Ok(installed_resources(gpu))
 }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-cleanup"
+description = "Enables the workspace_cleanup command without any pre-configured scope."
+commands.allow = ["workspace_cleanup"]
+
+[[permission]]
+identifier = "deny-workspace-cleanup"
+description = "Denies the workspace_cleanup command without any pre-configured scope."
+commands.deny = ["workspace_cleanup"]

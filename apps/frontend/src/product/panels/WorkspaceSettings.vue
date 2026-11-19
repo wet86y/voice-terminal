@@ -4,12 +4,16 @@ import UiDialog from '../../interface/UiDialog.vue'
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import AppUpdateCard from '../../interface/AppUpdateCard.vue'
 import WorkspaceLocationCard from '../../interface/WorkspaceLocationCard.vue'
+import type { WorkspaceCleanup } from '../desktop-port'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
 const candidateRoot = ref('')
 const pickerBusy = ref(false)
 const migrationConfirm = ref(false)
+const cleanupPlan = ref<WorkspaceCleanup | null>(null)
+const cleanupResult = ref<WorkspaceCleanup | null>(null)
+const cleanupBusy = ref(false)
 const canManage = computed(() => props.controller.canManage.value)
 const workspace = computed(() => props.controller.workspace.value)
 const activeJob = computed(() => props.controller.activeWorkspaceJob.value)
@@ -22,7 +26,7 @@ const progress = computed(() => {
   if (!job?.total_bytes || job.total_bytes <= 0 || job.completed_bytes == null) return undefined
   return Math.max(0, Math.min(100, Math.round(job.completed_bytes / job.total_bytes * 100)))
 })
-const controlsBusy = computed(() => pickerBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
+const controlsBusy = computed(() => pickerBusy.value || cleanupBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
 const updateStatus = computed(() => props.controller.appUpdate.value)
 
 async function chooseTarget() {
@@ -44,6 +48,23 @@ async function confirmMigration() {
   if (!candidateRoot.value || controlsBusy.value) return
   migrationConfirm.value = false
   await props.controller.migrateWorkspace(candidateRoot.value)
+}
+
+async function scanCleanup() {
+  if (controlsBusy.value || !canManage.value) return
+  cleanupBusy.value = true
+  cleanupResult.value = null
+  try { cleanupPlan.value = await props.controller.cleanupWorkspace() }
+  finally { cleanupBusy.value = false }
+}
+
+async function confirmCleanup() {
+  if (controlsBusy.value || !cleanupPlan.value?.entries.length) return
+  const { token } = cleanupPlan.value
+  cleanupBusy.value = true
+  cleanupPlan.value = null
+  try { cleanupResult.value = await props.controller.cleanupWorkspace(token) }
+  finally { cleanupBusy.value = false }
 }
 
 function cancelJob() {
@@ -70,7 +91,11 @@ function formatBytes(value: number | null | undefined) {
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
     <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
 
-    <WorkspaceLocationCard v-if="workspace" :root="workspace.root" :can-manage="canManage" :disabled="controlsBusy" :choosing="pickerBusy" @migrate="chooseTarget" />
+    <WorkspaceLocationCard v-if="workspace" :root="workspace.root" :can-manage="canManage" :disabled="controlsBusy" :choosing="pickerBusy" :cleaning="cleanupBusy" @cleanup="scanCleanup" @migrate="chooseTarget" />
+    <div v-if="cleanupResult" class="workspace-job-card" role="status">
+      <strong>已清理 {{ cleanupResult.removed_count }} 项，共 {{ formatBytes(cleanupResult.removed_bytes) }}</strong>
+      <details v-if="cleanupResult.skipped.length"><summary>{{ cleanupResult.skipped.length }} 项已跳过</summary><ul><li v-for="message in cleanupResult.skipped" :key="message">{{ message }}</li></ul></details>
+    </div>
 
     <section v-if="latestJob" class="workspace-job-card" :class="{ failed: latestJob.state === 'failed' }" aria-live="polite">
       <div class="workspace-job-heading"><div><strong>{{ isMigration ? '工作区迁移' : '工作区切换' }}</strong><span>{{ latestJob.state === 'failed' ? '失败' : ['complete', 'completed'].includes(latestJob.state) ? '已完成' : ['cancelled', 'canceled'].includes(latestJob.state) ? '已取消' : '处理中' }}</span></div><button v-if="activeJob && latestJob.can_cancel !== false" class="text-action" type="button" @click="cancelJob">取消迁移</button></div>
@@ -80,6 +105,18 @@ function formatBytes(value: number | null | undefined) {
     </section>
 
     <p v-if="controller.eventError.value" class="workspace-error" role="status">{{ controller.eventError.value }}</p>
+
+    <UiDialog :open="Boolean(cleanupPlan)" title="清理工作区" @close="cleanupPlan = null">
+      <div v-if="cleanupPlan" class="workspace-confirm-copy">
+        <p v-if="cleanupPlan.entries.length">发现 {{ cleanupPlan.entries.length }} 项可清理内容，共 {{ formatBytes(cleanupPlan.total_bytes) }}。清理后的组件暂存可能需要重新下载。</p>
+        <p v-else>当前未发现可清理的工作区文件。</p>
+        <ul v-if="cleanupPlan.entries.length" class="cleanup-entries">
+          <li v-for="entry in cleanupPlan.entries" :key="entry.path"><strong>{{ entry.path }}</strong><span>{{ entry.reason }} · {{ formatBytes(entry.bytes) }}</span></li>
+        </ul>
+        <details v-if="cleanupPlan.skipped.length"><summary>{{ cleanupPlan.skipped.length }} 项已跳过</summary><ul><li v-for="message in cleanupPlan.skipped" :key="message">{{ message }}</li></ul></details>
+      </div>
+      <template #actions><button class="outline-button" type="button" @click="cleanupPlan = null">关闭</button><button v-if="cleanupPlan?.entries.length" class="save-button workspace-confirm-button" type="button" @click="confirmCleanup">清理所列项目</button></template>
+    </UiDialog>
 
     <UiDialog :open="migrationConfirm" title="迁移并清理旧工作区？" @close="migrationConfirm = false">
       <div class="workspace-confirm-copy"><p>将工作区数据从当前目录复制到所选位置。</p><dl><div><dt>当前目录</dt><dd>{{ workspace?.root }}</dd></div><div><dt>目标目录</dt><dd>{{ candidateRoot }}</dd></div></dl><p>只有复制和校验成功后才会切换，并清理旧位置。</p></div>
@@ -111,5 +148,9 @@ function formatBytes(value: number | null | undefined) {
 .workspace-confirm-copy{display:grid;gap:14px;margin:16px 0;color:var(--muted);font-size:var(--font-body);line-height:1.55}
 .workspace-confirm-copy dl{padding:12px;border:1px solid var(--line);border-radius:10px}
 .workspace-confirm-button{min-height:var(--compact-control-height);padding:7px 14px}
+.cleanup-entries{display:grid;gap:10px;max-height:40vh;overflow:auto;list-style:none;margin:0;padding:12px;border:1px solid var(--line);border-radius:10px}
+.cleanup-entries li{display:grid;gap:2px;overflow-wrap:anywhere}
+.cleanup-entries strong{color:var(--text);font-weight:600}
+.cleanup-entries span{font-size:var(--font-caption)}
 @media(max-width:560px){.workspace-job-card{padding:14px}.workspace-job-heading{align-items:flex-start}.workspace-progress-wrap{grid-template-columns:1fr;gap:6px}.workspace-progress-wrap small{text-align:right}}
 </style>

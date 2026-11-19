@@ -2851,6 +2851,21 @@ pub fn download_resource_with_activation(
     progress: &mut Progress,
     enable: &mut Activation,
 ) -> Result<Vec<String>, String> {
+    let result = download_resource_inner(context, id, cancel, progress, enable);
+    if result.is_ok() {
+        let relative = format!("tmp/resource-downloads/{id}");
+        crate::workspace_cleanup::reclaim_cache(&context.install, &relative);
+    }
+    result
+}
+
+fn download_resource_inner(
+    context: &LaunchContext,
+    id: &str,
+    cancel: Arc<AtomicBool>,
+    progress: &mut Progress,
+    enable: &mut Activation,
+) -> Result<Vec<String>, String> {
     let item = spec(context, id)?;
     ensure_file_download_route(resource_kind(&item)?)?;
     let installed = destination(context, &item)?;
@@ -2936,7 +2951,7 @@ pub fn download_resource_with_activation(
         };
         let result =
             install_and_activate_dsh(&candidate, &cancel, progress, &mut installer, enable);
-        // retry candidate（重试候选）：中断或失败保留候选及归档缓存，重试仍核对相同目标。
+        // 中断或失败保留候选及归档缓存，重试仍核对相同目标。
         return result;
     }
     let root = safe_path(&context.install, &format!("tmp/resource-downloads/{id}"))?;
@@ -3171,7 +3186,11 @@ pub fn upgrade_bundled_with_activation(
             if current_for_upgrade(context, &item) {
                 return Ok(vec![id.into()]);
             }
-            download_patched_audiocpp(context, &item, cancel, progress, enable, false)
+            let result = download_patched_audiocpp(context, &item, cancel, progress, enable, false);
+            if result.is_ok() {
+                crate::workspace_cleanup::reclaim_cache(&context.install, "tmp/resource-downloads/tts-audiocpp-runtime");
+            }
+            result
         }
         _ => Err("不支持的离线组件迁移。".into()),
     }
@@ -4470,6 +4489,9 @@ mod download_tests {
         )
         .unwrap();
         fs::write(component.join(MODEL_RECEIPT), b"{broken receipt").unwrap();
+        let retry_cache = root.join("tmp/resource-downloads/test-model");
+        fs::create_dir_all(&retry_cache).unwrap();
+        fs::write(retry_cache.join("model.bin"), b"good").unwrap();
         let context = LaunchContext::portable(&root).unwrap();
         let _session = crate::verification::VerificationSession::begin();
         assert!(!current_for_upgrade(&context, &item));
@@ -4486,6 +4508,7 @@ mod download_tests {
         assert!(rebuilt);
         assert!(current_for_upgrade(&context, &item));
         assert_eq!(fs::read(component.join("model.bin")).unwrap(), b"good");
+        assert!(!retry_cache.exists());
         crate::verification::ensure_unchanged().unwrap();
         crate::workspace::remove_owned(&root, &owner).unwrap();
     }
