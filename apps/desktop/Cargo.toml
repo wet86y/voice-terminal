@@ -9,5 +9,5 @@ license = "Apache-2.0"
 
 [profile.release]
 strip = true
-lto = "thin"
-codegen-units = 1
+lto = "thin" # lto（薄链接时优化）；保留跨模块优化，控制对正式运行表现的影响。
+codegen-units = 8 # codegen-units（并行代码生成单元数）；按本机 14 个物理核心与约 16 GiB（二进制吉字节）内存取中等并行值。
