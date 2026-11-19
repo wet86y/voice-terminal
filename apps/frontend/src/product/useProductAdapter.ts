@@ -97,7 +97,8 @@ function messageFromError(error: unknown) {
 
 export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const application = useApplicationHost()
-  const voice = useVoiceTerminal(options)
+  // 远程模式的服务端事件带服务端墙钟；首音延迟只用本机单调时钟，避免跨机时钟差污染显示。
+  const voice = useVoiceTerminal({ ...options, latencyTimestamps: () => application.snapshot.value?.remote_mode !== true })
   const page = ref<ProductPage>('home')
   const settingsTab = ref<ProductSettingsTab>('wake')
   const snapshot = ref<ProductSnapshot | null>(null)
@@ -1075,7 +1076,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const turnId = currentTurnId.value
     return Boolean(turnId) && pendingSpeechRows.value.some(row => row.turnId === turnId)
   })
-  const shadow = computed<ShadowProductSnapshot>(() => connected.value && !remoteMode.value ? voice.shadowProduct.value : snapshot.value?.shadow || defaultShadow())
+  // 远程模式的语音连接同时接收服务端产品事件（runtime.snapshot、shadow.product），
+  // 后台轨迹与待决审批必须跟该实时流走；只有实时通道未连接或尚未收到权威投影时，
+  // 才回退到打开页面时读取的产品快照，避免把一次性快照当成持续更新的状态。
+  const shadow = computed<ShadowProductSnapshot>(() => {
+    if (remoteMode.value) {
+      const live = voice.shadowProduct.value
+      const liveReady = live.backend !== undefined || live.available
+        || (live.activities?.length ?? 0) > 0 || (live.timeline?.length ?? 0) > 0
+      if (voiceConnected.value && liveReady) return live
+      return snapshot.value?.shadow || defaultShadow()
+    }
+    return connected.value ? voice.shadowProduct.value : snapshot.value?.shadow || defaultShadow()
+  })
   const uiModels = computed<ProductUiModel[]>(() => {
     const providers = new Map(registry.value.providers.map(provider => [provider.id, provider]))
     return registry.value.models.map(item => {
@@ -1124,7 +1137,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   const latencyMs = computed(() => {
-    if (connected.value && !remoteMode.value) {
+    if (remoteMode.value) {
+      // 远程模式沿用同一套浏览器首音计时：不从服务端 latency 快照映射，也不与服务端同步时钟。
+      return voiceConnected.value ? voice.perceptualLatencyMs.value : null
+    }
+    if (connected.value) {
       // 首音延迟由浏览器本地计时；收到首个真实播放事件后停止计时。
       return voice.perceptualLatencyMs.value
     }
@@ -1133,7 +1150,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const candidates = [values.speech_end_to_playback_ms, values.agent_request_to_speak_ms, values.turn_total_ms]
     return candidates.find(value => typeof value === 'number' && Number.isFinite(value)) ?? null
   })
-  const latencyRunning = computed(() => connected.value && !remoteMode.value && voice.perceptualLatencyRunning.value)
+  const latencyRunning = computed(() => remoteMode.value
+    ? voiceConnected.value && voice.perceptualLatencyRunning.value
+    : connected.value && voice.perceptualLatencyRunning.value)
 
   function setListening(enabled: boolean) {
     return remoteMode.value ? voice.setDeviceListening(enabled)

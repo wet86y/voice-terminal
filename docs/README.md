@@ -13,6 +13,7 @@
 
 - [系统架构与生命周期](architecture/architecture.md)
 - [分布式设备运行架构与开发进度](architecture/distributed-device-runtime.md)
+- [远程 DSH 控制台中继（可行性调研与设计）](architecture/remote-dsh-console.md)
 - [分布式运行实施跟踪](development/distributed-device-implementation-plan.md)
 - [项目进程管理与系统显示身份](architecture/process-management.md)
 - [兼容性组件与更新交接](architecture/compatibility-component.md)
@@ -61,6 +62,8 @@
 ## 测试
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [远程模式首音延迟本地计算（2026-11-19）](testing/remote-latency-local-20261119.md)
+- [远程后台轨迹与授权按钮映射（2026-11-19）](testing/remote-shadow-approval-20261119.md)
 - [远程媒体恢复与日志修订验证（2026-11-19）](testing/remote-device-recovery-20261119.md)
 - [SSH（安全远程连接）桥接收尾与重复检查修订（2026-11-18）](testing/ssh-bridge-lifecycle-20261118.md)
 - [管理与文件通道就绪等待修订（2026-11-18）](testing/device-channel-wait-20261118.md)

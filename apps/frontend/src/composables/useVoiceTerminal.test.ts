@@ -14,15 +14,17 @@ class FakeSocket implements VoiceSocket {
   send(data: string) { this.sent.push(data) }
   close() { this.readyState = 3; this.onclose?.() }
   open() { this.readyState = 1; this.onopen?.() }
-  push(type: string, seq: number, payload: Record<string, unknown> = {}, ids: Record<string, string> = {}) {
-    this.onmessage?.({ data: JSON.stringify({ type, seq, timestamp: '2026-09-07T10:00:00.000Z',
+  push(type: string, seq: number, payload: Record<string, unknown> = {}, ids: Record<string, string> = {},
+    timestamp = '2026-09-07T10:00:00.000Z') {
+    this.onmessage?.({ data: JSON.stringify({ type, seq, timestamp,
       conversation_id: 'conversation_a', ...ids, payload }) })
   }
 }
 
-function openTerminal(now?: () => number) {
+function openTerminal(now?: () => number, latencyTimestamps?: () => boolean) {
   const socket = new FakeSocket()
-  const terminal = useVoiceTerminal({ webSocketUrl: 'ws://test.invalid/ws', webSocketFactory: () => socket, now })
+  const terminal = useVoiceTerminal({ webSocketUrl: 'ws://test.invalid/ws', webSocketFactory: () => socket, now,
+    latencyTimestamps })
   terminal.connect(); socket.open()
   return { socket, terminal }
 }
@@ -409,6 +411,65 @@ describe('V0.6 session protocol', () => {
       socket.push('agent.trace', 7, {
         trace_seq: 3, kind: 'SPEAK_STATE_CHANGED', conversation_id: 'episode_a', turn_id: 'input_current', state: 'wait',
       }, { turn_id: 'input_current' })
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(700)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('远程/跨机时钟域只使用本机单调时钟，服务端时间戳不参与首音延迟', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 1000
+      const { socket, terminal } = openTerminal(() => clock, () => false)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      // 服务端墙钟比本机快 8 秒；本地计时应从收到结束事件时开始，而不是服务端起点。
+      const skewedStart = new Date(Date.now() + 8000).toISOString()
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false },
+        { turn_id: 'input_a' }, skewedStart)
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(true)
+      expect(terminal.perceptualLatencyMs.value).toBe(0)
+
+      clock = 1320
+      vi.advanceTimersByTime(50)
+      expect(terminal.perceptualLatencyMs.value).toBe(320)
+
+      // 停止事件的服务端时间戳偏差更大；本地计时应只反映真实等待的 813 毫秒。
+      clock = 1813
+      socket.push('speech.started', 3, {
+        speech_id: 'speech_a', conversation_id: 'conversation_a', turn_id: 'input_a',
+        text: '开始播放', status: 'playing',
+      }, { turn_id: 'input_a', speech_id: 'speech_a' }, new Date(Date.now() + 12000).toISOString())
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(813)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('同机时钟域仍按服务端事件时间戳结算首音延迟', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 5000
+      const { socket, terminal } = openTerminal(() => clock, () => true)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      const startedAt = Date.parse(new Date(Date.now() - 200).toISOString())
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false },
+        { turn_id: 'input_a' }, new Date(startedAt).toISOString())
+
+      clock = 6000
+      vi.advanceTimersByTime(1000)
+      // 服务端事件间隔 700 毫秒；本机计时器已经走了 1000 毫秒，仍应以同域时间戳为准。
+      socket.push('speech.started', 3, {
+        speech_id: 'speech_a', conversation_id: 'conversation_a', turn_id: 'input_a',
+        text: '开始播放', status: 'playing',
+      }, { turn_id: 'input_a', speech_id: 'speech_a' }, new Date(startedAt + 700).toISOString())
+
       expect(terminal.perceptualLatencyRunning.value).toBe(false)
       expect(terminal.perceptualLatencyMs.value).toBe(700)
       terminal.dispose()

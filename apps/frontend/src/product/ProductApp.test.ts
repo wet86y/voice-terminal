@@ -654,6 +654,105 @@ describe('正式界面的真实控件交互', () => {
     compute.resolve({} as never)
   })
 
+  it('远程模式首音延迟只用本机计时，不映射服务端延迟快照', async () => {
+    const sent = vi.fn()
+    let socket!: { onopen: () => void; onmessage: (value: { data: string }) => void }
+    vi.stubGlobal('WebSocket', class {
+      readyState = 1
+      send = sent
+      close() {}
+      constructor() { socket = this as unknown as typeof socket }
+    })
+    vi.spyOn(productApi, 'snapshot').mockResolvedValue({
+      settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
+      runtime: { state: 'IDLE', listening: false },
+    } as never)
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+    vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+    const { value } = liveAdapter()
+    application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true,
+      remote_business_ready: true, voice_ws_url: 'ws://127.0.0.1:43876/token/ws', core_phase: 'ready',
+      startup_complete: true, state: 'running', components: [] } as unknown as ApplicationSnapshot
+    application.businessReady.value = true
+    await flushPromises()
+    socket.onopen()
+    let sequence = 0
+    const receive = (type: string, payload: Record<string, unknown>, ids: Record<string, string> = {}) =>
+      socket.onmessage({ data: JSON.stringify({ type, seq: ++sequence, timestamp: new Date().toISOString(),
+        conversation_id: 'voice-test', ...ids, payload }) })
+
+    receive('session.state', { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_a' })
+    expect(value.latencyRunning.value).toBe(true)
+    expect(typeof value.latencyMs.value).toBe('number')
+
+    // 服务端诊断快照里的 9999 毫秒不能覆盖本机计时；远程模式完全不读取该值。
+    value.snapshot.value = { runtime: { latency: { values: { speech_end_to_playback_ms: 9999 } } } } as never
+    receive('speech.started', {
+      speech_id: 'speech_a', conversation_id: 'voice-test', turn_id: 'input_a', text: '开始播放', status: 'playing',
+    }, { turn_id: 'input_a', speech_id: 'speech_a' })
+    expect(value.latencyRunning.value).toBe(false)
+    expect(value.latencyMs.value).not.toBe(9999)
+    expect(value.latencyMs.value).toBeGreaterThanOrEqual(0)
+    expect(value.latencyMs.value).toBeLessThan(5000)
+    vi.unstubAllGlobals()
+  })
+
+  it('远程模式后台轨迹与授权按钮跟随服务端语音实时快照', async () => {
+    const sent = vi.fn()
+    let socket!: { onopen: () => void; onmessage: (value: { data: string }) => void }
+    vi.stubGlobal('WebSocket', class {
+      readyState = 1
+      send = sent
+      close() {}
+      constructor() { socket = this as unknown as typeof socket }
+    })
+    vi.spyOn(productApi, 'snapshot').mockResolvedValue({
+      settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
+      shadow: {
+        available: true, backend: 'dsh', activities: [
+          { run_seq: 1, item_id: 'stale-tool', stream: 'tool', phase: 'completed', timestamp: '', tool_name: '旧工具' },
+        ],
+      },
+    } as never)
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+    vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+    const { value } = liveControls()
+    application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true,
+      remote_business_ready: true, voice_ws_url: 'ws://127.0.0.1:43876/token/ws', core_phase: 'ready',
+      startup_complete: true, state: 'running', components: [] } as unknown as ApplicationSnapshot
+    application.businessReady.value = true
+    await flushPromises()
+    socket.onopen()
+    let sequence = 0
+    socket.onmessage({ data: JSON.stringify({
+      type: 'runtime.snapshot', seq: ++sequence, timestamp: new Date().toISOString(),
+      conversation_id: 'voice-test',
+      payload: {
+        shadow: {
+          available: true, active: true, phase: 'working', user_input_required: false,
+          focus: '', summary: '', timeline: [], backend: 'dsh', activities: [
+            { run_seq: 4, item_id: 'live-approval', stream: 'approval', phase: 'started',
+              timestamp: '', approval_id: 'request-live', text: '需要执行目录写入', tool_name: 'bash' },
+          ],
+        },
+      },
+    }) })
+    await flushPromises()
+    expect(value.shadow.value.activities?.map(item => item.item_id)).toEqual(['live-approval'])
+    const trace = value.workbenchModel.value.shadow.trace
+    expect(trace).toHaveLength(1)
+    expect(trace[0]).toMatchObject({ approvalId: 'request-live', runSeq: 4, approvalPending: true })
+    expect(trace[0].text).toContain('需要执行目录写入')
+    const decide = vi.spyOn(productApi, 'decideDshApproval').mockResolvedValue({ result: 'accepted' })
+    await value.decideDshApproval('request-live', 4, 'allowed-once')
+    expect(decide).toHaveBeenCalledWith({ approval_id: 'request-live', run_seq: 4, decision: 'allowed-once' })
+    vi.unstubAllGlobals()
+  })
+
   it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {
     const { value } = liveControls()
     allowBusinessReady(value)

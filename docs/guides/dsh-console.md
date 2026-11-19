@@ -41,7 +41,10 @@ profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 
 
 先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用工作台“后台协作”面板底部的“代理控制台”入口。主界面网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
 该入口会向 Voice Server（语音服务）请求带访问令牌的 launch URL（启动地址），并在 DSH（代理执行宿主）界面就绪后打开控制台。主产品只支持桌面窗口，控制台统一交给系统默认浏览器打开。DSH（代理执行宿主）仍由应用管理生命周期，关闭控制台网页不会结束后台代理服务。
-DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端口时，必须使用受管入口生成的临时访问令牌。
+DSH Web Host（网页服务）默认只监听回环地址，端口由系统分配（`config/default.yaml` 的 `dsh.port: 0`）；DSH 把实际端口报告给统一宿主，受管入口返回带临时令牌的实际地址。直接访问实际端口时，必须使用受管入口生成的临时访问令牌。
+
+远程客户端（局域网配对）目前没有控制台入口：页面会显示“仅服务端本机可打开”。原因是服务端回环地址与启动令牌不能直接交给客户端。可行的中继方案、安全边界和未实现原因见[远程 DSH 控制台中继](../architecture/remote-dsh-console.md)；不要在远程客户端手工访问服务端回环地址或复制令牌。
+
 不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
 
 若界面显示 `Failed to load plugins`（插件加载失败），并提示
@@ -132,7 +135,7 @@ Voice 停止监听时，事件保留到下次手动启动处理，不会自动�
 
 ## 通信与安全边界
 
-DSH 固定监听 `127.0.0.1:3081`。Voice Server 每次启动生成独立 Bridge Bearer token，仅通过受管
+DSH 固定只听回环地址（默认 `127.0.0.1`，端口由系统分配，实际地址以宿主登记为准）。Voice Server 每次启动生成独立 Bridge Bearer token，仅通过受管
 子进程环境交给 Bundle；它与浏览器 launch token、DSH Cookie 和模型 API key完全分离。Bridge
 路由和 Voice 内部回调都拒绝非 loopback（本机回环地址）和错误 token（访问令牌）。有会话边界的
 上下文与生命周期操作继续校验 Session（会话）、epoch（会话代次）及 revision（上下文版本）；定时任务
@@ -183,7 +186,7 @@ revision 和 snapshot/delta。reset 会取消旧 Turn、把旧 Session 标记 re
 
 “系统运行”页可手动恢复失败的 DSH；恢复会重置自动重启计数，并验证桥接与关联会话。恢复后的语音服务保持待机，不自动重播语音或重新执行旧模型动作。独立后端调试继续沿用语音服务原来的启动与关闭链路。
 
-3081 被现有进程占用时 Runtime Manager拒绝附着。DSH 异常退出只做有限自动重启，达到上限后标记
+配置了固定端口且被现有进程占用，或 DSH 报告启动地址后端口未开始监听时，Runtime Manager 拒绝附着或按启动失败处理。DSH 异常退出只做有限自动重启，达到上限后标记
 unavailable；Voice 主链继续运行，并且不会为同一 Voice Session自动切到 native。首次 activation 无法
 建立、显式协议拒绝，或状态核对与一次幂等重试仍无法确认且 Bridge 确实不可用时，系统才产生一次真实
 `failed`。活跃 activation 的单次引导传输超时会保留当前 activation 并后台重同步；只要随后收到有效

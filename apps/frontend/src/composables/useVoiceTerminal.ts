@@ -57,6 +57,11 @@ export interface UseVoiceTerminalOptions {
   webSocketUrl?: string
   /** Injectable only for deterministic tests; production uses a monotonic clock. */
   now?: () => number
+  /**
+   * latencyTimestamps（是否使用服务端事件时间戳）：只在事件与本机处于同一时钟域时启用。
+   * 远程模式必须返回 false，只用本机单调时钟计时，避免混用两台机器的墙钟。
+   */
+  latencyTimestamps?: () => boolean
   connectTimeoutMs?: number // connectTimeoutMs（连接握手等待上限，毫秒）。
 }
 
@@ -161,6 +166,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const perceptualLatencyRunning = ref(false)
   const now = options.now ?? (() => typeof performance !== 'undefined' ? performance.now() : Date.now())
   const hasInjectedClock = options.now !== undefined // hasInjectedClock（是否使用外部注入时钟）：测试时不混用服务端墙钟与单调时钟。
+  // useLatencyTimestamps（是否采用服务端事件时间戳）：注入时钟的测试默认只走本机时钟；
+  // 产品可显式覆盖，远程模式据此关闭服务端时间戳。
+  const useLatencyTimestamps = options.latencyTimestamps ?? (() => !hasInjectedClock)
   const pendingShadowActivities: unknown[] = []
   let shadowActivityFrame: number | undefined
   let perceptualLatencyTimer: ReturnType<typeof setInterval> | undefined
@@ -172,7 +180,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   let perceptualLatencySettled = false
 
   function parsePerceptualLatencyTimestamp(value: string | null | undefined) {
-    if (hasInjectedClock || !value) return null
+    if (!value || !useLatencyTimestamps()) return null
     const timestamp = Date.parse(value)
     return Number.isFinite(timestamp) ? timestamp : null
   }
