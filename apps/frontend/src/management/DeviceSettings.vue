@@ -19,6 +19,7 @@ const searchingDevices = ref(false)
 const connection = ref<'connected' | 'disconnected' | 'unavailable'>('disconnected')
 const taskChannel = ref<'running' | 'stopped' | 'error'>('stopped')
 const taskChannelError = ref('')
+const taskDesktopControl = ref<{ available: boolean; error: string } | null>(null)
 const mediaChannel = ref<'running' | 'stopped' | 'error'>('stopped')
 const mediaChannelError = ref('')
 const mediaCaptureActive = ref<boolean | null>(null)
@@ -109,6 +110,14 @@ function newDeviceId() {
   return `device-${crypto.randomUUID()}`
 }
 
+function applyTaskChannel(result: Awaited<ReturnType<typeof nativeDeviceApi.remoteTaskChannel>>) {
+  taskChannel.value = result.state
+  taskChannelError.value = result.error || ''
+  taskDesktopControl.value = typeof result.desktop_control === 'boolean'
+    ? { available: result.desktop_control, error: result.desktop_control_error || '' }
+    : null
+}
+
 async function refresh() {
   loading.value = true
   error.value = ''
@@ -174,8 +183,7 @@ async function refresh() {
             nativeDeviceApi.remoteTaskChannel('status'),
             nativeDeviceApi.remoteMediaChannel('status'),
           ])
-          taskChannel.value = tasks.state
-          taskChannelError.value = tasks.error || ''
+          applyTaskChannel(tasks)
           mediaChannel.value = media.state
           mediaChannelError.value = media.error || ''
           mediaCaptureActive.value = media.capture_active ?? null
@@ -637,8 +645,7 @@ async function onRemotePreferenceChanged() {
 
     if (connection.value === 'connected' && wasTaskRunning && ttsChanged) {
       const tasks = await nativeDeviceApi.remoteTaskChannel('start')
-      taskChannel.value = tasks.state
-      taskChannelError.value = tasks.error || ''
+      applyTaskChannel(tasks)
       if (tasks.state !== 'running') throw new Error(tasks.error || '设置已保存，但远程任务通道重建失败。')
       if (wasMediaRunning) {
         const media = await nativeDeviceApi.remoteMediaChannel('start')
@@ -664,8 +671,7 @@ async function onRemotePreferenceChanged() {
       if (wasTaskRunning && ttsChanged && connection.value === 'connected') {
         try {
           const tasks = await nativeDeviceApi.remoteTaskChannel('start')
-          taskChannel.value = tasks.state
-          taskChannelError.value = tasks.error || ''
+          applyTaskChannel(tasks)
           if (tasks.state === 'running' && wasMediaRunning) {
             const media = await nativeDeviceApi.remoteMediaChannel('start')
             mediaChannel.value = media.state
@@ -765,8 +771,7 @@ async function activateRemoteChannels() {
       : '服务端管理已连接，语音核心暂不可用；组件管理仍可使用。'
     return
   }
-  taskChannel.value = state.task.state
-  taskChannelError.value = state.task.error || ''
+  applyTaskChannel(state.task)
   mediaChannel.value = state.media.state
   mediaChannelError.value = state.media.error || ''
   mediaCaptureActive.value = state.media.capture_active ?? null
@@ -812,8 +817,7 @@ async function connectHost(automatic = false) {
     if (runtime.state === 'waiting') throw new Error('当前设备尚未完成远程配对，不能连接服务端。')
     connection.value = 'connected'
     if (runtime.state === 'ready') {
-      taskChannel.value = runtime.task.state
-      taskChannelError.value = runtime.task.error || ''
+      applyTaskChannel(runtime.task)
       mediaChannel.value = runtime.media.state
       mediaChannelError.value = runtime.media.error || ''
       mediaCaptureActive.value = runtime.media.capture_active ?? null
@@ -1022,10 +1026,14 @@ onUnmounted(() => {
         <span class="connection-state" :data-state="connection">管理连接：{{ connection === 'connected' ? '已连接' : connection === 'unavailable' ? '当前构建不支持' : '已断开' }}</span>
         <span class="connection-state" :data-state="remoteCoreState">语音核心：{{ remoteCoreState === 'ready' ? '就绪' : remoteCoreState === 'starting' ? '准备中' : remoteCoreState === 'unavailable' ? '暂不可用' : '状态未知' }}</span>
         <span class="connection-state" :data-state="taskChannel">服务端任务：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : taskChannel === 'running' ? '已就绪' : taskChannel === 'error' ? '错误' : '准备中' }}</span>
+        <span v-if="connection === 'connected' && taskChannel === 'running' && taskDesktopControl"
+          class="connection-state" :data-state="taskDesktopControl.available ? 'ready' : 'unavailable'">桌面控制：{{ taskDesktopControl.available ? '已登记' : '暂不可用' }}</span>
         <span class="connection-state" :data-state="mediaChannel">服务端语音：{{ connection !== 'connected' ? status?.device_config?.paired_host ? '等待连接' : '等待配对' : mediaChannel === 'running' ? '已就绪' : mediaChannel === 'error' ? '错误' : '准备中' }}</span>
         <span v-if="mediaChannel === 'running'" class="interaction-state">{{ mediaCaptureActive ? '服务端已请求麦克风采集' : '当前未采集麦克风' }}</span>
       </div>
       <p v-if="taskChannelError || mediaChannelError" class="device-message warning">{{ taskChannelError || mediaChannelError }}</p>
+      <p v-if="connection === 'connected' && taskChannel === 'running' && taskDesktopControl?.error"
+        class="device-message warning">{{ taskDesktopControl.error }}</p>
     </section>
 
     <footer class="device-footer">

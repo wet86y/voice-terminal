@@ -20,7 +20,7 @@ from ..devices.capture_router import SelectableCapturePort
 from ..devices.local import LocalAudioDevice
 from ..devices.desktop_transport import LocalDesktopHelperTransport
 from ..devices.router import DeviceOutcomeUnknown, DeviceRouter, DeviceUnavailable
-from ..devices.registry import DeviceRegistry, InteractionLease
+from ..devices.registry import DeviceConnection, DeviceRegistry, InteractionLease
 from ..devices.remote_capture import RemoteAudioCapture
 from ..devices.diagnostics import device_event, lease_context
 from ..devices.remote_playback import RemotePlaybackOutbox
@@ -438,7 +438,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
 
     async def execute_device_task(
         self, *, request_id: str, device_id: str, operation: str, arguments: dict[str, Any],
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 30.0, expected_connection: DeviceConnection | None = None,
     ):
         """execute_device_task（固定目标执行设备任务）：远端未连接时失败关闭，不回退本机。"""
         if not isinstance(device_id, str) or not device_id or device_id != device_id.strip():
@@ -452,7 +452,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         try:
             return await router.execute(
                 request_id=request_id, device_id=device_id, operation=operation,
-                arguments=arguments, timeout_seconds=timeout_seconds,
+                arguments=arguments, timeout_seconds=timeout_seconds, expected_connection=expected_connection,
             )
         except DeviceOutcomeUnknown:
             connection = self.device_registry.connection(device_id)

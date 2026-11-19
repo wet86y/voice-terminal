@@ -919,9 +919,6 @@ function Invoke-OpTree($opArgs) {
   $includePixels = if ($null -ne $opArgs.includePixels) { [bool]$opArgs.includePixels } else { $true }
   $hwnd = Resolve-Window $target
   $snapshot = Get-SnapshotRecord $hwnd $maxElements $maxDepth
-  $script:TreeNodes = @()
-  $element = Get-UiaElement $hwnd
-  Walk-UiaTree $element 0 $maxDepth $maxElements
   $pixels = @()
   if ($includePixels) {
     $bitmap = Get-WindowBitmap $hwnd

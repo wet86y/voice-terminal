@@ -30,6 +30,8 @@ from ..devices.media_protocol import (
 from ..devices.pcm_stream import PcmInputStream
 from ..devices.remote_capture import RemoteAudioCapture
 from ..devices.remote_playback import RemotePlaybackOutbox, encode_playback_frame
+from ..devices.router import DeviceOutcomeUnknown, DeviceTargetChanged, DeviceUnavailable
+from ..devices.task_journal import TaskConflict
 from ..devices.client_tts import RemoteClientTtsOutbox
 from ..speaker.enrollment import EnrollmentRejectedError
 from ..speaker.enrollment_capture import EnrollmentCaptureError
@@ -2238,7 +2240,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     "connected": item.connected, "connection_generation": item.connection_generation,
                     "executor_generation": item.executor_generation,
                     "capabilities": sorted(set(item.capabilities)
-                                     | ({"desktop_control"} if item.device_id == "local"
+                                     | ({"desktop_control", "terminal_control", "file_transfer"} if item.device_id == "local"
                                         and getattr(runtime, "_local_desktop_transport", None) is not None else set())
                                      | ({"screen_capture"} if item.device_id == "local"
                                         and runtime.history.screen_capture.available_for("local") else set())),
@@ -2250,6 +2252,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "capability_labels": {
                     "audio_stream": "语音音频流", "client_tts": "客户端在线语音合成",
                     "desktop_control": "桌面观察与控制",
+                    "terminal_control": "受限终端",
+                    "file_transfer": "设备文件读写",
                     "screen_capture": "屏幕捕获"},
                 "fields": {"active_device_id": "当前获主机授予语音交互租约的设备；空值表示未授予",
                            "interaction_generation": "当前语音占用代次；切换时递增",
@@ -2398,8 +2402,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", **device_snapshot()},
                             headers={"Cache-Control": "no-store"})
 
-    async def dsh_device_target(payload: dict[str, Any], session: DshShadowAgentSession, *,
-                               allow_omitted: bool = False, required_capability: str = "desktop_control"):
+    def dsh_device_id(payload: dict[str, Any], session: DshShadowAgentSession, *, allow_omitted: bool = False) -> str:
+        """dsh_device_id（验证设备编号）：校验回调所属激活和明确的设备目标。"""
         activation_id = payload.get("activation_id")
         if not isinstance(activation_id, str) or not activation_id or session.activation_id != activation_id:
             raise HTTPException(status_code=409, detail="设备请求所属 DSH 激活已失效。")
@@ -2408,6 +2412,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             device_id = "local"
         if not isinstance(device_id, str) or not device_id or len(device_id) > 128 or device_id != device_id.strip():
             raise HTTPException(status_code=422, detail="设备编号无效。")
+        return device_id
+
+    async def dsh_device_target(payload: dict[str, Any], session: DshShadowAgentSession, *,
+                               allow_omitted: bool = False, required_capability: str = "desktop_control"):
+        device_id = dsh_device_id(payload, session, allow_omitted=allow_omitted)
         connection = runtime.device_registry.connection(device_id)
         if connection is None or not connection.connected:
             raise HTTPException(status_code=503, detail="固定目标设备未连接；不会改投本机。")
@@ -2436,7 +2445,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             record = await runtime.execute_device_task(request_id=payload["request_id"],
                 device_id=connection.device_id, operation="windows", arguments={}, timeout_seconds=15.0)
         except Exception as exc:
-            from ..devices.router import DeviceOutcomeUnknown
             status = 504 if isinstance(exc, DeviceOutcomeUnknown) else 503
             raise HTTPException(status_code=status, detail="固定目标设备窗口清单未取得可靠回执。") from exc
         if record.status == "unknown":
@@ -2485,7 +2493,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             record = await runtime.execute_device_task(request_id=payload["request_id"],
                 device_id=connection.device_id, operation="tree", arguments=arguments, timeout_seconds=20.0)
         except Exception as exc:
-            from ..devices.router import DeviceOutcomeUnknown
             status = 504 if isinstance(exc, DeviceOutcomeUnknown) else 503
             raise HTTPException(status_code=status, detail="固定目标设备窗口观察未取得可靠回执。") from exc
         if record.status == "unknown":
@@ -2541,20 +2548,21 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             record = await runtime.execute_device_task(request_id=payload["request_id"],
                 device_id=connection.device_id, operation=operation, arguments=arguments,
-                timeout_seconds=min(600.0, timeout_ms / 1000 + 8))
-        except Exception as exc:
-            from ..devices.task_journal import TaskConflict
-            from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
-            if isinstance(exc, TaskConflict):
-                raise HTTPException(status_code=409, detail="设备动作任务编号已用于其他内容。") from exc
-            if isinstance(exc, DeviceOutcomeUnknown):
+                timeout_seconds=min(600.0, timeout_ms / 1000 + 8), expected_connection=connection)
+        except TaskConflict as exc:
+            raise HTTPException(status_code=409, detail="设备动作任务编号已用于其他内容。") from exc
+        except DeviceTargetChanged as exc:
+            raise HTTPException(status_code=409, detail="设备动作观察所属代次已失效，动作未派发。") from exc
+        except DeviceOutcomeUnknown as exc:
+            try:
                 record = await runtime.query_device_task(payload["request_id"], connection.device_id)
-                if record is None:
-                    raise HTTPException(status_code=504, detail="设备动作结果未知；请查询原任务。") from exc
-            elif isinstance(exc, (DeviceUnavailable, RuntimeError)):
-                raise HTTPException(status_code=503, detail="设备动作尚未取得可靠回执。") from exc
-            else:
-                raise
+            except Exception:
+                record = None
+            if record is None:
+                raise HTTPException(status_code=504,
+                    detail=f"设备动作结果未知，请查询原任务 {payload['request_id']}。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="设备动作尚未取得可靠回执。") from exc
         if session.activation_id != payload["activation_id"]:
             raise HTTPException(status_code=409, detail="动作返回期间 DSH 激活已结束；任务仍固定在原设备。")
         return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted","task":{
@@ -2570,12 +2578,15 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if set(payload) != {"protocol_version","request_id","voice_session_id","dsh_session_id","epoch",
                             "context_revision","activation_id","device_id","task_id"}:
             raise HTTPException(status_code=422, detail="设备任务查询字段无效。")
-        await dsh_device_target(payload, session)
+        device_id = dsh_device_id(payload, session)
         task_id = payload.get("task_id")
         if not valid_device_request_id(task_id):
             raise HTTPException(status_code=422, detail="设备任务编号无效。")
         try:
-            record = await runtime.query_device_task(task_id, payload["device_id"])
+            record = await runtime.query_device_task(task_id, device_id)
+        except TaskConflict:
+            # 原记录归属其他设备时，与该设备下没有记录使用同一回执。
+            record = None
         except Exception as exc:
             raise HTTPException(status_code=503, detail="设备任务台账不可用。") from exc
         if session.activation_id != payload["activation_id"]:
@@ -2615,19 +2626,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             record = await runtime.execute_device_task(request_id=request_id,
                 device_id=connection.device_id, operation=f"terminal.{action}", arguments=arguments,
                 timeout_seconds=45.0 if action == "input" else 15.0)
-        except Exception as exc:
-            from ..devices.task_journal import TaskConflict
-            from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
-            if isinstance(exc, TaskConflict):
-                raise HTTPException(status_code=409, detail="设备终端任务编号已用于其他内容。") from exc
-            if isinstance(exc, DeviceOutcomeUnknown):
+        except TaskConflict as exc:
+            raise HTTPException(status_code=409, detail="设备终端任务编号已用于其他内容。") from exc
+        except DeviceOutcomeUnknown as exc:
+            try:
                 record = await runtime.query_device_task(request_id, connection.device_id)
-                if record is None or record.status == "unknown":
-                    raise HTTPException(status_code=504, detail="设备终端任务结果未知；请查询原任务，不要重放。") from exc
-            elif isinstance(exc, (DeviceUnavailable, RuntimeError)):
-                raise HTTPException(status_code=503, detail="固定目标设备终端通道不可用；不会改投本机。") from exc
-            else:
-                raise
+            except Exception:
+                record = None
+            if record is None or record.status == "unknown":
+                raise HTTPException(status_code=504,
+                    detail=f"设备终端任务结果未知，请查询原任务 {request_id}，不要重放。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail="固定目标设备终端通道不可用；不会改投本机。") from exc
         if session.activation_id != payload["activation_id"]:
             raise HTTPException(status_code=409, detail="终端任务返回期间 DSH 激活已结束；任务仍固定在原设备。")
         return JSONResponse({"protocol_version":BRIDGE_PROTOCOL_VERSION,"result":"accepted",
@@ -2707,8 +2717,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     timeout_seconds=timeout_seconds)
                 return record
             except Exception as exc:
-                from ..devices.task_journal import TaskConflict
-                from ..devices.router import DeviceOutcomeUnknown, DeviceUnavailable
                 if isinstance(exc, TaskConflict):
                     raise HTTPException(status_code=409, detail="设备文件任务编号已用于其他内容。") from exc
                 if isinstance(exc, DeviceOutcomeUnknown):

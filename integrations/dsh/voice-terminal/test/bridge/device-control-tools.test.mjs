@@ -7,21 +7,23 @@ const snapshot = { windowId: 10, processId: 20, executablePath: 'C:\\app.exe', t
   className: 'Window', rect: { x: 0, y: 0, width: 800, height: 600 }, foreground: true,
   treeHash: 'tree-1', shotHash: 'pixels-1', elementCount: 0 }
 
-function fixture(approvalResult = 'allowed-once') {
+function fixture(approvalResult = 'allowed-once', loseReceiptFor = '', refreshedSnapshot = snapshot) {
   const tools = new Map(), calls = [], approvals = []
   const remoteBytes = Buffer.alloc(128 * 1024 + 7, 0x5a)
   const sourceFiles = new Map()
   let uploadedBytes = Buffer.alloc(0)
   let streamedSaves = 0
+  let observations = 0
   const agent = { id: 'root' }
   const binding = { handle: { agent }, state: 'active', activationId: 'activation-1', dshSessionId: 'dsh-1',
     voiceSessionId: 'voice-1', epoch: 3, revision: 4, activationReady: Promise.resolve() }
   const approval = { async request(value) { approvals.push(value); return approvalResult } }
   const callback = async (path, payload, signal) => {
     calls.push({ path, payload, signal })
+    if (loseReceiptFor && path.endsWith(loseReceiptFor)) throw new Error('隔离测试丢失设备回执')
     if (path.endsWith('/device.observe')) {
       return { result: 'accepted', device_id: payload.device_id, connection_generation: 2,
-        executor_generation: 5, snapshot, elements: [], pixels: [] }
+        executor_generation: 5, snapshot: observations++ === 0 ? snapshot : refreshedSnapshot, elements: [], pixels: [] }
     }
     if (path.endsWith('/device.action')) {
       return { result: 'accepted', task: { request_id: payload.request_id, device_id: payload.device_id,
@@ -104,7 +106,8 @@ function fixture(approvalResult = 'allowed-once') {
 
 test('设备动作在用户一次性审批后固定本机目标并复核窗口身份', async () => {
   const f = fixture()
-  const observed = await f.tools.get('device_observe').execute({ device_id: 'local', window_id: 10 }, f.exec)
+  const observed = await f.tools.get('device_observe').execute({ device_id: 'local', window_id: 10,
+    max_elements: 3, max_depth: 2 }, f.exec)
   const result = await f.tools.get('device_control').execute({ device_id: 'local', based_on: observed.observation_id,
     action: 'click', arguments: { x: 12, y: 15 } }, f.exec)
   assert.equal(result.result, 'accepted')
@@ -112,7 +115,10 @@ test('设备动作在用户一次性审批后固定本机目标并复核窗口�
   assert.equal(f.approvals[0].toolName, 'device_control')
   assert.equal(f.approvals[0].agent, f.exec.agent)
   assert.equal(f.approvals[0].callId, f.exec.callId)
-  assert.equal(f.calls.filter(item => item.path.endsWith('/device.observe')).length, 4)
+  const observations = f.calls.filter(item => item.path.endsWith('/device.observe'))
+  assert.equal(observations.length, 2)
+  assert.equal(observations[1].payload.max_elements, 3)
+  assert.equal(observations[1].payload.max_depth, 2)
   const action = f.calls.find(item => item.path.endsWith('/device.action'))
   assert.equal(action.payload.device_id, 'local')
   assert.equal(action.payload.operation, 'click')
@@ -129,7 +135,37 @@ test('未获一次性审批时不派发桌面动作', async () => {
   await assert.rejects(f.tools.get('device_control').execute({ device_id: 'local', based_on: observed.observation_id,
     action: 'click', arguments: { x: 12, y: 15 } }, f.exec), /未获授权/)
   assert.equal(f.calls.filter(item => item.path.endsWith('/device.action')).length, 0)
+  assert.equal(f.calls.filter(item => item.path.endsWith('/device.observe')).length, 1)
   assert.equal(f.approvals.length, 1)
+})
+
+test('窗口内容变化时元素动作仍派发，坐标动作需要重新观察', async () => {
+  const changed = { ...snapshot, treeHash: 'tree-2', shotHash: 'pixels-2' }
+  for (const [args, shouldDispatch] of [[{ elementId: 'element-1' }, true], [{ x: 12, y: 15 }, false]]) {
+    const f = fixture('allowed-once', '', changed)
+    const observed = await f.tools.get('device_observe').execute({ device_id: 'local', window_id: 10 }, f.exec)
+    const click = f.tools.get('device_control').execute({ device_id: 'local', based_on: observed.observation_id,
+      action: 'click', arguments: args }, f.exec)
+    if (shouldDispatch) assert.equal((await click).result, 'accepted')
+    else await assert.rejects(click, /tree of window/)
+    assert.equal(f.calls.filter(item => item.path.endsWith('/device.action')).length, shouldDispatch ? 1 : 0)
+  }
+})
+
+test('桌面动作和终端回执丢失时保留原任务编号，且各派发一次', async () => {
+  const desktop = fixture('allowed-once', '/device.action')
+  const observed = await desktop.tools.get('device_observe').execute({ device_id: 'local', window_id: 10 }, desktop.exec)
+  await assert.rejects(desktop.tools.get('device_control').execute({ device_id: 'local', based_on: observed.observation_id,
+    action: 'click', arguments: { x: 12, y: 15 } }, desktop.exec), error => {
+    const sent = desktop.calls.filter(item => item.path.endsWith('/device.action'))
+    return sent.length === 1 && error.message.includes(sent[0].payload.request_id)
+  })
+
+  const terminal = fixture('allowed-once', '/device.terminal')
+  await assert.rejects(terminal.tools.get('device_terminal').execute({ action: 'create', device_id: 'remote' }, terminal.exec), error => {
+    const sent = terminal.calls.filter(item => item.path.endsWith('/device.terminal'))
+    return sent.length === 1 && error.message.includes(sent[0].payload.request_id)
+  })
 })
 
 test('设备终端固定目标、会话编号和只读命令，并对每条命令请求一次性审批', async () => {

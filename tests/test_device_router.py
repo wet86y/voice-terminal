@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from voice_terminal.devices.registry import DeviceRegistry
-from voice_terminal.devices.router import DeviceOutcomeUnknown, DeviceResponse, DeviceRouter
+from voice_terminal.devices.router import DeviceOutcomeUnknown, DeviceResponse, DeviceRouter, DeviceTargetChanged
 from voice_terminal.devices.task_journal import DeviceTaskJournal, TaskConflict
 
 
@@ -64,6 +64,29 @@ def test_read_only_task_query_never_reissues_and_rejects_other_device(tmp_path):
         assert transport.calls == 1
         with pytest.raises(TaskConflict):
             await router.query(request_id="r", device_id="C")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("replace_connection", [True, False])
+def test_pinned_target_cannot_move_to_replacement_before_dispatch(tmp_path, replace_connection):
+    async def scenario():
+        router = DeviceRouter(DeviceRegistry(), DeviceTaskJournal(tmp_path / "tasks.sqlite"))
+
+        class Transport:
+            async def execute(self, request):
+                pytest.fail("旧代次请求不应派发到设备")
+
+        original = await router.connect("B", Transport())
+        if replace_connection:
+            await router.connect("B", Transport())
+        else:
+            await router.restart_executor("B", original.connection_generation, Transport())
+
+        with pytest.raises(DeviceTargetChanged):
+            await router.execute(request_id="old", device_id="B", operation="windows", arguments={},
+                                 expected_connection=original)
+        assert router.journal.get("old") is None
 
     asyncio.run(scenario())
 

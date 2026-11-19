@@ -317,7 +317,8 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
     async observe(record: ObservationRecord, signal: AbortSignal): Promise<WindowSnapshot> {
       if (signal.aborted) throw new DeviceActionError('CANCELLED', '设备操作已取消。')
       const result = await post('/api/internal/dsh-bridge/device.observe', exec, activationId, {
-        device_id: record.target.deviceId, window_id: record.windowId, max_elements: 100, max_depth: 16,
+        device_id: record.target.deviceId, window_id: record.windowId,
+        max_elements: record.limits.maxElements, max_depth: record.limits.maxDepth,
         include_pixels: false, connection_generation: record.target.connectionGeneration,
         executor_generation: record.target.executorGeneration,
       }, randomUUID(), signal)
@@ -332,14 +333,6 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
     },
     async execute(action: WindowAction, observation: ObservationRecord, target: DeviceTarget,
       signal: AbortSignal): Promise<unknown> {
-      if (observations.get(action.basedOn) !== observation) {
-        throw new DeviceActionError('UNKNOWN_OBSERVATION', '原设备观察已过期。')
-      }
-      const current = targets.get(target.deviceId)
-      if (!current || current.connectionGeneration !== target.connectionGeneration
-        || current.executorGeneration !== target.executorGeneration) {
-        throw new DeviceActionError('STALE_DEVICE', '设备连接或执行器代次已变化。')
-      }
       const helper = helperAction(action, observation.windowId)
       const result = await post('/api/internal/dsh-bridge/device.action', exec, activationId, {
         device_id: target.deviceId, connection_generation: target.connectionGeneration,
@@ -411,14 +404,15 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
       if (!row || Object.keys(row).some(key => !allowed.includes(key)) || typeof row.device_id !== 'string'
         || typeof row.window_id !== 'number' || !Number.isSafeInteger(row.window_id)) throw new Error('观察设备编号或窗口句柄无效。')
       const activationId = ensure(exec)
+      const limits = { maxElements: row.max_elements === undefined ? 100 : Number(row.max_elements),
+        maxDepth: row.max_depth === undefined ? 16 : Number(row.max_depth) }
       const result = await post('/api/internal/dsh-bridge/device.observe', exec, activationId, {
         device_id: row.device_id, window_id: Number(row.window_id),
-        max_elements: row.max_elements === undefined ? 100 : Number(row.max_elements),
-        max_depth: row.max_depth === undefined ? 16 : Number(row.max_depth), include_pixels: false,
+        max_elements: limits.maxElements, max_depth: limits.maxDepth, include_pixels: false,
       })
       const target = targetOf(result)
       const snapshot = snapshotOf(result.snapshot)
-      const record = observations.record(snapshot, target)
+      const record = observations.record(snapshot, target, limits)
       targets.set(target.deviceId, target)
       return { result: 'accepted', observation_id: record.id, device_id: target.deviceId,
         connection_generation: target.connectionGeneration, executor_generation: target.executorGeneration,
@@ -446,9 +440,14 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
         || typeof row.action !== 'string' || !ACTION_NAMES.has(row.action as WindowActionName)
         || !asObject(row.arguments)) throw new Error('设备动作参数无效。')
       const activationId = ensure(exec)
+      const name = row.action as WindowActionName
+      const argsForAction = normalizeActionArguments(name, row.arguments)
+      // 辅助进程按元素编号重新定位，纯窗口动作只依赖窗口身份。
+      const checkContent = name !== 'window_control' && (Array.isArray(argsForAction.steps)
+        ? argsForAction.steps.some(step => typeof asObject(step)?.elementId !== 'string')
+        : typeof argsForAction.elementId !== 'string' || asObject(argsForAction.drag)?.toX !== undefined)
       const action: WindowAction = { requestId: randomUUID(), basedOn: row.based_on, deviceId: row.device_id,
-        name: row.action as WindowActionName,
-        arguments: normalizeActionArguments(row.action as WindowActionName, row.arguments), checkTree: true }
+        name, arguments: argsForAction, checkContent }
       const approval = agentCtx.get('approval') as ApprovalService | undefined
       const executor = new DeviceActionExecutor(observations, actionBackend(exec, activationId), {
         async approve(candidate, observation, signal) {
@@ -462,7 +461,6 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
         },
       })
       const result = await executor.execute(action, exec.signal)
-      if (ensure(exec) !== activationId) throw new Error('设备动作返回时 DSH 激活已失效。')
       return { result: 'accepted', action: action.name, device_id: action.deviceId,
         request_id: action.requestId, outcome: result as Json,
         fields: { action: '设备动作名称', device_id: '固定执行设备编号', request_id: '持久原任务编号',
@@ -472,10 +470,10 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
 
   agentCtx.tools.register(defineTool({
     name: 'device_task_query',
-    description: '只读查询 device_control 的原任务状态；不会重新执行未知任务。',
+    description: '只读查询窗口动作、终端或文件的原任务台账，设备断线时也可查询；不会重新执行。',
     parameters: {
       device_id: { type: 'string', description: '原任务固定目标设备编号。', required: true },
-      task_id: { type: 'string', description: 'device_control 返回的 request_id（原任务编号）。', required: true },
+      task_id: { type: 'string', description: '工具回执或提示中的原任务编号。', required: true },
     },
     output: { schema: { type: 'object' as const, additionalProperties: true as const },
       render: (_args: unknown, value: Record<string, Json>) => [{ type: 'text' as const, text: JSON.stringify(value) }] },
@@ -538,10 +536,17 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
       const values: Record<string, Json> = { device_id: row.device_id, action, terminal_id: terminalId }
       if (action === 'input') values.command_id = row.command_id as string
       if (action === 'output') values.offset = row.offset as number
-      const result = await post('/api/internal/dsh-bridge/device.terminal', exec, activationId, values, requestId)
+      let result: Record<string, Json>
+      try {
+        result = await post('/api/internal/dsh-bridge/device.terminal', exec, activationId, values, requestId)
+      } catch (error) {
+        if (error instanceof Error && error.message.includes(requestId)) throw error
+        const detail = error instanceof Error ? error.message : '未取得设备终端回执。'
+        throw new Error(`${detail} 原任务编号 ${requestId}，请查询原任务确认状态。`, { cause: error })
+      }
       const task = asObject(result.task)
       if (!task || task.request_id !== requestId || task.device_id !== row.device_id || typeof task.status !== 'string') {
-        throw new Error('设备终端原任务回执无效；请查询原任务。')
+        throw new Error(`设备终端原任务回执无效，请查询原任务 ${requestId}，不要重放。`)
       }
       if (task.status === 'unknown') throw new Error(`设备终端结果未知；请用 device_task_query 查询原任务 ${requestId}，不要重放。`)
       return { result: 'accepted', action, device_id: row.device_id, terminal_id: terminalId,

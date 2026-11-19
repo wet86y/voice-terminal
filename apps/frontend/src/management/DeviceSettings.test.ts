@@ -234,6 +234,20 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.findAll('button').find(button => button.text().trim() === '断开')).toBeUndefined()
   })
 
+  it('任务通道已就绪时仍单独显示桌面能力不可用及原因', async () => {
+    prepareRemoteHost()
+    vi.mocked(nativeDeviceApi.remoteTaskChannel).mockResolvedValue({
+      state: 'running', device_id: 'device-a', connection_generation: 1, executor_generation: 1,
+      desktop_control: false, desktop_control_error: '当前没有交互用户会话。', fields: {},
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const channelStatus = wrapper.get('.remote-channel-status').text()
+    expect(channelStatus).toContain('服务端任务：已就绪')
+    expect(channelStatus).toContain('桌面控制：暂不可用')
+    expect(channelStatus).toContain('当前没有交互用户会话。')
+  })
+
   it('模式选远程后自动保存；配对码保持前导零并自动建立连接通道', async () => {
     wrapper = mount(DeviceSettings)
     await flushPromises()

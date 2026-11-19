@@ -494,6 +494,8 @@ export const nativeDeviceApi = {
     connection_generation?: number // connection_generation（主机授予的连接代次）。
     executor_generation?: number // executor_generation（主机授予的执行器代次）。
     error?: string | null // error（最近一次通道错误）。
+    desktop_control?: boolean | null // desktop_control（当前通道是否已登记桌面控制能力）。
+    desktop_control_error?: string | null // desktop_control_error（桌面能力登记失败原因）。
       fields: Record<string, string> // fields（字段中文说明）。
     }>('device_ssh_task_channel', { action })
     const currentManagement = activeRemoteManagementSession

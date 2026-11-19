@@ -21,6 +21,7 @@ from voice_terminal.devices.capture_router import SelectableCapturePort
 from voice_terminal.devices.media_protocol import MediaFrame, MediaProtocolError
 from voice_terminal.devices.pcm_stream import PcmInputStream
 from voice_terminal.devices.remote_capture import RemoteAudioCapture, RemoteAudioCaptureError
+from voice_terminal.devices.router import DeviceOutcomeUnknown
 from voice_terminal.model_registry.service import ModelRegistryService
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
@@ -1250,6 +1251,25 @@ class ProductApiTests(unittest.TestCase):
                 "/v1/session/close", closed_body)
             assert closed.status_code == 200 and closed.json()["result"] == "closed"
             assert self.runtime.device_registry.connection(device_id).connected is False
+            offline = await self._request("POST", "/api/internal/dsh-bridge/device.task.query",
+                json=query_body, headers=headers)
+            assert offline.status_code == 200 and offline.json()["task"] == action_response.json()["task"]
+
+            reopened, _headers = await self._signed_gateway_request(private_key, device_id, "/v1/session/open",
+                {"protocol_version": 1, "capabilities": ["file_transfer", "terminal_control"]})
+            assert reopened.status_code == 200 and "desktop_control" not in reopened.json()["capabilities"]
+            for response in (terminal_response, file_response):
+                original_task = response.json()["task"]
+                queried = await self._request("POST", "/api/internal/dsh-bridge/device.task.query",
+                    json={**query_body, "task_id": original_task["request_id"]}, headers=headers)
+                assert queried.status_code == 200 and queried.json()["task"]["status"] == "succeeded"
+            wrong_device = await self._request("POST", "/api/internal/dsh-bridge/device.task.query",
+                json={**query_body, "device_id": "local"}, headers=headers)
+            assert wrong_device.status_code == 200 and wrong_device.json()["task"] is None
+            stale = await self._request("POST", "/api/internal/dsh-bridge/device.task.query",
+                json={**query_body, "activation_id": "stale"}, headers=headers)
+            assert stale.status_code == 409
+            await self.runtime.device_remote_sessions.close_all()
             self.runtime.dsh.bridge_hub.unregister(session)
 
         asyncio.run(scenario())
@@ -1746,7 +1766,7 @@ class ProductApiTests(unittest.TestCase):
             assert len(devices) == 1
             assert devices[0]["device_id"] == "local" and devices[0]["connected"] and devices[0]["interaction_active"]
             assert devices[0]["connection_generation"] == devices[0]["executor_generation"] == 1
-            assert isinstance(devices[0]["capabilities"], list)
+            assert {"desktop_control", "file_transfer", "terminal_control"} <= set(devices[0]["capabilities"])
             hub.unregister(session)
             assert (await self._request("POST", path, json=body, headers=headers)).status_code == 404
         asyncio.run(scenario())
@@ -1854,7 +1874,8 @@ class ProductApiTests(unittest.TestCase):
                                                 json=action, headers=headers)
                 self.assertEqual(completed.status_code, 200, completed.text)
                 execute.assert_awaited_with(request_id="action-1", device_id="local", operation="click",
-                    arguments={"x": 5, "y": 6, "hardware": False}, timeout_seconds=38.0)
+                    arguments={"x": 5, "y": 6, "hardware": False}, timeout_seconds=38.0,
+                    expected_connection=connection)
 
                 query.return_value = None
                 query_body = {"protocol_version": "2.0", "request_id": "query-1", "voice_session_id": "current",
@@ -1866,6 +1887,14 @@ class ProductApiTests(unittest.TestCase):
                 self.assertIsNone(queried.json()["task"])
                 query.assert_awaited_once_with("action-1", "local")
                 self.assertEqual(execute.await_count, 2)
+                execute.side_effect = DeviceOutcomeUnknown("隔离测试没有收到设备回执")
+                terminal = {**query_body, "request_id": "terminal-receipt-lost", "action": "create",
+                            "terminal_id": "terminal-1"}
+                del terminal["task_id"]
+                unknown = await self._request("POST", "/api/internal/dsh-bridge/device.terminal",
+                                              json=terminal, headers=headers)
+                self.assertEqual(unknown.status_code, 504)
+                self.assertIn(terminal["request_id"], unknown.json()["detail"])
             hub.unregister(session)
         asyncio.run(scenario())
 

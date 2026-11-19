@@ -26,6 +26,10 @@ class DeviceUnavailable(RuntimeError):
     """DeviceUnavailable（设备不可用）：请求尚未受理或等待原任务结果。"""
 
 
+class DeviceTargetChanged(DeviceUnavailable):
+    """DeviceTargetChanged（执行目标代次已变化）：本次请求尚未派发。"""
+
+
 class DeviceOutcomeUnknown(RuntimeError):
     """DeviceOutcomeUnknown（设备执行结果未知）：不能自动重做。"""
 
@@ -140,8 +144,9 @@ class DeviceRouter:
             return connection
 
     async def execute(self, *, request_id: str, device_id: str, operation: str,
-                      arguments: Any, timeout_seconds: float = 30.0) -> TaskRecord:
-        """execute（执行）：持久受理后发送；重复请求只查询既有记录。"""
+                      arguments: Any, timeout_seconds: float = 30.0,
+                      expected_connection: DeviceConnection | None = None) -> TaskRecord:
+        """execute（执行）：按指定连接快照受理并发送；重复请求只查询既有记录。"""
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 600:
             raise ValueError("设备操作超时必须大于零且不超过 600 秒。")
         arguments = _snapshot_json(arguments)
@@ -155,6 +160,11 @@ class DeviceRouter:
             return record
         async with self._lock:
             entry = self._connections.get(device_id)
+            if expected_connection is not None and (
+                entry is None or entry[0] != expected_connection
+                or self.registry.connection(device_id) != expected_connection
+            ):
+                raise DeviceTargetChanged("固定目标设备的连接或执行器代次已变化。")
             if entry is None:
                 raise DeviceUnavailable("目标设备未连接。")
             connection, transport = entry

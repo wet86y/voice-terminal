@@ -19,18 +19,17 @@ function fixture() {
   }
   const approval = { async approve() { state.afterApproval?.(); return state.approved } }
   const executor = new DeviceActionExecutor(store, backend, approval)
-  const action = { requestId: 'r', basedOn: record.id, deviceId: 'B', name: 'click', arguments: { x: 3 }, checkTree: true }
+  const action = { requestId: 'r', basedOn: record.id, deviceId: 'B', name: 'click', arguments: { x: 3 }, checkContent: true }
   return { executor, backend, state, action, target, snapshot }
 }
 
-test('授权前后复核并只执行一次，执行后允许窗口内容变化', async () => {
+test('授权后只复核一次，已确认回执不受动作引起的窗口变化影响', async () => {
   const f = fixture()
   const backendSignal = new AbortController().signal
-  // 只有授权后才发送动作；第三次读取用于确认进程身份。
-  f.backend.execute = async () => { f.state.calls++; f.state.fresh = { ...f.snapshot, treeHash: 'after', shotHash: 'after' }; return { ok: true } }
+  f.backend.execute = async () => { f.state.calls++; f.state.fresh = { ...f.snapshot, processId: 11 }; return { ok: true } }
   assert.deepEqual(await f.executor.execute(f.action, backendSignal), { ok: true })
   assert.equal(f.state.calls, 1)
-  assert.equal(f.state.observations, 3)
+  assert.equal(f.state.observations, 1)
 })
 
 test('跨设备观察、拒绝审批和审批期间窗口变化都不执行', async () => {
@@ -46,13 +45,13 @@ test('跨设备观察、拒绝审批和审批期间窗口变化都不执行', as
   }
 })
 
-test('执行后进程变化返回未知，不重发动作', async () => {
+test('设备未返回执行回执时保留任务编号，不重发动作', async () => {
   const f = fixture()
-  let reads = 0
-  // 在第二次观察完成后模拟进程替换。
-  f.state.afterApproval = () => {
-    Object.defineProperty(f.state, 'fresh', { get() { reads++; return reads > 1 ? { ...f.snapshot, processId: 11 } : f.snapshot } })
+  f.backend.execute = async () => {
+    f.state.calls++
+    throw new Error('设备回执丢失')
   }
-  await assert.rejects(f.executor.execute(f.action, new AbortController().signal), error => error.code === 'OUTCOME_UNKNOWN')
+  await assert.rejects(f.executor.execute(f.action, new AbortController().signal), error =>
+    error.code === 'OUTCOME_UNKNOWN' && error.message.includes(`原任务 ${f.action.requestId}`))
   assert.equal(f.state.calls, 1)
 })

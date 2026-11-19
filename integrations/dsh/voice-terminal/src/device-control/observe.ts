@@ -28,6 +28,7 @@ export interface ObservationRecord {
   elementCount: number
   /** Wall-clock capture time in milliseconds. */
   observedAt: number
+  limits: Readonly<{ maxElements: number; maxDepth: number }> // limits（原观察的元素数量和深度上限）。
   /**
    * The SSH target this observation came from. A later action citing this
    * observation replays against this exact target — never whatever target
@@ -85,7 +86,8 @@ export class ObservationStore {
    * @param target - the SSH target it was captured from.
    * @returns the stored record (id = hash of the state).
    */
-  record(snapshot: WindowSnapshot, target: DeviceTarget): ObservationRecord {
+  record(snapshot: WindowSnapshot, target: DeviceTarget,
+    limits = { maxElements: 100, maxDepth: 16 }): ObservationRecord {
     if (!target.deviceId || target.deviceId.length > 128 || target.deviceId !== target.deviceId.trim()
       || !Number.isSafeInteger(target.connectionGeneration) || target.connectionGeneration < 1
       || !Number.isSafeInteger(target.executorGeneration) || target.executorGeneration < 1) {
@@ -103,6 +105,7 @@ export class ObservationStore {
       shotHash: snapshot.shotHash,
       elementCount: snapshot.elementCount,
       observedAt: Date.now(),
+      limits: Object.freeze({ ...limits }),
       target: Object.freeze({ ...target }),
     }
     Object.freeze(record)
@@ -137,18 +140,14 @@ export class ObservationStore {
    * @param record - the observation the action cites.
    * @param fresh - the re-observation captured immediately before the action.
    * @param now - wall-clock now (injectable for tests).
-   * @param checkTree - whether the tree hash is even relevant to this call.
-   * Element-addressed actions (`type`, `click`/`scroll` by `elementId`) pass
-   * `false`: the helper re-resolves that exact element by its UIA RuntimeId
-   * immediately before acting and fails loudly if it's gone, so the coarser
-   * whole-window tree hash adds no safety there — it only false-positives on
-   * unrelated live content elsewhere in the window (a clock, a page still
-   * loading, autocomplete appearing). Coordinate-based clicks and `key` have
-   * no such per-target re-check, so they still want it (default `true`).
+   * @param checkTree - checkTree（是否比较界面树摘要）。
+   * @param checkPixels - checkPixels（是否比较窗口画面摘要）。
+   * 窗口动作只需复核窗口，元素动作由辅助进程重新定位明确的 UIA RuntimeId（界面元素运行时编号）。
+   * 坐标和按键动作依赖窗口内容，因此仍比较树及画面。
    * @returns the verdict.
    */
   verify(record: ObservationRecord, fresh: WindowSnapshot, target: DeviceTarget,
-    now: number = Date.now(), checkTree = true): FreshnessVerdict {
+    now: number = Date.now(), checkTree = true, checkPixels = true): FreshnessVerdict {
     if (this.entries.get(record.id) !== record) {
       return { ok: false, code: 'UNKNOWN_OBSERVATION', detail: '观察不存在或已经被替换。' }
     }
@@ -185,17 +184,19 @@ export class ObservationStore {
         detail: `the accessibility tree of window ${record.windowId} changed since observation ${record.id}`,
       }
     }
-    const pixelCheckExempt = this.config.staleCheckPixelsExemptMatchers.some(matcher => {
-      matcher.lastIndex = 0
-      const titleMatches = matcher.test(fresh.title)
-      matcher.lastIndex = 0
-      return titleMatches || (fresh.executablePath !== null && matcher.test(fresh.executablePath))
-    })
-    if (this.config.staleCheckPixels && !pixelCheckExempt && fresh.shotHash !== record.shotHash) {
-      return {
-        ok: false,
-        code: 'STALE_PIXELS',
-        detail: `the pixels of window ${record.windowId} changed since observation ${record.id}`,
+    if (checkPixels && this.config.staleCheckPixels && fresh.shotHash !== record.shotHash) {
+      const pixelCheckExempt = this.config.staleCheckPixelsExemptMatchers.some(matcher => {
+        matcher.lastIndex = 0
+        const titleMatches = matcher.test(fresh.title)
+        matcher.lastIndex = 0
+        return titleMatches || (fresh.executablePath !== null && matcher.test(fresh.executablePath))
+      })
+      if (!pixelCheckExempt) {
+        return {
+          ok: false,
+          code: 'STALE_PIXELS',
+          detail: `the pixels of window ${record.windowId} changed since observation ${record.id}`,
+        }
       }
     }
     return { ok: true }

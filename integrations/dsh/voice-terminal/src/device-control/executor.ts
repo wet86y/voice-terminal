@@ -16,7 +16,7 @@ export interface WindowAction {
   deviceId: string // deviceId（请求的设备编号，必须与观察一致）。
   name: WindowActionName // name（动作名称）。
   arguments: Readonly<Record<string, unknown>> // arguments（动作参数）。
-  checkTree: boolean // checkTree（是否复核整棵界面树）。
+  checkContent: boolean // checkContent（坐标或按键动作是否复核窗口内容）。
 }
 
 /** DeviceActionBackend（设备动作后端）：由统一设备路由提供。 */
@@ -52,7 +52,7 @@ function immutableJson(value: unknown): unknown {
 function copyAction(action: WindowAction): WindowAction {
   if (!action || typeof action.requestId !== 'string' || !action.requestId || action.requestId.length > 128
     || typeof action.basedOn !== 'string' || !action.basedOn || typeof action.deviceId !== 'string' || !action.deviceId
-    || !WINDOW_ACTIONS.has(action.name) || typeof action.checkTree !== 'boolean'
+    || !WINDOW_ACTIONS.has(action.name) || typeof action.checkContent !== 'boolean'
     || !action.arguments || typeof action.arguments !== 'object' || Array.isArray(action.arguments)) {
     throw new DeviceActionError('INVALID_ACTION', '设备动作参数无效。')
   }
@@ -82,37 +82,24 @@ export class DeviceActionExecutor {
     if (!record) throw new DeviceActionError('UNKNOWN_OBSERVATION', '观察不存在或已经过期。')
     if (record.target.deviceId !== action.deviceId) throw new DeviceActionError('STALE_DEVICE', '观察不属于指定设备。')
 
-    const verify = async () => {
-      const target = this.backend.currentTarget(record.target.deviceId)
-      if (!sameTarget(target, record.target)) throw new DeviceActionError('STALE_DEVICE', '设备连接或执行器已变化。')
-      const fresh = await this.backend.observe(record, signal)
-      if (!sameTarget(this.backend.currentTarget(record.target.deviceId), record.target)) {
-        throw new DeviceActionError('STALE_DEVICE', '观察期间设备连接或执行器已变化。')
-      }
-      const verdict = this.observations.verify(record, fresh, record.target, Date.now(), action.checkTree)
-      if (!verdict.ok) throw new DeviceActionError(verdict.code, verdict.detail)
+    if (!sameTarget(this.backend.currentTarget(record.target.deviceId), record.target)) {
+      throw new DeviceActionError('STALE_DEVICE', '设备连接或执行器已变化。')
     }
-    await verify()
     if (!await this.approval.approve(action, record, signal)) throw new DeviceActionError('DENIED', '设备动作未获授权。')
     if (signal.aborted) throw new DeviceActionError('CANCELLED', '设备动作已取消。')
-    // 审批可能耗时；等待期间窗口或设备可能已经变化，必须再次核对。
-    await verify()
-    let result: unknown
+    // 审批结束后只观察一次，确认执行时的窗口身份及所需内容。
+    const fresh = await this.backend.observe(record, signal)
+    const target = this.backend.currentTarget(record.target.deviceId)
+    if (!target) throw new DeviceActionError('STALE_DEVICE', '设备连接或执行器已变化。')
+    const verdict = this.observations.verify(record, fresh, target, Date.now(), action.checkContent, action.checkContent)
+    if (!verdict.ok) throw new DeviceActionError(verdict.code, verdict.detail)
+    if (signal.aborted) throw new DeviceActionError('CANCELLED', '设备动作已取消。')
     try {
-      result = await this.backend.execute(action, record, record.target, signal)
-    } catch {
-      throw new DeviceActionError('OUTCOME_UNKNOWN', '设备动作结果未知，请查询原请求。')
+      return await this.backend.execute(action, record, record.target, signal)
+    } catch (error) {
+      if (error instanceof DeviceActionError && error.code !== 'OUTCOME_UNKNOWN') throw error
+      throw new DeviceActionError('OUTCOME_UNKNOWN',
+        `设备动作结果未知，请用 device_task_query（原任务查询）查询设备 ${action.deviceId} 的原任务 ${action.requestId}，不要重放。`)
     }
-    try {
-      if (!sameTarget(this.backend.currentTarget(record.target.deviceId), record.target)) throw new Error('设备连接已变化')
-      const after = await this.backend.observe(record, signal)
-      if (!sameTarget(this.backend.currentTarget(record.target.deviceId), record.target)
-        || after.windowId !== record.windowId || after.processId !== record.processId
-        || after.executablePath !== record.executablePath) throw new Error('执行后进程身份无法确认')
-    } catch {
-      // 动作已经发出，观察发生变化不能伪装为动作未执行。
-      throw new DeviceActionError('OUTCOME_UNKNOWN', '设备动作已发出，但执行后状态无法确认。')
-    }
-    return result
   }
 }

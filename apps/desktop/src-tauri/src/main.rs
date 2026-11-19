@@ -114,7 +114,37 @@ struct RemoteDeviceTaskChannel {
     device_id: String,          // device_id（本机登记到服务端的稳定设备编号）。
     connection_generation: u64, // connection_generation（主机授予的管理连接代次）。
     executor_generation: u64,   // executor_generation（主机授予的客户端执行器代次）。
+    desktop_control: Result<(), String>, // desktop_control（登记时的桌面辅助能力及失败原因）。
     task: tauri::async_runtime::JoinHandle<()>, // task（受管异步轮询任务）。
+}
+
+#[cfg(feature = "ssh-device")]
+fn remote_device_task_status(
+    channel: Option<&RemoteDeviceTaskChannel>,
+    error: Option<&str>,
+) -> serde_json::Value {
+    let running = channel.is_some_and(|channel| channel.running.load(Ordering::Acquire));
+    let desktop_control = channel
+        .filter(|_| running)
+        .map(|channel| &channel.desktop_control);
+    serde_json::json!({
+        "state": if running { "running" } else if error.is_some() { "error" } else { "stopped" },
+        "device_id": channel.map(|channel| &channel.device_id),
+        "connection_generation": channel.map(|channel| channel.connection_generation),
+        "executor_generation": channel.map(|channel| channel.executor_generation),
+        "error": error,
+        "desktop_control": desktop_control.map(Result::is_ok),
+        "desktop_control_error": desktop_control.and_then(|status| status.as_ref().err()),
+        "fields": {
+            "state": "受管远端任务通道状态",
+            "device_id": "当前已登记的客户端设备编号",
+            "connection_generation": "主机授予的设备连接代次",
+            "executor_generation": "主机授予的客户端执行器代次",
+            "error": "最近一次任务通道错误",
+            "desktop_control": "当前任务通道是否已登记桌面控制能力；空值表示通道未运行",
+            "desktop_control_error": "桌面能力登记失败原因"
+        }
+    })
 }
 
 #[cfg(feature = "ssh-device")]
@@ -7492,27 +7522,14 @@ async fn device_ssh_task_channel(
                     .remote_task_channel
                     .lock()
                     .map_err(|error| error.to_string())?;
-                let running = channel
-                    .as_ref()
-                    .is_some_and(|channel| channel.running.load(Ordering::Acquire));
-                let device_id = channel.as_ref().map(|channel| channel.device_id.clone());
-                let connection_generation = channel
-                    .as_ref()
-                    .map(|channel| channel.connection_generation);
-                let executor_generation =
-                    channel.as_ref().map(|channel| channel.executor_generation);
                 let error = desktop
                     .remote_task_channel_error
                     .lock()
-                    .map_err(|error| error.to_string())?
-                    .clone();
-                return Ok(
-                    serde_json::json!({"state":if running{"running"}else if error.is_some(){"error"}else{"stopped"},
-                    "device_id":device_id,"connection_generation":connection_generation,"executor_generation":executor_generation,
-                    "error":error,"fields":{"state":"受管远端桌面任务通道状态","device_id":"当前已登记的客户端设备编号",
-                        "connection_generation":"主机授予的设备连接代次","executor_generation":"主机授予的客户端执行器代次",
-                        "error":"最近一次通道错误"}}),
-                );
+                    .map_err(|error| error.to_string())?;
+                return Ok(remote_device_task_status(
+                    channel.as_ref(),
+                    error.as_deref(),
+                ));
             }
             "stop" => {
                 let stopped = stop_remote_device_task_channel(&desktop).await?;
@@ -7528,16 +7545,17 @@ async fn device_ssh_task_channel(
         if !desktop.ssh_device.connected().await {
             return Err("请先连接并认证共享主机。".into());
         }
-        let active = desktop
-            .remote_task_channel
-            .lock()
-            .map_err(|error| error.to_string())?
-            .as_ref()
-            .is_some_and(|channel| channel.running.load(Ordering::Acquire));
-        if active {
-            return Ok(
-                serde_json::json!({"state":"running","fields":{"state":"受管远端桌面任务通道状态"}}),
-            );
+        {
+            let channel = desktop
+                .remote_task_channel
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if let Some(active) = channel
+                .as_ref()
+                .filter(|channel| channel.running.load(Ordering::Acquire))
+            {
+                return Ok(remote_device_task_status(Some(active), None));
+            }
         }
         if desktop
             .remote_task_channel_starting
@@ -7562,13 +7580,15 @@ async fn device_ssh_task_channel(
         if config.desired_role != voice_desktop_common::device_config::Role::RemoteClient {
             return Err("只有远端客户端角色可以开启桌面任务通道。".into());
         }
-        let desktop_ready = ensure_remote_desktop_helper(desktop.clone()).await.is_ok();
+        let desktop_control = ensure_remote_desktop_helper(desktop.clone())
+            .await
+            .map_err(|error| error.chars().take(240).collect::<String>());
         let mut capabilities = vec![
             "audio_stream".to_owned(),
             "file_transfer".to_owned(),
             "terminal_control".to_owned(),
         ];
-        if desktop_ready {
+        if desktop_control.is_ok() {
             capabilities.push("desktop_control".to_owned());
         }
         // client_tts（客户端原生直放能力）由开关和原生播放器支持决定；供应商凭据由服务端在线语音设置提供。
@@ -7627,24 +7647,21 @@ async fn device_ssh_task_channel(
                 }),
             );
         });
+        let channel = RemoteDeviceTaskChannel {
+            stop,
+            running,
+            device_id: config.device_id,
+            connection_generation,
+            executor_generation,
+            desktop_control,
+            task: loop_handle,
+        };
+        let response = remote_device_task_status(Some(&channel), None);
         *desktop
             .remote_task_channel
             .lock()
-            .map_err(|error| error.to_string())? = Some(RemoteDeviceTaskChannel {
-            stop,
-            running,
-            device_id: config.device_id.clone(),
-            connection_generation,
-            executor_generation,
-            task: loop_handle,
-        });
-        Ok(
-            serde_json::json!({"state":"running","device_id":config.device_id,
-            "connection_generation":connection_generation,
-            "executor_generation":executor_generation,
-            "fields":{"state":"受管远端桌面任务通道状态","device_id":"当前客户端设备编号",
-                "connection_generation":"主机授予的连接代次","executor_generation":"主机授予的执行器代次"}}),
-        )
+            .map_err(|error| error.to_string())? = Some(channel);
+        Ok(response)
     }
     #[cfg(not(feature = "ssh-device"))]
     {
@@ -10860,6 +10877,37 @@ mod tests {
                 total_decoded_samples += decoder.decode(&packet).unwrap().len();
             }
             assert_eq!(total_decoded_samples, 8 * 320);
+        });
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn task_channel_status_reports_desktop_capability_separately() {
+        tauri::async_runtime::block_on(async {
+            let mut channel = super::RemoteDeviceTaskChannel {
+                stop: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(true)),
+                device_id: "device-test".into(),
+                connection_generation: 2,
+                executor_generation: 3,
+                desktop_control: Err("当前没有交互用户会话。".into()),
+                task: tauri::async_runtime::spawn(async {}),
+            };
+            let limited = super::remote_device_task_status(Some(&channel), None);
+            assert_eq!(limited["state"], "running");
+            assert_eq!(limited["desktop_control"], false);
+            assert_eq!(limited["desktop_control_error"], "当前没有交互用户会话。");
+            assert!(limited["error"].is_null());
+
+            channel.desktop_control = Ok(());
+            let ready = super::remote_device_task_status(Some(&channel), None);
+            assert_eq!(ready["desktop_control"], true);
+            assert!(ready["desktop_control_error"].is_null());
+            channel.running.store(false, Ordering::Release);
+            let stopped = super::remote_device_task_status(Some(&channel), None);
+            assert_eq!(stopped["state"], "stopped");
+            assert!(stopped["desktop_control"].is_null());
+            channel.task.await.unwrap();
         });
     }
 
