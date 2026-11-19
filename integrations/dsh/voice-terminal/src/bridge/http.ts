@@ -144,7 +144,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           const approval = ctx.get('approval')
           if (policy !== 'ask' && policy !== 'never') response = result('conflict')
           else if (body.activation_id !== existing.activationId) response = result('stale')
-          else if (!approval || !existing.handle?.agent) response = result('unavailable')
+          else if (!approval || !existing.handle?.agent) response = result('conflict', { message: 'approval service unavailable' })
           else {
             approval.setPolicy(existing.handle.agent, policy)
             response = result('accepted')
