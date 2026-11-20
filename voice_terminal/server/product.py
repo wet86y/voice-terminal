@@ -25,6 +25,7 @@ from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
+from uuid import uuid4
 
 from ..speaker.settings import TUNING_DEFAULTS, validate_controls, validate_tuning
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig, resolve_tts_sample_rate, validate_tts_inference_steps
@@ -642,6 +643,8 @@ class ProductSettingsStore:
 
     def __init__(self, *, path: Path, config: AppConfig) -> None:
         self._settings_lock = threading.RLock()  # _settings_lock（设置锁）：保护后台保存与界面快照。
+        self._sync_instance = uuid4().hex  # _sync_instance（设置存储实例）：重启后拒绝旧实例响应。
+        self._sync_revision = 0  # _sync_revision（服务端保存修订）：仅成功持久化后递增，不写入用户设置格式。
         self.path = path
         self.config = config
         self.persona_directory = (config.paths.persona if config.paths and config.paths.separated
@@ -700,7 +703,13 @@ class ProductSettingsStore:
             value["schema_version"] = 2
         value["persona"] = self.read_persona()
         value["warnings"] = list(self.warnings)
+        value["sync"] = self.sync_state()
         return value
+
+    @_settings_locked
+    def sync_state(self) -> dict[str, Any]:
+        """sync_state（服务端设置依据）：实例编号与成功保存的递增修订。"""
+        return {"instance_id": self._sync_instance, "revision": self._sync_revision}
 
     @_settings_locked
     def settings_only(self) -> dict[str, Any]:
@@ -843,10 +852,39 @@ class ProductSettingsStore:
             entries = validate_entries(value)
         except ValueError as exc:
             raise ProductSettingsError(str(exc)) from exc
-        self._settings["custom_instructions"] = entries
-        self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
-        self._save_settings()
+        previous = self._settings
+        self._settings = {**previous, "custom_instructions": entries, "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION}
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings = previous
+            raise
         return self.snapshot()
+
+    @_settings_locked
+    def mutate_custom_instruction(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """mutate_custom_instruction（修改单条指令）：始终基于服务端现存列表。"""
+        operation, entry_id = payload.get("operation"), payload.get("id")
+        fields = {"operation", "id", "value"} if operation == "save" else {"operation", "id", "enabled"} if operation == "toggle" else {"operation", "id"}
+        if not isinstance(operation, str) or operation not in {"save", "toggle", "delete"} or set(payload) != fields or not isinstance(entry_id, str) or not entry_id:
+            raise ProductSettingsError("operation（操作）、id（指令编号）及操作参数无效。")
+        entries = deepcopy(self._settings["custom_instructions"])
+        index = next((i for i, item in enumerate(entries) if item["id"] == entry_id), None)
+        if operation == "delete":
+            entries = [item for item in entries if item["id"] != entry_id]
+        elif operation == "toggle":
+            if index is None or type(payload["enabled"]) is not bool:
+                raise ProductSettingsError("指令不存在，或 enabled（启用状态）不是布尔值，请刷新后重试。")
+            entries[index]["enabled"] = payload["enabled"]
+        else:
+            value = payload["value"]
+            if not isinstance(value, Mapping) or value.get("id") != entry_id:
+                raise ProductSettingsError("value（指令内容）的 id（编号）必须与目标一致。")
+            if index is None:
+                entries.append(dict(value))
+            else:
+                entries[index] = dict(value)
+        return self.save_custom_instructions(entries)
 
     @_settings_locked
     def effective_config(self) -> AppConfig:
@@ -858,6 +896,7 @@ class ProductSettingsStore:
         if getattr(self, "_tts_voice_selections", None):
             saved["tts"].pop("active_voice_by_model", None)
         _atomic_write_json(self.path, saved)
+        self._sync_revision += 1
         from ..compatibility import record_settings_validation
         # 校验凭据是可重建派生资料；写入失败不把已成功保存的设置误报为失败。
         try:
@@ -1161,10 +1200,15 @@ class ProductSettingsStore:
         enabled = payload.get("experimental_context_gate_enabled")
         if type(enabled) is not bool:
             raise ProductSettingsError("experimental_context_gate_enabled 必须是布尔值。")
+        previous = self._settings["shadow"]
         self._settings["shadow"] = {
             "experimental_context_gate_enabled": enabled,
         }
-        self._save_settings()
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["shadow"] = previous
+            raise
         return deepcopy(self._settings["shadow"])
 
     @_settings_locked
@@ -1298,6 +1342,7 @@ class ProductSettingsStore:
             self._save_settings()
         return restored
 
+    @_settings_locked
     def save_persona(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != set(PERSONA_FILES):
             raise ProductSettingsError("Persona 文档字段必须是 personality、user。")
@@ -1322,6 +1367,7 @@ class ProductSettingsStore:
                 raise ProductSettingsError("Persona 路径不在允许目录内。") from exc
 
         self._atomic_replace_documents({path: values[key] for key, path in paths.items()})
+        self._sync_revision += 1
         return self.snapshot()
 
 

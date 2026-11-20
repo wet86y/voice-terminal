@@ -21,6 +21,7 @@ import type {
 } from './types'
 import { validWakeTriggerCount, wakeIntervalParts, wakeIntervalSeconds } from '../interface/wake-task-interval'
 import { isRecord } from '../record'
+import { mergeInstructionDrafts, mergeSettingsDraft, readSettingsSync } from './settings-sync'
 import { desktopPort } from './desktop-port'
 import { nativeDeviceApi } from './native-device-api'
 import { deviceState } from './device-state'
@@ -38,7 +39,6 @@ const NOTICE_FADE_MS = 420
 const hotSwitchComputeModelIds = new Set<ProductHotSwitchModelId>(['paraformer', 'emotion', 'campplus'])
 /** AudioEnhancementKey（音频增强字段编号）：和持久化设置字段一致。 */
 type AudioEnhancementKey = keyof NonNullable<ProductSettingsSnapshot['audio_enhancements']>
-const audioEnhancementKeys: AudioEnhancementKey[] = ['dual_pass', 'emotion', 'acoustic_events'] // audioEnhancementKeys（可同步的音频增强字段）。
 
 export interface ProductUiModel extends ProductModel {
   provider: string
@@ -106,6 +106,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const pendingAudioEnhancements = new Set<AudioEnhancementKey>() // pendingAudioEnhancements（切换中而由本地事务暂时持有的开关）。
   let audioEnhancementRevision = 0 // audioEnhancementRevision（设置事务代次，拒绝切换前后到达的旧快照）。
   let savedApprovalSettings = { ...DEFAULT_SETTINGS.approvals } // savedApprovalSettings（最后一次确认已保存的授权设置）。
+  let savedShadowGate = DEFAULT_SETTINGS.shadow.experimental_context_gate_enabled // savedShadowGate（服务端确认的门禁状态）。
+  let settingsResponseRevision = 0 // settingsResponseRevision（已接纳回执代次）：拦截保存前发出的旧读取。
+  let settingsConnectionGeneration = 0 // settingsConnectionGeneration（目标连接代次）：断开换端后丢弃旧响应。
+  let activeMutationGeneration: number | null = null // activeMutationGeneration（当前提交所属的目标连接）。
+  const retiredSettingsInstances = new Set<string>() // retiredSettingsInstances（已退出的服务端设置实例）。
   const computeStatus = ref<ProductComputeStatus | null>(null)
   let computeStatusRevision = 0 // computeStatusRevision（组件状态代次）：旧进程的采样不能覆盖新状态。
   let computeStatusRequest = 0 // computeStatusRequest（采样请求代次）：并发请求只接纳最新结果。
@@ -203,6 +208,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   watch([page, settingsTab], ([currentPage, tab]) => {
+    if (settingsRefreshTimer !== undefined) window.clearInterval(settingsRefreshTimer)
+    settingsRefreshTimer = undefined
+    if (currentPage === 'settings') requestSettingsRefresh()
+    if (currentPage === 'settings') settingsRefreshTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && voice.connection.value !== 'connected') requestSettingsRefresh()
+    }, 5000)
     if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
     computeStatusTimer = undefined
     if (speakerStatusTimer !== undefined) window.clearInterval(speakerStatusTimer)
@@ -225,9 +236,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   let snapshotRequest: Promise<void> | null = null
+  let snapshotRefreshNeeded = false // snapshotRefreshNeeded（读取期间又收到服务端更新，结束后补读）。
   let dshRevision = 0 // dshRevision（宿主状态修订号）：阻止迟到的启动快照覆盖新状态。
   let speakerStatusRevision = 0 // speakerStatusRevision（声纹状态修订号）：保存后忽略迟到的旧状态。
   let reconnectTimer: number | undefined
+  let settingsRefreshTimer: number | undefined // settingsRefreshTimer（实时通道断开时设置页补读）。
   let dshStatusTimer: number | undefined
   let computeStatusTimer: number | undefined
   let speakerStatusTimer: number | undefined
@@ -238,7 +251,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let mutationQueue: Promise<unknown> = Promise.resolve()
 
   function enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const next = mutationQueue.then(operation, operation)
+    const run = async () => {
+      activeMutationGeneration = settingsConnectionGeneration
+      try { return await operation() }
+      finally { activeMutationGeneration = null }
+    }
+    const next = mutationQueue.then(run, run)
     mutationQueue = next.then(() => undefined, () => undefined)
     return next
   }
@@ -279,18 +297,82 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     noticeVisible.value = false
   }
 
+  function applySettingsResult(result: ProductMutationResult) {
+    if (activeMutationGeneration !== null && activeMutationGeneration !== settingsConnectionGeneration) return
+    const candidate = result.settings_snapshot ?? result.settings
+    if (!isRecord(candidate)) return
+    const next = JSON.parse(JSON.stringify(settings)) as ProductSettingsSnapshot
+    next.compute.devices = { ...computeSavedDevices.value }
+    next.shadow.experimental_context_gate_enabled = savedShadowGate
+    next.approvals = { ...savedApprovalSettings }
+    updateSettingsFromResponse(next, result)
+    if (applySettings(next, true)) settingsResponseRevision++
+  }
+
+  function applySettings(next: ProductSettingsSnapshot, receipt = false) {
+    const sync = readSettingsSync(next.sync), currentSync = settings.sync
+    if (sync && (retiredSettingsInstances.has(sync.instance_id)
+      || sync.instance_id === currentSync?.instance_id && sync.revision < currentSync.revision)) return false
+    if (sync && currentSync && sync.instance_id !== currentSync.instance_id) {
+      retiredSettingsInstances.add(currentSync.instance_id)
+      if (retiredSettingsInstances.size > 16) retiredSettingsInstances.delete(retiredSettingsInstances.values().next().value!)
+    }
+    const wake = mergeSettingsDraft(wakeForm, { enabled: settings.wake.enabled, keywords: settings.wake.keywords,
+      sensitivity: settings.wake.sensitivity }, { enabled: next.wake.enabled, keywords: next.wake.keywords, sensitivity: next.wake.sensitivity })
+    const silence = mergeSettingsDraft(silenceSeconds.value, settings.silence.seconds, next.silence.seconds)
+    const quiet = mergeSettingsDraft(quietHoursForm, settings.quiet_hours, next.quiet_hours!)
+    const speaker = mergeSettingsDraft(speakerForm, Object.fromEntries(Object.keys(speakerForm)
+      .map(key => [key, settings.speaker[key as keyof typeof settings.speaker]])), next.speaker)
+    const persona = mergeSettingsDraft(personaDocuments, settings.persona, next.persona)
+    const instructions = mergeInstructionDrafts(customInstructions.value, settings.custom_instructions,
+      next.custom_instructions, instructionBusy.value)
+    const devices = mergeSettingsDraft(settings.compute.devices,
+      snapshot.value === null ? initialComputeDevices : computeSavedDevices.value, next.compute.devices)
+    const audio = { ...next.audio_enhancements! }
+    for (const key of pendingAudioEnhancements) audio[key] = settings.audio_enhancements![key]
+    const shadow = settings.shadow.experimental_context_gate_enabled
+    const approvals = { ...settings.approvals }
+    updateSettingsFromResponse(settings, { settings: next })
+    settings.audio_enhancements = audio
+    computeSavedDevices.value = { ...next.compute.devices }
+    Object.assign(settings.compute.devices, devices)
+    savedShadowGate = next.shadow.experimental_context_gate_enabled
+    savedApprovalSettings = { ...next.approvals }
+    // 外部快照不覆盖正在提交的开关意图，最终值仍取服务端回执。
+    if (saving.value && !receipt) {
+      settings.shadow.experimental_context_gate_enabled = shadow
+      Object.assign(settings.approvals, approvals)
+    }
+    Object.assign(wakeForm, wake)
+    silenceSeconds.value = silence
+    Object.assign(quietHoursForm, quiet)
+    Object.assign(speakerForm, speaker)
+    Object.assign(personaDocuments, persona)
+    customInstructions.value = instructions
+    return true
+  }
+
+  function requestSettingsRefresh() {
+    if (adapterDisposed || !application.businessReady.value) return
+    if (snapshotRequest) snapshotRefreshNeeded = true
+    else void loadSnapshot(false)
+  }
+
+  watch(voice.settingsSync, sync => {
+    if (sync && (sync.instance_id !== settings.sync?.instance_id || sync.revision > settings.sync.revision)) requestSettingsRefresh()
+  })
+
+  watch([() => application.snapshot.value?.host_id, () => application.snapshot.value?.endpoint_revision], () => {
+    settingsConnectionGeneration++
+    settings.sync = undefined
+    retiredSettingsInstances.clear()
+    requestSettingsRefresh()
+  }, { flush: 'sync' })
+
   function applySnapshot(value: ProductSnapshot, requestedRegistryRevision: number, requestedDshRevision: number,
-    requestedAudioEnhancementRevision: number, requestedInstructionRevision: number) {
+    requestedAudioEnhancementRevision: number, requestedInstructionRevision: number, acceptSettings = true) {
     // 重连快照更新服务端基线，正在编辑的表单仍由根层持有。
-    const known = snapshot.value !== null
     const differs = (draft: unknown, saved: unknown) => JSON.stringify(draft) !== JSON.stringify(saved)
-    const wakeDirty = differs(wakeForm, { enabled: settings.wake.enabled, keywords: settings.wake.keywords, sensitivity: settings.wake.sensitivity })
-    const silenceDirty = silenceSeconds.value !== settings.silence.seconds
-    const quietDirty = differs(quietHoursForm, settings.quiet_hours)
-    const savedSpeaker = Object.fromEntries(Object.keys(speakerForm).map(key => [key, settings.speaker[key as keyof typeof settings.speaker]]))
-    const speakerDirty = differs(speakerForm, savedSpeaker)
-    const personaDirty = differs(personaDocuments, settings.persona)
-    const computeDirty = differs(settings.compute.devices, known ? computeSavedDevices.value : initialComputeDevices)
     const assignmentDirty = differs(modelAssignments, {
       voice: registry.value.assignments.voice_llm_model_id || '', shadow: registry.value.assignments.shadow_llm_model_id || '', status: registry.value.assignments.status_llm_model_id || '',
     })
@@ -308,46 +390,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       })
       scheduleDshStatusPoll()
     }
-    const nextSettings = normalizeSettings(value.settings)
-    if (requestedAudioEnhancementRevision === audioEnhancementRevision) {
-      const nextAudioEnhancements = nextSettings.audio_enhancements ?? DEFAULT_SETTINGS.audio_enhancements!
-      const audioEnhancements = { ...(settings.audio_enhancements ?? DEFAULT_SETTINGS.audio_enhancements!) }
-      for (const key of audioEnhancementKeys) {
-        if (!pendingAudioEnhancements.has(key)) audioEnhancements[key] = nextAudioEnhancements[key]
-      }
-      settings.audio_enhancements = audioEnhancements
+    if (acceptSettings) {
+      const nextSettings = normalizeSettings(value.settings)
+      if (requestedAudioEnhancementRevision !== audioEnhancementRevision) nextSettings.audio_enhancements = settings.audio_enhancements
+      if (requestedInstructionRevision !== instructionRevision || instructionWrites > 0) nextSettings.custom_instructions = settings.custom_instructions
+      applySettings(nextSettings)
     }
-    computeSavedDevices.value = { ...nextSettings.compute.devices }
-    settings.screen_capture = nextSettings.screen_capture
-    Object.assign(settings.wake, nextSettings.wake)
-    Object.assign(settings.silence, nextSettings.silence)
-    settings.quiet_hours = nextSettings.quiet_hours
-    if (!quietDirty) Object.assign(quietHoursForm, nextSettings.quiet_hours)
-    Object.assign(settings.shadow, nextSettings.shadow)
-    Object.assign(settings.approvals, nextSettings.approvals)
-    savedApprovalSettings = { ...nextSettings.approvals }
-    Object.assign(settings.speaker, nextSettings.speaker)
-    if (!computeDirty) Object.assign(settings.compute.devices, nextSettings.compute.devices)
-    Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
-    Object.assign(settings.tts, nextSettings.tts)
-    Object.assign(settings.persona, nextSettings.persona)
-    if (requestedInstructionRevision === instructionRevision && instructionWrites === 0) {
-      const hasPendingInstructionEdits = JSON.stringify(customInstructions.value) !== JSON.stringify(settings.custom_instructions)
-      settings.custom_instructions = nextSettings.custom_instructions.map(item => ({ ...item }))
-      if (!hasPendingInstructionEdits) {
-        customInstructions.value = nextSettings.custom_instructions.map(item => ({ ...item }))
-      }
-    }
-    settings.schema_version = nextSettings.schema_version
-    settings.warnings = nextSettings.warnings
-    if (!wakeDirty) Object.assign(wakeForm, {
-      enabled: nextSettings.wake.enabled,
-      keywords: [...nextSettings.wake.keywords],
-      sensitivity: nextSettings.wake.sensitivity,
-    })
-    if (!silenceDirty) silenceSeconds.value = nextSettings.silence.seconds
-    if (!speakerDirty) Object.assign(speakerForm, nextSettings.speaker)
-    if (!personaDirty) Object.assign(personaDocuments, nextSettings.persona)
     if (registryRevision === requestedRegistryRevision) {
       registry.value = normalizeRegistry(value.models)
       if (!assignmentDirty) syncAssignments(registry.value.assignments)
@@ -372,22 +420,27 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
-  async function loadSnapshot() {
+  async function loadSnapshot(refreshAuxiliary = true) {
     if (!application.businessReady.value) return
     if (snapshotRequest) return snapshotRequest
-    loading.value = true
+    if (refreshAuxiliary) loading.value = true
     const requestedRegistryRevision = registryRevision
     const requestedDshRevision = dshRevision
     const requestedAudioEnhancementRevision = audioEnhancementRevision
     const requestedInstructionRevision = instructionRevision
+    const requestedResponseRevision = settingsResponseRevision
+    const requestedConnectionGeneration = settingsConnectionGeneration
     snapshotRequest = productApi.snapshot().then(async value => {
-      if (adapterDisposed) return
-      applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision, requestedInstructionRevision)
-      await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
-      lastError.value = ''
-    }).catch(setError).finally(() => {
-      loading.value = false
+      if (adapterDisposed || requestedConnectionGeneration !== settingsConnectionGeneration) return
+      const versioned = readSettingsSync(value.settings?.sync) !== undefined
+      applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision, requestedInstructionRevision,
+        versioned || requestedResponseRevision === settingsResponseRevision)
+      if (refreshAuxiliary) await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
+      if (refreshAuxiliary) lastError.value = ''
+    }).catch(error => { if (refreshAuxiliary) setError(error) }).finally(() => {
+      if (refreshAuxiliary) loading.value = false
       snapshotRequest = null
+      if (snapshotRefreshNeeded) { snapshotRefreshNeeded = false; requestSettingsRefresh() }
     })
     return snapshotRequest
   }
@@ -443,6 +496,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     try {
       const response = await productApi.saveAudioEnhancements({ [key]: requested })
+      if (response.settings_snapshot) applySettingsResult({ settings_snapshot: response.settings_snapshot })
       settings.audio_enhancements = { ...DEFAULT_SETTINGS.audio_enhancements!, ...response.settings }
     } catch (failure) {
       settings.audio_enhancements = {
@@ -470,7 +524,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
           return
         }
         const latestDrafts = { ...settings.compute.devices }
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         for (const id of Object.keys(draftsBefore) as ProductLocalModelId[]) {
           if (id !== selectedModelId || latestDrafts[id] !== submitted) {
             settings.compute.devices[id] = latestDrafts[id] ?? draftsBefore[id]
@@ -727,7 +781,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         const result = await productApi.saveSpeaker(submitted)
         const changed = SPEAKER_FIELDS.some(field => speakerForm[field.key] !== submitted[field.key])
           || speakerForm.mode !== submitted.mode || speakerForm.owner_only_barge_in !== submitted.owner_only_barge_in
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         if (!changed) Object.assign(speakerForm, settings.speaker)
         await refreshSpeaker()
         setNotice(result.message || '声纹设置已保存。')
@@ -747,7 +801,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.saveSpeaker(submitted)
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         await refreshSpeaker()
         setNotice(result.message || '声纹模式与主人打断设置已立即生效。')
       } catch (error) {
@@ -1226,7 +1280,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
           keywords,
           sensitivity: wakeForm.sensitivity,
         })
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         setNotice(result.message || 'KWS（关键词唤醒）设置已保存并立即生效。')
       } catch (error) {
         setError(error)
@@ -1241,7 +1295,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.saveSilence({ seconds: silenceSeconds.value })
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         setNotice(result.message || '静默设置已保存，当前计时窗口立即采用新时长。')
       } catch (error) {
         setError(error)
@@ -1256,7 +1310,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.saveQuietHours({ ...quietHoursForm })
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         setNotice(result.message || '被动静默时间已即时生效。')
       } catch (error) {
         setError(error)
@@ -1272,11 +1326,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.saveApprovals(desired)
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         savedApprovalSettings = { ...settings.approvals }
         setNotice(result.message || '授权确认设置已即时生效。')
       } catch (error) {
         Object.assign(settings.approvals, savedApprovalSettings)
+        requestSettingsRefresh()
         setError(error)
       } finally {
         saving.value = false
@@ -1290,10 +1345,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.saveShadow({ experimental_context_gate_enabled: desired })
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         setNotice(result.message || 'Shadow 上下文门禁设置已立即生效。')
       } catch (error) {
-        settings.shadow.experimental_context_gate_enabled = !desired
+        settings.shadow.experimental_context_gate_enabled = savedShadowGate
+        requestSettingsRefresh()
         setError(error)
       } finally {
         saving.value = false
@@ -1306,7 +1362,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       saving.value = true
       try {
         const result = await productApi.savePersona({ ...personaDocuments })
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         setNotice(result.message || '人格与用户资料已保存；新会话开始后生效。')
       } catch (error) {
         setError(error)
@@ -1327,7 +1383,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         }))
         const result = await productApi.saveCustomInstructions({ custom_instructions: submitted })
         const changed = JSON.stringify(customInstructions.value) !== draftSnapshot
-        updateSettingsFromResponse(settings, result)
+        applySettingsResult(result)
         if (!changed) customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
         setNotice(result.message || '自定义指令已保存，后续模型请求立即使用新内容。')
       } catch (error) {
@@ -1356,15 +1412,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     instructionRevision++; instructionWrites++
     try {
       return await enqueue(async () => {
-        const saved = settings.custom_instructions.map(item => ({ ...item, keywords: [...(item.keywords ?? [])] }))
-        const previous = saved.find(item => item.id === id)
+        const previous = settings.custom_instructions.find(item => item.id === id)
         if (operation === 'toggle' && !previous) return false
         if (operation !== 'delete' || previous) {
-          const entry = operation === 'toggle' ? { ...previous!, enabled: enabled! } : submitted
-          const next = operation === 'delete' ? saved.filter(item => item.id !== id)
-            : previous ? saved.map(item => item.id === id ? entry : item) : [...saved, entry]
-          const result = await productApi.saveCustomInstructions({ custom_instructions: next })
-          updateSettingsFromResponse(settings, result)
+          // 客户端只表达目标条目和操作；合并及最终判断由服务端执行。
+          const result = await productApi.saveCustomInstructions(operation === 'save' ? { operation, id, value: submitted }
+            : operation === 'toggle' ? { operation, id, enabled } : { operation, id })
+          applySettingsResult(result)
         }
         const current = customInstructions.value.find(item => item.id === id)
         const stored = settings.custom_instructions.find(item => item.id === id)
@@ -1378,6 +1432,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       })
     } catch (error) {
       instructionErrors.value[id] = error instanceof Error ? error.message : '指令保存失败，请重试。'
+      requestSettingsRefresh()
       return false
     } finally {
       instructionRevision++; instructionWrites--
@@ -1646,21 +1701,24 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   watch(voice.connection, value => {
+    if (value === 'connected') void loadSnapshot()
     if (remoteMode.value) {
       if (value === 'offline' && application.snapshot.value?.management_connected) {
         setError(new Error(voice.connectionError.value || '服务端语音实时通道已断开。'))
       }
       return
     }
-    if (value === 'connected') {
-      void loadSnapshot()
-    }
     if (value === 'offline' && application.businessReady.value) {
       setError(new Error(voice.connectionError.value || 'Voice Server 连接已关闭。'))
     }
   })
 
+  function refreshVisibleSettings() {
+    if (document.visibilityState === 'visible') requestSettingsRefresh()
+  }
+
   onMounted(() => {
+    document.addEventListener('visibilitychange', refreshVisibleSettings)
     connect()
     reconnectTimer = window.setInterval(() => {
       if (remoteMode.value) {
@@ -1752,6 +1810,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }, { flush: 'sync' })
 
   onBeforeUnmount(() => {
+    document.removeEventListener('visibilitychange', refreshVisibleSettings)
+    if (settingsRefreshTimer !== undefined) window.clearInterval(settingsRefreshTimer)
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
     if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
@@ -1767,6 +1827,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settingsTab,
     snapshot,
     settings,
+    applySettingsResult,
     computeStatus,
     computeSavedDevices,
     registry,

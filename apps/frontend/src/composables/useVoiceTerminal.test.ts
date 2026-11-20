@@ -30,6 +30,17 @@ function openTerminal(now?: () => number, latencyTimestamps?: () => boolean) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('从正式运行消息读取设置修订，忽略无效修订且不发送保存命令', () => {
+    const { terminal, socket } = openTerminal()
+    try {
+      const sent = socket.sent.length
+      socket.push('runtime.snapshot', 1, { product_settings: { instance_id: 'server', revision: 2 } })
+      expect(terminal.settingsSync.value).toEqual({ instance_id: 'server', revision: 2 })
+      socket.push('runtime.snapshot', 2, { product_settings: { instance_id: 'server', revision: -1 } })
+      expect(terminal.settingsSync.value?.revision).toBe(2)
+      expect(socket.sent).toHaveLength(sent)
+    } finally { terminal.dispose() }
+  })
   it('握手超时与错误都会进入可恢复离线状态，旧连接关闭不能影响新连接', () => {
     vi.useFakeTimers()
     const sockets: FakeSocket[] = []

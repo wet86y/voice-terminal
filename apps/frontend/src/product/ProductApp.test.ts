@@ -21,7 +21,7 @@ import { provideProductContext } from './product-context'
 import { useWorkspaceResources } from './useWorkspaceResources'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
-import type { ProductComputeStatus } from './types'
+import type { CustomInstruction, ProductComputeStatus } from './types'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { APPLICATION_EXIT_EVENT } from '../runtime/application-motion'
 const application = {
@@ -72,6 +72,16 @@ function deferred<T>() {
   const promise = new Promise<T>(done => { resolve = done })
   return { promise, resolve }
 }
+function instructionService(entries: CustomInstruction[]) {
+  let saved = structuredClone(entries)
+  return (body: unknown) => {
+    const value = body as { operation: 'save' | 'toggle' | 'delete'; id: string; value?: CustomInstruction; enabled?: boolean }
+    if (value.operation === 'delete') saved = saved.filter(item => item.id !== value.id)
+    else if (value.operation === 'toggle') saved = saved.map(item => item.id === value.id ? { ...item, enabled: value.enabled! } : item)
+    else saved = saved.some(item => item.id === value.id) ? saved.map(item => item.id === value.id ? structuredClone(value.value!) : item) : [...saved, structuredClone(value.value!)]
+    return { settings: { custom_instructions: structuredClone(saved) } }
+  }
+}
 function liveAdapter() {
   let value!: ReturnType<typeof useProductAdapter>
   const wrapper = render({ setup() { value = useProductAdapter(); return () => h('div') } })
@@ -110,6 +120,88 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('进入设置和恢复远程连接时重新读取服务端设置', async () => {
+    application.snapshot.value = { remote_mode: true, management_connected: true } as never
+    const { value } = liveAdapter(); allowBusinessReady(value); await flushPromises()
+    const latest = structuredClone(DEFAULT_SETTINGS); latest.shadow.experimental_context_gate_enabled = true
+    const read = vi.mocked(productApi.snapshot).mockClear().mockResolvedValue({ settings: latest, models: DEFAULT_REGISTRY } as never)
+    value.page.value = 'settings'; value.settingsTab.value = 'persona'; await flushPromises()
+    expect(read).toHaveBeenCalledOnce()
+    expect(value.settings.shadow.experimental_context_gate_enabled).toBe(true)
+    read.mockClear()
+    value.voice.connection.value = 'offline'; await flushPromises()
+    value.voice.connection.value = 'connected'; await flushPromises()
+    expect(read).toHaveBeenCalledOnce()
+  })
+  it('服务端修订通知到达读取期间时，在旧读取结束后补读最新结果', async () => {
+    const { value } = liveAdapter(); allowBusinessReady(value); await flushPromises()
+    const old = deferred<Awaited<ReturnType<typeof productApi.snapshot>>>()
+    const latest = structuredClone(DEFAULT_SETTINGS)
+    latest.sync = { instance_id: 'server', revision: 2 }; latest.shadow.experimental_context_gate_enabled = true
+    const read = vi.mocked(productApi.snapshot).mockClear().mockReturnValueOnce(old.promise)
+      .mockResolvedValue({ settings: latest, models: DEFAULT_REGISTRY } as never)
+    const reading = value.loadSnapshot()
+    value.voice.settingsSync.value = latest.sync; await flushPromises()
+    old.resolve({ settings: { ...structuredClone(DEFAULT_SETTINGS), sync: { instance_id: 'server', revision: 1 } }, models: DEFAULT_REGISTRY } as never)
+    await reading; await flushPromises()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(value.settings.sync).toEqual(latest.sync)
+    expect(value.settings.shadow.experimental_context_gate_enabled).toBe(true)
+  })
+  it('保存最终回执优先于旧读取及旧回执字段，旧实例快照也不能回写', async () => {
+    const value = await adapter(); application.businessReady.value = true
+    const old = deferred<Awaited<ReturnType<typeof productApi.snapshot>>>()
+    const read = vi.spyOn(productApi, 'snapshot').mockReturnValueOnce(old.promise)
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({}); vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+    vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never); vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+    const reading = value.loadSnapshot()
+    const latest = structuredClone(DEFAULT_SETTINGS)
+    latest.sync = { instance_id: 'old-server', revision: 3 }; latest.shadow.experimental_context_gate_enabled = true
+    vi.spyOn(productApi, 'saveShadow').mockResolvedValue({ settings: { shadow: { experimental_context_gate_enabled: false } }, settings_snapshot: latest })
+    value.settings.shadow.experimental_context_gate_enabled = true; await value.saveShadowGate()
+    old.resolve({ settings: { ...structuredClone(DEFAULT_SETTINGS), sync: { instance_id: 'old-server', revision: 2 } }, models: DEFAULT_REGISTRY } as never)
+    await reading
+    expect(value.settings.shadow.experimental_context_gate_enabled).toBe(true)
+    const restarted = structuredClone(latest); restarted.sync = { instance_id: 'new-server', revision: 0 }
+    read.mockResolvedValueOnce({ settings: restarted, models: DEFAULT_REGISTRY } as never); await value.loadSnapshot()
+    read.mockResolvedValueOnce({ settings: { ...structuredClone(DEFAULT_SETTINGS), sync: { instance_id: 'old-server', revision: 10 } }, models: DEFAULT_REGISTRY } as never)
+    await value.loadSnapshot()
+    expect(value.settings.sync).toEqual(restarted.sync)
+    expect(value.settings.shadow.experimental_context_gate_enabled).toBe(true)
+  })
+  it('完整保存回执更新未编辑表单，保留另一条指令的正文草稿并同步开关', async () => {
+    const { value } = liveAdapter(); allowBusinessReady(value); await flushPromises()
+    const first: CustomInstruction = { id: 'first', name: '第一条', trigger: '静默', instruction: '执行静默', target: 'shadow', enabled: true, keywords: ['静默'] }
+    const second = { ...first, id: 'second', name: '第二条' }
+    value.settings.custom_instructions = structuredClone([first, second]); value.customInstructions.value = structuredClone([first, second])
+    value.customInstructions.value[0].instruction = '保留未提交的编辑'
+    const latest = structuredClone(DEFAULT_SETTINGS)
+    latest.custom_instructions = [{ ...first, enabled: false }, { ...second, enabled: false }]
+    latest.wake.sensitivity = 80; latest.quiet_hours!.start = '22:00'; latest.speaker.confirm_threshold = .7
+    latest.persona.user = '服务端新资料'; latest.silence.seconds = 60
+    vi.spyOn(productApi, 'saveSilence').mockResolvedValue({ settings_snapshot: latest })
+    value.silenceSeconds.value = 60; await value.saveSilence()
+    expect(value.wakeForm.sensitivity).toBe(80); expect(value.quietHoursForm.start).toBe('22:00')
+    expect(value.speakerForm.confirm_threshold).toBe(.7); expect(value.personaDocuments.user).toBe('服务端新资料')
+    expect(value.customInstructions.value[0].instruction).toBe('保留未提交的编辑')
+    expect(value.customInstructions.value.map(item => item.enabled)).toEqual([false, false])
+    vi.mocked(productApi.snapshot).mockResolvedValue({ settings: latest, models: DEFAULT_REGISTRY } as never)
+    await value.loadSnapshot()
+    expect(value.wakeForm.sensitivity).toBe(80); expect(value.customInstructions.value[0].instruction).toBe('保留未提交的编辑')
+  })
+  it('单条请求交由服务端合并，客户端旧列表不会覆盖服务端其它指令', async () => {
+    const first: CustomInstruction = { id: 'first', name: '第一条', trigger: '静默', instruction: '执行静默', target: 'shadow', enabled: true, keywords: [] }
+    const second = { ...first, id: 'second', name: '第二条' }
+    const service = instructionService([first, second])
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => service(body))
+    const a = await adapter(), b = await adapter()
+    for (const value of [a, b]) { value.settings.custom_instructions = structuredClone([first, second]); value.customInstructions.value = structuredClone([first, second]) }
+    a.customInstructions.value[0].name = '服务端接受第一项'; await a.saveInstructionEntry('first')
+    b.customInstructions.value[1].name = '服务端接受第二项'; await b.saveInstructionEntry('second')
+    expect(save.mock.calls[1][0]).toMatchObject({ operation: 'save', id: 'second' })
+    expect(b.settings.custom_instructions.map(item => item.name)).toEqual(['服务端接受第一项', '服务端接受第二项'])
+  })
+
   it('任务页保持打开时刷新到期状态，离开页面与卸载后停止轮询', async () => {
     const { value, wrapper } = liveAdapter()
     allowBusinessReady(value)
@@ -1924,16 +2016,17 @@ describe('正式界面的真实控件交互', () => {
     value.customInstructions.value = structuredClone([first, second])
     value.customInstructions.value[0].name = ' 静默模式 '
     value.customInstructions.value[1].trigger = '' // 不合法的其它草稿不阻止本条保存。
-    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+    const service = instructionService([first, second])
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => service(body))
     expect(await value.saveInstructionEntry('first')).toBe(true)
-    expect(save.mock.calls[0][0]).toMatchObject({ custom_instructions: [{ ...first, name: '静默模式' }, second] })
+    expect(save.mock.calls[0][0]).toEqual({ operation: 'save', id: 'first', value: { ...first, name: '静默模式' } })
     expect(value.customInstructions.value[1].trigger).toBe('')
     value.customInstructions.value[0].instruction = '尚未保存的目标'
     expect(await value.toggleInstructionEntry('first', false)).toBe(true)
-    expect(save.mock.calls[1][0]).toMatchObject({ custom_instructions: [{ instruction: '提前静默', enabled: false }, second] })
+    expect(save.mock.calls[1][0]).toEqual({ operation: 'toggle', id: 'first', enabled: false })
     expect(value.customInstructions.value[0].instruction).toBe('尚未保存的目标')
     expect(await value.deleteInstructionEntry('first')).toBe(true)
-    expect(save.mock.calls[2][0]).toEqual({ custom_instructions: [second] })
+    expect(save.mock.calls[2][0]).toEqual({ operation: 'delete', id: 'first' })
     expect(value.customInstructions.value.map(item => item.id)).toEqual(['second'])
     expect(value.customInstructions.value[0].trigger).toBe('')
   })
@@ -1946,12 +2039,13 @@ describe('正式界面的真实控件交互', () => {
     value.customInstructions.value[0].name = '第一条'
     value.customInstructions.value[1].name = '第二条'
     const response = deferred<Awaited<ReturnType<typeof productApi.saveCustomInstructions>>>()
+    const service = instructionService([first, second])
     const save = vi.spyOn(productApi, 'saveCustomInstructions').mockReturnValueOnce(response.promise)
-      .mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+      .mockImplementation(async body => service(body))
     const a = value.saveInstructionEntry('first'); const b = value.saveInstructionEntry('second')
     await flushPromises()
     expect(save).toHaveBeenCalledTimes(1)
-    response.resolve({ settings: structuredClone(save.mock.calls[0][0]) } as never)
+    response.resolve(service(save.mock.calls[0][0]))
     expect(await a).toBe(true); expect(await b).toBe(true)
     expect(value.settings.custom_instructions.map(item => item.name)).toEqual(['第一条', '第二条'])
     save.mockRejectedValueOnce(new Error('保存失败'))
@@ -1974,7 +2068,8 @@ describe('正式界面的真实控件交互', () => {
     value.settings.custom_instructions = structuredClone([first, second])
     value.customInstructions.value = structuredClone([first, second])
     const reading = value.loadSnapshot()
-    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => ({ settings: structuredClone(body) }) as never)
+    const service = instructionService([first, second])
+    const save = vi.spyOn(productApi, 'saveCustomInstructions').mockImplementation(async body => service(body))
     value.customInstructions.value[0].name = '新名称'
     expect(await value.saveInstructionEntry('first')).toBe(true)
     response.resolve({ settings: { ...structuredClone(DEFAULT_SETTINGS), custom_instructions: [first, second] }, models: structuredClone(DEFAULT_REGISTRY) } as never)
@@ -1983,7 +2078,8 @@ describe('正式界面的真实控件交互', () => {
     expect(value.customInstructions.value[0].name).toBe('新名称')
     value.customInstructions.value[1].name = '另一条'
     await value.saveInstructionEntry('second')
-    expect(save.mock.calls[1][0]).toMatchObject({ custom_instructions: [{ name: '新名称' }, { name: '另一条' }] })
+    expect(save.mock.calls[1][0]).toMatchObject({ operation: 'save', id: 'second', value: { name: '另一条' } })
+    expect(value.settings.custom_instructions.map(item => item.name)).toEqual(['新名称', '另一条'])
   })
   it('新建指令展开，保存校验只针对本条，取消新建不发送请求', async () => {
     const { value } = liveControls()

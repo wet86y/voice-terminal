@@ -38,6 +38,18 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect((control.element as HTMLInputElement).checked).toBe(false)
     wrapper.unmount()
   })
+  it('语音调节以服务端最终快照为准，不用请求目标或旧回执字段覆盖结论', async () => {
+    vi.spyOn(productApi, 'saveTts').mockResolvedValue({
+      settings: { tts: { speech_control_enabled: false } },
+      settings_snapshot: { tts: { speech_control_enabled: true } },
+    } as never)
+    const wrapper = render()
+    const control = wrapper.get('input[aria-label="语音调节"]')
+    await control.setValue(false); await flushPromises()
+    expect(settings.tts.speech_control_enabled).toBe(true)
+    expect((control.element as HTMLInputElement).checked).toBe(true)
+    wrapper.unmount()
+  })
   it('语音调节保存失败恢复原开关，显式关闭值不会被缺省值覆盖', async () => {
     settings.tts.speech_control_enabled = false
     vi.spyOn(productApi, 'saveTts').mockRejectedValue(new Error('设置无法保存'))

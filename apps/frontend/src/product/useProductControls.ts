@@ -23,6 +23,13 @@ import type { FloatingSessionAction } from './floating-window';
 export function useProductControls() {
   const adapter = useProductAdapter();
   const hotwordControls = useHotwordSettings(message => adapter.setNotice(message));
+  let hotwordSyncKey = ''; // hotwordSyncKey（热词页已处理的服务端设置修订）。
+  watch([() => adapter.settings.sync ? `${adapter.settings.sync.instance_id}:${adapter.settings.sync.revision}` : '',
+    hotwordControls.hotwordLoaded, hotwordControls.hotwordBusy], ([key, loaded, busy]) => {
+    if (!key || !loaded || busy || key === hotwordSyncKey) return;
+    hotwordSyncKey = key;
+    void hotwordControls.refreshHotwords();
+  });
   const applicationHost = useApplicationHost();
   const { snapshot: applicationSnapshot } = applicationHost;
   onMounted(() => {
@@ -1712,6 +1719,7 @@ export function useProductControls() {
   const floatingModel = useFloatingWindowProjection(voice, workbenchModel);
   return {
     ...hotwordControls,
+    applySettingsResult: adapter.applySettingsResult,
     floatingModel,
     floatingSessionAction,
     current,

@@ -2028,6 +2028,34 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         )
 
     @app.middleware("http")
+    async def settings_authority(request: Request, call_next):
+        """settings_authority（设置提交依据）：同项请求串行，以服务端最终快照结算。"""
+        path = request.url.path
+        if product_settings is None or request.method != "PUT" or path not in settings_request_locks:
+            return await call_next(request)
+        async with settings_request_locks[path]:
+            try:
+                response = await call_next(request)
+                if response.status_code < 300:
+                    content = b"".join([chunk async for chunk in response.body_iterator])
+                    payload = json.loads(content)
+                    # settings_snapshot（最终设置快照）：保留原回执形状，统一追加服务端依据。
+                    payload["settings_snapshot"] = product_settings.snapshot()
+                    response = JSONResponse(payload, status_code=response.status_code,
+                        headers={key: value for key, value in response.headers.items()
+                                 if key.lower() not in {"content-length", "content-type"}})
+                return response
+            finally:
+                # 复用已登记的 runtime.snapshot（运行快照），失败恢复后的修订也通知所有连接。
+                try:
+                    await runtime.bus.publish(runtime.snapshot())
+                except Exception:
+                    logger.warning("product.settings_notice_failed", exc_info=True)
+
+    settings_request_locks = {path: asyncio.Lock() for operation, (method, path, _) in DEVICE_MANAGEMENT_OPERATIONS.items()
+                              if operation.startswith("settings.") and method == "PUT"}  # settings_request_locks（同项设置提交锁）。
+
+    @app.middleware("http")
     async def startup_gate(request: Request, call_next):
         """startup_gate（启动门禁）：允许设置与查询，声纹采集等待模型加载结束。"""
         if (getattr(runtime, "application_initializing", False) is True
@@ -4239,10 +4267,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.put("/api/v1/product/settings/custom-instructions")
     async def update_custom_instructions(body: dict[str, Any]) -> dict[str, Any]:
         try:
-            if set(body) != {"custom_instructions"}:
-                raise ProductSettingsError("请求字段必须是 custom_instructions（自定义指令列表）。")
             store = product_store_or_404()
-            value = await asyncio.to_thread(store.save_custom_instructions, body["custom_instructions"])
+            if set(body) == {"custom_instructions"}:
+                value = await asyncio.to_thread(store.save_custom_instructions, body["custom_instructions"])
+            else:
+                value = await asyncio.to_thread(store.mutate_custom_instruction, body)
             await runtime.refresh_custom_instruction_settings()
             return {
                 "settings": {"custom_instructions": value["custom_instructions"]},

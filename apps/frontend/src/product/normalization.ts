@@ -2,6 +2,7 @@ import { SPEAKER_DEFAULTS } from "./speaker-policy"
 import type { ShadowProductSnapshot } from '../types'
 import type { CustomInstruction, DshRuntimeStatus, ProductAssignments, ProductLocalModelId, ProductModelRegistry, ProductMutationResult, ProductOnlineTtsModelId, ProductRuntimeState, ProductSettingsSnapshot } from './types'
 import { isRecord } from '../record'
+import { readSettingsSync } from './settings-sync'
 
 const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 
@@ -90,6 +91,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const onlineVoiceId = text(tts.online_voice_id).trim() || DEFAULT_SETTINGS.tts.online_voice_id!
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
+    sync: readSettingsSync(value.sync),
     audio_enhancements: Object.fromEntries(['dual_pass', 'emotion', 'acoustic_events'].map(key =>
       [key, !isRecord(value.audio_enhancements) || value.audio_enhancements[key] !== false])) as ProductSettingsSnapshot['audio_enhancements'],
     quiet_hours: { enabled: quiet.enabled === true, start: text(quiet.start) || '23:00', end: text(quiet.end) || '07:00' },
@@ -178,8 +180,13 @@ export function normalizeRuntimeState(value: string | undefined, connected: bool
   return 'standby'
 }
 export function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: ProductMutationResult) {
-  const candidate: unknown = result.settings
+  const candidate: unknown = result.settings_snapshot ?? result.settings
   if (!isRecord(candidate)) return
+  const sync = readSettingsSync(candidate.sync)
+  if (sync) settings.sync = sync
+  if (typeof candidate.schema_version === 'number') settings.schema_version = candidate.schema_version
+  if (isRecord(candidate.audio_enhancements)) settings.audio_enhancements = { ...settings.audio_enhancements!, ...candidate.audio_enhancements }
+  if (isRecord(candidate.inference)) settings.inference = candidate.inference as ProductSettingsSnapshot['inference']
   if (isRecord(candidate.screen_capture)) settings.screen_capture = candidate.screen_capture as unknown as ProductSettingsSnapshot["screen_capture"]
   if (isRecord(candidate.wake)) Object.assign(settings.wake, candidate.wake)
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)

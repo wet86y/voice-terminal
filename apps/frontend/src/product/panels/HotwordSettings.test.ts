@@ -35,6 +35,21 @@ describe('HotwordSettings（热词编辑页）', () => {
     expect(reopened.text()).not.toContain('有未保存的修改')
     reopened.unmount()
   })
+  it('服务端更新后补读未编辑的热词，未提交的输入不会被后台刷新覆盖', async () => {
+    const wrapper = mount(HotwordSettings); await flushPromises()
+    const read = vi.mocked(productApi.hotwords)
+    read.mockResolvedValue({ settings: { enabled: false, stream_enabled: true, threshold: .8,
+      entries: [{ word: '服务端词条', aliases: [], blacklist: [] }] }, status: 'ready' })
+    await controls.refreshHotwords(); await flushPromises()
+    expect(controls.hotwordForm.enabled).toBe(false)
+    expect(controls.hotwordForm.entries[0].word).toBe('服务端词条')
+    await wrapper.get('[aria-label="目标词 1"]').setValue('未提交编辑')
+    read.mockClear()
+    await controls.refreshHotwords()
+    expect(read).not.toHaveBeenCalled()
+    expect(controls.hotwordForm.entries[0].word).toBe('未提交编辑')
+    wrapper.unmount()
+  })
 
   it('导入合并相同目标，解析失败保留现有词表，试测不保存', async () => {
     const wrapper = mount(HotwordSettings)

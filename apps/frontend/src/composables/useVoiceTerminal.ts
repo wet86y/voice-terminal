@@ -35,6 +35,7 @@ import type {
 import { TERMINAL_STATES } from '../types'
 import { ConversationLog, readConversationEntry } from '../conversation-log'
 import { isRecord } from '../record'
+import { readSettingsSync } from '../product/settings-sync'
 import type { DeviceState } from '../product/device-state'
 import { MAX_SHADOW_ACTIVITIES, trimShadowActivities, isNonNegativeInteger, isAgentTrace, isSpeechOutput, isTerminalState, readString, readDelivery, createEmptyCurrentTurn, createEmptyLatency, createOfflineStatuses, createEmptyShadowProduct, readShadowActivity, readShadowProduct, parseServerMessage, copyLatencyValues } from './voiceTerminalProjection'
 
@@ -79,6 +80,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const inputPaused = ref(false) // inputPaused（自动暂停监听中）。
   const listeningRequested = ref(false) // listeningRequested（恢复监听意图）。
   const runtimeOperations = ref<import('../runtime/runtime-operations').RuntimeOperation[]>([])
+  const settingsSync = ref<import('../product/types').SettingsSyncState>() // settingsSync（服务端设置修订通知）。
   const canStart = ref(false)
   const devices = shallowRef<DeviceState | null>(null)
   const ownDevice = computed(() => devices.value?.devices.find(device => device.device_id === devices.value?.self_device_id))
@@ -887,6 +889,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyRuntimeSnapshot(payload: RuntimeSnapshotPayload, turnId: string | null) {
+    const sync = readSettingsSync(payload.product_settings)
+    if (sync && (sync.instance_id !== settingsSync.value?.instance_id || sync.revision !== settingsSync.value?.revision)) settingsSync.value = sync
     if (Array.isArray(payload.runtime_operations)) runtimeOperations.value = payload.runtime_operations
     inputPaused.value = payload.input_paused === true
     listeningRequested.value = payload.listening_requested ?? payload.listening
@@ -1485,6 +1489,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     inputPaused,
     listeningRequested,
     runtimeOperations,
+    settingsSync,
     canStart,
     devices,
     ownDevice,

@@ -180,7 +180,13 @@ export interface ScreenCaptureSettings {
   global_max_edge: number // global_max_edge（全局图最长边）。
   app_overrides: Array<{ executable: string; mode: 'auto' | 'cursor' | 'center' }> // app_overrides（文件名与中心模式规则）。
 }
+/** SettingsSyncState（服务端设置依据）：随存储实例重置，不改变持久设置格式。 */
+export interface SettingsSyncState {
+  instance_id: string // instance_id（服务端设置存储实例编号）。
+  revision: number // revision（该实例已成功保存的设置修订）。
+}
 export interface ProductSettingsSnapshot {
+  sync?: SettingsSyncState // sync（服务端设置依据），兼容旧回执省略。
   inference?: { backend: InferenceBackend } // inference（已保存的推理选择）。
   /** audio_enhancements（音频增强）：三个独立开关，兼容旧快照省略。 */
   audio_enhancements?: { dual_pass: boolean; emotion: boolean; acoustic_events: boolean }
@@ -388,6 +394,7 @@ export interface ProductSnapshot {
 }
 
 export interface ProductMutationResult {
+  settings_snapshot?: ProductSettingsSnapshot // settings_snapshot（服务端结算后的完整设置快照）。
   settings?: ProductSettingsSnapshot | Record<string, unknown>
   effective_from?: 'immediate' | 'components_ready' | 'next_request' | 'next_session' | 'retry_required' | 'application_restart' | string // effective_from（生效时机）：即时、加载结束、后续请求、新会话、重试或重启。
   pending?: boolean // pending（待生效标记）：设置已保存但尚未作用于当前会话。

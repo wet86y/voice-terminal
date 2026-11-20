@@ -5,6 +5,7 @@ import type {
   ProductMutationResult,
   ProductComputeDeviceSwitch,
   ProductSnapshot,
+  ProductSettingsSnapshot,
   WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductMinimaxVoiceName, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
@@ -440,10 +441,24 @@ async function readError(response: Response): Promise<ProductApiError> {
   return new ProductApiError(`请求失败（HTTP ${response.status}）。`, response.status)
 }
 
+function productRequestScope() {
+  const application = typeof window === 'undefined' ? undefined : window.__VOICE_APPLICATION__
+  return JSON.stringify([application?.remote_mode === true, application?.host_id,
+    application?.endpoint_revision, application?.voice_api_url])
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const scope = productRequestScope() // scope（本次请求的服务端及连接代次）。
+  const checkScope = () => {
+    if (scope !== productRequestScope()) throw new ProductApiError(
+      '请求目标已变化，请刷新当前服务端状态；原请求结果以原服务端为准。', 409,
+      undefined, 'STALE_SERVICE_TARGET')
+  }
   let response: Response
   try {
-    if (await remoteModeSelected()) {
+    const remote = await remoteModeSelected()
+    checkScope()
+    if (remote) {
       response = await remoteProductResponse(path, init)
     } else {
       response = await fetch(`${apiBaseUrl()}${path}`, {
@@ -459,8 +474,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (error instanceof ProductApiError) throw error
     throw new ProductApiError(error instanceof Error ? error.message : '无法连接 Voice Server。')
   }
+  checkScope()
   if (!response.ok) throw await readError(response)
-  return await response.json() as T
+  const result = await response.json() as T
+  checkScope()
+  return result
 }
 
 function jsonBody(value: unknown): RequestInit {
@@ -590,7 +608,7 @@ export const productApi = {
   /** 保存并即时切换当前详情页支持的本地模型设备。 */
   saveCompute: (value: ProductComputeDeviceSwitch) => request<ProductMutationResult>('/api/v1/product/settings/compute', jsonBody(value)),
   /** saveAudioEnhancements（事务切换音频增强）。 */
-  saveAudioEnhancements: (value: Record<string, boolean>) => request<{ settings: NonNullable<import('./types').ProductSettingsSnapshot['audio_enhancements']>; message: string }>('/api/v1/product/settings/audio-enhancements', jsonBody(value)),
+  saveAudioEnhancements: (value: Record<string, boolean>) => request<{ settings: NonNullable<import('./types').ProductSettingsSnapshot['audio_enhancements']>; message: string; settings_snapshot?: ProductSettingsSnapshot }>('/api/v1/product/settings/audio-enhancements', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */
   saveTts: (value: Partial<ProductTtsSettings>) => request<ProductMutationResult>('/api/v1/product/settings/tts', jsonBody(value)),
   /** minimaxVoiceName（查询 MiniMax 在线音色名称）：密钥仅由 Voice Server 使用。 */

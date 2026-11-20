@@ -29,8 +29,8 @@ export function useHotwordSettings(notify: (message: string) => void) {
   let editRevision = 0 // editRevision（防止迟到响应覆盖本地编辑）。
   function message(error: unknown) { return error instanceof Error ? error.message : String(error) }
   function changed() { editRevision++; hotwordPreview.value = null; hotwordImportPreview.value = null }
-  async function loadHotwords() {
-    if (hotwordLoaded.value || hotwordLoading.value) return
+  async function readHotwords(refresh = false) {
+    if (hotwordLoaded.value && !refresh || hotwordLoading.value) return
     hotwordLoading.value = true
     hotwordError.value = ''
     const revision = editRevision
@@ -41,6 +41,11 @@ export function useHotwordSettings(notify: (message: string) => void) {
       hotwordLoaded.value = true
     } catch (error) { hotwordError.value = message(error) }
     finally { hotwordLoading.value = false }
+  }
+  function loadHotwords() { return readHotwords() }
+  async function refreshHotwords() {
+    if (hotwordDirty.value || hotwordBusy.value) return
+    await readHotwords(true)
   }
   async function saveHotwords() {
     if (hotwordBusy.value || !hotwordLoaded.value) return
@@ -160,7 +165,7 @@ export function useHotwordSettings(notify: (message: string) => void) {
     return listDrafts.get(entry)?.[field] ?? entry[field].join('；')
   }
   return { hotwordForm, hotwordLoading, hotwordSaving, hotwordTesting, hotwordError, hotwordTestText,
-    hotwordPreview, hotwordLoaded, hotwordDirty, hotwordBusy, loadHotwords, saveHotwords, importHotwords,
+    hotwordPreview, hotwordLoaded, hotwordDirty, hotwordBusy, loadHotwords, refreshHotwords, saveHotwords, importHotwords,
     hotwordJsonLoading, hotwordJsonSaving, hotwordJsonReady, hotwordJsonBusy, hotwordJsonText,
     hotwordJsonDraftConflict, hotwordJsonError, loadHotwordJson, saveHotwordJson,
     hotwordImportPreview, applyHotwordImport,

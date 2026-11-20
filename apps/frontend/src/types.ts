@@ -235,6 +235,7 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  product_settings?: { instance_id: string; revision: number; warnings?: string[] } // product_settings（设置依据及警告）：instance_id（存储实例编号）、revision（保存修订）。
   inference?: InferenceSnapshot // inference（当前实际模型及切换状态）。
   runtime_operations?: import('./runtime/runtime-operations').RuntimeOperation[] // 运行操作快照。
   input_paused?: boolean // input_paused（维护操作暂时停听）。

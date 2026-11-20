@@ -341,6 +341,17 @@ class ProductSettingsRuntimeMixin:
         # compute（模型运行设备）有独立的应用重启契约，不能被其他设置顺带加载。
         live_sections = {key: pending[key] for key in ("wake", "silence", "quiet_hours", "speaker", "screen_capture") if key in pending}
         next_config = replace(apply_settings_to_config(previous, live_sections), compute=previous.compute)
+        changed_fields = [name for name in ("wake", "quiet_hours", "speaker", "screen_capture")
+                          if getattr(next_config, name) != getattr(previous, name)]  # changed_fields（本次实际变更的运行字段）。
+        silence_changed = next_config.agent.final_silence_ms != previous.agent.final_silence_ms
+
+        def merge_live_config(source):
+            """只更新本次负责的变更，保留等待期间其他设置的服务端结论。"""
+            updates = {name: getattr(source, name) for name in changed_fields}
+            if silence_changed:
+                updates["agent"] = replace(self.config.agent, final_silence_ms=source.agent.final_silence_ms)
+            if updates:
+                self.config = replace(self.config, **updates)
         wake_changed = next_config.wake != previous.wake
         old_worker = self.kws
         candidate = old_worker
@@ -361,12 +372,13 @@ class ProductSettingsRuntimeMixin:
                 episode = getattr(self.controller, "episode", None)
                 if episode is not None:
                     episode.invalidate_screen_capture()
-            self.config = next_config
-            self.quiet_policy.config = next_config.quiet_hours
+            # 模型加载期间其它设置可独立提交，只合并本入口负责的字段。
+            merge_live_config(next_config)
+            self.quiet_policy.config = self.config.quiet_hours
             self.state.wake_always_on = bool(next_config.wake.enabled)
             self.kws = candidate
             if self.controller is not None:
-                self.controller.set_agent_options(next_config.agent)
+                self.controller.set_agent_options(self.config.agent)
                 if wake_changed:
                     await self.controller.set_wake_settings(candidate, next_config.wake)
             if wake_changed:
@@ -389,13 +401,14 @@ class ProductSettingsRuntimeMixin:
             self.history.screen_capture.configure(previous.screen_capture)
             if candidate is not None and candidate is not old_worker:
                 await asyncio.to_thread(candidate.close)
-            self.config = previous
-            self.quiet_policy.config = previous.quiet_hours
+            if self.config is not previous:
+                merge_live_config(previous)
+            self.quiet_policy.config = self.config.quiet_hours
             self.kws = old_worker
             self._compute_models["kws"] = old_compute
             self.state.wake_always_on = bool(previous.wake.enabled)
             if self.controller is not None:
-                self.controller.set_agent_options(previous.agent)
+                self.controller.set_agent_options(self.config.agent)
                 if wake_changed:
                     await self.controller.set_wake_settings(old_worker, previous.wake)
             self.startup_errors = [item for item in self.startup_errors if not str(item).startswith("product_settings:")]

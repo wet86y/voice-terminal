@@ -10,7 +10,7 @@ import { useApplicationHost } from '../application-host'
 import { desktopPort } from '../desktop-port'
 import { useProductContext } from '../product-context'
 import { isRecord } from '../../record'
-import type { ProductLocalTtsModelId, ProductLocalTtsStatus, ProductOnlineTtsModelId, ProductTtsSettings } from '../types'
+import type { ProductLocalTtsModelId, ProductLocalTtsStatus, ProductMutationResult, ProductOnlineTtsModelId, ProductTtsSettings } from '../types'
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
 
 const props = withDefaults(defineProps<{ demo?: boolean }>(), { demo: false })
@@ -48,6 +48,21 @@ const status = computed(() => props.demo ? demoStatus : live.status.value)
 const readyModels = computed(() => status.value?.models.filter(item => item.available === true) ?? []) // readyModels（可启动的本地模型）。
 const selectedReady = computed(() => selected.value === 'minimax' || readyModels.value.some(item => item.id === selected.value))
 const options = reactive({ gpu_max_performance: settings.tts.gpu_max_performance ?? false, aniflive_chunk_optimization: settings.tts.aniflive_chunk_optimization ?? true, aniflive_first_audio_wait_ms: settings.tts.aniflive_first_audio_wait_ms ?? 0 })
+function applyTtsResult(result: ProductMutationResult) {
+  if (context?.applySettingsResult) context.applySettingsResult(result)
+  else {
+    const saved = result.settings_snapshot ?? result.settings
+    if (isRecord(saved) && isRecord(saved.tts)) Object.assign(settings.tts, saved.tts)
+  }
+  Object.assign(options, { gpu_max_performance: settings.tts.gpu_max_performance ?? false,
+    aniflive_chunk_optimization: settings.tts.aniflive_chunk_optimization ?? true,
+    aniflive_first_audio_wait_ms: settings.tts.aniflive_first_audio_wait_ms ?? 0 })
+}
+watch(() => [settings.tts.gpu_max_performance, settings.tts.aniflive_chunk_optimization, settings.tts.aniflive_first_audio_wait_ms], () => {
+  if (!savingQuality.value) Object.assign(options, { gpu_max_performance: settings.tts.gpu_max_performance ?? false,
+    aniflive_chunk_optimization: settings.tts.aniflive_chunk_optimization ?? true,
+    aniflive_first_audio_wait_ms: settings.tts.aniflive_first_audio_wait_ms ?? 0 })
+})
 const effective = computed(() => status.value?.backend === 'aniflive' ? status.value.local_model : 'minimax')
 const unavailable = computed(() => saving.value || !!status.value?.pending_selection)
 const targetSaveDisabled = computed(() => saving.value || !!status.value?.pending_selection || !selectedReady.value ||
@@ -82,9 +97,8 @@ async function setSpeechControl(enabled: boolean) {
   try {
     if (!props.demo) {
       const result = await productApi.saveTts({ speech_control_enabled: enabled })
-      if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+      applyTtsResult(result)
     }
-    settings.tts.speech_control_enabled = enabled
   } catch (failure) {
     settings.tts.speech_control_enabled = previous
     error.value = failure instanceof Error ? failure.message : '保存语音调节失败。'
@@ -110,7 +124,7 @@ async function applyTarget(choice: Choice) {
     }
     const result = await productApi.saveTts(choice === 'minimax' ? { backend: 'minimax' } : { backend: 'aniflive', local_model: choice })
     if (generation !== selectionGeneration) return
-    if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+    applyTtsResult(result)
     await live.refresh(true) // 切换结果不能被先前仍在途的状态读取覆盖。
   } catch (failure) {
     if (generation !== selectionGeneration) return
@@ -140,9 +154,9 @@ async function saveOption(key: keyof typeof options, value: boolean | number) {
   try {
     if (!props.demo) {
       const result = await productApi.saveTts({ [key]: value })
-      if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+      applyTtsResult(result)
     }
-    Object.assign(settings.tts, options)
+    else Object.assign(settings.tts, options)
   } catch (failure) {
     Object.assign(options, previous)
     error.value = failure instanceof Error ? failure.message : '保存本地合成选项失败。'
@@ -160,7 +174,7 @@ async function saveOnlineSettings() {
       return
     }
     const result = await productApi.saveTts({ online_model: onlineModelDraft.value, online_voice_id: voiceId })
-    if (isRecord(result.settings) && isRecord(result.settings.tts)) Object.assign(settings.tts, result.settings.tts)
+    applyTtsResult(result)
     await live.refresh(true)
   } catch (failure) {
     error.value = failure instanceof Error ? failure.message : '保存 MiniMax 在线模型与音色失败。'

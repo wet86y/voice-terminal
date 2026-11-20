@@ -2096,6 +2096,9 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
+        sync_state = getattr(getattr(self, "product_settings", None), "sync_state", None)
+        if callable(sync_state):
+            value.payload["product_settings"] = sync_state()  # product_settings（服务端设置实例与保存修订）。
         value.payload["audio_enhancements_switching"] = bool(getattr(self, "_enhancement_switching", False))
         operations = runtime_operations(self)
         value.payload["runtime_operations"] = operations.registry.snapshot()  # runtime_operations（运行操作状态）。
@@ -3247,7 +3250,6 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         """Apply the experimental timing gate without restarting the session."""
         value = bool(enabled)
         previous = self.config.shadow_agent.experimental_context_gate_enabled
-        old_config = self.config
         self.config = replace(
             self.config,
             shadow_agent=replace(
@@ -3261,7 +3263,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
                 if not value and isinstance(self.shadow_session, DshShadowAgentSession):
                     await self.shadow_session.flush_context_gate()
         except Exception:
-            self.config = old_config
+            self.config = replace(self.config, shadow_agent=replace(
+                self.config.shadow_agent, experimental_context_gate_enabled=previous))
             if self.shadow_session is not None:
                 self.shadow_session.set_context_gate_enabled(previous)
             raise

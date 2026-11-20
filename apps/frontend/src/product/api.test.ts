@@ -13,6 +13,19 @@ function expectRemoteRequest(args: Record<string, unknown> | undefined, operatio
 }
 
 describe('Product API（产品接口）地址', () => {
+  it('切换服务端后丢弃旧连接回执，不把旧服务端结果应用到新目标', async () => {
+    const application = { managed: true, origin: 'http://127.0.0.1:42123', voice_api_url: 'http://127.0.0.1:43876', voice_ws_url: 'ws://127.0.0.1:43876/ws', endpoint_revision: 1 }
+    window.__VOICE_APPLICATION__ = application
+    let resolve!: (response: Response) => void
+    const fetcher = vi.fn().mockReturnValue(new Promise<Response>(done => { resolve = done }))
+    vi.stubGlobal('fetch', fetcher)
+    const pending = productApi.saveShadow({ experimental_context_gate_enabled: true })
+    const rejected = expect(pending).rejects.toMatchObject({ status: 409, code: 'STALE_SERVICE_TARGET' })
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
+    application.endpoint_revision = 2
+    resolve(new Response(JSON.stringify({ settings: { shadow: { experimental_context_gate_enabled: true } } }), { status: 200 }))
+    await rejected
+  })
   it('拒绝缺失的 Host 地址，不回退到本机默认端口', () => {
     expect(() => apiBaseUrl()).toThrow('应用宿主尚未提供语音服务接口地址')
   })
