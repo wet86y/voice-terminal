@@ -138,16 +138,24 @@ impl NativeAudioProcessor {
     }
 
     /// update_playback_delay（更新播放参考延迟）：缓冲超限时关闭打断保护资格。
-    pub fn update_playback_delay(&mut self, buffered_ms: u64) -> Result<(), String> {
+    pub fn update_playback_delay(&mut self, buffered_ms: Option<u64>) -> Result<(), String> {
         if self.state != "ready" {
             return Err(self
                 .error
                 .clone()
                 .unwrap_or_else(|| "原生音频前处理不可用".into()));
         }
+        let Some(buffered_ms) = buffered_ms else {
+            self.protected_delay_valid = false;
+            self.playback_delay_ms = None;
+            return Ok(());
+        };
         self.protected_delay_valid = buffered_ms <= MAX_RENDER_DELAY_MS as u64;
         let delay_ms = buffered_ms.min(MAX_RENDER_DELAY_MS as u64) as u32;
-        self.aec.set_stream_delay_ms(delay_ms)?;
+        if let Err(error) = self.aec.set_stream_delay_ms(delay_ms) {
+            self.degrade(error.clone());
+            return Err(error);
+        }
         self.playback_delay_ms = Some(delay_ms);
         Ok(())
     }
@@ -329,7 +337,7 @@ mod tests {
             1
         );
         assert!(!processor.protected_interruption_available());
-        processor.update_playback_delay(40).unwrap();
+        processor.update_playback_delay(Some(40)).unwrap();
         assert!(processor.protected_interruption_available());
         assert_eq!(
             processor
@@ -345,7 +353,7 @@ mod tests {
         processor
             .push_playback_reference(32_000, &vec![0_i16; 320])
             .unwrap();
-        processor.update_playback_delay(900).unwrap();
+        processor.update_playback_delay(Some(900)).unwrap();
         assert!(!processor.protected_interruption_available());
         assert_eq!(processor.status()["playback_delay_ms"], 500);
     }
@@ -356,7 +364,7 @@ mod tests {
         processor
             .push_playback_reference(24_000, &vec![0_i16; 240])
             .unwrap();
-        processor.update_playback_delay(20).unwrap();
+        processor.update_playback_delay(Some(20)).unwrap();
         assert!(processor.protected_interruption_available());
         let before = processor.reverse_generation;
         let result = processor.process_capture(&capture_frame(true));

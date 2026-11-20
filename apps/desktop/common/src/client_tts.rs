@@ -226,7 +226,7 @@ pub struct MiniMaxTtsCancellation {
 impl MiniMaxTtsCancellation {
     /// request_cancel（请求取消）：真正结果仍由事件流中的 Cancelled/Failed 回执决定。
     pub fn request_cancel(&self) {
-        let _ = self.cancel.send(true);
+        self.cancel.send_replace(true);
     }
 
     /// is_cancelled（查询取消信号）：播放储备等待可以在合成结束前退出。
@@ -320,7 +320,7 @@ impl MiniMaxTtsHandle {
 
     /// request_cancel（请求取消）：取消结果仍须等待 Cancelled（云端确认）或 Failed（结果未知）。
     pub fn request_cancel(&self) {
-        let _ = self.cancel.send(true);
+        self.cancel.send_replace(true);
     }
 
     /// join（收拢合成任务）：只在终态事件被消费后调用。
@@ -1074,6 +1074,10 @@ mod tests {
         handle.join().await.unwrap();
         server.await.unwrap();
         assert!(audio_seen && alignment_seen && segment_seen && complete_seen);
+        // 供应商已经退出，此信号仍须通知设备尾音等待停止。
+        let cancellation = handle.cancellation_handle();
+        cancellation.request_cancel();
+        assert!(cancellation.is_cancelled());
     }
 
     #[tokio::test]

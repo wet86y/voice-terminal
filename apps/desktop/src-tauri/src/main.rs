@@ -206,7 +206,7 @@ impl PlaybackSnapshotBaseline {
 }
 
 #[cfg(feature = "ssh-device")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PlaybackSnapshotView {
     enqueued_ms: u64,         // enqueued_ms（设备累计接受时长）。
     played_ms: u64,           // played_ms（已提交给 WASAPI 的累计时长）。
@@ -223,6 +223,13 @@ struct ClientTtsPlaybackLedger {
     accepted_samples: u64,              // accepted_samples（该事务已加入原生播放器的累计样本数）。
     played_samples: u64,                // played_samples（该事务已经确认输出的累计样本数）。
     baseline: PlaybackSnapshotBaseline, // baseline（首次入队前采集的设备时钟基线）。
+}
+
+#[cfg(feature = "ssh-device")]
+#[derive(Clone)]
+struct RemotePlaybackStopReceipt {
+    snapshot: serde_json::Value, // snapshot（用于通用停播任务的设备快照）。
+    client_tts: Option<voice_desktop_common::device_protocol::ClientTtsPlaybackProgress>, // client_tts（直放停播时的精确采样进度）。
 }
 
 #[cfg(feature = "ssh-device")]
@@ -317,6 +324,7 @@ struct RemotePlaybackControlState {
     control_uncertain: bool, // control_uncertain（暂停/恢复结果未知时隔离后续 PCM）。
     stopped_keys: HashSet<String>, // stopped_keys（已确认停止并丢弃迟到帧的播放键）。
     stopped_key_order: VecDeque<String>, // stopped_key_order（已停止播放键的有界淘汰顺序）。
+    stopped_receipts: HashMap<String, RemotePlaybackStopReceipt>, // stopped_receipts（已确认停止的原始回执）。
     replaced_keys: HashSet<String>, // replaced_keys（已进入替换事务并丢弃迟到帧的旧播放键）。
     replaced_key_order: VecDeque<String>, // replaced_key_order（已替换播放键的有界淘汰顺序）。
     pending_replacement: Option<RemoteReplacementBinding>, // pending_replacement（需按设备事实结算的单一替换事务）。
@@ -324,25 +332,47 @@ struct RemotePlaybackControlState {
     settled_replacement_order: VecDeque<String>, // settled_replacement_order（替换回执的有界淘汰顺序）。
     baselines: HashMap<String, PlaybackSnapshotBaseline>, // baselines（播放键开始前的设备快照）。
     samples: HashMap<String, (u32, u64)>,        // samples（各播放键采样率与实际接收入队采样数）。
+    client_tts: HashMap<String, ClientTtsPlaybackLedger>, // client_tts（同一媒体租约内的直放采样台账）。
+    client_tts_cancellation: Option<(String, voice_desktop_common::client_tts::MiniMaxTtsCancellation)>, // client_tts_cancellation（当前唯一直放分段的取消信号）。
     opus_decoders: HashMap<String, RemoteOpusPlaybackDecoder>, // opus_decoders（按播放键隔离的下行 Opus 解码状态）。
 }
 
 #[cfg(feature = "ssh-device")]
 impl RemotePlaybackControlState {
+    fn forget_client_tts(&mut self, playback_key: &str) {
+        if self.client_tts.remove(playback_key).is_some()
+            && self.active_key.as_deref() == Some(playback_key)
+        {
+            self.active_key = None;
+        }
+        if self
+            .client_tts_cancellation
+            .as_ref()
+            .is_some_and(|(key, _)| key == playback_key)
+        {
+            self.client_tts_cancellation = None;
+        }
+    }
+
     fn snapshot_value(
         &self,
         playback_key: &str,
         current: PlaybackSnapshotView,
     ) -> Result<serde_json::Value, String> {
-        let baseline = self
-            .baselines
-            .get(playback_key)
-            .ok_or("播放键缺少设备快照基线")?;
-        let (sample_rate, sample_count) = self
-            .samples
-            .get(playback_key)
-            .copied()
-            .ok_or("播放键缺少已接收采样计数")?;
+        let (baseline, sample_rate, sample_count) =
+            if let Some(tts) = self.client_tts.get(playback_key) {
+                (tts.baseline, tts.sample_rate, tts.accepted_samples)
+            } else {
+                let baseline = *self
+                    .baselines
+                    .get(playback_key)
+                    .ok_or("播放键缺少设备快照基线")?;
+                let (rate, count) = *self
+                    .samples
+                    .get(playback_key)
+                    .ok_or("播放键缺少已接收采样计数")?;
+                (baseline, rate, count)
+            };
         if sample_rate == 0 {
             return Err("播放键采样率无效".into());
         }
@@ -4823,6 +4853,7 @@ async fn execute_remote_playback_task(
     };
     let mut control = state.remote_playback_control.lock().await;
     let stopping_key = requested_key.clone().or_else(|| control.active_key.clone());
+    let was_active = stopping_key.is_some() && stopping_key == control.active_key;
     let snapshot_state = state.clone();
     let stop_state = state.clone();
     let result =
@@ -4830,20 +4861,16 @@ async fn execute_remote_playback_task(
             &mut control,
             &task,
             requested_key,
-            move || async move {
-                let value =
-                    device_worker_action(snapshot_state, |worker| worker.playback_snapshot())
-                        .await?;
-                decode_worker_playback_snapshot(&value)
-            },
+            move || read_remote_playback_snapshot(snapshot_state),
             move || async move {
                 device_worker_action(stop_state, |worker| worker.playback_stop()).await
             },
         )
         .await;
-    if stopping_key
-        .as_ref()
-        .is_some_and(|key| control.stopped_keys.contains(key))
+    if was_active
+        && stopping_key
+            .as_ref()
+            .is_some_and(|key| control.stopped_keys.contains(key))
     {
         state
             .remote_playback_stop_epoch
@@ -4909,6 +4936,9 @@ fn remember_remote_stopped_key(control: &mut RemotePlaybackControlState, key: &s
         ..
     } = control;
     remember_remote_playback_tombstone(stopped_keys, stopped_key_order, key);
+    control
+        .stopped_receipts
+        .retain(|key, _| control.stopped_keys.contains(key));
 }
 
 #[cfg(feature = "ssh-device")]
@@ -5608,45 +5638,96 @@ where
     let playback_key = requested_key
         .or_else(|| control.active_key.clone())
         .ok_or("没有可停止的当前播放事务。")?;
-    if control.active_key.as_deref() != Some(playback_key.as_str())
-        || control.stopped_keys.contains(&playback_key)
-    {
-        return Ok(RemoteDeviceTaskResult {
+    let stopped = stop_remote_playback(control, &playback_key, read_snapshot, stop_device).await?;
+    Ok(match stopped {
+        Some(receipt) => RemoteDeviceTaskResult {
+            succeeded: true,
+            result: receipt.snapshot,
+        },
+        None => RemoteDeviceTaskResult {
             succeeded: false,
             result: serde_json::json!({"error":"指定播放键不再拥有当前设备输出；停止结果未知。",
                 "fields":{"error":"不能停止其它播放键或推断其输出状态"}}),
-        });
+        },
+    })
+}
+
+#[cfg(feature = "ssh-device")]
+async fn stop_remote_playback<FRead, FReadFuture, FStop, FStopFuture>(
+    control: &mut RemotePlaybackControlState,
+    playback_key: &str,
+    read_snapshot: FRead,
+    stop_device: FStop,
+) -> Result<Option<RemotePlaybackStopReceipt>, String>
+where
+    FRead: FnOnce() -> FReadFuture,
+    FReadFuture: Future<Output = Result<PlaybackSnapshotView, String>>,
+    FStop: FnOnce() -> FStopFuture,
+    FStopFuture: Future<Output = Result<(), String>>,
+{
+    if let Some(receipt) = control.stopped_receipts.get(playback_key) {
+        return Ok(Some(receipt.clone()));
     }
-    let snapshot = read_snapshot().await?;
-    let result = control.snapshot_value(&playback_key, snapshot)?;
-    if let Err(error) = stop_device().await {
-        // The worker may have applied stop before its receipt failed. Quarantine
-        // this playback key so late frames cannot become audible a second time.
-        remember_remote_stopped_key(control, &playback_key);
-        control.active_key = None;
-        control.control_uncertain = true;
-        return Err(format!("设备停止回执未知：{error}"));
+    let owns_output = control.active_key.as_deref() == Some(playback_key);
+    let unplayed_client_tts = control
+        .client_tts
+        .get(playback_key)
+        .is_some_and(|tts| tts.accepted_samples == 0);
+    if control.stopped_keys.contains(playback_key) || (!owns_output && !unplayed_client_tts) {
+        return Ok(None);
     }
-    remember_remote_stopped_key(control, &playback_key);
-    control.baselines.remove(&playback_key);
-    control.samples.remove(&playback_key);
-    if let Some(replacement) = control.pending_replacement.take() {
-        remember_remote_stopped_key(control, &replacement.old_playback_key);
-        control.baselines.remove(&replacement.old_playback_key);
-        control.samples.remove(&replacement.old_playback_key);
-        if let Some(successor) = replacement.successor_playback_key {
-            remember_remote_stopped_key(control, &successor);
-            control.baselines.remove(&successor);
-            control.samples.remove(&successor);
+    if let Some((key, cancellation)) = &control.client_tts_cancellation {
+        if key == playback_key {
+            cancellation.request_cancel();
         }
     }
-    control.active_key = None;
-    control.paused = false;
-    control.control_uncertain = false;
-    Ok(RemoteDeviceTaskResult {
-        succeeded: true,
-        result,
-    })
+    let current = if owns_output {
+        read_snapshot().await
+    } else {
+        Ok(PlaybackSnapshotView::default())
+    };
+    let receipt = current.and_then(|current| {
+        let snapshot = control.snapshot_value(playback_key, current)?;
+        let client_tts = control
+            .client_tts
+            .get_mut(playback_key)
+            .map(|tts| tts.progress(playback_key, current, true))
+            .transpose()?;
+        Ok(RemotePlaybackStopReceipt {
+            snapshot,
+            client_tts,
+        })
+    });
+    remember_remote_stopped_key(control, playback_key);
+    if owns_output {
+        control.active_key = None;
+    }
+    if owns_output {
+        if let Err(error) = stop_device().await {
+            // 设备可能已经停止，保留终态标记以拒绝迟到帧。
+            control.control_uncertain = true;
+            return Err(format!("设备停止回执未知：{error}"));
+        }
+        if let Some(replacement) = control.pending_replacement.take() {
+            remember_remote_stopped_key(control, &replacement.old_playback_key);
+            control.baselines.remove(&replacement.old_playback_key);
+            control.samples.remove(&replacement.old_playback_key);
+            if let Some(successor) = replacement.successor_playback_key {
+                remember_remote_stopped_key(control, &successor);
+                control.baselines.remove(&successor);
+                control.samples.remove(&successor);
+            }
+        }
+        control.paused = false;
+        control.control_uncertain = false;
+    }
+    control.baselines.remove(playback_key);
+    control.samples.remove(playback_key);
+    let receipt = receipt?;
+    control
+        .stopped_receipts
+        .insert(playback_key.to_owned(), receipt.clone());
+    Ok(Some(receipt))
 }
 
 #[cfg(feature = "ssh-device")]
@@ -5980,222 +6061,238 @@ fn decode_worker_playback_snapshot(
 }
 
 #[cfg(feature = "ssh-device")]
-async fn ensure_client_tts_playback_ledger(
-    state: Arc<Desktop>,
-    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
-    playback_key: &str,
-    sample_rate: u32,
-) -> Result<(), String> {
-    if !matches!(sample_rate, 16_000 | 24_000 | 32_000 | 48_000)
-        || playback_key.is_empty()
-        || playback_key.len() > 128
-        || playback_key.trim() != playback_key
-        || playback_key.contains('\0')
-    {
-        return Err("客户端直放播放键或采样率无效。".into());
-    }
-    if ledger
-        .lock()
-        .map_err(|_| "客户端直放播放台账不可用。")?
-        .contains_key(playback_key)
-    {
-        let rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
-        if rows
-            .get(playback_key)
-            .is_some_and(|entry| entry.sample_rate != sample_rate)
-        {
-            return Err("同一客户端播放键不能切换 PCM 采样率。".into());
+impl ClientTtsPlaybackLedger {
+    fn progress(
+        &mut self,
+        playback_key: &str,
+        snapshot: PlaybackSnapshotView,
+        stopped: bool,
+    ) -> Result<voice_desktop_common::device_protocol::ClientTtsPlaybackProgress, String> {
+        let output_ms = snapshot
+            .output_estimated_ms
+            .saturating_sub(self.baseline.output_estimated_ms);
+        let drained = self.accepted_samples > 0
+            && self.baseline.isolated
+            && snapshot.started
+            && snapshot.device_time_us > 0
+            && snapshot.buffered_ms == 0
+            && output_ms
+                >= snapshot
+                    .enqueued_ms
+                    .saturating_sub(self.baseline.enqueued_ms);
+        let played_samples = if drained {
+            self.accepted_samples
+        } else {
+            (output_ms.saturating_mul(u64::from(self.sample_rate)) / 1_000)
+                .min(self.accepted_samples)
         }
-        return Ok(());
+        .max(self.played_samples);
+        self.played_samples = played_samples;
+        let buffered_samples = if stopped {
+            0
+        } else {
+            (snapshot
+                .buffered_ms
+                .saturating_mul(u64::from(self.sample_rate))
+                / 1_000)
+                .min(self.accepted_samples - played_samples)
+        };
+        let progress = voice_desktop_common::device_protocol::ClientTtsPlaybackProgress {
+            playback_key: playback_key.to_owned(),
+            accepted_samples: self.accepted_samples,
+            played_samples,
+            buffered_samples,
+            output_complete: drained && !stopped,
+            device_time_us: snapshot.device_time_us,
+        };
+        progress.validate().map_err(str::to_owned)?;
+        Ok(progress)
     }
-    let value = device_worker_action(state.clone(), |worker| worker.playback_snapshot()).await?;
-    let snapshot = decode_client_tts_playback_snapshot(&value)?;
-    let baseline = PlaybackSnapshotBaseline {
-        enqueued_ms: snapshot.enqueued_ms,
-        played_ms: snapshot.played_ms,
-        output_estimated_ms: snapshot.output_estimated_ms,
-        isolated: snapshot.buffered_ms == 0,
-    };
-    let mut rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
-    if rows.len() >= MAX_REMOTE_PLAYBACK_KEYS {
-        return Err("客户端直放播放台账已达本媒体连接的固定容量。".into());
-    }
-    rows.entry(playback_key.to_owned())
-        .or_insert(ClientTtsPlaybackLedger {
-            sample_rate,
-            accepted_samples: 0,
-            played_samples: 0,
-            baseline,
-        });
-    Ok(())
 }
 
 #[cfg(feature = "ssh-device")]
-async fn client_tts_device_progress(
+async fn read_remote_playback_snapshot(
     state: Arc<Desktop>,
-    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
-    playback_key: String,
-    sample_rate: u32,
-) -> Result<voice_desktop_common::device_protocol::ClientTtsPlaybackProgress, String> {
-    ensure_client_tts_playback_ledger(state.clone(), ledger.clone(), &playback_key, sample_rate)
-        .await?;
+) -> Result<PlaybackSnapshotView, String> {
     let value = device_worker_action(state, |worker| worker.playback_snapshot()).await?;
-    let snapshot = decode_client_tts_playback_snapshot(&value)?;
-    let mut rows = ledger
-        .lock()
-        .map_err(|_| "客户端直放播放台账不可用。")?;
-    let entry = rows.get_mut(&playback_key)
-        .ok_or("客户端直放播放键已经清除。")?;
-    if entry.accepted_samples > 0 && value.get("playing").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Err("客户端直放的原输出端点已关闭。".into());
-    }
-    let output_ms = snapshot
-        .output_estimated_ms
-        .saturating_sub(entry.baseline.output_estimated_ms);
-    let output_complete = entry.accepted_samples > 0
-        && entry.baseline.isolated
-        && snapshot.started
-        && snapshot.device_time_us > 0
-        && snapshot.buffered_ms == 0
-        && output_ms >= snapshot.enqueued_ms.saturating_sub(entry.baseline.enqueued_ms);
-    let played_samples = if output_complete {
-        entry.accepted_samples
-    } else {
-        ((u128::from(output_ms) * u128::from(entry.sample_rate)) / 1_000)
-            .min(u128::from(entry.accepted_samples)) as u64
-    }.max(entry.played_samples);
-    entry.played_samples = played_samples;
-    let buffered_samples =
-        ((u128::from(snapshot.buffered_ms) * u128::from(entry.sample_rate)) / 1_000).min(
-            u128::from(entry.accepted_samples.saturating_sub(played_samples)),
-        ) as u64;
-    let progress = voice_desktop_common::device_protocol::ClientTtsPlaybackProgress {
-        playback_key,
-        accepted_samples: entry.accepted_samples,
-        played_samples,
-        buffered_samples,
-        output_complete,
-        device_time_us: snapshot.device_time_us,
-    };
-    progress.validate().map_err(str::to_owned)?;
-    Ok(progress)
+    decode_worker_playback_snapshot(&value)
 }
 
 #[cfg(feature = "ssh-device")]
-fn decode_client_tts_playback_snapshot(
-    value: &serde_json::Value,
-) -> Result<PlaybackSnapshotView, String> {
-    if value.get("playing").and_then(serde_json::Value::as_bool) == Some(false)
-        && value.get("snapshot").is_none()
+async fn client_tts_playback_control<'a>(
+    state: &'a Desktop,
+    identity: &client_tts_relay::MediaIdentity,
+) -> Result<tokio::sync::MutexGuard<'a, RemotePlaybackControlState>, String> {
+    let control = state.remote_playback_control.lock().await;
+    if control.device_id.as_deref() != Some(identity.device_id.as_str())
+        || control.core_session_id.as_deref() != Some(identity.core_session_id.as_str())
+        || control.connection_generation != identity.connection_generation
+        || control.executor_generation != identity.executor_generation
+        || control.interaction_generation != identity.interaction_generation
     {
-        return Ok(PlaybackSnapshotView {
-            enqueued_ms: 0,
-            played_ms: 0,
-            buffered_ms: 0,
-            output_estimated_ms: 0,
-            started: false,
-            device_time_us: 0,
-        });
+        return Err("客户端直放的媒体租约已失效。".into());
     }
-    decode_worker_playback_snapshot(value)
+    Ok(control)
 }
 
 #[cfg(feature = "ssh-device")]
 fn client_tts_playback_callbacks(
     state: Arc<Desktop>,
-    ledger: Arc<Mutex<HashMap<String, ClientTtsPlaybackLedger>>>,
-    playback_started: Arc<AtomicBool>,
+    identity: client_tts_relay::MediaIdentity,
 ) -> client_tts_relay::DirectPlaybackCallbacks {
+    let identity = Arc::new(identity);
+    let begin_state = state.clone();
+    let begin_identity = identity.clone();
+    let begin = Arc::new(
+        move |playback_key: String, sample_rate: u32, cancellation| {
+            let state = begin_state.clone();
+            let identity = begin_identity.clone();
+            Box::pin(async move {
+                let mut control = client_tts_playback_control(&state, &identity).await?;
+                if remote_playback_key_is_terminal(&control, &playback_key) {
+                    return Err("客户端直放播放键已经终止。".into());
+                }
+                if let Some(entry) = control.client_tts.get(&playback_key) {
+                    if entry.sample_rate != sample_rate {
+                        return Err("同一客户端播放键不能切换 PCM（原始音频采样）采样率。".into());
+                    }
+                } else {
+                    if control.client_tts.len() >= MAX_REMOTE_PLAYBACK_KEYS {
+                        return Err("客户端直放播放台账已达本媒体连接的固定容量。".into());
+                    }
+                    control.client_tts.insert(
+                        playback_key.clone(),
+                        ClientTtsPlaybackLedger {
+                            sample_rate,
+                            accepted_samples: 0,
+                            played_samples: 0,
+                            baseline: PlaybackSnapshotBaseline {
+                                enqueued_ms: 0,
+                                played_ms: 0,
+                                output_estimated_ms: 0,
+                                isolated: true,
+                            },
+                        },
+                    );
+                }
+                control.client_tts_cancellation = Some((playback_key, cancellation));
+                Ok(())
+            }) as client_tts_relay::PlaybackFuture<()>
+        },
+    );
+
     let enqueue_state = state.clone();
-    let enqueue_ledger = ledger.clone();
-    let enqueue_started = playback_started.clone();
+    let enqueue_identity = identity.clone();
     let enqueue_pcm = Arc::new(
         move |playback_key: String, sample_rate: u32, pcm: Vec<u8>| {
             let state = enqueue_state.clone();
-            let ledger = enqueue_ledger.clone();
-            let started = enqueue_started.clone();
+            let identity = enqueue_identity.clone();
             Box::pin(async move {
                 if pcm.is_empty() || pcm.len() % 2 != 0 {
-                    return Err("客户端直放拒绝空或不完整 PCM。".into());
+                    return Err("客户端直放拒绝空或不完整 PCM（原始音频采样）。".into());
                 }
-                ensure_client_tts_playback_ledger(
-                    state.clone(),
-                    ledger.clone(),
-                    &playback_key,
-                    sample_rate,
-                )
-                .await?;
-                let first_audio = ledger.lock()
-                    .map_err(|_| "客户端直放播放台账不可用。")?
+                let mut control = client_tts_playback_control(&state, &identity).await?;
+                if control.control_uncertain
+                    || remote_playback_key_is_terminal(&control, &playback_key)
+                {
+                    return Err("客户端直放播放键已经终止或设备控制结果未知。".into());
+                }
+                let entry = control
+                    .client_tts
                     .get(&playback_key)
-                    .is_some_and(|entry| entry.accepted_samples == 0);
-                if first_audio || !started.load(Ordering::Acquire) {
-                    if let Err(error) =
-                        device_worker_action(state.clone(), |worker| worker.playback_start()).await
-                    {
-                        started.store(false, Ordering::Release);
-                        return Err(error);
-                    }
-                    started.store(true, Ordering::Release);
+                    .ok_or("客户端直放播放键已经清除。")?;
+                if entry.sample_rate != sample_rate {
+                    return Err("客户端直放采样率与播放键不匹配。".into());
                 }
-                let sample_count =
-                    u64::try_from(pcm.len() / 2).map_err(|_| "客户端直放样本数溢出。")?;
+                let first_audio = entry.accepted_samples == 0;
+                let accepted_samples = entry
+                    .accepted_samples
+                    .checked_add((pcm.len() / 2) as u64)
+                    .ok_or("客户端直放播放键累计样本数溢出。")?;
+                if first_audio {
+                    device_worker_action(state.clone(), |worker| worker.playback_start()).await?;
+                    let snapshot = read_remote_playback_snapshot(state.clone()).await?;
+                    let entry = control
+                        .client_tts
+                        .get_mut(&playback_key)
+                        .ok_or("客户端直放播放键已经清除。")?;
+                    entry.baseline = PlaybackSnapshotBaseline {
+                        enqueued_ms: snapshot.enqueued_ms,
+                        played_ms: snapshot.played_ms,
+                        output_estimated_ms: snapshot.output_estimated_ms,
+                        isolated: snapshot.buffered_ms == 0,
+                    };
+                } else if control.active_key.as_deref() != Some(playback_key.as_str()) {
+                    return Err("客户端直放播放键已失去设备输出。".into());
+                }
                 let enqueue_key = playback_key.clone();
-                device_worker_action(state, move |worker| {
+                device_worker_action(state.clone(), move |worker| {
                     worker
                         .playback_enqueue_for_key(&enqueue_key, sample_rate, &pcm)
                         .map(|_| ())
                 })
                 .await?;
-                let mut rows = ledger.lock().map_err(|_| "客户端直放播放台账不可用。")?;
-                let entry = rows
+                let entry = control
+                    .client_tts
                     .get_mut(&playback_key)
                     .ok_or("客户端直放播放键已经清除。")?;
-                entry.accepted_samples = entry
-                    .accepted_samples
-                    .checked_add(sample_count)
-                    .ok_or("客户端直放播放键累计样本数溢出。")?;
+                entry.accepted_samples = accepted_samples;
+                control.active_key = Some(playback_key);
                 Ok(())
             }) as client_tts_relay::PlaybackFuture<()>
         },
     );
 
     let progress_state = state.clone();
-    let progress_ledger = ledger.clone();
+    let progress_identity = identity.clone();
     let progress = Arc::new(move |playback_key: String, sample_rate: u32| {
         let state = progress_state.clone();
-        let ledger = progress_ledger.clone();
+        let identity = progress_identity.clone();
         Box::pin(async move {
-            client_tts_device_progress(state, ledger, playback_key, sample_rate).await
+            let mut control = client_tts_playback_control(&state, &identity).await?;
+            let owns_output = control.active_key.as_deref() == Some(playback_key.as_str());
+            let entry = control
+                .client_tts
+                .get_mut(&playback_key)
+                .ok_or("客户端直放播放键已经清除。")?;
+            if sample_rate != entry.sample_rate {
+                return Err("客户端直放采样率与播放键不匹配。".into());
+            }
+            let snapshot = if entry.accepted_samples == 0 {
+                PlaybackSnapshotView::default()
+            } else if owns_output {
+                read_remote_playback_snapshot(state.clone()).await?
+            } else {
+                return Err("客户端直放播放键已失去设备输出。".into());
+            };
+            entry.progress(&playback_key, snapshot, false)
         })
             as client_tts_relay::PlaybackFuture<
                 voice_desktop_common::device_protocol::ClientTtsPlaybackProgress,
             >
     });
 
-    let stop_state = state;
-    let stop_ledger = ledger;
-    let stop_started = playback_started;
     let stop_and_snapshot = Arc::new(move |playback_key: String| {
-        let state = stop_state.clone();
-        let ledger = stop_ledger.clone();
-        let started = stop_started.clone();
+        let state = state.clone();
+        let identity = identity.clone();
         Box::pin(async move {
-            let sample_rate = ledger
-                .lock()
-                .map_err(|_| "客户端直放播放台账不可用。")?
-                .get(&playback_key)
-                .map(|entry| entry.sample_rate)
-                .ok_or("客户端取消引用了未知播放键。")?;
-            let progress =
-                client_tts_device_progress(state.clone(), ledger, playback_key, sample_rate)
-                    .await?;
-            device_worker_action(state.clone(), |worker| worker.playback_stop()).await?;
-            started.store(false, Ordering::Release);
-            state
-                .remote_playback_stop_epoch
-                .fetch_add(1, Ordering::AcqRel);
-            Ok(progress)
+            let mut control = client_tts_playback_control(&state, &identity).await?;
+            let was_active = control.active_key.as_deref() == Some(playback_key.as_str());
+            let result = stop_remote_playback(
+                &mut control,
+                &playback_key,
+                || read_remote_playback_snapshot(state.clone()),
+                || device_worker_action(state.clone(), |worker| worker.playback_stop()),
+            )
+            .await;
+            if was_active && control.stopped_keys.contains(&playback_key) {
+                state
+                    .remote_playback_stop_epoch
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            result?
+                .and_then(|receipt| receipt.client_tts)
+                .ok_or_else(|| "客户端直放播放键没有已确认的停止回执。".into())
         })
             as client_tts_relay::PlaybackFuture<
                 voice_desktop_common::device_protocol::ClientTtsPlaybackProgress,
@@ -6203,6 +6300,7 @@ fn client_tts_playback_callbacks(
     });
 
     client_tts_relay::DirectPlaybackCallbacks {
+        begin,
         enqueue_pcm,
         progress,
         stop_and_snapshot,
@@ -6812,14 +6910,7 @@ async fn run_remote_media_channel(
     };
     let mut client_tts_authorizations = client_tts_relay::ClientTtsAuthorizationStore::default();
     let mut revoked_client_tts_keys = HashSet::new(); // revoked_client_tts_keys（撤销后等待当前分段退出的播放键）。
-    let client_tts_playback_ledger =
-        Arc::new(Mutex::new(HashMap::<String, ClientTtsPlaybackLedger>::new()));
-    let client_tts_playback_started = Arc::new(AtomicBool::new(false));
-    let client_tts_playback = client_tts_playback_callbacks(
-        state.clone(),
-        client_tts_playback_ledger.clone(),
-        client_tts_playback_started.clone(),
-    );
+    let client_tts_playback = client_tts_playback_callbacks(state.clone(), tts_identity.clone());
     let mut client_tts_cancellations: HashMap<
         String,
         (
@@ -6846,8 +6937,8 @@ async fn run_remote_media_channel(
         while let Ok(request_id) = client_tts_finished_receiver.try_recv() {
             if let Some((_, key, _, _)) = client_tts_cancellations.remove(&request_id) {
                 if revoked_client_tts_keys.remove(&key) {
-                    if let Ok(mut rows) = client_tts_playback_ledger.lock() {
-                        rows.remove(&key);
+                    if let Ok(mut control) = client_tts_playback_control(&state, &tts_identity).await {
+                        control.forget_client_tts(&key);
                     }
                 }
             }
@@ -7097,8 +7188,8 @@ async fn run_remote_media_channel(
                                     if active {
                                         let _ = (client_tts_playback.stop_and_snapshot)(revoked_key.clone()).await;
                                         revoked_client_tts_keys.insert(revoked_key);
-                                    } else if let Ok(mut rows) = client_tts_playback_ledger.lock() {
-                                        rows.remove(&revoked_key);
+                                    } else if let Ok(mut control) = client_tts_playback_control(&state, &tts_identity).await {
+                                        control.forget_client_tts(&revoked_key);
                                     }
                                 }
                                 Ok(None) => {}
@@ -7438,7 +7529,26 @@ async fn run_remote_media_channel(
             }
         }
     }
-    if playback_started {
+    for (_, _, _, cancellation) in client_tts_cancellations.values() {
+        cancellation.request_cancel();
+    }
+    let active_client_tts_key = {
+        let control = client_tts_playback_control(&state, &tts_identity).await;
+        control.ok().and_then(|control| {
+            control
+                .active_key
+                .as_ref()
+                .filter(|key| control.client_tts.contains_key(*key))
+                .cloned()
+        })
+    };
+    if let Some(key) = active_client_tts_key {
+        if let Err(error) = (client_tts_playback.stop_and_snapshot)(key).await {
+            if outcome.is_ok() {
+                outcome = Err(error);
+            }
+        }
+    } else if playback_started {
         if let Err(error) =
             device_worker_action(state.clone(), |worker| worker.playback_stop()).await
         {
@@ -7446,9 +7556,6 @@ async fn run_remote_media_channel(
                 outcome = Err(error);
             }
         }
-    }
-    for (_, _, _, cancellation) in client_tts_cancellations.values() {
-        cancellation.request_cancel();
     }
     for (_, mut task) in client_tts_tasks.drain() {
         if tokio::time::timeout(Duration::from_secs(3), &mut task)
@@ -7460,10 +7567,10 @@ async fn run_remote_media_channel(
         }
     }
     client_tts_authorizations.clear();
-    if let Ok(mut ledger) = client_tts_playback_ledger.lock() {
-        ledger.clear();
+    if let Ok(mut control) = client_tts_playback_control(&state, &tts_identity).await {
+        control.client_tts.clear();
+        control.client_tts_cancellation = None;
     }
-    client_tts_playback_started.store(false, Ordering::Release);
     audio_sender.send_replace(None);
     let _ = write_sender.try_send(MediaWriteCommand::Close);
     drop(write_sender);
@@ -12774,7 +12881,7 @@ mod tests {
         let start_count = forbidden_calls.clone();
         let snapshot_count = forbidden_calls.clone();
         let enqueue_count = forbidden_calls.clone();
-        assert!(runtime
+        let dropped = runtime
             .block_on(process_remote_playback_frame_for_lease(
                 &next_bytes,
                 "device-a",
@@ -12809,11 +12916,19 @@ mod tests {
                     Ok(())
                 },
             ))
-            .is_err());
+            .unwrap();
+        let RemotePlaybackFrameOutcome::Cancelled { message, error: None } = dropped else {
+            panic!("停止结果未知时必须返回该帧的明确取消回执");
+        };
+        let receipt: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(receipt["type"], "playback.cancelled");
+        assert_eq!(receipt["sequence"], 1);
+        assert_eq!(receipt["reason"], "output_unavailable");
         assert_eq!(forbidden_calls.load(Ordering::Acquire), 0);
 
         control.control_uncertain = false;
         let mut discontinuous_header = next_header.clone();
+        discontinuous_header.sequence = 2;
         discontinuous_header.start_sample = 321;
         let discontinuous_bytes = encode_playback_frame(&discontinuous_header, &pcm).unwrap();
         let discontinuity_calls = Arc::new(AtomicUsize::new(0));
@@ -12857,7 +12972,7 @@ mod tests {
             ))
             .is_err());
         assert_eq!(discontinuity_calls.load(Ordering::Acquire), 0);
-        assert_eq!(next_sequence, 1);
+        assert_eq!(next_sequence, 2);
     }
 
     #[cfg(feature = "ssh-device")]
@@ -13886,6 +14001,97 @@ mod tests {
         assert!(stop_called.load(Ordering::Acquire));
         assert!(control.stopped_keys.contains("speech-key"));
         assert_eq!(control.active_key, None);
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn remote_stop_of_direct_tts_reuses_the_device_receipt_after_the_next_playback_starts() {
+        use super::{
+            execute_remote_playback_stop, stop_remote_playback, ClientTtsPlaybackLedger,
+            PlaybackSnapshotBaseline, PlaybackSnapshotView, RemotePlaybackControlState,
+        };
+        use voice_desktop_common::ssh_device::RemoteDeviceTask;
+
+        let task = RemoteDeviceTask {
+            request_id: "request-1".into(),
+            device_id: "device-a".into(),
+            core_session_id: "core-a".into(),
+            task_id: "task-1".into(),
+            connection_generation: 2,
+            executor_generation: 3,
+            sequence: 1,
+            operation: "playback.stop_and_snapshot".into(),
+            arguments: serde_json::json!({"playback_key":"direct-key"}),
+        };
+        let mut control = RemotePlaybackControlState {
+            device_id: Some(task.device_id.clone()),
+            core_session_id: Some(task.core_session_id.clone()),
+            connection_generation: task.connection_generation,
+            executor_generation: task.executor_generation,
+            active_key: Some("direct-key".into()),
+            ..RemotePlaybackControlState::default()
+        };
+        control.client_tts.insert(
+            "direct-key".into(),
+            ClientTtsPlaybackLedger {
+                sample_rate: 16_000,
+                accepted_samples: 16_000,
+                played_samples: 8_000,
+                baseline: PlaybackSnapshotBaseline {
+                    enqueued_ms: 200,
+                    played_ms: 200,
+                    output_estimated_ms: 200,
+                    isolated: true,
+                },
+            },
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let result = execute_remote_playback_stop(
+                &mut control,
+                &task,
+                Some("direct-key".into()),
+                || async {
+                    Ok(PlaybackSnapshotView {
+                        enqueued_ms: 1_200,
+                        played_ms: 840,
+                        buffered_ms: 400,
+                        output_estimated_ms: 800,
+                        started: true,
+                        device_time_us: 9_000_000,
+                    })
+                },
+                || async { Ok(()) },
+            )
+            .await
+            .unwrap();
+            assert!(result.succeeded);
+            assert_eq!(result.result["output_estimated_ms"], 600);
+            assert!(control.stopped_keys.contains("direct-key"));
+            assert!(control.active_key.is_none());
+
+            // 旧直放分段已撤销并开启下一段，迟到的媒体取消只读取原停播回执。
+            control.forget_client_tts("direct-key");
+            control.active_key = Some("next-key".into());
+            let cached = stop_remote_playback(
+                &mut control,
+                "direct-key",
+                || async { panic!("重复取消不应读取新一次播放的快照") },
+                || async { panic!("重复取消不应停止下一次播放") },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let progress = cached.client_tts.unwrap();
+            assert_eq!(progress.accepted_samples, 16_000);
+            assert_eq!(progress.played_samples, 9_600);
+            assert_eq!(progress.buffered_samples, 0);
+            assert!(!progress.output_complete);
+            assert_eq!(cached.snapshot, result.result);
+            assert_eq!(control.active_key.as_deref(), Some("next-key"));
+        });
     }
 
     #[cfg(feature = "ssh-device")]

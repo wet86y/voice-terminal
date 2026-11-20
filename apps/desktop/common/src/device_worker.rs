@@ -97,10 +97,12 @@ impl AudioProcessingSlot {
     fn process_capture(
         &mut self,
         frame: &mut crate::wasapi_capture::CaptureFrame,
+        buffered_ms: Option<u64>, // buffered_ms（当前播放快照的缓冲时长，缺少快照时为空）。
     ) -> serde_json::Value {
         #[cfg(feature = "native-audio")]
         {
             if let Some(processor) = self.processor.as_mut() {
+                let _ = processor.update_playback_delay(buffered_ms);
                 let result = processor.process_capture(frame);
                 frame.pcm = result.pcm;
                 self.refresh();
@@ -117,7 +119,7 @@ impl AudioProcessingSlot {
         }
         #[cfg(not(feature = "native-audio"))]
         {
-            let _ = frame;
+            let _ = (frame, buffered_ms);
             self.status.clone()
         }
     }
@@ -126,7 +128,7 @@ impl AudioProcessingSlot {
         &mut self,
         sample_rate: u32,
         samples: &[i16],
-        buffered_ms: u64,
+        buffered_ms: Option<u64>,
     ) -> serde_json::Value {
         #[cfg(feature = "native-audio")]
         {
@@ -714,8 +716,12 @@ pub fn serve_with_helper_path(
                         std::time::Duration::from_millis(request.wait_ms.unwrap_or(20) as u64);
                     match stream.recv_frame(wait) {
                         Ok(Some(mut frame)) => {
+                            let buffered_ms = render_stream
+                                .as_ref()
+                                .and_then(|stream| stream.snapshot().ok())
+                                .map(|snapshot| snapshot.buffered_ms);
                             let audio_processing_state =
-                                audio_processing.process_capture(&mut frame);
+                                audio_processing.process_capture(&mut frame, buffered_ms);
                             (
                                 true,
                                 "ready",
@@ -931,8 +937,8 @@ pub fn serve_with_helper_path(
                             let snapshot = stream.snapshot();
                             let buffered_ms = snapshot
                                 .as_ref()
-                                .map(|value| value.buffered_ms)
-                                .unwrap_or(501);
+                                .ok()
+                                .map(|value| value.buffered_ms);
                             audio_processing.push_reference(sample_rate, &samples, buffered_ms);
                             (
                                 true,
@@ -2234,9 +2240,9 @@ mod tests {
         assert_eq!(slot.status["state"], "stopped");
         assert_eq!(slot.start_capture()["state"], "ready");
         let reference = vec![0_i16; 320]; // 32 kHz（每秒 32,000 个采样）的 10 毫秒参考帧。
-        let status = slot.push_reference(32_000, &reference, 20);
+        let status = slot.push_reference(32_000, &reference, Some(600));
         assert_eq!(status["state"], "ready");
-        assert_eq!(status["protected_interruption_available"], true);
+        assert_eq!(status["protected_interruption_available"], false);
 
         let mut frame = crate::wasapi_capture::CaptureFrame {
             sequence: 0,
@@ -2245,9 +2251,11 @@ mod tests {
             discontinuity_before: false,
             pcm: vec![0_i16; 320],
         };
-        let frame_status = slot.process_capture(&mut frame);
+        let frame_status = slot.process_capture(&mut frame, Some(400));
         assert_eq!(frame_status["near_end_voice"], false);
         assert_eq!(frame_status["protected_interruption_available"], true);
+        let frame_status = slot.process_capture(&mut frame, None);
+        assert_eq!(frame_status["protected_interruption_available"], false);
         assert_eq!(frame.pcm.len(), 320);
         slot.reset_alignment();
         assert_eq!(slot.status["protected_interruption_available"], false);

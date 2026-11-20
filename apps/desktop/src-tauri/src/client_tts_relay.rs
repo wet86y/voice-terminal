@@ -25,7 +25,7 @@ pub(super) const MAX_SEEN_REQUESTS: usize = 4096; // MAX_SEEN_REQUESTS（单媒�
 const MIN_AUDIO_OUTPUT_MS: u64 = 80; // MIN_AUDIO_OUTPUT_MS（有效音频输出的最短设备确认时长）。
 const OUTPUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100); // OUTPUT_PROGRESS_INTERVAL（实际输出进度回执间隔）。
 const OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(6); // OUTPUT_STALL_TIMEOUT（端点无输出进度的等待上限）。
-const OUTPUT_BUFFER_MS: u64 = 600; // OUTPUT_BUFFER_MS（客户端直放的目标储备，毫秒）。
+const OUTPUT_BUFFER_MS: u64 = 400; // OUTPUT_BUFFER_MS（客户端直放储备上限，为 500 毫秒回声参考延迟上限留余量）。
 const MAX_CONTROL_BYTES: usize = 16 * 1024; // MAX_CONTROL_BYTES（含单次凭据的媒体直放控制消息上限）。
 const MAX_ALIGNMENT_BYTES: usize = 2048; // MAX_ALIGNMENT_BYTES（单条对齐数据的字节上限）。
 
@@ -278,10 +278,13 @@ pub type PlaybackProgressCallback =
     Arc<dyn Fn(String, u32) -> PlaybackFuture<ClientTtsPlaybackProgress> + Send + Sync>; // PlaybackProgressCallback（读取按键设备输出时钟快照的回调）。
 pub type StopPlaybackCallback =
     Arc<dyn Fn(String) -> PlaybackFuture<ClientTtsPlaybackProgress> + Send + Sync>; // StopPlaybackCallback（按键停止并确认输出结果的回调）。
+pub type BeginPlaybackCallback =
+    Arc<dyn Fn(String, u32, MiniMaxTtsCancellation) -> PlaybackFuture<()> + Send + Sync>; // BeginPlaybackCallback（登记当前分段的播放键、采样率和取消信号）。
 
 /// DirectPlaybackCallbacks（客户端原生播放器回调）：PCM 不离开客户端进程。
 #[derive(Clone)]
 pub struct DirectPlaybackCallbacks {
+    pub begin: BeginPlaybackCallback, // begin（在首批音频前登记当前直放分段）。
     pub enqueue_pcm: EnqueuePcmCallback, // enqueue_pcm（按固定播放事务加入既有原生播放器）。
     pub progress: PlaybackProgressCallback, // progress（读取该播放键在设备时钟上的实际输出进度）。
     pub stop_and_snapshot: StopPlaybackCallback, // stop_and_snapshot（按键停止并读取真实设备结果）。
@@ -519,6 +522,12 @@ pub async fn start_request(
     let (credential, permit) = authorizations.begin_request(&parsed)?;
     let mut handle = MiniMaxTtsHandle::start(parsed.request.clone(), credential)?;
     let cancellation = handle.cancellation_handle();
+    (playback.begin)(
+        parsed.playback_key.clone(),
+        parsed.request.sample_rate,
+        cancellation.clone(),
+    )
+    .await?;
     send_request_status(
         &writer,
         &identity,
@@ -593,8 +602,14 @@ async fn forward_events(
     let mut provider_total_samples = None;
     let mut segment_finished = None;
     let mut provider_terminal = false;
-    let mut progress_sequence = 0_u64;
-    let mut last_progress = None;
+    let mut output = OutputProgress {
+        playback,
+        writer,
+        identity,
+        request,
+        sequence: 0,
+        last_progress: None,
+    };
     let mut progress_tick = tokio::time::interval(OUTPUT_PROGRESS_INTERVAL);
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -622,8 +637,8 @@ async fn forward_events(
                         let samples = u64::try_from(pcm.len() / 2).map_err(|_| "MiniMax PCM 样本数溢出。")?;
                         generated_samples = generated_samples.checked_add(samples).ok_or("MiniMax PCM 样本位置溢出。")?;
                         for frame in framer.push(&pcm)? {
-                            if !enqueue_frame(playback, request, &cancellation, &mut pending_samples,
-                                frame.sample_rate, frame.pcm).await? {
+                            if !enqueue_frame(&mut output, || cancellation.is_cancelled(), &mut pending_samples,
+                                generated_samples, frame.sample_rate, frame.pcm).await? {
                                 break;
                             }
                         }
@@ -658,8 +673,8 @@ async fn forward_events(
                             return Err("MiniMax 文本段完成位置与实际 PCM 采样数不一致。".into());
                         }
                         if let Some(frame) = framer.finish() {
-                            if !enqueue_frame(playback, request, &cancellation, &mut pending_samples,
-                                frame.sample_rate, frame.pcm).await? {
+                            if !enqueue_frame(&mut output, || cancellation.is_cancelled(), &mut pending_samples,
+                                generated_samples, frame.sample_rate, frame.pcm).await? {
                                 continue;
                             }
                         }
@@ -686,11 +701,7 @@ async fn forward_events(
                     }
                     ClientTtsEvent::Cancelled { task_id } => {
                         if task_id != request.request_id { return Err("MiniMax 取消回执任务编号不匹配。".into()); }
-                        let progress = (playback.stop_and_snapshot)(request.playback_key.clone()).await?;
-                        validate_progress(&progress, &request.playback_key)?;
-                        send_request_status(writer, identity, request, "media.tts.cancelled", progress_json(&progress), progress_labels()).await?;
-                        permit.fail();
-                        return Ok(());
+                        return output.cancelled(&mut permit).await;
                     }
                     ClientTtsEvent::Failed { task_id, .. } => {
                         if task_id != request.request_id { return Err("MiniMax 失败回执任务编号不匹配。".into()); }
@@ -699,10 +710,12 @@ async fn forward_events(
                 }
             }
             _ = progress_tick.tick() => {
-                if generated_samples > 0 {
-                    let progress = send_output_progress(playback, writer, identity, request, generated_samples,
-                        &mut progress_sequence, &mut last_progress).await?;
-                    pending_samples = progress.accepted_samples - progress.played_samples;
+                if generated_samples > 0 && !cancellation.is_cancelled() {
+                    let progress = output.report(generated_samples).await;
+                    if !cancellation.is_cancelled() {
+                        let progress = progress?;
+                        pending_samples = progress.accepted_samples - progress.played_samples;
+                    }
                 }
             }
         }
@@ -716,16 +729,14 @@ async fn forward_events(
     let mut deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
     let mut played_samples = request.playback_start_sample;
     let progress = loop {
-        let progress = send_output_progress(
-            playback,
-            writer,
-            identity,
-            request,
-            generated_samples,
-            &mut progress_sequence,
-            &mut last_progress,
-        )
-        .await?;
+        if cancellation.is_cancelled() {
+            return output.cancelled(&mut permit).await;
+        }
+        let progress = output.report(generated_samples).await;
+        if cancellation.is_cancelled() {
+            return output.cancelled(&mut permit).await;
+        }
+        let progress = progress?;
         if progress.accepted_samples >= end_sample
             && progress.played_samples >= end_sample
             && progress.buffered_samples == 0
@@ -770,10 +781,10 @@ async fn forward_events(
 }
 
 async fn enqueue_frame(
-    playback: &DirectPlaybackCallbacks,
-    request: &ParsedRequest,
-    cancellation: &MiniMaxTtsCancellation,
+    output: &mut OutputProgress<'_>,
+    is_cancelled: impl Fn() -> bool,
     pending_samples: &mut u64,
+    generated_samples: u64,
     sample_rate: u32,
     pcm: Vec<u8>,
 ) -> Result<bool, String> {
@@ -784,11 +795,14 @@ async fn enqueue_frame(
     let limit = u64::from(sample_rate) * OUTPUT_BUFFER_MS / 1_000;
     let mut deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
     while pending_samples.saturating_add(samples) > limit {
-        if cancellation.is_cancelled() {
+        if is_cancelled() {
             return Ok(false);
         }
-        let progress = (playback.progress)(request.playback_key.clone(), sample_rate).await?;
-        validate_progress(&progress, &request.playback_key)?;
+        let progress = output.report(generated_samples).await;
+        if is_cancelled() {
+            return Ok(false);
+        }
+        let progress = progress?;
         let pending = progress.accepted_samples - progress.played_samples;
         if pending < *pending_samples {
             deadline = Instant::now() + OUTPUT_STALL_TIMEOUT;
@@ -802,61 +816,88 @@ async fn enqueue_frame(
         }
         tokio::time::sleep(OUTPUT_PROGRESS_INTERVAL).await;
     }
-    if cancellation.is_cancelled() {
+    if is_cancelled() {
         return Ok(false);
     }
-    (playback.enqueue_pcm)(request.playback_key.clone(), sample_rate, pcm).await?;
+    let enqueued =
+        (output.playback.enqueue_pcm)(output.request.playback_key.clone(), sample_rate, pcm).await;
+    if is_cancelled() {
+        return Ok(false);
+    }
+    enqueued?;
     *pending_samples += samples;
     Ok(true)
 }
 
-async fn send_output_progress(
-    playback: &DirectPlaybackCallbacks,
-    writer: &mpsc::Sender<MediaWriteCommand>,
-    identity: &MediaIdentity,
-    request: &ParsedRequest,
-    generated_samples: u64,
-    sequence: &mut u64,
-    previous: &mut Option<ClientTtsPlaybackProgress>,
-) -> Result<ClientTtsPlaybackProgress, String> {
-    let progress =
-        (playback.progress)(request.playback_key.clone(), request.request.sample_rate).await?;
-    validate_progress(&progress, &request.playback_key)?;
-    let max_accepted = request
-        .playback_start_sample
-        .saturating_add(generated_samples);
-    if progress.accepted_samples > max_accepted
-        || progress.accepted_samples < request.playback_start_sample
-        || progress.played_samples < request.playback_start_sample
-        || previous.as_ref().is_some_and(|prior| {
-            progress.accepted_samples < prior.accepted_samples
-                || progress.played_samples < prior.played_samples
-        })
-    {
-        return Err("客户端设备播放进度跨越了固定键或 PCM 样本单调性边界。".into());
-    }
-    if previous.as_ref() != Some(&progress) {
-        *sequence = sequence.saturating_add(1);
-        let mut extra = progress_json(&progress);
-        extra["progress_sequence"] = json!(*sequence);
-        extra["generated_samples"] = json!(generated_samples);
+struct OutputProgress<'a> {
+    playback: &'a DirectPlaybackCallbacks, // playback（设备播放器回调）。
+    writer: &'a mpsc::Sender<MediaWriteCommand>, // writer（设备媒体回执发送队列）。
+    identity: &'a MediaIdentity,           // identity（当前设备媒体租约）。
+    request: &'a ParsedRequest,            // request（当前直放分段）。
+    sequence: u64,                         // sequence（当前分段单调递增的进度编号）。
+    last_progress: Option<ClientTtsPlaybackProgress>, // last_progress（上次发送的设备进度）。
+}
+
+impl OutputProgress<'_> {
+    async fn cancelled(&self, permit: &mut RequestPermit) -> Result<(), String> {
+        let progress = (self.playback.stop_and_snapshot)(self.request.playback_key.clone()).await?;
+        validate_progress(&progress, &self.request.playback_key)?;
         send_request_status(
-            writer,
-            identity,
-            request,
-            "media.tts.output_progress",
-            extra,
-            {
-                let mut value = progress_labels();
-                value.insert("progress_sequence", "当前分段内单调递增的输出进度序号");
-                value.insert("generated_samples", "客户端本段已经生成的 PCM 样本数");
-                value
-            },
+            self.writer,
+            self.identity,
+            self.request,
+            "media.tts.cancelled",
+            progress_json(&progress),
+            progress_labels(),
         )
         .await?;
-        *previous = Some(progress.clone());
+        permit.fail();
+        Ok(())
     }
-    Ok(progress)
+
+    async fn report(
+        &mut self,
+        generated_samples: u64,
+    ) -> Result<ClientTtsPlaybackProgress, String> {
+        let request = self.request;
+        let progress =
+            (self.playback.progress)(request.playback_key.clone(), request.request.sample_rate)
+                .await?;
+        validate_progress(&progress, &request.playback_key)?;
+        let max_accepted = request
+            .playback_start_sample
+            .saturating_add(generated_samples);
+        if progress.accepted_samples > max_accepted
+            || progress.accepted_samples < request.playback_start_sample
+            || progress.played_samples < request.playback_start_sample
+            || self.last_progress.as_ref().is_some_and(|prior| {
+                progress.accepted_samples < prior.accepted_samples
+                    || progress.played_samples < prior.played_samples
+            })
+        {
+            return Err("客户端设备播放进度跨越了固定键或 PCM 样本单调性边界。".into());
+        }
+        if self.last_progress.as_ref() != Some(&progress) {
+            self.sequence = self.sequence.saturating_add(1);
+            let mut extra = progress_json(&progress);
+            extra["progress_sequence"] = json!(self.sequence);
+            extra["generated_samples"] = json!(generated_samples);
+            let mut fields = progress_labels();
+            fields.insert("progress_sequence", "当前分段内单调递增的输出进度序号");
+            fields.insert("generated_samples", "客户端本段已经生成的 PCM 样本数");
+            send_request_status(
+                self.writer,
+                self.identity,
+                request,
+                "media.tts.output_progress",
+                extra,
+                fields,
+            )
+            .await?;
+            self.last_progress = Some(progress.clone());
+        }
+        Ok(progress)
+    }
 }
 
 async fn send_request_status(
@@ -1138,6 +1179,60 @@ mod tests {
         });
         fields(&mut value);
         value
+    }
+
+    #[tokio::test]
+    async fn reports_audible_progress_while_a_large_provider_chunk_waits_for_queue_credit() {
+        let identity = identity();
+        let request = parse_request(&request(), &identity).unwrap();
+        let (writer, mut written) = mpsc::channel(4);
+        let rate = request.request.sample_rate;
+        let reserved = u64::from(rate) * OUTPUT_BUFFER_MS / 1_000;
+        let playback = DirectPlaybackCallbacks {
+            begin: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+            enqueue_pcm: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+            progress: Arc::new(move |playback_key, _| {
+                Box::pin(async move {
+                    Ok(ClientTtsPlaybackProgress {
+                        playback_key,
+                        accepted_samples: reserved,
+                        played_samples: reserved / 2,
+                        buffered_samples: reserved / 2,
+                        output_complete: false,
+                        device_time_us: 10_000,
+                    })
+                })
+            }),
+            stop_and_snapshot: Arc::new(|_| {
+                Box::pin(async { panic!("正常入队不会停止设备") })
+            }),
+        };
+        let mut output = OutputProgress {
+            playback: &playback,
+            writer: &writer,
+            identity: &identity,
+            request: &request,
+            sequence: 0,
+            last_progress: None,
+        };
+        let mut pending = reserved;
+        assert!(enqueue_frame(
+            &mut output,
+            || false,
+            &mut pending,
+            reserved + 640,
+            rate,
+            vec![0; 1_280],
+        )
+        .await
+        .unwrap());
+        let MediaWriteCommand::Text(message) = written.try_recv().unwrap() else {
+            panic!("需要设备实际输出进度回执");
+        };
+        let progress: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(progress["type"], "media.tts.output_progress");
+        assert_eq!(progress["played_samples"], reserved / 2);
+        assert_eq!(pending, reserved / 2 + 640);
     }
 
     #[test]
