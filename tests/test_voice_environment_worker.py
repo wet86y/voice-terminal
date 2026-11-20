@@ -363,11 +363,15 @@ def test_defender_injection_requires_trusted_location_and_valid_signature(tmp_pa
     monkeypatch.setenv('ProgramData',str(tmp_path))
     monkeypatch.setenv('SystemRoot',str(tmp_path/'Windows'))
     monkeypatch.setenv('PSModulePath','外部模块目录')
+    shell=tmp_path/'Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+    shell.parent.mkdir(parents=True)
+    shell.touch()
+    monkeypatch.setattr(worker,'powershell_candidates',lambda:[shell])
     module=tmp_path/'Microsoft/Windows Defender/Platform/4.18.26080.4-0/MpOAV.dll'
     with patch.object(worker.subprocess,'run',return_value=SimpleNamespace(returncode=signature_result)) as verify:
         assert worker.defender_injected_module(module)==accepted
         assert verify.call_args.kwargs['env']['VOICE_SYSTEM_MODULE_PATH']==str(module)
-        assert verify.call_args.kwargs['env']['PSModulePath']==str(tmp_path/'Windows/System32/WindowsPowerShell/v1.0/Modules')
+        assert verify.call_args.kwargs['env']['PSModulePath']==str(shell.parent/'Modules')+';'+str(tmp_path/'Windows/System32/WindowsPowerShell/v1.0/Modules')
         assert not worker.defender_injected_module(tmp_path/'external/MpOAV.dll')
         assert not worker.defender_injected_module(module.with_name('unknown.dll'))
         verify.assert_called_once()

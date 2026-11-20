@@ -54,7 +54,6 @@ const openSshBusy = ref(false)
 const openSshStatusLoading = ref(false)
 const openSshLongWaitNotice = ref(false) // openSshLongWaitNotice（本机 SSH 准备任务超过前台等待时间后仍在后台跟踪）。
 const openingPairing = ref(false) // openingPairing（配对码生成阶段，与广播启停分别显示）。
-const broadcastPreflightBusy = ref(false) // broadcastPreflightBusy（开启本机广播前检查 SSH 并等待准备任务）。
 const runtimeStatusTimer = ref<ReturnType<typeof setTimeout> | null>(null) // runtimeStatusTimer（轻量设备状态补查，不查询 Windows 功能）。
 let runtimeStatusReading = false // runtimeStatusReading（防止设备状态补查重叠）。
 let disposed = false // disposed（页面销毁后不再启动补查）。
@@ -98,7 +97,6 @@ const broadcastRuntimeError = computed(() => {
 const broadcastPhaseLabel = computed(() => {
   if (status.value?.device_runtime?.operation?.active) return status.value.device_runtime.operation.message
   if (deviceSettingsOperation.active) return deviceSettingsOperation.phase
-  if (broadcastPreflightBusy.value) return '正在检查本机 SSH 服务，请稍候…'
   if (openingPairing.value) return '正在生成配对码…'
   if (busy.value) return '正在应用设备设置；如出现 Windows 管理员授权，请完成授权。'
   if (!isBroadcasting.value) return '广播已关闭'
@@ -108,7 +106,7 @@ const broadcastPhaseLabel = computed(() => {
 })
 const visibleOpenSshJob = computed(() => openSshJobPending.value || openSshBusy.value || !openSshStatus.value?.ready
   ? openSshJob.value : null) // visibleOpenSshJob（已就绪时不把历史终态当作当前失败）。
-const canSave = computed(() => !loading.value && !busy.value && !openSshBusy.value && !broadcastPreflightBusy.value && !openSshJobPending.value
+const canSave = computed(() => !loading.value && !busy.value && !openSshBusy.value && !openSshJobPending.value
   && !status.value?.device_runtime?.operation?.active
   && !!status.value && (mode.value === 'remote' || localCoreAvailable.value))
 
@@ -256,7 +254,7 @@ function scheduleRuntimeStatusWatch() {
       if (disposed) return
       if ((next.device_runtime?.revision ?? 0) < (status.value?.device_runtime?.revision ?? 0)) return
       if ((next.device_runtime?.operation?.state_revision ?? 0) < (status.value?.device_runtime?.operation?.state_revision ?? 0)) return
-      if (!busy.value && !broadcastPreflightBusy.value && !loading.value && !deviceSettingsOperation.active) {
+      if (!busy.value && !loading.value && !deviceSettingsOperation.active) {
         status.value = { ...next }
         if (next.device_config) {
           mode.value = next.device_config.mode
@@ -275,7 +273,7 @@ function scheduleRuntimeStatusWatch() {
   }, 1500)
 }
 
-watch([mode, busy, broadcastPreflightBusy, isBroadcasting], scheduleRuntimeStatusWatch)
+watch([mode, busy, isBroadcasting], scheduleRuntimeStatusWatch)
 
 async function refreshOpenSshStatus() {
   if (disposed) return
@@ -740,32 +738,12 @@ async function onBroadcastChanged() {
 
 async function changeBroadcast() {
   const savedValue = status.value?.device_config?.broadcast_enabled ?? false
-  if (broadcastEnabled.value && !savedValue) {
-    if (broadcastPreflightBusy.value || openSshBusy.value || openSshJobPending.value) {
-      broadcastEnabled.value = savedValue
-      openSshStatusError.value = 'Windows SSH 功能任务正在进行，请完成后再开启广播。'
-      return
-    }
-    broadcastPreflightBusy.value = true
-    setDeviceSettingsPhase('正在检查本机 SSH 服务，请稍候…')
-    openSshStatusError.value = ''
-    error.value = ''
-    notice.value = ''
-    try {
-      await ensureOpenSshServerReady()
-    } catch (failure) {
-      broadcastEnabled.value = savedValue
-      openSshStatusError.value = failure instanceof Error ? failure.message : String(failure)
-      recordDeviceSettingsError(openSshStatusError.value)
-      return
-    } finally {
-      broadcastPreflightBusy.value = false
-    }
-    if (!window.confirm('开启后将创建本程序专用的局域网规则，只允许当前活动私有或域子网访问微软 SSH 服务、六位码配对端口和多播设备发现端口。可能需要 Windows 管理员授权。继续吗？')) {
-      broadcastEnabled.value = savedValue
-      return
-    }
+  if (broadcastEnabled.value && !savedValue && (openSshBusy.value || openSshJobPending.value)) {
+    broadcastEnabled.value = savedValue
+    openSshStatusError.value = 'Windows SSH 功能任务正在进行，请完成后再开启广播。'
+    return
   }
+  // 检查、必要维修和广播保存由同一个原生任务执行，已有许可不再要求页面二次确认。
   if (!await saveConfig()) broadcastEnabled.value = status.value?.device_config?.broadcast_enabled ?? savedValue
 }
 
@@ -937,16 +915,16 @@ onUnmounted(() => {
     </fieldset>
     <section v-if="mode === 'local'" class="device-card">
       <h3>局域网连接</h3>
-      <p class="broadcast-status" role="status" aria-live="polite" :aria-busy="busy || broadcastPreflightBusy">
+      <p class="broadcast-status" role="status" aria-live="polite" :aria-busy="busy">
         <span class="connection-state" :data-state="broadcastRuntimeError ? 'error' : status?.device_runtime?.broadcast_actual ? 'connected' : 'disconnected'">{{ broadcastPhaseLabel }}</span>
       </p>
-      <p v-if="broadcastRuntimeError && !busy && !broadcastPreflightBusy" class="device-message error" role="alert">{{ broadcastRuntimeError }}</p>
-      <label class="device-toggle"><span><strong>广播并接受配对</strong><small>开启后本机出现在局域网搜索结果中，并接受六位码配对。</small></span>
-        <input v-model="broadcastEnabled" type="checkbox" aria-label="广播并接受配对" :disabled="broadcastPreflightBusy || controlsLocked" @change="onBroadcastChanged" />
+      <p v-if="broadcastRuntimeError && !busy" class="device-message error" role="alert">{{ broadcastRuntimeError }}</p>
+      <label class="device-toggle"><span><strong>广播并接受配对</strong><small>开启后可被局域网发现并接受配对；关闭保留配对与网络许可，再次开启直接复用。</small></span>
+        <input v-model="broadcastEnabled" type="checkbox" aria-label="广播并接受配对" :disabled="controlsLocked" @change="onBroadcastChanged" />
       </label>
       <div class="button-row">
-        <button class="outline-button" :disabled="controlsLocked || broadcastPreflightBusy || openSshStatusLoading" @click="checkOpenSshServer">{{ openSshStatusLoading ? '正在读取 SSH 状态…' : '检查 SSH 服务' }}</button>
-        <button v-if="isBroadcasting" class="primary-button" :disabled="controlsLocked || broadcastPreflightBusy || !status?.device_runtime?.broadcast_actual" @click="openPairingWindow">获取配对码</button>
+        <button class="outline-button" :disabled="controlsLocked || openSshStatusLoading" @click="checkOpenSshServer">{{ openSshStatusLoading ? '正在读取 SSH 状态…' : '检查 SSH 服务' }}</button>
+        <button v-if="isBroadcasting" class="primary-button" :disabled="controlsLocked || !status?.device_runtime?.broadcast_actual" @click="openPairingWindow">获取配对码</button>
         <button v-if="pairingCode" class="outline-button" :disabled="controlsLocked" @click="closePairingWindow">关闭配对窗口</button>
       </div>
       <p v-if="openSshStatus" class="small-text" role="status">

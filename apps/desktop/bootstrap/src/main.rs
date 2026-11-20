@@ -218,10 +218,12 @@ fn start_in_desktop(root: &Path, entry: &Path, debug: bool) -> Result<u32, Strin
     use std::os::windows::process::CommandExt;
     let session = voice_desktop_common::agent_debug::interactive_session()?;
     let task = format!("VoiceTerminal-Agent-{}", workspace::new_id());
-    let shell = PathBuf::from(std::env::var_os("SystemRoot").ok_or("找不到 Windows 系统目录。")?)
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let shell = voice_desktop_common::powershell::select(
+        voice_desktop_common::powershell::Purpose::Launch,
+    )?;
     let run = |script: &str, token: &str| {
-        Command::new(&shell)
+        shell
+            .command()
             .args([
                 "-NoLogo",
                 "-NoProfile",

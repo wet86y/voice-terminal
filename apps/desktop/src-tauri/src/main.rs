@@ -1899,11 +1899,11 @@ async fn save_device_config_inner(
     {
         operation.phase(
             "preparing_access",
-            "正在配置局域网规则；如出现 Windows 管理员授权，请完成确认",
+            "正在检查局域网配置；确认需要系统修复时才请求管理员授权",
         );
         // 合并 SSH（安全远程连接）与配对规则：由同一轮状态复核决定是否需要授权。
         let access = tauri::async_runtime::spawn_blocking(|| {
-            voice_desktop_common::system_feature::set_device_broadcast_access(true)
+            voice_desktop_common::system_feature::prepare_device_broadcast_access(true)
         })
         .await
         .map_err(|_| "局域网受限防火墙准备任务无法启动。".to_string())??;
@@ -1952,11 +1952,15 @@ async fn save_device_config_inner(
             return Err(error);
         }
     };
-    client_event(&state, "client.settings_saved", serde_json::json!({
+    client_event(
+        &state,
+        "client.settings_saved",
+        serde_json::json!({
         "device_id":config.device_id,"mode":if config.mode == voice_desktop_common::device_config::RunMode::Remote {"remote"}else{"local"},
         "client_online_tts_local":config.client_online_tts_local,"audio_compression":config.audio_compression,
         "previous_client_online_tts_local":old_config.as_ref().map(|value| value.client_online_tts_local),
-        "previous_audio_compression":old_config.as_ref().map(|value| value.audio_compression),"trigger":"device-config-save"}));
+        "previous_audio_compression":old_config.as_ref().map(|value| value.audio_compression),"trigger":"device-config-save"}),
+    );
     if runtime_change {
         operation.phase("starting", "正在启动目标运行模式");
         state
@@ -1980,9 +1984,13 @@ async fn save_device_config_inner(
                 if let Some(previous) = old_config {
                     let restore =
                         voice_desktop_common::device_config::save(&context.data, &previous);
-                    client_event(&state, "client.settings_restored", serde_json::json!({
+                    client_event(
+                        &state,
+                        "client.settings_restored",
+                        serde_json::json!({
                         "device_id":previous.device_id,"client_online_tts_local":previous.client_online_tts_local,
-                        "result":if restore.is_ok(){"restored"}else{"failed"},"reason":"目标模式启动失败"}));
+                        "result":if restore.is_ok(){"restored"}else{"failed"},"reason":"目标模式启动失败"}),
+                    );
                     if restore.is_ok()
                         && previous.mode == voice_desktop_common::device_config::RunMode::Local
                     {
@@ -2033,18 +2041,8 @@ async fn save_device_config_inner(
         if !runtime_change {
             set_local_device_gateway(&state, false).await?;
         }
-        let disable = tauri::async_runtime::spawn_blocking(|| {
-            voice_desktop_common::system_feature::set_device_broadcast_access(false)
-        })
-        .await
-        .map_err(|_| "局域网规则关闭任务无法启动。".to_string())?;
-        if let Err(error) = disable {
-            *state
-                .broadcast_error
-                .lock()
-                .map_err(|_| "广播错误状态不可用。")? = Some(error.clone());
-            return Err(format!("目标运行模式已保存，应用已停止接受远程连接，但本轮创建的防火墙规则未能全部关闭：{error}"));
-        }
+        // 广播是应用入口的开关。长期网络许可和设备授权继续保留，重新开启只读复核后复用。
+        // stop_local_remote_services（关闭本轮入口）已清除广播检查快照，不保留过期网络状态。
     }
     *state
         .broadcast_error
@@ -2690,9 +2688,9 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
     let status = if let Some(status) = cached {
         status
     } else {
-        let status = tauri::async_runtime::spawn_blocking(
-            voice_desktop_common::system_feature::open_ssh_server_runtime_status,
-        )
+        let status = tauri::async_runtime::spawn_blocking(|| {
+            voice_desktop_common::system_feature::prepare_device_broadcast_access(false)
+        })
         .await
         .map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
         *state
@@ -10331,6 +10329,13 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 fn main() {
+    if let Some(result) = voice_desktop_common::system_maintenance::dispatch() {
+        if let Err(error) = result {
+            eprintln!("系统维护失败：{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(feature = "ssh-device")]
     if let Some(result) = voice_desktop_common::device_bridge::dispatch() {
         let code = match result {

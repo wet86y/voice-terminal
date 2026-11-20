@@ -5,7 +5,6 @@ use crate::{
     device_trust::DeviceTrustStore,
     LaunchContext,
 };
-use serde::Deserialize;
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, TcpStream},
@@ -24,12 +23,7 @@ struct BridgeArguments {
     workspace_id: String, // workspace_id（被项目密钥绑定的工作区编号）。
     owner_sid: String,    // owner_sid（授权密钥登记的 Windows 登录账户 SID）。
     device_id: String,    // device_id（已经通过配对登记的客户端编号）。
-    build: String,        // build（密钥授权时登记的程序构建编号）。
-}
-
-#[derive(Deserialize)]
-struct ReleaseIdentity {
-    build: String, // build（正式程序构建编号）。
+    protocol: u32,        // protocol（长期授权桥接协议版本）。
 }
 
 /// dispatch（SSH 早期分派）：命中专用入口时在 Tauri、网页和 Python 启动前处理。
@@ -61,13 +55,29 @@ fn run(args: &[String]) -> Result<(), String> {
     if crate::system_feature::current_user_sid()? != arguments.owner_sid {
         return Err("当前 SSH 登录账户 SID 与项目密钥登记账户不匹配。".into());
     }
-    let release: ReleaseIdentity = serde_json::from_value(crate::resources::load(
-        &context.program.join("release.json"),
-    )?)
-    .map_err(|_| "当前程序缺少有效 release.json 构建身份。".to_string())?;
-    if release.build != arguments.build {
-        return Err("SSH 密钥绑定的程序构建与当前受管程序不匹配。".into());
+    let release = crate::resources::load(&context.program.join("release.json"))?;
+    crate::compatibility::require_device_bridge_protocol(arguments.protocol, &release)?;
+    let executable_records = release["files"]
+        .as_array()
+        .ok_or("正式程序文件清单不可用。")?
+        .iter()
+        .filter(|record| record["path"] == "VoiceTerminalDesktop.exe")
+        .cloned()
+        .collect::<Vec<_>>();
+    if executable_records.len() != 1 {
+        return Err("正式程序清单缺少唯一桌面入口。".into());
     }
+    crate::workspace::verify_fixed_files_with_progress(
+        &context.program,
+        &executable_records,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_, _, _| {},
+    )?;
+    let current_build = release["build"]
+        .as_str()
+        .filter(|value| valid_ascii_token(value, 128))
+        .ok_or("当前正式程序缺少有效构建身份。")?
+        .to_owned();
     match device_config::load_from_root(&context.data) {
         LoadResult::Valid(config) if config.mode == RunMode::Local && config.broadcast_enabled => {}
         _ => return Err("本机不处于已保存的本地广播模式；SSH 桥接拒绝网络会话。".into()),
@@ -89,7 +99,8 @@ fn run(args: &[String]) -> Result<(), String> {
             workspace_id: arguments.workspace_id,
             owner_sid: arguments.owner_sid,
             client_device_id: arguments.device_id,
-            build: arguments.build,
+            // 前导帧仍报告当前运行构建，后续本机服务继续核对真实发行身份。
+            build: current_build,
             fields: std::collections::BTreeMap::from([
                 ("type".into(), "正式 SSH 强制命令桥接类型".into()),
                 ("protocol_version".into(), "桥接前导协议版本".into()),
@@ -128,7 +139,7 @@ fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
         "",
         "--device-id",
         "",
-        "--build",
+        "--bridge-protocol",
         "",
     ];
     if args.len() != EXPECTED.len()
@@ -138,16 +149,18 @@ fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
         || args[5] != EXPECTED[5]
         || args[7] != EXPECTED[7]
     {
-        return Err("SSH 桥接参数必须是强制命令中固定的工作区、账户、设备和构建身份。".into());
+        return Err("SSH 桥接参数必须是强制命令中固定的工作区、账户、设备和协议版本。".into());
     }
     let workspace_id = &args[2];
     let owner_sid = &args[4];
     let device_id = &args[6];
-    let build = &args[8];
+    let protocol = args[8]
+        .parse::<u32>()
+        .map_err(|_| "设备授权协议版本无效。")?;
     if !crate::workspace::valid_workspace_id(workspace_id)
         || !valid_sid(owner_sid)
         || !valid_device_id(device_id)
-        || !valid_ascii_token(build, 128)
+        || protocol != crate::compatibility::DEVICE_BRIDGE_PROTOCOL_VERSION
     {
         return Err("SSH 桥接身份参数格式无效。".into());
     }
@@ -155,7 +168,7 @@ fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
         workspace_id: workspace_id.clone(),
         owner_sid: owner_sid.clone(),
         device_id: device_id.clone(),
-        build: build.clone(),
+        protocol,
     })
 }
 
@@ -466,8 +479,8 @@ mod tests {
                 "S-1-5-21-42",
                 "--device-id",
                 "device-a",
-                "--build",
-                "product-test",
+                "--bridge-protocol",
+                "1",
             ]
             .map(str::to_owned);
             let arguments = parse_arguments(&args).unwrap();
@@ -477,7 +490,7 @@ mod tests {
                 workspace_id: arguments.workspace_id,
                 owner_sid: arguments.owner_sid,
                 client_device_id: arguments.device_id,
-                build: arguments.build,
+                build: "product-current".into(),
                 fields: [
                     ("type", "桥接消息类型"),
                     ("protocol_version", "桥接协议版本"),
@@ -546,8 +559,8 @@ mod tests {
                 "S-1-5-21-42",
                 "--device-id",
                 "device-a",
-                "--build",
-                "product-test",
+                "--bridge-protocol",
+                "1",
             ]
             .map(str::to_owned);
             assert!(parse_arguments(&args).is_err(), "{workspace_id:?}");
@@ -577,14 +590,21 @@ mod tests {
             "S-1-5-21-42",
             "--device-id",
             "device-a",
-            "--build",
-            "b20261117",
+            "--bridge-protocol",
+            "1",
         ]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
         assert!(parse_arguments(&args).is_ok());
         assert!(parse_arguments(&[args.clone(), vec!["extra".into()]].concat()).is_err());
+        let mut invalid = args.clone();
+        invalid[7] = "--build".into();
+        invalid[8] = "product-old".into();
+        assert!(parse_arguments(&invalid).is_err(), "不保留旧构建绑定入口");
+        invalid[7] = "--bridge-protocol".into();
+        invalid[8] = "2".into();
+        assert!(parse_arguments(&invalid).is_err(), "未支持的协议必须拒绝");
         assert!(ip_in_scope(
             "192.168.1.24".parse().unwrap(),
             "192.168.1.0/24"

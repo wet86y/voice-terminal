@@ -7,8 +7,7 @@ pub const OPENSSH_SERVER_ID: &str = "openssh-server"; // OPENSSH_SERVER_ID（Ope
 pub const OPENSSH_SERVER_JOB_ID: &str = "system-feature-openssh-server"; // OPENSSH_SERVER_JOB_ID（OpenSSH Server 受管任务编号）。
 const OPENSSH_CAPABILITY: &str = "OpenSSH.Server~~~~0.0.1.0"; // OPENSSH_CAPABILITY（Windows 可选功能固定名称）。
 pub const DEVICE_PAIRING_PORT: u16 = 18_766; // DEVICE_PAIRING_PORT（仅限局域网的 OPAQUE 配对端口）。
-pub const OPENSSH_SERVER_UAC_CANCELLED_ERROR: &str =
-    "已取消 Windows 管理员授权；OpenSSH Server 未由本任务启动。"; // OPENSSH_SERVER_UAC_CANCELLED_ERROR（用户拒绝 UAC 后的固定结果）。
+pub const OPENSSH_SERVER_UAC_CANCELLED_ERROR: &str = "已取消 Windows 管理员授权；系统维护未执行。"; // OPENSSH_SERVER_UAC_CANCELLED_ERROR（用户拒绝 UAC 后的固定结果）。
 const MAX_EXISTING_SSH_RULES: usize = 8; // MAX_EXISTING_SSH_RULES（界面最多显示的其他 SSH 入站候选规则）。
 const MAX_SSH_RULE_DETAIL_CHARS: usize = 180; // MAX_SSH_RULE_DETAIL_CHARS（单条防火墙规则摘要最大字符数）。
 
@@ -494,8 +493,8 @@ fn open_ssh_server_status_with_details(details: bool) -> Result<OpenSshServerSta
             .encode(product_executable.to_string_lossy().as_bytes());
         let script = r#"
 $systemModuleRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-# PSModulePath（PowerShell 模块搜索路径）：固定为 Windows 自带模块，避免宿主 PowerShell 7 模块污染 Windows PowerShell 5.1。
-$env:PSModulePath = $systemModuleRoot
+# PSModulePath（PowerShell 模块搜索路径）：使用所选解释器及 Windows 自带模块，不继承其他解释器的模块路径。
+$env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $systemModuleRoot
 # PSModuleAutoLoadingPreference（模块自动加载策略）：只在本次只读脚本进程中启用模块自动加载。
 $PSModuleAutoLoadingPreference = 'All'
 $ErrorActionPreference = 'Stop'
@@ -643,7 +642,7 @@ $authorizedKeysPath = if ($accountIsAdmin) {
 } else { $null }
 $authorizedKeysExists = $authorizedKeysPath -and (Test-Path -LiteralPath $authorizedKeysPath -PathType Leaf)
 # 只取项目三条规则；批量管道复用提供程序，避免三次规则枚举和重复过滤器查询。
-$ownedRules = @(Get-NetFirewallRule -Name @('VoiceTerminal-OpenSSH-Server-In-TCP','VoiceTerminal-Device-Pairing-TCP-In','VoiceTerminal-Device-Discovery-UDP-In') -ErrorAction SilentlyContinue)
+$ownedRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name @('VoiceTerminal-OpenSSH-Server-In-TCP','VoiceTerminal-Device-Pairing-TCP-In','VoiceTerminal-Device-Discovery-UDP-In') -ErrorAction SilentlyContinue)
 $projectRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-OpenSSH-Server-In-TCP' } | Select-Object -First 1
 $pairingRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-Device-Pairing-TCP-In' } | Select-Object -First 1
 $discoveryRule = $ownedRules | Where-Object { $_.Name -eq 'VoiceTerminal-Device-Discovery-UDP-In' } | Select-Object -First 1
@@ -670,6 +669,17 @@ if ($null -ne $pairingRule) {
 $projectAccessValid = Test-ProjectFirewallRule $projectRule $systemOpenSsh $effectivePort $localLanScopes
 $pairingAccessValid = Test-ProjectFirewallRule $pairingRule $expectedDesktopPath {DEVICE_PAIRING_PORT} $localLanScopes
 $discoveryAccessValid = Test-ProjectFirewallRule $discoveryRule $expectedDesktopPath 5353 $localLanScopes 'UDP'
+if (-not ($projectAccessValid -and $pairingAccessValid -and $discoveryAccessValid)) {
+    $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object {
+        $physicalInterfaces -contains $_.InterfaceIndex -and [string]$_.NetworkCategory -in @('Private','DomainAuthenticated')
+    } | ForEach-Object { if ([string]$_.NetworkCategory -eq 'Private') { 'Private' } else { 'Domain' } } | Sort-Object -Unique)
+    foreach ($profileName in $activeProfiles) {
+        $policy = Get-NetFirewallProfile -PolicyStore ActiveStore -Name $profileName -ErrorAction Stop
+        if ([string]$policy.Enabled -eq 'True' -and ([string]$policy.AllowLocalFirewallRules -eq 'False' -or [string]$policy.AllowInboundRules -eq 'False')) {
+            throw '当前防火墙策略不允许本机入站规则生效；请由系统管理员检查策略，程序未反复申请授权或覆盖其他规则。'
+        }
+    }
+}
 $otherSshInboundRules = @()
 if ({INCLUDE_EXTERNAL_RULES}) {
 $sshProbePort = if ($null -ne $effectivePort) { [string]$effectivePort } else { '22' }
@@ -781,7 +791,17 @@ where
     {
         let status = prepare_open_ssh_server_with_progress(
             open_ssh_server_status,
-            run_elevated_powershell_with_progress,
+            |_script, on_wait| {
+                let code = if crate::system_maintenance::elevated()? {
+                    run_maintenance_script(&open_ssh_server_install_script(), on_wait)?
+                } else {
+                    crate::system_maintenance::execute(
+                        crate::system_maintenance::Operation::PrepareOpenSsh {},
+                        on_wait,
+                    )?
+                };
+                elevated_exit_result(code)
+            },
             on_wait,
         )?;
         remember_runtime_status(&status);
@@ -868,8 +888,8 @@ fn open_ssh_server_install_script() -> String {
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $systemModuleRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-# PSModulePath（PowerShell 模块搜索路径）：固定为 Windows 自带模块，供官方 DISM 与防火墙命令使用。
-$env:PSModulePath = $systemModuleRoot
+# PSModulePath（PowerShell 模块搜索路径）：使用所选解释器及系统模块，供官方 DISM（映像维护）与防火墙命令使用。
+$env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $systemModuleRoot
 $PSModuleAutoLoadingPreference = 'All'
 try {{
     $capability = Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop
@@ -1032,6 +1052,69 @@ pub fn set_device_broadcast_access(enabled: bool) -> Result<OpenSshServerStatus,
     configure_project_access(enabled, true, true, true)
 }
 
+#[derive(Default)]
+struct BroadcastRepairGate {
+    failed: bool, // failed（本轮维修失败或取消后，等待用户主动重试）。
+}
+
+impl BroadcastRepairGate {
+    fn repair<T>(
+        &mut self,
+        explicit: bool,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !explicit && self.failed {
+            return Err("本机广播配置修复已失败或取消；已停止自动申请授权，请在设备设置中重新开启广播以重试。".into());
+        }
+        let result = action();
+        self.failed = result.is_err();
+        result
+    }
+}
+
+static BROADCAST_REPAIR: std::sync::Mutex<BroadcastRepairGate> =
+    std::sync::Mutex::new(BroadcastRepairGate { failed: false });
+
+/// prepare_device_broadcast_access（广播检查与必要维修）：有效规则直接复用；只合并修复本程序拥有的系统配置。
+pub fn prepare_device_broadcast_access(explicit: bool) -> Result<OpenSshServerStatus, String> {
+    // 合并同时发生的自动启动、核心就绪和手动保存，避免相同故障产生多次 UAC（管理员授权）。
+    let mut gate = BROADCAST_REPAIR
+        .lock()
+        .map_err(|_| "广播维修状态不可用。")?;
+    let before = cached_open_ssh_server_runtime_status(explicit)?;
+    prepare_broadcast_with(&mut gate, explicit, before, |before| {
+        if !before.ready {
+            enable_open_ssh_server()?;
+        }
+        set_device_broadcast_access(true)
+    })
+}
+
+fn prepare_broadcast_with(
+    gate: &mut BroadcastRepairGate,
+    explicit: bool,
+    before: OpenSshServerStatus,
+    repair: impl FnOnce(&OpenSshServerStatus) -> Result<OpenSshServerStatus, String>,
+) -> Result<OpenSshServerStatus, String> {
+    if before.ready
+        && before.project_access_valid
+        && before.pairing_access_valid
+        && before.discovery_access_valid
+    {
+        gate.failed = false;
+        return Ok(before);
+    }
+    if before.local_lan_addresses.is_empty() || before.local_lan_scopes.is_empty() {
+        return Err(
+            "没有可用的私有或域物理局域网；未申请管理员授权，请检查网络连接和网络类型。".into(),
+        );
+    }
+    if before.account_is_entra || before.account_ssh_username.is_none() {
+        return Err("当前 Windows 账户不支持受管 SSH 登录；未申请管理员授权。".into());
+    }
+    gate.repair(explicit, || repair(&before))
+}
+
 fn configure_project_access(
     enabled: bool,   // enabled（是否启用所选程序规则）。
     ssh: bool,       // ssh（是否维护 SSH 规则）。
@@ -1069,32 +1152,29 @@ fn configure_project_access(
             std::env::current_exe().map_err(|error| format!("无法定位本程序正式入口：{error}"))?;
         let script = project_access_script(enabled, ssh, pairing, discovery, &before, &executable);
         let outcome = (|| {
-            run_elevated_powershell(&script)?;
-            let mut after = before.clone();
-            if ssh {
-                after.project_access_enabled = enabled;
-                after.project_access_valid = enabled;
-                after.project_network_scope = if enabled {
-                    before.local_lan_scopes.clone()
-                } else {
-                    vec![]
-                };
+            run_admin_operation(
+                crate::system_maintenance::Operation::ProjectAccess {
+                    enabled,
+                    ssh,
+                    pairing,
+                    discovery,
+                },
+                &script,
+            )?;
+            let after = cached_open_ssh_server_runtime_status(true)?;
+            if enabled
+                && ((!ssh || after.project_access_valid)
+                    && (!pairing || after.pairing_access_valid)
+                    && (!discovery || after.discovery_access_valid))
+                || !enabled
+                    && ((!ssh || !after.project_access_enabled)
+                        && (!pairing || !after.pairing_access_enabled)
+                        && (!discovery || !after.discovery_access_enabled))
+            {
+                Ok(after)
+            } else {
+                Err("系统维护已结束，但本程序网络规则尚未实际生效；请检查防火墙策略。".into())
             }
-            if pairing {
-                after.pairing_access_enabled = enabled;
-                after.pairing_access_valid = enabled;
-                after.pairing_network_scope = if enabled {
-                    before.local_lan_scopes.clone()
-                } else {
-                    vec![]
-                };
-            }
-            if discovery {
-                after.discovery_access_enabled = enabled;
-                after.discovery_access_valid = enabled;
-            }
-            remember_runtime_status(&after);
-            Ok(after)
         })();
         if let Err(error) = outcome {
             if let Ok(mut cache) = RUNTIME_STATUS_CACHE.lock() {
@@ -1274,6 +1354,17 @@ fn manage_project_device_key(
     if status.account_sid.as_deref() != Some(owner_sid) {
         return Err("配对窗口账户 SID 与当前 Windows 登录账户不匹配。".into());
     }
+    if add {
+        let mut requested = network_scopes.to_vec();
+        requested.sort();
+        requested.dedup();
+        let mut active = status.local_lan_scopes.clone();
+        active.sort();
+        active.dedup();
+        if requested != active {
+            return Err("设备公钥来源范围与当前实际局域网不匹配，请重新获取配对码。".into());
+        }
+    }
     let metadata = std::fs::symlink_metadata(executable)
         .map_err(|error| format!("无法检查桥接可执行文件：{error}"))?;
     if crate::workspace::metadata_reparse(&metadata) || !metadata.is_file() {
@@ -1293,8 +1384,8 @@ fn manage_project_device_key(
     let line = if add {
         let command =
             format!(
-            "\"{}\" --ssh-device-bridge --workspace-id {} --owner-sid {} --device-id {} --build {}",
-            executable.display(), workspace_id, owner_sid, device_id, build,
+            "\"{}\" --ssh-device-bridge --workspace-id {} --owner-sid {} --device-id {} --bridge-protocol {}",
+            executable.display(), workspace_id, owner_sid, device_id, crate::compatibility::DEVICE_BRIDGE_PROTOCOL_VERSION,
         );
         let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
         format!("from=\"{scopes}\",restrict,command=\"{escaped_command}\" {public_key} {marker}")
@@ -1322,7 +1413,18 @@ fn manage_project_device_key(
         script = script.replace(&format!("@@{name}@@"), &encoded);
     }
     if status.account_is_admin {
-        run_elevated_powershell(&script)?;
+        run_admin_operation(
+            crate::system_maintenance::Operation::DeviceKey {
+                add,
+                public_key: public_key.into(),
+                workspace_id: workspace_id.into(),
+                device_id: device_id.into(),
+                build: build.into(),
+                owner_sid: owner_sid.into(),
+                network_scopes: network_scopes.to_vec(),
+            },
+            &script,
+        )?;
     } else {
         let output = run_powershell(&script, std::time::Duration::from_secs(30))?;
         if !output.contains("VoiceTerminalAuthorizedKeyUpdated") {
@@ -1451,6 +1553,9 @@ try {
     $prefix = 'VoiceTerminal:'
     $owned = @($rows | Where-Object { $_.EndsWith(" $marker", [StringComparison]::Ordinal) })
     $otherRows = @($rows | Where-Object { -not $_.EndsWith(" $marker", [StringComparison]::Ordinal) })
+    if ($action -eq 'add' -and $owned.Count -eq 1 -and [string]::Equals([string]$owned[0], $line, [StringComparison]::Ordinal)) {
+        Write-Output 'VoiceTerminalAuthorizedKeyUpdated'; exit 0
+    }
     if ($action -eq 'add') {
         if ($otherRows | Where-Object { $_.IndexOf($publicKey, [StringComparison]::Ordinal) -ge 0 }) { throw '该公钥已在非本程序授权行中出现；为避免通用 SSH 权限，未登记。' }
         $rows = @($otherRows + $line)
@@ -1485,7 +1590,7 @@ try {
 }
 "#;
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn encode_powershell(script: &str) -> String {
     use base64::Engine;
     let encoded = script
@@ -1495,220 +1600,203 @@ fn encode_powershell(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(encoded)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn powershell_executable() -> Result<std::path::PathBuf, String> {
-    let system_root =
-        std::env::var_os("SystemRoot").ok_or("Windows SystemRoot 环境变量不可用。")?;
-    let executable = std::path::PathBuf::from(system_root)
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    if !executable.is_file() {
-        return Err("系统 Windows PowerShell 不存在。".into());
-    }
-    Ok(executable)
+    Ok(crate::powershell::select(crate::powershell::Purpose::System)?.executable)
 }
 
 #[cfg(windows)]
 fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, String> {
-    use std::{
-        io::Read,
-        os::windows::process::CommandExt,
-        process::{Command, Stdio},
-        thread,
-        time::Instant,
-    };
-    let executable = powershell_executable()?;
-    let system_module_path = std::path::PathBuf::from(
-        // system_module_path（隔离宿主版本后的 Windows PowerShell 官方模块搜索路径）。
-        std::env::var_os("SystemRoot").ok_or("Windows SystemRoot 环境变量不可用。")?,
-    )
-    .join("System32/WindowsPowerShell/v1.0/Modules");
-    let script = format!("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n{script}");
-    let mut child = Command::new(executable)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-        ])
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（不创建控制台窗口，避免 Windows Terminal 空窗）。
-        .env("PSModulePath", system_module_path)
-        .spawn()
-        .map_err(|error| format!("无法启动 Windows PowerShell：{error}"))?;
-    // 同时排空两个管道，避免系统模块的诊断或进度输出填满管道后把查询卡住。
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or("PowerShell 标准输出管道不可用。")?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or("PowerShell 错误输出管道不可用。")?;
-    let output_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let error_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("无法读取 PowerShell 任务状态：{error}"))?
-        {
-            let output = output_reader
-                .join()
-                .map_err(|_| "PowerShell 输出读取线程异常。")?
-                .map_err(|error| format!("无法读取 PowerShell 状态回执：{error}"))?;
-            let diagnostic_bytes = error_reader
-                .join()
-                .map_err(|_| "PowerShell 错误读取线程异常。")?
-                .map_err(|error| format!("无法读取 PowerShell 错误回执：{error}"))?;
-            if !status.success() {
-                let exit_code = status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "未知".into());
-                let diagnostic = String::from_utf8_lossy(&diagnostic_bytes)
-                    .chars()
-                    .filter(|character| !character.is_control() || *character == ' ')
-                    .take(240)
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let detail = if diagnostic.is_empty() {
-                    String::new()
-                } else {
-                    format!("；诊断：{diagnostic}")
-                };
-                return Err(format!(
-                    "OpenSSH Server 状态查询失败（PowerShell 退出码 {exit_code}）{detail}。"
-                ));
-            }
-            return String::from_utf8(output)
-                .map(|value| value.trim().to_owned())
-                .map_err(|_| "OpenSSH Server 状态结果不是 UTF-8。".into());
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("OpenSSH Server 状态查询超时。".into());
-        }
-        thread::sleep(std::time::Duration::from_millis(50));
+    let host = crate::powershell::select(crate::powershell::Purpose::System)?;
+    let (code, output, diagnostic) =
+        crate::powershell::execute(&host, script, timeout, &mut |_| {})?;
+    if code != 0 {
+        let diagnostic = diagnostic
+            .chars()
+            .filter(|ch| !ch.is_control() || *ch == ' ')
+            .take(240)
+            .collect::<String>();
+        return Err(format!(
+            "系统脚本执行失败（PowerShell 退出码 {code}）；{diagnostic}"
+        ));
     }
+    Ok(output)
 }
 
 #[cfg(windows)]
-fn run_elevated_powershell(script: &str) -> Result<(), String> {
-    let exit_code = run_elevated_powershell_process(script, &mut |_| {})?;
-    if exit_code == 0 {
-        Ok(())
-    } else {
-        Err(format!("程序网络规则或设备公钥配置未完成（PowerShell 退出码 {exit_code}）；请检查 Windows 授权及系统策略。"))
-    }
-}
-
-#[cfg(windows)]
-fn run_elevated_powershell_with_progress(
-    script: &str,
-    on_wait: &mut dyn FnMut(std::time::Duration),
-) -> Result<(), String> {
-    elevated_exit_result(run_elevated_powershell_process(script, on_wait)?)
-}
-
-/// run_elevated_powershell_process（执行管理员任务）：调用方按安装或网络配置解释退出码。
-#[cfg(windows)]
-fn run_elevated_powershell_process(
+fn run_maintenance_script(
     script: &str,
     on_wait: &mut dyn FnMut(std::time::Duration),
 ) -> Result<u32, String> {
-    use std::{mem::size_of, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-        UI::{
-            Shell::{
-                ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-            },
-            WindowsAndMessaging::SW_HIDE,
-        },
+    let host = crate::powershell::select(crate::powershell::Purpose::Maintenance)?;
+    let (code, _, diagnostic) =
+        crate::powershell::execute(&host, script, std::time::Duration::from_secs(600), on_wait)?;
+    if code == 1 {
+        let diagnostic = diagnostic
+            .chars()
+            .filter(|ch| !ch.is_control() || *ch == ' ')
+            .take(240)
+            .collect::<String>();
+        return Err(format!("系统维护未完成；{diagnostic}"));
+    }
+    Ok(code)
+}
+
+#[cfg(windows)]
+fn run_admin_operation(
+    operation: crate::system_maintenance::Operation,
+    script: &str,
+) -> Result<(), String> {
+    let code = if crate::system_maintenance::elevated()? {
+        run_maintenance_script(script, &mut |_| {})?
+    } else {
+        crate::system_maintenance::execute(operation, &mut |_| {})?
     };
-
-    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
-        value.encode_wide().chain(std::iter::once(0)).collect()
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!("程序网络规则或设备公钥维护失败（退出码 {code}）。"))
     }
+}
 
-    let executable = wide(powershell_executable()?.as_os_str());
-    let verb = wide(std::ffi::OsStr::new("runas"));
-    // 所有管理员脚本使用系统模块路径，避免继承 PowerShell 7（新版命令行）模块。
-    let script = format!("$env:PSModulePath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/Modules'\n$PSModuleAutoLoadingPreference = 'All'\n{script}");
-    let encoded = encode_powershell(&script);
-    let parameters = wide(std::ffi::OsStr::new(&format!(
-        "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
-    )));
-    let mut execute = SHELLEXECUTEINFOW {
-        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
-        lpVerb: verb.as_ptr(),
-        lpFile: executable.as_ptr(),
-        lpParameters: parameters.as_ptr(),
-        nShow: SW_HIDE,
-        ..Default::default()
-    };
-
-    let launched = unsafe { ShellExecuteExW(&mut execute) };
-    if launched == 0 {
-        let code = unsafe { GetLastError() };
-        return if code == ERROR_CANCELLED {
-            Err(OPENSSH_SERVER_UAC_CANCELLED_ERROR.into())
-        } else {
-            Err(format!(
-                "无法启动 OpenSSH Server 管理任务（Windows 错误代码 {code}）。"
-            ))
-        };
+/// execute_maintenance_operation（维护操作正式分派）：参数重新经生产校验，不接受脚本和可执行路径。
+#[cfg(windows)]
+pub(crate) fn execute_maintenance_operation(
+    operation: crate::system_maintenance::Operation,
+) -> Result<u32, String> {
+    if !crate::system_maintenance::elevated()? {
+        return Err("系统维护进程未获管理员授权。".into());
     }
-
-    let process = execute.hProcess;
-    if process.is_null() {
-        return Err("Windows 未返回 OpenSSH Server 管理任务句柄，无法确认任务结束状态。".into());
-    }
-    let started = std::time::Instant::now();
-    let mut last_progress = started;
-    loop {
-        let wait = unsafe { WaitForSingleObject(process, 1_000) };
-        if wait == WAIT_OBJECT_0 {
-            break;
-        }
-        if wait == WAIT_TIMEOUT {
-            let now = std::time::Instant::now();
-            if now.duration_since(last_progress) >= std::time::Duration::from_secs(15) {
-                on_wait(now.duration_since(started));
-                last_progress = now;
+    match operation {
+        crate::system_maintenance::Operation::PrepareOpenSsh {} => {
+            let status = open_ssh_server_runtime_status()?;
+            if status.ready {
+                return Ok(0);
             }
-            continue;
+            // 复用生产安装准入，拒绝未知或签名不合格的现有系统服务。
+            prepare_open_ssh_server_with_progress(
+                open_ssh_server_runtime_status,
+                |script, _| elevated_exit_result(run_maintenance_script(script, &mut |_| {})?),
+                |_| {},
+            )?;
+            Ok(0)
         }
-        unsafe { CloseHandle(process) };
-        return Err("等待 OpenSSH Server 管理任务时发生错误；最终状态未知，请先刷新状态。".into());
+        crate::system_maintenance::Operation::ProjectAccess {
+            enabled,
+            ssh,
+            pairing,
+            discovery,
+        } => {
+            configure_project_access(enabled, ssh, pairing, discovery)?;
+            Ok(0)
+        }
+        #[cfg(feature = "ssh-device")]
+        crate::system_maintenance::Operation::DeviceKey {
+            add,
+            public_key,
+            workspace_id,
+            device_id,
+            build,
+            owner_sid,
+            network_scopes,
+        } => {
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            let context = crate::LaunchContext::from_executable(&executable, &[])?;
+            if context.workspace_id != workspace_id {
+                return Err("设备公钥维护工作区与当前正式程序不匹配。".into());
+            }
+            let release = crate::resources::load(&context.program.join("release.json"))?;
+            if release["build"].as_str() != Some(build.as_str()) {
+                return Err("设备公钥维护请求不属于当前正式程序构建。".into());
+            }
+            manage_project_device_key(
+                add,
+                &public_key,
+                &workspace_id,
+                &device_id,
+                &build,
+                &executable,
+                &owner_sid,
+                &network_scopes,
+            )?;
+            Ok(0)
+        }
     }
-    let mut exit_code = 1u32;
-    let exit_read = unsafe { GetExitCodeProcess(process, &mut exit_code) };
-    unsafe { CloseHandle(process) };
-    if exit_read == 0 {
-        return Err("无法读取 OpenSSH Server 管理任务退出状态；请刷新状态确认结果。".into());
-    }
-    Ok(exit_code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_broadcast_permission_is_reused_without_any_maintenance() {
+        let mut status = OpenSshServerStatus::from_json(complete_server_status()).unwrap();
+        status.project_access_valid = true;
+        status.pairing_access_valid = true;
+        status.discovery_access_valid = true;
+        assert!(status.ready);
+        let mut gate = BroadcastRepairGate { failed: true };
+        let result = prepare_broadcast_with(&mut gate, false, status.clone(), |_| {
+            panic!("有效网络许可不能触发系统维护")
+        })
+        .unwrap();
+        assert_eq!(result, status);
+        assert!(!gate.failed);
+    }
+
+    #[test]
+    fn unavailable_lan_does_not_request_admin_and_missing_discovery_rule_can_be_repaired() {
+        let mut status = OpenSshServerStatus::from_json(complete_server_status()).unwrap();
+        let mut gate = BroadcastRepairGate::default();
+        status.local_lan_addresses.clear();
+        assert!(
+            prepare_broadcast_with(&mut gate, false, status.clone(), |_| panic!(
+                "网络断开不应申请管理员权限"
+            ))
+            .unwrap_err()
+            .contains("没有可用")
+        );
+        status.local_lan_addresses = vec!["192.168.1.2".into()];
+        status.local_lan_scopes = vec!["192.168.1.0/24".into()];
+        status.project_access_valid = true;
+        status.pairing_access_valid = true;
+        status.discovery_access_valid = false;
+        assert!(
+            prepare_broadcast_with(&mut gate, false, status.clone(), |_| panic!(
+                "不支持的账户不应申请管理员权限"
+            ))
+            .unwrap_err()
+            .contains("账户不支持")
+        );
+        status.account_ssh_username = Some("lan-user".into());
+        let result = prepare_broadcast_with(&mut gate, false, status, |before| {
+            let mut after = before.clone();
+            after.discovery_access_valid = true;
+            Ok(after)
+        })
+        .unwrap();
+        assert!(result.discovery_access_valid);
+    }
+
+    #[test]
+    fn failed_automatic_broadcast_repair_is_not_repeated_until_explicit_retry() {
+        let mut gate = BroadcastRepairGate::default();
+        let attempts = std::cell::Cell::new(0);
+        let mut repair = || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>("管理员取消授权".into())
+        };
+        assert!(gate.repair(false, &mut repair).is_err());
+        assert!(gate
+            .repair(false, &mut repair)
+            .unwrap_err()
+            .contains("停止自动申请"));
+        assert_eq!(attempts.get(), 1);
+        assert!(gate.repair(true, &mut repair).is_err());
+        assert_eq!(attempts.get(), 2);
+        gate.repair(true, || Ok(())).unwrap();
+        assert!(!gate.failed);
+    }
     use crate::device_config::{Role, RuntimeSnapshot};
     use serde_json::json;
     use std::{
@@ -2493,7 +2581,7 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
 
     #[cfg(windows)]
     #[test]
-    fn powershell_51_key_registration_preserves_other_lines_and_supports_unicode_paths() {
+    fn selected_powershell_key_registration_preserves_other_lines_and_supports_unicode_paths() {
         // 仅在临时目录写测试公钥；系统身份仍用真实 SID（安全标识符），ACL（访问控制）命令全部替换。
         let temp_owner = std::env::temp_dir();
         let temp = temp_owner.join(format!("voice-ssh-key-{}", crate::workspace::new_id()));
@@ -2925,7 +3013,7 @@ $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{source_b
     fn powershell_status_runner_can_resolve_the_windows_signature_cmdlet() {
         let script = r#"
 $systemModuleRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-$env:PSModulePath = $systemModuleRoot
+$env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $systemModuleRoot
 $PSModuleAutoLoadingPreference = 'All'
 $signature = Get-AuthenticodeSignature -FilePath (Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe') -ErrorAction Stop
 $command = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue

@@ -14,6 +14,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub const DEVICE_BRIDGE_PROTOCOL_VERSION: u32 = 1; // DEVICE_BRIDGE_PROTOCOL_VERSION（长期设备授权使用的桥接协议版本）。
+
+/// require_device_bridge_protocol（设备授权协议判断）：长期授权绑定正式桥接协议，不绑定单次构建。
+pub fn require_device_bridge_protocol(protocol: u32, release: &Value) -> Result<(), String> {
+    if protocol != DEVICE_BRIDGE_PROTOCOL_VERSION
+        || release
+            .pointer("/compatibility/desktop_protocol")
+            .and_then(Value::as_u64)
+            != Some(u64::from(protocol))
+    {
+        return Err("已保存的设备授权协议与当前正式程序不兼容；请检查更新或重新配对。".into());
+    }
+    Ok(())
+}
+
 /// migrate_device_runtime_config（迁移设备运行配置）：经兼容组件归档 v2 原件并原子写入 v3。
 /// 迁移完全由原生层完成，不读取 Python（后端运行环境）或业务组件。
 pub fn migrate_device_runtime_config(data_root: &Path) -> Result<bool, String> {

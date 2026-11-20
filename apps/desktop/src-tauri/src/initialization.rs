@@ -167,20 +167,10 @@ pub fn auto_start(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Stri
         {
             let background_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                let preparation = async {
-                    let status = tauri::async_runtime::spawn_blocking(voice_desktop_common::system_feature::open_ssh_server_status)
-                        .await.map_err(|_| "SSH 服务状态检查任务无法启动。".to_string())??;
-                    if !status.ready {
-                        return Err("本机语音核心已启动，但微软 SSH 服务尚未就绪；请在设备设置中点击“检查 SSH 服务”后重试广播。".into());
-                    }
-                    if !status.project_access_enabled || !status.pairing_access_enabled {
-                        tauri::async_runtime::spawn_blocking(|| voice_desktop_common::system_feature::set_device_broadcast_access(true))
-                            .await.map_err(|_| "局域网受限防火墙准备任务无法启动。".to_string())??;
-                    }
-                    super::sync_local_discovery(background_state.clone()).await
-                }.await;
+                // 自动启动和手动广播使用同一准备入口，完整核对三条规则；同一故障不循环申请授权。
+                let preparation = super::sync_local_discovery(background_state.clone()).await;
                 if let Err(error) = preparation {
-                    *background_state.error.lock().unwrap() = Some(error);
+                    *background_state.broadcast_error.lock().unwrap() = Some(error);
                 }
             });
         }

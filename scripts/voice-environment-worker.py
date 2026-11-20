@@ -165,21 +165,47 @@ def prune(site, names):
             pass
     return {'removed_files': len(paths)}  # removed_files（已清理的候选文件数）。
 
+def powershell_candidates():
+    """PowerShell（脚本解释器）：优先采用用户指定路径，否则按稳定版本发现顺序选择。"""
+    preferred=os.environ.get('VOICE_POWERSHELL_PATH')
+    if preferred:
+        selected=Path(preferred)
+        return [selected] if selected.is_absolute() else []
+    candidates=[]
+    command=shutil.which('pwsh.exe')
+    if command: candidates.append(Path(command))
+    for variable, relative in [('ProgramFiles','PowerShell'),('LOCALAPPDATA','Microsoft/PowerShell')]:
+        base=Path(os.environ[variable])/relative if os.environ.get(variable) else None
+        if base and base.is_dir(): candidates.extend(sorted(base.glob('*/pwsh.exe'),reverse=True))
+    system_root=os.environ.get('SystemRoot')
+    if system_root: candidates.append(Path(system_root)/'System32/WindowsPowerShell/v1.0/powershell.exe')
+    result=[]; seen=set()
+    for candidate in candidates:
+        try:
+            resolved=candidate.resolve(strict=True)
+            if resolved.name.lower() in {'powershell.exe','pwsh.exe'} and resolved not in seen:
+                seen.add(resolved); result.append(resolved)
+        except OSError: pass
+    return result
+
 def defender_injected_module(path):
     """Defender module（系统防护注入模块）：核验固定系统位置和微软有效签名。"""
     program_data=os.environ.get('ProgramData')
     if not program_data or path.name.lower()!='mpoav.dll': return False
     platform_root=(Path(program_data)/'Microsoft/Windows Defender/Platform').resolve()
     if not path.is_relative_to(platform_root): return False
-    powershell_root=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0'
-    script="Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop; $signature=Get-AuthenticodeSignature -LiteralPath $env:VOICE_SYSTEM_MODULE_PATH; if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match '^CN=Microsoft Windows, O=Microsoft Corporation(?:,|$)') { exit 0 }; exit 1"
-    try:
-        result=subprocess.run([str(powershell_root/'powershell.exe'),'-NoProfile','-NonInteractive','-Command',script],
-            env={**os.environ,'PSModulePath':str(powershell_root/'Modules'),'VOICE_SYSTEM_MODULE_PATH':str(path)},stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20,
-            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        return result.returncode==0
-    except (OSError,subprocess.TimeoutExpired): return False
+    system_modules=Path(os.environ.get('SystemRoot','C:/Windows'))/'System32/WindowsPowerShell/v1.0/Modules'
+    script="$ErrorActionPreference='Stop'; $env:PSModulePath=(Join-Path $PSHOME 'Modules') + ';' + $env:VOICE_SYSTEM_MODULES; Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $signature=Get-AuthenticodeSignature -LiteralPath $env:VOICE_SYSTEM_MODULE_PATH -ErrorAction Stop; if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match '^CN=Microsoft Windows, O=Microsoft Corporation(?:,|$)') { exit 0 }; exit 1"
+    for executable in powershell_candidates():
+        try:
+            result=subprocess.run([str(executable),'-NoProfile','-NonInteractive','-Command',script],
+                env={**os.environ,'PSModulePath':str(executable.parent/'Modules')+';'+str(system_modules),
+                     'VOICE_SYSTEM_MODULE_PATH':str(path),'VOICE_SYSTEM_MODULES':str(system_modules)},stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20,
+                creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            if result.returncode==0: return True
+        except (OSError,subprocess.TimeoutExpired): continue
+    return False
 
 def verified_product_host_files(image):
     """仅认可当前真实产品宿主及其清单登记的三项 CRT（C++运行库）文件。"""

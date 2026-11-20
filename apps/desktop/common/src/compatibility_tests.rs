@@ -1,5 +1,25 @@
 //! 兼容性组件回归：即时性、并发、精确迁移和事务恢复。
 use super::*;
+
+#[test]
+fn device_authorization_survives_build_changes_only_with_the_current_protocol() {
+    for build in ["product-first", "product-updated"] {
+        require_device_bridge_protocol(
+            1,
+            &json!({"build":build,"compatibility":{"desktop_protocol":1}}),
+        )
+        .unwrap();
+    }
+    assert!(
+        require_device_bridge_protocol(1, &json!({"compatibility":{"desktop_protocol":2}}))
+            .is_err()
+    );
+    assert!(
+        require_device_bridge_protocol(2, &json!({"compatibility":{"desktop_protocol":2}}))
+            .is_err()
+    );
+    assert!(require_device_bridge_protocol(1, &json!({"build":"missing-contract"})).is_err());
+}
 use crate::workspace::{self, file_hash, remove_owned};
 use base64::Engine;
 use std::path::PathBuf;

@@ -53,6 +53,7 @@ pub mod native_opus; // native_opus（固定 libopus 1.6.1 编解码器）：原
 pub mod native_ui;
 #[cfg(windows)]
 pub mod native_vad; // native_vad（原生 WebRTC VAD）：静态链接固定 C 源码，不加载 Python。
+pub mod powershell; // powershell（按能力自动选择的脚本宿主）。
 pub mod process_host;
 pub mod remote_import_contract; // remote_import_contract（远程导入契约）：服务端暂存编号、相对路径清单及摘要边界。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
@@ -62,6 +63,8 @@ pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创�
 #[cfg(feature = "ssh-device")]
 pub mod ssh_device; // ssh_device（固定主机指纹的原生 SSH 业务通道）。
 pub mod system_feature; // system_feature（系统功能）：共享主机专用的 Windows 能力查询与受管任务。
+#[cfg(windows)]
+pub mod system_maintenance; // system_maintenance（仅本次运行复用的受限提权宿主）。
 pub mod verification; // verification（独占维护任务的批量校验与结果复用）。
 pub mod wasapi_capture; // wasapi_capture（WASAPI 采集流）：事件驱动默认麦克风及 PCM 帧转换。
 pub mod wasapi_render; // wasapi_render（WASAPI 播放流）：共享模式默认扬声器与有界 PCM 储备。
@@ -476,6 +479,10 @@ impl LaunchContext {
                 "VOICE_PROCESS_HOST".into(),
                 host.to_string_lossy().into_owned(),
             );
+        }
+        if let Some(shell) = std::env::var_os("VOICE_POWERSHELL_PATH") {
+            // VOICE_POWERSHELL_PATH（用户指定的 PowerShell 脚本解释器绝对路径）。
+            values.insert("VOICE_POWERSHELL_PATH".into(), shell.to_string_lossy().into_owned());
         }
         values.insert(
             "VOICE_RESOURCE_POLICY".into(),

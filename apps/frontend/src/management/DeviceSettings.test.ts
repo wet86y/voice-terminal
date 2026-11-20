@@ -510,36 +510,29 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).toContain('局域网公告发布失败')
   })
 
-  it('广播开启前 SSH 未就绪时获准后等待系统任务完成再保存', async () => {
-    vi.useFakeTimers()
+  it('广播开启统一交给原生检查和维修，等待同一保存任务，不另开 SSH 任务或确认窗口', async () => {
     sshReady = false
     wrapper = mount(DeviceSettings)
     await flushPromises()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
-    vi.mocked(nativeDeviceApi.openSshServerStatus).mockReset()
-      .mockResolvedValueOnce(makeSshStatus(false))
-      .mockResolvedValueOnce(makeSshStatus(true))
-      .mockResolvedValueOnce(makeSshStatus(true))
-      .mockResolvedValueOnce(makeSshStatus(true))
-    vi.mocked(nativeDeviceApi.resourceJobs).mockReset()
-      .mockResolvedValueOnce([makeLocalSshJob('running')])
-      .mockResolvedValueOnce([makeLocalSshJob('complete')])
-      .mockResolvedValueOnce([makeLocalSshJob('complete')])
-
+    let finishSave!: () => void
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockImplementationOnce(async config => {
+      await new Promise<void>(resolve => { finishSave = resolve })
+      currentStatus = makeConfig('local', true)
+      currentStatus.device_config = config
+      return currentStatus
+    })
     await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
     await flushPromises()
-
-    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledOnce()
-    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledWith(true)
-    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
-    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', true)
-    await vi.advanceTimersByTimeAsync(1200)
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({ mode: 'local', broadcast_enabled: true }), false)
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(window.confirm).not.toHaveBeenCalled()
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    finishSave()
     await flushPromises()
-
-    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({
-      mode: 'local', broadcast_enabled: true, desired_role: 'shared_host',
-    }), false)
-    expect(wrapper.text()).toContain('版本：9.5.0.0')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', true)
   })
 
   it('SSH 准备超过五分钟后继续显示任务，晚到完成时清除等待告警并恢复检查按钮', async () => {
@@ -600,24 +593,19 @@ describe('DeviceSettings（设备设置）', () => {
     expect(check.element.disabled).toBe(false)
   })
 
-  it('广播开启前 SSH 未就绪且用户取消时还原开关并且不保存', async () => {
+  it('广播维修的系统授权取消后恢复实际配置，不另开安装任务或重复保存', async () => {
     sshReady = false
-    vi.mocked(window.confirm).mockReturnValue(false)
     wrapper = mount(DeviceSettings)
     await flushPromises()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
-    vi.mocked(nativeDeviceApi.enableOpenSshServer).mockClear()
-    vi.mocked(nativeDeviceApi.resourceJobs).mockClear()
-
+    vi.mocked(nativeDeviceApi.saveDeviceConfig).mockRejectedValueOnce(new Error('已取消 Windows 管理员授权；系统维护未执行。'))
     await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
     await flushPromises()
-
-    expect(window.confirm).toHaveBeenCalledOnce()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.resourceJobs).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(window.confirm).not.toHaveBeenCalled()
     expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', false)
-    expect(wrapper.get('[role="alert"]').text()).toContain('你取消了 SSH 服务准备')
+    expect(wrapper.get('[role="alert"]').text()).toContain('已取消 Windows 管理员授权')
   })
 
   it('SSH 已就绪时按钮只检查状态，不重新安装或重启', async () => {

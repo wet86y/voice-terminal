@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::Duration,
@@ -84,14 +84,10 @@ impl DeviceHelper {
         }
         let helper = crate::canonical_path(helper)
             .map_err(|error| format!("无法解析设备辅助脚本：{error}"))?;
-        let root = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录")?;
-        let powershell = Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        if !powershell.is_file() {
-            return Err("系统 PowerShell（命令行）不可用".into());
-        }
+        let powershell = crate::powershell::select(crate::powershell::Purpose::Desktop)?;
         let job =
             crate::windows::Job::new().map_err(|error| format!("无法建立设备进程作业：{error}"))?;
-        let mut command = Command::new(powershell);
+        let mut command = powershell.command();
         command
             .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
             .arg(helper)
