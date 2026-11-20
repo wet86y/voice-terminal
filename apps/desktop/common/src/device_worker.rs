@@ -203,9 +203,19 @@ fn read_frame(input: &mut impl Read) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn write_frame(output: &mut impl Write, response: &Response<'_>) -> Result<(), String> {
-    let bytes = serde_json::to_vec(response).map_err(|_| "设备控制回执编码失败")?;
-    if bytes.is_empty() || bytes.len() > MAX_FRAME {
-        return Err("设备控制回执超过大小限制".into());
+    let mut bytes = serde_json::to_vec(response).map_err(|_| "设备控制回执编码失败")?;
+    if bytes.len() > MAX_FRAME {
+        // 控制回执超限只影响本次请求，保留同一进程内的音频状态。
+        bytes = serde_json::to_vec(&Response {
+            protocol_version: response.protocol_version,
+            request_id: response.request_id,
+            ok: false,
+            state: "response_too_large",
+            data: Some(serde_json::json!({
+                "error":"设备控制回执超过大小限制，操作结果未知。",
+                "fields":{"error":"设备控制回执无法通过控制管道的原因"}
+            })),
+        }).map_err(|_| "设备控制回执错误信息编码失败")?;
     }
     output
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -1981,6 +1991,32 @@ impl Drop for ManagedWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_reply_preserves_the_control_pipe_for_following_requests() {
+        let mut output = Vec::new();
+        let mut reply = Response {
+            protocol_version: 1,
+            request_id: "large",
+            ok: true,
+            state: "ready",
+            data: Some(serde_json::Value::String("a".repeat(MAX_FRAME))),
+        };
+        write_frame(&mut output, &reply).unwrap();
+        reply.request_id = "next";
+        reply.data = None;
+        write_frame(&mut output, &reply).unwrap();
+        let mut stream = output.as_slice();
+        let first: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut stream).unwrap().unwrap()).unwrap();
+        assert_eq!(first["request_id"], "large");
+        assert_eq!(first["state"], "response_too_large");
+        assert_eq!(first["ok"], false);
+        let next: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut stream).unwrap().unwrap()).unwrap();
+        assert_eq!(next["request_id"], "next");
+        assert_eq!(next["ok"], true);
+    }
     fn frame(value: serde_json::Value) -> Vec<u8> {
         let bytes = serde_json::to_vec(&value).unwrap();
         [

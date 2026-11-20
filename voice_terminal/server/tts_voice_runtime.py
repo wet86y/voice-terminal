@@ -1,9 +1,11 @@
 """音色后台任务：模型、素材与操作身份隔离，不进入对话历史。"""
 from __future__ import annotations
 import asyncio
+import hashlib
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 from ..providers.minimax_tts import MiniMaxTtsClient
@@ -302,7 +304,7 @@ class TtsVoiceOperationManager:
             await session.close()
 
     def start_play(self, model, asset_id):
-        self._require_library(model).asset_path(asset_id)
+        self._require_library(model).playback_source(asset_id)
         return self._new("play", {"model": model, "asset_id": asset_id}, self._play)
 
     def start_transcribe(self, model, asset_id):
@@ -427,35 +429,22 @@ class TtsVoiceOperationManager:
         if player is None:
             raise TtsVoiceOperationError("程序播放器尚未启动。")
         asset_id = operation.request["asset_id"]
-        path = library.high_fidelity_path(asset_id) or library.asset_path(asset_id)
-        try:
-            import numpy as np
-            import soundfile as sf
-            from scipy.signal import resample_poly
-            with path.open("rb") as handle:
-                samples, rate = sf.read(handle, dtype="int16", always_2d=True)
-        except Exception as exc:
-            raise TtsVoiceOperationError("音频素材无法解码为 WAV。") from exc
-        mono = samples.astype(np.int32).mean(axis=1).astype(np.int16)
-        if rate != player.sample_rate:
-            from fractions import Fraction
-            ratio = Fraction(int(player.sample_rate), int(rate))
-            converted = resample_poly(mono.astype(np.float32), ratio.numerator, ratio.denominator)
-            mono = np.clip(np.rint(converted), -32768, 32767).astype(np.int16)
-        pcm = mono.astype("<i2", copy=False).tobytes()
-        if player.channels == 2:
-            pcm = np.repeat(mono.reshape(-1, 1), 2, axis=1).astype("<i2", copy=False).tobytes()
+        path, digest = library.playback_source(asset_id)
+        sample_rate, channels = player.sample_rate, player.channels
+        pcm = await asyncio.to_thread(self._decode_playback_audio, path, digest, sample_rate, channels)
+        duration = len(pcm) / (sample_rate * channels * 2)
+        if operation.state == "cancelled":
+            return {}
         self._allow_user_initiated_playback(player, operation.id)
-        enqueue_async = getattr(player, "enqueue_async", None)
-        if callable(enqueue_async):
-            await enqueue_async(operation.id, pcm)
-        else:
-            player.enqueue(operation.id, pcm)
-        finish_stream = getattr(player, "finish_stream_async", None)
-        if callable(finish_stream):
-            await finish_stream(operation.id)
-        duration = len(pcm) / (player.sample_rate * player.channels * 2)
         try:
+            enqueue_async = getattr(player, "enqueue_async", None)
+            if callable(enqueue_async):
+                await enqueue_async(operation.id, pcm)
+            else:
+                player.enqueue(operation.id, pcm)
+            finish_stream = getattr(player, "finish_stream_async", None)
+            if callable(finish_stream):
+                await finish_stream(operation.id)
             await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
             if not player.has_started(operation.id):
                 raise TtsVoiceOperationError("音频未从当前输出设备播放，请检查静音策略或设备状态。")
@@ -463,6 +452,33 @@ class TtsVoiceOperationManager:
             if operation.playback_outcome != "stopped":
                 await self._confirm_playback_stop(operation, player)
         return {"asset_id": asset_id, "duration_ms": round(duration * 1000)}
+
+    @staticmethod
+    def _decode_playback_audio(path: Path, digest: str | None, sample_rate: int, channels: int) -> bytes:
+        """_decode_playback_audio（准备播放采样）：在后台线程对齐程序播放器的采样率和声道。"""
+        try:
+            import numpy as np
+            import soundfile as sf
+            from scipy.signal import resample_poly
+            with path.open("rb") as handle:
+                if digest is not None:
+                    if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+                        raise TtsVoiceOperationError("参考音频摘要与登记内容不一致。")
+                    handle.seek(0)
+                samples, rate = sf.read(handle, dtype="int16", always_2d=True)
+        except TtsVoiceOperationError:
+            raise
+        except Exception as exc:
+            raise TtsVoiceOperationError("参考音频无法解码。") from exc
+        mono = samples.astype(np.int32).mean(axis=1).astype(np.int16)
+        if rate != sample_rate:
+            from fractions import Fraction
+            ratio = Fraction(int(sample_rate), int(rate))
+            converted = resample_poly(mono.astype(np.float32), ratio.numerator, ratio.denominator)
+            mono = np.clip(np.rint(converted), -32768, 32767).astype(np.int16)
+        if channels == 2:
+            mono = np.repeat(mono.reshape(-1, 1), 2, axis=1)
+        return mono.astype("<i2", copy=False).tobytes()
 
     @staticmethod
     async def _confirm_playback_stop(operation, player):

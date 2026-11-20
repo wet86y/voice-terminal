@@ -5,7 +5,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { isDelivered, digest } from '../shared/protocol.js'
 import type { Json, ShadowEventBody } from '../shared/protocol.js'
-import { bindingCallback } from './callbacks.js'
+import { bindingAttachment, bindingCallback } from './callbacks.js'
 import { clearActivationIfCurrent, stableBridgeToolId } from './messages.js'
 import { stopRuntimeReminder } from './context.js'
 import type { Binding } from './contracts.js'
@@ -212,18 +212,12 @@ export function installScreenCaptureTool(agentCtx: Context, binding: Binding): v
       }
       await binding.activationReady
       if (ensure(exec) !== activationId) throw new Error('截图请求所属 DSH 激活已更换')
-      const response = await bindingCallback(binding, '/api/internal/dsh-bridge/screen.capture', {
+      const prepared = await bindingAttachment(binding, '/api/internal/dsh-bridge/screen.capture', {
         request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
         dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
         context_revision: binding.revision, activation_id: activationId,
         ...(args.device_id === undefined ? {} : { device_id: args.device_id }),
-      }, exec.signal)
-      if (response.result !== 'accepted') throw new Error('屏幕捕获请求未获服务端接受')
-      const rawCapture = response.capture
-      if (rawCapture === null || typeof rawCapture !== 'object' || Array.isArray(rawCapture)) {
-        throw new Error('屏幕捕获服务返回了无效结果')
-      }
-      const prepared = await prepareDirectScreenCapture(binding, rawCapture as Record<string, Json>)
+      }, (body, signal) => prepareDirectScreenCapture(binding, body, signal), exec.signal)
       if (ensure(exec) !== activationId) throw new Error('屏幕捕获结果所属 DSH 激活已失效')
       return { result: 'captured' as const, capture: prepared.facts, visual_frames: [prepared.frame] }
     },

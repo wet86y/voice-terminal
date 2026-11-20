@@ -23,6 +23,7 @@ from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..application.ports import validate_endpoint_url
 from ..devices.clock_sync import DeviceClockMapper, MediaClockSync, media_clock
 from ..devices.diagnostics import device_event
+from ..devices.file_transfer import MAX_CHUNK_BYTES, device_file_transfer_id
 from ..devices.media_protocol import (
     PROTOCOL_VERSION as MEDIA_PROTOCOL_VERSION, MediaFrame, MediaProtocolError, decode_uplink, parse_tts_control,
 )
@@ -52,13 +53,6 @@ def device_file_subtask_id(request_id: str, suffix: str) -> str:
     """device_file_subtask_id（文件子任务编号）：为重试固定到同一设备台账记录。"""
     digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:8]
     return f"{request_id[:105]}:{suffix}:{digest}"
-
-
-def device_file_transfer_id(connection: Any, request_id: str) -> str:
-    """device_file_transfer_id（文件传输编号）：绑定原请求和设备连接/执行器代次。"""
-    material = (f"{connection.device_id}\0{connection.connection_generation}\0"
-                f"{connection.executor_generation}\0{request_id}").encode("utf-8")
-    return hashlib.sha256(material).hexdigest()[:32]
 
 
 # DEVICE_MANAGEMENT_OPERATIONS（受限远程业务操作）：每个枚举只映射到本服务既有业务路由。
@@ -112,7 +106,6 @@ DEVICE_MANAGEMENT_OPERATIONS: dict[str, tuple[str, str, bool]] = {
     "tts.assets.import.prepare": ("POST", "/internal/application/tts-assets/import/prepare", False),
     "tts.assets.import.commit": ("POST", "/internal/application/tts-assets/import/commit", False),
     "tts.assets.import.abort": ("POST", "/internal/application/tts-assets/import/abort", False),
-    "tts.assets.audio.read": ("POST", "/internal/application/tts-assets/audio/read", True),
     "dsh.approval.decide": ("POST", "/internal/application/dsh-approval", True),
 }
 
@@ -131,12 +124,6 @@ def _remote_management_request_spec(
         if set(arguments) != tts_import_fields[operation]:
             raise ValueError("TTS 单文件导入操作字段不符合固定票据契约。")
         return DEVICE_MANAGEMENT_OPERATIONS[operation][0], DEVICE_MANAGEMENT_OPERATIONS[operation][1], dict(arguments)
-    if operation == "tts.assets.audio.read":
-        value = arguments.get("value")
-        if (set(arguments) != {"value"} or not isinstance(value, dict)
-                or set(value) != {"model_id", "asset_id"}):
-            raise ValueError("TTS 音频读取只接受 value 中的 model_id 与 asset_id。")
-        return DEVICE_MANAGEMENT_OPERATIONS[operation][0], DEVICE_MANAGEMENT_OPERATIONS[operation][1], dict(value)
     if operation == "dsh.approval.decide":
         if set(arguments) != {"approval_id", "decision", "run_seq"}:
             raise ValueError("DSH 权限答复只接受 approval_id、decision 与 run_seq。")
@@ -339,8 +326,8 @@ class LoopbackDeviceGatewayGuard:
         await self.app(scope, receive, send)
 
 
-async def _device_gateway_json(request: Any, *, label: str, max_bytes: int = 4096) -> dict[str, Any]:
-    """_device_gateway_json（设备网关 JSON）：有界读取并拒绝重复字段。"""
+async def _device_gateway_bytes(request: Any, *, label: str, max_bytes: int) -> bytes:
+    """_device_gateway_bytes（设备网关请求体）：读取有界请求。"""
     try:
         declared_length = request.headers.get("content-length")
         if declared_length is not None and int(declared_length) > max_bytes:
@@ -352,14 +339,27 @@ async def _device_gateway_json(request: Any, *, label: str, max_bytes: int = 409
             if size > max_bytes:
                 raise HTTPException(status_code=413, detail=f"{label}超过大小上限。")
             chunks.append(chunk)
-        payload = json.loads(b"".join(chunks), object_pairs_hook=_unique_json_fields)
+        return b"".join(chunks)
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{label}无法读取。") from exc
+
+
+def _device_gateway_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
+    """_device_gateway_json_object（网关元数据对象）：拒绝重复字段。"""
+    try:
+        payload = json.loads(raw, object_pairs_hook=_unique_json_fields)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"{label}不是有效且唯一字段的 JSON。") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail=f"{label}必须是 JSON 对象。")
     return payload
+
+
+async def _device_gateway_json(request: Any, *, label: str, max_bytes: int = 4096) -> dict[str, Any]:
+    raw = await _device_gateway_bytes(request, label=label, max_bytes=max_bytes)
+    return _device_gateway_json_object(raw, label=label)
 
 
 async def _device_gateway_payload(request: Any) -> dict[str, Any]:
@@ -882,6 +882,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
+    from starlette.concurrency import run_in_threadpool
+    from .dsh_attachment_transport import StagedAttachmentResponse, attachment_response, capture_response
+
     app = FastAPI(title="Voice Terminal Server", version=__version__, lifespan=lifespan)
     aniflive_import_service = None
 
@@ -963,7 +966,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def device_gateway_file_transfer(request: Request) -> JSONResponse:
         """device_gateway_file_transfer（签名 FILE 文件操作）：只操作既有 DSH 文件票据。"""
         _require_device_gateway_port(request)
-        payload = await _device_gateway_json(request, label="设备文件通道操作", max_bytes=128 * 1024)
+        chunk = None
+        if request.headers.get("content-type") == "application/octet-stream":
+            # 二进制分块格式：4 字节大端元数据长度、JSON 元数据、原始分块。
+            metadata_limit = 4096
+            body = await _device_gateway_bytes(
+                request, label="设备文件二进制分块", max_bytes=4 + metadata_limit + MAX_CHUNK_BYTES,
+            )
+            metadata_size = int.from_bytes(body[:4], "big")
+            boundary = 4 + metadata_size
+            if not 0 < metadata_size <= metadata_limit or not 0 < len(body) - boundary <= MAX_CHUNK_BYTES:
+                raise HTTPException(status_code=422, detail="设备文件二进制分块长度无效。")
+            payload = _device_gateway_json_object(body[4:boundary], label="设备文件分块元数据")
+            chunk = body[boundary:]
+            if payload.get("action") != "upload_chunk":
+                raise HTTPException(status_code=422, detail="二进制请求只支持设备上传分块。")
+        else:
+            payload = await _device_gateway_json(request, label="设备文件通道操作", max_bytes=128 * 1024)
         action = payload.get("action")
         if type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1:
             raise HTTPException(status_code=422, detail="设备文件通道协议版本无效。")
@@ -1017,7 +1036,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 headers={"Cache-Control": "no-store"})
 
         action_fields = {
-            "upload_chunk": {"offset", "data_base64", "chunk_sha256"},
+            "upload_chunk": {"offset", "chunk_sha256"} | ({"data_base64"} if chunk is None else set()),
             "read_chunk": {"offset", "limit"},
             "finish_upload": {"expected_bytes", "expected_sha256"},
             "finish_download": {"expected_bytes", "expected_sha256"},
@@ -1053,12 +1072,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                "channel_token": payload["channel_token"]}
         try:
             if action == "upload_chunk":
-                if (type(payload["offset"]) is not int or not isinstance(payload["data_base64"], str)
-                        or not isinstance(payload["chunk_sha256"], str)):
-                    raise ValueError("文件分块字段无效。")
-                transfer = await asyncio.to_thread(store.append_device_channel_chunk, **key,
-                    offset=payload["offset"], data_base64=payload["data_base64"],
-                    chunk_sha256=payload["chunk_sha256"])
+                if chunk is None:
+                    transfer = await asyncio.to_thread(store.append_device_channel_chunk, **key,
+                        offset=payload["offset"], data_base64=payload["data_base64"],
+                        chunk_sha256=payload["chunk_sha256"])
+                else:
+                    transfer = await asyncio.to_thread(store.append_device_channel_bytes, **key,
+                        offset=payload["offset"], raw=chunk, chunk_sha256=payload["chunk_sha256"])
             elif action == "read_chunk":
                 if type(payload["offset"]) is not int or type(payload["limit"]) is not int:
                     raise ValueError("文件读取偏移或分块上限无效。")
@@ -1158,7 +1178,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if operation in {
             "tts.assets.import.prepare", "tts.assets.import.commit", "tts.assets.import.abort",
-            "tts.assets.audio.read",
         }:
             if "file_transfer" not in connection.capabilities:
                 raise HTTPException(status_code=403, detail="远程设备未获准使用文件传输能力。")
@@ -1254,6 +1273,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "connection_generation": connection.connection_generation,
             "executor_generation": connection.executor_generation,
             "capabilities": list(connection.capabilities),
+            "separate_playback_tasks": True,
             "fields": {
                 "protocol_version": "设备任务通道协议版本",
                 "result": "会话注册结果",
@@ -1262,6 +1282,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "connection_generation": "主机授予的连接代次",
                 "executor_generation": "主机授予的设备执行器代次",
                 "capabilities": "本次已登记设备能力编号",
+                "separate_playback_tasks": "支持独立轮询播报控制任务",
             },
         }, headers={"Cache-Control": "no-store"})
 
@@ -1270,7 +1291,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         """device_gateway_session_poll（客户端拉取任务）：仅返回该设备的原目标任务。"""
         _require_device_gateway_port(request)
         payload = await _device_gateway_json(request, label="设备任务轮询")
-        if (set(payload) != {"protocol_version", "connection_generation", "executor_generation", "wait_ms"}
+        lane = payload.get("lane")
+        if (set(payload) - {"lane"} != {"protocol_version", "connection_generation", "executor_generation", "wait_ms"}
+                or ("lane" in payload and lane not in ("general", "playback"))
                 or type(payload.get("protocol_version")) is not int or payload["protocol_version"] != 1
                 or type(payload.get("connection_generation")) is not int or payload["connection_generation"] < 1
                 or type(payload.get("executor_generation")) is not int or payload["executor_generation"] < 1
@@ -1283,6 +1306,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             task = await runtime.poll_remote_device_task(
                 device_id, payload["connection_generation"], payload["executor_generation"], payload["wait_ms"],
+                lane=lane,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="设备任务轮询参数无效。") from exc
@@ -2214,7 +2238,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         devices = [{"device_id": item.device_id, "name": "本机" if item.device_id == "local" else item.device_id,
                     "connected": item.connected, "connection_generation": item.connection_generation,
                     "executor_generation": item.executor_generation,
-                    "capabilities": sorted(set(item.capabilities)
+                    "capabilities": sorted((set(item.capabilities) - {"screen_capture"})
                                      | ({"desktop_control", "terminal_control", "file_transfer"} if item.device_id == "local"
                                         and getattr(runtime, "_local_desktop_transport", None) is not None else set())
                                      | ({"screen_capture"} if runtime.history.screen_capture.available_for(item.device_id) else set())),
@@ -2360,7 +2384,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         )
 
     @app.post("/api/internal/dsh-bridge/attachment.read")
-    async def dsh_attachment_read(request: Request) -> JSONResponse:
+    async def dsh_attachment_read(request: Request) -> Response:
         """attachment.read（程序内部取图）：验证绑定，不触发模型工具或历史浏览。"""
         remote = request.client.host if request.client is not None else None
         if not runtime.dsh.bridge_hub.authorize(request.headers.get("authorization"), remote):
@@ -2380,8 +2404,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         item = runtime.history.screen_attachment(session.voice_session_id, aid)
         if item is None:
             raise HTTPException(status_code=404, detail="当前会话附件不存在")
-        return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", "attachment": item},
-                            headers={"Cache-Control": "no-store"})
+        data = await asyncio.to_thread(base64.b64decode, item["base64"], validate=True)
+        if runtime.dsh.bridge_hub.resolve(payload) is not session or payload["epoch"] != session.epoch:
+            raise HTTPException(status_code=409, detail="stale binding")
+        return attachment_response(data)
 
     @app.post("/api/internal/dsh-bridge/device.list")
     async def dsh_device_list(request: Request) -> JSONResponse:
@@ -2823,18 +2849,18 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             headers={"Cache-Control":"no-store"})
 
     @app.post("/api/internal/dsh-bridge/device.file.transfer")
-    async def dsh_device_file_transfer(request: Request) -> JSONResponse:
-        """device.file.transfer（文件分块回调）：只为当前 DSH 激活读写票据对应的有界数据。"""
+    async def dsh_device_file_transfer(request: Request) -> Response:
+        """device.file.transfer（文件回调）：当前 DSH 激活读取原始文件流或提交已批准的写入。"""
         payload, session = await dsh_callback_body(request)
         base = {"protocol_version", "request_id", "voice_session_id", "dsh_session_id", "epoch",
                 "context_revision", "activation_id", "device_id", "connection_generation",
                 "executor_generation", "parent_request_id", "transfer_id", "action"}
         action = payload.get("action")
-        extras = {"read_chunk": {"offset", "limit"},
+        extras = {"read_stream": set(),
             "upload_chunk": {"offset", "data_base64"}, "finish_upload": {"expected_bytes", "expected_sha256"},
             "close": set()}
         if not isinstance(action, str) or action not in extras or set(payload) != base | extras[action]:
-            raise HTTPException(status_code=422, detail="文件传输分块请求字段或操作无效。")
+            raise HTTPException(status_code=422, detail="文件传输请求字段或操作无效。")
         connection = await dsh_device_target(payload, session, required_capability="file_transfer")
         if (not valid_device_request_id(payload.get("request_id"))
                 or not valid_device_request_id(payload.get("parent_request_id"))
@@ -2851,11 +2877,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                "connection_generation":connection.connection_generation,
                "executor_generation":connection.executor_generation}
         try:
-            if action == "read_chunk":
-                if type(payload["offset"]) is not int or type(payload["limit"]) is not int:
-                    raise ValueError("文件分块读取偏移或上限无效。")
-                result = await asyncio.to_thread(store.read_chunk, **key, offset=payload["offset"], limit=payload["limit"])
-            elif action == "upload_chunk":
+            if action == "read_stream":
+                def is_current() -> bool:
+                    return (runtime.dsh.bridge_hub.resolve(payload) is session
+                            and session.epoch == payload["epoch"]
+                            and session.activation_id == payload["activation_id"]
+                            and runtime.device_registry.connection(connection.device_id) == connection)
+
+                handle, size = await run_in_threadpool(store.open_staged_read, **key)
+
+                def release() -> None:
+                    store.finish_staged_read(handle, **key)
+
+                if not is_current():
+                    await run_in_threadpool(release)
+                    raise HTTPException(status_code=409, detail="附件打开期间设备或 DSH 激活已变化。")
+                return StagedAttachmentResponse(handle, size, is_current=is_current, release=release)
+            if action == "upload_chunk":
                 if type(payload["offset"]) is not int or not isinstance(payload["data_base64"], str):
                     raise ValueError("文件分块上传字段无效。")
                 result = await asyncio.to_thread(store.append_core_chunk, **key,
@@ -2926,7 +2964,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "fields":{"transfer":"固定设备、代次和原请求绑定的分块收据"}},headers={"Cache-Control":"no-store"})
 
     @app.post("/api/internal/dsh-bridge/screen.capture")
-    async def dsh_screen_capture(request: Request) -> JSONResponse:
+    async def dsh_screen_capture(request: Request) -> Response:
         """screen.capture（DSH 按需截屏）：限于当前有效激活，并复用唯一屏幕捕获服务。"""
         payload, session = await dsh_callback_body(request)
         activation_id = payload.get("activation_id")
@@ -2946,7 +2984,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         generation = service.generation
         lease_generation = service.lease_generation("dsh", activation_id)
         try:
-            packet = await service.grab(source="dsh", scope=activation_id, device_id=device_id)
+            packet = await service.grab(source="dsh", scope=activation_id, device_id=device_id, binary=True)
         except asyncio.TimeoutError as exc:
             raise HTTPException(status_code=504, detail="屏幕捕获超过 3 秒时限。") from exc
         except RuntimeError as exc:
@@ -2959,10 +2997,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=409, detail="捕获期间屏幕图像设置已变化，本次图片已作废。")
         if session.activation_id != activation_id:
             raise HTTPException(status_code=409, detail="捕获期间 DSH 激活已结束，本次图片已作废。")
-        response = JSONResponse(
-            {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", "capture": packet},
-            headers={"Cache-Control": "no-store"},
-        )
+        response = capture_response(packet)
         service.consume("dsh", activation_id, packet["capture_id"])
         return response
 
@@ -3432,112 +3467,6 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=409, detail="TTS 文件导入请求未能绑定到唯一 DFT 票据。") from exc
         return JSONResponse(ticket, headers={"Cache-Control": "no-store"})
 
-    @app.post("/internal/application/tts-assets/audio/read")
-    async def read_remote_tts_asset_audio(request: Request) -> JSONResponse:
-        """read_remote_tts_asset_audio（远程音频素材读取）：只回传已登记且不超过 1 MiB 的音频字节。"""
-        authorize_application(request)
-        try:
-            payload = await request.json()
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="TTS 音频读取请求不是有效 JSON。") from exc
-        public_fields = {"model_id", "asset_id"}
-        internal_fields = {"_authenticated_device_id", "_connection_generation", "_executor_generation"}
-        if not isinstance(payload, dict) or set(payload) != public_fields | internal_fields:
-            raise HTTPException(status_code=422, detail="TTS 音频读取字段不符合固定契约。")
-        device_id = payload.get("_authenticated_device_id")
-        connection_generation = payload.get("_connection_generation")
-        executor_generation = payload.get("_executor_generation")
-        if (not valid_device_request_id(device_id) or type(connection_generation) is not int
-                or connection_generation < 1 or type(executor_generation) is not int
-                or executor_generation < 1):
-            raise HTTPException(status_code=422, detail="TTS 音频读取设备身份或代次无效。")
-        connection = runtime.device_registry.connection(device_id)
-        if (connection is None or not connection.connected or "file_transfer" not in connection.capabilities
-                or connection.connection_generation != connection_generation
-                or connection.executor_generation != executor_generation):
-            raise HTTPException(status_code=409, detail="TTS 音频读取设备连接或执行器代次已变化。")
-        model_id, asset_id = payload.get("model_id"), payload.get("asset_id")
-        if (not isinstance(model_id, str) or not model_id or len(model_id) > 128
-                or not model_id.isascii()
-                or any(not (character.isalnum() or character in "._:-") for character in model_id)
-                or not isinstance(asset_id, str) or not re.fullmatch(r"[0-9a-f]{32}", asset_id)):
-            raise HTTPException(status_code=422, detail="TTS 音色库或素材编号无效。")
-        try:
-            library = tts_voice_library_or_503(model_id)
-            with library._lock:
-                metadata = library._index["assets"].get(asset_id)
-            if not isinstance(metadata, dict):
-                raise HTTPException(status_code=404, detail="TTS 音频素材不存在。")
-            asset_root = Path(library.assets_dir).resolve()
-            maximum_audio_bytes = 1024 * 1024  # maximum_audio_bytes（远程预览最大原始音频长度：1 MiB）。
-
-            def checked_audio_path(path: Path):
-                if path.is_symlink() or not path.is_file():
-                    raise HTTPException(status_code=404, detail="TTS 音频素材不存在或不可读取。")
-                resolved_path = path.resolve(strict=True)
-                if not resolved_path.is_relative_to(asset_root):
-                    raise HTTPException(status_code=404, detail="TTS 音频素材不存在或不可读取。")
-                return path.stat()
-
-            high_fidelity_path = library.high_fidelity_path(asset_id)
-            use_high_fidelity = high_fidelity_path is not None
-            if use_high_fidelity:
-                data_path = high_fidelity_path
-                media_type = "audio/wav"
-                before = checked_audio_path(data_path)
-                if before.st_size > maximum_audio_bytes:
-                    # 高保真旁路副本过大时，改用登记的规范素材，仍对实际回传字节实施相同大小限制。
-                    data_path = (library._source_path(asset_id) if metadata.get("format") == "source"
-                                 else library.asset_path(asset_id))
-                    media_type = library.asset_media_type(asset_id)
-                    use_high_fidelity = False
-                    before = checked_audio_path(data_path)
-            else:
-                data_path = (library._source_path(asset_id) if metadata.get("format") == "source"
-                             else library.asset_path(asset_id))
-                media_type = library.asset_media_type(asset_id)
-                before = checked_audio_path(data_path)
-            if before.st_size <= 0:
-                raise HTTPException(status_code=404, detail="TTS 音频素材为空。")
-            if before.st_size > maximum_audio_bytes:
-                raise HTTPException(status_code=413, detail="TTS 音频素材超过 1 MiB 预览上限。")
-            data = await asyncio.to_thread(data_path.read_bytes)
-            after = data_path.stat()
-            if (data_path.is_symlink() or before.st_size != after.st_size
-                    or before.st_mtime_ns != after.st_mtime_ns or before.st_ino != after.st_ino
-                    or len(data) != after.st_size):
-                raise HTTPException(status_code=409, detail="TTS 音频素材读取期间发生变化。")
-            if len(data) > maximum_audio_bytes:
-                raise HTTPException(status_code=413, detail="TTS 音频素材超过 1 MiB 预览上限。")
-            remote_import = metadata.get("remote_import")
-            expected_sha256 = None
-            if isinstance(remote_import, dict):
-                stored_digest_field = ("high_fidelity_sha256" if use_high_fidelity else "stored_sha256")
-                expected_sha256 = remote_import.get(stored_digest_field)
-                if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
-                    raise HTTPException(status_code=409, detail="TTS 音频素材缺少有效的导入摘要。")
-            elif use_high_fidelity:
-                expected_sha256 = metadata.get("high_fidelity_sha256")
-                if expected_sha256 is not None and (not isinstance(expected_sha256, str)
-                        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
-                    raise HTTPException(status_code=409, detail="TTS 高保真素材登记摘要无效。")
-            actual_sha256 = hashlib.sha256(data).hexdigest()
-            if expected_sha256 is not None and actual_sha256 != expected_sha256:
-                raise HTTPException(status_code=409, detail="TTS 音频素材与导入时登记的 SHA-256 摘要不匹配。")
-        except HTTPException:
-            raise
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="TTS 音频素材不存在或文件缺失。") from exc
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail="TTS 音频素材无法安全读取。") from exc
-        return JSONResponse({"data_base64": base64.b64encode(data).decode("ascii"),
-            "media_type": media_type, "bytes": len(data), "sha256": actual_sha256,
-            "fields": {"data_base64": "已登记 TTS 音频的规范 Base64 字节内容",
-                "media_type": "原音频或高保真旁路副本的媒体类型",
-                "bytes": "实际返回音频内容的字节数，最大 1 MiB",
-                "sha256": "本次实际回传音频内容的 SHA-256 摘要"}},
-            headers={"Cache-Control": "no-store"})
-
     @app.post("/internal/application/tts-assets/import/commit")
     async def commit_remote_tts_asset_import(request: Request) -> JSONResponse:
         """commit_remote_tts_asset_import（提交 TTS 音频导入）：复核 DFT staging 后幂等写 VoiceLibrary。"""
@@ -3934,7 +3863,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.post("/api/v1/tts/operations/play")
     async def start_tts_play(body: dict[str, Any]):
-        return await start_tts_voice_operation(lambda: tts_voice_operations_or_503().start_play(body.get("model"), body.get("asset_id")))
+        if set(body) != {"model", "asset_id"}:
+            raise HTTPException(status_code=422, detail="播放只接受 model（模型标识）与 asset_id（素材编号）。")
+        return await start_tts_voice_operation(lambda: tts_voice_operations_or_503().start_play(body["model"], body["asset_id"]))
 
     @app.post("/api/v1/tts/operations/transcribe")
     async def start_tts_transcribe(body: dict[str, Any]):

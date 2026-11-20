@@ -45,6 +45,7 @@ const MANAGEMENT_BRIDGE_MARKER: &str = "voice-terminal-v1-management"; // MANAGE
 const FILE_BRIDGE_MARKER: &str = "voice-terminal-v1-file"; // FILE_BRIDGE_MARKER（独立 SSH 大文件通道标记）。
 const MAX_REQUEST_BYTES: usize = 1_048_576; // MAX_REQUEST_BYTES（控制请求体上限，字节）。
 const MAX_RESPONSE_BYTES: usize = 2_097_152; // MAX_RESPONSE_BYTES（控制回执体上限，字节）。
+const MAX_TASK_RECEIPT_BYTES: usize = 256 * 1024; // MAX_TASK_RECEIPT_BYTES（设备任务回执完整请求上限）。
 const MAX_HEADER_BYTES: usize = 16_384; // MAX_HEADER_BYTES（HTTP 响应头上限，字节）。
 const MAX_MEDIA_MESSAGE_BYTES: usize = 270_336; // MAX_MEDIA_MESSAGE_BYTES（WebSocket 单消息上限，字节）。
 const REMOTE_DEVICE_OPERATIONS: &[&str] = &[
@@ -52,6 +53,7 @@ const REMOTE_DEVICE_OPERATIONS: &[&str] = &[
     "apps",
     "snapshot",
     "shot",
+    "screen.capture_file",
     "tree",
     "click",
     "type",
@@ -158,6 +160,8 @@ pub struct RemoteDeviceSessionLease {
     pub connection_generation: u64, // connection_generation（主机授予的连接代次）。
     pub executor_generation: u64, // executor_generation（主机授予的执行器代次）。
     pub capabilities: Vec<String>, // capabilities（主机登记的设备能力）。
+    #[serde(default)]
+    pub separate_playback_tasks: bool, // separate_playback_tasks（主机支持独立播报控制轮询）。
 }
 
 /// RemoteDeviceTask（远端设备任务）：绑定设备、核心及两类代次的有界桌面命令。
@@ -191,6 +195,43 @@ pub struct RemoteDeviceTaskPoll {
 pub struct RemoteDeviceTaskResult {
     pub succeeded: bool,           // succeeded（辅助进程是否明确确认成功）。
     pub result: serde_json::Value, // result（有限 JSON 操作结果或明确错误）。
+}
+
+fn task_completion_payload(
+    task: &RemoteDeviceTask,
+    succeeded: bool,
+    result: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocol_version":1, "connection_generation":task.connection_generation,
+        "executor_generation":task.executor_generation, "task_id":task.task_id,
+        "sequence":task.sequence, "core_session_id":task.core_session_id,
+        "succeeded":succeeded, "result":result,
+    })
+}
+
+fn bounded_task_receipt(
+    task: &RemoteDeviceTask,
+    outcome: RemoteDeviceTaskResult,
+) -> Result<RemoteDeviceTaskResult, String> {
+    let payload = task_completion_payload(task, outcome.succeeded, &outcome.result);
+    if serde_json::to_vec(&payload).map_or(false, |bytes| bytes.len() <= MAX_TASK_RECEIPT_BYTES) {
+        return Ok(outcome);
+    }
+    if matches!(
+        task.operation.as_str(),
+        "windows" | "apps" | "snapshot" | "tree" | "shot" | "readText" | "readTable" | "displays"
+            | "cursorPosition" | "file.list" | "file.read" | "file.stat"
+    ) {
+        return Ok(RemoteDeviceTaskResult {
+            succeeded: false,
+            result: serde_json::json!({
+                "error":"只读设备结果超过单条控制回执容量，请缩小读取范围。",
+                "fields":{"error":"设备读取回执未交付的原因"}
+            }),
+        });
+    }
+    Err("设备任务回执超过大小限制，操作结果未知。".into())
 }
 
 /// SshDeviceIdentity（SSH 设备身份）：私钥由当前项目目录加密维护，界面仅接收公钥。
@@ -2654,7 +2695,7 @@ impl SshDeviceManager {
         timeout: Duration,
     ) -> Result<RemoteDeviceSessionLease, String> {
         let valid_capabilities = !capabilities.is_empty()
-            && capabilities.len() <= 5
+            && capabilities.len() <= 6
             && capabilities.windows(2).all(|pair| pair[0] < pair[1])
             && capabilities.iter().all(|value| {
                 matches!(
@@ -2663,6 +2704,7 @@ impl SshDeviceManager {
                         | "client_tts"
                         | "desktop_control"
                         | "file_transfer"
+                        | "screen_capture"
                         | "terminal_control"
                 )
             });
@@ -2702,22 +2744,30 @@ impl SshDeviceManager {
         wait_ms: u32,
         timeout: Duration,
     ) -> Result<Option<RemoteDeviceTask>, String> {
+        self.poll_remote_device_task_lane(lease, wait_ms, timeout, None).await
+    }
+
+    async fn poll_remote_device_task_lane(
+        &self,
+        lease: &RemoteDeviceSessionLease,
+        wait_ms: u32,
+        timeout: Duration,
+        lane: Option<&str>,
+    ) -> Result<Option<RemoteDeviceTask>, String> {
         validate_remote_session_lease(lease)?;
         if wait_ms > 5_000 || timeout.is_zero() || timeout > Duration::from_secs(15) {
             return Err("远端设备轮询等待或超时时限无效。".into());
         }
-        let response = self
-            .post_json(
-                "/v1/session/poll",
-                &serde_json::json!({
-                    "protocol_version":1,
-                    "connection_generation":lease.connection_generation,
-                    "executor_generation":lease.executor_generation,
-                    "wait_ms":wait_ms,
-                }),
-                timeout,
-            )
-            .await?;
+        let mut payload = serde_json::json!({
+            "protocol_version":1,
+            "connection_generation":lease.connection_generation,
+            "executor_generation":lease.executor_generation,
+            "wait_ms":wait_ms,
+        });
+        if let Some(lane) = lane {
+            payload["lane"] = serde_json::Value::String(lane.into());
+        }
+        let response = self.post_json("/v1/session/poll", &payload, timeout).await?;
         if response.status != 200 {
             return Err(format!(
                 "远端设备任务轮询失败，HTTP 状态码 {}。",
@@ -2737,6 +2787,9 @@ impl SshDeviceManager {
         }
         if let Some(task) = &poll.task {
             validate_remote_device_task(task, lease)?;
+            if lane.is_some_and(|lane| task.operation.starts_with("playback.") != (lane == "playback")) {
+                return Err("主机返回了其他类别的设备任务。".into());
+            }
         }
         Ok(poll.task)
     }
@@ -2754,22 +2807,14 @@ impl SshDeviceManager {
         if timeout.is_zero() || timeout > Duration::from_secs(600) {
             return Err("远端设备回执超时时限无效。".into());
         }
-        if serde_json::to_vec(&result).map_or(true, |encoded| encoded.len() > 256 * 1024) {
+        let payload = task_completion_payload(task, succeeded, &result);
+        if serde_json::to_vec(&payload).map_or(true, |encoded| encoded.len() > MAX_TASK_RECEIPT_BYTES) {
             return Err("远端设备操作结果超过大小限制。".into());
         }
         let response = self
             .post_json(
                 "/v1/session/complete",
-                &serde_json::json!({
-                    "protocol_version":1,
-                    "connection_generation":lease.connection_generation,
-                    "executor_generation":lease.executor_generation,
-                    "task_id":task.task_id,
-                    "sequence":task.sequence,
-                    "core_session_id":task.core_session_id,
-                    "succeeded":succeeded,
-                    "result":result,
-                }),
+                &payload,
                 timeout,
             )
             .await?;
@@ -3014,7 +3059,7 @@ impl SshDeviceManager {
         lease: RemoteDeviceSessionLease,
         stop: Arc<AtomicBool>,
         journal: Option<&DeviceTaskReceiptJournal>,
-        mut execute: F,
+        execute: F,
     ) -> Result<(), String>
     where
         F: FnMut(RemoteDeviceTask) -> Fut,
@@ -3033,64 +3078,15 @@ impl SshDeviceManager {
                     }
                 }
             }
-            loop {
-                if stop.load(Ordering::Acquire) {
-                    break Ok(());
-                }
-                if let Some(journal) = journal {
-                    journal.ensure_room()?;
-                }
-                let task = match self
-                    .poll_remote_device_task(&lease, 1000, Duration::from_secs(8))
-                    .await
-                {
-                    Ok(task) => task,
-                    Err(error) => break Err(error),
-                };
-                let Some(task) = task else { continue };
-                let execution = execute(task.clone());
-                tokio::pin!(execution);
-                let execution_result = loop {
-                    tokio::select! {
-                        result = &mut execution => break result,
-                        _ = tokio::time::sleep(Duration::from_secs(20)) => {
-                            if let Err(error) = self.heartbeat_remote_device_session(&lease, Duration::from_secs(8)).await {
-                                break Err(error);
-                            }
-                        }
-                    }
-                };
-                let outcome = match execution_result {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        // A helper timeout or process loss does not prove that the action failed.
-                        // Closing the session leaves the already accepted task as unknown.
-                        break Err(error);
-                    }
-                };
-                if let Some(journal) = journal {
-                    if let Err(error) = journal.record(&task, &outcome) {
-                        break Err(error);
-                    }
-                }
-                if let Err(error) = self
-                    .complete_remote_device_task(
-                        &lease,
-                        &task,
-                        outcome.succeeded,
-                        outcome.result,
-                        Duration::from_secs(10),
-                    )
-                    .await
-                {
-                    // A lost completion receipt leaves the durable client receipt for the next SSH connection.
-                    break Err(error);
-                }
-                if let Some(journal) = journal {
-                    if let Err(error) = journal.remove(&task.device_id, &task.task_id) {
-                        break Err(error);
-                    }
-                }
+            let execute = tokio::sync::Mutex::new(execute);
+            if lease.separate_playback_tasks {
+                tokio::try_join!(
+                    self.run_remote_device_task_lane(&lease, &stop, journal, &execute, Some("general")),
+                    self.run_remote_device_task_lane(&lease, &stop, journal, &execute, Some("playback")),
+                )?;
+                Ok(())
+            } else {
+                self.run_remote_device_task_lane(&lease, &stop, journal, &execute, None).await
             }
         };
         let result = result.await;
@@ -3100,6 +3096,60 @@ impl SshDeviceManager {
         match (result, close_result) {
             (Err(error), _) => Err(error),
             (Ok(()), Ok(_) | Err(_)) => Ok(()),
+        }
+    }
+
+    async fn run_remote_device_task_lane<F, Fut>(
+        &self,
+        lease: &RemoteDeviceSessionLease,
+        stop: &AtomicBool,
+        journal: Option<&DeviceTaskReceiptJournal>,
+        execute: &tokio::sync::Mutex<F>,
+        lane: Option<&str>,
+    ) -> Result<(), String>
+    where
+        F: FnMut(RemoteDeviceTask) -> Fut,
+        Fut: Future<Output = Result<RemoteDeviceTaskResult, String>>,
+    {
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(journal) = journal {
+                journal.ensure_room()?;
+            }
+            let Some(task) = self
+                .poll_remote_device_task_lane(lease, 1000, Duration::from_secs(8), lane)
+                .await?
+            else {
+                continue;
+            };
+            let execution = (execute.lock().await)(task.clone());
+            tokio::pin!(execution);
+            let outcome = loop {
+                tokio::select! {
+                    // 含副作用的操作如果无法确认结果，会话关闭会保留原任务为未知。
+                    result = &mut execution => break result?,
+                    _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                        self.heartbeat_remote_device_session(lease, Duration::from_secs(8)).await?;
+                    }
+                }
+            };
+            let outcome = bounded_task_receipt(&task, outcome)?;
+            if let Some(journal) = journal {
+                journal.record(&task, &outcome)?;
+            }
+            self.complete_remote_device_task(
+                lease,
+                &task,
+                outcome.succeeded,
+                outcome.result,
+                Duration::from_secs(10),
+            )
+            .await?;
+            if let Some(journal) = journal {
+                journal.remove(&task.device_id, &task.task_id)?;
+            }
         }
     }
 
@@ -3399,7 +3449,7 @@ fn validate_remote_session_lease(lease: &RemoteDeviceSessionLease) -> Result<(),
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let capabilities_valid = !lease.capabilities.is_empty()
-        && lease.capabilities.len() <= 5
+        && lease.capabilities.len() <= 6
         && lease.capabilities.windows(2).all(|pair| pair[0] < pair[1])
         && lease.capabilities.iter().all(|value| {
             matches!(
@@ -3408,6 +3458,7 @@ fn validate_remote_session_lease(lease: &RemoteDeviceSessionLease) -> Result<(),
                     | "client_tts"
                     | "desktop_control"
                     | "file_transfer"
+                    | "screen_capture"
                     | "terminal_control"
             )
         });
@@ -4539,6 +4590,7 @@ mod tests {
             .unwrap();
         assert_eq!(lease.device_id, "test-device");
         assert_eq!(lease.capabilities, ["audio_stream", "client_tts"]);
+        assert!(lease.separate_playback_tasks);
         assert_eq!(lease.connection_generation, 1);
         assert_eq!(lease.executor_generation, 1);
         let dispatch = call_python_gateway_test_route("POST", "/__test__/dispatch-stop").await;
@@ -4548,16 +4600,32 @@ mod tests {
         let stop_after_execute = stop.clone();
         let execute_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let execute_count_ref = execute_count.clone();
+        let screen_started = Arc::new(tokio::sync::Notify::new());
+        let screen_can_finish = Arc::new(tokio::sync::Notify::new());
         manager
             .run_remote_device_task_channel_for_lease(lease, stop, move |task| {
                 let stop = stop_after_execute.clone();
                 let execute_count = execute_count_ref.clone();
+                let screen_started = screen_started.clone();
+                let screen_can_finish = screen_can_finish.clone();
                 async move {
+                    if task.operation == "screen.capture_file" {
+                        screen_started.notify_one();
+                        tokio::time::timeout(Duration::from_secs(5), screen_can_finish.notified())
+                            .await.expect("截图执行期间播报停止任务应能独立到达");
+                        return Ok(RemoteDeviceTaskResult {
+                            succeeded: true,
+                            result: serde_json::json!({"fields":{}}),
+                        });
+                    }
                     assert_eq!(task.operation, "playback.stop_and_snapshot");
+                    tokio::time::timeout(Duration::from_secs(5), screen_started.notified())
+                        .await.expect("普通任务与播报任务应并行领取");
                     assert_eq!(task.arguments["playback_key"], "speech-playback-e2e");
                     assert_eq!(task.connection_generation, 1);
                     assert_eq!(task.executor_generation, 1);
                     execute_count.fetch_add(1, Ordering::AcqRel);
+                    screen_can_finish.notify_one();
                     stop.store(true, Ordering::Release);
                     Ok(RemoteDeviceTaskResult {
                         succeeded: true,
@@ -5639,6 +5707,7 @@ mod tests {
             connection_generation: 2,
             executor_generation: 3,
             capabilities: vec!["desktop_control".into()],
+            separate_playback_tasks: false,
         };
         validate_remote_session_lease(&lease).unwrap();
         let task = RemoteDeviceTask {

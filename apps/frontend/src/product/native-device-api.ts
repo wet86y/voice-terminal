@@ -1,5 +1,5 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
-import type { ProductLocalTtsModelId, ProductTtsAsset, RemoteTtsAssetAudio, RemoteTtsAssetImportCancelled } from '../interface/tts-voice-types'
+import type { ProductLocalTtsModelId, ProductTtsAsset, RemoteTtsAssetImportCancelled } from '../interface/tts-voice-types'
 
 /** DeviceAudioEndpoint（默认音频端点）：本机系统混音格式与设备周期。 */
 export interface DeviceAudioEndpoint {
@@ -231,14 +231,6 @@ function isLoopbackVoiceForwarderUrl(value: unknown): value is string {
   } catch { return false }
 }
 
-const REMOTE_TTS_AUDIO_MEDIA_TYPES = new Set(['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/flac', 'audio/ogg'])
-const REMOTE_TTS_AUDIO_MAX_BYTES = 1024 * 1024 // REMOTE_TTS_AUDIO_MAX_BYTES（远程音频回包 1 MiB 上限）。
-
-function isBase64Audio(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= Math.ceil(REMOTE_TTS_AUDIO_MAX_BYTES / 3) * 4
-    && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-}
-
 function isOpenSshServerStatus(value: unknown): value is OpenSshServerStatus {
   if (!isRecord(value)) return false
   const capabilityStates = ['Installed', 'NotPresent', 'InstallPending', 'UninstallPending', 'Staged', 'Unknown']
@@ -397,19 +389,6 @@ export const nativeDeviceApi = {
   resourceJobs: () => call<ManagedResourceJob[]>('resource_jobs'),
   /** remoteTtsAssetImport（远程 TTS 资产导入）：客户端原生选择器通过固定 FILE 通道上传音频。 */
   remoteTtsAssetImport,
-  /** remoteTtsAssetAudio（读取远程参考音频）：按服务端模型和资产编号返回已校验的受限媒体回包。 */
-  remoteTtsAssetAudio: async (modelId: ProductLocalTtsModelId, assetId: string): Promise<RemoteTtsAssetAudio> => {
-    if (!assetId || assetId.length > 128 || assetId.trim() !== assetId) throw new Error('远程参考音频编号无效。')
-    const result: unknown = await call('device_ssh_tts_asset_audio', { model_id: modelId, asset_id: assetId })
-    if (!isRecord(result) || !isBase64Audio(result.data_base64)
-      || typeof result.media_type !== 'string' || !REMOTE_TTS_AUDIO_MEDIA_TYPES.has(result.media_type)
-      || !Number.isSafeInteger(result.bytes) || Number(result.bytes) < 1 || Number(result.bytes) > REMOTE_TTS_AUDIO_MAX_BYTES
-      || typeof result.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(result.sha256)
-      || !isStringMap(result.fields)) {
-      throw new Error('远程 TTS 音频回执字段无效或超出大小限制。')
-    }
-    return result as unknown as RemoteTtsAssetAudio
-  },
   probeSshHost: (address: string, port: number) => call<{ fingerprint: string; trusted: false; fields: Record<string, string> }>(
     'device_ssh_probe', { address, port },
   ),

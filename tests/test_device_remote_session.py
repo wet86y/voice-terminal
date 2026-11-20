@@ -30,6 +30,37 @@ def test_remote_session_accepts_client_tts_capability_without_granting_voice_lea
     asyncio.run(scenario())
 
 
+def test_playback_control_can_settle_while_the_screen_task_is_in_flight(tmp_path) -> None:
+    async def scenario():
+        _, _, router, hub = _runtime(tmp_path)
+        connection = await hub.open("client-a", ["audio_stream", "file_transfer", "screen_capture"])
+        device = (connection.device_id, connection.connection_generation, connection.executor_generation)
+        screenshot = asyncio.create_task(router.execute(
+            request_id="shot-1", device_id=device[0], operation="screen.capture_file", arguments={},
+        ))
+        stop = None
+        try:
+            shot_task = await hub.poll(*device, lane="general")
+            assert shot_task is not None and shot_task.operation == "screen.capture_file"
+            stop = asyncio.create_task(router.execute(
+                request_id="stop-1", device_id=device[0], operation="playback.stop_and_snapshot", arguments={},
+            ))
+            playback = await hub.poll(*device, lane="playback")
+            assert playback is not None and playback.operation == "playback.stop_and_snapshot"
+            assert await hub.poll(*device, wait_ms=0, lane="general") is None
+            assert await hub.complete(device_id=device[0], connection_generation=device[1],
+                executor_generation=device[2], task_id=playback.task_id, sequence=playback.sequence,
+                core_session_id=playback.core_session_id, succeeded=True, result={}) == "accepted"
+            assert (await stop).status == "succeeded"
+            assert not screenshot.done()
+        finally:
+            await hub.close(device[0], device[1])
+            await asyncio.gather(*(task for task in (screenshot, stop) if task is not None),
+                                 return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 
 
 def test_remote_session_dispatches_fixed_task_and_deduplicates_completion(tmp_path) -> None:

@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
@@ -101,8 +102,8 @@ def choose_center(state, config):
 # clip_bounds（系统限制的鼠标范围，未知为空）、notification_state（系统通知状态，未知为空）、
 # elapsed_ms（捕获与编码耗时，由服务填入）。
 # attachments（编码附件）：attachment_id（附件标识）、role（全局或局部）、mime_type（媒体类型）、
-# width/height（宽高）、bytes（字节数）、sha256（内容摘要）、base64（图片编码）。
-def encode_pair(frame, state, config):
+# width/height（宽高）、bytes（字节数）、sha256（内容摘要）、data（原始图片）或 base64（兼容业务表示）。
+def encode_pair(frame, state, config, *, binary=False):
     """encode_pair（同帧双图编码）：先裁局部，再缩小全局；边缘补黑。"""
     from PIL import Image
     if not isinstance(frame, Image.Image):
@@ -125,13 +126,26 @@ def encode_pair(frame, state, config):
         raw = stream.getvalue()
         attachments.append({"attachment_id": f"{capture_id}-{role}", "role": role, "mime_type": mime,
                             "width": image.width, "height": image.height, "bytes": len(raw),
-                            "sha256": hashlib.sha256(raw).hexdigest(), "base64": base64.b64encode(raw).decode("ascii")})
-    return {"capture_id": capture_id, "captured_at": time.time(), "monitor_bounds": state["monitor_bounds"],
+                            "sha256": hashlib.sha256(raw).hexdigest(), "data": raw})
+    packet = {"capture_id": capture_id, "captured_at": time.time(), "monitor_bounds": state["monitor_bounds"],
             "executable": state["executable"], "center_point": center,
             "crop_rect": (rect[0] + left, rect[1] + top, rect[2] + left, rect[3] + top),
             "valid_region": (max(0, rect[0]) + left, max(0, rect[1]) + top,
                              min(frame.width, rect[2]) + left, min(frame.height, rect[3]) + top),
             **facts, "attachments": attachments}
+    return packet if binary else screen_packet_json(packet)
+
+
+def screen_packet_json(packet):
+    """screen_packet_json（截图文本表示）：供需要现有图像上下文格式的业务入口调用。"""
+    images = packet.get("attachments", ())
+    if not any("data" in item for item in images):
+        return packet
+    return {**packet, "attachments": [
+        {**{key: value for key, value in item.items() if key != "data"},
+         "base64": base64.b64encode(item["data"]).decode("ascii")} if "data" in item else item
+        for item in images
+    ]}
 
 
 def windows_state():
@@ -194,7 +208,7 @@ def windows_state():
             "capture_detected": bool(capture), "notification_state": notification.value, "executable": executable}
 
 
-def capture_windows(config):
+def capture_windows(config, *, binary=False):
     """capture_windows（按系统选屏抓取）：当前动作单次采集，不开视频循环。"""
     from ctypes import wintypes as w
     import dxcam
@@ -236,7 +250,7 @@ def capture_windows(config):
                 from PIL import Image
                 # BGRA（蓝绿红透明四通道）由图像库转换，不加载视觉计算库。
                 image = Image.frombytes("RGBA", (frame.shape[1], frame.shape[0]), frame.tobytes(), "raw", "BGRA")
-                return encode_pair(image, state, config)
+                return encode_pair(image, state, config, binary=binary)
             except Exception:
                 if attempt:
                     raise
@@ -251,7 +265,7 @@ class ScreenCaptureService:
     """ScreenCaptureService（串行捕获服务）：超时不会使原生调用重叠。"""
     def __init__(self, config=None, capture=None):
         self.config = config or ScreenCaptureConfig()
-        self.capture = capture or capture_windows
+        self.capture = capture or partial(capture_windows, binary=True)
         self.generation = 0  # generation（配置及生命周期代次）。
         self._native_busy = threading.Lock()
         self._lease_lock = threading.Lock()  # _lease_lock（待消费状态的并发保护锁）。
@@ -359,14 +373,14 @@ class ScreenCaptureService:
                 self._lease_generations[key] = self._lease_generations.get(key, 0) + 1
                 self._unconsumed_captures.pop(key, None)
 
-    async def grab(self, *, source=None, scope=None):
+    async def grab(self, *, source=None, scope=None, binary=False):
         """grab（捕获或复用图片）：source（来源）独立维护未消费租约。"""
         if not self.available:
             raise RuntimeError("屏幕捕获当前不可用")
         lease_key = self._lease_key(source, scope)
         pending = self._unconsumed_packet(lease_key)
         if pending is not None:
-            return pending
+            return pending if binary else await asyncio.to_thread(screen_packet_json, pending)
         if not self._native_busy.acquire(blocking=False):
             raise RuntimeError("上一次屏幕捕获尚未结束")
         config = self.config
@@ -387,7 +401,8 @@ class ScreenCaptureService:
                 self._native_busy.release()
         future = asyncio.get_running_loop().run_in_executor(self._executor, work)
         future.add_done_callback(lambda value: value.exception() if not value.cancelled() else None)
-        return await asyncio.wait_for(asyncio.shield(future), timeout=3)
+        packet = await asyncio.wait_for(asyncio.shield(future), timeout=3)
+        return packet if binary else await asyncio.to_thread(screen_packet_json, packet)
 
 
 def capture_message(packet):

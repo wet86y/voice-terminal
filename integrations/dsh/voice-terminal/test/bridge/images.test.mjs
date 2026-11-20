@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { AttachmentBody } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/shared/attachment-transport.js'
 import { prepareContextImages, freshFrames, installImageCapabilityGuard, frameKey, registerVoiceImageSummaryGuard } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/images.js'
 import { enqueueAuthoritativeContext } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
 import { voiceContextProjection } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/image-history.js'
@@ -16,10 +17,12 @@ function fixture() {
     inject(value) { queue.push(value) }, followup(value) { queue.push(value) } }
   const binding = { state: 'active', voiceSessionId: 'voice', dshSessionId: 'dsh', epoch: 1, handle: { agent },
     queuedMessages: new Map(), records: [], traceRevision: 0,
-    callbacks: { signal: new AbortController().signal, async send(path, body) {
-      reads.push({ path, body }); return { result: 'accepted', attachment: { base64: data.toString('base64'), sha256: hash, mime_type: 'image/png' } }
+    callbacks: { signal: new AbortController().signal, async receiveAttachment(path, body, consume) {
+      reads.push({ path, body })
+      const reader = new AttachmentBody(new Response(data).body.getReader())
+      try { return await consume(reader) } finally { await reader.close() }
     } },
-    attachments: { async saveImages(inputs) { saved.push(inputs); return inputs.map(() => ({ attachmentId: `sha256:${hash}`, mediaType: 'image/png', bytes: 3, width: 1, height: 1 })) } } }
+    attachments: { imageLimits: { maxImageBytes: 1024 }, async saveImages(inputs) { saved.push(inputs); return inputs.map(() => ({ attachmentId: `sha256:${hash}`, mediaType: 'image/png', bytes: 3, width: 1, height: 1 })) } } }
   const frame = (revision, capture) => ({ revision, origin: 'external_system', kind: 'observation',
     content: { message_id: capture, conversation_id: 'voice', parts: [{ type: 'text', text: `观察 ${capture}` },
       ...['global', 'local'].map(role => ({ type: 'image', role, attachment_id: `${capture}-${role}`, mime_type: 'image/png', bytes: 3, sha256: hash }))] } })
@@ -34,7 +37,7 @@ test('程序自动加载双图，首次上下文包含原生图片块且未新�
   assert.equal(f.queue.length, 1)
   assert.deepEqual(f.queue[0].content.slice(1).map(p => p.type), ['text', 'image', 'image'])
   assert.equal(f.reads.length, 1); assert.equal(f.saved.length, 1)
-  assert.ok(f.saved.every(batch => batch[0].data.equals(Buffer.from([1, 2, 3]))))
+  assert.ok(f.saved.every(batch => Buffer.from(batch[0].data).equals(Buffer.from([1, 2, 3]))))
   assert.ok(!JSON.stringify(f.queue).includes('AQID'))
 })
 
@@ -71,8 +74,9 @@ test('同一消息身份出现不同内容拒绝，加载失败不会注入半�
   await prepareContextImages(f.binding, frames); enqueueAuthoritativeContext(f.binding, f.body(1, frames), 'snapshot')
   const changed = structuredClone(frames); changed[0].content.parts[0].text = '已被改写'
   assert.throws(() => freshFrames(f.binding, changed), /摘要冲突/)
-  const other = fixture(); other.binding.callbacks.send = async () => ({ result: 'accepted', attachment: { base64: 'AQID', sha256: 'bad', mime_type: 'image/png' } })
-  await assert.rejects(prepareContextImages(other.binding, [other.frame(1, 'capture-x')]), /读取失败/)
+  const other = fixture(), broken = other.frame(1, 'capture-x')
+  broken.content.parts[1].sha256 = 'a'.repeat(64)
+  await assert.rejects(prepareContextImages(other.binding, [broken]), /摘要不匹配/)
   assert.equal(other.queue.length, 0)
 })
 

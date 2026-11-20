@@ -70,11 +70,11 @@ class _PendingRemoteTask:
 class _RemoteSession:
     device_id: str
     connection: DeviceConnection
-    queue: asyncio.Queue[RemoteDeviceTask | None]
+    ready: asyncio.Condition
     last_seen: float
     sequence: int = 0
     closed: bool = False
-    poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: list[RemoteDeviceTask] = field(default_factory=list)
     pending: dict[str, _PendingRemoteTask] = field(default_factory=dict)
     completed: OrderedDict[str, tuple[int, bool, Any]] = field(default_factory=OrderedDict)
 
@@ -105,7 +105,7 @@ class RemoteDeviceSessionHub:
             session = _RemoteSession(
                 device_id=device_id,
                 connection=connection,
-                queue=asyncio.Queue(maxsize=MAX_REMOTE_SESSION_TASKS),
+                ready=asyncio.Condition(self._lock),
                 last_seen=time.monotonic(),
             )
             transport = _RemoteDeviceTransport(self, device_id, connection)
@@ -148,40 +148,31 @@ class RemoteDeviceSessionHub:
                     and time.monotonic() - session.last_seen < REMOTE_SESSION_IDLE_SECONDS)
 
     async def poll(self, device_id: str, connection_generation: int, executor_generation: int,
-                   wait_ms: int = 1000) -> RemoteDeviceTask | None:
-        """poll（轮询任务）：保留 SSH 会话，由设备主动获取核心派发任务。"""
+                   wait_ms: int = 1000, *, lane: str | None = None) -> RemoteDeviceTask | None:
+        """poll（轮询任务）：分离实时播报控制和普通设备任务，保留各自的领取顺序。"""
         if type(wait_ms) is not int or not 0 <= wait_ms <= 5000:
             raise ValueError("设备任务轮询等待范围必须为 0 至 5000 毫秒。")
+        if lane not in (None, "general", "playback"):
+            raise ValueError("设备任务轮询类别无效。")
         session = self._get_session(device_id, connection_generation, executor_generation)
-        async with session.poll_lock:
+        async with session.ready:
             session.last_seen = time.monotonic()
-            deadline = time.monotonic() + wait_ms / 1000
-            while True:
-                if wait_ms == 0:
-                    try:
-                        task = session.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return None
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return None
-                    try:
-                        task = await asyncio.wait_for(session.queue.get(), timeout=remaining)
-                    except asyncio.TimeoutError:
+            deadline = session.last_seen + wait_ms / 1000
+            while not session.closed:
+                for index, task in enumerate(session.queue):
+                    if lane is None or task.operation.startswith("playback.") == (lane == "playback"):
+                        session.pending[task.task_id].claimed = True
                         session.last_seen = time.monotonic()
-                        return None
-                session.last_seen = time.monotonic()
-                if task is None:
-                    return None
-                # A task that timed out before a client pulled it is left in
-                # the bounded queue only until this point; never execute it late.
-                async with self._lock:
-                    pending = session.pending.get(task.task_id)
-                    if (self._sessions.get(device_id) is session and not session.closed
-                            and pending is not None and not pending.future.cancelled()):
-                        pending.claimed = True
-                        return task
+                        return session.queue.pop(index)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(session.ready.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+            session.last_seen = time.monotonic()
+            return None
 
     async def heartbeat(self, device_id: str, connection_generation: int,
                         executor_generation: int) -> str:
@@ -211,7 +202,7 @@ class RemoteDeviceSessionHub:
                     return "already_completed"
                 raise DeviceUnavailable("设备回执不属于当前在途任务。")
             task = pending.task
-            if (task.sequence != sequence or task.core_session_id != core_session_id
+            if (not pending.claimed or task.sequence != sequence or task.core_session_id != core_session_id
                     or task.connection_generation != connection_generation
                     or task.executor_generation != executor_generation or task.device_id != device_id):
                 raise DeviceUnavailable("设备回执与原任务或设备代次不匹配。")
@@ -288,6 +279,8 @@ class RemoteDeviceSessionHub:
                 raise DeviceUnavailable("设备会话已断开。")
             if len(session.pending) >= MAX_REMOTE_SESSION_PENDING:
                 raise DeviceUnavailable("远端设备在途任务已达上限。")
+            if len(session.queue) >= MAX_REMOTE_SESSION_TASKS:
+                raise DeviceUnavailable("远端设备任务队列已满。")
             if request.task_id in session.pending:
                 raise DeviceUnavailable("远端设备任务编号正在使用。")
             session.sequence += 1
@@ -316,12 +309,10 @@ class RemoteDeviceSessionHub:
             except Exception as exc:
                 raise DeviceUnavailable("远端任务代次未能持久绑定；任务未进入设备队列。") from exc
             future: asyncio.Future[DeviceResponse] = asyncio.get_running_loop().create_future()
-            try:
-                session.queue.put_nowait(task)
-            except asyncio.QueueFull as exc:
-                raise DeviceUnavailable("远端设备任务队列已满。") from exc
+            session.queue.append(task)
             session.pending[task.task_id] = _PendingRemoteTask(task, future)
             session.last_seen = time.monotonic()
+            session.ready.notify_all()
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
@@ -335,6 +326,7 @@ class RemoteDeviceSessionHub:
                     else:
                         future.cancel()
                         session.pending.pop(task.task_id, None)
+                        session.queue.remove(current.task)
             raise
         finally:
             async with self._lock:
@@ -355,19 +347,12 @@ class RemoteDeviceSessionHub:
 
     async def _retire_locked(self, session: _RemoteSession, message: str) -> None:
         session.closed = True
-        while not session.queue.empty():
-            try:
-                session.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        session.queue.clear()
         for pending in tuple(session.pending.values()):
             if not pending.future.done():
                 pending.future.set_exception(DeviceOutcomeUnknown(message))
         session.pending.clear()
-        try:
-            session.queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        session.ready.notify_all()
 
 
 class _RemoteDeviceTransport:

@@ -578,7 +578,11 @@ def test_remote_output_waiter_requires_a_drained_device_clock_snapshot() -> None
         }
         with pytest.raises(PlaybackOutcomeUnknown, match="期限内"):
             await runtime.wait_remote_playback_output("speech-a", 0.001)
+        assert runtime.remote_playback_buffered_ms("speech-a") == 20
         await outbox.close()
+        assert runtime.remote_playback_is_bound("speech-a")
+        assert runtime.remote_playback_buffered_ms("speech-a") == 0
+        assert runtime.remote_playback_snapshot("speech-a")["buffered_ms"] == 20
 
     asyncio.run(scenario())
 

@@ -656,6 +656,30 @@ class VoiceLibrary:
                 return self._source_path(asset_id).read_bytes()
         return self.asset_path(asset_id).read_bytes()
 
+    def playback_source(self, asset_id: str) -> tuple[Path, str | None]:
+        """playback_source（试听素材及登记摘要）：支持原始录音，优先使用高保真副本。"""
+        if not isinstance(asset_id, str):
+            raise VoiceLibraryError("asset_id（音频素材标识）无效。")
+        with self._lock:
+            metadata = self._index["assets"].get(asset_id)
+            if not isinstance(metadata, dict):
+                raise FileNotFoundError("音频素材不存在。")
+            if metadata.get("format") == "source":
+                path = self._source_path(asset_id)
+                digest = metadata.get("sha256")
+            else:
+                primary = self.asset_path(asset_id)
+                high_fidelity = self.high_fidelity_path(asset_id)
+                path = high_fidelity or primary
+                remote_import = metadata.get("remote_import")
+                digest_key = "high_fidelity_sha256" if high_fidelity else "stored_sha256"
+                digest = remote_import.get(digest_key) if isinstance(remote_import, dict) else None
+            if path.is_symlink() or not path.resolve().is_relative_to(self.assets_dir):
+                raise VoiceLibraryError("试听素材必须保存在音色库中。")
+            if not path.is_file():
+                raise FileNotFoundError("音频素材文件缺失。")
+            return path, digest
+
     def asset_media_type(self, asset_id: str) -> str:
         with self._lock:
             metadata = self._index['assets'].get(asset_id)

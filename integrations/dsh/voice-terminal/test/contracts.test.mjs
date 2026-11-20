@@ -57,6 +57,34 @@ test('CallbackScope（回调生命周期）释放会取消并等待未完成网�
   } finally { globalThis.fetch = originalFetch }
 })
 
+test('二进制响应收到响应头后仍受回调生命周期管理', { timeout: 2000 }, async () => {
+  const originalFetch = globalThis.fetch
+  let started
+  const began = new Promise(resolve => { started = resolve })
+  let raw
+  globalThis.fetch = async (_url, options) => {
+    const stream = new ReadableStream({ start(controller) {
+      controller.enqueue(Uint8Array.of(42))
+      options.signal.addEventListener('abort', () => controller.error(options.signal.reason), { once: true })
+    } })
+    raw = new Response(stream, { headers: { 'content-type': 'application/octet-stream' } })
+    return raw
+  }
+  try {
+    const scope = new CallbackScope()
+    const pending = scope.receiveAttachment('/attachment', {}, async body => {
+      assert.deepEqual(await body.readBytes(1), Uint8Array.of(42))
+      started()
+      await body.readBytes(1)
+    })
+    const rejected = assert.rejects(pending, { name: 'AbortError' })
+    await began
+    await scope.dispose()
+    await rejected
+    assert.equal(raw.body.locked, false)
+  } finally { globalThis.fetch = originalFetch }
+})
+
 test('TaskService（任务服务）关闭时取消后台投递，并保留任务以供重启重试', async () => {
   const temporary = await mkdtemp(join(tmpdir(), 'voice-dsh-cancel-'))
   process.env.VOICE_DSH_TASKS_PATH = join(temporary, 'tasks.json')

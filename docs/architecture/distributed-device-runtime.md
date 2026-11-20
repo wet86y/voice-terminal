@@ -144,7 +144,7 @@
 | 播放与结算 | [播放器](../../voice_terminal/audio/player.py)提供暂停、恢复、替换、停止快照和输出位置估算；[语音输出](../../voice_terminal/controller/episode_output.py)、[播放流水线](../../voice_terminal/controller/speech_pipeline.py)依赖这些语义 | 先完整盘点调用契约；远程控制命令与设备回执分离，不能只实现音频入队 |
 | 历史 | [会话台账](../../voice_terminal/session/ledger.py)维护传达与截图记录；[会话契约](../../voice_terminal/session/contracts.py)区分传达状态 | 保留既有结算入口，对远程回执增加身份、代次及重复检查 |
 | 声纹注册 | [注册录音](../../voice_terminal/speaker/enrollment_capture.py)通过 `TimedRecordingPort`（限时采集接口）及本机实现录音，复用现有前处理器并保留停止、取消和释放语义 | 接入指定设备能力；保留质量检查及与日常链路的一致性 |
-| 屏幕输入 | [截图服务](../../voice_terminal/screen_capture.py)、[屏幕输入调度](../../voice_terminal/agent/screen_input.py)及会话台账维护双图、消费状态和请求重试 | 已按当前交互设备路由：本机用本地捕获，远端设备用其执行器的 `tree` 与 `shot` 取整屏和前台窗口范围，同时保留双图编码、附件、消费状态和请求重试；主语音截图不只经过 DSH 工具 |
+| 屏幕输入 | [截图服务](../../voice_terminal/screen_capture.py)、[屏幕输入调度](../../voice_terminal/agent/screen_input.py)及会话台账维护双图、消费状态和请求重试 | 远端客户端在同一帧上原生生成全局 JPEG（有损图像）和局部 PNG（无损图像），经 FILE（设备文件通道）传输原始字节。任务回执记录固定设备、文件摘要和裁剪信息。客户端登记双图能力后才开放远端截图，同样支持主语音与 DSH（代理执行宿主）入口。 |
 | 代理执行 | [DSH 锁](../../config/dsh/runtime.lock.json)固定 0.2.1-rc.5；[项目插件](../../integrations/dsh/voice-terminal/package.json)为 0.2.2；[代理预设](../../integrations/dsh/voice-terminal/preset/shadow-agent/agent.cordis.yml)已有本地命令和文件工具 | 本地工具保留；新增设备路由与远端工具，复用现有审批和后台任务归属 |
 | 组件就绪 | [能力资源检查](../../voice_terminal/application/resource_readiness.py)维持现有单机门禁；原生启动入口读取独立设备配置，未知配置保留原件，未实现的主机或客户端角色不会冒充单机核心启动 | 按角色计算启动需求，且在轻量客户端加载 Python（后端运行环境）前分流 |
 | 外壳与业务地址 | [应用宿主网页接口](../../voice_terminal/application/web.py)使用实例会话和一次性入口令牌；[前端接口](../../apps/frontend/src/product/api.ts)从宿主取得业务地址，也有本机管理请求 | 拆分本机管理与当前核心业务路由；不能全局替换一个地址完成角色切换 |
@@ -210,7 +210,19 @@
 
 局域网通过 mDNS（多播服务发现）辅助发现；异地使用保存的地址或 Tailscale（组网工具）地址。客户端主动通过 SSH 连接共享主机，客户端无需开放 SSH 入站；主机通过双向业务通道派发设备任务。发现结果不代表设备已获信任，手动地址也必须走身份核对。配对绑定稳定设备身份、SSH 主机指纹与公钥；指纹变化不得无提示续连。
 
-控制、音频和大文件传输分离；实时音频使用独立 SSH 连接，避免与 SFTP（安全文件传输协议）大文件或命令输出共用连接形成阻塞。内部业务服务保持回环监听，通过受限入口和隧道访问。现有语音接口不能仅因位于 SSH 转发后，就把任意本机进程视为已授权客户端；远端身份、业务授权、浏览器来源和设备操作权限都要核验，不能直接把旧管理接口暴露到局域网。
+控制、音频和大文件传输分离。实时音频使用独立 SSH 连接，播报控制任务与截图、文件等普通设备任务独立轮询。内部业务服务保持回环监听，通过受限入口和隧道访问。现有语音接口不能仅因位于 SSH 转发后，就把任意本机进程视为已授权客户端；远端身份、业务授权、浏览器来源和设备操作权限都要核验，不能直接把旧管理接口暴露到局域网。
+
+### 高频截图与文件附件
+
+远端截图任务通过控制通道传递截图范围和文件票据，原始双图经独立 FILE（设备文件通道）上传。服务端验证文件和裁剪范围后，用原始图片向 DSH（代理执行宿主）交付。按需截图的回环响应依次包含四字节大端清单长度、JSON（结构化文本）截图清单、全局图和局部图。读取已登记的会话图片时，回环响应直接返回单张图片字节。DSH 校验摘要后按内容复用附件引用，工具结果只携带视图信息与附件引用。
+
+已暂存的设备文件通过 `read_stream`（一次打开原始文件流）交给 DSH。服务端为同一个已复核的暂存文件持有读句柄，逐段读取并在完成、取消或断开时释放句柄和票据。流绑定当前 DSH 激活与原设备连接代次，DSH 在入库前验证整份文件的长度和 SHA-256（内容摘要）。文件内容由一条回环请求交付，业务接口继续负责配对、操作授权与设备选择。
+
+以上回环附件接口随服务端与 DSH 插件同步切换。设备间仍使用现有受限 SSH（安全外壳协议）和 FILE 通道。本阶段的优化覆盖服务端向 DSH 的附件交付。设备间每次建连和分块确认的耗时，以及附件与语音并发时的表现，由双机实测评估。
+
+实现见[服务端附件传输](../../voice_terminal/server/dsh_attachment_transport.py)与[DSH 附件读取](../../integrations/dsh/voice-terminal/src/shared/attachment-transport.ts)。
+
+### 远端桌面执行器
 
 社区 [dsh-windows-remote-ssh（远端 Windows 操作插件）](https://github.com/pureexe/dsh-windows-remote-ssh)可作为复用来源。2026-11-14 核对其[说明](https://github.com/pureexe/dsh-windows-remote-ssh/blob/main/README.md)与[包声明](https://github.com/pureexe/dsh-windows-remote-ssh/blob/main/package.json)：现有方式通过 SFTP 投放辅助脚本及请求，再以一次性计划任务进入已登录的交互桌面；它不是常驻音频执行器。开发依赖基线为 DSH 0.1.5-rc.2，同级依赖范围虽允许更高版本，也不能据此认定已兼容本项目 0.2.1-rc.5。接入前固定不可变提交、核对 MIT（宽松开源许可证）声明、工具接口、审批与附件，再决定复用范围。
 

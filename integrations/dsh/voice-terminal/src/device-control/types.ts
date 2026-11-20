@@ -1,5 +1,6 @@
 import type { Json } from '../shared/protocol.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentConsumer } from '../shared/callback.js'
 
 /** DeviceTarget（设备目标）：由已认证设备管理器提供，不含连接凭据。 */
 export interface DeviceTarget {
@@ -49,3 +50,6 @@ export interface DeviceToolBinding {
 
 /** DeviceToolCallback（设备回调）：沿用桥接拥有的认证、取消和清理路径。 */
 export type DeviceToolCallback = (path: string, payload: Record<string, Json>, signal?: AbortSignal) => Promise<Record<string, Json>>
+/** DeviceAttachmentCallback（设备附件回调）：在已绑定的回调范围内消费完整字节流。 */
+export type DeviceAttachmentCallback = <T>(path: string, payload: Record<string, Json>,
+  consume: AttachmentConsumer<T>, signal?: AbortSignal) => Promise<T>

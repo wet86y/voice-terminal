@@ -98,30 +98,3 @@ describe('nativeDeviceApi.remoteVoiceForwarder（远程语音回环转发）', (
     await expect(nativeDeviceApi.remoteVoiceForwarder('stop')).resolves.toEqual({ state: 'stopped', fields: {} })
   })
 })
-
-describe('nativeDeviceApi.remoteTtsAssetAudio（远程参考音频字节）', () => {
-  it('按模型和资产编号读取有界音频并保留校验字段', async () => {
-    const response = { data_base64: 'AQID', media_type: 'audio/wav', bytes: 3,
-      sha256: '0'.repeat(64), fields: { bytes: '音频字节数' } }
-    const invoke = vi.fn().mockResolvedValue(response)
-    window.__TAURI_INTERNALS__ = { invoke }
-
-    await expect(nativeDeviceApi.remoteTtsAssetAudio('aniflive', 'asset-a')).resolves.toEqual(response)
-    expect(invoke).toHaveBeenCalledWith('device_ssh_tts_asset_audio', { model_id: 'aniflive', asset_id: 'asset-a' })
-  })
-
-  it('拒绝不支持媒体类型、非法 Base64 或超过 1 MiB 的回包', async () => {
-    const invoke = vi.fn().mockResolvedValue({ data_base64: 'AQID', media_type: 'text/plain', bytes: 3,
-      sha256: '0'.repeat(64), fields: {} })
-    window.__TAURI_INTERNALS__ = { invoke }
-    await expect(nativeDeviceApi.remoteTtsAssetAudio('aniflive', 'asset-a')).rejects.toThrow('回执字段无效')
-
-    invoke.mockResolvedValue({ data_base64: 'not base64!', media_type: 'audio/wav', bytes: 3,
-      sha256: '0'.repeat(64), fields: {} })
-    await expect(nativeDeviceApi.remoteTtsAssetAudio('aniflive', 'asset-a')).rejects.toThrow('回执字段无效')
-
-    invoke.mockResolvedValue({ data_base64: 'AQID', media_type: 'audio/wav', bytes: 1_048_577,
-      sha256: '0'.repeat(64), fields: {} })
-    await expect(nativeDeviceApi.remoteTtsAssetAudio('aniflive', 'asset-a')).rejects.toThrow('回执字段无效')
-  })
-})

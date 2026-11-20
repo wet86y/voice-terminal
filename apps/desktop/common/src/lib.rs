@@ -24,6 +24,8 @@ pub mod device_discovery; // device_discovery（局域网 mDNS 发现）：公�
 pub mod device_file_channel; // device_file_channel（独立 SSH FILE 通道）：有界分块、摘要和强制命令前导校验。
 pub mod device_files; // device_files（设备文件任务）：安全目录清单和受限小文件读取。
 pub mod device_helper; // device_helper（设备桌面辅助进程）：受管管道与生命周期。
+#[cfg(all(windows, feature = "ssh-device"))]
+pub mod native_screen; // native_screen（客户端原生双图截图）。
 pub mod device_management_contract; // device_management_contract（设备管理契约）：独立会话、固定操作请求和字段说明。
 #[cfg(feature = "ssh-device")]
 pub mod device_pairing; // device_pairing（原生 OPAQUE 六位码配对）：不在网络传送明文配对码。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 
@@ -10,7 +11,7 @@ from voice_terminal.devices.file_transfer import (
 )
 
 
-def test_device_file_upload_is_generation_bound_and_exposes_verified_chunks(tmp_path):
+def test_device_file_upload_is_generation_bound_and_exposes_verified_stream(tmp_path):
     store = DeviceFileTransferStore(tmp_path / "data")
     ticket = store.prepare_device_upload(device_id="device-a", connection_generation=2,
                                         executor_generation=3, expected_bytes=256 * 600,
@@ -37,15 +38,19 @@ def test_device_file_upload_is_generation_bound_and_exposes_verified_chunks(tmp_
     ready = store.verify_device_upload(transfer_id=ticket["transfer_id"], device_id="device-a",
         connection_generation=2, executor_generation=3, expected_bytes=len(content), expected_sha256=digest)
     assert ready["state"] == "ready" and ready["bytes"] == len(content)
-    chunk = store.read_chunk(transfer_id=ticket["transfer_id"], device_id="device-a",
-        connection_generation=2, executor_generation=3, offset=0, limit=4096)
-    raw = base64.b64decode(chunk["data_base64"], validate=True)
-    assert raw == content[:4096]
-    assert chunk["chunk_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert chunk["sha256"] == digest
+    request = {key: value for key, value in channel_key.items() if key != "channel_token"}
     with pytest.raises(DeviceFileTransferError):
-        store.read_chunk(transfer_id=ticket["transfer_id"], device_id="device-a",
-            connection_generation=1, executor_generation=3, offset=0)
+        store.open_staged_read(**{**request, "connection_generation": 1})
+    handle, size = store.open_staged_read(**request)
+    try:
+        with pytest.raises(DeviceFileTransferError):
+            store.open_staged_read(**request)
+        with pytest.raises(DeviceFileTransferError):
+            store.close(**request)
+        assert size == len(content) and handle.read() == content
+    finally:
+        store.finish_staged_read(handle, **request)
+    assert handle.closed and not list(store.root.iterdir())
 
 
 def test_core_attachment_chunks_are_sequential_idempotent_and_digest_checked(tmp_path):
@@ -68,11 +73,10 @@ def test_core_attachment_chunks_are_sequential_idempotent_and_digest_checked(tmp
     digest = hashlib.sha256(content).hexdigest()
     ready = store.finish_core_upload(**request, expected_bytes=len(content), expected_sha256=digest)
     assert ready["state"] == "ready" and ready["sha256"] == digest
-    first_out = store.read_chunk(**request, offset=0, limit=8192)
-    assert base64.b64decode(first_out["data_base64"], validate=True) == content[:8192]
-    assert store.close(**request) is True
     with pytest.raises(DeviceFileTransferError):
-        store.read_chunk(**request, offset=0)
+        store.open_staged_read(**request)
+    assert store.device_file_download_ticket(**request)["sha256"] == digest
+    assert store.close(**request) is True
 
 
 def test_local_large_file_is_stream_staged_with_source_identity_and_chunk_hash(tmp_path):
@@ -85,11 +89,48 @@ def test_local_large_file_is_stream_staged_with_source_identity_and_chunk_hash(t
     staged = store.stage_local_file(transfer_id=ticket["transfer_id"], device_id="local",
         connection_generation=1, executor_generation=1, source_path=source)
     assert staged["state"] == "ready" and staged["bytes"] == len(content)
-    chunk = store.read_chunk(transfer_id=ticket["transfer_id"], device_id="local",
-        connection_generation=1, executor_generation=1, offset=0, limit=8192)
-    raw = base64.b64decode(chunk["data_base64"], validate=True)
-    assert raw == content[:8192]
-    assert chunk["chunk_sha256"] == hashlib.sha256(raw).hexdigest()
+    request = dict(transfer_id=ticket["transfer_id"], device_id="local",
+                   connection_generation=1, executor_generation=1)
+    handle, size = store.open_staged_read(**request)
+    try:
+        assert size == len(content) and handle.read() == content
+    finally:
+        store.finish_staged_read(handle, **request)
+    assert source.read_bytes() == content
+
+
+def test_cancelled_binary_response_releases_staged_handle_and_ticket(tmp_path):
+    from voice_terminal.server.dsh_attachment_transport import FILE_READ_SIZE, StagedAttachmentResponse
+
+    async def scenario():
+        store = DeviceFileTransferStore(tmp_path / "data")
+        source = tmp_path / "source.bin"
+        data = b"\x89PNG\x00\xff" * FILE_READ_SIZE
+        source.write_bytes(data)
+        key = dict(transfer_id="d" * 32, device_id="local", connection_generation=1, executor_generation=1)
+        store.prepare_local_upload(**key, expected_bytes=len(data))
+        store.stage_local_file(**key, source_path=source)
+        handle, size = store.open_staged_read(**key)
+        response = StagedAttachmentResponse(handle, size, is_current=lambda: True,
+                                            release=lambda: store.finish_staged_read(handle, **key))
+        first_block = asyncio.Event()
+
+        async def receive():
+            await first_block.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message.get("body"):
+                assert message["body"] == data[:FILE_READ_SIZE]
+                first_block.set()
+                await asyncio.Future()  # 模拟发送首块时客户端断开。
+
+        await asyncio.wait_for(response({"type": "http", "asgi": {"spec_version": "2.0"}}, receive, send), 2)
+        assert handle.closed and not list(store.root.iterdir())
+        with pytest.raises(DeviceFileTransferError):
+            store.open_staged_read(**key)
+
+    asyncio.run(scenario())
 
 
 def test_local_attachment_commit_is_atomic_non_overwriting_and_idempotent(tmp_path):

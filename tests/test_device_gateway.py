@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
 
+import httpx
+
+from voice_terminal.devices.file_transfer import DeviceFileTransferStore
+from voice_terminal.devices.registry import DeviceRegistry
 from voice_terminal.server.http_api import (
     LoopbackDeviceGatewayGuard, _device_gateway_challenge_payload, _device_gateway_payload,
-    _device_media_open_payload, _device_media_clock_response,
+    _device_media_open_payload, _device_media_clock_response, create_app,
 )
 
 
@@ -97,6 +104,45 @@ def test_main_application_port_keeps_existing_http_routes() -> None:
 
     asyncio.run(invoke())
     assert calls == ["/api/v1/product/snapshot"]
+
+
+def test_file_gateway_accepts_raw_upload_chunks_on_the_original_ticket(tmp_path):
+    async def scenario():
+        registry = DeviceRegistry()
+        connection = registry.connect("client-a", capabilities=("file_transfer",))
+        store = DeviceFileTransferStore(tmp_path)
+        app = create_app(SimpleNamespace(device_registry=registry, device_file_transfer_store=store))
+        raw = bytes(range(256)) * 256
+        sha256 = hashlib.sha256(raw).hexdigest()
+        ticket = {
+            "transfer_id": "a" * 32, "device_id": connection.device_id,
+            "connection_generation": connection.connection_generation,
+            "executor_generation": connection.executor_generation,
+        }
+        store.prepare_screen_upload(**ticket)
+        channel = store.open_device_file_channel(**ticket, operation="file.sftp.upload", maximum_bytes=len(raw))
+        identity = {**ticket, "channel_token": channel["channel_token"]}
+        metadata = {"protocol_version": 1, "action": "upload_chunk", **identity,
+                    "offset": 0, "chunk_sha256": sha256}
+        metadata["fields"] = dict.fromkeys(metadata, "文件上传分块元数据")
+        packed = json.dumps(metadata).encode("utf-8")
+        framed = len(packed).to_bytes(4, "big") + packed + raw
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18765") as client:
+            headers = {"content-type": "application/octet-stream"}
+            url = "/v1/file-transfer"
+            response = await client.post(url, content=framed[:-1] + b"\x00", headers=headers)
+            assert response.status_code == 409
+            response = await client.post(url, content=framed, headers=headers)
+            assert response.status_code == 200
+            assert response.json()["transfer"]["next_offset"] == len(raw)
+            response = await client.post(url, content=framed, headers=headers)
+            assert response.status_code == 200
+        store.finish_device_channel_upload(**identity, expected_bytes=len(raw), expected_sha256=sha256)
+        assert store.consume_screen_upload(**ticket, expected_bytes=len(raw), expected_sha256=sha256) == raw
+        assert not list(store.root.iterdir())
+
+    asyncio.run(scenario())
 
 
 def test_gateway_listener_allows_only_registered_websockets():

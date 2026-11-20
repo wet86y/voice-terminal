@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
+import { AttachmentBody } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/shared/attachment-transport.js'
 import { installDeviceTools } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/device-control/tools.js'
 
 const snapshot = { windowId: 10, processId: 20, executablePath: 'C:\\app.exe', title: 'App',
   className: 'Window', rect: { x: 0, y: 0, width: 800, height: 600 }, foreground: true,
   treeHash: 'tree-1', shotHash: 'pixels-1', elementCount: 0 }
 
-function fixture(approvalResult = 'allowed-once', loseReceiptFor = '', refreshedSnapshot = snapshot) {
+function fixture(approvalResult = 'allowed-once', loseReceiptFor = '', refreshedSnapshot = snapshot, corruptRead = false) {
   const tools = new Map(), calls = [], approvals = []
-  const remoteBytes = Buffer.alloc(128 * 1024 + 7, 0x5a)
+  const remoteBytes = Buffer.alloc(3 * 1024 * 1024 + 7, 0x5a)
   const sourceFiles = new Map()
   let uploadedBytes = Buffer.alloc(0)
   let streamedSaves = 0
@@ -54,13 +55,6 @@ function fixture(approvalResult = 'allowed-once', loseReceiptFor = '', refreshed
         operation: `file.${payload.action}`, status: payload.action === 'write' ? 'receiving' : 'succeeded', result: taskResult } }
     }
     if (path.endsWith('/device.file.transfer')) {
-      if (payload.action === 'read_chunk') {
-        const chunk = remoteBytes.subarray(payload.offset, payload.offset + payload.limit)
-        return { result: 'accepted', transfer: { transfer_id: payload.transfer_id, offset: payload.offset,
-          bytes: chunk.length, total_bytes: remoteBytes.length,
-          sha256: createHash('sha256').update(remoteBytes).digest('hex'),
-          chunk_sha256: createHash('sha256').update(chunk).digest('hex'), data_base64: chunk.toString('base64') } }
-      }
       if (payload.action === 'upload_chunk') {
         if (payload.offset !== uploadedBytes.length) throw new Error('unexpected upload offset')
         uploadedBytes = Buffer.concat([uploadedBytes, Buffer.from(payload.data_base64, 'base64')])
@@ -98,7 +92,23 @@ function fixture(approvalResult = 'allowed-once', loseReceiptFor = '', refreshed
   binding.attachments = attachments
   const context = { tools: { register(tool) { tools.set(tool.name, tool) } },
     get(name) { return name === 'approval' ? approval : undefined } }
-  installDeviceTools(context, binding, callback)
+  const receiveAttachment = async (path, payload, consume, signal) => {
+    calls.push({ path, payload, signal })
+    assert.equal(payload.action, 'read_stream')
+    let offset = 0
+    const body = new AttachmentBody(new ReadableStream({
+      pull(controller) {
+        const size = Math.min(113 * 1024, remoteBytes.length - offset)
+        if (!size) { controller.close(); return }
+        const chunk = Buffer.from(remoteBytes.subarray(offset, offset + size))
+        if (corruptRead && offset === 0) chunk[0] = 0
+        controller.enqueue(chunk)
+        offset += size
+      }
+    }).getReader())
+    try { return await consume(body, signal) } finally { await body.close() }
+  }
+  installDeviceTools(context, binding, callback, receiveAttachment)
   const exec = { agent, callId: 'call-1', signal: new AbortController().signal }
   return { tools, calls, approvals, exec, sourceFiles, remoteBytes, get uploadedBytes() { return uploadedBytes },
     get streamedSaves() { return streamedSaves } }
@@ -220,18 +230,23 @@ test('拒绝设备文件授权时不向设备派发读取请求', async () => {
   assert.equal(f.calls.filter(item => item.path.endsWith('/device.file')).length, 0)
 })
 
-test('设备大文件读取通过有界分块进入 DSH 流式附件并校验全文件摘要', async () => {
+test('设备文件只发一次内容请求，以二进制流入库并校验全文件摘要', async () => {
   const f = fixture()
   const read = await f.tools.get('device_file').execute({ action: 'read', device_id: 'remote',
-    path: 'D:\\approved\\large.bin', max_bytes: 256 * 1024 }, f.exec)
+    path: 'D:\\approved\\large.bin', max_bytes: 4 * 1024 * 1024 }, f.exec)
   assert.equal(read.presentation, 'file')
   assert.equal(read.bytes, f.remoteBytes.length)
   assert.equal(read.sha256, createHash('sha256').update(f.remoteBytes).digest('hex'))
   assert.equal(f.streamedSaves, 1)
-  const parts = f.calls.filter(item => item.path.endsWith('/device.file.transfer') && item.payload.action === 'read_chunk')
-  assert.equal(parts.length, 3)
-  assert.deepEqual(parts.map(item => item.payload.offset), [0, 64 * 1024, 128 * 1024])
-  assert.equal(f.calls.filter(item => item.path.endsWith('/device.file.transfer') && item.payload.action === 'close').length, 1)
+  const parts = f.calls.filter(item => item.path.endsWith('/device.file.transfer'))
+  assert.deepEqual(parts.map(item => item.payload.action), ['read_stream'])
+  assert.equal(parts[0].payload.transfer_id, 'e'.repeat(32))
+})
+
+test('设备文件流长度正常但内容改变时拒绝完成入库', async () => {
+  const f = fixture('allowed-once', '', snapshot, true)
+  await assert.rejects(f.tools.get('device_file').execute({ action: 'read', device_id: 'remote',
+    path: 'D:\\approved\\large.bin', max_bytes: 4 * 1024 * 1024 }, f.exec), /摘要不匹配/)
 })
 
 test('设备文件写入只接受已登记附件、一次性审批并按序传送摘要匹配的分块', async () => {

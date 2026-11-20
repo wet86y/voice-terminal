@@ -4,7 +4,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { restoreVoiceContextFrames } from './image-history.js'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '../shared/services.js'
-import { bindingCallback } from './callbacks.js'
+import { bindingAttachment, bindingCallback } from './callbacks.js'
 /** HTTP component（本机接口组件）：现有 Bridge 2.0 路由与会话操作。 */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BRIDGE_PROTOCOL_VERSION, json, result, authorized, readBody, digest, assertEnvelope } from '../shared/protocol.js'
@@ -69,8 +69,9 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
             await ctx.agentPresets.mount(agentCtx, preset.id)
             installRootTools(agentCtx, binding)
             installScreenCaptureTool(agentCtx, binding)
-            ctx.deviceControl.installAgentTools(agentCtx, binding, (callbackPath, payload, signal) =>
-              bindingCallback(binding, callbackPath, payload, signal))
+            ctx.deviceControl.installAgentTools(agentCtx, binding,
+              (callbackPath, payload, signal) => bindingCallback(binding, callbackPath, payload, signal),
+              (callbackPath, payload, consume, signal) => bindingAttachment(binding, callbackPath, payload, consume, signal))
             installImageCapabilityGuard(agentCtx, binding)
           }
           let handle: AgentHandle

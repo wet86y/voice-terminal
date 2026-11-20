@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 const props = withDefaults(defineProps<{
   src?: string // src（参考音频播放地址）。
@@ -8,18 +8,18 @@ const props = withDefaults(defineProps<{
   busy: boolean // busy（音色任务正在执行）。
   transcribing: boolean // transcribing（正在识别校对文本）。
   active: boolean // active（当前附件拥有播放焦点）。
-  loadable?: boolean // loadable（允许点击后从服务端按需读取音频）。
-  loading?: boolean // loading（服务端音频正在读取）。
+  remotePlayable?: boolean // remotePlayable（可通过当前交互设备播放）。
+  remotePlaying?: boolean // remotePlaying（远程试听任务可停止）。
   compact?: boolean // compact（仅显示试听按钮的紧凑模式）。
   removable?: boolean // removable（是否显示移除参考音频按钮）。
   transcribable?: boolean // transcribable（是否显示转写校对按钮）。
-}>(), { loadable: false, loading: false, compact: false, removable: true, transcribable: true })
-const emit = defineEmits<{ play: []; transcribe: []; remove: []; error: [message: string] }>()
+}>(), { remotePlayable: false, remotePlaying: false, compact: false, removable: true, transcribable: true })
+const emit = defineEmits<{ play: []; stop: []; transcribe: []; remove: []; error: [message: string] }>()
 const audio = ref<HTMLAudioElement>() // audio（原生音频播放器）。
 const playing = ref(false) // playing（实际播放状态）。
 const currentTime = ref(0) // currentTime（当前播放秒数）。
 const mediaDuration = ref(0) // mediaDuration（播放器读取的实际秒数）。
-const pendingLoadPlayback = ref(false) // pendingLoadPlayback（等待服务端音频读回后继续本次播放）。
+const playbackLabel = computed(() => props.remotePlaying ? '停止参考音频' : playing.value ? '暂停参考音频' : '播放参考音频')
 const duration = computed(() => mediaDuration.value || props.durationMs / 1000)
 const progress = computed(() => duration.value ? Math.min(100, currentTime.value / duration.value * 100) : 0)
 function timeLabel(seconds: number) {
@@ -35,13 +35,9 @@ async function playLoadedAudio() {
 }
 async function togglePlayback() {
   const player = audio.value
-  if (!player || !props.src) {
-    if (props.loadable && !props.loading) {
-      pendingLoadPlayback.value = true
-      emit('play')
-    }
-    return
-  }
+  if (props.remotePlaying) { emit('stop'); return }
+  if (props.remotePlayable) { emit('play'); return }
+  if (!player || !props.src) return
   if (playing.value) { pause(); return }
   emit('play')
   await playLoadedAudio()
@@ -56,35 +52,21 @@ function seek(event: Event) {
   audio.value.currentTime = Number((event.target as HTMLInputElement).value)
   updateTime()
 }
-watch(() => props.active, active => { if (!active) { pause(); pendingLoadPlayback.value = false } })
-watch(() => props.src, async (src, previous) => {
-  pause(); currentTime.value = 0; mediaDuration.value = 0
-  if (!src) { pendingLoadPlayback.value = false; return }
-  const resumeAfterLoad = pendingLoadPlayback.value && src !== previous
-  if (resumeAfterLoad) {
-    pendingLoadPlayback.value = false
-    await nextTick()
-    await playLoadedAudio()
-  }
-})
-watch(() => props.loading, async (loading, wasLoading) => {
-  if (!wasLoading || loading) return
-  await nextTick()
-  if (!props.src) pendingLoadPlayback.value = false
-})
+watch(() => props.active, active => { if (!active) pause() })
+watch(() => props.src, () => { pause(); currentTime.value = 0; mediaDuration.value = 0 })
 onBeforeUnmount(pause)
 </script>
 
 <template>
-  <div class="audio-attachment" :class="{ compact }" role="group" aria-label="参考音频播放器" :aria-busy="loading">
+  <div class="audio-attachment" :class="{ compact }" role="group" aria-label="参考音频播放器">
     <audio v-if="src" ref="audio" :src="src" preload="metadata" @loadedmetadata="loaded" @durationchange="loaded" @timeupdate="updateTime" @play="playing = true" @pause="playing = false" @ended="playing = false" @error="playing = false; emit('error', '参考音频加载失败，请重试或重新上传。')"></audio>
-    <button type="button" class="audio-play" :aria-label="loading ? '正在加载参考音频' : playing ? '暂停参考音频' : '播放参考音频'" :title="loading ? '正在从服务端读取音频' : playing ? '暂停参考音频' : '播放参考音频'" :disabled="(!src && !loadable) || loading" @click="togglePlayback">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="playing" d="M8 5v14M16 5v14" /><path v-else d="m9 5 10 7-10 7Z" /></svg>
+    <button type="button" class="audio-play" :aria-label="playbackLabel" :title="playbackLabel" :disabled="!src && !remotePlayable && !remotePlaying" @click="togglePlayback">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="remotePlaying" d="M6 6h12v12H6z" /><path v-else-if="playing" d="M8 5v14M16 5v14" /><path v-else d="m9 5 10 7-10 7Z" /></svg>
     </button>
     <div v-if="!compact" class="audio-details">
       <div class="audio-summary"><strong :title="filename">{{ filename }}</strong><button v-if="transcribable" type="button" class="transcribe-action" :disabled="busy" @click="emit('transcribe')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12v9H9l-4 3v-3H4ZM7 7h6M7 10h4" /></svg>{{ transcribing ? '正在识别…' : '开始校对文本' }}</button></div>
-      <div class="audio-timeline"><input type="range" aria-label="参考音频播放进度" min="0" :max="duration || 1" step="0.01" :value="currentTime" :disabled="!src || !duration" :style="{ '--audio-progress': `${progress}%` }" :aria-valuetext="`${timeLabel(currentTime)} / ${timeLabel(duration)}`" @input="seek"><small>{{ timeLabel(currentTime) }} / {{ timeLabel(duration) }}</small></div>
-      <small v-if="loading" class="audio-loading" role="status">正在从服务端读取音频…</small>
+      <div v-if="src" class="audio-timeline"><input type="range" aria-label="参考音频播放进度" min="0" :max="duration || 1" step="0.01" :value="currentTime" :disabled="!duration" :style="{ '--audio-progress': `${progress}%` }" :aria-valuetext="`${timeLabel(currentTime)} / ${timeLabel(duration)}`" @input="seek"><small>{{ timeLabel(currentTime) }} / {{ timeLabel(duration) }}</small></div>
+      <div v-else-if="duration" class="audio-timeline"><small>时长 {{ timeLabel(duration) }}</small></div>
     </div>
     <button v-if="removable && !compact" type="button" class="audio-remove" aria-label="移除参考音频" title="移除参考音频" :disabled="busy" @click="emit('remove')"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
   </div>

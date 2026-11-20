@@ -233,7 +233,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self.bus = EventBus(self._observe_device_state)
         self.history = SessionLedger(limit=10)
         self.history.screen_capture = ScreenCaptureRouter(
-            self.history.screen_capture, self.device_registry, self.device_router,
+            self.history.screen_capture, self.device_registry, self.device_router, self.device_file_transfer_store,
         )
         self._conversation_tasks: set[asyncio.Task] = set()
         # The conversation log is written from synchronous commit paths, so the
@@ -515,12 +515,13 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         return connection
 
     async def poll_remote_device_task(self, device_id: str, connection_generation: int,
-                                      executor_generation: int, wait_ms: int = 1000) -> RemoteDeviceTask | None:
+                                      executor_generation: int, wait_ms: int = 1000,
+                                      *, lane: str | None = None) -> RemoteDeviceTask | None:
         """poll_remote_device_task（客户端拉取任务）：固定当前连接和执行器代次。"""
         if self.device_remote_sessions is None:
             raise RuntimeError("远端设备任务通道不可用。")
         return await self.device_remote_sessions.poll(
-            device_id, connection_generation, executor_generation, wait_ms,
+            device_id, connection_generation, executor_generation, wait_ms, lane=lane,
         )
 
     async def heartbeat_remote_device_session(self, device_id: str, connection_generation: int,
@@ -978,7 +979,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
     def remote_playback_buffered_ms(self, playback_key: str) -> int:
         """remote_playback_buffered_ms（合并网络与端点储备）：网络未接纳帧加设备缓冲。"""
         binding = self._remote_playback_bindings.get(playback_key)
-        if binding is None:
+        if binding is None or binding[1].closed:
             return 0
         network_ms = binding[1].pending_ms_for_key(playback_key)
         snapshot = self._remote_client_tts_progress.get(playback_key) or self._remote_playback_progress.get(playback_key)

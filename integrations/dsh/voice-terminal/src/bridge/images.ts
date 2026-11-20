@@ -1,11 +1,12 @@
 /** Images（图片上下文）：程序加载并收纳附件，模型无需再次调用读图工具。 */
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { Json } from '../shared/protocol.js'
 import { digest } from '../shared/protocol.js'
 import { record } from '../shared/json-record.js'
-import { bindingCallback } from './callbacks.js'
+import { bindingAttachment } from './callbacks.js'
+import type { AttachmentBody } from '../shared/attachment-transport.js'
 import type { Binding } from './contracts.js'
 import type { Context } from '../shared/services.js'
 import { LlmError, IMAGE_OFFLOAD_REQUIRED_CODE } from '@deepseek-ai/dsh-llm'
@@ -93,30 +94,36 @@ export async function prepareContextImages(binding: Binding, frames: Json[]): Pr
         binding.imageAttachments.set(aid, sameBytes)
         continue
       }
-      if (!binding.attachments) throw new Error('DSH 图片附件服务未挂载')
-      const reply = await bindingCallback(binding, '/api/internal/dsh-bridge/attachment.read', {
+      const attachments = binding.attachments
+      if (!attachments) throw new Error('DSH 图片附件服务未挂载')
+      const size = part.bytes
+      if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 1
+        || size > attachments.imageLimits.maxImageBytes) throw new Error('共享图片附件长度无效')
+      const ref = await bindingAttachment(binding, '/api/internal/dsh-bridge/attachment.read', {
         request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
         dsh_session_id: binding.dshSessionId, epoch, attachment_id: aid,
+      }, async (body, signal) => {
+        const bytes = await body.readVerifiedBytes(size, hash)
+        await body.expectEnd()
+        signal?.throwIfAborted()
+        const refs = await attachments.saveImages([{ data: bytes, mediaType: String(part.mime_type) as ImageMediaType, name: aid }])
+        if (!refs[0]) throw new Error('图片附件收纳失败')
+        return refs[0]
       })
-      const image = record(reply.attachment)
-      if (reply.result !== 'accepted' || image.sha256 !== hash || image.mime_type !== part.mime_type || typeof image.base64 !== 'string') throw new Error('图片附件读取失败')
-      const bytes = Buffer.from(image.base64, 'base64')
-      if (bytes.length !== part.bytes || createHash('sha256').update(bytes).digest('hex') !== hash) throw new Error('图片附件字节校验失败')
-      const refs = await binding.attachments.saveImages([{ data: bytes, mediaType: String(part.mime_type) as ImageMediaType, name: aid }])
       if (binding.state === 'retired' || binding.epoch !== epoch || binding.callbacks?.signal.aborted) throw new Error('图片所属会话已失效')
-      if (!refs[0]) throw new Error('图片附件收纳失败')
-      binding.imageAttachments.set(aid, { hash, ref: refs[0] })
+      binding.imageAttachments.set(aid, { hash, ref })
     }
   }
 }
 
 /**
- * prepareDirectScreenCapture（直接截图收纳）：校验服务端编码后写入 DSH 原生附件库。
+ * prepareDirectScreenCapture（直接截图收纳）：读取清单与两张原图后写入 DSH 原生附件库。
  * 不进入 Voice（语音）共享历史；调用结果只归属当前 DSH 工具消息。
  */
 export async function prepareDirectScreenCapture(
-  binding: Binding, capture: Record<string, Json>,
+  binding: Binding, body: AttachmentBody, signal?: AbortSignal,
 ): Promise<{ frame: Json; facts: Record<string, Json> }> {
+  const capture = record(await body.readManifest())
   const captureId = capture.capture_id
   if (typeof captureId !== 'string' || !/^[a-f0-9]{32}$/u.test(captureId)) throw new Error('屏幕捕获标识无效')
   if (!Array.isArray(capture.attachments) || capture.attachments.length !== 2) throw new Error('屏幕捕获必须包含全局图与局部图')
@@ -124,14 +131,13 @@ export async function prepareDirectScreenCapture(
   const limits = binding.attachments.imageLimits
   if (limits.maxImagesPerMessage < 2) throw new Error('DSH 附件库不允许在一条工具结果中保存全局图与局部图')
 
-  const parsed = capture.attachments.map((raw: Json) => {
+  const parsed = capture.attachments.map(raw => {
     const image = record(raw)
     const attachmentId = image.attachment_id
     const role = image.role
     const declaredMimeType = image.mime_type
     const bytes = image.bytes
     const hash = image.sha256
-    const base64 = image.base64
     const width = image.width
     const height = image.height
     if (typeof attachmentId !== 'string' || attachmentId !== `${captureId}-${role}`
@@ -141,19 +147,15 @@ export async function prepareDirectScreenCapture(
       throw new Error('屏幕图片媒体类型与图片用途不匹配')
     }
     if (!limits.mediaTypes.includes(mimeType)) throw new Error('DSH 附件库不接受此屏幕图片媒体类型')
-    if (!Number.isSafeInteger(bytes) || Number(bytes) < 1 || Number(bytes) > limits.maxImageBytes
-      || !Number.isSafeInteger(width) || Number(width) < 1 || Number(width) > limits.maxImageDimension
-      || !Number.isSafeInteger(height) || Number(height) < 1 || Number(height) > limits.maxImageDimension
-      || Number(width) * Number(height) > limits.maxImagePixels) {
+    if (typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes < 1 || bytes > limits.maxImageBytes
+      || typeof width !== 'number' || !Number.isSafeInteger(width) || width < 1 || width > limits.maxImageDimension
+      || typeof height !== 'number' || !Number.isSafeInteger(height) || height < 1 || height > limits.maxImageDimension
+      || width * height > limits.maxImagePixels) {
       throw new Error('屏幕图片尺寸或字节数无效')
     }
-    if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/u.test(hash) || typeof base64 !== 'string'
-      || base64.length !== Math.ceil(Number(bytes) / 3) * 4) throw new Error('屏幕图片摘要或编码无效')
-    const data = Buffer.from(base64, 'base64')
-    if (data.length !== Number(bytes) || data.toString('base64') !== base64
-      || createHash('sha256').update(data).digest('hex') !== hash) throw new Error('屏幕图片字节校验失败')
-    return { attachmentId, role, mimeType, bytes: Number(bytes), hash, data, width: Number(width), height: Number(height) }
-  }).sort((left, right) => left.role.localeCompare(right.role))
+    if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/u.test(hash)) throw new Error('屏幕图片摘要无效')
+    return { attachmentId, role, mimeType, bytes, hash, width, height }
+  })
   const [globalImage, localImage] = parsed
   if (!globalImage || !localImage || globalImage.role !== 'global' || localImage.role !== 'local') {
     throw new Error('屏幕捕获图片顺序无效')
@@ -162,12 +164,19 @@ export async function prepareDirectScreenCapture(
     throw new Error('屏幕双图超过 DSH 附件库的整批字节数上限')
   }
 
+  const images = []
+  for (const image of parsed) {
+    const data = await body.readVerifiedBytes(image.bytes, image.hash)
+    images.push({ ...image, data })
+  }
+  await body.expectEnd()
+  signal?.throwIfAborted()
   const stored = binding.imageAttachments ??= new Map()
   for (const image of parsed) {
     const existing = stored.get(image.attachmentId)
     if (existing && existing.hash !== image.hash) throw new Error('屏幕图片附件摘要冲突')
   }
-  const uniqueMissing = parsed.filter(image => !stored.has(image.attachmentId)
+  const uniqueMissing = images.filter(image => !stored.has(image.attachmentId)
     && ![...stored.values()].some(item => item.hash === image.hash))
   const references = uniqueMissing.length
     ? await binding.attachments.saveImages(uniqueMissing.map(image => ({

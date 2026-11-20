@@ -188,6 +188,10 @@ async def main() -> None:
             connection = test_case.runtime.device_registry.connection(device_id)
             if connection is None or not connection.connected:
                 raise HTTPException(status_code=409, detail="Rust SSH 设备会话尚未注册。")
+            state["screen_task"] = asyncio.create_task(router.execute(
+                request_id="screen-while-stopping", device_id=device_id, operation="screen.capture_file",
+                arguments={}, timeout_seconds=15,
+            ))
             state["stop_task"] = asyncio.create_task(
                 RemotePlaybackTransactions(router, device_id, timeout_seconds=15)
                 .stop_and_snapshot_confirmed("speech-playback-e2e")

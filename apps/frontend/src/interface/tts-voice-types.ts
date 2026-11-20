@@ -61,16 +61,6 @@ export interface ProductTtsVoice {
 }
 /** ProductTtsAsset（音频附件）：标识与毫秒时长。 */
 export interface ProductTtsAsset { asset_id: string; duration_ms: number }
-/** RemoteTtsAssetAudio（远程音频字节）：由桌面原生通道读取并限长校验。 */
-export interface RemoteTtsAssetAudio {
-  data_base64: string // data_base64（标准 Base64 音频字节）。
-  media_type: string // media_type（受允许音频格式限制的媒体类型）。
-  bytes: number // bytes（解码后的原始字节数，上限 1 MiB）。
-  sha256: string // sha256（原始音频的小写 SHA-256）。
-  fields: Record<string, string> // fields（字段中文说明）。
-}
-/** RemoteTtsAssetAudioPort（远程音频读取端口）：按服务端资产编号读取，不传路径。 */
-export type RemoteTtsAssetAudioPort = (model: ProductLocalTtsModelId, assetId: string) => Promise<RemoteTtsAssetAudio>
 /** RemoteTtsAssetImportCancelled（取消远程参考音频导入）：客户端文件选择器取消，不产生服务端票据或文件传输。 */
 export interface RemoteTtsAssetImportCancelled { cancelled: true; fields: Record<string, string> }
 /** RemoteTtsAssetImportPort（远程参考音频导入端口）：供正式产品注入，展示组件不依赖产品业务模块。 */

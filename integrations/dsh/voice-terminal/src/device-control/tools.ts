@@ -7,7 +7,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { AttachmentId, type FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { Context } from '../shared/services.js'
 import type { Json } from '../shared/protocol.js'
-import type { DeviceToolBinding, DeviceToolCallback } from './types.js'
+import type { DeviceAttachmentCallback, DeviceToolBinding, DeviceToolCallback } from './types.js'
 import { DeviceActionError, DeviceActionExecutor, type DeviceActionBackend, type WindowAction, type WindowActionName } from './executor.js'
 import { ObservationStore, type ObservationRecord } from './observe.js'
 import type { DeviceTarget, WindowSnapshot } from './types.js'
@@ -282,7 +282,8 @@ function helperAction(action: WindowAction, windowId: number): { operation: stri
 }
 
 /** installDeviceTools（登记设备工具）：只对已绑定根代理提供设备清单、观察和经审批动作。 */
-export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding, callback: DeviceToolCallback): void {
+export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding, callback: DeviceToolCallback,
+  receiveAttachment: DeviceAttachmentCallback): void {
   const observations = new ObservationStore(OBSERVATION_CONFIG)
   const targets = new Map<string, DeviceTarget>()
   const ensure = (exec: ToolRunContext): string => {
@@ -292,14 +293,18 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
     }
     return binding.activationId
   }
-  const post = async (path: string, exec: ToolRunContext, activationId: string,
-    values: Record<string, Json>, requestId: string = randomUUID(), signal = exec.signal): Promise<Record<string, Json>> => {
+  const callbackValues = async (exec: ToolRunContext, activationId: string,
+    values: Record<string, Json>, requestId: string): Promise<Record<string, Json>> => {
     await binding.activationReady
     if (ensure(exec) !== activationId) throw new Error('设备操作所属激活已更换。')
-    const result = await callback(path, {
+    return {
       request_id: requestId, voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
       epoch: binding.epoch, context_revision: binding.revision, activation_id: activationId, ...values,
-    }, signal)
+    }
+  }
+  const post = async (path: string, exec: ToolRunContext, activationId: string,
+    values: Record<string, Json>, requestId: string = randomUUID(), signal = exec.signal): Promise<Record<string, Json>> => {
+    const result = await callback(path, await callbackValues(exec, activationId, values, requestId), signal)
     if (ensure(exec) !== activationId) throw new Error('设备操作返回时激活已失效。')
     return result
   }
@@ -720,63 +725,29 @@ export function installDeviceTools(agentCtx: Context, binding: DeviceToolBinding
           || typeof data.executor_generation !== 'number' || !Number.isSafeInteger(data.executor_generation)) {
           throw new Error('设备大文件读取票据格式无效。')
         }
-        if (!binding.attachments) throw new Error('DSH 原生文件附件服务未挂载。')
-        const transferCall = (offset: number, signal: AbortSignal = exec.signal) => post(
-          '/api/internal/dsh-bridge/device.file.transfer', exec, activationId, {
-            device_id: row.device_id as string, connection_generation: data.connection_generation as number,
-            executor_generation: data.executor_generation as number, parent_request_id: requestId,
-            transfer_id: data.transfer_id as string, action: 'read_chunk', offset, limit: 64 * 1024,
-          }, `${requestId.slice(0, 80)}:read:${offset}:${createHash('sha256').update(requestId).digest('hex').slice(0, 8)}`, signal)
-        let keepTicket = false
-        try {
-          const stream = async function* (): AsyncIterable<Uint8Array> {
-            const digest = createHash('sha256')
-            let offset = 0
-            while (offset < (data.bytes as number)) {
-              const response = await transferCall(offset)
-              const chunk = asObject(response.transfer)
-              if (!chunk || chunk.transfer_id !== data.transfer_id || chunk.offset !== offset
-                || chunk.total_bytes !== data.bytes || chunk.sha256 !== data.sha256
-                || typeof chunk.data_base64 !== 'string' || typeof chunk.bytes !== 'number'
-                || !Number.isSafeInteger(chunk.bytes) || chunk.bytes < 1 || chunk.bytes > 64 * 1024
-                || typeof chunk.chunk_sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(chunk.chunk_sha256)) {
-                throw new Error('设备文件读取分块收据字段或偏移无效。')
-              }
-              const bytes = Buffer.from(chunk.data_base64, 'base64')
-              if (bytes.toString('base64') !== chunk.data_base64 || bytes.length !== chunk.bytes
-                || createHash('sha256').update(bytes).digest('hex') !== chunk.chunk_sha256) {
-                throw new Error('设备文件读取分块编码、长度或摘要无效。')
-              }
-              digest.update(bytes)
-              offset += bytes.length
-              if (offset > (data.bytes as number)) throw new Error('设备文件读取分块超过完整长度。')
-              yield new Uint8Array(bytes)
-            }
-            if (offset !== data.bytes || digest.digest('hex') !== data.sha256) {
-              throw new Error('设备文件流完整长度或 SHA-256 摘要不匹配。')
-            }
-          }
-          const file = await binding.attachments.saveFileStream({ data: stream(), signal: exec.signal, name: data.name })
-          const expectedAttachmentId = `sha256:${data.sha256}`
-          if (file.attachmentId !== expectedAttachmentId || file.bytes !== data.bytes) {
-            throw new Error('DSH 附件服务返回的内容标识与设备文件摘要不匹配。')
-          }
-          return { result: 'accepted', action, device_id: row.device_id, path: sanitizePath(data.path, 240),
-            presentation: 'file', attachment: { attachmentId: file.attachmentId, name: file.name, bytes: file.bytes },
-            bytes: data.bytes as number, sha256: data.sha256,
-            fields: { action: '设备文件操作名称', device_id: '固定执行设备编号', path: '已校验的目标文件',
-              presentation: '通过有界流式 DSH 原始文件附件服务返回', attachment: '按完整长度和摘要验证的文件附件引用',
-              bytes: '原始文件字节数', sha256: '原始字节 SHA-256 摘要' } }
-        } finally {
-          if (!keepTicket) {
-            await post('/api/internal/dsh-bridge/device.file.transfer', exec, activationId, {
-              device_id: row.device_id, connection_generation: data.connection_generation as number,
-              executor_generation: data.executor_generation as number, parent_request_id: requestId,
-              transfer_id: data.transfer_id as string, action: 'close',
-            }, `${requestId.slice(0, 80)}:read-close:${createHash('sha256').update(requestId).digest('hex').slice(0, 8)}`,
-              new AbortController().signal).catch(() => undefined)
-          }
+        const attachments = binding.attachments
+        if (!attachments) throw new Error('DSH 原生文件附件服务未挂载。')
+        const { bytes, sha256, name } = data
+        const payload = await callbackValues(exec, activationId, {
+          device_id: row.device_id, connection_generation: data.connection_generation,
+          executor_generation: data.executor_generation, parent_request_id: requestId,
+          transfer_id: data.transfer_id, action: 'read_stream',
+        }, randomUUID())
+        const file = await receiveAttachment('/api/internal/dsh-bridge/device.file.transfer', payload,
+          async (body, signal) => {
+            if (ensure(exec) !== activationId) throw new Error('设备文件读取所属激活已失效。')
+            return attachments.saveFileStream({ data: body.verifiedStream(bytes, sha256), signal: signal ?? exec.signal, name })
+          }, exec.signal)
+        if (ensure(exec) !== activationId) throw new Error('设备文件返回时激活已失效。')
+        if (file.attachmentId !== `sha256:${sha256}` || file.bytes !== bytes) {
+          throw new Error('DSH 附件服务返回的内容标识与设备文件摘要不匹配。')
         }
+        return { result: 'accepted', action, device_id: row.device_id, path: sanitizePath(data.path, 240),
+          presentation: 'file', attachment: { attachmentId: file.attachmentId, name: file.name, bytes: file.bytes },
+          bytes, sha256,
+          fields: { action: '设备文件操作名称', device_id: '固定执行设备编号', path: '已校验的目标文件',
+            presentation: '通过有界流式 DSH 原始文件附件服务返回', attachment: '按完整长度和摘要验证的文件附件引用',
+            bytes: '原始字节数', sha256: '原始字节 SHA-256 摘要' } }
       }
       if (!data || typeof data.data_base64 !== 'string' || typeof data.sha256 !== 'string'
         || !/^[0-9a-f]{64}$/u.test(data.sha256) || typeof data.bytes !== 'number' || !Number.isSafeInteger(data.bytes)

@@ -717,9 +717,9 @@ class ProductApiTests(unittest.TestCase):
         assert _remote_management_request_spec("tts.assets.import.abort", abort_args) == (
             "POST", "/internal/application/tts-assets/import/abort", abort_args,
         )
-        audio_args = {"value":{"model_id":"minimax-female-shaonv-zh","asset_id":"a" * 32}}
-        assert _remote_management_request_spec("tts.assets.audio.read", audio_args) == (
-            "POST", "/internal/application/tts-assets/audio/read", audio_args["value"],
+        play_args = {"value":{"model":"minimax-female-shaonv-zh","asset_id":"a" * 32}}
+        assert _remote_management_request_spec("tts.operation.play", play_args) == (
+            "POST", "/api/v1/tts/operations/play", play_args["value"],
         )
         approval_args = {"approval_id": "approval-1", "decision": "rejected", "run_seq": 3}
         assert _remote_management_request_spec("dsh.approval.decide", approval_args) == (
@@ -734,10 +734,6 @@ class ProductApiTests(unittest.TestCase):
         ):
             with self.subTest(invalid_approval=invalid_approval), self.assertRaisesRegex(ValueError, "DSH 权限答复"):
                 _remote_management_request_spec("dsh.approval.decide", invalid_approval)
-        with self.assertRaisesRegex(ValueError, "TTS 音频读取"):
-            _remote_management_request_spec("tts.assets.audio.read", {
-                "value":{"model_id":"minimax-female-shaonv-zh","asset_id":"a" * 32,"path":"C:/private"},
-            })
         with self.assertRaisesRegex(ValueError, "TTS 单文件导入操作字段"):
             _remote_management_request_spec("tts.assets.import.commit", {**commit_args,"path":"C:/bad"})
         assert _remote_management_request_spec("tts.aniflive.import.reference", {
@@ -1017,10 +1013,11 @@ class ProductApiTests(unittest.TestCase):
         with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": token}):
             asyncio.run(scenario())
 
-    def test_remote_tts_asset_audio_read_returns_bounded_pathless_library_bytes(self) -> None:
+    def test_remote_tts_reference_uses_current_audio_output_without_file_transfer(self) -> None:
         async def scenario():
             import hashlib
             import io
+            from types import SimpleNamespace
             import numpy as np
             import soundfile as sf
 
@@ -1030,144 +1027,97 @@ class ProductApiTests(unittest.TestCase):
             self.runtime.device_host_id = host_id
             self.runtime.device_trust_store.approve(device_id, self._ssh_public_key(private_key), trusted_at_ms=1_000)
             opened, _ = await self._signed_gateway_request(private_key, device_id, "/v1/session/open",
-                {"protocol_version":1,"capabilities":["file_transfer"]})
+                {"protocol_version": 1, "capabilities": ["audio_stream"]})
             assert opened.status_code == 200, opened.text
-            lease = opened.json()
+            connection = opened.json()
+            registry = self.runtime.device_registry
+            lease = registry.prepare_switch(device_id, registry.generation)
+            assert registry.commit_switch(lease)
+            assert "file_transfer" not in registry.connection(device_id).capabilities
+
             model_id = self.runtime.config.tts.local_model
             library = self.runtime.voice_library.for_model(model_id)
-
-            sample_rate = 16_000
-            time_axis = np.arange(sample_rate * 5, dtype=np.float32) / sample_rate
-            signal = (0.15 * np.sin(2 * np.pi * 220 * time_axis)).astype(np.float32)
-            wav = io.BytesIO()
-            sf.write(wav, signal, sample_rate, format="WAV", subtype="PCM_16")
-            imported = await asyncio.to_thread(library.put_import, wav.getvalue(), "reference.wav")
-            asset_id = imported["asset_id"]
-            imported_pcm = np.frombuffer(wav.getvalue()[44:], dtype="<i2")
-            hifi_result = await asyncio.to_thread(library.put_high_fidelity_pcm, asset_id,
-                imported_pcm.tobytes(), sample_rate=32_000)
-            high_fidelity = library.high_fidelity_path(asset_id)
-            assert high_fidelity is not None and hifi_result
-            stored_high_fidelity_digest = hashlib.sha256(high_fidelity.read_bytes()).hexdigest()
+            short_audio = io.BytesIO()
+            tone = 0.15 * np.sin(2 * np.pi * 220 * np.arange(80_000) / 16_000)
+            sf.write(short_audio, tone, 16_000, format="WAV")
+            asset_id = library.put_import(short_audio.getvalue(), "reference.wav")["asset_id"]
+            pcm = b"\x23\x01" * 600_000
+            library.put_high_fidelity_pcm(asset_id, pcm, sample_rate=48_000)
+            hifi_path = library.high_fidelity_path(asset_id)
+            assert hifi_path is not None and hifi_path.stat().st_size > 1024 * 1024
             with library._lock:
                 library._index["assets"][asset_id]["remote_import"] = {
-                    "stored_sha256": hashlib.sha256(library.asset_bytes(asset_id)).hexdigest(),
-                    "high_fidelity_sha256": stored_high_fidelity_digest,
+                    "high_fidelity_sha256": hashlib.sha256(hifi_path.read_bytes()).hexdigest(),
                 }
-            expected_audio = high_fidelity.read_bytes() if high_fidelity else library.asset_bytes(asset_id)
-            expected_media_type = "audio/wav" if high_fidelity else library.asset_media_type(asset_id)
-            assert 0 < len(expected_audio) <= 1024 * 1024
+            source_audio = io.BytesIO()
+            sf.write(source_audio, np.frombuffer(pcm, dtype="<i2"), 48_000, format="WAV")
+            source = library.put_source(source_audio.getvalue(), "long-original.wav")
+            assert source["size_bytes"] > 1024 * 1024
 
-            async def management(request_id, arguments, *, session_generation=None, expected_http_status=200):
-                payload = {"protocol_version":1,"request_id":request_id,"target_host_id":host_id,
-                    "session_generation":session_generation or lease["connection_generation"],
-                    "operation":"tts.assets.audio.read","arguments":arguments,
-                    "fields":{"protocol_version":"远程管理协议版本","request_id":"稳定操作编号",
-                        "target_host_id":"目标服务端编号","session_generation":"当前设备会话代次",
-                        "operation":"固定 TTS 音频读取操作","arguments":"model_id 与 asset_id 固定参数"}}
+            async def management(operation, arguments, *, generation=None, expected_status=200):
+                payload = {
+                    "protocol_version": 1, "request_id": os.urandom(16).hex(), "target_host_id": host_id,
+                    "session_generation": generation or connection["connection_generation"],
+                    "operation": operation, "arguments": arguments,
+                    "fields": {"protocol_version":"协议版本", "request_id":"请求编号", "target_host_id":"目标服务端",
+                        "session_generation":"设备会话代次", "operation":"音色业务操作", "arguments":"音色操作参数"},
+                }
                 response, _ = await self._signed_gateway_request(private_key, device_id, "/v1/management", payload)
-                assert response.status_code == expected_http_status, response.text
+                assert response.status_code == expected_status, response.text
                 return response.json()
 
-            response = await management("a" * 32, {"value":{"model_id":model_id,"asset_id":asset_id}})
-            assert response["status"] == 200, response["body"]
-            result = response["body"]
-            assert base64.b64decode(result["data_base64"], validate=True) == expected_audio
-            assert result["media_type"] == expected_media_type
-            assert result["bytes"] == len(expected_audio)
-            assert result["sha256"] == hashlib.sha256(expected_audio).hexdigest()
-            assert set(result["fields"]) == {"data_base64","media_type","bytes","sha256"}
-            assert "path" not in result and "staging_dir" not in result
-            assert str(self.root) not in str(result)
+            async def play(identifier):
+                response = await management("tts.operation.play", {"value": {"model": model_id, "asset_id": identifier}})
+                assert response["status"] == 202, response["body"]
+                started = response["body"]
+                assert started["kind"] == "play" and started["result"] is None
+                assert set(started) == {"operation_id", "kind", "state", "model", "result", "error", "playback_outcome"}
+                operation_id = started["operation_id"]
+                await asyncio.wait_for(self.runtime.tts_voice_operations._items[operation_id].task, 5)
+                completed = await management("tts.operation.read", {"operation_id": operation_id})
+                assert completed["status"] == 200, completed["body"]
+                return completed["body"]
 
-            # 超过 1 MiB 的高保真副本应回退为登记的规范资产字节。
-            large_hifi_import = await asyncio.to_thread(library.put_import, wav.getvalue(), "large-hifi.wav")
-            large_hifi_id = large_hifi_import["asset_id"]
-            await asyncio.to_thread(library.put_high_fidelity_pcm, large_hifi_id,
-                b"\x00\x00" * 600_000, sample_rate=48_000)
-            large_hifi_path = library.high_fidelity_path(large_hifi_id)
-            assert large_hifi_path is not None and large_hifi_path.stat().st_size > 1024 * 1024
-            canonical_audio = library.asset_bytes(large_hifi_id)
-            fallback = await management("f" * 32,
-                {"value":{"model_id":model_id,"asset_id":large_hifi_id}})
-            assert fallback["status"] == 200, fallback["body"]
-            fallback_body = fallback["body"]
-            assert base64.b64decode(fallback_body["data_base64"], validate=True) == canonical_audio
-            assert fallback_body["media_type"] == library.asset_media_type(large_hifi_id)
-            assert fallback_body["bytes"] == len(canonical_audio) <= 1024 * 1024
-            assert fallback_body["sha256"] == hashlib.sha256(canonical_audio).hexdigest()
+            async def enqueue(key, samples):
+                assert await self.runtime._enqueue_player_audio(key, 48_000, samples)
 
-            # 被登记的导入高保真摘要与当前副本不一致时，预览必须拒绝回传。
-            corrupt_import = await asyncio.to_thread(library.put_import, wav.getvalue(), "corrupt-hifi.wav")
-            corrupt_id = corrupt_import["asset_id"]
-            await asyncio.to_thread(library.put_high_fidelity_pcm, corrupt_id,
-                imported_pcm.tobytes(), sample_rate=32_000)
-            corrupt_path = library.high_fidelity_path(corrupt_id)
-            assert corrupt_path is not None
-            registered_digest = hashlib.sha256(corrupt_path.read_bytes()).hexdigest()
-            with library._lock:
-                library._index["assets"][corrupt_id]["remote_import"] = {
-                    "stored_sha256": hashlib.sha256(library.asset_bytes(corrupt_id)).hexdigest(),
-                    "high_fidelity_sha256": registered_digest,
-                }
-            damaged = bytearray(corrupt_path.read_bytes())
-            damaged[-1] ^= 1
-            corrupt_path.write_bytes(damaged)
-            corrupt_preview = await management("1" * 32,
-                {"value":{"model_id":model_id,"asset_id":corrupt_id}})
-            assert corrupt_preview["status"] == 409
-            forged_internal = await self._request("POST", "/internal/application/tts-assets/audio/read",
-                json={"model_id":model_id,"asset_id":asset_id,
-                    "_authenticated_device_id":device_id,
-                    "_connection_generation":lease["connection_generation"],
-                    "_executor_generation":lease["executor_generation"]})
-            assert forged_internal.status_code == 403
+            self.runtime.player = SimpleNamespace(sample_rate=48_000, channels=1, buffered_ms=0,
+                allow_user_initiated=lambda _key: None, enqueue_async=enqueue,
+                finish_stream_async=AsyncMock(), wait_until_output_complete=AsyncMock(),
+                stop_and_snapshot_confirmed=AsyncMock(), has_started=lambda _key: True)
+            with patch.object(self.runtime, "enqueue_remote_playback", new_callable=AsyncMock) as media:
+                for identifier in (asset_id, source["asset_id"]):
+                    media.reset_mock()
+                    completed = await play(identifier)
+                    assert completed["state"] == "succeeded", completed
+                    assert completed["playback_outcome"] == "stopped"
+                    assert completed["result"] == {"asset_id": identifier, "duration_ms": 12_500}
+                    calls = media.await_args_list
+                    assert len(calls) > 1 and b"".join(call.args[2] for call in calls) == pcm
+                    assert all(call.args[:2] == (completed["operation_id"], 48_000)
+                               and call.kwargs == {"delivery_device_id": device_id} for call in calls)
 
-            invalid_asset = await management("b" * 32,
-                {"value":{"model_id":model_id,"asset_id":"../outside"}})
-            assert invalid_asset["status"] == 422
-            missing = await management("c" * 32,
-                {"value":{"model_id":model_id,"asset_id":"f" * 32}})
-            assert missing["status"] == 404
-            oversized_asset = await asyncio.to_thread(
-                library.put_source, b"x" * (1024 * 1024 + 1), "large-reference.wav",
-            )
-            oversized = await management("d" * 32,
-                {"value":{"model_id":model_id,"asset_id":oversized_asset["asset_id"]}})
-            assert oversized["status"] == 413
+                media.reset_mock()
+                damaged = bytearray(hifi_path.read_bytes())
+                damaged[-1] ^= 1
+                hifi_path.write_bytes(damaged)
+                corrupt = await play(asset_id)
+                assert corrupt["state"] == "failed" and "摘要" in corrupt["error"]
+                media.assert_not_awaited()
 
-            stale = await management("e" * 32, {"value":{"model_id":model_id,"asset_id":asset_id}},
-                session_generation=lease["connection_generation"] + 1, expected_http_status=409)
-            assert "detail" in stale
+            for arguments in ({"model": model_id, "asset_id": "../outside"},
+                              {"model": model_id, "asset_id": "f" * 32},
+                              {"model": model_id, "asset_id": asset_id, "path": "C:/private"}):
+                bad = await management("tts.operation.play", {"value": arguments})
+                assert bad["status"] == 422
+            await management("tts.operation.play", {"value": {"model": model_id, "asset_id": asset_id}},
+                             generation=connection["connection_generation"] + 1, expected_status=409)
+            await management("tts.assets.audio.read", {"value": {"model_id": model_id, "asset_id": asset_id}},
+                             expected_status=422)
+            old_route = await self._request("POST", "/internal/application/tts-assets/audio/read", json={})
+            assert old_route.status_code == 404
 
-            limited_private_key = Ed25519PrivateKey.generate()
-            limited_device_id = "tts-audio-limited-client"
-            self.runtime.device_trust_store.approve(limited_device_id,
-                self._ssh_public_key(limited_private_key), trusted_at_ms=1_000)
-            limited_opened, _ = await self._signed_gateway_request(limited_private_key, limited_device_id,
-                "/v1/session/open", {"protocol_version":1,"capabilities":["audio_stream"]})
-            assert limited_opened.status_code == 200, limited_opened.text
-            limited_lease = limited_opened.json()
-            limited_payload = {"protocol_version":1,"request_id":"f" * 32,"target_host_id":host_id,
-                "session_generation":limited_lease["connection_generation"],
-                "operation":"tts.assets.audio.read",
-                "arguments":{"value":{"model_id":model_id,"asset_id":asset_id}},
-                "fields":{"protocol_version":"远程管理协议版本","request_id":"稳定操作编号",
-                    "target_host_id":"目标服务端编号","session_generation":"当前设备会话代次",
-                    "operation":"固定 TTS 音频读取操作","arguments":"model_id 与 asset_id 固定参数"}}
-            limited_response, _ = await self._signed_gateway_request(limited_private_key, limited_device_id,
-                "/v1/management", limited_payload)
-            assert limited_response.status_code == 403, limited_response.text
-
-            for key, ident, current_lease in ((private_key, device_id, lease),
-                                               (limited_private_key, limited_device_id, limited_lease)):
-                closed, _ = await self._signed_gateway_request(key, ident, "/v1/session/close",
-                    {"protocol_version":1,"connection_generation":current_lease["connection_generation"],
-                     "executor_generation":current_lease["executor_generation"]})
-                assert closed.status_code == 200
-
-        with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": "test-tts-audio-internal-token"}):
-            asyncio.run(scenario())
+        asyncio.run(scenario())
 
     def test_signed_remote_session_routes_dsh_tasks_and_queries_original_receipt(self) -> None:
         from types import SimpleNamespace
@@ -1443,7 +1393,7 @@ class ProductApiTests(unittest.TestCase):
             poll_body = {"protocol_version":1,"connection_generation":lease["connection_generation"],
                 "executor_generation":lease["executor_generation"],"wait_ms":1000}
 
-            source = bytes(range(256)) * 1025
+            source = bytes(range(256)) * (12 * 1024 + 1)
             source_sha = __import__("hashlib").sha256(source).hexdigest()
             read_body = {**envelope,"request_id":"remote-large-read-1","action":"read",
                 "path":"D:\\AI\\approved\\large.bin","max_bytes":len(source)}
@@ -1498,16 +1448,22 @@ class ProductApiTests(unittest.TestCase):
             transfer_common = {**envelope,"connection_generation":lease["connection_generation"],
                 "executor_generation":lease["executor_generation"],"parent_request_id":read_body["request_id"],
                 "transfer_id":transfer_id}
-            chunk_response = await self._request("POST","/api/internal/dsh-bridge/device.file.transfer",
-                json={**transfer_common,"request_id":"remote-large-read-chunk-1","action":"read_chunk",
-                    "offset":0,"limit":8192},headers=headers)
-            assert chunk_response.status_code == 200, chunk_response.text
-            chunk = chunk_response.json()["transfer"]
-            assert base64.b64decode(chunk["data_base64"],validate=True) == source[:8192]
-            assert chunk["sha256"] == source_sha
-            closed_read = await self._request("POST","/api/internal/dsh-bridge/device.file.transfer",
-                json={**transfer_common,"request_id":"remote-large-read-close-1","action":"close"},headers=headers)
-            assert closed_read.status_code == 200 and closed_read.json()["transfer"]["closed"] is True
+            transfer_path = "/api/internal/dsh-bridge/device.file.transfer"
+            read_request = {**transfer_common,"request_id":"remote-file-content-1","action":"read_stream"}
+            stale = await self._request("POST", transfer_path,
+                json={**read_request, "activation_id": "retired"}, headers=headers)
+            assert stale.status_code == 409
+            removed = await self._request("POST", transfer_path,
+                json={**read_request, "action": "read_chunk", "offset": 0, "limit": 8192}, headers=headers)
+            assert removed.status_code == 422
+            content = await self._request("POST", transfer_path, json=read_request, headers=headers)
+            assert content.status_code == 200
+            assert content.headers["content-type"] == "application/octet-stream"
+            assert int(content.headers["content-length"]) == len(source)
+            assert content.content == source
+            assert not list(store.root.iterdir())
+            repeated = await self._request("POST", transfer_path, json=read_request, headers=headers)
+            assert repeated.status_code == 409
 
             attachment = b"approved streamed attachment\x00" * 8192
             attachment_sha = __import__("hashlib").sha256(attachment).hexdigest()
@@ -1968,15 +1924,19 @@ class ProductApiTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import Mock
         from voice_terminal.devices.screen import ScreenCaptureRouter
+        from tests.test_screen_capture import packet
 
         async def scenario():
             session = SimpleNamespace(voice_session_id="current", dsh_session_id="dsh", epoch=2,
                                       activation_id="active", prepare_callback_binding=AsyncMock())
             hub = self.runtime.dsh.bridge_hub
             hub.register(session)
+            captured = packet()
+            for image in captured["attachments"]:
+                image["data"] = base64.b64decode(image.pop("base64"), validate=True)
             local = SimpleNamespace(config=SimpleNamespace(enabled=True), available=True, generation=1,
                                     lease_generation=Mock(return_value=0), invalidate=Mock(), consume=Mock(),
-                                    grab=AsyncMock(return_value={"capture_id": "image"}))
+                                    grab=AsyncMock(return_value=captured))
             registry = self.runtime.device_registry
             registry.connect("remote")
             lease = registry.prepare_switch("remote", registry.generation)
@@ -1989,9 +1949,15 @@ class ProductApiTests(unittest.TestCase):
             assert (await self._request("POST", path, json=body, headers=headers)).status_code == 503
             assert (await self._request("POST", path, json={**body, "device_id": " "}, headers=headers)).status_code == 422
             response = await self._request("POST", path, json={**body, "device_id": "local"}, headers=headers)
-            assert response.status_code == 200 and response.json()["capture"]["capture_id"] == "image"
-            assert response.json()["capture"]["execution_device_id"] == "local"
-            local.grab.assert_awaited_once_with(source="dsh", scope="active")
+            assert response.status_code == 200 and response.headers["content-type"] == "application/octet-stream"
+            size = int.from_bytes(response.content[:4], "big")
+            manifest = json.loads(response.content[4:4 + size])
+            assert manifest["capture_id"] == captured["capture_id"]
+            assert manifest["execution_device_id"] == "local"
+            assert manifest["attachments"] == [{k: v for k, v in item.items() if k != "data"}
+                                               for item in captured["attachments"]]
+            assert response.content[4 + size:] == b"".join(image["data"] for image in captured["attachments"])
+            local.grab.assert_awaited_once_with(source="dsh", scope="active", binary=True)
             hub.unregister(session)
         asyncio.run(scenario())
 
@@ -2015,7 +1981,8 @@ class ProductApiTests(unittest.TestCase):
             async with session._event_lock:
                 response = await asyncio.wait_for(self._request("POST", path, json=body, headers=headers), .5)
             assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
-            assert response.json()["attachment"]["base64"] == stored["attachments"][0]["base64"]
+            assert response.headers["content-type"] == "application/octet-stream"
+            assert response.content == base64.b64decode(stored["attachments"][0]["base64"], validate=True)
             session.prepare_callback_binding.assert_not_awaited()
             hub.unregister(session)
             assert (await self._request("POST", path, json=body, headers=headers)).status_code == 409

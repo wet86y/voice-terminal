@@ -1,11 +1,12 @@
 /** Device control component（设备控制组件）：作为桥接根代理的独立加载服务。 */
 import type { Context } from '../shared/services.js'
 import { installDeviceTools } from './tools.js'
-import type { DeviceToolBinding, DeviceToolCallback } from './types.js'
+import type { DeviceAttachmentCallback, DeviceToolBinding, DeviceToolCallback } from './types.js'
 
 /** DeviceControlService（设备控制服务）：加载行只提供当前桥接的根代理入口。 */
 export interface DeviceControlService {
-  installAgentTools(agentCtx: Context, binding: DeviceToolBinding, callback: DeviceToolCallback): void
+  installAgentTools(agentCtx: Context, binding: DeviceToolBinding, callback: DeviceToolCallback,
+    receiveAttachment: DeviceAttachmentCallback): void
 }
 
 declare module '@deepseek-ai/cordis' {

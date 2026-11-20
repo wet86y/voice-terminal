@@ -282,7 +282,7 @@ impl FileReceiver for ValidatingFileReceiver {
         }
         let body = serde_json::to_value(&request).map_err(|_| "固定文件网关开始请求无法编码。")?;
         let mut stream = connect_file_gateway()?;
-        let (status, response) = file_gateway_exchange(&mut stream, &body, Some(&authorization))?;
+        let (status, response) = file_gateway_exchange(&mut stream, &body, Some(&authorization), None)?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -395,14 +395,13 @@ impl FileReceiver for ValidatingFileReceiver {
             "upload_chunk",
             serde_json::json!({
                 "offset": offset,
-                "data_base64": device_file_channel::encode_file_channel_base64(bytes),
                 "chunk_sha256": chunk_sha256,
                 "fields": {
                     "protocol_version":"设备文件通道协议版本","action":"固定文件通道操作",
                     "device_id":"受信 SSH 强制命令客户端编号","connection_generation":"设备连接代次",
                     "executor_generation":"设备执行器代次","transfer_id":"原 DSH 文件传输编号",
                     "channel_token":"原票据签发的短期通道能力令牌","offset":"当前原始文件字节偏移",
-                    "data_base64":"规范 Base64 原始文件分块","chunk_sha256":"当前分块 SHA-256 摘要"
+                    "chunk_sha256":"当前原始分块 SHA-256 摘要"
                 }
             }),
         );
@@ -413,7 +412,7 @@ impl FileReceiver for ValidatingFileReceiver {
         let stream = gateways
             .get_mut(&session.channel_token)
             .ok_or("固定文件网关会话已经关闭。")?;
-        let (status, response) = file_gateway_exchange(stream, &payload, None)?;
+        let (status, response) = file_gateway_exchange(stream, &payload, None, Some(bytes))?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -460,7 +459,7 @@ impl FileReceiver for ValidatingFileReceiver {
         let stream = gateways
             .get_mut(&session.channel_token)
             .ok_or("固定文件网关会话已经关闭。")?;
-        let (status, response) = file_gateway_exchange(stream, &payload, None)?;
+        let (status, response) = file_gateway_exchange(stream, &payload, None, None)?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -565,7 +564,7 @@ impl FileReceiver for ValidatingFileReceiver {
         let stream = gateways
             .get_mut(&session.channel_token)
             .ok_or("固定文件网关会话已经关闭。")?;
-        let (status, response) = file_gateway_exchange(stream, &payload, None)?;
+        let (status, response) = file_gateway_exchange(stream, &payload, None, None)?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -616,7 +615,7 @@ impl FileReceiver for ValidatingFileReceiver {
             stream = Some(connect_file_gateway()?);
         }
         let mut stream = stream.ok_or("固定文件网关取消连接不可用。")?;
-        let (status, response) = file_gateway_exchange(&mut stream, &payload, None)?;
+        let (status, response) = file_gateway_exchange(&mut stream, &payload, None, None)?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -687,7 +686,7 @@ fn send_file_gateway_action(
     extras: serde_json::Value,
 ) -> Result<(u16, serde_json::Value), String> {
     let payload = file_gateway_payload(peer, session, action, extras);
-    file_gateway_exchange(stream, &payload, None)
+    file_gateway_exchange(stream, &payload, None, None)
 }
 
 fn connect_file_gateway() -> Result<TcpStream, String> {
@@ -712,6 +711,7 @@ fn file_gateway_exchange(
     stream: &mut TcpStream,
     body: &serde_json::Value,
     authorization: Option<&FileTransferAuthorization>,
+    chunk: Option<&[u8]>,
 ) -> Result<(u16, serde_json::Value), String> {
     let path = FILE_TRANSFER_GATEWAY_PATH;
     if path != "/v1/file-transfer" {
@@ -730,16 +730,27 @@ fn file_gateway_exchange(
             authorization.timestamp_ms, authorization.signature,
         );
     }
+    let (content_type, length) = match chunk {
+        Some(chunk) if payload.len() <= 4096 => ("application/octet-stream", 4 + payload.len() + chunk.len()),
+        Some(_) => return Err("设备文件二进制分块元数据超过大小上限。".into()),
+        None => ("application/json", payload.len()),
+    };
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18765\r\nAccept: application/json\r\nContent-Type: application/json\r\n{headers}Connection: keep-alive\r\nContent-Length: {}\r\n\r\n",
-        payload.len(),
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18765\r\nAccept: application/json\r\nContent-Type: {content_type}\r\n{headers}Connection: keep-alive\r\nContent-Length: {length}\r\n\r\n",
     );
     stream
         .write_all(request.as_bytes())
         .map_err(|_| "固定设备文件网关请求头写入失败。")?;
+    if chunk.is_some() {
+        stream.write_all(&(payload.len() as u32).to_be_bytes())
+            .map_err(|_| "固定设备文件网关二进制元数据长度写入失败。")?;
+    }
     stream
         .write_all(&payload)
         .map_err(|_| "固定设备文件网关请求体写入失败。")?;
+    if let Some(chunk) = chunk {
+        stream.write_all(chunk).map_err(|_| "固定设备文件网关原始分块写入失败。")?;
+    }
     stream
         .flush()
         .map_err(|_| "固定设备文件网关请求刷新失败。")?;

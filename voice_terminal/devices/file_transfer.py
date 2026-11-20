@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 from uuid import uuid4
-from typing import Any
+from typing import Any, BinaryIO
 
 
 MAX_CHUNK_BYTES = 64 * 1024  # MAX_CHUNK_BYTES（控制 API 每次读写暂存文件的字节上限）。
@@ -22,6 +22,14 @@ TRANSFER_TTL_SECONDS = 60 * 60  # TRANSFER_TTL_SECONDS（传输租约空闲失�
 FILE_CHANNEL_TTL_SECONDS = 15 * 60  # FILE_CHANNEL_TTL_SECONDS（受限文件会话令牌空闲失效时限）。
 _TRANSFER_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+MAX_SCREEN_UPLOAD_BYTES = 128 * 1024 * 1024  # 双图暂存预算，覆盖受支持的最大图像尺寸。
+
+
+def device_file_transfer_id(connection: Any, request_id: str) -> str:
+    """device_file_transfer_id（文件传输编号）：绑定原请求和设备连接/执行器代次。"""
+    material = (f"{connection.device_id}\0{connection.connection_generation}\0"
+                f"{connection.executor_generation}\0{request_id}").encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:32]
 
 
 class DeviceFileTransferError(RuntimeError):
@@ -42,6 +50,7 @@ class _Transfer:
     sha256: str | None = None
     expected_bytes: int | None = None
     expected_sha256: str | None = None
+    screen_upload: bool = False  # screen_upload（截屏票据）：编码结束后由设备登记准确长度。
     target_path: str | None = None
     modified_ns: int | None = None
     touched_at: float = 0.0
@@ -54,6 +63,7 @@ class _Transfer:
     channel_chunk_receipts: dict[int, tuple[int, str, int]] = field(default_factory=dict)  # channel_chunk_receipts（下载块的幂等收据）。
     tts_import_ticket: dict[str, Any] | None = None  # tts_import_ticket（可选的受管 TTS 单文件导入票据绑定）。
     tts_import_committed: bool = False  # tts_import_committed（VOICE 库已按本票据持久化导入结果）。
+    reading: bool = False  # reading（二进制读取正在占用暂存文件）。
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -102,7 +112,42 @@ class DeviceFileTransferStore:
                            transfer_id, expected_bytes=expected_bytes)
         if record.tts_import_ticket is not None:
             raise DeviceFileTransferError("TTS 音频导入票据不能复用为 DSH 文件读取票据。")
+        if record.screen_upload:
+            raise DeviceFileTransferError("截屏票据不能复用为 DSH 文件读取票据。")
         return record.snapshot()
+
+    def prepare_screen_upload(self, *, transfer_id: str, device_id: str,
+                              connection_generation: int, executor_generation: int) -> None:
+        """prepare_screen_upload（登记截屏上传）：先预留双图预算，首个签名请求锁定实际字节数。"""
+        with self._lock:
+            if transfer_id in self._records:
+                raise DeviceFileTransferError("截屏上传票据已登记。")
+            record = self._new(device_id, connection_generation, executor_generation, "device_upload",
+                               transfer_id, expected_bytes=MAX_SCREEN_UPLOAD_BYTES)
+            record.screen_upload = True
+            record.expected_bytes = None
+
+    def consume_screen_upload(self, *, transfer_id: str, device_id: str, connection_generation: int,
+                              executor_generation: int, expected_bytes: int, expected_sha256: str) -> bytes:
+        """consume_screen_upload（读取并释放截图暂存）：关闭读句柄后清除本次文件。"""
+        with self._lock:
+            record = self._get(transfer_id, device_id, connection_generation, executor_generation)
+            if not record.screen_upload:
+                raise DeviceFileTransferError("原上传票据没有绑定双图。")
+        try:
+            with self._lock:
+                self._verify_ready_file(record)
+                if (type(expected_bytes) is not int or record.bytes != expected_bytes
+                        or record.sha256 != expected_sha256):
+                    raise DeviceFileTransferError("截屏任务回执与双图上传票据不匹配。")
+            with record.path.open("rb") as stream:
+                raw = stream.read(expected_bytes + 1)
+            if len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != expected_sha256:
+                raise DeviceFileTransferError("截屏文件读取时发生变化。")
+            return raw
+        finally:
+            self.close(transfer_id=transfer_id, device_id=device_id, connection_generation=connection_generation,
+                       executor_generation=executor_generation)
 
     def prepare_tts_asset_import(self, *, transfer_id: str, device_id: str,
                                  connection_generation: int, executor_generation: int,
@@ -516,8 +561,15 @@ class DeviceFileTransferStore:
         with self._lock:
             record = self._get(transfer_id, device_id, connection_generation, executor_generation)
             expected_direction = "device_upload" if operation == "file.sftp.upload" else "core_upload"
-            if record.direction != expected_direction or record.expected_bytes is None:
+            if record.direction != expected_direction:
                 raise DeviceFileTransferError("固定文件通道操作与已审批文件传输方向不匹配。")
+            if record.screen_upload and (maximum_bytes > MAX_SCREEN_UPLOAD_BYTES
+                    or record.expected_bytes is not None and maximum_bytes != record.expected_bytes):
+                raise DeviceFileTransferError("截屏文件超过双图暂存预算或与原长度不一致。")
+            if record.expected_bytes is None:
+                if not record.screen_upload or expected_sha256 is not None:
+                    raise DeviceFileTransferError("固定文件通道缺少已登记的文件长度。")
+                record.expected_bytes = maximum_bytes
             if record.expected_bytes > maximum_bytes:
                 raise DeviceFileTransferError("固定文件通道上限低于已登记的审批文件长度。")
             if operation == "file.sftp.download":
@@ -560,8 +612,20 @@ class DeviceFileTransferStore:
                                     connection_generation: int, executor_generation: int,
                                     channel_token: str, offset: int, data_base64: str,
                                     chunk_sha256: str) -> dict[str, Any]:
-        """写入设备读取分块；复用 DeviceFileTransferStore（设备文件传输存储）的票据和偏移。"""
-        raw = self._decode_channel_chunk(offset, data_base64)
+        """兼容旧本机桥接器的 Base64（文本编码）分块。"""
+        return self.append_device_channel_bytes(
+            transfer_id=transfer_id, device_id=device_id, connection_generation=connection_generation,
+            executor_generation=executor_generation, channel_token=channel_token, offset=offset,
+            raw=self._decode_channel_chunk(offset, data_base64), chunk_sha256=chunk_sha256,
+        )
+
+    def append_device_channel_bytes(self, *, transfer_id: str, device_id: str,
+                                     connection_generation: int, executor_generation: int,
+                                     channel_token: str, offset: int, raw: bytes,
+                                     chunk_sha256: str) -> dict[str, Any]:
+        """写入 FILE（设备文件）原始分块，核对原票据、偏移及摘要。"""
+        if type(offset) is not int or offset < 0 or not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_CHUNK_BYTES:
+            raise DeviceFileTransferError("固定文件通道分块偏移或字节数无效。")
         if not isinstance(chunk_sha256, str) or not _SHA256.fullmatch(chunk_sha256):
             raise DeviceFileTransferError("固定文件通道分块摘要格式无效。")
         actual_chunk_sha256 = hashlib.sha256(raw).hexdigest()
@@ -740,27 +804,33 @@ class DeviceFileTransferStore:
             record.touched_at = time.monotonic()
             return True
 
-    def read_chunk(self, *, transfer_id: str, device_id: str, connection_generation: int,
-                   executor_generation: int, offset: int, limit: int = MAX_CHUNK_BYTES) -> dict[str, Any]:
-        """从已复核暂存文件读取一个有界附件分块。"""
-        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= MAX_CHUNK_BYTES:
-            raise DeviceFileTransferError("文件暂存读取偏移或分块上限无效。")
+    def open_staged_read(self, *, transfer_id: str, device_id: str, connection_generation: int,
+                         executor_generation: int) -> tuple[BinaryIO, int]:
+        """open_staged_read（打开已复核的原始读取流）：读取期间保留暂存文件。"""
         with self._lock:
             record = self._get(transfer_id, device_id, connection_generation, executor_generation)
+            if (record.reading or record.direction not in {"local_upload", "device_upload"}
+                    or record.screen_upload or record.tts_import_ticket is not None):
+                raise DeviceFileTransferError("票据未开放为可用的设备文件读取流。")
             self._verify_ready_file(record)
-            if offset > record.bytes:
-                raise DeviceFileTransferError("文件暂存读取偏移超过文件长度。")
-            with record.path.open("rb") as handle:
-                handle.seek(offset)
-                chunk = handle.read(min(limit, record.bytes - offset))
+            handle = record.path.open("rb")
+            record.reading = True
             record.touched_at = time.monotonic()
-            return {"transfer_id": transfer_id, "offset": offset, "bytes": len(chunk),
-                    "total_bytes": record.bytes, "sha256": record.sha256,
-                    "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
-                    "data_base64": base64.b64encode(chunk).decode("ascii"),
-                    "fields": {"transfer_id": "原文件传输编号", "offset": "本分块的原文件字节偏移",
-                        "bytes": "本分块字节数", "total_bytes": "完整文件字节数", "sha256": "完整文件摘要",
-                        "chunk_sha256": "当前分块摘要", "data_base64": "规范 Base64 文件分块"}}
+            return handle, record.bytes
+
+    def finish_staged_read(self, handle: BinaryIO, *, transfer_id: str, device_id: str,
+                           connection_generation: int, executor_generation: int) -> None:
+        """finish_staged_read（结束读取）：完成、取消或断开时都释放句柄与原票据。"""
+        with self._lock:
+            handle.close()
+            record = self._records.get(transfer_id)
+            if record is not None and (record.device_id, record.connection_generation,
+                                       record.executor_generation) == (device_id, connection_generation,
+                                                                       executor_generation):
+                record.reading = False
+                record.touched_at = time.monotonic()
+                self.close(transfer_id=transfer_id, device_id=device_id,
+                           connection_generation=connection_generation, executor_generation=executor_generation)
 
     def device_file_download_ticket(self, *, transfer_id: str, device_id: str,
                                     connection_generation: int, executor_generation: int) -> dict[str, Any]:
@@ -779,8 +849,10 @@ class DeviceFileTransferStore:
         """关闭传输租约；验收保留策略启用时保留现场文件。"""
         with self._lock:
             record = self._get(transfer_id, device_id, connection_generation, executor_generation)
+            if record.reading:
+                raise DeviceFileTransferError("暂存文件正在读取，由读取流负责释放。")
             self._records.pop(transfer_id, None)
-            if self.preserve_staged_files:
+            if self.preserve_staged_files and not record.screen_upload:
                 return True
             for path in (record.partial_path, record.path, Path(f"{record.path}.{record.transfer_id}.part")):
                 try:
@@ -819,7 +891,8 @@ class DeviceFileTransferStore:
                 return existing
             if len(self._records) >= MAX_TRANSFERS:
                 raise DeviceFileTransferError("核心文件传输并行数已达上限。")
-            reserved = sum(item.expected_bytes or 0 for item in self._records.values())
+            reserved = sum(MAX_SCREEN_UPLOAD_BYTES if item.screen_upload and item.expected_bytes is None
+                           else item.expected_bytes or 0 for item in self._records.values())
             if reserved + expected_bytes > MAX_STAGING_BYTES:
                 raise DeviceFileTransferError("核心并行文件暂存预留容量已达上限。")
             self._ensure_root()
@@ -994,10 +1067,11 @@ class DeviceFileTransferStore:
                       if now - item[4] >= TRANSFER_TTL_SECONDS]
             for key in closed:
                 self._closed_tts_imports.pop(key, None)
-            expired = [key for key, item in self._records.items() if now - item.touched_at >= TRANSFER_TTL_SECONDS]
+            expired = [key for key, item in self._records.items()
+                       if not item.reading and now - item.touched_at >= TRANSFER_TTL_SECONDS]
             for key in expired:
                 record = self._records.pop(key)
-                if not self.preserve_staged_files:
+                if not self.preserve_staged_files or record.screen_upload:
                     for path in (record.partial_path, record.path, Path(f"{record.path}.{record.transfer_id}.part")):
                         try:
                             if path.is_file() and not self._is_reparse(path):
