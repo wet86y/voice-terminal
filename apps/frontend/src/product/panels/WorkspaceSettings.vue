@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import UiDialog from '../../interface/UiDialog.vue'
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import AppUpdateCard from '../../interface/AppUpdateCard.vue'
 import WorkspaceLocationCard from '../../interface/WorkspaceLocationCard.vue'
-import type { WorkspaceCleanup } from '../desktop-port'
+import { desktopPort, type DesktopPort, type DesktopWorkspacePort, type WorkspaceCleanup } from '../desktop-port'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
@@ -28,6 +28,36 @@ const progress = computed(() => {
 })
 const controlsBusy = computed(() => pickerBusy.value || cleanupBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
 const updateStatus = computed(() => props.controller.appUpdate.value)
+const debugPort = desktopPort() as DesktopPort & DesktopWorkspacePort
+const debugAccess = ref<boolean | null>(null)
+const debugSaving = ref(false)
+const debugError = ref('')
+
+onMounted(async () => {
+  if (!debugPort.available) return
+  try {
+    const info = await debugPort.workspaceInfo()
+    debugAccess.value = info.allow_external_debug ?? null
+  } catch (error) {
+    debugError.value = error instanceof Error ? error.message : '无法读取外部调试设置。'
+  }
+})
+
+async function changeDebugAccess(event: Event) {
+  const control = event.target as HTMLInputElement
+  const allowed = control.checked
+  debugSaving.value = true
+  debugError.value = ''
+  try {
+    await debugPort.setAgentDebugAllowed(allowed)
+    debugAccess.value = allowed
+  } catch (error) {
+    control.checked = debugAccess.value === true
+    debugError.value = error instanceof Error ? error.message : '无法保存外部调试设置。'
+  } finally {
+    debugSaving.value = false
+  }
+}
 
 async function chooseTarget() {
   if (controlsBusy.value || !canManage.value) return
@@ -87,6 +117,15 @@ function formatBytes(value: number | null | undefined) {
     <SettingsPageHeader section="workspace" title-id="workspace-settings-title" />
 
     <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
+
+    <section v-if="debugAccess !== null || debugError" class="workspace-job-card">
+      <label v-if="debugAccess !== null" class="workspace-job-heading">
+        <span>允许外部调试</span>
+        <input type="checkbox" :checked="debugAccess" :disabled="debugSaving" @change="changeDebugAccess" />
+      </label>
+      <p>允许同一系统账户查询状态和切换启动模式。调试模式下可操作此程序的控件和业务接口。</p>
+      <p v-if="debugError" class="workspace-error" role="alert">{{ debugError }}</p>
+    </section>
 
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
     <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>

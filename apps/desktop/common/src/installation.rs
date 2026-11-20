@@ -788,6 +788,27 @@ fn read_acknowledgement(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 pub fn launch(root: &Path) -> Result<u32, String> {
+    launch_with_handoff(root, |token| {
+        let mut command = Command::new(root.join("VoiceTerminal.exe"));
+        command.args(["--startup-handoff", token]).current_dir(root);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        command.spawn().map_err(|e| format!("正式程序启动失败：{e}"))?;
+        Ok(())
+    })
+}
+
+pub fn launch_with_handoff(
+    root: &Path,
+    start: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<u32, String> {
     let expected = canonical_path(&root.join("app/VoiceTerminalDesktop.exe"))?;
     let token = workspace::new_id();
     let path = safe_path(root, &format!("tmp/handoff-{token}.json"))?;
@@ -795,43 +816,30 @@ pub fn launch(root: &Path) -> Result<u32, String> {
         &path,
         &json!({"token":token,"state":"waiting","fields":{"token":"一次性启动凭据","state":"等待受控窗口显示"}}),
     )?;
-    let mut command = Command::new(root.join("VoiceTerminal.exe"));
-    command
-        .args(["--startup-handoff", &token])
-        .current_dir(root);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command
-        .spawn()
-        .map_err(|e| format!("正式程序启动失败：{e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline {
-        if let Ok(record) = read_acknowledgement(&path) {
-            if record["token"] == token && record["state"] == "window-ready" {
-                let pid = record["pid"].as_u64().ok_or("交接进程编号无效")? as u32;
-                if let Some((created, exe)) = workspace::process_identity(pid)? {
-                    if record["create_time"].as_u64() == Some(created)
-                        && exe
-                            .to_string_lossy()
-                            .eq_ignore_ascii_case(&expected.to_string_lossy())
-                    {
-                        let _ = fs::remove_file(path);
-                        return Ok(pid);
+    let result = (|| {
+        start(&token)?;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            if let Ok(record) = read_acknowledgement(&path) {
+                if record["token"] == token && record["state"] == "window-ready" {
+                    let pid = record["pid"].as_u64().ok_or("交接进程编号无效")? as u32;
+                    if let Some((created, exe)) = workspace::process_identity(pid)? {
+                        if record["create_time"].as_u64() == Some(created)
+                            && exe
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&expected.to_string_lossy())
+                        {
+                            return Ok(pid);
+                        }
                     }
                 }
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        Err("正式程序未确认窗口交接。已安装本体保留，请退出目标程序后重试或双击工作区正式入口。".into())
+    })();
     let _ = fs::remove_file(path);
-    Err("正式程序未确认窗口交接。已安装本体保留，请退出目标程序后重试或双击工作区正式入口。".into())
+    result
 }
 
 #[cfg(test)]

@@ -3697,6 +3697,9 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 speech_handle_finished = True
 
 
+        from ..agent_debug import point
+        await point("llm.provider", "input", {"turn_id": source_turn_id, "message_count": len(messages),
+                                              "reasoning_effort": reasoning_effort})
         try:
             async with aclosing(self._provider_stream(messages, reasoning_effort=reasoning_effort)) as stream:
                 async for item in stream:
@@ -3705,6 +3708,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     if item["type"] == "accepted":
                         self._screen_accepted()
                     if item["type"] == "finish":
+                        await point("llm.provider", "result", {"turn_id": source_turn_id, "item": item})
                         finished = True
                         metrics = item.get("stream_metrics")
                         if isinstance(metrics, dict):

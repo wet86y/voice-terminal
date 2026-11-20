@@ -637,6 +637,11 @@ class SpeechPipeline:
                     await self._wait_for_playback_permission(ws, token)
                     if not self._valid(token) or not ws.committed:
                         return
+                    if not audio_returned_bytes:
+                        from ..agent_debug import point
+                        await point("tts.playback", "input", {"turn_id": ws.turn_id, "bytes": len(pcm)})
+                        if not self._valid(token) or not ws.committed:
+                            return
                     audio_returned_bytes += len(pcm)
                     audio_signal.set()
                     if "first_audio" not in ws.timings:

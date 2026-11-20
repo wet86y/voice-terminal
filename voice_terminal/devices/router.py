@@ -1,5 +1,6 @@
 """Device task routing（设备任务路由）：固定目标并保存未知执行结果。"""
 from __future__ import annotations
+from .. import agent_debug
 
 import asyncio
 import json
@@ -96,6 +97,7 @@ class DeviceRouter:
             self._connections[device_id] = (connection, transport)
             return connection
 
+    @agent_debug.observe_operation
     async def attach_transport(self, device_id: str, transport: DeviceTransport) -> DeviceConnection:
         """attach_transport（绑定已登记传输）：不改变连接租约或当前交互设备。"""
         # Protocol（协议）未声明 runtime_checkable；检查运行时所需的公开方法。
@@ -120,6 +122,7 @@ class DeviceRouter:
                     and self.registry.connection(device_id) == connection
                     and (not callable(is_connected) or is_connected() is True))
 
+    @agent_debug.observe_operation
     async def disconnect(self, device_id: str, connection_generation: int) -> bool:
         """disconnect（断开连接）：旧连接不能清除已替换的连接。"""
         async with self._lock:

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-debug-trace-native"
+description = "Enables the agent_debug_trace_native command without any pre-configured scope."
+commands.allow = ["agent_debug_trace_native"]
+
+[[permission]]
+identifier = "deny-agent-debug-trace-native"
+description = "Denies the agent_debug_trace_native command without any pre-configured scope."
+commands.deny = ["agent_debug_trace_native"]

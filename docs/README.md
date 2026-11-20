@@ -27,6 +27,8 @@
 
 ## 说明
 
+- [代理调试模式](guides/agent-debug.md)
+
 - [开发资产治理与覆盖更新](development/asset-governance.md)
 - [开发、构建与同包交付流程](development/desktop-pipeline.md)
 - [更新日志填写规范](development/release-notes.md)

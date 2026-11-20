@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 
+from .. import agent_debug
 from .events import VoiceEvent
 
 
@@ -15,6 +16,8 @@ class EventBus:
         self._lock = asyncio.Lock()
 
     async def publish(self, value: VoiceEvent) -> None:
+        if agent_debug.ENABLED and not value.type.startswith(("audio.level", "asr.partial")):
+            await agent_debug.point(value.type, "event", {"turn_id": value.turn_id, "payload": value.payload})
         if self._observe is not None:
             self._observe(value)
         async with self._lock:

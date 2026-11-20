@@ -1,6 +1,8 @@
 """Process supervisor（进程监督器）：启动、诊断、采样与统一回收。"""
 from __future__ import annotations
 
+from .. import agent_debug
+
 import asyncio
 import json
 import logging
@@ -258,6 +260,9 @@ class ApplicationHost:
             "VOICE_APP_SERVICE_GENERATION": generation,
             "VOICE_WEB_ORIGINS": self.frontend_origin or self.origin,
             "VOICE_APP_ENDPOINTS": json.dumps(endpoint_table, separators=(",", ":"))}
+        if key in {"voice", "asr", "analysis"}:
+            from ..agent_debug import worker_environment
+            env.update(worker_environment())
         if key == "dev":
             # Node（界面开发服务）只需来源、实例标识和会话转发值，不应继承内部 Bearer 凭据。
             env.pop("VOICE_APP_INTERNAL_TOKEN", None)
@@ -693,6 +698,7 @@ class ApplicationHost:
             return True
         return False
 
+    @agent_debug.observe_operation
     async def start_service(self, key, *, entry_only=False, force_cpu=False):
         if key == "analysis" and (self.no_analysis or not self.manifest["analysis_enabled"]):
             self.state.component(key, state="disabled", enabled=False, phase="配置已停用")
@@ -1317,6 +1323,7 @@ class ApplicationHost:
                 log.exception("应用进程指标采样失败")
             await asyncio.sleep(2)
 
+    @agent_debug.observe_operation
     async def shutdown(self):
         # 总退出预算 15 秒，预留 1 秒发布最终状态并关闭宿主界面入口。
         deadline = min(time.monotonic() + 14, self.shutdown_deadline or float("inf"))

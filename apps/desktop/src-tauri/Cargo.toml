@@ -13,7 +13,7 @@ custom-protocol = ["tauri/custom-protocol"]
 distribution = ["voice-desktop-common/distribution"]
 qualification = ["distribution", "voice-desktop-common/qualification"]
 native-audio = ["voice-desktop-common/native-audio"] # native-audio（Windows 产品的静态 CRT 原生 AEC/VAD 与 Opus 编解码）。
-ssh-device = ["voice-desktop-common/ssh-device", "dep:tokio"] # ssh-device（产品内置 SSH 设备连接，不依赖外部 ssh.exe）。
+ssh-device = ["voice-desktop-common/ssh-device"] # ssh-device（产品内置 SSH 设备连接，不依赖外部 ssh.exe）。
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,7 +27,7 @@ base64 = "0.22" # base64（校验并解码受限的远程 TTS 音频预览）。
 sha2 = "0.10" # sha2（远程导入文件的 SHA-256（安全散列算法 256 位）完整性校验）。
 rand = { version = "=0.10.3", features = ["sys_rng"] } # rand（请求编号和临时标识的系统随机数生成）。
 voice-desktop-common = { path = "../common" }
-tokio = { version = "1", features = ["sync", "time"], optional = true } # tokio（SSH 媒体收发任务的有界异步通道）。
+tokio = { version = "1", features = ["sync", "time", "io-util", "macros"] } # tokio（媒体及代理调试的有界异步通道）。
 
 [dev-dependencies]
 voice-desktop-common = { path = "../common", features = ["ssh-device-test-support"] } # voice-desktop-common（SSH（安全外壳协议）闭环集成测试支持，仅用于测试构建）。
@@ -35,4 +35,6 @@ russh = { version = "=0.65.1", default-features = false, features = ["ring", "rs
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "process"] } # tokio（异步 SSH 与产品网关集成测试运行时）。
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "=0.39.1" # webview2-com（网页引擎内部调试调用，版本与桌面框架一致）。
+windows = { version = "0.62.2", features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_Foundation"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

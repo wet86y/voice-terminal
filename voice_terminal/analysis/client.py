@@ -1,3 +1,4 @@
+from .. import agent_debug
 import asyncio
 import base64
 import json
@@ -38,6 +39,7 @@ class AnalysisClient:
                 raise RuntimeError(result["error"])
             return result
 
+    @agent_debug.observe_operation
     async def analyze(self, operation: str, pcm: bytes, turn_id: str, generation_id: int, timeout_ms: int) -> dict:
         if os.environ.get("VOICE_APP_ANALYSIS_AVAILABLE") == "0":
             raise RuntimeError("应用未确认分析工作进程所有权或就绪状态")

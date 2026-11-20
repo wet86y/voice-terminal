@@ -13,6 +13,9 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .. import agent_debug
+import re
+
 from .ports import is_address_in_use
 
 from .startup_page import loading_page, render_startup_page
@@ -112,6 +115,36 @@ else void refresh();
 </script></body></html>"""
 
 
+# 正式宿主路由同时生成调试目录。路径参数沿用原处理器的校验。
+_APPLICATION_ROUTES = {
+    "GET": {
+        "/api/v1/application/snapshot": "snapshot",
+        "/api/v1/application/events": "events",
+        "/api/v1/application/device-pairing": "pairing",
+    },
+    "POST": {
+        "/api/v1/application/exit": "exit",
+        "/api/v1/application/dsh-approval": "approval",
+        "/api/v1/application/device-pairing": "pairing",
+        "/api/v1/application/wake-tasks": "wakeup",
+        "/api/v1/application/components/{component}/retry": "component_retry",
+        "/api/v1/application/capabilities/{capability}/retry": "capability_retry",
+    },
+}
+_APPLICATION_PATTERNS = {
+    method: [(re.compile(re.sub(r"\\\{\w+\\\}", r"[^/]+", re.escape(template))), template, key)
+             for template, key in routes.items()]
+    for method, routes in _APPLICATION_ROUTES.items()
+}
+
+
+def _match_application_operation(method: str, path: str) -> tuple[str, str]:
+    for pattern, template, key in _APPLICATION_PATTERNS[method]:
+        if pattern.fullmatch(path):
+            return f"{method} {template}", key
+    return "", ""
+
+
 class HostWeb:
     """HostWeb（宿主网页）：私网 UI 会话只由一次性桌面令牌建立。"""
 
@@ -159,6 +192,15 @@ class HostWeb:
                         pass
 
             def data(self, value, status: int = 200):
+                point = getattr(self, "debug_operation", "")
+                if point:
+                    token = agent_debug.start_call(self.debug_call_id)
+                    try:
+                        agent_debug.point_sync(point, "result" if status < 400 else "error",
+                                               {"status": status, "data": value})
+                    finally:
+                        agent_debug.end_call(token)
+                    self.debug_operation = ""
                 self.send(json.dumps(value, ensure_ascii=False).encode(), "application/json; charset=utf-8", status)
 
             def host_matches(self) -> bool:
@@ -194,6 +236,7 @@ class HostWeb:
                 return valid
 
             def do_GET(self):
+                self.debug_operation = ""
                 parsed = urlsplit(self.path)
                 path = parsed.path
                 if not self.host_matches():
@@ -217,11 +260,18 @@ class HostWeb:
                     if not self.allowed():
                         self.data({"error": "应用会话无效，请通过桌面程序重新打开"}, 403)
                         return
-                    if path == "/api/v1/application/snapshot":
+                    if path == "/api/v1/application/operations" and agent_debug.ENABLED:
+                        self.data({"operations": [{"method": method, "path": template}
+                                                  for method, routes in _APPLICATION_ROUTES.items()
+                                                  for template in routes if routes[template] != "events"]})
+                        return
+                    self.debug_operation, operation = _match_application_operation("GET", path)
+                    _, self.debug_call_id = agent_debug.point_sync(self.debug_operation, "input", {})
+                    if operation == "snapshot":
                         self.data(owner.application.state.snapshot())
-                    elif path == "/api/v1/application/events":
+                    elif operation == "events":
                         self.events()
-                    elif path == "/api/v1/application/device-pairing":
+                    elif operation == "pairing":
                         try:
                             self.data(owner.application.device_pairing({"operation": "status"}))
                         except HTTPError as exc:
@@ -327,6 +377,7 @@ class HostWeb:
                 self.close_connection = True
 
             def do_POST(self):
+                self.debug_operation = ""
                 path = urlsplit(self.path).path
                 internal = path in {"/internal/application/report", "/internal/application/device-helper"}
                 if not self.allowed(mutation=not internal, internal=internal):
@@ -346,6 +397,10 @@ class HostWeb:
                 except (ValueError, json.JSONDecodeError):
                     self.data({"error": "请求内容无效"}, 400)
                     return
+                self.debug_operation, operation = _match_application_operation("POST", path)
+                if self.debug_operation:
+                    payload, self.debug_call_id = agent_debug.point_sync(
+                        self.debug_operation, "input", payload, lambda value: isinstance(value, dict))
                 if internal:
                     if path == "/internal/application/report":
                         self.data({"ok": owner.application.report(payload)})
@@ -370,10 +425,10 @@ class HostWeb:
                             self.data({"error": str(exc)[:240]}, 422)
                         except Exception:
                             self.data({"error": "桌面设备操作未能取得可信回执；执行结果未知。"}, 503)
-                elif path == "/api/v1/application/exit":
+                elif operation == "exit":
                     owner.application.request_exit()
                     self.data({"ok": True}, 202)
-                elif path == "/api/v1/application/dsh-approval":
+                elif operation == "approval":
                     try:
                         self.data(owner.application.decide_dsh_approval(payload))
                     except HTTPError as exc:
@@ -384,7 +439,7 @@ class HostWeb:
                         self.data({"detail": detail}, exc.code if exc.code in {400, 403, 409, 422, 503} else 503)
                     except Exception:
                         self.data({"detail": "权限决定未确认，请等待请求状态刷新。"}, 503)
-                elif path == "/api/v1/application/device-pairing":
+                elif operation == "pairing":
                     try:
                         result = owner.application.device_pairing(payload)
                         self.data(result, 200)
@@ -398,7 +453,7 @@ class HostWeb:
                         self.data({"detail": str(exc)[:240]}, 422)
                     except Exception:
                         self.data({"detail": "设备配对操作未能确认，请刷新状态后重试。"}, 503)
-                elif path == "/api/v1/application/wake-tasks":
+                elif operation == "wakeup":
                     try:
                         self.data(owner.application.create_wake_task(payload), 201)
                     except HTTPError as exc:
@@ -409,13 +464,13 @@ class HostWeb:
                         self.data({"detail": detail}, exc.code if exc.code in {400, 404, 409, 422, 503} else 503)
                     except Exception:
                         self.data({"detail": "任务创建未确认，请刷新列表后检查；DSH（代理执行宿主）可能暂不可用。"}, 503)
-                elif path.startswith("/api/v1/application/components/") and path.endswith("/retry"):
+                elif operation == "component_retry":
                     key = path.split("/")[-2]
                     if owner.application.request_retry(key, trigger="component-api"):
                         self.data({"ok": True}, 202)
                     else:
                         self.data({"error": "组件当前不能重试"}, 409)
-                elif path.startswith("/api/v1/application/capabilities/") and path.endswith("/retry"):
+                elif operation == "capability_retry":
                     capability = path.split("/")[-2]
                     if owner.application.request_capability_retry(capability):
                         self.data({"ok": True}, 202)

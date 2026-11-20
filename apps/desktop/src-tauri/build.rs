@@ -2,8 +2,9 @@ fn main() {
     // 应用图标资源改变后重新编译，确保标题栏与任务栏同时更新。
     println!("cargo:rerun-if-changed=icons/icon.ico");
     println!("cargo:rerun-if-changed=icons/icon.png");
-    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&[
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(command_manifest(&[
+            "agent_debug_set_allowed",
+            "agent_debug_trace_native",
             "desktop_initialize",
             "desktop_manage",
             "desktop_start_service",
@@ -98,7 +99,16 @@ fn main() {
             "resource_cancel",
             "aniflive_import_choose_folder",
             "aniflive_import_start",
-        ]),
-    ))
+        ])))
     .expect("桌面权限清单构建失败");
+}
+
+fn command_manifest(commands: &'static [&'static str]) -> tauri_build::AppManifest {
+    // 代理调试目录与正式权限生成使用同一个原生命令声明。
+    std::fs::write(
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("desktop-commands.txt"),
+        commands.join("\n"),
+    )
+    .expect("无法写入正式命令目录");
+    tauri_build::AppManifest::new().commands(commands)
 }

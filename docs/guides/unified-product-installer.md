@@ -18,7 +18,9 @@
 | `npm run github:release:local` | 同一发行包更新本机并公开发行，自动回下载核验 |
 | `scripts/distribute-desktop.ps1 -SkipProductBuild` | 使用上次本地发布的同一程序包构建安装器 |
 | `npm run dev:ui` | 构建并运行隔离的前端演示，不启动业务后端 |
-| `VoiceTerminal.exe --exit` | 请求同一工作区已有正式实例正常退出 |
+| `VoiceTerminal.exe --exit` | 正常退出同一工作区的实例并等待释放工作区 |
+| `VoiceTerminal.exe --agent-debug` | 使用正式界面启动[代理调试模式](agent-debug.md) |
+| `VoiceTerminal.exe --agent-stdio` | 通过标准输入输出调用调试接口 |
 | `VoiceTerminal.exe --verify-package` | 原生逐文件验证固定本体，不要求后端环境 |
 
 正式程序包在 `.local/build/program-package/program.zip`（统一本体归档），只交付正式入口、宿主、界面、业务及支持文件。`app/release.json`（本体清单）的 `components`（组件登记）属于工作区状态，重装保留。安装器不内嵌完整后端环境、代理宿主或用户数据；本体换入后检查组件状态并交接正式程序，不下载或安装组件。随包种子和原生补丁保留在本体资源内，组件安装更新由正式程序组件列表执行。产品和安装器继续复用原生依赖编译缓存。

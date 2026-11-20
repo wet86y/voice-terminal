@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app_icon;
+mod agent_debug;
 mod integrity_commands;
 use integrity_commands::{
     app_integrity_check, app_integrity_download, app_integrity_status, maintenance_payload,
@@ -468,6 +469,8 @@ fn frontend_capability(
     };
     if mode == FrontendMode::Product {
         if let Some(permissions) = capability["permissions"].as_array_mut() {
+            permissions.push(serde_json::json!("allow-agent-debug-set-allowed"));
+            permissions.push(serde_json::json!("allow-agent-debug-trace-native"));
             permissions.push(serde_json::json!("allow-device-config-status"));
             permissions.push(serde_json::json!("allow-device-config-save"));
             permissions.push(serde_json::json!("allow-device-worker-start"));
@@ -518,7 +521,7 @@ fn frontend_capability(
 
 /// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗展示、输入启停及窗口交互。
 fn floating_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
-    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","core:event:allow-listen","core:event:allow-unlisten"]})
+    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
 }
 
 /// floating_publisher_capability（悬浮窗状态发布权限）：主窗口只能更新浮窗展示快照。
@@ -749,6 +752,9 @@ impl Desktop {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(debug) = app.try_state::<Arc<agent_debug::AgentDebug>>() {
+            debug.revoke();
+        }
         #[cfg(feature = "ssh-device")]
         self.device_terminal.shutdown();
         #[cfg(feature = "ssh-device")]
@@ -966,6 +972,7 @@ fn create_floating_window(
         .background_color(tauri::window::Color(0, 0, 0, 0))
         .shadow(false)
         .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
+    .initialization_script(agent_debug::AgentDebug::window_script(app))
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
@@ -2090,11 +2097,12 @@ async fn device_discovery_search(
         desktop
             .discovery_search_expires_at_ms
             .store(expires_at_ms, Ordering::Release);
-        Ok(serde_json::json!({
+        let result = serde_json::json!({
             "protocol_version":voice_desktop_common::device_discovery::DISCOVERY_PROTOCOL_VERSION,
             "devices":devices,
             "fields":{"protocol_version":"固定 mDNS 发现协议版本","devices":"搜索到的服务端身份、配对入口、能力及局域网地址记录"}
-        }))
+        });
+        Ok(result)
     }
     #[cfg(not(feature = "ssh-device"))]
     {
@@ -3150,6 +3158,7 @@ async fn device_ssh_connect(
         };
         operation.phase("connecting", "正在验证已配对服务端并建立安全连接。");
         client_event(&state, "client.connect_attempt", serde_json::json!({"state":"connecting"}));
+        let debug_call = agent_debug::window_operation(&window);
         let outcome = async {
         let context = state.context().ok_or("缺少正式工作区")?;
         let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
@@ -3193,6 +3202,16 @@ async fn device_ssh_connect(
         state
             .remote_client_connected
             .store(false, Ordering::Release);
+        let mut timeout = timeout_ms.unwrap_or(10_000);
+        if let Some((debug, call)) = &debug_call {
+            if let Some(value) = debug.point("device.connection", "input", *call, &serde_json::json!({"timeout_ms":timeout})).await {
+                if let Some(replacement) = value["timeout_ms"].as_u64().filter(|value| (1..=60_000).contains(value)) {
+                    timeout = replacement;
+                } else {
+                    debug.observe("device.connection", "rejected", *call, &serde_json::json!({"reason":"连接等待时间无效。"}));
+                }
+            }
+        }
         state
             .ssh_device
             .connect(
@@ -3200,7 +3219,7 @@ async fn device_ssh_connect(
                 transport_credential_ref.as_deref(),
                 &device_id,
                 target,
-                std::time::Duration::from_millis(timeout_ms.unwrap_or(10_000)),
+                std::time::Duration::from_millis(timeout),
             )
             .await?;
         if !matches!(voice_desktop_common::device_config::load_from_root(&context.data),
@@ -3219,6 +3238,12 @@ async fn device_ssh_connect(
                 "transport_credential_ref":"单独用于 OpenSSH 账户登录的凭据引用；为空时沿用产品设备身份"}}),
         )
         }.await;
+        if let Some((debug, call)) = debug_call {
+            match &outcome {
+                Ok(result) => debug.observe("device.connection", "result", call, result),
+                Err(error) => debug.observe("device.connection", "error", call, &serde_json::json!({"reason":error})),
+            }
+        }
         client_event(&state, if outcome.is_ok() { "client.connected" } else { "client.connect_failed" },
             serde_json::json!({"reason":outcome.as_ref().err(),"state":if outcome.is_ok(){"connected"}else{"error"}}));
         operation.finish(outcome.as_ref().err().cloned());
@@ -3318,8 +3343,7 @@ async fn device_ssh_request(
 /// device_ssh_management_request（提交远程业务操作）：固定目标、操作枚举和管理会话代次。
 #[cfg(feature = "ssh-device")]
 /// remote_business_operation_allowed（检查远程业务操作是否位于固定白名单中）。
-fn remote_business_operation_allowed(operation: &str) -> bool {
-    const ALLOWED_OPERATIONS: &[&str] = &[
+const REMOTE_BUSINESS_OPERATIONS: &[&str] = &[
         "management.status",
         "resource.inventory",
         "resource.jobs",
@@ -3416,7 +3440,9 @@ fn remote_business_operation_allowed(operation: &str) -> bool {
         "speaker.template.delete",
         "speaker.template.update",
     ];
-    ALLOWED_OPERATIONS.contains(&operation)
+#[cfg(feature = "ssh-device")]
+fn remote_business_operation_allowed(operation: &str) -> bool {
+    REMOTE_BUSINESS_OPERATIONS.contains(&operation)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -8338,11 +8364,20 @@ fn workspace_info(
     require_command(state.mode, DesktopCommand::FocusMain)?;
     trusted(&window, &state)?;
     let context = state.context().ok_or("缺少产品工作区")?;
+    let allow_external_debug = voice_desktop_common::agent_debug::allowed(&context.data).unwrap_or(false);
     Ok(
         serde_json::json!({"root":context.install,"data_dir":context.data,
-        "version":env!("CARGO_PKG_VERSION"),"can_manage":true,
-        "fields":{"root":"当前工作区根目录","data_dir":"用户数据目录","version":"程序版本","can_manage":"允许管理工作区"}}),
+        "version":env!("CARGO_PKG_VERSION"),"can_manage":true,"allow_external_debug":allow_external_debug,
+        "fields":{"root":"当前工作区根目录","data_dir":"用户数据目录","version":"程序版本","can_manage":"允许管理工作区","allow_external_debug":"允许外部调试"}}),
     )
+}
+#[tauri::command]
+fn agent_debug_set_allowed(
+    window: WebviewWindow,
+    state: tauri::State<Arc<Desktop>>,
+    allowed: bool,
+) -> Result<(), String> {
+    agent_debug::set_allowed(window, state, allowed)
 }
 fn require_workspace(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     trusted(window, state)?;
@@ -9286,6 +9321,9 @@ fn start_service_for(
         let context = state.context().ok_or("产品服务缺少桌面启动上下文。")?;
         command = voice_desktop_common::process_host::python_command(&context.python);
         context.configure_command(&mut command);
+        if let Some(debug) = app.try_state::<Arc<agent_debug::AgentDebug>>() {
+            debug.configure_worker(&mut command, &context.install)?;
+        }
         if let voice_desktop_common::device_config::LoadResult::Valid(device_config) =
             voice_desktop_common::device_config::load_from_root(&context.data)
         {
@@ -9748,6 +9786,7 @@ fn create_window(
     .background_color(tauri::window::Color(14, 17, 24, 255))
     .visible(false)
     .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
+    .initialization_script(agent_debug::AgentDebug::window_script(app))
     .title(if build_state.mode == FrontendMode::UiPreview {
         "Voice Terminal · 前端演示（无业务后端）"
     } else {
@@ -9957,6 +9996,27 @@ fn launch_device_config(
     Ok(Some(config))
 }
 
+const AGENT_TRAY_ITEMS: [(&str, &str); 3] = [
+    ("show", "打开工作台"), ("floating", "悬浮窗模式"), ("exit", "退出应用"),
+];
+
+fn handle_tray_item(app: &tauri::AppHandle, state: &Arc<Desktop>, id: &str) {
+    match id {
+        "show" => show(app),
+        "floating" => {
+            let enabled = !state.floating_mode.load(Ordering::Acquire);
+            if let Err(error) = set_floating_mode(app, state, enabled) {
+                set_floating_menu_checked(state, false);
+                if enabled {
+                    let _ = app.emit_to("main", "voice-terminal:floating-error", error);
+                }
+            }
+        }
+        "exit" => state.shutdown(app),
+        _ => {}
+    }
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let preview_count = args
@@ -9968,12 +10028,18 @@ fn run() -> Result<(), String> {
     }
     let preview = preview_count == 1;
     let exit_requested = args.iter().any(|arg| arg == "--exit");
+    let agent_mode = args.iter().any(|arg| arg == "--agent-debug");
     let (context, mode, program, data, webview2) = if preview {
         let (program, _, data) = ui_preview_context(&args)?;
         voice_desktop_common::prepare_webview_access_paths(&data, None)?;
         (None, FrontendMode::UiPreview, program, data, None)
     } else {
         let context = LaunchContext::from_args()?;
+        if agent_mode && (!voice_desktop_common::agent_debug::allowed(&context.data)?
+            || voice_desktop_common::agent_debug::session_id()? == 0 || context.diagnostic || exit_requested)
+        {
+            return Err("调试模式需要已授权的正式交互桌面。".into());
+        }
         voice_desktop_common::compatibility::migrate_device_runtime_config(&context.data)?;
         apply_launch_mode_override(&context.data, &args)?;
         context.prepare_webview_access()?;
@@ -10114,12 +10180,37 @@ fn run() -> Result<(), String> {
         qualification_control && args.iter().any(|value| value == "--qualification-exit");
     let instance_state = state.clone();
     let build_state = state.clone();
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        agent_debug_set_allowed,agent_debug::agent_debug_trace_native,
+        desktop_status,desktop_page_ready,device_config_status,device_config_save,device_discovery_search,device_pairing_window_open,device_pairing_window_close,device_pairing_window_status,device_pairing_connect,device_worker_start,device_worker_status,device_worker_audio_devices,device_worker_desktop_helper_health,
+            device_worker_capture_start,device_worker_capture_next,device_worker_capture_stop,
+        device_worker_playback_start,device_worker_playback_enqueue,device_worker_playback_snapshot,device_worker_playback_stop,
+            device_ssh_probe,device_ssh_identity_create,device_ssh_identity_status,device_ssh_identity_delete,
+            device_ssh_transport_identity_import,device_ssh_transport_identity_status,device_ssh_transport_identity_delete,
+            device_ssh_connect,device_ssh_pairing_request,device_ssh_request,device_ssh_management_request,device_ssh_import_start,device_ssh_import_cancel,device_ssh_tts_asset_import,device_ssh_disconnect,device_ssh_status,device_ssh_task_channel,device_ssh_media_channel,device_ssh_voice_forwarder,
+            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
+            skip_startup,
+            export_logs,
+            open_console,
+            exit_application,
+            focus_main,
+            desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
+            model_credentials_status,model_credentials_save,inference_selection_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
+            resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
+            workspace_info,workspace_choose,workspace_link,workspace_migrate,workspace_cleanup,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
+            resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_system_feature_access,resource_download,resource_download_required,resource_import,resource_import_choose_sources,resource_import_start,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
+            aniflive_import_choose_folder,aniflive_import_start
+    ];
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(move |app, arguments, _| {
             if arguments.iter().any(|value|value=="--exit")||qualification_control
                 && arguments.iter().any(|value| value == "--qualification-exit")
             {
                 instance_state.shutdown(app);
+            } else if instance_state.mode == FrontendMode::Product
+                && arguments.iter().any(|value| value == "--agent-debug") != agent_mode
+            {
+                show(app);
             } else if arguments.iter().any(|value| matches!(value.as_str(), "--mode" | "--broadcast"))
                 && instance_state.mode == FrontendMode::Product
             {
@@ -10143,26 +10234,7 @@ fn run() -> Result<(), String> {
             }
         }))
         .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![
-        desktop_status,desktop_page_ready,device_config_status,device_config_save,device_discovery_search,device_pairing_window_open,device_pairing_window_close,device_pairing_window_status,device_pairing_connect,device_worker_start,device_worker_status,device_worker_audio_devices,device_worker_desktop_helper_health,
-            device_worker_capture_start,device_worker_capture_next,device_worker_capture_stop,
-        device_worker_playback_start,device_worker_playback_enqueue,device_worker_playback_snapshot,device_worker_playback_stop,
-            device_ssh_probe,device_ssh_identity_create,device_ssh_identity_status,device_ssh_identity_delete,
-            device_ssh_transport_identity_import,device_ssh_transport_identity_status,device_ssh_transport_identity_delete,
-            device_ssh_connect,device_ssh_pairing_request,device_ssh_request,device_ssh_management_request,device_ssh_import_start,device_ssh_import_cancel,device_ssh_tts_asset_import,device_ssh_disconnect,device_ssh_status,device_ssh_task_channel,device_ssh_media_channel,device_ssh_voice_forwarder,
-            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
-            skip_startup,
-            export_logs,
-            open_console,
-            exit_application,
-            focus_main,
-            desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
-            model_credentials_status,model_credentials_save,inference_selection_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
-            resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
-            workspace_info,workspace_choose,workspace_link,workspace_migrate,workspace_cleanup,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
-            resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_system_feature_access,resource_download,resource_download_required,resource_import,resource_import_choose_sources,resource_import_start,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
-            aniflive_import_choose_folder,aniflive_import_start
-        ])
+        .invoke_handler(handler)
         .setup(move |app| {
             if qualification_exit||exit_requested {
                 build_state.shutdown(app.handle());
@@ -10171,36 +10243,24 @@ fn run() -> Result<(), String> {
             if let Some(context)=build_state.context(){
                 *build_state.workspace_guard.lock().unwrap()=Some(voice_desktop_common::installation::WorkspaceGuard::acquire(&context.install).map_err(std::io::Error::other)?);
                 initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
+                agent_debug::AgentDebug::install(app.handle(), build_state.clone(), agent_mode).map_err(std::io::Error::other)?;
             }
             let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).map(|pending|pending||context.install.join("tmp/native-install.json").exists())).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
             create_window(app.handle(),build_state.clone(),maintenance).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
-                let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
-                let floating_item = CheckMenuItem::with_id(app, "floating", "悬浮窗模式", true, false, None::<&str>)?;
-                let exit_item = MenuItem::with_id(app, "exit", "退出应用", true, None::<&str>)?;
+                let [(show_id, show_label), (float_id, float_label), (exit_id, exit_label)] = AGENT_TRAY_ITEMS;
+                let show_item = MenuItem::with_id(app, show_id, show_label, true, None::<&str>)?;
+                let floating_item = CheckMenuItem::with_id(app, float_id, float_label, true, false, None::<&str>)?;
+                let exit_item = MenuItem::with_id(app, exit_id, exit_label, true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show_item, &floating_item, &exit_item])?;
                 *build_state.floating_menu.lock().unwrap() = Some(floating_item);
                 let icon = app_icon::tray();
-                let exit_state = build_state.clone();
-                let floating_state = build_state.clone();
+                let tray_state = build_state.clone();
                 let tray = TrayIconBuilder::with_id("voice-terminal")
                     .icon(icon)
                     .tooltip("Voice Terminal · 语音终端")
                     .menu(&menu)
-                    .on_menu_event(move |app, event| match event.id.as_ref() {
-                        "show" => show(app),
-                        "floating" => {
-                            let enabled = !floating_state.floating_mode.load(Ordering::Acquire);
-                            if let Err(error) = set_floating_mode(app, &floating_state, enabled) {
-                                set_floating_menu_checked(&floating_state, false);
-                                if enabled {
-                                    let _ = app.emit_to("main", "voice-terminal:floating-error", error);
-                                }
-                            }
-                        }
-                        "exit" => exit_state.shutdown(app),
-                        _ => {}
-                    })
+                    .on_menu_event(move |app, event| handle_tray_item(app, &tray_state, event.id.as_ref()))
                     .on_tray_icon_event(|tray, event| {
                         if matches!(
                             event,

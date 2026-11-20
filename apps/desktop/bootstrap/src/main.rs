@@ -119,6 +119,12 @@ fn start() -> Result<(), String> {
     }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let root = executable.parent().ok_or("正式入口缺少工作区目录")?;
+    if args == ["--agent-stdio"] {
+        return voice_desktop_common::agent_debug::relay(root);
+    }
+    if args == ["--exit"] {
+        return voice_desktop_common::agent_debug::request_exit(root);
+    }
     if let Some(task) = workspace::pending_task(root)? {
         return run_task(&task);
     }
@@ -128,6 +134,17 @@ fn start() -> Result<(), String> {
         workspace::recover_install(root)?;
     }
     let context = LaunchContext::from_executable(&executable, &args)?;
+    if args.iter().any(|arg| arg == "--agent-debug") && value(&args, "--startup-handoff").is_none()
+    {
+        return start_with_receipt(root, &executable, &context, &args, true);
+    }
+    if args.is_empty() && voice_desktop_common::agent_debug::session_id()? == 0 {
+        return start_with_receipt(root, &executable, &context, &args, false);
+    }
+    spawn_desktop(&context, &args)
+}
+
+fn spawn_desktop(context: &LaunchContext, args: &[String]) -> Result<(), String> {
     let mut command = Command::new(desktop_executable(&context)?);
     context.configure_command(&mut command);
     // 独立桌面进程不继承调用者管道，正式启动命令与安装器都能完成退出。
@@ -138,6 +155,21 @@ fn start() -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::{
+            Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE},
+            System::Console::{
+                GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            },
+        };
+        // 新桌面进程使用自己的空句柄。关闭根入口的标准句柄继承位，SSH 和调用方才能收到文件结束。
+        for standard in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let handle = GetStdHandle(standard);
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
         command.creation_flags(0x08000000);
     }
     command
@@ -147,12 +179,113 @@ fn start() -> Result<(), String> {
         .map_err(|e| format!("无法建立正式桌面窗口：{e}"))?;
     Ok(())
 }
+
+fn start_with_receipt(
+    root: &Path,
+    entry: &Path,
+    context: &LaunchContext,
+    args: &[String],
+    debug: bool,
+) -> Result<(), String> {
+    use voice_desktop_common::agent_debug;
+    if !agent_debug::allowed(&context.data)? {
+        return Err("请在设置的关于页允许外部调试。".into());
+    }
+    installation::ensure_idle(root)?;
+    drop(installation::WorkspaceGuard::acquire(root)?);
+    let pid = if agent_debug::session_id()? == 0 {
+        if debug && args != ["--agent-debug"] {
+            return Err(
+                "跨会话启动使用 --agent-debug（调试模式），设备角色沿用当前工作区设置。".into(),
+            );
+        }
+        start_in_desktop(root, entry, debug)?
+    } else {
+        installation::launch_with_handoff(root, |token| {
+            let mut launch_args = args.to_vec();
+            launch_args.extend(["--startup-handoff".into(), token.into()]);
+            spawn_desktop(context, &launch_args)
+        })?
+    };
+    println!(
+        "{}",
+        serde_json::json!({"pid":pid,"mode":if debug {"agent-debug"} else {"normal"},"fields":{"pid":"正式宿主进程号","mode":"启动模式"}})
+    );
+    Ok(())
+}
+
+fn start_in_desktop(root: &Path, entry: &Path, debug: bool) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    let session = voice_desktop_common::agent_debug::interactive_session()?;
+    let task = format!("VoiceTerminal-Agent-{}", workspace::new_id());
+    let shell = PathBuf::from(std::env::var_os("SystemRoot").ok_or("找不到 Windows 系统目录。")?)
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let run = |script: &str, token: &str| {
+        Command::new(&shell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("VOICE_AGENT_LAUNCH_TASK", &task)
+            .env("VOICE_AGENT_LAUNCH_ENTRY", entry)
+            .env("VOICE_AGENT_LAUNCH_TOKEN", token)
+            .env(
+                "VOICE_AGENT_LAUNCH_MODE",
+                if debug { "--agent-debug " } else { "" },
+            )
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|error| error.to_string())
+    };
+    let result = installation::launch_with_handoff(root, |token| {
+        let output = run(
+            r#"
+$ErrorActionPreference = 'Stop'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$arguments = $env:VOICE_AGENT_LAUNCH_MODE + '--startup-handoff ' + $env:VOICE_AGENT_LAUNCH_TOKEN
+$action = New-ScheduledTaskAction -Execute $env:VOICE_AGENT_LAUNCH_ENTRY -Argument $arguments
+$principal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $env:VOICE_AGENT_LAUNCH_TASK -Action $action -Principal $principal -Settings $settings | Out-Null
+Start-ScheduledTask -TaskName $env:VOICE_AGENT_LAUNCH_TASK
+"#,
+            token,
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err("无法为当前账户的交互桌面启动正式调试实例。请确认该账户已登录桌面并具有按需计划任务权限。".into())
+        }
+    });
+    let cleanup = run("Unregister-ScheduledTask -TaskName $env:VOICE_AGENT_LAUNCH_TASK -Confirm:$false -ErrorAction SilentlyContinue", "");
+    if result.is_ok() && !cleanup.is_ok_and(|output| output.status.success()) {
+        eprintln!("调试启动交接已完成，计划任务清理调用失败。");
+    }
+    let pid = result?;
+    if voice_desktop_common::agent_debug::process_session_id(pid)? != session {
+        return Err("窗口交接来自另一交互会话。".into());
+    }
+    Ok(pid)
+}
 fn main() {
     if let Err(message) = start() {
         eprintln!("{message}");
-        if std::env::args().any(|arg| {
-            arg == "--install-package" || arg == "--verify-package" || arg == "--retain-installer"
-        }) {
+        if voice_desktop_common::agent_debug::session_id() == Ok(0)
+            || std::env::args().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--install-package"
+                        | "--verify-package"
+                        | "--retain-installer"
+                        | "--exit"
+                        | "--agent-debug"
+                        | "--agent-stdio"
+                )
+            })
+        {
             std::process::exit(1);
         }
         voice_desktop_common::windows::error(&message);

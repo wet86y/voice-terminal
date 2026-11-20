@@ -63,6 +63,8 @@
     "allow-export-logs",
     "allow-focus-main",
     "allow-workspace-info",
+    "allow-agent-debug-set-allowed",
+    "allow-agent-debug-trace-native",
     "allow-workspace-choose",
     "allow-workspace-link",
     "allow-workspace-migrate",

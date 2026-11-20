@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-agent-debug-set-allowed"
+description = "Enables the agent_debug_set_allowed command without any pre-configured scope."
+commands.allow = ["agent_debug_set_allowed"]
+
+[[permission]]
+identifier = "deny-agent-debug-set-allowed"
+description = "Denies the agent_debug_set_allowed command without any pre-configured scope."
+commands.deny = ["agent_debug_set_allowed"]

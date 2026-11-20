@@ -13,7 +13,7 @@ sha1 = { version = "=0.11.0", optional = true } # sha1（WebSocket 协议接受�
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "fs", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "fs", "macros"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"], optional = true } # futures-util（WebSocket 消息收发扩展）。
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"], optional = true } # tokio-tungstenite（Rust 异步 WebSocket，使用系统 TLS 根证书）。
 rand = { version = "=0.10.3", features = ["sys_rng"], optional = true } # rand（设备身份密钥和签名的操作系统随机数）。
@@ -31,7 +31,7 @@ cc = "1"
 distribution = []
 qualification = ["distribution"]
 native-audio = [] # native-audio（启用固定 WebRTC AEC/VAD 与 Opus 编解码原生组件）。
-ssh-device = ["dep:russh", "dep:tokio", "dep:futures-util", "dep:tokio-tungstenite", "dep:rand", "dep:ed25519-dalek", "dep:sha1", "dep:mdns-sd", "dep:opaque-ke", "dep:aes-gcm", "dep:rand-pake", "windows-sys/Win32_Graphics_GdiPlus", "windows-sys/Win32_System_StationsAndDesktops"] # ssh-device（客户端 SSH 连接、局域网发现、OPAQUE 配对、设备媒体、截图及固定 FILE 文件传输）。
+ssh-device = ["dep:russh", "dep:futures-util", "dep:tokio-tungstenite", "dep:rand", "dep:ed25519-dalek", "dep:sha1", "dep:mdns-sd", "dep:opaque-ke", "dep:aes-gcm", "dep:rand-pake", "windows-sys/Win32_Graphics_GdiPlus", "windows-sys/Win32_System_StationsAndDesktops"] # ssh-device（客户端 SSH 连接、局域网发现、OPAQUE 配对、设备媒体、截图及固定 FILE 文件传输）。
 ssh-device-test-support = ["ssh-device"] # ssh-device-test-support（仅测试使用的固定指纹 SSH 集成夹具接口）。
 
 # SSH（安全外壳协议）验收示例使用可选 SSH 依赖，只在启用对应能力时编译。
@@ -47,4 +47,4 @@ required-features = ["ssh-device"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_Audio", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls_Dialogs", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Credentials", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Controls_Dialogs", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography"] }

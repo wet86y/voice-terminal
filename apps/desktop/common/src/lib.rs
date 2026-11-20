@@ -7,6 +7,8 @@ use std::{
 };
 
 pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
+#[cfg(windows)]
+pub mod agent_debug; // agent_debug（代理调试）：工作区授权、命令和本机传输。
 #[cfg(feature = "ssh-device")]
 pub mod client_tts; // client_tts（无 Python 客户端 MiniMax 双向流式语音合成）。
 pub mod compatibility; // compatibility（兼容性组件）：版本化规则、安装迁移与即时组件盘点。
@@ -311,7 +313,7 @@ impl LaunchContext {
                 return Err(format!("启动参数重复：{arg}"));
             }
             match arg.as_str() {
-                "--dev" | "--diagnostic" | "--exit" => {}
+                "--dev" | "--diagnostic" | "--exit" | "--agent-debug" => {}
                 "--mode" | "--broadcast" => {
                     i += 1;
                     let selected = args

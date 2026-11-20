@@ -1,5 +1,6 @@
 """Authenticated Voice Terminal side of the first-party DSH Shadow Bridge."""
 from __future__ import annotations
+from .. import agent_debug
 
 import asyncio
 import hashlib
@@ -289,6 +290,7 @@ class DshBridgeClient:
             raise DshBridgeError("MiniMax 配置同步未确认，稍后重试")
         return result
 
+    @agent_debug.observe_operation
     async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = str(payload.get("request_id") or uuid.uuid4())
         body = {

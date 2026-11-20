@@ -121,6 +121,15 @@ class AsrWorkerClient:
                         )
                         continue
                 if self.on_result is not None and isinstance(message, dict):
+                    if message.get("type") == "asr.final":
+                        from ..agent_debug import point
+                        original = message
+                        message, call_id = await point("asr.final", "result", original, lambda value:
+                            isinstance(value, dict) and value.keys() == original.keys()
+                            and all(value[key] == original[key] for key in original if key != "text")
+                            and isinstance(value["text"], str) and len(value["text"]) <= 100_000)
+                    else:
+                        call_id = None
                     logger.info(
                         "asr.client.received type=%s turn_id=%s text_len=%d text=%r latency=%s",
                         message.get("type"),
@@ -130,7 +139,12 @@ class AsrWorkerClient:
                         json.dumps(message.get("latency"), ensure_ascii=False),  # latency（识别分段耗时）。
                     )
                     try:
-                        await self.on_result(message)
+                        from ..agent_debug import start_call, end_call
+                        token = start_call(call_id)
+                        try:
+                            await self.on_result(message)
+                        finally:
+                            end_call(token)
                     except asyncio.CancelledError:
                         raise
                     except Exception:

@@ -1,5 +1,6 @@
 """Selectable capture route（可切换采集路由）：固定控制器引用，串行更换设备端口。"""
 from __future__ import annotations
+from .. import agent_debug
 
 import asyncio
 
@@ -135,6 +136,7 @@ class SelectableCapturePort:
                 await port.stop()
             return True
 
+    @agent_debug.observe_operation
     async def start(self) -> None:
         """start（启动当前端口）：沿用核心控制器现有的会话启停入口。"""
         async with self._switch_lock:
@@ -146,6 +148,7 @@ class SelectableCapturePort:
             await port.start()
             self._running = True
 
+    @agent_debug.observe_operation
     async def stop(self) -> None:
         """stop（停止当前端口）：唤醒正在等待的帧读取并释放设备资源。"""
         async with self._switch_lock:

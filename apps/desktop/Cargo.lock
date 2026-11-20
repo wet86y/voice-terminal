@@ -5704,6 +5704,8 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "voice-desktop-common",
+ "webview2-com",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

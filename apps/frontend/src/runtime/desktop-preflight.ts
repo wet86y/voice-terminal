@@ -31,6 +31,8 @@ export interface NativeCommandInvoker {
 
 type NativeWindow = Window & {
   __TAURI_INTERNALS__?: NativeCommandInvoker
+  /** __VOICE_AGENT_DEBUG__（正式调试启动标志）：仅由本机正式宿主初始化。 */
+  __VOICE_AGENT_DEBUG__?: true
   /** __TAURI_EVENT_PLUGIN_INTERNALS__（桌面事件插件内部接口）：同步移除本地事件回调。 */
   __TAURI_EVENT_PLUGIN_INTERNALS__?: {
     unregisterListener(event: string, eventId: number): void
@@ -39,7 +41,32 @@ type NativeWindow = Window & {
 
 /** locateNativeInvoker（查找原生命令调用器）：浏览器运行时不提供替代实现。 */
 export function locateNativeInvoker(target: Window | undefined = typeof window === 'undefined' ? undefined : window): NativeCommandInvoker | null {
-  return (target as NativeWindow | undefined)?.__TAURI_INTERNALS__ ?? null
+  const desktop = target as NativeWindow | undefined
+  const native = desktop?.__TAURI_INTERNALS__
+  if (!native || !desktop?.__VOICE_AGENT_DEBUG__) return native ?? null
+  return {
+    transformCallback: native.transformCallback?.bind(native),
+    unregisterCallback: native.unregisterCallback?.bind(native),
+    async invoke<T>(command: string, args?: Record<string, unknown>) {
+      if (command.startsWith('plugin:')) return native.invoke<T>(command, args)
+      const input = await native.invoke<{ call_id: number; replacement: Record<string, unknown> | null } | null>(
+        'agent_debug_trace_native', { point: command, stage: 'input', value: args ?? {} },
+      ).catch(() => null)
+      const report = (stage: 'result' | 'error', value: unknown) => {
+        if (input) void native.invoke('agent_debug_trace_native', {
+          point: command, stage, value: value ?? null, callId: input.call_id,
+        }).catch(() => {})
+      }
+      try {
+        const value = await native.invoke<T>(command, input?.replacement ?? args)
+        report('result', value)
+        return value
+      } catch (error) {
+        report('error', typeof error === 'string' ? error : null)
+        throw error
+      }
+    },
+  }
 }
 
 /** validateDesktopStatus（验证桌面状态）：任何字段不匹配都阻止应用模块加载。 */

@@ -13,6 +13,7 @@ import re
 import secrets
 import time
 from pathlib import Path
+from enum import StrEnum
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, quote
 from uuid import uuid4
@@ -781,6 +782,19 @@ async def _device_pairing_payload(request: Any) -> dict[str, Any]:
     return {**payload, "client_nonce_bytes": nonce, "signature_bytes": signature}
 
 
+class VoiceSocketCommand(StrEnum):
+    """实时控制消息的正式分发契约。"""
+
+    SUBSCRIBE = "subscribe"
+    CONVERSATION_IMAGE_READ = "conversation.image.read"
+    SESSION_START = "session.start"
+    SESSION_STOP = "session.stop"
+    SESSION_RESET = "session.reset"
+    SESSION_CLEAR = "session.clear"
+    SESSION_REASONING_MODE = "session.reasoning_mode"
+    SHADOW_DEBUG_WAKE = "shadow.debug.wake"
+
+
 def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(message, dict) or message.get("type") != "command":
         return None
@@ -886,6 +900,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     from .dsh_attachment_transport import StagedAttachmentResponse, attachment_response, capture_response
 
     app = FastAPI(title="Voice Terminal Server", version=__version__, lifespan=lifespan)
+    from .. import agent_debug
+    if agent_debug.ENABLED:
+        app.router.route_class = agent_debug.route_class()
+        make_schema = app.openapi
+
+        def schema_with_voice_commands():
+            schema = make_schema()
+            schema["x-voice-commands"] = list(VoiceSocketCommand)
+            return schema
+
+        app.openapi = schema_with_voice_commands
     aniflive_import_service = None
 
     def aniflive_import_or_503():
@@ -4625,7 +4650,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             result = "accepted"
             detail = None
             try:
-                if command == "session.start":
+                if command == VoiceSocketCommand.SESSION_START:
                     await runtime.start_listening(remote_lease=lease, expected_stop_revision=stop_revision)
                     if (not runtime.state.listening and not runtime.listening_intent_pending()
                             and stop_revision == runtime._listen_stop_revision):
@@ -4665,14 +4690,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     await writer.close(code=1008)
                     return
                 if (getattr(runtime, "application_initializing", False) is True
-                        and command in {"session.start", "session.reset", "session.clear", "shadow.debug.wake"}):
+                        and command in {VoiceSocketCommand.SESSION_START, VoiceSocketCommand.SESSION_RESET, VoiceSocketCommand.SESSION_CLEAR, VoiceSocketCommand.SHADOW_DEBUG_WAKE}):
                     await _send_error(writer, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True,
                                       request_id=message["request_id"])
                     continue
-                if command == "subscribe":
+                _payload, _ = await agent_debug.point(
+                    f"WS /ws:{command}", "input", _payload, lambda value: isinstance(value, dict))
+                if command == VoiceSocketCommand.SUBSCRIBE:
                     await writer.send_json(sequencer.envelope(runtime.snapshot()))
                     changed.set()
-                elif command == "conversation.image.read":
+                elif command == VoiceSocketCommand.CONVERSATION_IMAGE_READ:
                     cid = _payload.get("conversation_id")
                     aid = _payload.get("attachment_id")
                     item = runtime.history.screen_attachment(cid, aid) if cid == runtime.conversation.conversation_id and isinstance(aid, str) else None
@@ -4688,9 +4715,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                 conversation_id=cid, attachment_id=aid, index=index, total=total,
                                 mime_type=item["mime_type"], data=encoded[index * chunk_size:(index + 1) * chunk_size])))
                             await asyncio.sleep(0)
-                elif command in {"session.start", "session.stop"}:
+                elif command in {VoiceSocketCommand.SESSION_START, VoiceSocketCommand.SESSION_STOP}:
                     if device is None:
-                        await (runtime.start_listening() if command == "session.start" else runtime.stop_listening())
+                        await (runtime.start_listening() if command == VoiceSocketCommand.SESSION_START else runtime.stop_listening())
                         runtime.device_state_changed()
                         continue
                     request_id = message["request_id"]
@@ -4702,7 +4729,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             "device.intent", request_id=request_id, result="rejected",
                             detail="本设备尚未取得可用的语音输入。",
                         )))
-                    elif command == "session.stop":
+                    elif command == VoiceSocketCommand.SESSION_STOP:
                         await remote_listening(command, request_id, lease, stop_revision)
                     elif start_task is None or start_task.done():
                         if start_task is not None:
@@ -4712,8 +4739,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         await writer.send_json(sequencer.envelope(event(
                             "device.intent", request_id=request_id, result="rejected", detail="正在启动录制。",
                         )))
-                elif command in {"session.reset", "session.clear"}:
-                    operation = "reset" if command == "session.reset" else "clear"
+                elif command in {VoiceSocketCommand.SESSION_RESET, VoiceSocketCommand.SESSION_CLEAR}:
+                    operation = "reset" if command == VoiceSocketCommand.SESSION_RESET else "clear"
                     try:
                         if operation == "reset":
                             await runtime.reset_session()
@@ -4727,11 +4754,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             "HANDOFF_RESET_FAILED" if operation == "reset" else "SESSION_CLEAR_FAILED",
                             "会话操作未完成，已保存的材料与归档已保留，可重试以完成会话切换。", None, True,
                             request_id=message["request_id"])
-                elif command == "session.reasoning_mode":
+                elif command == VoiceSocketCommand.SESSION_REASONING_MODE:
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
                         await _send_error(writer, sequencer, "INVALID_REASONING_MODE", "运行模式必须是 fast（快速）或 deep（深度）。", None, True)
-                elif command == "shadow.debug.wake":
+                elif command == VoiceSocketCommand.SHADOW_DEBUG_WAKE:
                     async def debug_sink(items: list[ShadowEvent]) -> None:
                         for item in items:
                             await debug_events.put(event(

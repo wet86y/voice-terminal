@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { runDesktopPreflight, validateDesktopStatus, type NativeCommandInvoker } from './desktop-preflight'
+import { locateNativeInvoker, runDesktopPreflight, validateDesktopStatus, type NativeCommandInvoker } from './desktop-preflight'
 import { APPLICATION_EXIT_EVENT } from './application-motion'
 
 function native(status: unknown): NativeCommandInvoker {
@@ -14,6 +14,21 @@ afterEach(() => {
 })
 
 describe('desktop preflight（桌面预检）', () => {
+  it('以相同的正式调用器执行新命令并回传真实结果', async () => {
+    const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'agent_debug_trace_native' && args?.stage === 'input') {
+        return { call_id: 8, replacement: { text: '替换后' } }
+      }
+      if (command === 'new_production_command') return { accepted: args?.text }
+    })
+    vi.stubGlobal('__TAURI_INTERNALS__', { invoke })
+    vi.stubGlobal('__VOICE_AGENT_DEBUG__', true)
+    expect(await locateNativeInvoker()?.invoke('new_production_command', { text: '原值' })).toEqual({ accepted: '替换后' })
+    expect(invoke).toHaveBeenCalledWith('agent_debug_trace_native', {
+      point: 'new_production_command', stage: 'result', value: { accepted: '替换后' }, callId: 8,
+    })
+  })
+
   it('核验尚未完成时收到原生退出通知，保留退出动效并拒绝迟到的产品挂载', async () => {
     document.body.innerHTML = '<div id="app"></div>'
     const root = document.getElementById('app')!

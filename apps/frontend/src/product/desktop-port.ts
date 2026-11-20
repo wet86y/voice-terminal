@@ -14,6 +14,8 @@ export interface WorkspaceInfo {
   /** version（应用版本）与 can_manage（是否开放工作区管理）。 */
   version: string
   can_manage: boolean
+  /** allow_external_debug（允许通过本机调用接口请求调试）。 */
+  allow_external_debug?: boolean
 }
 
 /** WorkspaceChoice（工作区选择结果）：选择器仅返回候选根目录，不会立即切换。 */
@@ -164,6 +166,7 @@ export interface DesktopWorkspacePort {
   resourceInstallPlan(resourceId: string): Promise<ResourceInstallPlan>
   /** workspace_info（工作区信息）：可在 Voice（语音服务）就绪前读取。 */
   workspaceInfo(): Promise<WorkspaceInfo>
+  setAgentDebugAllowed(allowed: boolean): Promise<void>
   /** workspace_choose（选择工作区）：打开原生文件夹选择器，取消时返回 null。 */
   chooseWorkspace(): Promise<WorkspaceChoice | null>
   /** workspace_link（链接工作区）：初始化或切换到选择的目标根目录。 */
@@ -297,6 +300,7 @@ export function desktopPort(): DesktopPort {
     startFloatingDrag: () => call('start_floating_drag'),
     controlFloatingSession: action => call('control_floating_session', { action }),
     workspaceInfo: () => call<WorkspaceInfo>('workspace_info'),
+    setAgentDebugAllowed: allowed => call('agent_debug_set_allowed', { allowed }),
     chooseWorkspace: () => call<WorkspaceChoice | null>('workspace_choose'),
     linkWorkspace: targetRoot => call<{ job_id: string }>('workspace_link', { target_root: targetRoot }),
     migrateWorkspace: targetRoot => call<{ job_id: string }>('workspace_migrate', { target_root: targetRoot }),
