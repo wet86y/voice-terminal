@@ -499,6 +499,21 @@ fn verify_package_maps(record: &Value, release: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// finish_committed_install（已提交本体的收尾）：短暂占用时只重试旧文件清理，保留恢复记录。
+fn finish_committed_install(root: &Path) -> Result<(), String> {
+    let mut result = workspace::recover_install(root);
+    for delay_ms in [100, 300, 1000, 2000] {
+        if result.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        result = workspace::recover_install(root);
+    }
+    result.map_err(|error| {
+        format!("本体已启用，但更新事务收尾未完成；原事务已保留，可从正式入口继续：{error}")
+    })
+}
+
 fn activate(
     root: &Path,
     stage: &Path,
@@ -567,7 +582,7 @@ fn activate(
         Ok(())
     })();
     match result {
-        Ok(()) => workspace::recover_install(root),
+        Ok(()) => finish_committed_install(root),
         Err(error) => {
             workspace::recover_install(root)
                 .map_err(|recovery| format!("{error}；恢复原本体失败：{recovery}"))?;
@@ -1750,6 +1765,41 @@ mod tests {
         assert!(!root.join("tmp/update-transaction.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(windows)]
+    #[test]
+    fn committed_cleanup_waits_for_old_file_release_and_preserves_current_program() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = fixture();
+        run(&package("current", false), &root).unwrap();
+        let old = root.join("tmp/publish/old/app/VoiceTerminalDesktop.exe");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"old executable").unwrap();
+        let user = root.join("data/user.txt");
+        fs::write(&user, b"user data").unwrap();
+        atomic_json(
+            &root.join("tmp/update-transaction.json"),
+            &json!({"schema":1,"state":"committed","items":[{"path":"app","original":true}]}),
+        )
+        .unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&old)
+            .unwrap();
+        assert!(workspace::recover_install(&root).is_err());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        finish_committed_install(&root).unwrap();
+        release.join().unwrap();
+        assert!(!root.join("tmp/update-transaction.json").exists());
+        assert!(!root.join("tmp/publish").exists());
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(), b"current");
+        assert_eq!(fs::read(user).unwrap(), b"user data");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn interrupted_activation_restores_previous_body() {
         let root = fixture();

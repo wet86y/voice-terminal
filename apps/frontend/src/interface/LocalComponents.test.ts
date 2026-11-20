@@ -33,6 +33,34 @@ it('网络与占用仅给重试建议，内容恢复失败才进入既有全面�
   wrapper.unmount()
 })
 
+it.each([
+  { id: 'system-feature-openssh-server' },
+  { id: 'history-system-feature-openssh-server-17' },
+  { id: 'host-feature-task', operation: 'system_feature' as const },
+])('系统功能失败记录 $id 不显示组件恢复或下载重试', async job => {
+  const value = model()
+  value.managedResourceJobs = [{
+    ...job, resourceId: 'openssh-server', label: 'OpenSSH（安全外壳服务）',
+    state: 'failed', phase: '系统功能查询失败', canCancel: false,
+    recovery: { event: 'unknown', state: 'retry_available', next_action: 'retry', message: '旧系统功能恢复提示' },
+  }]
+  const wrapper = mount(LocalComponents, { props: { model: value } })
+  expect(wrapper.find('.component-recovery').exists()).toBe(false)
+  expect(wrapper.text()).not.toContain('旧系统功能恢复提示')
+  expect(wrapper.text()).not.toContain('重试此任务')
+
+  await wrapper.setProps({ model: { ...value, managedResourceJobs: [...value.managedResourceJobs, {
+    id: 'dl-voice-server', resourceId: 'voice-server', label: '语音依赖',
+    state: 'failed', phase: '下载失败', canCancel: false,
+    recovery: { event: 'transfer', state: 'retry_available', next_action: 'retry', message: '语音组件下载可重试' },
+  }] } })
+  expect(wrapper.findAll('.component-recovery button')).toHaveLength(1)
+  await wrapper.get('.component-recovery button').trigger('click')
+  expect(wrapper.emitted('resourceDownload')).toEqual([['voice-server']])
+  expect(wrapper.text()).not.toContain('旧系统功能恢复提示')
+  wrapper.unmount()
+})
+
 it('远程组件故障不显示本机程序全面校验入口', () => {
   const value = model()
   value.remoteTarget = true

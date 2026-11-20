@@ -60,6 +60,8 @@ const categoryDefinitions: Array<{ id: LocalComponentCategory; title: string; de
 const latestJobs = computed(() => {
   const jobs = new Map<string, ManagedResourceJob>()
   for (const job of props.model.managedResourceJobs ?? []) {
+    // 兼容未携带 operation（任务类型）的旧任务；系统功能及其历史记录不提供组件下载重试。
+    if (job.operation === 'system_feature' || /^(?:history-)?system-feature-/.test(job.id)) continue
     const previous = jobs.get(job.resourceId)
     if (!previous || jobIsActive(job) || !jobIsActive(previous)) jobs.set(job.resourceId, job)
   }

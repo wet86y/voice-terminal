@@ -69,7 +69,7 @@ export interface ResourceStatus {
 
 /** ResourceJob（资源任务）：下载、导入及取消状态的桌面事件负载。 */
 export interface ResourceJob {
-  operation?: 'install' | 'reset' // operation（安装或用户确认的重置）。
+  operation?: 'install' | 'reset' | 'system_feature' // operation（组件安装、用户确认的重置或独立系统功能任务）。
   first_error?: string | null // first_error（本轮首次错误）。
   failure_resource_id?: string | null // failure_resource_id（实际失败的依赖组件）。
   /** recovery（组件共用恢复结果）：普通传输／占用错误与内容一致性异常分别引导。 */

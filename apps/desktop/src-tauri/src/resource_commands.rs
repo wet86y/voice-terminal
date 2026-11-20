@@ -3986,19 +3986,30 @@ impl ResourceManager {
             ) else {
                 continue;
             };
+            let system_feature_job = is_system_feature_job(job_id);
             let mut error = value["error"].as_str().map(str::to_owned);
-            let mut recovery = value
-                .get("recovery")
-                .filter(|value| value.is_object())
-                .cloned();
+            // 系统功能历史记录可能误带组件恢复建议；保留原始错误，移除错误的下载入口。
+            let mut recovery = if system_feature_job {
+                None
+            } else {
+                value
+                    .get("recovery")
+                    .filter(|value| value.is_object())
+                    .cloned()
+            };
             let can_cancel = false;
             if !terminal(&state) {
                 state = "failed".into();
-                phase = "应用退出时任务中断，可使用相同下载任务重试".into();
-                error = Some("上次运行期间任务中断；固定下载任务可重试。".into());
-                recovery = Some(voice_desktop_common::component_recovery::interrupted());
+                if system_feature_job {
+                    phase = "应用退出时系统功能任务中断，请前往设备与角色重新检查".into();
+                    error = Some("上次系统功能任务中断；请在设备与角色中检查状态后重新操作。".into());
+                } else {
+                    phase = "应用退出时任务中断，可使用相同下载任务重试".into();
+                    error = Some("上次运行期间任务中断；固定下载任务可重试。".into());
+                    recovery = Some(voice_desktop_common::component_recovery::interrupted());
+                }
             }
-            if recovery.is_none() && state == "failed" {
+            if !system_feature_job && recovery.is_none() && state == "failed" {
                 if let Some(message) = error.as_deref() {
                     recovery = Some(voice_desktop_common::component_recovery::guidance(
                         voice_desktop_common::component_recovery::classify(message),
@@ -4320,6 +4331,7 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "组件安装或用户确认的重置"
     });
     if is_system_feature_job(&snapshot.job_id) {
+        value["recovery"] = Value::Null;
         value["fields"]["resource_id"] = json!("Windows 系统功能编号");
         value["fields"]["installed_resources"] =
             json!("本任务不安装工作区组件；系统功能状态单独复核");
@@ -4346,7 +4358,7 @@ fn terminal_job_history_for_retry(job_id: &str, previous: &JobSnapshot) -> Optio
 }
 
 fn is_system_feature_job(job_id: &str) -> bool {
-    job_id.starts_with("system-feature-")
+    job_id.starts_with("system-feature-") || job_id.starts_with("history-system-feature-")
 }
 
 fn validate_batch_admission(
@@ -5080,6 +5092,9 @@ mod service_tests {
             "本任务不安装工作区组件；系统功能状态单独复核"
         );
         assert!(super::is_system_feature_job(&snapshot.job_id));
+        assert!(super::is_system_feature_job(
+            "history-system-feature-openssh-server-17"
+        ));
         assert!(!super::is_system_feature_job("dl-dsh"));
     }
 
@@ -5228,6 +5243,61 @@ mod service_tests {
             jobs["interrupted"].snapshot.recovery.as_ref().unwrap()["event"],
             "interrupted"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restored_system_feature_jobs_remove_component_recovery_and_preserve_failure_history() {
+        let root = std::env::temp_dir().join(format!(
+            "voice-system-feature-jobs-{}",
+            voice_desktop_common::workspace::new_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("jobs.json");
+        let original_error = "OpenSSH Server 状态查询失败；请检查系统功能查询权限。";
+        for job_id in [
+            "system-feature-openssh-server",
+            "history-system-feature-openssh-server-17",
+        ] {
+            for state in ["failed", "running"] {
+                for recovery in [
+                    Value::Null,
+                    voice_desktop_common::component_recovery::guidance(
+                        voice_desktop_common::component_recovery::Event::Unknown,
+                        false,
+                    ),
+                ] {
+                    voice_desktop_common::workspace::atomic_json(
+                        &path,
+                        &json!({"jobs":[{
+                            "job_id":job_id,"resource_id":"openssh-server",
+                            "state":state,"phase":"系统功能查询失败",
+                            "error":original_error,"first_error":original_error,
+                            "recovery":recovery,"created_at":17,"revision":2
+                        }]}),
+                    )
+                    .unwrap();
+                    let jobs = ResourceManager::load_jobs(&path).unwrap();
+                    let snapshot = &jobs[job_id].snapshot;
+                    assert_eq!(snapshot.state, "failed");
+                    assert_eq!(snapshot.first_error.as_deref(), Some(original_error));
+                    assert_eq!(snapshot.created_at, 17);
+                    assert_eq!(snapshot.revision, 3);
+                    assert!(snapshot.recovery.is_none());
+                    assert!(!snapshot.can_cancel);
+                    assert!(!snapshot.phase.contains("下载"));
+                    if state == "failed" {
+                        assert_eq!(snapshot.error.as_deref(), Some(original_error));
+                    } else {
+                        assert!(snapshot.phase.contains("设备与角色"));
+                    }
+                    let value = super::event_value(snapshot);
+                    assert_eq!(value["operation"], "system_feature");
+                    assert!(value["recovery"].is_null());
+                    assert_eq!(value["first_error"], original_error);
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

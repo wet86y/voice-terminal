@@ -251,6 +251,7 @@ const model = computed<LocalComponentsModel>(() => {
       const resource = inventory.find(item => item.resource_id === job.resource_id)
       return {
         id: job.job_id,
+        operation: job.operation,
         resourceId: job.resource_id,
         label: job.resource_id === 'batch' ? '批量资源导入'
           : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
