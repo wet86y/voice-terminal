@@ -15,6 +15,22 @@ def _between(source: str, start: str, end: str) -> str:
     return source[start_index:end_index]
 
 
+def test_registered_desktop_commands_are_in_the_permission_manifest() -> None:
+    desktop = ROOT / "apps/desktop/src-tauri"
+    registrations = _between(
+        (desktop / "src/main.rs").read_text(encoding="utf-8"),
+        "tauri::generate_handler![", "\n    ];",
+    ).split("[", 1)[1]
+    handlers = {item.strip().rsplit("::", 1)[-1] for item in registrations.split(",") if item.strip()}
+    manifest = _between(
+        (desktop / "build.rs").read_text(encoding="utf-8"),
+        "app_manifest(command_manifest(&[", "\n        ]",
+    )
+    manifest_commands = set(re.findall(r'"([a-z][a-z0-9_]+)"', manifest))
+    assert handlers
+    assert handlers == manifest_commands
+
+
 def test_frontend_product_operations_reach_native_and_server_allowlists() -> None:
     frontend_source = (ROOT / "apps/frontend/src/product/api.ts").read_text(encoding="utf-8")
     frontend_map = _between(
@@ -37,7 +53,7 @@ def test_frontend_product_operations_reach_native_and_server_allowlists() -> Non
     native_source = (ROOT / "apps/desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
     native_allowlist = _between(
         native_source,
-        "const ALLOWED_OPERATIONS: &[&str] = &[",
+        "const REMOTE_BUSINESS_OPERATIONS: &[&str] = &[",
         "\n    ];",
     )
     native_operations = set(re.findall(r'"([a-z][a-z0-9_.]+)"', native_allowlist))

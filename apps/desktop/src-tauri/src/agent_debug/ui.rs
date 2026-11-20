@@ -420,7 +420,7 @@ async fn evaluate(window: &WebviewWindow, expression: String) -> Result<Value, S
 
 fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'static str>, String> {
     let url = window.url().map_err(|error| error.to_string())?;
-    let capability = if window.label() == "floating" {
+    let mut capability = if window.label() == "floating" {
         crate::floating_capability(&url.origin().ascii_serialization(), 0)
     } else if crate::boot_page_url(&url) {
         serde_json::from_str(include_str!("../../capabilities/boot.json"))
@@ -428,6 +428,22 @@ fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'sta
     } else {
         crate::frontend_capability(state.mode, &url.origin().ascii_serialization(), 0)
     };
+    if window.label() == "main"
+        && crate::remote_static_product_page_url(&url)
+        && state.context().is_some_and(|context| {
+            voice_desktop_common::device_config::inspect(&context.data).mode
+                == Some(voice_desktop_common::device_config::RunMode::Remote)
+        })
+    {
+        let imports: Value = serde_json::from_str(include_str!("../../capabilities/remote-import.json"))
+            .map_err(|error| error.to_string())?;
+        if let (Some(commands), Some(imports)) = (
+            capability["permissions"].as_array_mut(),
+            imports["permissions"].as_array(),
+        ) {
+            commands.extend(imports.iter().cloned());
+        }
+    }
     Ok(COMMANDS
         .lines()
         .filter(|command| {

@@ -943,6 +943,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     ]
     # VOICE_WEB_ORIGINS（界面允许来源）由宿主传入当前桌面实际地址，禁止浏览器默认回退。
     origins = list(dict.fromkeys(configured_origins))
+    allowed_headers = ["Content-Type"]
+    if agent_debug.ENABLED:
+        allowed_headers.append("X-Voice-Agent-Call")  # 调试调用编号，用于关联桌面与核心事件。
     try:
         from fastapi.middleware.cors import CORSMiddleware  # type: ignore
         app.add_middleware(
@@ -950,7 +953,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             allow_origins=origins,
             allow_credentials=False,
             allow_methods=["GET", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Content-Type"],
+            allow_headers=allowed_headers,
         )
     except ImportError:  # pragma: no cover - FastAPI installs middleware with the app
         pass

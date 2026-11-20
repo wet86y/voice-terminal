@@ -2315,6 +2315,25 @@ class ProductApiTests(unittest.TestCase):
         self.assertNotEqual(blocked.headers.get("access-control-allow-origin"), "*")
         self.assertIsNone(blocked.headers.get("access-control-allow-origin"))
 
+    def test_debug_call_header_requires_debug_mode_and_configured_origin(self) -> None:
+        async def preflight(origin):
+            return await self._request("OPTIONS", "/api/v1/devices", headers={
+                "Origin": origin, "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-voice-agent-call",
+            })
+
+        desktop_origin = "http://127.0.0.1:9123"
+        self.assertEqual(asyncio.run(preflight(desktop_origin)).status_code, 400)
+        with patch.dict(os.environ, {"VOICE_WEB_ORIGINS": desktop_origin}), \
+                patch("voice_terminal.agent_debug.ENABLED", True):
+            self.app = create_app(self.runtime)
+        allowed = asyncio.run(preflight(desktop_origin))
+        self.assertEqual(allowed.status_code, 200)
+        self.assertIn("x-voice-agent-call", allowed.headers["access-control-allow-headers"].lower())
+        denied = asyncio.run(preflight("http://127.0.0.1:5173"))
+        self.assertEqual(denied.status_code, 400)
+        self.assertNotIn("access-control-allow-origin", denied.headers)
+
     def test_dsh_launch_is_origin_json_and_ready_gated(self) -> None:
         status = asyncio.run(self._request("GET", "/api/v1/dsh/status"))
         self.assertEqual(status.status_code, 200)

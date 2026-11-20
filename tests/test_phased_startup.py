@@ -334,8 +334,7 @@ def test_reinitialize_reports_asr_session_when_other_voice_core_services_are_mis
         runtime._application_local_ready = True
         runtime._application_session_ready = True
         with patch.object(runtime, "close", new=AsyncMock()), \
-             patch.object(runtime, "initialize", new=AsyncMock(side_effect=initialize_with_missing_remote_services)), \
-             patch.object(runtime, "snapshot", return_value={}):
+             patch.object(runtime, "initialize", new=AsyncMock(side_effect=initialize_with_missing_remote_services)):
             response = await runtime.application_control("reinitialize", endpoint_table={})
 
         assert response["ok"] is False

@@ -174,7 +174,9 @@ def test_continuous_button_maps_each_original_request_and_expires_at_window_boun
         assert await pending(session, "first", 1) == "accepted"
         await session.decide_approval("first", "allowed-until-silence", 1)
         assert session.snapshot()["continuous_approval"] is True
-        assert client.calls[-1][1]["decision"] == "allowed-once"
+        decision, policy = client.calls[-2:]
+        assert decision[0] == "approval.decide" and decision[1]["decision"] == "allowed-once"
+        assert policy[0] == "approval.policy" and policy[1]["policy"] == "ask"
         assert await pending(session, "second", 2) == "accepted"
         await session._approval_auto_task
         decisions = [body for name, body in client.calls if name == "approval.decide"]

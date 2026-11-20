@@ -248,7 +248,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="voice-controls">
-          <UiButton class="voice-session-action" :class="{ 'voice-stop-button': sessionActive }" :disabled="model.disabled" :busy="Boolean(model.sessionOperation)" @click="emit('action')">
+          <UiButton class="voice-session-action" :class="{ 'voice-stop-button': sessionActive }" :aria-label="model.action" :disabled="model.disabled" :busy="Boolean(model.sessionOperation)" @click="emit('action')">
             <i v-if="model.sessionOperation" class="voice-session-spinner" aria-hidden="true"></i>
             <i v-else-if="sessionActive" class="voice-stop-icon" aria-hidden="true"></i>
             <span role="status" aria-live="polite">{{ model.sessionOperation === 'reset' ? '上下文整理中' : model.sessionOperation === 'clear' ? '会话清除中' : model.action }}</span>

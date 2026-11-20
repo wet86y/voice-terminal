@@ -144,7 +144,7 @@ def test_aborted_switch_never_restores_old_audio_lease_without_an_explicit_new_c
     assert fresh_stream.accept(frame).start_sample == 0
 
 
-def test_pcm_stream_requires_contiguous_samples_and_new_stream_after_gap():
+def test_pcm_stream_marks_sample_gap_and_discards_late_frame():
     registry = DeviceRegistry()
     registry.connect("B")
     lease = registry.prepare_switch("B", registry.generation)
@@ -153,13 +153,16 @@ def test_pcm_stream_requires_contiguous_samples_and_new_stream_after_gap():
                             map_device_time=lambda value: 100.0 + value / 1_000_000)
     first = stream.accept(_frame("s", 0, 640, 320, 20000, b"\0\0" * 320))
     assert first.start_sample == 640 and first.captured_at == 100.02
-    with pytest.raises(MediaProtocolError, match="采样位置"):
-        stream.accept(_frame("s", 1, 1280, 320, 40000, b"\0\0" * 320))
-    with pytest.raises(MediaProtocolError, match="关闭"):
-        stream.accept(_frame("s", 1, 960, 320, 40000, b"\0\0" * 320))
+    assert not first.discontinuity_before
+    after_gap = stream.accept(_frame("s", 1, 1280, 320, 40000, b"\0\0" * 320))
+    assert after_gap.start_sample == 1280 and after_gap.discontinuity_before
+    assert stream.accept(_frame("s", 1, 960, 320, 40000, b"\0\0" * 320)) is None
+    contiguous = stream.accept(_frame("s", 2, 1600, 320, 60000, b"\0\0" * 320))
+    assert contiguous.start_sample == 1600 and not contiguous.discontinuity_before
+    assert not stream.closed
 
 
-def test_pcm_stream_closes_immediately_when_capture_marks_a_discontinuity():
+def test_pcm_stream_preserves_explicit_discontinuity_without_closing_media():
     registry = DeviceRegistry()
     registry.connect("B")
     lease = registry.prepare_switch("B", registry.generation)
@@ -167,9 +170,10 @@ def test_pcm_stream_closes_immediately_when_capture_marks_a_discontinuity():
     stream = PcmInputStream(stream_id="s", core_session_id="core", lease=lease, registry=registry,
                             map_device_time=float)
     frame = replace(_frame("s", 0, 0, 320, 20_000, b"\0\0" * 320), discontinuity_before=True)
-    with pytest.raises(MediaProtocolError, match="重建音频流"):
-        stream.accept(frame)
-    assert stream.closed
+    assert stream.accept(frame).discontinuity_before
+    contiguous = stream.accept(_frame("s", 1, 320, 320, 40_000, b"\0\0" * 320))
+    assert contiguous.start_sample == 320 and not contiguous.discontinuity_before
+    assert not stream.closed
 
 
 def test_pcm_stream_retains_clock_mapping_uncertainty():

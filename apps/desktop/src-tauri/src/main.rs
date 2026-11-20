@@ -521,7 +521,8 @@ fn frontend_capability(
 
 /// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗展示、输入启停及窗口交互。
 fn floating_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
-    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
+    let embedded = normalized_origin == REMOTE_STATIC_PRODUCT_ORIGIN;
+    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":embedded,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
 }
 
 /// floating_publisher_capability（悬浮窗状态发布权限）：主窗口只能更新浮窗展示快照。
@@ -833,6 +834,8 @@ fn boot_page_url(url: &tauri::Url) -> bool {
 fn remote_static_product_page_url(url: &tauri::Url) -> bool {
     boot_page_url(url) && matches!(url.path(), "/" | "/index.html")
 }
+
+const REMOTE_STATIC_PRODUCT_ORIGIN: &str = "http://tauri.localhost"; // 远程客户端内置页面来源。
 
 // request_service_start（首次主页面加载后请求服务）：刷新及业务导航不会再次启动。
 fn request_service_start(
@@ -9199,7 +9202,7 @@ fn start_service_for(
                 .remote_client_connected
                 .store(false, Ordering::Release);
             // origin（静态产品页来源）：让桌面预检确认远程产品资产就绪，无需启动本地 Python 核心。
-            *state.origin.lock().unwrap() = Some("http://tauri.localhost".into());
+            *state.origin.lock().unwrap() = Some(REMOTE_STATIC_PRODUCT_ORIGIN.into());
             *state.initialization.lock().unwrap() = serde_json::json!({
                 "phase":"远程配对模式已启动，等待搜索并连接服务端",
                 "can_cancel":false,"failed":false,
@@ -10248,6 +10251,7 @@ fn run() -> Result<(), String> {
             let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).map(|pending|pending||context.install.join("tmp/native-install.json").exists())).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
             create_window(app.handle(),build_state.clone(),maintenance).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
+                app.add_capability(floating_capability(REMOTE_STATIC_PRODUCT_ORIGIN, 0).to_string())?;
                 let [(show_id, show_label), (float_id, float_label), (exit_id, exit_label)] = AGENT_TRAY_ITEMS;
                 let show_item = MenuItem::with_id(app, show_id, show_label, true, None::<&str>)?;
                 let floating_item = CheckMenuItem::with_id(app, float_id, float_label, true, false, None::<&str>)?;
@@ -11032,7 +11036,7 @@ mod tests {
             remote_task_channel_error: std::sync::Mutex::new(None),
             remote_media_channel: std::sync::Mutex::new(None),
             remote_media_channel_starting: AtomicBool::new(false),
-            remote_media_stop_revision: AtomicU64::new(0),
+            remote_media_stop_revision: std::sync::atomic::AtomicU64::new(0),
             remote_media_channel_error: std::sync::Mutex::new(None),
             remote_voice_forwarder: std::sync::Mutex::new(None),
             remote_playback_control: tokio::sync::Mutex::new(
@@ -12082,6 +12086,14 @@ mod tests {
                     startup_access, startup_expected,
                     "启动页权限与产品页专属操作分离：{command}"
                 );
+                if matches!(
+                    command,
+                    "device_ssh_import_start" | "device_ssh_import_cancel" | "device_ssh_tts_asset_import"
+                ) {
+                    assert!(authority
+                        .resolve_access(command, "main", "main", &tauri::ipc::Origin::Local)
+                        .is_some(), "内置远程工作台缺少导入权限：{command}");
+                }
                 let owned = tauri::ipc::Origin::Remote {
                     url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap(),
                 };
@@ -12177,6 +12189,9 @@ mod tests {
         authority
             .add_capability(floating_publisher_capability(origin_text, 9).to_string())
             .unwrap();
+        authority
+            .add_capability(floating_capability(super::REMOTE_STATIC_PRODUCT_ORIGIN, 0).to_string())
+            .unwrap();
 
         for command in [
             "get_floating_model",
@@ -12184,6 +12199,12 @@ mod tests {
             "start_floating_drag",
             "control_floating_session",
         ] {
+            assert!(authority
+                .resolve_access(command, "floating", "floating", &tauri::ipc::Origin::Local)
+                .is_some());
+            assert!(authority
+                .resolve_access(command, "main", "main", &tauri::ipc::Origin::Local)
+                .is_none());
             assert!(
                 authority
                     .resolve_access(command, "floating", "floating", &origin)

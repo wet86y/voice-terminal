@@ -1,0 +1,11 @@
+{
+  "identifier": "remote-import",
+  "description": "内置主工作台的远程导入操作，由原生命令核对当前配对角色、连接及目标。",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-device-ssh-import-start",
+    "allow-device-ssh-import-cancel",
+    "allow-device-ssh-tts-asset-import"
+  ]
+}

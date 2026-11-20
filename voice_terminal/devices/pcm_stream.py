@@ -12,7 +12,7 @@ from .registry import DeviceRegistry, InteractionLease
 
 
 class PcmInputStream:
-    """PcmInputStream（原始音频输入流）：一次缺口后必须建立新流。"""
+    """PcmInputStream（原始音频输入流）：标记采样缺口，由识别链路重新建立连续性。"""
 
     def __init__(self, *, stream_id: str, core_session_id: str, lease: InteractionLease, registry: DeviceRegistry,
                  map_device_time: Callable[[int], float | tuple[float, float]],

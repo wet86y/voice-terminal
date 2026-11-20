@@ -11,7 +11,8 @@
     "withGlobalTauri": true,
     "security": {
       "capabilities": [
-        "boot"
+        "boot",
+        "remote-import"
       ]
     }
   },
