@@ -75,6 +75,12 @@ const localCoreAvailable = computed(() => status.value?.local_core_available !==
 const openSshJobPending = computed(() => !!openSshJob.value && ['queued', 'running', 'cancelling'].includes(openSshJob.value.state))
 const remoteOpenSshJobPending = computed(() => !!remoteOpenSshSnapshot.value?.job
   && ['queued', 'running', 'cancelling'].includes(remoteOpenSshSnapshot.value.job.state))
+const remoteOpenSshJobIsHistorical = computed(() => !!remoteOpenSshSnapshot.value?.job
+  && remoteOpenSshSnapshot.value.status.ready && !remoteOpenSshJobPending.value) // remoteOpenSshJobIsHistorical（当前已就绪时，结束的准备任务只作为历史记录）。
+const remoteOpenSshJobCreatedAt = computed(() => {
+  const createdAt = remoteOpenSshSnapshot.value?.job?.created_at
+  return createdAt === undefined ? null : new Date(createdAt)
+}) // remoteOpenSshJobCreatedAt（服务端任务创建时间；旧服务端未提供时不推测日期）。
 const isRemote = computed(() => mode.value === 'remote')
 // canDisconnect（允许断开）：底层 SSH（安全远程连接）已认证时，管理握手失败也必须保留恢复入口。
 const canDisconnect = computed(() => isRemote.value && !!status.value?.device_config?.paired_host
@@ -110,8 +116,8 @@ const canSave = computed(() => !loading.value && !busy.value && !openSshBusy.val
   && !status.value?.device_runtime?.operation?.active
   && !!status.value && (mode.value === 'remote' || localCoreAvailable.value))
 
-/** localOpenSshJobStateLabel（本机 SSH 任务状态中文说明）：长任务仍在后台运行时明确呈现状态。 */
-function localOpenSshJobStateLabel(state: string) {
+/** openSshJobStateLabel（SSH 任务状态中文说明）：本机与服务端使用相同的任务状态名称。 */
+function openSshJobStateLabel(state: string) {
   return ({ queued: '等待开始', running: '进行中', cancelling: '正在取消', complete: '已完成', failed: '失败', cancelled: '已取消' } as Record<string, string>)[state] ?? state
 }
 
@@ -943,7 +949,7 @@ onUnmounted(() => {
       <p v-if="status?.device_runtime" class="small-text">广播意图：{{ status.device_runtime.broadcast_requested ? '开启' : '关闭' }}；mDNS 公告：{{ status.device_runtime.broadcast_actual ? '已发布' : '未发布' }}。</p>
       <p class="small-text">“检查 SSH 服务”先只读检查。服务未就绪时会说明缺口，并在你同意后通过 Windows 官方功能安装或启动；误取消后可再次点击。</p>
       <p v-if="openSshStatusError" :class="['device-message', openSshLongWaitNotice ? 'warning' : 'error']" :role="openSshLongWaitNotice ? 'status' : 'alert'">{{ openSshStatusError }}</p>
-      <p v-if="visibleOpenSshJob" class="small-text" role="status">任务状态：{{ localOpenSshJobStateLabel(visibleOpenSshJob.state) }}；{{ visibleOpenSshJob.phase }}<span v-if="visibleOpenSshJob.error">：{{ visibleOpenSshJob.error }}</span></p>
+      <p v-if="visibleOpenSshJob" class="small-text" role="status">任务状态：{{ openSshJobStateLabel(visibleOpenSshJob.state) }}；{{ visibleOpenSshJob.phase }}<span v-if="visibleOpenSshJob.error">：{{ visibleOpenSshJob.error }}</span></p>
       <div v-if="pairingCode" class="pairing-code-box" role="status">
         <span>本机六位配对码 · 有效至 {{ new Date(pairingExpiresAt).toLocaleTimeString() }}</span>
         <output>{{ pairingCode }}</output>
@@ -1013,9 +1019,18 @@ onUnmounted(() => {
           有效端口：{{ remoteOpenSshSnapshot.status.effective_port ?? '未验证' }}；实际监听：{{ remoteOpenSshSnapshot.status.listening_ports.join(', ') || '无' }}；
           配置：{{ remoteOpenSshSnapshot.status.configuration_valid ? '有效' : '未验证' }}；本程序局域网规则：{{ remoteOpenSshSnapshot.status.project_access_valid ? '已验证' : '未验证' }}；配对规则：{{ remoteOpenSshSnapshot.status.pairing_access_valid ? '已验证' : '未验证' }}。
         </p>
-        <article v-if="remoteOpenSshSnapshot.job" class="remote-device-row" aria-live="polite">
+        <details v-if="remoteOpenSshSnapshot.job && remoteOpenSshJobIsHistorical" class="remote-device-row remote-ssh-job-history">
+          <summary>历史准备任务：{{ openSshJobStateLabel(remoteOpenSshSnapshot.job.state) }}（当前服务已就绪）</summary>
+          <p class="small-text">此记录属于此前的准备任务；本次检查已确认服务就绪。</p>
+          <p v-if="remoteOpenSshJobCreatedAt" class="small-text">
+            任务创建时间：<time :datetime="remoteOpenSshJobCreatedAt.toISOString()">{{ remoteOpenSshJobCreatedAt.toLocaleString('zh-CN', { hour12: false }) }}</time>
+          </p>
+          <p class="small-text">当时阶段：{{ remoteOpenSshSnapshot.job.phase }}</p>
+          <p v-if="remoteOpenSshSnapshot.job.error" class="small-text">历史错误：{{ remoteOpenSshSnapshot.job.error }}</p>
+        </details>
+        <article v-else-if="remoteOpenSshSnapshot.job" class="remote-device-row" aria-live="polite">
           <div class="remote-device-title">
-            <strong>服务端任务：{{ remoteOpenSshSnapshot.job.state }}</strong>
+            <strong>服务端任务：{{ openSshJobStateLabel(remoteOpenSshSnapshot.job.state) }}</strong>
             <code>{{ remoteOpenSshSnapshot.job.job_id }}</code>
           </div>
           <p>{{ remoteOpenSshSnapshot.job.phase }}</p>

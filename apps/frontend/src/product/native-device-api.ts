@@ -177,6 +177,7 @@ export interface RemoteSshSystemFeatureJob {
   phase: string // phase（服务端系统功能任务阶段，含管理员确认等待阶段）。
   error: string | null // error（服务端任务失败原因）。
   can_cancel: boolean // can_cancel（当前任务是否允许取消）。
+  created_at?: number // created_at（任务创建时间，Unix 毫秒；兼容未返回时间的旧服务端）。
   fields: Record<string, string> // fields（字段中文说明）。
 }
 
@@ -264,6 +265,8 @@ function isRemoteSshSystemFeatureJob(value: unknown): value is RemoteSshSystemFe
     && value.resource_id === 'openssh-server'
     && ['queued', 'running', 'cancelling', 'complete', 'failed', 'cancelled'].includes(String(value.state))
     && typeof value.phase === 'string' && isNullableString(value.error)
+    && (value.created_at === undefined || (typeof value.created_at === 'number'
+      && Number.isSafeInteger(value.created_at) && value.created_at >= 0 && value.created_at <= 8.64e15))
     && typeof value.can_cancel === 'boolean' && isStringMap(value.fields)
 }
 

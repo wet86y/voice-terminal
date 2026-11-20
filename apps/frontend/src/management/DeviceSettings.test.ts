@@ -678,6 +678,121 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.find('input[placeholder*="SHA256"]').exists()).toBe(false)
   })
 
+  it.each([
+    { state: 'failed', label: '失败', createdAt: undefined },
+    { state: 'failed', label: '失败', createdAt: 1794928935566 },
+    { state: 'cancelled', label: '已取消', createdAt: undefined },
+    { state: 'complete', label: '已完成', createdAt: undefined },
+  ] as const)('服务端已就绪时，$state 任务仅作为可展开的历史记录（创建时间：$createdAt）', async ({ state, label, createdAt }) => {
+    prepareRemoteHost()
+    const historicalError = state === 'failed' ? '旧版本的状态查询失败' : null
+    const job = { ...makeRemoteSshJob(state, '此前的准备阶段', historicalError), created_at: createdAt }
+    const snapshot = makeRemoteSshSnapshot(true, job)
+    snapshot.status.capability_state = 'Unknown'
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>)
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    request.mockClear()
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+
+    const card = wrapper.get('.remote-ssh-feature-card')
+    expect(card.get('[data-state="ready"]').text()).toContain('服务端微软 OpenSSH Server 已就绪')
+    expect(card.find('.device-message.error').exists()).toBe(false)
+    expect(card.find('[role="alert"]').exists()).toBe(false)
+    expect(card.findAll('button').map(button => button.text().trim())).toEqual(['检查 SSH 服务'])
+    const history = card.get('.remote-ssh-job-history')
+    expect((history.element as HTMLDetailsElement).open).toBe(false)
+    expect(history.get('summary').text()).toBe(`历史准备任务：${label}（当前服务已就绪）`)
+    expect(history.text()).toContain('当时阶段：此前的准备阶段')
+    if (historicalError) expect(history.text()).toContain(`历史错误：${historicalError}`)
+    if (createdAt === undefined) {
+      expect(history.find('time').exists()).toBe(false)
+    } else {
+      expect(history.get('time').attributes('datetime')).toBe('2026-11-17T15:22:15.566Z')
+    }
+    await history.get('summary').trigger('click')
+    expect((history.element as HTMLDetailsElement).open).toBe(true)
+    expect(snapshot.job?.state).toBe(state)
+    expect(snapshot.job?.error).toBe(historicalError)
+    expect(request.mock.calls.map(([operation]) => operation)).toEqual(['system.ssh.status'])
+    expect(window.confirm).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.openSshServerStatus).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+  })
+
+  it('服务端当前检查恢复就绪后清除失败提示，再次未就绪时仍显示原失败与重试入口', async () => {
+    prepareRemoteHost()
+    const job = makeRemoteSshJob('failed', '资源处理失败', '旧版本的状态查询失败')
+    let ready = false
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') {
+        return makeManagementResponse(operation, makeRemoteSshSnapshot(ready, job) as unknown as Record<string, unknown>)
+      }
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    request.mockClear()
+    const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!
+
+    for (const currentReady of [false, true, false]) {
+      ready = currentReady
+      await check.trigger('click')
+      await flushPromises()
+      const card = wrapper.get('.remote-ssh-feature-card')
+      expect(card.find('.remote-ssh-job-history').exists()).toBe(currentReady)
+      expect(card.find('[role="alert"]').exists()).toBe(!currentReady)
+      expect(card.findAll('button').some(button => button.text() === '重试服务端 SSH 准备')).toBe(!currentReady)
+      if (!currentReady) {
+        expect(card.get('[role="alert"]').text()).toBe('旧版本的状态查询失败')
+        expect(card.text()).toContain('服务端任务：失败')
+      }
+    }
+    expect(job.state).toBe('failed')
+    expect(request.mock.calls.map(([operation]) => operation)).toEqual(Array(3).fill('system.ssh.status'))
+  })
+
+  it('服务端已就绪时仍跟踪进行中的准备任务，任务结束后转入历史并停止补查', async () => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    let statusReads = 0
+    vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      if (operation === 'management.status') return makeManagementResponse(operation, { core_state: 'ready' })
+      if (operation === 'system.ssh.status') {
+        statusReads += 1
+        const job = statusReads === 1
+          ? makeRemoteSshJob('running', '正在复核服务端状态')
+          : makeRemoteSshJob('failed', '资源处理失败', '此前的准备任务失败')
+        return makeManagementResponse(operation, makeRemoteSshSnapshot(true, job) as unknown as Record<string, unknown>)
+      }
+      throw new Error(`Unexpected remote operation: ${operation}`)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+
+    await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('服务端任务：进行中')
+    expect(wrapper.find('.remote-ssh-job-history').exists()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(statusReads).toBe(2)
+    expect(wrapper.get('.remote-ssh-job-history summary').text()).toContain('失败（当前服务已就绪）')
+    expect(wrapper.find('.remote-ssh-feature-card .device-message.error').exists()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+    expect(statusReads).toBe(2)
+  })
+
   it('远程服务端未就绪时必须明确确认，取消不发送启动操作', async () => {
     prepareRemoteHost()
     const snapshot = makeRemoteSshSnapshot(false)
