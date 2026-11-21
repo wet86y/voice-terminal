@@ -147,7 +147,6 @@ def validate_endpoint_report(component: str, payload: dict) -> dict[str, object]
                 or (port is not None and (isinstance(port, bool) or not isinstance(port, int)
                     or not 1 <= port <= 65535))):
             raise ValueError("端点报告的主机或端口无效。")
-        scheme = "http" if component in {"host", "web", "voice", "dsh"} else "ws"
         if base_url is not None:
             if not isinstance(base_url, str):
                 raise ValueError("端点报告的 base_url（基础地址）无效。")
@@ -156,7 +155,8 @@ def validate_endpoint_report(component: str, payload: dict) -> dict[str, object]
                 base_port = base.port
             except ValueError as exc:
                 raise ValueError("端点报告的 base_url（基础地址）无效。") from exc
-            if (base.scheme != scheme or base.hostname not in {"127.0.0.1", "localhost"}
+            if (base.scheme not in ENDPOINT_SCHEMES.get(component, ())
+                    or base.hostname not in {"127.0.0.1", "localhost"}
                     or (host is not None and base.hostname != host)
                     or (port is not None and base_port != port)
                     or base.path not in ("", "/") or base.username or base.password

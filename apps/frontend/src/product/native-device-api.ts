@@ -471,6 +471,27 @@ export const nativeDeviceApi = {
     }
     return response.body
   },
+  /** remoteDshConsole（远程原生网页）：浏览器票据留在原生层，产品页只接收状态。 */
+  remoteDshConsole: async (action: 'open' | 'status' | 'stop') => {
+    const result: unknown = await call('device_ssh_dsh_console', { action })
+    if (!isRecord(result) || !isStringMap(result.fields) || typeof result.opened !== 'boolean'
+      || !['running', 'stopped'].includes(String(result.state))) {
+      throw new Error('远程控制台回执字段无效。')
+    }
+    if (result.state === 'running') {
+      let origin: URL
+      try { origin = new URL(String(result.origin)) } catch { throw new Error('远程控制台本机来源无效。') }
+      const host = origin.hostname.split('.')
+      const loopback = host.length === 4 && host[0] === '127' && host.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+      if (origin.protocol !== 'http:' || !loopback || !origin.port
+        || origin.origin !== result.origin || origin.username || origin.password) {
+        throw new Error('远程控制台必须使用原生程序的本机回环来源。')
+      }
+    }
+    if ((action === 'open' && (result.state !== 'running' || result.opened !== true))
+      || (action === 'stop' && result.state !== 'stopped')) throw new Error('远程控制台操作尚未完成。')
+    return result
+  },
   /** remoteVoiceForwarder（远程语音回环转发）：仅连接客户端本机随机端口，不把服务端地址交给网页。 */
   remoteVoiceForwarder: async (action: 'start' | 'status' | 'stop'): Promise<RemoteVoiceForwarderResult> => {
     const result: unknown = await call('device_ssh_voice_forwarder', { action })

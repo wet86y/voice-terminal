@@ -28,12 +28,7 @@ export function createSettingsAdapter(ctx: Context, config: Config): {
       return {
         workspaceId: read(config.workspaceId.get()),
         defaultWorkspaceId: read(config.defaultWorkspaceId.get()),
-        provider: read(config.provider.get()),
-        model: read(config.model.get()),
-        reasoningEffort: read(config.reasoningEffort.get()),
         fallbackNotice: fallbackNotice === 'workspace-unavailable'
-          || fallbackNotice === 'model-unavailable'
-          || fallbackNotice === 'reasoning-unavailable'
           ? fallbackNotice
           : undefined,
       }
@@ -96,54 +91,6 @@ async function resolveVoiceWorkspace(ctx: Context, settings: ReturnType<typeof c
   return defaultWorkspace
 }
 
-/** Resolve an explicit model route against DSH's live provider/model directory. */
-async function resolveVoiceModelSelection(ctx: Context, settings: ReturnType<typeof createSettingsAdapter>, globalSelection: ModelSelection) {
-  const current = settings.get() as VoiceTerminalSettings
-  const hasModelOverride = Boolean(current.provider || current.model)
-  if (!hasModelOverride && !current.reasoningEffort) return { ...globalSelection }
-  if (hasModelOverride && (!current.provider || !current.model)) {
-    await recordFallback(settings, 'model-unavailable', 'saved provider/model override is incomplete')
-    return { ...globalSelection }
-  }
-
-  try {
-    const providerId = current.provider ?? globalSelection.provider
-    const modelId = current.model ?? globalSelection.model
-    const providers = ctx.llm.listProviders()
-    const provider = providers.find(entry => entry.id === providerId)
-    if (provider === undefined) throw new Error(`provider ${providerId} is not routable`)
-    const models = await ctx.llm.listModels(providerId)
-    if (!models.some(entry => entry.id === modelId)) {
-      throw new Error(`model ${providerId}/${modelId} is not available`)
-    }
-    const info = await ctx.llm.resolveModelInfo(providerId, modelId)
-    const efforts = info.reasoning?.efforts ?? []
-    const defaultEffort = info.reasoning?.defaultEffort
-    const chosenEffort = efforts.find(effort => effort.id === current.reasoningEffort)?.id
-    if (current.reasoningEffort && efforts.length > 0
-      && !efforts.some(effort => effort.id === current.reasoningEffort)) {
-      await recordFallback(settings, 'reasoning-unavailable', `reasoning effort ${current.reasoningEffort} is not supported by ${providerId}/${modelId}`)
-      return {
-        provider: providerId,
-        model: modelId,
-        ...(defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort }),
-      }
-    }
-    if (current.reasoningEffort && efforts.length === 0) {
-      await recordFallback(settings, 'reasoning-unavailable', `model ${providerId}/${modelId} does not expose reasoning effort choices`)
-    }
-    const selection = hasModelOverride
-      ? { provider: providerId, model: modelId }
-      : { ...globalSelection }
-    return current.reasoningEffort && chosenEffort !== undefined
-      ? { ...selection, reasoningEffort: chosenEffort }
-      : selection
-  } catch (error) {
-    await recordFallback(settings, 'model-unavailable', String(error instanceof Error ? error.message : error))
-    return { ...globalSelection }
-  }
-}
-
 /** Create one new voice session and durably attach it before returning to the Bridge. */
 export async function createAttachedVoiceSession(options: {
   readonly ctx: Context
@@ -154,7 +101,8 @@ export async function createAttachedVoiceSession(options: {
   readonly setup: (agentCtx: Context) => Promise<void>
 }): Promise<{ readonly handle: AgentHandle; readonly workspace: Awaited<ReturnType<typeof resolveVoiceWorkspace>>; readonly modelSelection: ModelSelection }> {
   const workspace = await resolveVoiceWorkspace(options.ctx, options.settings)
-  const modelSelection = await resolveVoiceModelSelection(options.ctx, options.settings, options.globalSelection)
+  // globalSelection（DSH 当前全局选择）在正式 open（打开会话）入口逐次读取，不再应用插件覆盖。
+  const modelSelection = { ...options.globalSelection }
   const handle = await options.ctx.agents.create({
     sessionId: SessionId(options.sessionId),
     agentOptions: modelSelection,

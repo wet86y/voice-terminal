@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from ..config import DshConfig
 from ..application.ports import managed_bind_port
@@ -22,6 +23,7 @@ from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
 from .official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
 from .profile import merge_profile_package, migrate_plugin_patch, migrate_schedule_patch, native_schedule_enabled
+from .console import DshConsoleProxy, DshConsoleTarget
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,8 @@ class DshRuntimeManager:
         self._launch_error: str | None = None
         self._closing = False
         self._restart_count = 0
+        self._console_generation = ""  # _console_generation（当前受管网页实例代次）。
+        self.console = DshConsoleProxy(self.console_target)
 
     @property
     def launch_url(self) -> str | None:
@@ -105,6 +109,13 @@ class DshRuntimeManager:
 
     def status_payload(self) -> dict[str, object]:
         return self.status().as_dict()
+
+    def console_target(self) -> DshConsoleTarget | None:
+        """console_target（内部网页目标）：凭据只在服务端内部交给固定目标代理。"""
+        if (self._state != "ready" or self._process is None or self._process.returncode is not None
+                or not self._actual_origin or not self._launch_url or not self._console_generation):
+            return None
+        return DshConsoleTarget(self._actual_origin, self._console_generation, self._launch_url)
 
     def begin_start(self) -> None:
         if self._closing:
@@ -132,6 +143,7 @@ class DshRuntimeManager:
         if self._process is not None and self._process.returncode is None:
             return
         self._state = "starting"
+        self.console.close_all()
         self._message = "DSH 控制台正在启动。"
         self._launch_url = None
         self._launch_error = None
@@ -221,6 +233,7 @@ class DshRuntimeManager:
             await self._stop_child(force=True)
 
     async def close(self) -> None:
+        self.console.close_all()
         self._closing = True
         sync_task = getattr(self, "_credential_sync_task", None)
         if sync_task is not None:
@@ -491,6 +504,7 @@ class DshRuntimeManager:
         self._actual_port = port
         self._actual_origin = origin
         self._launch_url = launch_url
+        self._console_generation = uuid4().hex
         self.bridge.set_origin(origin)
         if os.environ.get("VOICE_APP_ORIGIN"):
             if self._process is None:
@@ -529,6 +543,7 @@ class DshRuntimeManager:
     async def _monitor(self, process: asyncio.subprocess.Process) -> None:
         returncode = await process.wait()
         if process is self._process and not self._closing:
+            self.console.close_all()
             self._state = "exited"
             self._message = f"DSH 进程已退出（exit {returncode}）。"
             self._launch_url = None
@@ -563,6 +578,7 @@ class DshRuntimeManager:
             return sock.connect_ex((self.config.host, port)) == 0
 
     async def _stop_child(self, *, force: bool) -> None:
+        self.console.close_all()
         process = self._process
         if process is None:
             return

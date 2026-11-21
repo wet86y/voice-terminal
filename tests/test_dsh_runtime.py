@@ -359,6 +359,7 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(os.name == "nt", "需要 Windows（操作系统）的进程树回收")
     async def test_forced_windows_shutdown_waits_for_actual_child_exit(self) -> None:
         manager = object.__new__(DshRuntimeManager)
+        manager.console = Mock()
         manager.config = DshConfig(shutdown_timeout_ms=1000)
         process = Mock(returncode=None)
         waits = 0
@@ -378,6 +379,7 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
         manager.bridge = Mock()
         with patch.dict(os.environ, {"VOICE_APP_ORIGIN": ""}), patch("voice_terminal.dsh.runtime.asyncio.create_subprocess_exec", AsyncMock(return_value=killer)) as spawn:
             await manager._stop_child(force=False)
+        manager.console.close_all.assert_called_once()
         self.assertEqual(process.wait.await_count, 2)
         self.assertEqual(process.returncode, 0)
         self.assertIsNone(manager._process)

@@ -694,16 +694,16 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   async function openDshConsole() {
-    if (application.snapshot.value?.remote_mode === true) {
-      setError(new Error('此设备无法访问服务端回环地址，请在服务端本机打开 DSH（代理执行宿主）控制台。'))
-      return
-    }
     const desktop = desktopPort()
     if (!desktop.available) {
       setError(new Error('DSH 控制台只能由 Voice Terminal 桌面应用打开。'))
       return
     }
     try {
+      if (application.snapshot.value?.remote_mode === true) {
+        await nativeDeviceApi.remoteDshConsole('open')
+        return
+      }
       const result = await productApi.launchDsh()
       const launchUrl = new URL(result.url)
       if (!dsh.value.ui_origin || launchUrl.origin !== dsh.value.ui_origin || launchUrl.pathname !== '/' || !launchUrl.searchParams.has('token')) {

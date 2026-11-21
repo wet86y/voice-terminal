@@ -44,6 +44,7 @@ try {
   }))
   await writeFile(join(profile, 'cordis.patch.yml'), [
     '- id: agent-default-model', '  config:', '    provider: mock', '    model: local-test',
+    '- id: voice-terminal-shadow-bridge', '  config:', '    provider: retired-voice-provider', '    model: retired-model', '    reasoningEffort: max',
     '- id: agent-preset-registry', '  config:', '    default: shadow-agent',
     '- id: session-log-deepseek', '  disabled: true',
     '- id: session-title-llm', '  disabled: true',
@@ -91,6 +92,10 @@ try {
   assert.equal((await api(prefix + 'health')).bundle_version, '0.2.2')
   const envelope = () => ({ protocol_version: '2.0', request_id: randomUUID(), voice_session_id: 'voice-test', dsh_session_id: 'dsh-loader-test', epoch: 1 })
   assert.equal((await api(prefix + 'session.open', envelope())).result, 'accepted')
+  const voiceSettings = ctx.settings.describe().find(entry => entry.ns === 'voice-terminal-shadow-bridge').value
+  assert.ok(['provider', 'model', 'reasoningEffort'].every(key => !Object.hasOwn(voiceSettings, key)),
+    '插件正式设置表单不再提供模型覆盖')
+  assert.deepEqual(ctx.agentDefaultModel.currentSelection(), { provider: 'mock', model: 'local-test' })
   const agent = ctx.agents.list().find(value => value.id === 'dsh-loader-test')
   assert.ok(agent, '完整官方预设创建代理成功')
   assert.equal((await api(prefix + 'wake', { ...envelope(), activation_id: 'activation-test', context_revision: 0 })).result, 'accepted')

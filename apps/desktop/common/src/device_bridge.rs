@@ -90,7 +90,9 @@ fn run(args: &[String]) -> Result<(), String> {
         .map_err(|_| "OpenSSH 未提供原始会话标记；交互式 shell 被拒绝。".to_string())?;
     let (channel, send_prelude) = bridge_target(&marker)?;
     verify_ssh_connection_scope(&marker)?;
-    let endpoint = service_endpoints::query(&context.install, &expected_executable, channel)?;
+    let endpoint = with_queryable_identity(&arguments.owner_sid, || {
+        service_endpoints::query(&context.install, &expected_executable, channel)
+    })?;
     let prelude = if send_prelude {
         let prelude = DeviceBridgePrelude {
             message_type: "bridge.prelude".into(),
@@ -122,6 +124,86 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn bridge_target(marker: &str) -> Result<(BridgeChannel, bool), String> {
     BridgeChannel::from_marker(marker)
+}
+
+// with_queryable_identity（跨登录会话身份读取）：仅向当前账户开放本桥接进程的有限查询权，
+// 使桌面宿主仍能严格核验可执行文件；查询后恢复原 DACL（访问控制列表）。不开放写入或终止权。
+#[cfg(windows)]
+fn with_queryable_identity<T>(owner_sid: &str, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    use std::{ffi::c_void, ptr, sync::Mutex};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{ACL, DACL_SECURITY_INFORMATION, Authorization::{
+            ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo,
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_KERNEL_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        }},
+        System::Threading::{GetCurrentProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    static TRANSITION: Mutex<()> = Mutex::new(()); // TRANSITION（当前进程权限临时变更串行锁）。
+    let _transition = TRANSITION.lock().map_err(|_| "桥接进程身份权限状态不可用。")?;
+    if owner_sid != crate::system_feature::current_user_sid()? {
+        return Err("只能为当前账户提供桥接进程身份读取。".into());
+    }
+    struct LocalMemory(*mut c_void);
+    impl Drop for LocalMemory {
+        fn drop(&mut self) { if !self.0.is_null() { unsafe { LocalFree(self.0); } } }
+    }
+    struct ProcessDacl {
+        descriptor: *mut c_void, // descriptor（保留原 DACL 存储的系统安全描述符）。
+        acl: *mut ACL, // acl（原访问控制列表，不修改其内容）。
+        changed: bool, // changed（当前进程是否暂时追加有限查询授权）。
+    }
+    impl ProcessDacl {
+        fn restore(&mut self) -> Result<(), String> {
+            if self.changed {
+                let code = unsafe { SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION, ptr::null_mut(), ptr::null_mut(), self.acl, ptr::null()) };
+                if code != 0 { return Err(format!("桥接进程原身份权限恢复失败，系统错误码：{code}。")); }
+                self.changed = false;
+            }
+            Ok(())
+        }
+    }
+    impl Drop for ProcessDacl {
+        fn drop(&mut self) {
+            let _ = self.restore();
+            if !self.descriptor.is_null() { unsafe { LocalFree(self.descriptor); } }
+        }
+    }
+    let mut original = ProcessDacl { descriptor: ptr::null_mut(), acl: ptr::null_mut(), changed: false };
+    let code = unsafe { GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+        ptr::null_mut(), ptr::null_mut(), &mut original.acl, ptr::null_mut(), &mut original.descriptor) };
+    if code != 0 { return Err(format!("无法读取桥接进程身份权限，系统错误码：{code}。")); }
+    // null DACL（无限制列表）本来就允许查询，不把它替换为更窄的列表。
+    if !original.acl.is_null() {
+        let wide = owner_sid.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut sid = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 {
+            return Err("无法解析当前桥接账户安全标识。".into());
+        }
+        let _sid = LocalMemory(sid);
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION, grfAccessMode: GRANT_ACCESS,
+            grfInheritance: 0, Trustee: TRUSTEE_W { TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER, ptstrName: sid.cast(), ..Default::default() },
+        };
+        let mut acl = ptr::null_mut();
+        let code = unsafe { SetEntriesInAclW(1, &access, original.acl, &mut acl) };
+        let _acl = LocalMemory(acl.cast());
+        if code != 0 { return Err(format!("无法准备桥接进程有限查询权限，系统错误码：{code}。")); }
+        let code = unsafe { SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION, ptr::null_mut(), ptr::null_mut(), acl, ptr::null()) };
+        if code != 0 { return Err(format!("无法提供桥接进程有限查询权限，系统错误码：{code}。")); }
+        original.changed = true;
+    }
+    let result = operation();
+    original.restore()?;
+    result
+}
+
+#[cfg(not(windows))]
+fn with_queryable_identity<T>(_owner_sid: &str, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    operation()
 }
 
 fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
@@ -335,6 +417,35 @@ fn valid_ascii_token(value: &str, limit: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn bridge_identity_query_preserves_the_original_process_acl_on_success_and_failure() {
+        use std::ptr;
+        use windows_sys::Win32::{Foundation::LocalFree, Security::{ACL, DACL_SECURITY_INFORMATION,
+            Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT}}, System::Threading::GetCurrentProcess};
+        fn snapshot() -> Vec<u8> {
+            unsafe {
+                let mut descriptor = ptr::null_mut();
+                let mut acl: *mut ACL = ptr::null_mut();
+                assert_eq!(GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(), ptr::null_mut(), &mut acl, ptr::null_mut(), &mut descriptor), 0);
+                let bytes = if acl.is_null() { Vec::new() }
+                    else { std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize).to_vec() };
+                LocalFree(descriptor);
+                bytes
+            }
+        }
+        let owner = crate::system_feature::current_user_sid().unwrap();
+        let before = snapshot();
+        assert_eq!(with_queryable_identity(&owner, || Ok(7)).unwrap(), 7);
+        assert_eq!(snapshot(), before);
+        let result: Result<(), String> = with_queryable_identity(&owner, || Err("测试查询失败".into()));
+        assert_eq!(result.unwrap_err(), "测试查询失败");
+        assert_eq!(snapshot(), before);
+        assert!(with_queryable_identity("S-1-5-18", || Ok(())).is_err());
+        assert_eq!(snapshot(), before);
+    }
 
     #[test]
     fn accepted_ssh_metadata_is_bounded_without_repeating_system_scans() {

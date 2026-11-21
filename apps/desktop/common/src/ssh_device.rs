@@ -164,6 +164,14 @@ pub struct RemoteDeviceSessionLease {
     pub separate_playback_tasks: bool, // separate_playback_tasks（主机支持独立播报控制轮询）。
 }
 
+/// DshConsoleLease（原生网页授权）：绑定当前 SSH 会话和服务端核心，不占用语音或桌面任务。
+#[derive(Clone)]
+pub struct DshConsoleLease {
+    pub session_id: String, // session_id（仍须设备签名的网页授权编号）。
+    pub core_session_id: String, // core_session_id（签发网页授权的核心运行编号）。
+    session: Arc<ConnectedDeviceSession>, // session（打开网页时已验证的固定主机会话）。
+}
+
 /// RemoteDeviceTask（远端设备任务）：绑定设备、核心及两类代次的有界桌面命令。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteDeviceTask {
@@ -1040,7 +1048,8 @@ fn encode_websocket_upgrade_request(
 ) -> Result<Vec<u8>, String> {
     validate_gateway_auth_headers(auth)?;
     if path_and_query.len() > 2048
-        || !(path_and_query.starts_with("/v1/media?") || path_and_query.starts_with("/v1/voice?"))
+        || !(path_and_query.starts_with("/v1/media?") || path_and_query.starts_with("/v1/voice?")
+            || path_and_query.starts_with("/v1/dsh-console?"))
         || !path_and_query.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'/' | b'_' | b'-' | b'.' | b':' | b'?' | b'&' | b'=')
@@ -1552,6 +1561,7 @@ pub async fn probe_host_key(address: &str, port: u16, timeout: Duration) -> Resu
 #[derive(Clone)]
 struct PinnedHostHandler {
     expected_fingerprint: String, // expected_fingerprint（已确认的主机指纹）。
+    bridge_stderr: Arc<Mutex<Vec<u8>>>, // bridge_stderr（固定桥接的有界错误输出，只保留在当前连接内存）。
 }
 
 impl client::Handler for PinnedHostHandler {
@@ -1565,6 +1575,22 @@ impl client::Handler for PinnedHostHandler {
             server_public_key,
             &self.expected_fingerprint,
         ))
+    }
+
+    async fn extended_data(
+        &mut self,
+        _channel: russh::ChannelId,
+        ext: u32,
+        data: &[u8],
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if ext == 1 {
+            if let Ok(mut error) = self.bridge_stderr.lock() {
+                let remaining = 4096_usize.saturating_sub(error.len());
+                error.extend_from_slice(&data[..data.len().min(remaining)]);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1588,6 +1614,7 @@ fn device_ssh_client_config() -> client::Config {
 pub struct SshDeviceConnection {
     handle: client::Handle<PinnedHostHandler>, // handle（已验证 SSH 会话）。
     target: SshDeviceTarget,                   // target（不可在会话中途替换的主机身份）。
+    bridge_stderr: Arc<Mutex<Vec<u8>>>, // bridge_stderr（本条 SSH 连接最多四千字节的固定桥接拒绝原因）。
     management_open: Option<(RemoteManagementOpenRequest, std::time::Instant)>, // management_open（本条 SSH 连接复用的管理租约申请及本机到期时间）。
     management_reuse_allowed: bool, // management_reuse_allowed（服务端明确声明连续请求逐次核验信任后才复用通道）。
     management_channel:
@@ -1614,8 +1641,10 @@ impl SshDeviceConnection {
             return Err("SSH 私钥须在写入本机加密存储前完成本机解锁。".into());
         }
 
+        let bridge_stderr = Arc::new(Mutex::new(Vec::new()));
         let handler = PinnedHostHandler {
             expected_fingerprint: target.host_key_sha256.clone(),
+            bridge_stderr: bridge_stderr.clone(),
         };
         let config = Arc::new(device_ssh_client_config());
         let mut handle = tokio::time::timeout(
@@ -1647,6 +1676,7 @@ impl SshDeviceConnection {
         Ok(Self {
             handle,
             target,
+            bridge_stderr,
             management_open: None,
             management_reuse_allowed: false,
             management_channel: tokio::sync::Mutex::new(None),
@@ -1656,6 +1686,17 @@ impl SshDeviceConnection {
     /// is_closed（检查认证 SSH 会话是否已被传输层关闭）：复用 russh（Rust SSH 库）连接代次事实。
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
+    }
+
+    // bridge_failure（专用单通道失败说明）：不把错误输出混入文件或网页协议，也不另写日志。
+    fn bridge_failure(&self, fallback: &str) -> String {
+        let reason = self.bridge_stderr.lock().ok().map(|bytes| {
+            String::from_utf8_lossy(&bytes).chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(512).collect::<String>().trim().to_owned()
+        }).unwrap_or_default();
+        if reason.is_empty() { fallback.to_owned() }
+        else { format!("SSH（安全远程连接）受限桥接未就绪：{reason}") }
     }
 
     /// open_fixed_bridge（打开固定桥接）：只允许产品内置的控制、媒体、管理或文件标记。
@@ -1878,7 +1919,8 @@ impl LanUpdateChannel<'_> {
     pub async fn exchange(&mut self, operation: crate::lan_update::Operation, cancel: &AtomicBool) -> Result<crate::lan_update::Response, String> {
         let current=self.manager.current_session().await?;
         if !Arc::ptr_eq(&current,&self.owner) { return Err("版本同步所属连接已失效，请重新检查版本。".into()); }
-        let response=crate::lan_update::exchange(self.stream.as_mut(),operation,cancel).await?;
+        let response=crate::lan_update::exchange(self.stream.as_mut(),operation,cancel).await
+            .map_err(|error| self.connection.bridge_failure(&error))?;
         let current=self.manager.current_session().await?;
         if !Arc::ptr_eq(&current,&self.owner) { return Err("版本同步回执不再属于当前连接。".into()); }
         response.validate(&self.host_id)?;
@@ -2273,6 +2315,91 @@ impl SshDeviceManager {
             Ok((_, auth)) => connection.post_json_with_auth(path, body, Some(&auth), timeout).await,
             Err(response) => Ok(response),
         }
+    }
+
+    /// open_dsh_console（申请原生网页授权）：只允许服务端固定 DSH 目标和客户端回环来源。
+    pub async fn open_dsh_console(&self, origin: &str) -> Result<DshConsoleLease, String> {
+        let session = self.current_session().await?;
+        let body = serde_json::json!({"protocol_version":1,"action":"open","browser_origin":origin});
+        let (core_session_id, response) = self.console_request(&session, &body).await?;
+        let session_id = response.get("console_session_id").and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            .ok_or("服务端控制台会话编号无效。")?.to_owned();
+        if response["protocol_version"] != 1 || response["state"] != "ready" {
+            return Err("控制台协议版本与客户端不一致，请同步升级服务端和客户端。".into());
+        }
+        let lease = DshConsoleLease { session_id, core_session_id, session };
+        if !self.dsh_console_current(&lease).await { return Err("打开控制台期间共享主机连接已变化。".into()); }
+        Ok(lease)
+    }
+
+    async fn console_request(&self, session: &ConnectedDeviceSession, body: &serde_json::Value)
+        -> Result<(String, serde_json::Value), String> {
+        let path = "/v1/dsh-console";
+        let timeout = Duration::from_secs(15);
+        let (challenge, auth) = self.authorize_gateway(session, &session.connection, "POST", path, body, timeout)
+            .await?.map_err(|_| "服务端未授权远程 DSH 网页访问。".to_string())?;
+        let response = session.connection.post_json_with_auth(path, body, Some(&auth), timeout).await?;
+        if response.status != 200 {
+            return Err("远程 DSH 控制台不可用；请确认服务端版本、设备授权及 DSH 就绪状态。".into());
+        }
+        Ok((challenge.core_session_id, response.body))
+    }
+
+    /// dsh_console_current（网页目标检查）：旧连接不能在切换或重新配对后借用新目标。
+    pub async fn dsh_console_current(&self, lease: &DshConsoleLease) -> bool {
+        self.connection.lock().await.as_ref().is_some_and(|current|
+            Arc::ptr_eq(current, &lease.session) && !current.connection.is_closed())
+    }
+
+    /// dsh_console_status（网页授权查询）：不自动重新签发失效授权。
+    pub async fn dsh_console_status(&self, lease: &DshConsoleLease) -> Result<(), String> {
+        if !self.dsh_console_current(lease).await { return Err("共享主机连接已变化。".into()); }
+        let (core, body) = self.console_request(&lease.session, &serde_json::json!({
+            "protocol_version":1,"action":"status","console_session_id":lease.session_id,
+        })).await?;
+        if core != lease.core_session_id || body["state"] != "ready" {
+            return Err("远程控制台授权已失效。".into());
+        }
+        Ok(())
+    }
+
+    /// close_dsh_console（撤销本次网页授权）：不关闭服务端 DSH 或影响其他设备。
+    pub async fn close_dsh_console(&self, lease: &DshConsoleLease) {
+        if self.dsh_console_current(lease).await {
+            let _ = tokio::time::timeout(Duration::from_secs(3), self.console_request(&lease.session,
+                &serde_json::json!({"protocol_version":1,"action":"close","console_session_id":lease.session_id}))).await;
+        }
+    }
+
+    /// dsh_console_tunnel（固定网页隧道）：专用 SSH 控制连接承载有界 WebSocket 二进制块。
+    pub async fn dsh_console_tunnel(&self, lease: &DshConsoleLease)
+        -> Result<crate::dsh_console::ConsoleTunnel, String> {
+        if !self.dsh_console_current(lease).await { return Err("共享主机连接已变化。".into()); }
+        let key = load_session_transport_key(self, &lease.session)?;
+        let connection = SshDeviceConnection::connect(lease.session.target.clone(), key.as_str(), Duration::from_secs(8)).await?;
+        let opened = async {
+            let path = "/v1/dsh-console";
+            let body = serde_json::json!({"protocol_version":1,"console_session_id":lease.session_id});
+            let (challenge, auth) = self.authorize_gateway(&lease.session, &connection, "GET", path, &body, Duration::from_secs(5))
+                .await?.map_err(|_| "主机未授权控制台隧道。".to_string())?;
+            if challenge.core_session_id != lease.core_session_id || !self.dsh_console_current(lease).await {
+                return Err("控制台签发实例或已配对连接已变化。".to_string());
+            }
+            let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8;16]>());
+            let request = encode_websocket_upgrade_request(&format!("{path}?console_session_id={}", lease.session_id),
+                &auth, &key, lease.session.target.gateway_port)?;
+            let mut stream = connection.open_fixed_bridge(CONTROL_BRIDGE_MARKER).await?;
+            stream.write_all(&request).await.map_err(|_| "控制台隧道握手写入失败。".to_string())?;
+            stream.flush().await.map_err(|_| "控制台隧道握手刷新失败。".to_string())?;
+            read_websocket_upgrade_response(stream.as_mut(), &key).await?;
+            Ok(stream)
+        };
+        let stream = match tokio::time::timeout(Duration::from_secs(12), opened).await {
+            Ok(Ok(stream)) => stream,
+            _ => { let _ = connection.close().await; return Err("远程控制台隧道建立失败或授权已失效。".into()); }
+        };
+        Ok(crate::dsh_console::ConsoleTunnel::new(stream, connection).await)
     }
 
     async fn authorize_gateway(
@@ -3430,8 +3557,9 @@ fn device_request_proof_message_for_method(
                 | "/v1/interaction/abort"
                 | "/v1/management"
                 | "/v1/file-transfer"
+                | "/v1/dsh-console"
         ))
-        || (method == "GET" && matches!(path, "/v1/media" | "/v1/voice"));
+        || (method == "GET" && matches!(path, "/v1/media" | "/v1/voice" | "/v1/dsh-console"));
     if !device_id_ok || !target_ok || !session_ok || !challenge_ok {
         return Err("设备业务请求签名字段无效。".into());
     }
@@ -4369,6 +4497,97 @@ mod tests {
             .expect("读取 Python 测试网关回执失败");
         parse_http_response(&response).unwrap()
     }
+    #[tokio::test]
+    #[ignore = "需要显式指定已配对客户端安装目录，在该设备当前账户下只读验收"]
+    async fn paired_client_version_precheck_uses_the_saved_pinned_identity() {
+        let root = std::env::var_os("VOICE_TEST_PAIRED_CLIENT_ROOT") // VOICE_TEST_PAIRED_CLIENT_ROOT（明确选择的真实客户端安装目录）。
+            .map(PathBuf::from).expect("必须显式选择真实客户端安装目录");
+        let data = root.join("data");
+        let config = match crate::device_config::load_from_root(&data) {
+            crate::device_config::LoadResult::Valid(config) => config,
+            _ => panic!("真实客户端设备配置无效"),
+        };
+        assert_eq!(config.mode, crate::device_config::RunMode::Remote);
+        let host = config.host.expect("真实客户端尚未配对");
+        let host_id = host.host_id.expect("配对目标缺少设备编号");
+        let manager = SshDeviceManager::default();
+        manager.set_key_root(&data).unwrap();
+        manager.connect(&host.credential_ref, host.transport_credential_ref.as_deref(),
+            &config.device_id, SshDeviceTarget { address: host.address, port: host.port,
+                username: host.username, host_key_sha256: host.host_key_sha256,
+                gateway_port: DEFAULT_GATEWAY_PORT }, Duration::from_secs(10)).await.unwrap();
+        let result = manager.lan_version_status(&host_id, env!("CARGO_PKG_VERSION")).await;
+        manager.disconnect().await.unwrap();
+        let response = result.unwrap_or_else(|error| panic!("真实固定桥接版本预检失败：{error}"));
+        assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+        println!("真实配对客户端版本预检通过：{}", response.version);
+    }
+
+    #[tokio::test]
+    async fn fixed_bridge_rejection_reports_bounded_stderr_without_treating_it_as_protocol_data() {
+        struct RejectingBridge {
+            channel: Option<russh::Channel<russh::server::Msg>>, // channel（保留到固定命令处理完成的测试通道）。
+        }
+        impl russh::server::Server for RejectingBridge {
+            type Handler = Self;
+            fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> Self {
+                Self { channel: None }
+            }
+        }
+        impl russh::server::Handler for RejectingBridge {
+            type Error = russh::Error;
+            async fn auth_publickey(&mut self, _user: &str, _key: russh::server::VerifiedPublicKey<'_>)
+                -> Result<russh::server::Auth, Self::Error> {
+                Ok(russh::server::Auth::Accept)
+            }
+            async fn channel_open_session(&mut self, channel: russh::Channel<russh::server::Msg>,
+                reply: russh::server::ChannelOpenHandle, _session: &mut russh::server::Session)
+                -> Result<(), Self::Error> {
+                reply.accept().await;
+                self.channel = Some(channel);
+                Ok(())
+            }
+            async fn exec_request(&mut self, channel: russh::ChannelId, command: &[u8],
+                session: &mut russh::server::Session) -> Result<(), Self::Error> {
+                assert_eq!(command, FILE_BRIDGE_MARKER.as_bytes());
+                session.channel_success(channel)?;
+                let message = format!("固定桥接身份已失效。{}", "x".repeat(8192));
+                session.extended_data(channel, 1, message.into_bytes())?;
+                session.exit_status_request(channel, 1)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                Ok(())
+            }
+        }
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = host_key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let config = Arc::new(russh::server::Config { keys: vec![host_key],
+            auth_rejection_time: Duration::ZERO, auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default() });
+        let (ready, address) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut handler = RejectingBridge { channel: None };
+            let running = russh::server::Server::run_on_socket(&mut handler, config, &listener);
+            let _ = ready.send((listener.local_addr().unwrap(), running.handle()));
+            running.await
+        });
+        let (address, shutdown) = address.await.unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
+            .to_openssh(LineEnding::LF).unwrap();
+        let manager = SshDeviceManager::default();
+        manager.connect_with_test_credentials("test-device", SshDeviceTarget {
+            address: "127.0.0.1".into(), port: address.port(), username: "test-device".into(),
+            host_key_sha256: fingerprint, gateway_port: DEFAULT_GATEWAY_PORT,
+        }, &key, &key, Duration::from_secs(5)).await.unwrap();
+        let error = manager.lan_version_status("test-host", "1.0.0").await.err().unwrap();
+        assert!(error.contains("固定桥接身份已失效。"), "{error}");
+        assert!(error.len() < 1700, "错误说明必须有界");
+        manager.disconnect().await.unwrap();
+        shutdown.shutdown("bridge diagnostic completed".into());
+        server.await.unwrap().unwrap();
+    }
+
     #[derive(Clone)]
     struct LoopbackForwardSshServer {
         gateway: std::net::SocketAddr, // gateway（仅测试用的回环网关地址）。

@@ -559,7 +559,7 @@ struct Desktop {
     #[cfg(all(test, feature = "ssh-device"))]
     playback_worker_test_operations: Mutex<Vec<String>>, // playback_worker_test_operations（已调用的替换设备操作顺序）。
     #[cfg(feature = "ssh-device")]
-    ssh_device: voice_desktop_common::ssh_device::SshDeviceManager, // ssh_device（SSH 设备管理器）：私钥仅由原生层读取。
+    ssh_device: Arc<voice_desktop_common::ssh_device::SshDeviceManager>, // ssh_device（SSH 设备管理器）：私钥仅由原生层读取。
     #[cfg(feature = "ssh-device")]
     pairing_window: Mutex<
         Option<
@@ -600,6 +600,8 @@ struct Desktop {
     remote_media_channel_error: Mutex<Option<String>>, // remote_media_channel_error（最近一次音频通道错误）。
     #[cfg(feature = "ssh-device")]
     remote_voice_forwarder: Mutex<Option<RemoteVoiceForwarder>>, // remote_voice_forwarder（本机 loopback 上受随机票据保护的语音事件 WebSocket 转发）。
+    #[cfg(feature = "ssh-device")]
+    remote_dsh_console: tokio::sync::Mutex<Option<voice_desktop_common::dsh_console::DshConsoleForwarder>>, // remote_dsh_console（本机原生网页入口，不占用语音任务）。
     #[cfg(feature = "ssh-device")]
     remote_playback_control: tokio::sync::Mutex<RemotePlaybackControlState>, // remote_playback_control（任务通道与媒体流共用的播放控制状态）。
     #[cfg(feature = "ssh-device")]
@@ -2954,6 +2956,7 @@ async fn stop_remote_device_runtime(state: &Arc<Desktop>) -> Result<(), String> 
             publication.stop()?;
         }
         stop_remote_voice_forwarder(state).await?;
+        stop_remote_dsh_console(state).await;
         stop_remote_media_channel(state).await?;
         stop_remote_device_task_channel(state).await?;
         state.ssh_device.disconnect().await?;
@@ -4396,6 +4399,7 @@ async fn device_ssh_disconnect(
     #[cfg(feature = "ssh-device")]
     {
         let voice_forwarder_stopped = stop_remote_voice_forwarder(state.inner()).await?;
+        stop_remote_dsh_console(state.inner()).await;
         let media_channel_stopped = stop_remote_media_channel(state.inner()).await?;
         let task_channel_stopped = stop_remote_device_task_channel(state.inner()).await?;
         let disconnect_result = state.ssh_device.disconnect().await;
@@ -7648,6 +7652,12 @@ async fn stop_remote_voice_forwarder(state: &Arc<Desktop>) -> Result<bool, Strin
 }
 
 #[cfg(feature = "ssh-device")]
+async fn stop_remote_dsh_console(state: &Arc<Desktop>) {
+    let console = state.remote_dsh_console.lock().await.take();
+    if let Some(console) = console { console.stop().await; }
+}
+
+#[cfg(feature = "ssh-device")]
 async fn stop_remote_device_task_channel(state: &Arc<Desktop>) -> Result<bool, String> {
     let channel = state
         .remote_task_channel
@@ -8312,6 +8322,61 @@ async fn device_ssh_voice_forwarder(
     trusted(&window, &state)?;
     let _ = action;
     Err("当前产品构建未包含 SSH 语音 WebSocket 转发能力。".into())
+}
+
+/// device_ssh_dsh_console（远程原生网页）：正式注册的打开、查询和停止入口。
+#[tauri::command]
+async fn device_ssh_dsh_console(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    action: String, // action（open 打开系统浏览器、status 查询或 stop 关闭网页入口）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前窗口或应用状态不能打开远程控制台。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        let desktop = state.inner().clone();
+        if action == "stop" {
+            stop_remote_dsh_console(&desktop).await;
+            return Ok(serde_json::json!({"state":"stopped","opened":false,"origin":null,
+                "fields":{"state":"客户端网页入口状态","opened":"本次是否打开系统浏览器","origin":"不含登录凭据的本机网页来源"}}));
+        }
+        if !matches!(action.as_str(), "open" | "status") { return Err("控制台操作必须为 open、status 或 stop。".into()); }
+        let mut slot = desktop.remote_dsh_console.lock().await;
+        if action == "status" {
+            let running = slot.as_ref().is_some_and(|console| console.running());
+            return Ok(serde_json::json!({"state":if running {"running"} else {"stopped"},"opened":false,
+                "origin":slot.as_ref().filter(|console| console.running()).map(|console| console.origin()),
+                "fields":{"state":"客户端网页入口状态","opened":"本次是否打开系统浏览器","origin":"不含登录凭据的本机网页来源"}}));
+        }
+        lan_update::require_compatible(&desktop).await?;
+        let context = desktop.context().ok_or("缺少正式工作区。")?;
+        match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Remote
+                    && config.host.as_ref().is_some_and(|host| host.host_id.is_some()) => {}
+            _ => return Err("远程控制台只允许已配对的客户端模式。".into()),
+        }
+        if !desktop.ssh_device.connected().await { return Err("请先连接已配对共享主机。".into()); }
+        let reuse = match slot.as_ref() {
+            Some(console) if console.running() => console.check().await.is_ok(),
+            _ => false,
+        };
+        if !reuse {
+            if let Some(console) = slot.take() { console.stop().await; }
+            *slot = Some(voice_desktop_common::dsh_console::DshConsoleForwarder::start(desktop.ssh_device.clone()).await?);
+        }
+        let console = slot.as_ref().ok_or("远程控制台入口未就绪。")?;
+        let url = console.bootstrap_url()?;
+        // 入口只能由当前原生监听器生成；一次性票据不返回产品网页或调试回执。
+        voice_desktop_common::windows::open_url(&url)?;
+        Ok(serde_json::json!({"state":"running","opened":true,"origin":console.origin(),
+            "fields":{"state":"客户端网页入口状态","opened":"本次是否已打开系统默认浏览器","origin":"不含登录凭据的本机网页来源"}}))
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    { let _ = action; Err("当前产品构建未包含远程 DSH 网页转发能力。".into()) }
 }
 
 // desktop_page_ready（真实页面就绪）：界面挂载后确认；迁移不使用缓存启动状态。
@@ -10207,7 +10272,7 @@ fn run() -> Result<(), String> {
         #[cfg(all(test, feature = "ssh-device"))]
         playback_worker_test_operations: Mutex::new(Vec::new()),
         #[cfg(feature = "ssh-device")]
-        ssh_device: voice_desktop_common::ssh_device::SshDeviceManager::default(),
+        ssh_device: Arc::new(voice_desktop_common::ssh_device::SshDeviceManager::default()),
         #[cfg(feature = "ssh-device")]
         pairing_window: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
@@ -10240,6 +10305,8 @@ fn run() -> Result<(), String> {
         remote_media_channel_error: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         remote_voice_forwarder: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        remote_dsh_console: tokio::sync::Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         remote_playback_control: tokio::sync::Mutex::new(RemotePlaybackControlState::default()),
         #[cfg(feature = "ssh-device")]
@@ -11127,7 +11194,7 @@ mod tests {
             remote_desktop_helper: std::sync::Mutex::new(None),
             playback_worker_test_responses: std::sync::Mutex::new(responses.into()),
             playback_worker_test_operations: std::sync::Mutex::new(Vec::new()),
-            ssh_device,
+            ssh_device: std::sync::Arc::new(ssh_device),
             pairing_window: std::sync::Mutex::new(None),
             pairing_listener: tokio::sync::Mutex::new(None),
             discovery_publication: std::sync::Mutex::new(None),
@@ -11147,6 +11214,7 @@ mod tests {
             remote_media_stop_revision: std::sync::atomic::AtomicU64::new(0),
             remote_media_channel_error: std::sync::Mutex::new(None),
             remote_voice_forwarder: std::sync::Mutex::new(None),
+            remote_dsh_console: tokio::sync::Mutex::new(None),
             remote_playback_control: tokio::sync::Mutex::new(
                 super::RemotePlaybackControlState::default(),
             ),

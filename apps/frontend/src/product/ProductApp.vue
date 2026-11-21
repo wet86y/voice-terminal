@@ -192,8 +192,8 @@ function exportLogs() {
     <Workbench
       v-show="activePage === 'home'"
       :model="workbenchModel"
-      :console-enabled="!applicationSnapshot?.remote_mode && dsh.state === 'ready'"
-      :console-label="applicationSnapshot?.remote_mode ? '仅服务端本机可打开' : dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
+      :console-enabled="dsh.state === 'ready'"
+      :console-label="dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
       @settings="activePage = 'settings'"
       @console="openDshConsole"
       @action="runtimeAction"

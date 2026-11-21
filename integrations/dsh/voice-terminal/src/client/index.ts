@@ -11,7 +11,7 @@ import { registerVoiceTerminalContextNode } from './voice-terminal-context.js'
 import { VoiceTerminalContextNodeView } from './VoiceTerminalContextNodeView.tsx'
 import { en, zh, type VoiceTerminalLocaleKey } from './locales.js'
 import type { VoiceTerminalSettings } from '../shared/settings-contract.js'
-import { VOICE_TERMINAL_SETTINGS_NAMESPACE } from '../shared/settings-contract.js'
+import { VOICE_TERMINAL_SETTINGS_NAMESPACE, DSH_GLOBAL_MODEL_NAMESPACE } from '../shared/settings-contract.js'
 
 export type { VoiceTerminalLocaleKey } from './locales.js'
 export type { VoiceTerminalSettingsInjected } from './VoiceTerminalSettingsTab.tsx'
@@ -32,15 +32,30 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => registerVoiceTerminalContextNode(ctx), 'voice-terminal: visible DSH injections')
 
   const settings = ctx.configForms.get<VoiceTerminalSettings>(VOICE_TERMINAL_SETTINGS_NAMESPACE)
+  const globalModel = ctx.configForms.get<Awaited<ReturnType<VoiceTerminalSettingsInjected['modelCatalog']>>['default']>(DSH_GLOBAL_MODEL_NAMESPACE)
   const modelCatalog: VoiceTerminalSettingsInjected['modelCatalog'] = async () => {
     const response = await ctx.remote.session.modelCatalog()
     if (!response.ok) throw new Error(`session.modelCatalog failed: ${response.error.code}: ${response.error.message}`)
     return response.value
   }
+  // 只适配公开失效事件，目录、默认模型及推理能力仍由 session.modelCatalog（正式目录接口）提供。
+  const subscribeModelCatalog: VoiceTerminalSettingsInjected['subscribeModelCatalog'] = listener => {
+    const refresh = (): void => { listener(false) }
+    const disposers = [
+      ctx.remote.$on('llm/adapters-updated', refresh),
+      ctx.remote.$on('settings/document-updated', refresh),
+      ctx.remote.$on('credentials/record-updated', refresh),
+      ctx.remote.$on('credentials/reference-updated', refresh),
+      ctx.on('connection/reset', () => { listener(true) }),
+    ]
+    return () => { for (const dispose of disposers) dispose() }
+  }
   const injected = (): VoiceTerminalSettingsInjected => ({
-    hooks: { preferences: settings, workspaces: ctx.workspaces.list },
+    hooks: { preferences: settings, globalModel, workspaces: ctx.workspaces.list },
     mutateSettings: ops => settings.mutate(ops),
+    mutateGlobalModel: (ops, revision) => globalModel.mutate(ops, revision),
     modelCatalog,
+    subscribeModelCatalog,
   })
   const t = ctx.locale.bind('settings.voiceTerminal')
 

@@ -14,12 +14,6 @@ export interface Config {
   readonly workspaceId: Volatile<string>
   /** Project fallback workspace id（项目备用工作区标识）. */
   readonly defaultWorkspaceId: Volatile<string>
-  /** Model provider id（模型供应方标识）. */
-  readonly provider: Volatile<string>
-  /** Model id（模型标识）. */
-  readonly model: Volatile<string>
-  /** Reasoning effort id（推理强度标识）. */
-  readonly reasoningEffort: Volatile<string>
   /** Settings fallback notice（设置回退提示）. */
   readonly fallbackNotice: Volatile<string>
 }

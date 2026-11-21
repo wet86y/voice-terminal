@@ -105,7 +105,10 @@ def test_gateway_reports_share_the_voice_owner_but_reject_late_generations(monke
     app.generations["voice"] = "current"
     monkeypatch.setattr(app, "_endpoint_pid_is_owned", lambda key, pid, created: key == "gateway" and pid == 123)
     report = {"component": "gateway", "generation": "current", "pid": 123,
-              "endpoint_url": "http://127.0.0.1:43210"}
+              "endpoint_url": "http://127.0.0.1:43210",
+              "endpoint": {"host": "127.0.0.1", "port": 43210,
+                           "base_url": "http://127.0.0.1:43210", "pid": 123,
+                           "created_at": 1_700_000_000.0}}
     try:
         assert app.report(report)
         assert app.state.snapshot()["endpoints"]["gateway"]["port"] == 43210

@@ -98,3 +98,23 @@ describe('nativeDeviceApi.remoteVoiceForwarder（远程语音回环转发）', (
     await expect(nativeDeviceApi.remoteVoiceForwarder('stop')).resolves.toEqual({ state: 'stopped', fields: {} })
   })
 })
+
+describe('nativeDeviceApi.remoteDshConsole（远程原生网页）', () => {
+  it('打开只返回本机来源和状态，不需要网页处理登录地址', async () => {
+    const response = { state:'running', opened:true, origin:'http://127.0.0.1:43210', fields:{ state:'网页入口状态' } }
+    const invoke = vi.fn().mockResolvedValue(response)
+    window.__TAURI_INTERNALS__ = { invoke }
+    await expect(nativeDeviceApi.remoteDshConsole('open')).resolves.toEqual(response)
+    expect(invoke).toHaveBeenCalledWith('device_ssh_dsh_console', { action:'open' })
+  })
+
+  it.each(['http://server:43210', 'http://127.0.0.1:43210/?token=value', 'http://user@127.0.0.1:43210'])('拒绝不是原生回环来源的回执 %s', async origin => {
+    window.__TAURI_INTERNALS__ = { invoke:vi.fn().mockResolvedValue({state:'running',opened:true,origin,fields:{}}) }
+    await expect(nativeDeviceApi.remoteDshConsole('open')).rejects.toThrow()
+  })
+
+  it('打开操作不能把尚未打开浏览器的状态当成成功', async () => {
+    window.__TAURI_INTERNALS__ = { invoke:vi.fn().mockResolvedValue({state:'running',opened:false,origin:'http://127.0.0.1:43210',fields:{}}) }
+    await expect(nativeDeviceApi.remoteDshConsole('open')).rejects.toThrow('尚未完成')
+  })
+})

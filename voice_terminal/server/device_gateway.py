@@ -71,6 +71,10 @@ class DeviceGateway:
         }
 
     async def _stop(self) -> None:
+        dsh = getattr(self.runtime, "dsh", None)
+        console = getattr(dsh, "console", None)
+        if console is not None:
+            console.close_all()
         self.runtime._device_gateway_listener_socket = None
         if self.server is not None:
             self.server.should_exit = True

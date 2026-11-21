@@ -298,7 +298,7 @@ except ImportError:  # pragma: no cover - optional during doctor/setup
 
 # _GATEWAY_WEBSOCKET_PATHS（回环网关放行的 WebSocket 路径）：媒体通道与语音控制通道；
 # 其余 WebSocket 一律以 1008（策略违规）关闭，避免网关端口变成通用业务入口。
-_GATEWAY_WEBSOCKET_PATHS = frozenset({"/v1/media", "/v1/voice"})
+_GATEWAY_WEBSOCKET_PATHS = frozenset({"/v1/media", "/v1/voice", "/v1/dsh-console"})
 
 
 class LoopbackDeviceGatewayGuard:
@@ -525,7 +525,7 @@ async def _device_gateway_challenge_payload(request: Any) -> dict[str, Any]:
     allowed_post_paths = {
         "/v1/status", "/v1/devices", "/v1/session/open", "/v1/session/poll",
         "/v1/session/complete", "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
-        "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer",
+        "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management", "/v1/file-transfer", "/v1/dsh-console",
     }
     if (set(payload) != expected or type(payload.get("protocol_version")) is not int
             or payload.get("protocol_version") != 1
@@ -968,7 +968,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                  "/v1/session/open", "/v1/session/poll", "/v1/session/complete",
                                  "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
                                  "/v1/interaction/prepare", "/v1/interaction/abort", "/v1/management",
-                                 "/v1/file-transfer", "/v1/media", "/v1/voice"}),
+                                 "/v1/file-transfer", "/v1/media", "/v1/voice", "/v1/dsh-console"}),
     )
 
     @app.get("/health")
@@ -991,6 +991,81 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except DeviceTrustError as exc:
             raise HTTPException(status_code=422, detail="设备签名挑战字段无效。") from exc
         return JSONResponse(challenge, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/dsh-console")
+    async def device_gateway_dsh_console(request: Request) -> JSONResponse:
+        """device_gateway_dsh_console（原生网页会话）：签名授权固定宿主，独立于语音任务。"""
+        from ..dsh.console import CONSOLE_SESSION_SECONDS
+
+        _require_device_gateway_port(request)
+        payload = await _device_gateway_json(request, label="远程控制台会话")
+        action = payload.get("action")
+        expected = {"protocol_version", "action", "browser_origin" if action == "open" else "console_session_id"}
+        if (set(payload) != expected or type(payload.get("protocol_version")) is not int
+                or payload["protocol_version"] != 1 or not isinstance(action, str) or action not in {"open", "status", "close"}):
+            raise HTTPException(status_code=422, detail="远程控制台操作字段无效。")
+        _authorize_device_gateway_request(runtime, request, payload)
+        device_id = request.headers.get("x-voice-terminal-device-id", "")
+        proxy = getattr(getattr(runtime, "dsh", None), "console", None)
+        if proxy is None:
+            raise HTTPException(status_code=503, detail="服务端 DSH 网页转发尚未就绪。")
+        try:
+            if action == "open":
+                trust = runtime.device_trust_store
+                key = trust.trusted_key(device_id)
+                identity = next((item for item in trust.snapshot()["devices"] if item["device_id"] == device_id), None)
+                if key is None or identity is None:
+                    raise ValueError("客户端设备未获信任。")
+                trusted_at = identity["trusted_at_ms"]
+
+                def authorized() -> bool:
+                    if getattr(runtime, "_device_gateway_enabled", False) is not True:
+                        return False
+                    snapshot = trust.snapshot()
+                    return snapshot["state"] == "valid" and any(item["device_id"] == device_id and item["state"] == "trusted"
+                        and item["trusted_at_ms"] == trusted_at and item["fingerprint"] == identity["fingerprint"]
+                        for item in snapshot["devices"])
+
+                session = await proxy.open(device_id, runtime.core_session_id, payload["browser_origin"], authorized)
+            else:
+                session_id = payload.get("console_session_id")
+                if (not isinstance(session_id, str) or len(session_id) != 64
+                        or any(character not in "0123456789abcdef" for character in session_id)):
+                    raise ValueError("控制台会话编号无效。")
+                session = proxy.get(session_id, device_id, runtime.core_session_id)
+                if action == "close":
+                    proxy.close(session)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="远程 DSH 控制台不可用，请等待宿主就绪后重新打开。") from exc
+        return JSONResponse({"protocol_version": 1, "state": "closed" if action == "close" else "ready",
+            "console_session_id": session.session_id, "expires_in_seconds": CONSOLE_SESSION_SECONDS,
+            "fields": {"protocol_version": "控制台转发协议版本", "state": "设备网页授权状态",
+                "console_session_id": "仍须设备签名的控制台会话编号", "expires_in_seconds": "本次授权最长存活秒数"}},
+            headers={"Cache-Control": "no-store"})
+
+    @app.websocket("/v1/dsh-console")
+    async def device_gateway_dsh_console_tunnel(websocket: WebSocket) -> None:
+        """device_gateway_dsh_console_tunnel（固定网页隧道）：内层保留原站路径和协议。"""
+        try:
+            _require_device_gateway_port(websocket)
+            query = websocket.scope.get("query_string", b"")
+            if not isinstance(query, bytes) or len(query) > 128:
+                raise ValueError("控制台握手字段超过限制。")
+            pairs = parse_qsl(query.decode("ascii"), keep_blank_values=True, strict_parsing=True)
+            if len(pairs) != 1 or pairs[0][0] != "console_session_id":
+                raise ValueError("控制台握手字段无效。")
+            session_id = pairs[0][1]
+            if len(session_id) != 64 or any(character not in "0123456789abcdef" for character in session_id):
+                raise ValueError("控制台会话编号无效。")
+            _authorize_device_gateway_request(runtime, websocket, {
+                "protocol_version": 1, "console_session_id": session_id,
+            }, method="GET")
+            proxy = runtime.dsh.console
+            session = proxy.get(session_id, websocket.headers.get("x-voice-terminal-device-id", ""), runtime.core_session_id)
+        except (HTTPException, ValueError, AttributeError, UnicodeDecodeError):
+            await websocket.close(code=1008)
+            return
+        await proxy.tunnel(websocket, session)
 
     @app.post("/v1/file-transfer")
     async def device_gateway_file_transfer(request: Request) -> JSONResponse:

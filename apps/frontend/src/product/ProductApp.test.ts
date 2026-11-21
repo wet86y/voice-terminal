@@ -645,14 +645,17 @@ describe('正式界面的真实控件交互', () => {
     expect(components.get('[data-category="tts"] .local-category-toggle').attributes('aria-expanded')).toBe('true')
   })
 
-  it('远程产品页禁用只能在服务端本机访问的 DSH 回环控制台入口', async () => {
+  it('远程产品页在 DSH 就绪时启用原生网页入口', async () => {
+    application.businessReady.value = true
+    vi.spyOn(productApi, 'snapshot').mockResolvedValue({ settings:structuredClone(DEFAULT_SETTINGS), models:DEFAULT_REGISTRY,
+      dsh:{ enabled:true,state:'ready',version:'0.2.1-rc.5',profile:'web',ui_origin:null,message:'' } } as never)
     application.snapshot.value = { remote_mode: true, management_connected: true, startup_complete: true,
       state: 'running', components: [] } as unknown as ApplicationSnapshot
     const wrapper = render(ProductApp)
     await flushPromises()
     const workbench = wrapper.findComponent(Workbench)
-    expect(workbench.props('consoleEnabled')).toBe(false)
-    expect(workbench.props('consoleLabel')).toBe('仅服务端本机可打开')
+    expect(workbench.props('consoleEnabled')).toBe(true)
+    expect(workbench.props('consoleLabel')).toBe('代理控制台')
     expect(wrapper.get('.remote-host-banner').text()).toContain('管理通道已连接')
     expect(wrapper.get('.remote-host-banner').text()).toContain('服务端语音实时通道已断开')
   })
@@ -1758,13 +1761,32 @@ describe('正式界面的真实控件交互', () => {
     expect(openTab).not.toHaveBeenCalled()
   })
 
-  it('远程客户端禁用服务端回环控制台入口并阻止请求本机地址', async () => {
+  it('远程原生入口失败时显示升级原因并且不回退取得服务端启动令牌', async () => {
     application.snapshot.value = { remote_mode: true, management_connected: true } as ApplicationSnapshot
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+      focus: vi.fn(), exportLogs: vi.fn(), openConsole: vi.fn(), openMinimaxVoiceLibrary: vi.fn(), exit: vi.fn() })
     const launch = vi.spyOn(productApi, 'launchDsh')
+    vi.spyOn(nativeDeviceApi, 'remoteDshConsole').mockRejectedValue(new Error('请同步升级服务端和客户端。'))
     const value = await adapter()
     await value.openDshConsole()
     expect(launch).not.toHaveBeenCalled()
-    expect(value.lastError.value).toContain('请在服务端本机打开 DSH')
+    expect(value.lastError.value).toContain('请同步升级服务端和客户端')
+  })
+
+  it('远程控制台经正式原生命令打开，并保留服务端凭据在原生和服务端', async () => {
+    application.snapshot.value = { remote_mode: true, management_connected: true } as ApplicationSnapshot
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+      focus: vi.fn(), exportLogs: vi.fn(), openConsole: vi.fn(), openMinimaxVoiceLibrary: vi.fn(), exit: vi.fn() })
+    const open = vi.spyOn(nativeDeviceApi, 'remoteDshConsole').mockResolvedValue({
+      state:'running', opened:true, origin:'http://127.0.0.1:43210', fields:{},
+    })
+    const launch = vi.spyOn(productApi, 'launchDsh')
+    const value = await adapter()
+    value.dsh.value = { ...value.dsh.value, state:'ready' }
+    await value.openDshConsole()
+    expect(open).toHaveBeenCalledWith('open')
+    expect(launch).not.toHaveBeenCalled()
+    expect(value.lastError.value).toBe('')
   })
 
   it('宿主晚于页面就绪时更新控制台状态，迟到的启动快照不能覆盖它', async () => {

@@ -46,6 +46,7 @@ macro_rules! desktop_command_registry {
             device_ssh_task_channel,
             device_ssh_media_channel,
             device_ssh_voice_forwarder,
+            device_ssh_dsh_console,
             publish_floating_model,
             get_floating_model,
             return_to_workbench,

@@ -15,9 +15,6 @@ export const Config = z.object({
   maxBodyBytes: z.natural().min(1).default(2_097_152),
   workspaceId: z.string().default('').volatile(),
   defaultWorkspaceId: z.string().default('').volatile(),
-  provider: z.string().default('').volatile(),
-  model: z.string().default('').volatile(),
-  reasoningEffort: z.string().default('').volatile(),
   fallbackNotice: z.string().default('').volatile(),
 })
 

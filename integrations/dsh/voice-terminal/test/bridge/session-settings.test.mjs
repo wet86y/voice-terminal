@@ -72,7 +72,7 @@ test('new voice session inherits DSH global model and attaches before returning'
   assert.deepEqual(state.operations, ['create', 'attach:session-inherit'])
 })
 
-test('new voice session applies its workspace, model, and reasoning choices', async () => {
+test('new voice session preserves its workspace and ignores retired plugin model overrides', async () => {
   const customWorkspace = {
     id: 'custom-workspace', path: 'D:\\Projects\\Voice',
     async status() { return 'ok' },
@@ -89,12 +89,13 @@ test('new voice session applies its workspace, model, and reasoning choices', as
     globalSelection, setup,
   })
 
-  assert.deepEqual(created.modelSelection, { provider: 'voice-provider', model: 'voice-model', reasoningEffort: 'max' })
+  assert.deepEqual(created.modelSelection, globalSelection)
+  assert.deepEqual(state.createOptions().agentOptions, globalSelection)
   assert.equal(state.createOptions().meta.cwd, customWorkspace.path)
   assert.equal(customWorkspace.attached, 'session-custom')
 })
 
-test('an unavailable saved model falls back to the current DSH global model', async () => {
+test('each new voice session uses the latest DSH global model and reasoning selection', async () => {
   const state = fixture({ selection: { provider: 'voice-provider', model: 'removed-model' } })
   const created = await createAttachedVoiceSession({
     ctx: state.ctx, settings: state.settings, sessionId: 'session-model-fallback', presetId: 'shadow-agent',
@@ -102,7 +103,10 @@ test('an unavailable saved model falls back to the current DSH global model', as
   })
 
   assert.deepEqual(created.modelSelection, globalSelection)
-  assert.equal(state.settings.get().fallbackNotice, 'model-unavailable')
+  const next = { provider: 'other-provider', model: 'other-model', reasoningEffort: 'high' }
+  await createAttachedVoiceSession({ ctx: state.ctx, settings: state.settings, sessionId: 'session-global-next', presetId: 'shadow-agent', globalSelection: next, setup })
+  assert.deepEqual(state.createOptions().agentOptions, next)
+  assert.equal(state.settings.get().fallbackNotice, undefined)
 })
 
 test('an unavailable workspace falls back to the project workspace and records a notice', async () => {

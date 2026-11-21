@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 // DSH Remote API's SettingsPathOpView（设置接口提供的路径操作类型）.
 import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -7,35 +7,8 @@ import { Button, IconChevronDownOutlineRegular, IconFolderCloseRegular, Menu } f
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime, InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import type { VoiceTerminalSettings } from '../shared/settings-contract.js'
+import { ModelCatalogObserver, isCatalogEffortCurrent, type ModelCatalog, type CatalogInvalidations, type CatalogSnapshot } from '../shared/model-catalog.js'
 import css from './VoiceTerminalSettingsPage.module.css'
-
-interface ModelChoice {
-  /** Stable model identifier（稳定模型标识）. */
-  readonly id: string
-  /** Display name supplied by DSH（DSH 提供的显示名称）. */
-  readonly name: string
-  /** Reasoning options advertised by this model（该模型公布的推理选项）. */
-  readonly reasoning?: {
-    /** Supported reasoning levels（支持的推理强度）. */
-    readonly efforts: readonly { readonly id: string; readonly name: string }[]
-    /** Provider default reasoning level（供应方默认推理强度）. */
-    readonly defaultEffort?: string
-  }
-}
-
-interface ModelCatalog {
-  /** DSH global model selection（DSH 全局模型选择）. */
-  readonly default: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
-  /** Models grouped by provider（按供应方分组的模型）. */
-  readonly groups: readonly {
-    /** Stable provider identifier（稳定供应方标识）. */
-    readonly id: string
-    /** Display name supplied by DSH（DSH 提供的显示名称）. */
-    readonly name: string
-    /** Routable models for this provider（该供应方当前可用模型）. */
-    readonly models: readonly ModelChoice[]
-  }[]
-}
 
 /** DSH services captured by this settings page（设置页面）. */
 export interface VoiceTerminalSettingsInjected {
@@ -43,13 +16,19 @@ export interface VoiceTerminalSettingsInjected {
   readonly hooks: {
     /** Preferences（持久设置快照）：由官方 slots（界面插槽）生成订阅钩子。 */
     readonly preferences: ConfigForm<VoiceTerminalSettings>
+    /** Global model（全局模型）：与 DSH 正式选择器共用一个设置条目。 */
+    readonly globalModel: ConfigForm<ModelCatalog['default']>
     /** Workspaces（工作区快照）：由宿主同步。 */
     readonly workspaces: IWorkspaces['list']
   }
   /** mutateSettings（修改设置）：普通操作回调，不携带服务实例。 */
-  readonly mutateSettings: (ops: readonly SettingsPathOpView[]) => Promise<unknown>
+  readonly mutateSettings: (ops: readonly SettingsPathOpView[]) => Promise<boolean>
+  /** mutateGlobalModel（修改宿主全局模型）：使用官方设置校验及版本保护。 */
+  readonly mutateGlobalModel: (ops: readonly SettingsPathOpView[], expectedRevision: number | undefined) => Promise<boolean>
   /** Current routable DSH models（DSH 当前可用模型目录）. */
   readonly modelCatalog: () => Promise<ModelCatalog>
+  /** subscribeModelCatalog（目录变更订阅）：使用公开宿主事件，随页面释放。 */
+  readonly subscribeModelCatalog: CatalogInvalidations
 }
 
 export type VoiceTerminalSettingsPageProps =
@@ -74,9 +53,8 @@ interface MenuFieldProps {
   readonly onSelect: (id: string) => void
 }
 
-type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+type SaveState = 'idle' | 'saving' | 'saved' | 'error' | 'stale'
 
-const FOLLOW_GLOBAL_ID = 'follow-global'
 const MODEL_DEFAULT_ID = 'model-default'
 
 function modelKey(provider: string, model: string): string {
@@ -141,31 +119,26 @@ function MenuField({ label, description, value, items, selectedId, disabled, onS
 }
 
 /** Render Voice Terminal plugin settings as an independent DSH settings page（独立的 DSH 设置页面）. */
-export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutateSettings, modelCatalog, t }: VoiceTerminalSettingsPageProps): ReactNode {
+export function VoiceTerminalSettingsPage({ usePreferences, useGlobalModel, useWorkspaces, mutateSettings, mutateGlobalModel, modelCatalog, subscribeModelCatalog, t }: VoiceTerminalSettingsPageProps): ReactNode {
   const preference = usePreferences(value => value)
+  const globalModelPreference = useGlobalModel(value => value)
   const workspaceSnapshot = useWorkspaces(value => value)
-  const [catalog, setCatalog] = useState<ModelCatalog>()
-  const [catalogFailed, setCatalogFailed] = useState(false)
+  const [catalogState, setCatalogState] = useState<CatalogSnapshot<ModelCatalog>>({ catalog: undefined, loading: true, failed: false })
+  const catalogObserver = useRef<ModelCatalogObserver<ModelCatalog> | undefined>(undefined)
+  const { catalog, loading: catalogLoading, failed: catalogFailed } = catalogState
   const [saveState, setSaveState] = useState<SaveState>('idle')
   const value = preference.value
 
   useEffect(() => {
-    let current = true
-    void modelCatalog().then(
-      result => { if (current) { setCatalog(result); setCatalogFailed(false) } },
-      () => { if (current) setCatalogFailed(true) },
-    )
-    return () => { current = false }
-  }, [modelCatalog])
+    const observer = new ModelCatalogObserver(modelCatalog, subscribeModelCatalog, setCatalogState)
+    catalogObserver.current = observer
+    return () => { catalogObserver.current = undefined; observer.dispose() }
+  }, [modelCatalog, subscribeModelCatalog])
 
   const models = useMemo(() => catalog?.groups.flatMap(group =>
     group.models.map(model => ({ ...model, provider: group.id, providerName: group.name }))) ?? [], [catalog])
-  const configuredModelKey = value?.provider && value.model ? modelKey(value.provider, value.model) : ''
-  const configuredModel = models.find(model => modelKey(model.provider, model.id) === configuredModelKey)
-  const modelMissing = catalog !== undefined && configuredModelKey !== '' && configuredModel === undefined
   const globalModel = models.find(model =>
     model.provider === catalog?.default.provider && model.id === catalog.default.model)
-  const effectiveModel = configuredModel ?? globalModel
   const defaultWorkspaceId = value?.defaultWorkspaceId ?? ''
   const workspaceId = value?.workspaceId ?? defaultWorkspaceId
   const workspace = workspaceSnapshot.items.find(item => item.workspaceId === workspaceId)
@@ -173,16 +146,13 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
   const effectiveWorkspace = workspace
     ?? workspaceSnapshot.items.find(item => item.workspaceId === defaultWorkspaceId)
     ?? workspaceSnapshot.items[0]
-  const efforts = effectiveModel?.reasoning?.efforts ?? []
-  const configuredEffort = value?.reasoningEffort ?? ''
-  const effortMissing = configuredEffort !== '' && !efforts.some(effort => effort.id === configuredEffort)
-  const effectiveEffort = effortMissing ? effectiveModel?.reasoning?.defaultEffort ?? ''
-    : configuredEffort || effectiveModel?.reasoning?.defaultEffort || ''
+  const efforts = globalModel?.reasoning?.efforts ?? []
+  const effectiveEffort = catalog?.default.reasoningEffort ?? globalModel?.reasoning?.defaultEffort ?? ''
 
-  const save = async (ops: readonly SettingsPathOpView[]): Promise<void> => {
+  const save = async (ops: readonly SettingsPathOpView[], mutate = mutateSettings): Promise<void> => {
     setSaveState('saving')
     try {
-      await mutateSettings(ops)
+      if (!await mutate(ops)) { setSaveState('stale'); return }
       setSaveState('saved')
     } catch (_error) {
       setSaveState('error')
@@ -195,32 +165,39 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
       { op: 'unset', path: ['fallbackNotice'] },
     ])
   }
-  const setModel = (next: string): void => {
-    if (next === FOLLOW_GLOBAL_ID) {
-      void save([
-        { op: 'unset', path: ['provider'] },
-        { op: 'unset', path: ['model'] },
-        { op: 'unset', path: ['reasoningEffort'] },
-        { op: 'unset', path: ['fallbackNotice'] },
-      ])
-      return
-    }
+  const setModel = async (next: string): Promise<void> => {
     const selected = parseModelKey(next)
     if (selected === undefined) return
-    void save([
+    setSaveState('saving')
+    const latest = await catalogObserver.current?.refresh()
+    if (!latest) { setSaveState('error'); return }
+    const model = latest.groups.find(group => group.id === selected.provider)?.models.find(model => model.id === selected.model)
+    if (!model) {
+      setSaveState('stale'); return
+    }
+    await save([
       { op: 'set', path: ['provider'], value: selected.provider },
       { op: 'set', path: ['model'], value: selected.model },
-      { op: 'unset', path: ['reasoningEffort'] },
-      { op: 'unset', path: ['fallbackNotice'] },
-    ])
-  }
-  const setEffort = (next: string): void => {
-    void save([
-      next === MODEL_DEFAULT_ID
+      model.reasoning?.defaultEffort === undefined
         ? { op: 'unset', path: ['reasoningEffort'] }
+        : { op: 'set', path: ['reasoningEffort'], value: model.reasoning.defaultEffort },
+    ], ops => mutateGlobalModel(ops, globalModelPreference.revision))
+  }
+  const setEffort = async (next: string): Promise<void> => {
+    setSaveState('saving')
+    const latest = await catalogObserver.current?.refresh()
+    if (!latest) { setSaveState('error'); return }
+    if (!isCatalogEffortCurrent(latest, globalModel,
+      next === MODEL_DEFAULT_ID ? undefined : next)) {
+      setSaveState('stale'); return
+    }
+    await save([
+      next === MODEL_DEFAULT_ID
+        ? globalModel?.reasoning?.defaultEffort === undefined
+          ? { op: 'unset', path: ['reasoningEffort'] }
+          : { op: 'set', path: ['reasoningEffort'], value: globalModel.reasoning.defaultEffort }
         : { op: 'set', path: ['reasoningEffort'], value: next },
-      { op: 'unset', path: ['fallbackNotice'] },
-    ])
+    ], ops => mutateGlobalModel(ops, globalModelPreference.revision))
   }
 
   const workspaceItems = useMemo<readonly MenuEntry[]>(() => workspaceSnapshot.items.map(item => ({
@@ -231,34 +208,20 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
   const workspaceValue = effectiveWorkspace
     ? <ChoiceContent primary={effectiveWorkspace.title} detail={effectiveWorkspace.path} />
     : <ChoiceContent primary={t('noWorkspace')} />
-  const modelItems = useMemo<readonly MenuEntry[]>(() => catalog === undefined ? [] : [
-    {
-      id: FOLLOW_GLOBAL_ID,
-      label: (
-        <ChoiceContent
-          primary={t('followGlobal')}
-          detail={catalog.default.provider + '/' + catalog.default.model}
-        />
-      ),
-    },
-    { type: 'separator' as const, id: 'provider-separator' },
-    ...catalog.groups.flatMap(group => [
+  const modelItems = useMemo<readonly MenuEntry[]>(() => catalog?.groups.flatMap(group => [
       { type: 'label' as const, id: 'provider:' + group.id, text: group.name },
       ...group.models.map(model => ({
         id: modelKey(group.id, model.id),
         label: <ChoiceContent primary={model.name} detail={group.id + '/' + model.id} />,
       })),
-    ]),
-  ], [catalog, t])
-  const modelSelectedId = configuredModel === undefined ? FOLLOW_GLOBAL_ID : configuredModelKey
-  const modelValue = configuredModel
-    ? <ChoiceContent primary={configuredModel.name} detail={configuredModel.providerName + '/' + configuredModel.id} />
-    : catalog
+    ]) ?? [], [catalog])
+  const modelSelectedId = catalog ? modelKey(catalog.default.provider, catalog.default.model) : undefined
+  const modelValue = catalog
       ? <ChoiceContent
         primary={globalModel?.name ?? catalog.default.model}
         detail={catalog.default.provider + '/' + catalog.default.model}
       />
-      : <ChoiceContent primary={t('followGlobal')} />
+      : <ChoiceContent primary={t('loading')} />
   const effortItems = useMemo<readonly MenuEntry[]>(() => [
     { id: MODEL_DEFAULT_ID, label: t('modelDefault') },
     ...efforts.map(effort => ({ id: effort.id, label: effort.name })),
@@ -267,14 +230,11 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
   const effortValue = effectiveEffortName
     ? <ChoiceContent primary={effectiveEffortName} detail={effectiveEffort} />
     : <ChoiceContent primary={t('modelDefault')} />
-  const warningText = value?.fallbackNotice === 'workspace-unavailable' ? t('workspaceUnavailable')
-    : value?.fallbackNotice === 'model-unavailable' ? t('modelUnavailable')
-      : value?.fallbackNotice === 'reasoning-unavailable' ? t('reasoningUnavailable')
-        : undefined
+  const warningText = value?.fallbackNotice === 'workspace-unavailable' ? t('workspaceUnavailable') : undefined
 
   return (
     <section
-      aria-busy={preference.status === 'loading' || workspaceSnapshot.state === 'loading'}
+      aria-busy={preference.status === 'loading' || globalModelPreference.status === 'loading' || workspaceSnapshot.state === 'loading' || catalogLoading}
       className={css.page}
     >
       <h2 className={css.heading}>Voice Terminal</h2>
@@ -286,8 +246,6 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
       {catalogFailed ? <p role="alert" className={css.warning}>{t('catalogError')}</p> : null}
       {warningText !== undefined ? <p role="status" className={css.warning}>{warningText}</p> : null}
       {invalidWorkspace ? <p role="status" className={css.warning}>{t('workspaceMissing')}</p> : null}
-      {modelMissing ? <p role="status" className={css.warning}>{t('modelMissing')}</p> : null}
-      {effortMissing ? <p role="status" className={css.warning}>{t('reasoningUnavailable')}</p> : null}
 
       <MenuField
         label={t('workspace')}
@@ -305,21 +263,22 @@ export function VoiceTerminalSettingsPage({ usePreferences, useWorkspaces, mutat
         value={modelValue}
         items={modelItems}
         selectedId={modelSelectedId}
-        disabled={catalog === undefined || models.length === 0 || !preference.writable}
+        disabled={catalog === undefined || catalogLoading || catalogFailed || saveState === 'saving' || models.length === 0 || globalModelPreference.status !== 'ready' || !globalModelPreference.writable}
         onSelect={setModel}
       />
 
       <MenuField
         label={t('effort')}
+        description={t('effortHelp')}
         value={effortValue}
         items={effortItems}
         selectedId={effectiveEffort || MODEL_DEFAULT_ID}
-        disabled={catalog === undefined || efforts.length === 0 || !preference.writable}
+        disabled={catalog === undefined || catalogLoading || catalogFailed || saveState === 'saving' || efforts.length === 0 || globalModelPreference.status !== 'ready' || !globalModelPreference.writable}
         onSelect={setEffort}
       />
 
       <p aria-live="polite" className={css.saveState}>
-        {saveState === 'saving' ? t('saving') : saveState === 'saved' ? t('saved') : saveState === 'error' ? t('saveError') : ''}
+        {saveState === 'saving' ? t('saving') : saveState === 'saved' ? t('saved') : saveState === 'error' ? t('saveError') : saveState === 'stale' ? t('catalogChanged') : ''}
       </p>
     </section>
   )
