@@ -400,6 +400,8 @@ impl ResourceManager {
         }
     }
 
+    pub(crate) fn application_handle(&self) -> AppHandle { self.app.clone() }
+
     pub fn context(&self) -> LaunchContext {
         self.context.clone()
     }

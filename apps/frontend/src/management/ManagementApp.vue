@@ -9,6 +9,7 @@ import type { LocalComponentCategory, LocalComponentRow, LocalComponentsModel, M
 import ResourceInstallDialog from '../product/panels/ResourceInstallDialog.vue'
 import WorkspaceSettings from '../product/panels/WorkspaceSettings.vue'
 import DeviceSettings from './DeviceSettings.vue'
+import LanVersionDialog from '../interface/LanVersionDialog.vue'
 import { useWorkspaceResources } from '../product/useWorkspaceResources'
 import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type DesktopCredentialsPort, type DesktopWorkspacePort, type ResourceStatus } from '../product/desktop-port'
 
@@ -332,6 +333,7 @@ function exportLogs() {
     </SettingsFrame>
     <ResourceInstallDialog :controller="resources" />
     <template #overlays>
+      <LanVersionDialog />
       <div v-if="logExportSuccess" class="save-notice" role="status">日志压缩包已保存到所选文件夹。</div>
       <div v-if="logExportError" class="save-notice error-notice" role="alert">
         <span>!</span>{{ logExportError }}<button aria-label="关闭错误" @click="logExportError = ''">×</button>

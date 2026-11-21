@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-version-check"
+description = "Enables the device_version_check command without any pre-configured scope."
+commands.allow = ["device_version_check"]
+
+[[permission]]
+identifier = "deny-device-version-check"
+description = "Denies the device_version_check command without any pre-configured scope."
+commands.deny = ["device_version_check"]

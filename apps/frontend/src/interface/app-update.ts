@@ -1,5 +1,6 @@
 /** AppUpdateStatus（应用更新状态）：正式界面与隔离样例共用展示契约。 */
 export interface AppUpdateStatus {
+  source?: 'lan' // source（局域网版本同步的独立进度来源）。
   operation?: 'update' | 'integrity' // operation（更新或当前版本完整性维护）。
   installer_ready?: boolean // installer_ready（匹配本地构建的校验程序已经准备）。
   /** state（更新阶段）。 */

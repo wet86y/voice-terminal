@@ -7,6 +7,7 @@ import { productApi, type ProductDeviceSnapshot } from '../product/api'
 import { deviceState } from '../product/device-state'
 import ManagedResourceProgress from '../interface/ManagedResourceProgress.vue'
 import UiDialog from '../interface/UiDialog.vue'
+import { lanVersionSync, showLanVersionSync } from '../product/lan-version-sync'
 import type { ManagedResourceJob as ProgressJob } from '../interface/local-components'
 
 /** DeviceConfirmation（设备操作确认）：项目弹窗只承接业务确认，管理员提权仍由 Windows 处理。 */
@@ -875,6 +876,10 @@ async function searchForDevices() {
 
 async function activateRemoteChannels() {
   const state = await ensureRemoteClientRuntime()
+  if (state.state === 'waiting' && state.reason === 'version_mismatch') {
+    notice.value = '双端程序版本不同，等待确认版本同步。'
+    return
+  }
   if (state.state === 'waiting') throw new Error('远程模式尚未完成配对，连接通道没有启动。')
   if (state.state === 'management_only') {
     taskChannel.value = 'stopped'
@@ -933,6 +938,11 @@ async function connectHost(automatic = false) {
       status.value = await nativeDeviceApi.deviceConfigStatus()
     }
     const runtime = await ensureRemoteClientRuntime()
+    if (runtime.state === 'waiting' && runtime.reason === 'version_mismatch') {
+      notice.value = '双端程序版本不同，请确认同步后继续连接。'
+      showLanVersionSync()
+      return
+    }
     if (runtime.state === 'waiting') throw new Error('当前设备尚未完成远程配对，不能连接服务端。')
     connection.value = 'connected'
     if (runtime.state === 'ready') {
@@ -1165,6 +1175,10 @@ onUnmounted(() => {
 
     <section v-if="isRemote" class="device-card remote-channel-status">
       <h3>服务端连接状态</h3>
+      <p v-if="lanVersionSync.check && lanVersionSync.check.comparison !== 'same'" role="status">
+        程序版本不同：本机 {{ lanVersionSync.check.local_version }}，服务端 {{ lanVersionSync.check.remote_version }}。
+        <button type="button" class="outline-button" @click="showLanVersionSync">同步程序版本</button>
+      </p>
       <p>连接、任务和语音通道由程序自动准备；断线时不会把操作改投本机。</p>
       <div class="button-row">
         <span class="connection-state" :data-state="connection">管理连接：{{ connection === 'connected' ? '已连接' : connection === 'unavailable' ? '当前构建不支持' : '已断开' }}</span>

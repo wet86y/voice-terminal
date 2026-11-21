@@ -33,6 +33,8 @@
     "allow-device-ssh-transport-identity-status",
     "allow-device-ssh-transport-identity-delete",
     "allow-device-ssh-connect",
+    "allow-device-version-check",
+    "allow-device-version-sync",
     "allow-device-ssh-request",
     "allow-device-ssh-management-request",
     "allow-device-ssh-disconnect",

@@ -22,6 +22,7 @@ import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
 import ComputeSettings from "./panels/ComputeSettings.vue";
 import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
 import DeviceSettings from "../management/DeviceSettings.vue";
+import LanVersionDialog from '../interface/LanVersionDialog.vue'
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
 import { startRemoteClientRuntimeSupervisor } from './remote-client-runtime'
@@ -228,6 +229,7 @@ function exportLogs() {
         <DeviceSettings v-if="activeSettingsTab === 'devices'" /></article
     ></SettingsFrame>
     <template #overlays>
+      <LanVersionDialog />
       <div class="notification-stack">
       <OperationNotice :operations="noticeOperations" :retryable="Boolean(application.recovery?.value?.suspended && application.recovery?.value?.operation?.state === 'failed')" @retry="nativeAction(async () => { await application.recover?.() })" />
       <Transition name="save-notice"

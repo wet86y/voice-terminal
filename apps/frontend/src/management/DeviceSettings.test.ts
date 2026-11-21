@@ -108,6 +108,7 @@ describe('DeviceSettings（设备设置）', () => {
   }
 
   beforeEach(() => {
+    vi.spyOn(nativeDeviceApi, 'versionCheck').mockResolvedValue({host_id:'server-a',local_version:'1.0.0',remote_version:'1.0.0',comparison:'same',can_sync:false,reason:null,fields:{}})
     recordDeviceSettingsError('')
     currentStatus = makeConfig('local', false)
     sshReady = true

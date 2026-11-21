@@ -33,6 +33,8 @@ macro_rules! desktop_command_registry {
             device_ssh_transport_identity_status,
             device_ssh_transport_identity_delete,
             device_ssh_connect,
+            device_version_check,
+            device_version_sync,
             device_ssh_pairing_request,
             device_ssh_request,
             device_ssh_management_request,

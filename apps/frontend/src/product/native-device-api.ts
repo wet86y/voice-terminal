@@ -341,6 +341,19 @@ export interface NativeSshTransportIdentity {
 }
 
 /** nativeDeviceApi（原生设备接口）：只显式调用，不在模块加载时启动进程或打开端点。 */
+/** DeviceVersionCheck（正式产品版本预检）：同版构建差异不参与同步判断。 */
+export interface DeviceVersionCheck {
+  host_id: string // host_id（当前配对服务端编号）。
+  local_version: string // local_version（本机正式版本）。
+  remote_version: string // remote_version（服务端正式版本）。
+  comparison: 'same' | 'local_older' | 'remote_older' // comparison（仅按产品版本号的高低关系）。
+  can_sync: boolean // can_sync（高版本设备持有可用分发器）。
+  reason: string | null // reason（暂不能同步的原因）。
+  remote_update_state?: string | null // remote_update_state（服务端最近的本体同步状态）。
+  remote_update_error?: string | null // remote_update_error（服务端更新交接的失败原因）。
+  fields: Record<string, string> // fields（字段中文说明）。
+}
+
 export const nativeDeviceApi = {
   deviceConfigStatus: async () => {
     const status = await call<DeviceConfigStatus>('device_config_status')
@@ -368,6 +381,11 @@ export const nativeDeviceApi = {
     fields: Record<string, string> // fields（字段的中文说明）。
   }>('device_discovery_search', { timeoutMs }),
   /** openPairingWindow（开启本机配对窗口）：六位码仅在本次回执中返回。 */
+  versionCheck: () => call<DeviceVersionCheck>('device_version_check'),
+  versionSync: (expectedHostId: string, expectedRemoteVersion: string) => call<import('../interface/app-update').AppUpdateStatus>(
+    'device_version_sync', { expectedHostId, expectedRemoteVersion, confirmed: true }),
+  cancelVersionSync: () => call<void>('app_update_cancel'),
+
   openPairingWindow: () => call<DevicePairingWindowResult>('device_pairing_window_open'),
   /** closePairingWindow（关闭本机配对窗口）：撤销尚未使用的六位码和监听器。 */
   closePairingWindow: () => call<void>('device_pairing_window_close'),

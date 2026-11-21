@@ -1863,9 +1863,57 @@ pub struct SshDeviceManager {
     key_root: Mutex<Option<PathBuf>>, // key_root（当前工作区的项目私钥目录根；不使用用户目录）。
     connection: tokio::sync::Mutex<Option<Arc<ConnectedDeviceSession>>>, // connection（当前 SSH 与产品设备身份绑定会话）。
     active_lease: tokio::sync::Mutex<Option<RemoteDeviceSessionLease>>, // active_lease（当前任务通道确认的设备连接与执行器代次）。
+    lan_version: tokio::sync::Mutex<Option<(Arc<ConnectedDeviceSession>, std::time::Instant, crate::lan_update::Response)>>, // lan_version（当前连接短期版本预检，不记录构建差异）。
+}
+
+/// LanUpdateChannel（本体同步专用连接）：独立使用 FILE 标记，避免与管理原始命令互相复用。
+pub struct LanUpdateChannel<'a> {
+    manager: &'a SshDeviceManager, // manager（逐次核对当前连接，主动断开后不得继续提交更新）。
+    owner: Arc<ConnectedDeviceSession>, // owner（本次版本同步绑定的已认证连接代次）。
+    connection: SshDeviceConnection, // connection（独立且固定主机指纹的安全连接）。
+    stream: Box<dyn AsyncDeviceStream>, // stream（稳定版本同步引导字节流）。
+    pub host_id: String, // host_id（当前配对目标）。
+}
+impl LanUpdateChannel<'_> {
+    pub async fn exchange(&mut self, operation: crate::lan_update::Operation, cancel: &AtomicBool) -> Result<crate::lan_update::Response, String> {
+        let current=self.manager.current_session().await?;
+        if !Arc::ptr_eq(&current,&self.owner) { return Err("版本同步所属连接已失效，请重新检查版本。".into()); }
+        let response=crate::lan_update::exchange(self.stream.as_mut(),operation,cancel).await?;
+        let current=self.manager.current_session().await?;
+        if !Arc::ptr_eq(&current,&self.owner) { return Err("版本同步回执不再属于当前连接。".into()); }
+        response.validate(&self.host_id)?;
+        Ok(response)
+    }
+    pub async fn close(self) { let _=self.connection.close().await; }
 }
 
 impl SshDeviceManager {
+    /// open_lan_update（打开版本同步）：不申请业务管理、任务、媒体租约。
+    pub async fn open_lan_update(&self, host_id: &str) -> Result<LanUpdateChannel<'_>,String> {
+        if !crate::device_management_contract::valid_host_id(host_id) { return Err("版本同步目标编号无效。".into()); }
+        let session=self.current_session().await?;
+        let key=load_session_transport_key(self,&session)?;
+        let connection=SshDeviceConnection::connect(session.target.clone(),key.as_str(),Duration::from_secs(10)).await?;
+        let stream=tokio::time::timeout(Duration::from_secs(10),connection.open_fixed_bridge(FILE_BRIDGE_MARKER)).await.map_err(|_| "版本同步文件桥接超时。")??;
+        if !self.connection.lock().await.as_ref().is_some_and(|current| Arc::ptr_eq(current,&session)) { return Err("配对连接在版本同步期间发生变化。".into()); }
+        Ok(LanUpdateChannel { manager:self, owner:session, connection, stream, host_id:host_id.into() })
+    }
+    pub async fn lan_version_status(&self, host_id:&str, version:&str) -> Result<crate::lan_update::Response,String> {
+        let session=self.current_session().await?;
+        let mut cache=self.lan_version.lock().await;
+        if let Some((owner,at,response))=cache.as_ref() {
+            if Arc::ptr_eq(owner,&session) && response.host_id==host_id && at.elapsed()<Duration::from_secs(3) { return Ok(response.clone()); }
+        }
+        let mut channel=self.open_lan_update(host_id).await?;
+        let response=channel.exchange(crate::lan_update::Operation::Status {version:version.into()},&AtomicBool::new(false)).await;
+        channel.close().await;
+        let response=response?;
+        if response.state!="status" { return Err("服务端未提供版本检查状态。".into()); }
+        if !self.connection.lock().await.as_ref().is_some_and(|current| Arc::ptr_eq(current,&session)) { return Err("版本检查回执已不属于当前连接。".into()); }
+        *cache=Some((session,std::time::Instant::now(),response.clone()));
+        Ok(response)
+    }
+    pub async fn invalidate_lan_version(&self) { *self.lan_version.lock().await=None; }
     async fn current_session(&self) -> Result<Arc<ConnectedDeviceSession>, String> {
         self.connection.lock().await.clone()
             .ok_or_else(|| "当前没有已认证的 SSH 主机连接。".to_string())

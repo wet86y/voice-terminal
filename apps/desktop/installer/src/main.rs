@@ -486,6 +486,9 @@ fn consume_maintenance_config(
             return Err("维护构建字段缺少中文说明。".into());
         }
     }
+    if config["build"].as_str().is_some_and(|build| installation::package_build(PACKAGE).map_or(true, |actual| actual != build)) {
+        return Err("更新配置的目标构建与分发器内嵌本体不一致。".into());
+    }
     let installer_size = config["installer_size"]
         .as_u64()
         .filter(|size| *size > 0)

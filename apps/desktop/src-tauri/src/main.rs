@@ -8,6 +8,8 @@ macro_rules! desktop_handler {
 mod app_icon;
 mod agent_debug;
 mod integrity_commands;
+mod lan_update;
+use lan_update::{device_version_check, device_version_sync};
 use integrity_commands::{
     app_integrity_check, app_integrity_download, app_integrity_status, maintenance_payload,
     MaintenanceAction,
@@ -503,6 +505,8 @@ fn frontend_capability(
                 "allow-device-ssh-identity-status",
                 "allow-device-ssh-identity-delete",
                 "allow-device-ssh-connect",
+                "allow-device-version-check",
+                "allow-device-version-sync",
                 "allow-device-ssh-request",
                 "allow-device-ssh-management-request",
                 "allow-device-ssh-import-start",
@@ -3417,6 +3421,7 @@ async fn device_ssh_request(
     }
     #[cfg(feature = "ssh-device")]
     {
+        lan_update::require_compatible(&state).await?;
         let reply = state
             .ssh_device
             .post_json(
@@ -3553,6 +3558,7 @@ async fn device_ssh_management_request(
     }
     #[cfg(feature = "ssh-device")]
     {
+        lan_update::require_compatible(&state).await?;
         if !remote_business_operation_allowed(&operation) {
             return Err("远程业务操作不在客户端原生白名单中。".into());
         }
@@ -3914,6 +3920,7 @@ async fn device_ssh_tts_asset_import(
         if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
             return Err("当前窗口或应用状态不允许远程 TTS 文件导入。".into());
         }
+        lan_update::require_compatible(&state).await?;
         if model_id.is_empty()
             || model_id.len() > 64
             || !model_id
@@ -4142,6 +4149,7 @@ async fn device_ssh_import_start(
         if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
             return Err("当前窗口或应用状态不允许远程资源导入。".into());
         }
+        lan_update::require_compatible(&state).await?;
         let context = state.context().ok_or("缺少正式工作区")?;
         let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
             voice_desktop_common::device_config::LoadResult::Valid(config)
@@ -7700,6 +7708,7 @@ async fn device_ssh_task_channel(
             "start" => {}
             _ => return Err("远端设备任务通道操作必须为 start、status 或 stop。".into()),
         }
+        lan_update::require_compatible(&desktop).await?;
         if desktop.stopping.load(Ordering::Acquire) {
             return Err("应用正在退出。".into());
         }
@@ -7898,6 +7907,7 @@ async fn device_ssh_media_channel(
         "start" => {}
         _ => return Err("远端语音媒体通道操作必须为 start、status 或 stop。".into()),
     }
+    lan_update::require_compatible(&desktop).await?;
     if desktop.stopping.load(Ordering::Acquire) {
         return Err("应用正在退出。".into());
     }
@@ -8192,6 +8202,7 @@ async fn device_ssh_voice_forwarder(
         "start" => {}
         _ => return Err("语音转发操作必须为 start、status 或 stop。".into()),
     }
+    lan_update::require_compatible(&desktop).await?;
     if !desktop.ssh_device.connected().await {
         return Err("请先连接并认证共享主机。".into());
     }
@@ -8935,6 +8946,40 @@ fn download_and_handoff_update(
             );
             return Ok(());
         }
+        handoff_local_update(&state, &app, &installer, &retained, action, None)
+    })();
+    if let Err(mut error) = result {
+        if let Some(manager) = app.try_state::<Arc<ResourceManager>>() {
+            if let Err(recovery) = manager.resume_accepting_jobs() {
+                error = format!("{error}；恢复维护前服务失败：{recovery}");
+            }
+        }
+        let cancelled = state.app_update.cancel.load(Ordering::Acquire) || error.contains("已取消");
+        let payload = maintenance_payload(
+            action,
+            if cancelled { "cancelled" } else { "failed" },
+            Some(&manifest),
+            0,
+            manifest.size,
+            None,
+            Some(&error),
+            false,
+        );
+        emit_app_update(&state, &app, payload);
+    }
+    state.app_update.busy.store(false, Ordering::Release);
+}
+
+// handoff_local_update（共用本地分发器交接）：文件来源不影响工作区、进程、取消及安装校验。
+fn handoff_local_update(
+    state: &Arc<Desktop>, app: &tauri::AppHandle, installer: &Path,
+    retained: &voice_desktop_common::app_update::RetainedInstaller, action: MaintenanceAction, source: Option<&str>, // source（局域网来源，在线发行更新省略）。
+) -> Result<(), String> {
+    let context=state.context().ok_or("缺少当前工作区上下文")?;
+    let manifest=&retained.manifest;
+    if state.app_update.cancel.load(Ordering::Acquire) { return Err("更新交接已取消。".into()); }
+    voice_desktop_common::lan_update::verify_installer_cancellable(installer, retained, &state.app_update.cancel)?;
+    if state.app_update.cancel.load(Ordering::Acquire) { return Err("更新交接已取消。".into()); }
         if let Some(manager) = app.try_state::<Arc<ResourceManager>>() {
             manager.pause_and_wait()?;
         }
@@ -8968,7 +9013,7 @@ fn download_and_handoff_update(
                 "parent_executable":"当前主程序可执行文件位置","version":"待安装产品版本","tag":"对应 GitHub 发行标签",
                 "build":"目标程序构建编号","installer_size":"已校验分发安装器字节数","installer_sha256":"已校验分发安装器 SHA-256 摘要"}});
         workspace::atomic_json(&config_path, &config)?;
-        let handing_off = maintenance_payload(
+        let mut handing_off = maintenance_payload(
             action,
             "handing_off",
             Some(&manifest),
@@ -8978,11 +9023,12 @@ fn download_and_handoff_update(
             None,
             false,
         );
+        if let Some(source)=source { handing_off["source"]=serde_json::json!(source); handing_off["fields"]["source"]=serde_json::json!("局域网版本同步来源"); }
         if let Err(error) = state.app_update.begin_handoff(handing_off.clone()) {
             let _ = fs::remove_file(&config_path);
             return Err(error);
         }
-        let _ = app.emit(APP_UPDATE_PROGRESS_EVENT, handing_off);
+        let _ = app.emit(APP_UPDATE_PROGRESS_EVENT, &handing_off);
         let mut command = Command::new(&installer);
         command
             .arg(if action == MaintenanceAction::CheckIntegrity {
@@ -9000,43 +9046,10 @@ fn download_and_handoff_update(
             let _ = fs::remove_file(&config_path);
             return Err(format!("无法启动更新分发器：{error}"));
         }
-        emit_app_update(
-            &state,
-            &app,
-            maintenance_payload(
-                action,
-                "handing_off",
-                Some(&manifest),
-                manifest.size,
-                manifest.size,
-                Some("正在关闭旧程序并启动安装器"),
-                None,
-                false,
-            ),
-        );
+        handing_off["phase"]=serde_json::json!("正在关闭旧程序并启动安装器");
+        emit_app_update(&state, &app, handing_off);
         state.shutdown(&app);
         Ok::<(), String>(())
-    })();
-    if let Err(mut error) = result {
-        if let Some(manager) = app.try_state::<Arc<ResourceManager>>() {
-            if let Err(recovery) = manager.resume_accepting_jobs() {
-                error = format!("{error}；恢复维护前服务失败：{recovery}");
-            }
-        }
-        let cancelled = state.app_update.cancel.load(Ordering::Acquire) || error.contains("已取消");
-        let payload = maintenance_payload(
-            action,
-            if cancelled { "cancelled" } else { "failed" },
-            Some(&manifest),
-            0,
-            manifest.size,
-            None,
-            Some(&error),
-            false,
-        );
-        emit_app_update(&state, &app, payload);
-    }
-    state.app_update.busy.store(false, Ordering::Release);
 }
 
 fn show(app: &tauri::AppHandle) {

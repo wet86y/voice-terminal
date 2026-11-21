@@ -57,6 +57,7 @@ impl RunningServices {
 }
 
 struct ValidatingFileReceiver {
+    app: tauri::AppHandle, // app（独立本体版本同步复用正式维护入口）。
     diagnostic_root: std::path::PathBuf, // diagnostic_root（受管安装根目录，仅用于有界连接日志）。
     coordinator: Arc<RemoteImportCoordinator>, // coordinator（唯一远程导入票据和提交协调器）。
     data_root: PathBuf,                  // data_root（验证信任登记的当前工作区数据根目录）。
@@ -154,6 +155,7 @@ impl RemoteServices {
             .ok_or("正式程序缺少有效构建编号。")?
             .to_owned();
         let receiver: Arc<dyn FileReceiver> = Arc::new(ValidatingFileReceiver {
+            app: self.manager.application_handle(),
             diagnostic_root: context.install.clone(),
             coordinator,
             data_root: data_root.to_path_buf(),
@@ -256,6 +258,11 @@ impl ValidatingFileReceiver {
 }
 
 impl FileReceiver for ValidatingFileReceiver {
+    fn application_update(&self, peer: &FileChannelPeer) -> Result<Box<dyn voice_desktop_common::lan_update::Handler>, String> {
+        self.validate_peer_identity(peer)?;
+        self.validate_active_broadcast()?;
+        crate::lan_update::ServerHandler::new(self.app.clone(),peer.clone())
+    }
     fn connection_error(&self, error: &str) {
         let _ = voice_desktop_common::logs::record_device_channel_error(
             &self.diagnostic_root,

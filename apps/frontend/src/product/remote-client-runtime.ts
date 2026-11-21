@@ -1,14 +1,16 @@
 import { watch } from 'vue'
 import { matchesRemoteManagementEnvelope, nativeDeviceApi } from './native-device-api'
 import { deviceState } from './device-state'
+import { ensureLanVersion } from './lan-version-sync'
 
 export type RemoteClientRuntimeState =
   | { state: 'ready'; core_state: 'ready'; task: Awaited<ReturnType<typeof nativeDeviceApi.remoteTaskChannel>>; media: Awaited<ReturnType<typeof nativeDeviceApi.remoteMediaChannel>> }
   | { state: 'management_only'; core_state: 'starting' | 'unavailable' }
-  | { state: 'waiting'; reason: 'local_mode' | 'pairing_required' | 'reconnect_suspended' }
+  | { state: 'waiting'; reason: 'local_mode' | 'pairing_required' | 'reconnect_suspended' | 'version_mismatch' }
 
 let startupInFlight: Promise<RemoteClientRuntimeState> | null = null
 let supervisorStop: (() => void) | null = null
+let versionBlockedHost: string | null = null // versionBlockedHost（已经停止旧业务通道的异版目标）。
 // 上次待机申请对应的任务会话和语音租约代次。切换或重连后才重新申请。
 let standby: { host: string; connection: number | undefined; executor: number | undefined; interaction: number | undefined } | null = null
 
@@ -26,6 +28,17 @@ export function ensureRemoteClientRuntime(): Promise<RemoteClientRuntimeState> {
 
     const host = await nativeDeviceApi.sshHostStatus()
     if (!host.connected) await nativeDeviceApi.connectSshHost()
+
+    if (!await ensureLanVersion()) {
+      if (versionBlockedHost !== config.paired_host.host_id) {
+        await nativeDeviceApi.remoteMediaChannel('stop')
+        await nativeDeviceApi.remoteTaskChannel('stop')
+        standby = null
+        versionBlockedHost = config.paired_host.host_id
+      }
+      return { state: 'waiting', reason: 'version_mismatch' } as const
+    }
+    versionBlockedHost = null
 
     let task = await nativeDeviceApi.remoteTaskChannel('status')
     if (task.state !== 'running') {
@@ -86,7 +99,7 @@ export function startRemoteClientRuntimeSupervisor(): () => void {
         failures = 0
         schedule(state.state === 'ready' ? 2000 : 3000)
       } else {
-        schedule(15000)
+        schedule(state.reason === 'version_mismatch' ? 3000 : 15000)
       }
     } catch {
       const delay = retryDelays[Math.min(failures, retryDelays.length - 1)]
@@ -100,6 +113,7 @@ export function startRemoteClientRuntimeSupervisor(): () => void {
   const stop = () => {
     unsubscribe()
     standby = null
+    versionBlockedHost = null
     if (stopped) return
     stopped = true
     if (timer !== null) clearTimeout(timer)

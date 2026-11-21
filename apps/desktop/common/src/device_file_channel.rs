@@ -364,6 +364,10 @@ pub struct DeviceFileTransferReceipt {
 
 /// FileReceiver（原生文件接收器）：协调器持有票据并负责文件落盘与导入提交。
 pub trait FileReceiver: Send + Sync + 'static {
+    /// application_update（打开独立版本同步会话）：不经过组件导入或核心文件任务。
+    fn application_update(&self, _peer: &FileChannelPeer) -> Result<Box<dyn crate::lan_update::Handler>, String> {
+        Err("对端尚未支持局域网本体更新。".into())
+    }
     /// connection_error（连接结束诊断）：只接收固定协议错误，不接收传输正文或凭据。
     fn connection_error(&self, _error: &str) {}
 
@@ -446,6 +450,9 @@ pub trait FileReceiver: Send + Sync + 'static {
 // type（固定消息类型）：begin、chunk、finish 或 cancel；其他通用 SSH 操作均不接受。
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientFrame {
+    ApplicationUpdate {
+        request: crate::lan_update::Request, // request（稳定引导协议的本体同步请求）。
+    },
     Begin {
         source_id: String,                 // source_id（管理通道签发的服务端来源编号）。
         request_id: String,                // request_id（与来源预留相同的稳定业务请求编号）。
@@ -582,6 +589,12 @@ where
             }
         };
         match frame {
+            ClientFrame::ApplicationUpdate { request } => {
+                if active_source.is_some() || active_device_transfer.is_some() {
+                    return Err("已有文件业务不能切换为本体版本同步。".into());
+                }
+                return crate::lan_update::serve(&mut stream, request, receiver.application_update(&peer)?);
+            }
             ClientFrame::Begin {
                 source_id,
                 request_id,

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nativeDeviceApi, type DeviceConfigStatus } from './native-device-api'
 import { ensureRemoteClientRuntime } from './remote-client-runtime'
 import { deviceState, type DeviceState } from './device-state'
@@ -44,7 +44,23 @@ function runningMedia(deviceId: string, interactionGeneration: number,
 }
 
 describe('remote-client-runtime（远程客户端运行监督）', () => {
+  beforeEach(() => {
+    vi.spyOn(nativeDeviceApi, 'versionCheck').mockResolvedValue({host_id:'server-a',local_version:'1.0.0',remote_version:'1.0.0',comparison:'same',can_sync:false,reason:null,fields:{}})
+  })
   afterEach(() => vi.restoreAllMocks())
+
+  it('双端版本不一致时在管理、任务和语音业务之前等待项目确认', async () => {
+    mockReadyManager()
+    vi.spyOn(nativeDeviceApi, 'versionCheck').mockResolvedValue({host_id:'server-a',local_version:'1.0.0',remote_version:'1.2.0',comparison:'local_older',can_sync:true,reason:null,fields:{}})
+    const tasks = vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockResolvedValue({state:'stopped',fields:{}})
+    const media = vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockResolvedValue({state:'stopped',fields:{}})
+    await expect(ensureRemoteClientRuntime()).resolves.toEqual({state:'waiting',reason:'version_mismatch'})
+    expect(nativeDeviceApi.remoteManagementRequest).not.toHaveBeenCalled()
+    expect(tasks).toHaveBeenCalledWith('stop')
+    expect(media).toHaveBeenCalledWith('stop')
+    expect(tasks).not.toHaveBeenCalledWith('start')
+    expect(media).not.toHaveBeenCalledWith('start')
+  })
 
   it('已配对远程模式会自动建立 SSH、任务与语音通道', async () => {
     mockReadyManager()

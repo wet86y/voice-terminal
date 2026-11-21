@@ -44,6 +44,7 @@ pub mod download;
 pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
 pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
 pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
+pub mod lan_update; // lan_update（局域网版本同步）：复用受限文件桥接的独立本体更新引导。
 pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志。
 #[cfg(all(windows, feature = "native-audio"))]
 pub mod native_aec; // native_aec（原生 WebRTC AEC）：固定 1.0.1 对应源码与 C ABI。
