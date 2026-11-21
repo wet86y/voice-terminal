@@ -138,6 +138,7 @@ export interface OpenSshServerStatus {
   effective_port: number | null // effective_port（sshd 有效监听端口配置）。
   listening_ports: number[] // listening_ports（sshd 进程实际监听端口）。
   configuration_valid: boolean // configuration_valid（sshd 有效配置校验状态）。
+  configuration_path?: string | null // configuration_path（服务实际配置文件，兼容旧服务端未提供的情况）。
   authorized_keys_path: string | null // authorized_keys_path（当前账户授权公钥文件路径）。
   authorized_keys_exists: boolean // authorized_keys_exists（当前账户授权公钥文件是否存在）。
   account_name: string | null // account_name（当前 Windows 登录账户名）。

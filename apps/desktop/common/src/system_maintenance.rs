@@ -23,6 +23,21 @@ pub(crate) enum Operation {
     },
 }
 
+impl Operation {
+    /// execution_timeout（操作执行时限）：官方功能下载可慢于普通规则维护，两个维护层共用同一策略。
+    pub(crate) fn execution_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::PrepareOpenSsh {} => 30 * 60,
+            _ => 600,
+        })
+    }
+
+    /// response_timeout（维护回执时限）：给执行前后状态核验留出余量，不早于脚本结束期限。
+    fn response_timeout(&self) -> std::time::Duration {
+        self.execution_timeout() + std::time::Duration::from_secs(60)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -236,6 +251,7 @@ mod native {
                 );
             }
             self.sequence += 1;
+            let response_timeout = action.response_timeout();
             let request = Request {
                 id: self.sequence,
                 powershell,
@@ -255,7 +271,7 @@ mod native {
                         result = &mut exchange => break result,
                         _ = tokio::time::sleep(Duration::from_secs(15)) => {
                             on_wait(started.elapsed());
-                            if started.elapsed() >= Duration::from_secs(660) { break Err("系统维护回执超时，结果未知；未自动重放操作。".into()); }
+                            if started.elapsed() >= response_timeout { break Err("系统维护回执超时，结果未知；未自动重放操作。".into()); }
                         }
                     }
                 }
@@ -486,6 +502,7 @@ mod tests {
         for action in [
             serde_json::json!({"operation":"powershell","script":"exit"}),
             serde_json::json!({"operation":"prepare_open_ssh","script":"exit"}),
+            serde_json::json!({"operation":"prepare_open_ssh","timeout_seconds":86400}),
             serde_json::json!({"operation":"project_access","enabled":true,"ssh":true,"pairing":true,"discovery":true,"path":"C:/other.exe"}),
         ] {
             assert!(serde_json::from_value::<Request>(
@@ -493,5 +510,18 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn official_download_and_its_response_remain_valid_after_regular_maintenance_deadline() {
+        let download = Operation::PrepareOpenSsh {};
+        let rules = Operation::ProjectAccess {
+            enabled: true, ssh: true, pairing: true, discovery: true,
+        };
+        let slow_download_elapsed = std::time::Duration::from_secs(15 * 60);
+        assert!(rules.execution_timeout() < slow_download_elapsed);
+        assert!(download.execution_timeout() > slow_download_elapsed);
+        assert!(download.response_timeout() > download.execution_timeout());
+        assert!(rules.response_timeout() > rules.execution_timeout());
     }
 }

@@ -10,6 +10,7 @@ pub const DEVICE_PAIRING_PORT: u16 = 18_766; // DEVICE_PAIRING_PORT（仅限局�
 pub const OPENSSH_SERVER_UAC_CANCELLED_ERROR: &str = "已取消 Windows 管理员授权；系统维护未执行。"; // OPENSSH_SERVER_UAC_CANCELLED_ERROR（用户拒绝 UAC 后的固定结果）。
 const MAX_EXISTING_SSH_RULES: usize = 8; // MAX_EXISTING_SSH_RULES（界面最多显示的其他 SSH 入站候选规则）。
 const MAX_SSH_RULE_DETAIL_CHARS: usize = 180; // MAX_SSH_RULE_DETAIL_CHARS（单条防火墙规则摘要最大字符数）。
+const OPENSSH_SERVICE_SCRIPT: &str = include_str!("openssh_service.ps1"); // OPENSSH_SERVICE_SCRIPT（官方服务定位及命令参数检查）。
 
 /// current_user_sid（当前进程账户 SID）：从 Windows 访问令牌读取，不从环境变量猜测。
 pub fn current_user_sid() -> Result<String, String> {
@@ -99,6 +100,7 @@ pub struct OpenSshServerStatus {
     pub effective_port: Option<u16>, // effective_port（sshd 有效配置端口）。
     pub listening_ports: Vec<u16>,   // listening_ports（sshd 进程当前实际监听端口）。
     pub configuration_valid: bool, // configuration_valid（sshd -T 通过，或未变化的官方运行服务已加载有效配置）。
+    pub configuration_path: Option<String>, // configuration_path（服务实际使用的配置文件，包含 -f 指定路径）。
     pub authorized_keys_path: Option<String>, // authorized_keys_path（当前账户使用的授权公钥文件位置）。
     pub authorized_keys_exists: bool, // authorized_keys_exists（当前账户授权公钥文件是否存在）。
     pub account_name: Option<String>, // account_name（当前 Windows 登录账户名称）。
@@ -296,11 +298,7 @@ impl OpenSshServerStatus {
             }
         }
 
-        let official_path = source_path.as_deref().is_some_and(|path| {
-            path.replace('/', "\\")
-                .to_ascii_lowercase()
-                .ends_with("\\system32\\openssh\\sshd.exe")
-        });
+        let official_path = source_path.as_deref().is_some_and(official_openssh_path);
         let official_version = source_version
             .as_deref()
             .is_some_and(|version| !version.trim().is_empty());
@@ -313,7 +311,16 @@ impl OpenSshServerStatus {
             official_binary_hint && official_path && official_version && microsoft_signature;
         // Unknown（只读查询权限不足）时，只有微软程序、服务路径、配置和实际监听都完整核验后才可推断就绪；
         // 这样已就绪服务不会仅因 Get-WindowsCapability 需要提权而反复要求管理员授权。
-        let capability_confirmed = matches!(capability_state, "Installed" | "Unknown");
+        // 微软独立安装版不登记 Windows 可选功能；不能因此安装第二份或覆盖已有服务。
+        let independent_install = source_path.as_deref().is_some_and(|path| {
+            official_openssh_path(path)
+                && !path
+                    .replace('/', "\\")
+                    .to_ascii_lowercase()
+                    .contains("\\system32\\")
+        });
+        let capability_confirmed = matches!(capability_state, "Installed" | "Unknown")
+            || independent_install && matches!(capability_state, "NotPresent" | "Removed");
         let ready = capability_confirmed
             && service_present
             && service_state.as_deref() == Some("Running")
@@ -336,6 +343,7 @@ impl OpenSshServerStatus {
             effective_port,
             listening_ports,
             configuration_valid,
+            configuration_path: optional_string_if_present(&value, "configuration_path")?,
             authorized_keys_path,
             authorized_keys_exists,
             account_name,
@@ -363,15 +371,16 @@ impl OpenSshServerStatus {
                 ("service_present".into(), "sshd 系统服务是否存在".into()),
                 ("service_state".into(), "sshd 当前运行状态".into()),
                 ("startup_type".into(), "sshd 现有启动类型；本检查只读取".into()),
-                ("source_path".into(), "微软系统目录中的 OpenSSH Server 程序位置".into()),
+                ("source_path".into(), "现有微软系统版或独立安装版 OpenSSH 服务程序位置".into()),
                 ("source_version".into(), "OpenSSH Server 文件版本".into()),
                 ("signature_status".into(), "OpenSSH Server 程序签名验证状态".into()),
                 ("signature_subject".into(), "OpenSSH Server 程序签名主体".into()),
-                ("official_binary".into(), "微软系统路径、非空文件版本及微软签名证据是否齐全".into()),
+                ("official_binary".into(), "微软默认安装路径、非空文件版本及微软签名证据是否齐全".into()),
                 ("service_path_official".into(), "sshd 服务路径是否指向微软系统程序".into()),
                 ("effective_port".into(), "sshd 有效配置端口".into()),
                 ("listening_ports".into(), "sshd 进程实际监听端口".into()),
                 ("configuration_valid".into(), "sshd -T 通过，或未变化的官方运行服务已加载有效配置".into()),
+                ("configuration_path".into(), "sshd 服务实际加载的配置文件路径".into()),
                 ("authorized_keys_path".into(), "当前 Windows 账户公钥文件路径".into()),
                 ("authorized_keys_exists".into(), "当前账户公钥文件是否存在".into()),
                 ("account_name".into(), "当前 Windows 登录账户名称；不通过用户目录名推断".into()),
@@ -394,6 +403,33 @@ impl OpenSshServerStatus {
             .collect(),
         })
     }
+}
+
+fn official_openssh_path(path: &str) -> bool {
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    if normalized
+        == format!(
+            "{}\\system32\\openssh\\sshd.exe",
+            system_root.trim_end_matches('\\')
+        )
+        .to_ascii_lowercase()
+    {
+        return true;
+    }
+    ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .chain(["C:\\Program Files".into(), "C:\\Program Files (x86)".into()])
+        .any(|root| {
+            ["OpenSSH", "OpenSSH-Win64", "OpenSSH-Win32", "OpenSSH-ARM64"]
+                .iter()
+                .any(|folder| {
+                    normalized
+                        == format!("{}\\{folder}\\sshd.exe", root.trim_end_matches('\\'))
+                            .to_ascii_lowercase()
+                })
+        })
 }
 
 fn optional_string(value: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
@@ -500,33 +536,23 @@ $PSModuleAutoLoadingPreference = 'All'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 {PROJECT_RULE_HELPERS}
-$systemOpenSsh = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
-$sourcePath = $null; $sourceVersion = $null; $signatureStatus = 'NotFound'; $signatureSubject = $null
-$officialBinary = $false
-if (Test-Path -LiteralPath $systemOpenSsh -PathType Leaf) {
-    $binary = Get-Item -LiteralPath $systemOpenSsh -ErrorAction Stop
-    $sourcePath = [string]$binary.FullName
-    $sourceVersion = [string]$binary.VersionInfo.FileVersion
-    $signature = Get-AuthenticodeSignature -FilePath $systemOpenSsh -ErrorAction SilentlyContinue
-    if ($null -ne $signature) {
-        $signatureStatus = [string]$signature.Status
-        if ($null -ne $signature.SignerCertificate) { $signatureSubject = [string]$signature.SignerCertificate.Subject }
-    }
-    $officialBinary = $signatureStatus -eq 'Valid' -and $signatureSubject -match '(?i)Microsoft (Corporation|Windows)'
-}
+{OPENSSH_SERVICE_HELPERS}
 $service = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
+$nativeService = $null
 $startupType = $null; $servicePathOfficial = $false; $serviceProcessId = 0
 if ($null -ne $service) {
     $nativeService = Get-CimInstance -ClassName Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
     if ($null -ne $nativeService) {
         $startupType = [string]$nativeService.StartMode
         $serviceProcessId = [int]$nativeService.ProcessId
-        $servicePath = [string]$nativeService.PathName
-        if ($servicePath.StartsWith('"')) { $servicePath = ($servicePath -split '"', 3)[1] }
-        else { $servicePath = ($servicePath -split '\s+', 2)[0] }
-        $servicePathOfficial = [string]::Equals([IO.Path]::GetFullPath($servicePath), [IO.Path]::GetFullPath($systemOpenSsh), [StringComparison]::OrdinalIgnoreCase)
     }
 }
+$layout = Get-ProjectOpenSshLayout $nativeService
+$systemOpenSsh = if ($layout.SourcePath) { $layout.SourcePath } else { Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe' }
+$sourcePath = $layout.SourcePath; $sourceVersion = $layout.SourceVersion
+$signatureStatus = $layout.SignatureStatus; $signatureSubject = $layout.SignatureSubject
+$officialBinary = $layout.OfficialBinary; $servicePathOfficial = $layout.ServicePathOfficial
+$sshdConfigPath = $layout.ConfigPath
 $capabilityState = 'Unknown'
 if (-not $officialBinary -or $null -eq $service) {
     try { $capabilityState = [string](Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop).State } catch { }
@@ -559,19 +585,12 @@ foreach ($address in @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -Type Unicast -
 $localLanAddresses = @($localLanAddresses | Sort-Object -Unique)
 $localLanScopes = @($localLanScopes | Sort-Object -Unique)
 $configurationValid = $false; $effectivePort = $null
-if ($officialBinary) {
+if ($officialBinary -and $layout.ArgumentsValid) {
     # Windows PowerShell 5 treats native stderr as a NativeCommandError. The
     # OpenSSH probe can emit stderr when this unelevated account cannot read
     # protected host keys; that must not abort the whole read-only snapshot.
-    $probeErrorPreference = $ErrorActionPreference
-    $effectiveExitCode = -1
-    try {
-        $ErrorActionPreference = 'Continue'
-        $effective = @(& $systemOpenSsh -T 2>$null)
-        $effectiveExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $probeErrorPreference
-    }
+    $probe = Invoke-ProjectOpenSshProbe $layout
+    $effective = $probe.Lines; $effectiveExitCode = $probe.ExitCode
     $configurationValid = $effectiveExitCode -eq 0
     if ($configurationValid) {
         $portLine = $effective | Where-Object { $_ -match '^port\s+[0-9]+$' } | Select-Object -First 1
@@ -586,9 +605,8 @@ if ($serviceProcessId -gt 0) {
 }
 # 普通用户通常不能读取 ProgramData 下的 SSH 私钥，因此 sshd -T 可能拒绝输出。
 # 若微软服务已在运行、主配置从服务启动后未变且没有 Include（外部配置），可用实际监听端口核验已加载配置。
-if (-not $configurationValid -and $serviceProcessId -gt 0 -and $null -ne $service -and $service.Status -eq 'Running' -and $servicePathOfficial) {
+if (-not $configurationValid -and $officialBinary -and $layout.ArgumentsValid -and $layout.SimpleConfig -and $serviceProcessId -gt 0 -and $null -ne $service -and $service.Status -eq 'Running' -and $servicePathOfficial) {
     $serviceProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$serviceProcessId" -ErrorAction SilentlyContinue
-    $sshdConfigPath = Join-Path $env:ProgramData 'ssh/sshd_config'
     $sshdConfig = Get-Item -LiteralPath $sshdConfigPath -ErrorAction SilentlyContinue
     if ($null -ne $serviceProcess -and $null -ne $sshdConfig -and $sshdConfig.LastWriteTimeUtc -le ([datetime]$serviceProcess.CreationDate).ToUniversalTime()) {
         # 只有完整读取且读取前后的文件元数据一致时，才用主配置推断已加载端口；读取失败必须保持未验证。
@@ -615,6 +633,7 @@ if (-not $configurationValid -and $serviceProcessId -gt 0 -and $null -ne $servic
             if (-not $hasConfigInclude -and $portLines.Count -le 1) {
                 $loadedPort = 22
                 if ($portLines.Count -eq 1) { $loadedPort = [int](($portLines[0] -split '\s+')[1]) }
+                if ($null -ne $layout.PortOverride) { $loadedPort = $layout.PortOverride }
                 if ($loadedPort -gt 0 -and $listeningPorts -contains $loadedPort) {
                     $configurationValid = $true
                     $effectivePort = $loadedPort
@@ -635,11 +654,7 @@ if ($null -ne (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
 $sshUsername = if ($null -ne $localAccount) { [string]$localAccount.Name } else { $accountName }
 if (-not $sshUsername -or $sshUsername -notmatch '^[A-Za-z0-9._-]+(?:\\[A-Za-z0-9._-]+)?$') { $sshUsername = $null }
 $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.User.Value)'" -ErrorAction SilentlyContinue
-$authorizedKeysPath = if ($accountIsAdmin) {
-    Join-Path $env:ProgramData 'ssh/administrators_authorized_keys'
-} elseif ($profile -and $profile.LocalPath) {
-    Join-Path $profile.LocalPath '.ssh/authorized_keys'
-} else { $null }
+$authorizedKeysPath = Resolve-ProjectOpenSshAuthorizedKeys $layout $accountIsAdmin $profile.LocalPath
 $authorizedKeysExists = $authorizedKeysPath -and (Test-Path -LiteralPath $authorizedKeysPath -PathType Leaf)
 # 只取项目三条规则；批量管道复用提供程序，避免三次规则枚举和重复过滤器查询。
 $ownedRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name @('VoiceTerminal-OpenSSH-Server-In-TCP','VoiceTerminal-Device-Pairing-TCP-In','VoiceTerminal-Device-Discovery-UDP-In') -ErrorAction SilentlyContinue)
@@ -713,7 +728,7 @@ foreach ($candidate in $enabledInboundRules) {
     }
     $matchesSshRuleName = [string]$candidate.Name -match '(?i)(ssh|sshd|openssh)'
     $allowsAnyProgramOnSshPort = ($candidatePrograms.Count -eq 0 -or $candidatePrograms -contains 'Any') -and
-        $candidatePorts -contains $sshProbePort
+        ($candidatePorts -contains $sshProbePort -or $candidatePorts -contains 'Any')
     if (-not ($matchesSshd -or $matchesSshRuleName -or $allowsAnyProgramOnSshPort)) { continue }
     $addressFilter = $addressFiltersByRule[$candidateId]
     $candidateRemote = if ($null -ne $addressFilter) {
@@ -738,6 +753,7 @@ foreach ($candidate in $enabledInboundRules) {
     effective_port = $effectivePort
     listening_ports = @($listeningPorts)
     configuration_valid = $configurationValid
+    configuration_path = $sshdConfigPath
     authorized_keys_path = $authorizedKeysPath
     authorized_keys_exists = [bool]$authorizedKeysExists
     account_name = $accountName
@@ -760,6 +776,7 @@ foreach ($candidate in $enabledInboundRules) {
 "#.replace("{OPENSSH_CAPABILITY}", OPENSSH_CAPABILITY)
             .replace("{INCLUDE_EXTERNAL_RULES}", if details { "$true" } else { "$false" })
             .replace("{PROJECT_RULE_HELPERS}", FIREWALL_VALIDATION_SCRIPT)
+            .replace("{OPENSSH_SERVICE_HELPERS}", OPENSSH_SERVICE_SCRIPT)
             .replace("{PRODUCT_EXE_B64}", &product_executable_b64)
             .replace("{DEVICE_PAIRING_PORT}", &DEVICE_PAIRING_PORT.to_string())
             .replace("{MAX_EXISTING_SSH_RULES}", &MAX_EXISTING_SSH_RULES.to_string());
@@ -777,7 +794,8 @@ foreach ($candidate in $enabledInboundRules) {
 
 /// enable_open_ssh_server（显式启用主机功能）：仅由共享主机专用管理任务调用并触发系统 UAC。
 /// Windows 安装可选功能时可能创建微软默认 SSH 入站规则；仅本次全新生成且此前不存在的规则会被禁用。
-/// 不改动既有 sshd 启动类型、程序专用防火墙规则、账户公钥或配置文件。
+/// 保留既有启动类型；显式准备禁用的服务时改为手动，启动失败则恢复禁用。
+/// 不覆盖程序专用防火墙规则、账户公钥或配置文件。
 pub fn enable_open_ssh_server() -> Result<OpenSshServerStatus, String> {
     enable_open_ssh_server_with_progress(|_| {})
 }
@@ -793,7 +811,11 @@ where
             open_ssh_server_status,
             |_script, on_wait| {
                 let code = if crate::system_maintenance::elevated()? {
-                    run_maintenance_script(&open_ssh_server_install_script(), on_wait)?
+                    run_maintenance_script(
+                        &open_ssh_server_install_script(),
+                        crate::system_maintenance::Operation::PrepareOpenSsh {}.execution_timeout(),
+                        on_wait,
+                    )?
                 } else {
                     crate::system_maintenance::execute(
                         crate::system_maintenance::Operation::PrepareOpenSsh {},
@@ -891,8 +913,14 @@ $systemModuleRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\M
 # PSModulePath（PowerShell 模块搜索路径）：使用所选解释器及系统模块，供官方 DISM（映像维护）与防火墙命令使用。
 $env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $systemModuleRoot
 $PSModuleAutoLoadingPreference = 'All'
+{service_helpers}
 try {{
-    $capability = Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop
+    $existingService = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
+    $nativeService = if ($null -ne $existingService) {{ Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop }} else {{ $null }}
+    $layout = Get-ProjectOpenSshLayout $nativeService
+    if ($null -ne $existingService -and (-not $layout.OfficialBinary -or -not $layout.ServicePathOfficial -or -not $layout.ArgumentsValid)) {{ exit 15 }}
+    # 已有微软独立安装版同样复用，不调用 DISM（系统映像维护）安装另一份系统服务。
+    $capability = if ($null -ne $existingService) {{ @{{ State = 'Installed' }} }} else {{ Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop }}
     if ($capability.State -in @('InstallPending', 'UninstallPending', 'Staged')) {{ exit 12 }}
     $wasInstalled = $capability.State -eq 'Installed'
     function Get-OpenSshDefaultFirewallRules {{
@@ -915,13 +943,13 @@ try {{
     }}
     if (-not $wasInstalled) {{
         try {{
-            Add-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop | Out-Null
+            $installed = Add-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop
         }} catch {{
             try {{ Disable-NewOpenSshDefaultFirewallRule }} catch {{ exit 14 }}
             exit 13
         }}
         $installedCapability = Get-WindowsCapability -Online -Name '{OPENSSH_CAPABILITY}' -ErrorAction Stop
-        if ($installedCapability.State -in @('InstallPending', 'UninstallPending', 'Staged')) {{
+        if ($installed.RestartNeeded -or $installedCapability.State -in @('InstallPending', 'UninstallPending', 'Staged')) {{
             Disable-NewOpenSshDefaultFirewallRule
             exit 12
         }}
@@ -932,14 +960,35 @@ try {{
     }}
     # 仅对本任务全新安装生成的微软默认规则执行 fail-closed（默认拒绝）处理；既有规则保持原状。
     Disable-NewOpenSshDefaultFirewallRule
+    # 下载后及启动前重新读取服务登记和微软签名，不能仅信任提权前的检查结果。
+    $nativeService = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
+    $layout = Get-ProjectOpenSshLayout $nativeService
+    if ($null -eq $nativeService -or -not $layout.OfficialBinary -or -not $layout.ServicePathOfficial -or -not $layout.ArgumentsValid) {{ exit 15 }}
     if (-not $wasInstalled) {{ Set-Service -Name 'sshd' -StartupType Automatic -ErrorAction Stop }}
     $service = Get-Service -Name 'sshd' -ErrorAction Stop
-    if ($service.Status -ne 'Running') {{ Start-Service -Name 'sshd' -ErrorAction Stop }}
+    if ($service.Status -ne 'Running') {{
+        $ports = if ($null -ne $layout.PortOverride) {{ @($layout.PortOverride) }} else {{ @(22) }}
+        if ($wasInstalled -and (Test-Path -LiteralPath $layout.ConfigPath -PathType Leaf)) {{
+            $probe = Invoke-ProjectOpenSshProbe $layout
+            if ($probe.ExitCode -ne 0) {{ exit 17 }}
+            $configuredPorts = @($probe.Lines | Where-Object {{ $_ -match '^port\s+[0-9]+$' }} | ForEach-Object {{ [int](($_ -split '\s+')[1]) }})
+            if (-not $configuredPorts.Count) {{ exit 17 }}
+            $ports = $configuredPorts
+        }}
+        if (@(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {{ $ports -contains $_.LocalPort -and $_.OwningProcess -ne $nativeService.ProcessId }}).Count) {{ exit 16 }}
+        $wasDisabled = [string]$nativeService.StartMode -eq 'Disabled'
+        if ($wasDisabled) {{ Set-Service -Name 'sshd' -StartupType Manual -ErrorAction Stop }}
+        try {{ Start-Service -Name 'sshd' -ErrorAction Stop }} catch {{
+            if ($wasDisabled) {{ Set-Service -Name 'sshd' -StartupType Disabled -ErrorAction Stop }}
+            throw
+        }}
+    }}
     exit 0
 }} catch {{
     exit 1
 }}
-"#
+"#,
+        service_helpers = OPENSSH_SERVICE_SCRIPT,
     )
 }
 
@@ -949,6 +998,9 @@ fn elevated_exit_result(exit_code: u32) -> Result<(), String> {
         12 => Err("OpenSSH Server 正处于 Windows 功能维护或重启等待状态；请刷新状态，待维护结束后再操作。".into()),
         13 => Err("Windows 官方 OpenSSH Server 功能源安装失败；请检查 Windows 功能源、Windows Update 或组织策略后重试。".into()),
         14 => Err("OpenSSH Server 安装产生的默认入站规则未能安全确认已关闭；服务未启动，请在 SSH 设置中检查规则后重试。".into()),
+        15 => Err("现有或安装后的 SSH（安全外壳协议）服务路径、微软签名或服务参数复核失败；未启动或替换该服务，请检查原有安装。".into()),
+        16 => Err("SSH（安全外壳协议）所需端口已被其他进程占用；未终止现有进程或修改端口，请处理冲突后重试。".into()),
+        17 => Err("现有 SSH（安全外壳协议）服务的有效配置检查失败；未启动服务或覆盖配置，请检查配置与主机密钥权限。".into()),
         _ => Err("OpenSSH Server 系统功能安装或 sshd 启动失败；请刷新状态并检查 Windows 管理员权限、功能源和策略。".into()),
     }
 }
@@ -1082,10 +1134,7 @@ pub fn prepare_device_broadcast_access(explicit: bool) -> Result<OpenSshServerSt
         .lock()
         .map_err(|_| "广播维修状态不可用。")?;
     let before = cached_open_ssh_server_runtime_status(explicit)?;
-    prepare_broadcast_with(&mut gate, explicit, before, |before| {
-        if !before.ready {
-            enable_open_ssh_server()?;
-        }
+    prepare_broadcast_with(&mut gate, explicit, before, |_| {
         set_device_broadcast_access(true)
     })
 }
@@ -1103,6 +1152,10 @@ fn prepare_broadcast_with(
     {
         gate.failed = false;
         return Ok(before);
+    }
+    // 广播启动只读检查依赖；下载与启用必须经过正式系统功能任务的用户确认。
+    if !before.ready {
+        return Err("微软 SSH（安全外壳协议）服务尚未就绪；请在设备设置中开启广播或点击“检查 SSH 服务”，确认下载或启动后再重试。".into());
     }
     if before.local_lan_addresses.is_empty() || before.local_lan_scopes.is_empty() {
         return Err(
@@ -1202,7 +1255,7 @@ fn project_access_script(
 ) -> String {
     let mut rules = Vec::new();
     if ssh {
-        rules.push(format!("@{{ Name='VoiceTerminal-OpenSSH-Server-In-TCP'; Program=(Join-Path $env:SystemRoot 'System32/OpenSSH/sshd.exe'); Port={}; Protocol='TCP' }}", status.effective_port.unwrap_or(22)));
+        rules.push(format!("@{{ Name='VoiceTerminal-OpenSSH-Server-In-TCP'; Program=$sshProgram; Port={}; Protocol='TCP' }}", status.effective_port.unwrap_or(22)));
     }
     if pairing {
         rules.push(format!("@{{ Name='VoiceTerminal-Device-Pairing-TCP-In'; Program=$desktopProgram; Port={DEVICE_PAIRING_PORT}; Protocol='TCP' }}"));
@@ -1212,6 +1265,8 @@ fn project_access_script(
     }
     let program_b64 =
         base64::engine::general_purpose::STANDARD.encode(executable.to_string_lossy().as_bytes());
+    let ssh_program_b64 = base64::engine::general_purpose::STANDARD
+        .encode(status.source_path.as_deref().unwrap_or_default().as_bytes());
     let scope_b64 = base64::engine::general_purpose::STANDARD
         .encode(status.local_lan_scopes.join(",").as_bytes());
     let enabled = if enabled { "$true" } else { "$false" };
@@ -1222,6 +1277,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 {helpers}
 $desktopProgram = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{program_b64}'))
+$sshProgram = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{ssh_program_b64}'))
 $remoteScope = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{scope_b64}')) -split ','
 $rules = @(
 {rules}
@@ -1354,6 +1410,9 @@ fn manage_project_device_key(
     if status.account_sid.as_deref() != Some(owner_sid) {
         return Err("配对窗口账户 SID 与当前 Windows 登录账户不匹配。".into());
     }
+    let authorized_keys_path = status.authorized_keys_path.as_deref().ok_or(
+        "现有 SSH（安全外壳协议）配置使用自定义授权文件、条件或命令，或配置无法读取；程序未修改任何公钥，请核对微软默认公钥存储配置后重试。",
+    )?;
     if add {
         let mut requested = network_scopes.to_vec();
         requested.sort();
@@ -1398,6 +1457,7 @@ fn manage_project_device_key(
         ("MARKER", &marker),
         ("PUBLIC_KEY", public_key),
         ("LINE", &line),
+        ("KEY_PATH", authorized_keys_path),
         (
             "ADMIN",
             if status.account_is_admin {
@@ -1511,8 +1571,13 @@ try {
     if ([string]$identity.Name -match '^(?i:AzureAD)\\') { throw 'Microsoft Entra 账户不受当前 Windows OpenSSH 支持。' }
     $isAdmin = Test-ProjectAdministratorAccount $identity
     if ($isAdmin -ne $adminExpected) { throw '管理员公钥存储与当前账户组身份不匹配。' }
-    $path = if ($isAdmin) { Join-Path $env:ProgramData 'ssh/administrators_authorized_keys' }
-        else { Join-Path $env:USERPROFILE '.ssh/authorized_keys' }
+    $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@KEY_PATH@@'))
+    $userKeysPath = Join-Path $env:USERPROFILE '.ssh/authorized_keys'
+    $adminKeysPath = Join-Path $env:ProgramData 'ssh/administrators_authorized_keys'
+    if (-not [string]::Equals([IO.Path]::GetFullPath($path), [IO.Path]::GetFullPath($userKeysPath), [StringComparison]::OrdinalIgnoreCase) -and
+        -not ($isAdmin -and [string]::Equals([IO.Path]::GetFullPath($path), [IO.Path]::GetFullPath($adminKeysPath), [StringComparison]::OrdinalIgnoreCase))) {
+        throw '授权公钥目标不是已验证的微软默认公钥文件。'
+    }
     $fullPath = [IO.Path]::GetFullPath($path)
     $cursor = [IO.DirectoryInfo]([IO.Path]::GetDirectoryName($fullPath))
     while ($null -ne $cursor) {
@@ -1626,11 +1691,12 @@ fn run_powershell(script: &str, timeout: std::time::Duration) -> Result<String, 
 #[cfg(windows)]
 fn run_maintenance_script(
     script: &str,
+    timeout: std::time::Duration, // timeout（按正式维护操作确定的执行时限）。
     on_wait: &mut dyn FnMut(std::time::Duration),
 ) -> Result<u32, String> {
     let host = crate::powershell::select(crate::powershell::Purpose::Maintenance)?;
     let (code, _, diagnostic) =
-        crate::powershell::execute(&host, script, std::time::Duration::from_secs(600), on_wait)?;
+        crate::powershell::execute(&host, script, timeout, on_wait)?;
     if code == 1 {
         let diagnostic = diagnostic
             .chars()
@@ -1648,7 +1714,7 @@ fn run_admin_operation(
     script: &str,
 ) -> Result<(), String> {
     let code = if crate::system_maintenance::elevated()? {
-        run_maintenance_script(script, &mut |_| {})?
+        run_maintenance_script(script, operation.execution_timeout(), &mut |_| {})?
     } else {
         crate::system_maintenance::execute(operation, &mut |_| {})?
     };
@@ -1676,7 +1742,13 @@ pub(crate) fn execute_maintenance_operation(
             // 复用生产安装准入，拒绝未知或签名不合格的现有系统服务。
             prepare_open_ssh_server_with_progress(
                 open_ssh_server_runtime_status,
-                |script, _| elevated_exit_result(run_maintenance_script(script, &mut |_| {})?),
+                |script, _| {
+                    elevated_exit_result(run_maintenance_script(
+                        script,
+                        crate::system_maintenance::Operation::PrepareOpenSsh {}.execution_timeout(),
+                        &mut |_| {},
+                    )?)
+                },
                 |_| {},
             )?;
             Ok(0)
@@ -1742,6 +1814,22 @@ mod tests {
         .unwrap();
         assert_eq!(result, status);
         assert!(!gate.failed);
+    }
+
+    #[test]
+    fn missing_ssh_never_installs_from_manual_or_automatic_broadcast_start() {
+        for explicit in [false, true] {
+            let mut status = OpenSshServerStatus::from_json(complete_server_status()).unwrap();
+            status.ready = false;
+            let error = prepare_broadcast_with(
+                &mut BroadcastRepairGate::default(),
+                explicit,
+                status,
+                |_| panic!("广播入口不能绕过系统功能下载确认"),
+            )
+            .unwrap_err();
+            assert!(error.contains("确认下载或启动"));
+        }
     }
 
     #[test]
@@ -1909,6 +1997,31 @@ mod tests {
         assert!(!status.project_access_valid);
         assert!(!status.pairing_access_enabled);
         assert!(!status.pairing_access_valid);
+    }
+
+    #[test]
+    fn signed_independent_microsoft_server_is_reused_without_windows_capability() {
+        for folder in ["OpenSSH", "OpenSSH-Win64", "OpenSSH-ARM64"] {
+            let mut value = complete_server_status();
+            value["source_path"] = json!(format!("C:\\Program Files\\{folder}\\sshd.exe"));
+            value["capability_state"] = json!("NotPresent");
+            let status = OpenSshServerStatus::from_json(value).unwrap();
+            assert!(status.ready);
+            prepare_open_ssh_server_with(
+                || Ok(status.clone()),
+                |_| panic!("已有官方独立版不应下载安装另一份"),
+            )
+            .unwrap();
+        }
+        for path in [
+            "D:\\Downloads\\OpenSSH\\sshd.exe",
+            "C:\\Users\\tester\\System32\\OpenSSH\\sshd.exe",
+            "C:\\Program Files\\OpenSSH-old\\sshd.exe",
+        ] {
+            let mut value = complete_server_status();
+            value["source_path"] = json!(path);
+            assert!(!OpenSshServerStatus::from_json(value).unwrap().ready);
+        }
     }
 
     #[test]
@@ -2312,10 +2425,10 @@ mod tests {
         assert!(!status.contains(&per_rule_port_query));
         assert!(!status.contains(&per_rule_application_query));
         assert!(status.contains("$sshProbePort = if ($null -ne $effectivePort)"));
-        assert!(status.contains("$probeErrorPreference = $ErrorActionPreference"));
-        assert!(status.contains("$ErrorActionPreference = 'Continue'"));
-        assert!(status.contains("$effectiveExitCode = $LASTEXITCODE"));
-        assert!(status.contains("$ErrorActionPreference = $probeErrorPreference"));
+        assert!(OPENSSH_SERVICE_SCRIPT.contains("$preference = $ErrorActionPreference"));
+        assert!(OPENSSH_SERVICE_SCRIPT.contains("$ErrorActionPreference = 'Continue'"));
+        assert!(OPENSSH_SERVICE_SCRIPT.contains("$code = $LASTEXITCODE"));
+        assert!(OPENSSH_SERVICE_SCRIPT.contains("$ErrorActionPreference = $preference"));
         assert!(status.contains("if ($null -eq $portFilter) { continue }"));
         assert!(status.contains("$candidatePorts -contains $sshProbePort"));
         assert!(status.contains("$otherSshInboundRules.Count -ge {MAX_EXISTING_SSH_RULES}"));
@@ -2551,6 +2664,14 @@ $denyOnly = @($identity.Claims | Where-Object { $_.Type -eq [Security.Claims.Cla
             ("MARKER", "VoiceTerminal:real-account:device"),
             ("PUBLIC_KEY", "ssh-ed25519 TEST"),
             ("LINE", line),
+            (
+                "KEY_PATH",
+                if admin {
+                    admin_path.to_str().unwrap()
+                } else {
+                    user_path.to_str().unwrap()
+                },
+            ),
             ("ADMIN", if admin { "true" } else { "false" }),
         ] {
             script = script.replace(
@@ -2624,6 +2745,7 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
                     ("MARKER", "VoiceTerminal:workspace:device"),
                     ("PUBLIC_KEY", "ssh-ed25519 TEST"),
                     ("LINE", line.as_str()),
+                    ("KEY_PATH", target.to_str().unwrap()),
                     ("ADMIN", if admin { "true" } else { "false" }),
                 ] {
                     script = script.replace(
@@ -2660,27 +2782,73 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
     #[test]
     fn generated_install_script_parses_without_executing_system_commands() {
         use base64::Engine as _;
-        use std::process::Command;
 
         let source = open_ssh_server_install_script();
         let source_base64 = base64::engine::general_purpose::STANDARD.encode(source.as_bytes());
         let parser = format!(
             "$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{source_base64}')); [void][ScriptBlock]::Create($source);"
         );
-        let encoded_parser = encode_powershell(&parser);
-        let output = Command::new(powershell_executable().unwrap())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                encoded_parser.as_str(),
-            ])
-            .output()
-            .expect("PowerShell parser process should start without elevation");
-        assert!(
-            output.status.success(),
-            "generated install script must parse as a ScriptBlock"
-        );
+        // 复用生产标准输入管道，避免双重编码超过 Windows（操作系统）命令行长度上限。
+        run_powershell(&parser, std::time::Duration::from_secs(10)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_layout_and_authorized_keys_follow_actual_supported_configuration() {
+        let temp_owner =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp");
+        let temp = temp_owner.join(format!("ssh-layout-{}", crate::workspace::new_id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let config = temp.join("默认 配置");
+        let custom = temp.join("自定义配置");
+        std::fs::write(&config, "AuthorizedKeysFile .ssh/authorized_keys\nMatch Group administrators\n AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\n").unwrap();
+        std::fs::write(&custom, "AuthorizedKeysFile .ssh/custom_keys\n").unwrap();
+        let fixture_b64 = base64::engine::general_purpose::STANDARD
+            .encode(crate::canonical_path(&temp).unwrap().to_string_lossy().as_bytes());
+        let cases = r#"
+$fixture = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@FIXTURE@@'))
+$script:SignatureValid = $true
+function Test-Path {
+    [CmdletBinding()] param([string]$LiteralPath, [string]$PathType)
+    if ($LiteralPath -like '*\sshd.exe') { return $true }
+    Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType
+}
+function Get-Item {
+    [CmdletBinding()] param([string]$LiteralPath)
+    if ($LiteralPath -like '*\sshd.exe') { return [pscustomobject]@{ FullName=$LiteralPath; VersionInfo=@{FileVersion='9.5.6.4'} } }
+    Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -ErrorAction Stop
+}
+function Get-AuthenticodeSignature {
+    [CmdletBinding()] param([string]$FilePath)
+    @{Status=$(if ($script:SignatureValid) { 'Valid' } else { 'NotTrusted' });SignerCertificate=@{Subject='CN=Microsoft Corporation'}}
+}
+$binary = Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe'
+$config = Join-Path $fixture '默认 配置'
+$layout = Get-ProjectOpenSshLayout @{PathName=('"' + $binary + '" -f "' + $config + '" -p 2223')}
+if (-not $layout.OfficialBinary -or -not $layout.ServicePathOfficial -or -not $layout.ArgumentsValid -or $layout.ConfigPath -ne $config -or $layout.PortOverride -ne 2223 -or ($layout.ProbeArguments -join '|') -ne "-T|-f|$config|-p|2223") { throw '实际服务路径和参数未保留' }
+$adminPath = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+$userPath = Join-Path $fixture '.ssh\authorized_keys'
+if ((Resolve-ProjectOpenSshAuthorizedKeys $layout $true $fixture) -ne $adminPath) { throw '管理员默认条件块未生效' }
+if ((Resolve-ProjectOpenSshAuthorizedKeys $layout $false $fixture) -ne $userPath) { throw '普通账户被错误选择为管理员存储' }
+$layout.ConfigPath = Join-Path $fixture '自定义配置'
+if ($null -ne (Resolve-ProjectOpenSshAuthorizedKeys $layout $false $fixture)) { throw '自定义授权文件不能被静默替换成默认位置' }
+$options = Get-ProjectOpenSshLayout @{PathName=($binary + ' -o "Port=2224"')}
+if (-not $options.ArgumentsValid -or $options.SimpleConfig -or ($options.ProbeArguments -join '|') -ne '-T|-o|Port=2224') { throw '配置覆盖参数未传递' }
+$unknown = Get-ProjectOpenSshLayout @{PathName=('"' + $binary + '" -Z')}
+if ($unknown.ArgumentsValid) { throw '未知服务参数不能被忽略' }
+$script:SignatureValid = $false
+if ((Get-ProjectOpenSshLayout @{PathName=$binary}).OfficialBinary) { throw '无效签名被误判官方程序' }
+$script:SignatureValid = $true
+if ((Get-ProjectOpenSshLayout @{PathName=(Join-Path $fixture 'sshd.exe')}).OfficialBinary) { throw '非官方安装位置被放行' }
+'Validated'
+"#.replace("@@FIXTURE@@", &fixture_b64);
+        let output = run_powershell(
+            &(OPENSSH_SERVICE_SCRIPT.to_owned() + &cases),
+            std::time::Duration::from_secs(15),
+        )
+        .unwrap();
+        assert_eq!(output, "Validated");
+        crate::workspace::remove_owned(&temp, &temp_owner).unwrap();
     }
 
     #[cfg(windows)]
@@ -2716,7 +2884,19 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
     ) -> std::process::Output {
         use std::process::Command;
 
-        let source = open_ssh_server_install_script().replace(
+        // 官方路径与签名定位单独执行脚本测试；此处只替换只读盘点，所有写入仍由下方模拟命令承接。
+        let layout_mock = r#"
+function Get-ProjectOpenSshLayout {
+    param($NativeService)
+    @{ OfficialBinary=($script:ServiceState -ne 'Unverified'); ServicePathOfficial=$true; ArgumentsValid=$true;
+       SourcePath=(Join-Path $env:SystemRoot 'System32/OpenSSH/sshd.exe'); ProbeArguments=@('-T'); PortOverride=$null;
+       ConfigPath=(Join-Path $env:SystemRoot 'win.ini') }
+}
+function Invoke-ProjectOpenSshProbe {
+    @{ ExitCode=$(if ($script:ServiceState -eq 'InvalidConfig') { 1 } else { 0 }); Lines=@('port 22') }
+}
+"#;
+        let source = open_ssh_server_install_script().replace(OPENSSH_SERVICE_SCRIPT, layout_mock).replace(
             "} catch {\n    exit 1\n}",
             "} catch {\n    [Console]::Out.WriteLine('MOCK:ERROR:' + $_.Exception.Message)\n    exit 1\n}",
         );
@@ -2743,11 +2923,12 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
             "$false"
         };
         // fail_service_start_literal（模拟 sshd 服务启动失败标志）：仅改变本进程内的模拟命令结果。
-        let fail_service_start_literal = if initial_service == "StartFails" {
-            "$true"
-        } else {
-            "$false"
-        };
+        let fail_service_start_literal =
+            if matches!(initial_service, "StartFails" | "DisabledStartFails") {
+                "$true"
+            } else {
+                "$false"
+            };
         let initial_service_state = if initial_service == "StartFails" {
             "Stopped"
         } else {
@@ -2756,6 +2937,7 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
         let setup = format!(
             r#"
 $script:CapabilityState = '{initial_capability}'
+$script:ServicePresent = $script:CapabilityState -eq 'Installed'
 $script:DefaultRulePresent = {existing_rule_literal}
 $script:DefaultRuleEnabled = $true
 $script:ServiceState = '{initial_service_state}'
@@ -2784,6 +2966,7 @@ function Add-WindowsCapability {{
         throw 'mock feature source unavailable'
     }}
     $script:CapabilityState = if ($script:PendingAfterAdd) {{ 'InstallPending' }} else {{ 'Installed' }}
+    $script:ServicePresent = $true
     $script:DefaultRulePresent = $true
 }}
 function Get-NetFirewallRule {{
@@ -2805,7 +2988,7 @@ function Set-NetFirewallRule {{
 function Set-Service {{
     [CmdletBinding()]
     param([string]$Name, [string]$StartupType)
-    if ($Name -ne 'sshd' -or $StartupType -ne 'Automatic') {{ throw 'unexpected service mutation' }}
+    if ($Name -ne 'sshd' -or $StartupType -notin @('Automatic','Manual','Disabled')) {{ throw 'unexpected service mutation' }}
     [Console]::Out.WriteLine("MOCK:Set-Service:$StartupType")
 }}
 function Get-Service {{
@@ -2813,7 +2996,18 @@ function Get-Service {{
     param([string]$Name)
     if ($Name -ne 'sshd') {{ throw 'unexpected service query' }}
     [Console]::Out.WriteLine('MOCK:Get-Service:sshd')
-    [pscustomobject]@{{ Status = $script:ServiceState }}
+    if ($script:ServicePresent) {{ [pscustomobject]@{{ Status = $script:ServiceState }} }}
+}}
+function Get-CimInstance {{
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Filter)
+    if ($ClassName -ne 'Win32_Service' -or $Filter -ne "Name='sshd'") {{ throw 'unexpected service metadata query' }}
+    if ($script:ServicePresent) {{ [pscustomobject]@{{ ProcessId=0; StartMode=$(if ($script:ServiceState -like 'Disabled*') {{ 'Disabled' }} else {{ 'Manual' }}) }} }}
+}}
+function Get-NetTCPConnection {{
+    [CmdletBinding()]
+    param([string]$State)
+    if ($script:ServiceState -eq 'PortConflict') {{ [pscustomobject]@{{ LocalPort=22; OwningProcess=99 }} }}
 }}
 function Start-Service {{
     [CmdletBinding()]
@@ -2919,6 +3113,45 @@ $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{source_b
 
     #[cfg(windows)]
     #[test]
+    fn existing_service_rejects_conflicts_and_invalid_configuration_and_can_enable_disabled_service(
+    ) {
+        for (state, code) in [
+            ("Unverified", 15),
+            ("PortConflict", 16),
+            ("InvalidConfig", 17),
+        ] {
+            let output = run_mocked_open_ssh_install_script("Installed", true, state, false);
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{state}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("MOCK:Start-Service"));
+            assert!(!stdout.contains("MOCK:Add-WindowsCapability"));
+            assert!(!stdout.contains("MOCK:Set-NetFirewallRule"));
+        }
+        let output = run_mocked_open_ssh_install_script("Installed", true, "Disabled", false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("MOCK:Set-Service:Manual"));
+        assert!(stdout.contains("MOCK:Start-Service:sshd"));
+        assert!(!stdout.contains("MOCK:Set-Service:Automatic"));
+        let output =
+            run_mocked_open_ssh_install_script("Installed", true, "DisabledStartFails", false);
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("MOCK:Set-Service:Manual"));
+        assert!(stdout.contains("MOCK:Set-Service:Disabled"));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn install_script_fails_closed_on_firewall_query_and_partial_install_paths() {
         let initial_query_failure = run_mocked_open_ssh_install_script_with_faults(
             "NotPresent",
@@ -3015,7 +3248,8 @@ $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{source_b
 $systemModuleRoot = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
 $env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + $systemModuleRoot
 $PSModuleAutoLoadingPreference = 'All'
-$signature = Get-AuthenticodeSignature -FilePath (Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe') -ErrorAction Stop
+# 模块自动加载回归使用系统必备签名程序，不要求预先安装可选的 SSH（安全外壳协议）服务。
+$signature = Get-AuthenticodeSignature -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ErrorAction Stop
 $command = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue
 @{
     module_path = $env:PSModulePath

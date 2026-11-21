@@ -75,6 +75,7 @@ function makeManagementResponse(
 
 describe('DeviceSettings（设备设置）', () => {
   let wrapper: VueWrapper | undefined
+  let mountTarget: HTMLDivElement | undefined // mountTarget（需要真实焦点行为时的挂载节点）。
   let currentStatus: DeviceConfigStatus
   let sshReady: boolean
   let sshConnected: boolean
@@ -82,6 +83,18 @@ describe('DeviceSettings（设备设置）', () => {
   let mediaRunning: boolean
   let interactionGeneration: number
   const clipboardWrite = vi.fn()
+
+  /** respondToConfirmation（通过正式项目弹窗确认或取消，不模拟浏览器原生确认框）。 */
+  async function respondToConfirmation(accepted = true) {
+    await flushPromises()
+    const dialog = wrapper!.get('[role="dialog"]')
+    expect(dialog.attributes('aria-modal')).toBe('true')
+    const action = dialog.findAll('button').find(button => accepted ? button.text().startsWith('确认') : button.text() === '取消')
+    expect(action).toBeDefined()
+    await action!.trigger('click')
+    await flushPromises()
+    expect(window.confirm).not.toHaveBeenCalled()
+  }
 
   function prepareRemoteHost() {
     currentStatus = makeConfig('remote', false)
@@ -104,7 +117,7 @@ describe('DeviceSettings（设备设置）', () => {
     interactionGeneration = 0
     clipboardWrite.mockReset().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: clipboardWrite } })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.spyOn(window, 'confirm').mockImplementation(() => { throw new Error('设备操作必须使用项目弹窗') })
     vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockImplementation(async () => currentStatus)
     vi.spyOn(nativeDeviceApi, 'saveDeviceConfig').mockImplementation(async (config: DeviceConfig) => {
       currentStatus = makeConfig(config.mode, config.broadcast_enabled)
@@ -183,6 +196,8 @@ describe('DeviceSettings（设备设置）', () => {
   afterEach(() => {
     wrapper?.unmount()
     wrapper = undefined
+    mountTarget?.remove()
+    mountTarget = undefined
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
@@ -360,7 +375,9 @@ describe('DeviceSettings（设备设置）', () => {
 
   it('本机广播开关保存本地运行意图，获取配对码后自动复制', async () => {
     currentStatus = makeConfig('local', false)
-    wrapper = mount(DeviceSettings)
+    mountTarget = document.createElement('div')
+    document.body.append(mountTarget)
+    wrapper = mount(DeviceSettings, { attachTo: mountTarget })
     await flushPromises()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
     const checkbox = wrapper.get('input[aria-label="广播并接受配对"]')
@@ -369,6 +386,7 @@ describe('DeviceSettings（设备设置）', () => {
 
     const getCode = wrapper.findAll('button').find(button => button.text().trim() === '获取配对码')
     expect(getCode).toBeDefined()
+    getCode!.element.focus()
     await getCode!.trigger('click')
     await flushPromises()
 
@@ -376,12 +394,19 @@ describe('DeviceSettings（设备设置）', () => {
       mode: 'local', broadcast_enabled: true, desired_role: 'shared_host',
     }), false)
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledTimes(2)
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledTimes(3)
     expect(vi.mocked(nativeDeviceApi.openSshServerStatus).mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(nativeDeviceApi.saveDeviceConfig).mock.invocationCallOrder[0]!)
     expect(nativeDeviceApi.openPairingWindow).toHaveBeenCalledOnce()
     expect(clipboardWrite).toHaveBeenCalledWith('000042')
     expect(wrapper.get('.pairing-code-box output').text()).toBe('000042')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本机配对码')
+    expect(wrapper.get('.pairing-code-box output').attributes('aria-label')).toBe('本机六位配对码')
+    await wrapper.get('[role="dialog"]').findAll('button').find(button => button.text() === '关闭配对窗口')!.trigger('click')
+    await flushPromises()
+    expect(nativeDeviceApi.closePairingWindow).toHaveBeenCalledOnce()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(document.activeElement).toBe(getCode!.element)
   })
 
   it('历史 SSH 失败不覆盖当前就绪状态，进入页面只查询一次系统状态', async () => {
@@ -393,6 +418,27 @@ describe('DeviceSettings（设备设置）', () => {
     expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledOnce()
     expect(wrapper.text()).not.toContain('旧版本的状态查询失败')
     expect(wrapper.text()).toContain('广播已关闭')
+  })
+
+  it('自动复制挂起时配对码弹窗仍可关闭，迟到回执不覆盖关闭结果', async () => {
+    currentStatus = makeConfig('local', true)
+    let finishCopy!: () => void
+    clipboardWrite.mockImplementationOnce(() => new Promise<void>(resolve => { finishCopy = resolve }))
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '获取配对码')!.trigger('click')
+    await flushPromises()
+    const close = wrapper.get('[role="dialog"]').findAll('button').find(button => button.text() === '关闭配对窗口')!
+    expect(close.element.disabled).toBe(false)
+    expect(wrapper.get('.pairing-code-box output').text()).toBe('000042')
+    await close.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(nativeDeviceApi.closePairingWindow).toHaveBeenCalledOnce()
+    finishCopy()
+    await flushPromises()
+    expect(wrapper.text()).toContain('六位码和本机配对监听器已关闭')
+    expect(wrapper.text()).not.toContain('六位配对码已复制')
   })
 
   it('首次慢速 SSH 查询不锁住运行模式，切到远程后丢弃旧查询结果', async () => {
@@ -510,11 +556,16 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).toContain('局域网公告发布失败')
   })
 
-  it('广播开启统一交给原生检查和维修，等待同一保存任务，不另开 SSH 任务或确认窗口', async () => {
+  it('广播开启在 SSH 缺失时先确认官方下载，准备就绪后才保存和开启网络访问', async () => {
     sshReady = false
     wrapper = mount(DeviceSettings)
     await flushPromises()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
+    vi.mocked(nativeDeviceApi.enableOpenSshServer).mockImplementationOnce(async () => {
+      sshReady = true
+      return { job_id: 'system-feature-openssh-server', fields: {} }
+    })
+    vi.mocked(nativeDeviceApi.resourceJobs).mockResolvedValue([makeLocalSshJob('complete')])
     let finishSave!: () => void
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockImplementationOnce(async config => {
       await new Promise<void>(resolve => { finishSave = resolve })
@@ -524,15 +575,52 @@ describe('DeviceSettings（设备设置）', () => {
     })
     await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
     await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Windows Update（系统更新）下载')
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)
+    expect(wrapper.get('[role="progressbar"]').attributes('aria-valuenow')).toBeUndefined()
+    await respondToConfirmation()
     expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledOnce()
     expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledWith(expect.objectContaining({ mode: 'local', broadcast_enabled: true }), false)
-    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
-    expect(window.confirm).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledExactlyOnceWith(true)
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(vi.mocked(nativeDeviceApi.enableOpenSshServer).mock.invocationCallOrder[0]!)
+      .toBeLessThan(vi.mocked(nativeDeviceApi.saveDeviceConfig).mock.invocationCallOrder[0]!)
     expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
     finishSave()
     await flushPromises()
     expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', true)
+  })
+
+  it('广播开启重新检查已缓存的 SSH 状态，取消下载时不安装、不保存且恢复关闭状态', async () => {
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    sshReady = false
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+    expect(nativeDeviceApi.openSshServerStatus).toHaveBeenCalledWith(true)
+    await respondToConfirmation(false)
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', false)
+    expect(wrapper.text()).toContain('你取消了 SSH 服务准备')
+  })
+
+  it('广播开启的官方下载任务失败时不保存配置，保留实际错误和重试入口', async () => {
+    sshReady = false
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.resourceJobs).mockResolvedValue([
+      { ...makeLocalSshJob('failed'), error: 'Windows Update（系统更新）源不可用' },
+    ])
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await respondToConfirmation()
+    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledWith(true)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('Windows Update（系统更新）源不可用')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
   })
 
   it('SSH 准备超过五分钟后继续显示任务，晚到完成时清除等待告警并恢复检查按钮', async () => {
@@ -544,12 +632,14 @@ describe('DeviceSettings（设备设置）', () => {
     vi.mocked(nativeDeviceApi.resourceJobs).mockImplementation(async () => [makeLocalSshJob(jobState)])
 
     await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
-    await flushPromises()
-    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    await respondToConfirmation()
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1200)
     await flushPromises()
 
     expect(wrapper.text()).toContain('Windows SSH 准备任务仍在进行')
     expect(wrapper.text()).toContain('任务状态：进行中')
+    expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)
+    expect(wrapper.get('[role="progressbar"]').attributes('aria-valuetext')).toContain('任务状态：进行中')
     const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!
     expect(check.element.disabled).toBe(true)
 
@@ -562,6 +652,7 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).not.toContain('准备任务仍在进行')
     expect(wrapper.text()).not.toContain('等待 Windows SSH 服务准备超时')
     expect(check.element.disabled).toBe(false)
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
   })
 
   it('SSH 准备超时后晚到失败时显示真实原因并开放重试', async () => {
@@ -576,8 +667,8 @@ describe('DeviceSettings（设备设置）', () => {
     ])
 
     await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
-    await flushPromises()
-    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    await respondToConfirmation()
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1200)
     await flushPromises()
     expect(wrapper.text()).toContain('Windows SSH 准备任务仍在进行')
 
@@ -594,7 +685,7 @@ describe('DeviceSettings（设备设置）', () => {
   })
 
   it('广播维修的系统授权取消后恢复实际配置，不另开安装任务或重复保存', async () => {
-    sshReady = false
+    sshReady = true
     wrapper = mount(DeviceSettings)
     await flushPromises()
     vi.mocked(nativeDeviceApi.saveDeviceConfig).mockClear()
@@ -606,6 +697,37 @@ describe('DeviceSettings（设备设置）', () => {
     expect(window.confirm).not.toHaveBeenCalled()
     expect(wrapper.get('input[aria-label="广播并接受配对"]').element).toHaveProperty('checked', false)
     expect(wrapper.get('[role="alert"]').text()).toContain('已取消 Windows 管理员授权')
+  })
+
+  it('官方下载超过五分钟并切换页面后，任务完成继续开启原请求的广播，不重复下载或残留失败提示', async () => {
+    vi.useFakeTimers()
+    sshReady = false
+    let jobState = 'running'
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    vi.mocked(nativeDeviceApi.resourceJobs).mockImplementation(async () => [makeLocalSshJob(jobState)])
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await respondToConfirmation()
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1200)
+    await flushPromises()
+    expect(wrapper.text()).toContain('Windows SSH 准备任务仍在进行')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    wrapper.unmount()
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    jobState = 'complete'
+    sshReady = true
+    await vi.advanceTimersByTimeAsync(1500)
+    await flushPromises()
+    expect(nativeDeviceApi.enableOpenSshServer).toHaveBeenCalledExactlyOnceWith(true)
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ broadcast_enabled: true }), false)
+    expect(wrapper.get('.broadcast-status').text()).toContain('广播已运行')
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeUndefined()
   })
 
   it('SSH 已就绪时按钮只检查状态，不重新安装或重启', async () => {
@@ -622,16 +744,119 @@ describe('DeviceSettings（设备设置）', () => {
 
   it('SSH 未就绪且用户取消时不启动安装任务，并允许再次检查', async () => {
     sshReady = false
-    vi.mocked(window.confirm).mockReturnValue(false)
     wrapper = mount(DeviceSettings)
     await flushPromises()
     const check = wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')
     await check!.trigger('click')
-    await flushPromises()
+    await respondToConfirmation(false)
 
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('你取消了 SSH 服务准备')
     expect(check!.element.disabled).toBe(false)
+  })
+
+  it('项目确认框可用 Escape 取消，关闭页面也不会提交尚未确认的下载', async () => {
+    sshReady = false
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const check = () => wrapper!.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!
+    await check().trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('准备本机 SSH 服务')
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(check().element.disabled).toBe(false)
+
+    await wrapper.get('input[aria-label="广播并接受配对"]').setValue(true)
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+    wrapper.unmount()
+    wrapper = undefined
+    await flushPromises()
+    expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(window.confirm).not.toHaveBeenCalled()
+  })
+
+  it('损坏配置通过项目弹窗确认归档，取消保留原件，确认才提交修复', async () => {
+    currentStatus.runtime.config_state = 'invalid'
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const repair = () => wrapper!.findAll('button').find(button => button.text() === '归档原件并修复')!
+    await repair().trigger('click')
+    await respondToConfirmation(false)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    await repair().trigger('click')
+    await respondToConfirmation()
+    expect(nativeDeviceApi.saveDeviceConfig).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mode: 'local' }), true)
+  })
+
+  it('搜索、配对和通道准备共用一个进度条，阶段变化时不显示配对码或虚假百分比', async () => {
+    currentStatus = makeConfig('remote')
+    let finishSearch!: () => void
+    let finishPairing!: () => void
+    let finishChannels!: () => void
+    const pair = vi.mocked(nativeDeviceApi.pairWithDiscoveredDevice).getMockImplementation()!
+    const tasks = vi.mocked(nativeDeviceApi.remoteTaskChannel).getMockImplementation()!
+    vi.mocked(nativeDeviceApi.searchDevices).mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { finishSearch = resolve })
+      return { protocol_version: 1, devices: [foundHost], fields: {} }
+    })
+    vi.mocked(nativeDeviceApi.pairWithDiscoveredDevice).mockImplementationOnce(async (...args) => {
+      await new Promise<void>(resolve => { finishPairing = resolve })
+      return pair(...args)
+    })
+    vi.mocked(nativeDeviceApi.remoteTaskChannel).mockImplementation(async action => {
+      if (action === 'start') await new Promise<void>(resolve => { finishChannels = resolve })
+      return tasks(action)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const expectProgress = (phase: string) => {
+      expect(wrapper!.findAll('[role="progressbar"]')).toHaveLength(1)
+      const progress = wrapper!.get('[role="progressbar"]')
+      expect(progress.attributes('aria-label')).toBe('设备连接进度')
+      expect(progress.attributes('aria-valuetext')).toContain(phase)
+      expect(progress.attributes('aria-valuetext')).not.toContain('000042')
+      expect(progress.attributes('aria-valuenow')).toBeUndefined()
+    }
+    await wrapper.findAll('button').find(button => button.text() === '搜索设备')!.trigger('click')
+    await flushPromises()
+    expectProgress('正在搜索')
+    finishSearch()
+    await flushPromises()
+    await wrapper.get('input[autocomplete="one-time-code"]').setValue('000042')
+    await wrapper.findAll('button').find(button => button.text() === '连接')!.trigger('click')
+    await flushPromises()
+    expectProgress('正在验证配对')
+    finishPairing()
+    await flushPromises()
+    expectProgress('正在准备任务与语音通道')
+    finishChannels()
+    await flushPromises()
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
+    expect(nativeDeviceApi.pairWithDiscoveredDevice).toHaveBeenCalledWith(foundHost.host_id, '000042')
+  })
+
+  it('重新连接服务端时显示统一进度，连接失败后保留错误并恢复重试', async () => {
+    prepareRemoteHost()
+    sshConnected = false
+    let failConnection!: (failure: Error) => void
+    vi.mocked(nativeDeviceApi.connectSshHost).mockImplementationOnce(() => new Promise((_, reject) => { failConnection = reject }))
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const connect = () => wrapper!.findAll('button').find(button => button.text() === '连接服务端')!
+    await connect().trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)
+    expect(wrapper.get('[role="progressbar"]').attributes('aria-valuetext')).toContain('正在连接配对服务端')
+    expect(connect().element.disabled).toBe(true)
+    failConnection(new Error('服务端连接超时'))
+    await flushPromises()
+    expect(wrapper.find('[role="progressbar"]').exists()).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('服务端连接超时')
+    expect(connect().element.disabled).toBe(false)
   })
 
   it('其他入站规则默认收起，只显示有限条数和短摘要', async () => {
@@ -801,7 +1026,6 @@ describe('DeviceSettings（设备设置）', () => {
       if (operation === 'system.ssh.status') return makeManagementResponse(operation, snapshot as unknown as Record<string, unknown>)
       throw new Error(`Unexpected remote operation: ${operation}`)
     })
-    vi.mocked(window.confirm).mockReturnValue(false)
     wrapper = mount(DeviceSettings)
     await flushPromises()
 
@@ -812,10 +1036,33 @@ describe('DeviceSettings（设备设置）', () => {
     await prepare!.trigger('click')
     await flushPromises()
 
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('服务端'))
+    expect(wrapper.get('[role="dialog"]').text()).toContain('服务端 A')
+    await respondToConfirmation(false)
     expect(request.mock.calls.filter(([operation]) => operation === 'system.ssh.enable')).toHaveLength(0)
     expect(nativeDeviceApi.enableOpenSshServer).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('服务端微软 OpenSSH Server 尚未就绪')
+  })
+
+  it('服务端确认等待期间更换配对目标，旧确认不能授权新服务端', async () => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    const request = vi.mocked(nativeDeviceApi.remoteManagementRequest).mockImplementation(async operation => {
+      return makeManagementResponse(operation, operation === 'management.status' ? { core_state: 'ready' }
+        : makeRemoteSshSnapshot(false) as unknown as Record<string, unknown>)
+    })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '检查 SSH 服务')!.trigger('click')
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '请求服务端安装或启动')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('服务端 A')
+    currentStatus = structuredClone(currentStatus)
+    currentStatus.device_config!.paired_host!.host_id = 'server-b'
+    currentStatus.device_config!.paired_host!.display_name = '服务端 B'
+    await vi.advanceTimersByTimeAsync(1500)
+    await respondToConfirmation()
+    expect(request.mock.calls.filter(([operation]) => operation === 'system.ssh.enable')).toHaveLength(0)
   })
 
   it('服务端 UAC 等待与失败显示服务端任务状态，失败后可重试并只按 ready 快照标记就绪', async () => {
@@ -849,9 +1096,11 @@ describe('DeviceSettings（设备设置）', () => {
     await wrapper.findAll('button').find(button => button.text().trim() === '检查 SSH 服务')!.trigger('click')
     await flushPromises()
     await wrapper.findAll('button').find(button => button.text().trim() === '请求服务端安装或启动')!.trigger('click')
-    await flushPromises()
+    await respondToConfirmation()
     expect(request).toHaveBeenCalledWith('system.ssh.enable', { confirmed: true })
     expect(wrapper.text()).toContain('服务端正在等待 Windows UAC（用户账户控制）授权')
+    expect(wrapper.findAll('[role="progressbar"]')).toHaveLength(1)
+    expect(wrapper.get('[role="progressbar"]').attributes('aria-valuetext')).toContain('等待 Windows 管理员授权')
     expect(wrapper.text()).not.toContain('服务端微软 OpenSSH Server 已就绪')
 
     await vi.advanceTimersByTimeAsync(1500)
@@ -860,7 +1109,7 @@ describe('DeviceSettings（设备设置）', () => {
     const retry = wrapper.findAll('button').find(button => button.text().trim() === '重试服务端 SSH 准备')
     expect(retry).toBeDefined()
     await retry!.trigger('click')
-    await flushPromises()
+    await respondToConfirmation()
     expect(request).toHaveBeenCalledWith('system.ssh.enable', { confirmed: true })
 
     await vi.advanceTimersByTimeAsync(1500)

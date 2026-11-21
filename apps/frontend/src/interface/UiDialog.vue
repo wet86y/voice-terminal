@@ -43,7 +43,9 @@ watch(
       panel.value?.focus();
     } else {
       document.removeEventListener("keydown", key);
-      previous?.focus();
+      // 关闭弹窗后，等待触发按钮解除禁用再恢复焦点。
+      await nextTick();
+      if (!props.open) previous?.focus();
     }
   },
   { immediate: true },
