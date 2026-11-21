@@ -18,7 +18,7 @@ export function frontendContinuity(session) {
           .then(value => value.runtime_recovery).catch(() => undefined);
         let recovery = await desktopRecovery();
         if (recovery?.suspended) window.__VOICE_DESKTOP_RECOVERY__ = true;
-        while (recovery?.suspended) {
+        while (recovery?.suspended && recovery.operation?.state === 'running') {
           await new Promise(resolve => setTimeout(resolve, 200));
           recovery = await desktopRecovery();
         }

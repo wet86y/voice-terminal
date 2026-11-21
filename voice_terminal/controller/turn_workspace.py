@@ -81,6 +81,8 @@ class TurnWorkspace:
     episode_id: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     committed: bool = False
+    history_committed: bool = False  # history_committed（本轮输入已入账）：随工作区释放，不保留全局轮次集合。
+    settled: bool = False  # settled（本轮终态已结算）：在异步发布前置位，阻止并发重复结算。
     playback_started: bool = False
     hard_closed: bool = False
     raw_partial: str = ""

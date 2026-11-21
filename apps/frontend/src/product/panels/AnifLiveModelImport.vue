@@ -5,6 +5,7 @@ import { desktopPort, type DesktopPort, type DesktopWorkspacePort, type Resource
 import { nativeDeviceApi } from '../native-device-api'
 import type { RemoteManagementOperation } from '../native-device-api'
 import { useApplicationHost } from '../application-host'
+import { createTtsOperationScope, isTtsOperationAborted } from '../tts-operation'
 import ManagedResourceProgress from '../../interface/ManagedResourceProgress.vue'
 import type { ManagedResourceJob } from '../../interface/local-components'
 
@@ -73,7 +74,8 @@ const canSubmit = computed(() => Boolean(scan.value && (!remoteMode.value || sca
 const sourceLabel = computed(() => sourceType.value === 'local' ? '本地文件夹' : sourceType.value === 'huggingface' ? 'Hugging Face（模型托管平台）' : 'ModelScope（魔搭模型托管平台）')
 
 onMounted(() => { void refreshPending() })
-onBeforeUnmount(() => { disposed = true })
+const transcriptionScope = createTtsOperationScope() // transcriptionScope（仅属于本页参考草稿的转写任务）。
+onBeforeUnmount(() => { disposed = true; transcriptionScope.dispose() })
 
 function updateJob(job: AnifLiveImportJob) {
   const index = jobs.value.findIndex(row => row.task_id === job.task_id)
@@ -360,23 +362,22 @@ async function transcribeReference(job: AnifLiveImportJob) {
   scanError.value = ''
   transcribingTasks.value.push(job.task_id)
   try {
-    let assetId = referenceAssets.value[job.task_id]
-    if (!assetId && file) {
-      assetId = (await productApi.uploadTtsAsset('aniflive', file)).asset.asset_id
-      referenceAssets.value[job.task_id] = assetId
-    }
-    if (!assetId) return
-    let operation = await productApi.startTtsTranscribe('aniflive', assetId)
-    while (operation.state === 'running') {
-      await wait(400)
-      operation = await productApi.getTtsOperation(operation.operation_id)
-    }
+    if (!referenceAssets.value[job.task_id] && !file) return
+    const operation = await transcriptionScope.run(async assertActive => {
+      let assetId = referenceAssets.value[job.task_id]
+      if (!assetId && file) {
+        assetId = (await productApi.uploadTtsAsset('aniflive', file)).asset.asset_id
+        assertActive()
+        referenceAssets.value[job.task_id] = assetId
+      }
+      return productApi.startTtsTranscribe('aniflive', assetId!)
+    })
     if (operation.state !== 'succeeded' || !operation.result?.text) {
       throw new Error(operation.error || '参考录音转写没有返回文本，请手动填写。')
     }
     referenceDrafts.value[job.task_id] = operation.result.text
   } catch (failure) {
-    scanError.value = failure instanceof Error ? failure.message : '参考录音转写失败，请手动填写。'
+    if (!isTtsOperationAborted(failure)) scanError.value = failure instanceof Error ? failure.message : '参考录音转写失败，请手动填写。'
   } finally {
     transcribingTasks.value = transcribingTasks.value.filter(id => id !== job.task_id)
   }

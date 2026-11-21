@@ -5,8 +5,39 @@ import http from 'node:http'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createDesktopServer } from '../scripts/frontend-dev.mjs'
+import { frontendContinuity } from '../scripts/frontend-continuity.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
+
+test('热更新恢复失败停止原生轮询，后续服务恢复仍接回原页面', async () => {
+  const code = frontendContinuity('session').transform(
+    'await waitForSuccessfulPing(url.href); location.reload();', '/node_modules/vite/dist/client/client.mjs',
+  )
+  const run = new (Object.getPrototypeOf(async function () {}).constructor)(
+    'window', 'url', 'waitForSuccessfulPing', 'hmrClient', 'fetch', 'transport', 'createHMRHandler', 'handleMessage', 'setTimeout', code,
+  )
+  const observations = []
+  let statusCalls = 0, restoreService
+  const serviceReady = new Promise(resolve => { restoreService = resolve })
+  const window = { __TAURI_INTERNALS__: { invoke: async () => {
+    statusCalls++
+    return { runtime_recovery: { suspended: true, operation: { state: statusCalls === 1 ? 'running' : 'failed' } } }
+  } } }
+  const pending = run(window, { href: 'http://localhost/' }, async () => { observations.push('waiting'); await serviceReady },
+    { hotModulesMap: new Map([['/module.ts', {}]]) }, async path => observations.push(path),
+    { disconnect: async () => observations.push('disconnect'), connect: async () => observations.push('connect') },
+    value => value, () => {}, callback => queueMicrotask(callback))
+  for (let tick = 0; tick < 12; tick++) await Promise.resolve()
+  assert.equal(statusCalls, 2)
+  assert.deepEqual(observations, ['waiting'])
+  assert.equal(window.__VOICE_DESKTOP_RECOVERY__, true)
+  restoreService()
+  await pending
+  assert.deepEqual(observations, ['waiting', '/module.ts', 'disconnect', 'connect'])
+  assert.equal(statusCalls, 2)
+  assert.equal(window.__VOICE_DESKTOP_RECOVERY__, false)
+})
+
 async function request(origin, path, headers = {}) {
   const response = await fetch(origin + path, { headers, redirect: 'manual' })
   return { status: response.status, headers: response.headers, body: await response.text() }

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 from ..core.events import utc_now_iso
+from ..session.contracts import EVENT_IDEMPOTENCY_WINDOW
 from ..shadow_agent.contracts import (
     ShadowContextFrame,
     ShadowContextSnapshot,
@@ -1236,8 +1237,10 @@ class DshShadowAgentSession:
             if self.production_sink is not None:
                 await self.production_sink([event])
             self._accepted_events[event_id] = digest
+            if len(self._accepted_events) > EVENT_IDEMPOTENCY_WINDOW:
+                self._accepted_events.pop(next(iter(self._accepted_events)))
             self._accepted_requests[request_id] = request_digest
-            if len(self._accepted_requests) > 4096:
+            if len(self._accepted_requests) > EVENT_IDEMPOTENCY_WINDOW:
                 self._accepted_requests.pop(next(iter(self._accepted_requests)))
 
             if terminal:

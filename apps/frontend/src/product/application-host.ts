@@ -183,7 +183,6 @@ const snapshot = ref<ApplicationSnapshot | null>(null)
 const error = ref('')
 const inspecting = ref(startupWasSkipped())
 const connected = ref(false)
-const now = ref(Date.now())
 const retryingAll = ref(false)
 const sessionInvalid = ref(false)
 const recovery = ref<DesktopRecovery | null>(null)
@@ -196,7 +195,6 @@ const SESSION_INVALID_MESSAGE = '会话已失效，请退出后重新启动。'
 let started = false
 let events: EventSource | null = null
 let fallback: ReturnType<typeof setInterval> | undefined
-let clock: ReturnType<typeof setInterval> | undefined
 let reconnect: ReturnType<typeof setTimeout> | undefined
 let refreshRequest: Promise<void> | null = null
 let remoteApplicationRevision = 0 // remoteApplicationRevision（远程桌面状态投影修订号）。
@@ -243,10 +241,8 @@ function closeEvents() {
 
 function clearHostTimers() {
   if (fallback !== undefined) clearInterval(fallback)
-  if (clock !== undefined) clearInterval(clock)
   if (reconnect !== undefined) clearTimeout(reconnect)
   fallback = undefined
-  clock = undefined
   reconnect = undefined
 }
 
@@ -308,11 +304,6 @@ function apply(value: ApplicationSnapshot) {
   snapshot.value = value
   if (value.remote_mode) connected.value = value.management_connected === true
   if (value.startup_complete) entered = true
-  if (value.state === 'stopped' && clock !== undefined) {
-    now.value = Date.now()
-    clearInterval(clock)
-    clock = undefined
-  }
   error.value = ''
 }
 
@@ -569,7 +560,6 @@ async function start() {
     if (!started || version !== lifecycle) return
     recoveryTimer = setInterval(() => { void refreshRecovery() }, 2000)
   }
-  clock = setInterval(() => { now.value = Date.now() }, 1000)
   await refresh()
   if (!started || version !== lifecycle || sessionInvalid.value) return
   subscribe()
@@ -604,7 +594,6 @@ function applyRecovery(value: DesktopRecovery) {
   }
   if (!value.suspended && started) {
     // 新宿主可能仍在加载模型；保留页面，先重新接入其轻量状态接口。
-    if (clock === undefined) clock = setInterval(() => { now.value = Date.now() }, 1000)
     void refresh().then(subscribe)
   }
 }
@@ -642,7 +631,7 @@ export function useApplicationHost() {
   // runtimeFailure（运行期故障）：启动完成后核心能力才失败，据此显示横幅。
   const runtimeFailure = computed(() => applicationRuntimeFailure(snapshot.value))
   const runtimeOperations = computed(() => recovery.value?.operation ? [recovery.value.operation] : [])
-  return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid, recovery, runtimeOperations,
+  return { managed, snapshot, error, inspecting, connected, retryingAll, sessionInvalid, recovery, runtimeOperations,
     businessReady, overlay, corePhase, runtimeFailure, start, stop, retry, retryCapability, retryFailed, exit,
     recover: async () => {
       if (remoteModeSelected()) throw new Error('远程模式不能启动本机语音服务。')

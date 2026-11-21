@@ -12,6 +12,7 @@ from ..quiet_hours import PassiveQuietSuppressed
 from ..gpu_performance import GpuSnapshot
 from .speech_admission import ADMISSION_STAGING_CHARS, AdmissionState, SubmittedClause
 from .stream_buffer import FLUSH_DUE, buffered_stream
+from ..tts.call_options import call_tts_hook
 
 logger = logging.getLogger(__name__)
 
@@ -123,13 +124,7 @@ class SpeechPipeline:
 
     def _new_tts_session(self, ws, *, fresh=False):
         """Factory hook for transaction-owned output implementations."""
-        try:
-            return self.tts.session(fresh=fresh, turn_id=ws.turn_id)
-        except TypeError:
-            try:
-                return self.tts.session(fresh=fresh)
-            except TypeError:
-                return self.tts.session()
+        return call_tts_hook(self.tts.session, fresh=fresh, turn_id=ws.turn_id)
 
     def _bind_tts_session(self, ws, session):
         self._tts_session = session
@@ -933,10 +928,7 @@ class SpeechPipeline:
                         self._bind_tts_session(ws, session)
                         checkout = getattr(tts_client, "checkout_prewarm", None)
                         if callable(checkout):
-                            try:
-                                warm = bool(checkout(session, turn_id=ws.turn_id))
-                            except TypeError:
-                                warm = bool(checkout(session))
+                            warm = bool(call_tts_hook(checkout, session, turn_id=ws.turn_id))
                         else:
                             warm = False
                         checkout_reason = getattr(
@@ -961,10 +953,7 @@ class SpeechPipeline:
                                     and prewarm_ready is not None):
                                 await prewarm_ready.wait()
                                 if callable(checkout):
-                                    try:
-                                        warm = bool(checkout(session, turn_id=ws.turn_id))
-                                    except TypeError:
-                                        warm = bool(checkout(session))
+                                    warm = bool(call_tts_hook(checkout, session, turn_id=ws.turn_id))
                             session_usable = (
                                 getattr(session, "reusable", True)
                                 if getattr(session, "bidi", False)
@@ -1004,10 +993,7 @@ class SpeechPipeline:
                             # first speak on the warm path without sending a
                             # second task_start.
                             if not warm and callable(checkout):
-                                try:
-                                    warm = bool(checkout(session, turn_id=ws.turn_id))
-                                except TypeError:
-                                    warm = bool(checkout(session))
+                                warm = bool(call_tts_hook(checkout, session, turn_id=ws.turn_id))
                             checkout_reason = getattr(
                                 tts_client, "last_prewarm_checkout_reason",
                                 "not_available" if not callable(checkout) else "not_prewarmed",

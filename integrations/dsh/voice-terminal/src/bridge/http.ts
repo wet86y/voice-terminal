@@ -18,11 +18,14 @@ import { installRootTools, installScreenCaptureTool } from './tools.js'
 import { createUserMessage, createBridgeUserMessage } from './messages.js'
 import { enqueueAuthoritativeContext, holdAuthoritativeContext, releaseHeldContext, enqueueDeferredActivation, armRuntimeReminder, stopRuntimeReminder, discardResumedAuthoritativeContext } from './context.js'
 import { exportSessionPage, readSessionTelemetry } from './observer.js'
-import type { Binding, Config } from './contracts.js'
+import type { Binding, Config, RetiredBinding } from './contracts.js'
 import { stopRuntimeActivity } from './events.js'
 import { prepareContextImages, installImageCapabilityGuard } from './images.js'
 
-export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<string, Binding>, settingsReady: ReturnType<typeof import('./settings.js').initializeVoiceTerminalSettings>, startupError: () => unknown) {
+export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<string, Binding>, settingsReady: ReturnType<typeof import('./settings.js').initializeVoiceTerminalSettings>, startupError: () => unknown, retiredBindings = new Map<string, RetiredBinding>()) {
+  // 只读结果随查询重新读取；导出分页仍由 export_id（导出编号）冻结的单份快照保证。
+  const reads = new Set(['session.state', 'session.context', 'session.export', 'observer.snapshot', 'observer.update'])
+  const inFlight = new Map<string, { digest: string; done: Promise<Json | undefined> }>() // inFlight（执行中写请求）：成功和失败均合并，避免未知结果被并发重做。
   return {
     kind: 'prefix' as const,
     path: config.routePrefix,
@@ -34,6 +37,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
       }
       if (req.method !== 'POST') { json(res, 404, result('not_found')); return }
       let releaseContext: (() => void) | undefined
+      let releaseRequest: ((failure: Json | undefined) => void) | undefined
+      let requestFailure: Json | undefined
       try {
         const body = await readBody(req, config.maxBodyBytes)
         if (path === 'host.minimax.sync') {
@@ -50,10 +55,46 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           return
         }
         assertEnvelope(body)
+        const readOnly = reads.has(path)
+        const bodyDigest = digest({ path, body })
+        if (!readOnly) {
+          const key = JSON.stringify(path === 'session.open' || path === 'session.resume'
+            ? ['open', body.dsh_session_id] : path === 'session.retire'
+              ? ['retire', body.dsh_session_id] : ['request', body.dsh_session_id, body.request_id])
+          for (;;) {
+            const pending = inFlight.get(key)
+            if (pending) {
+              if (pending.digest !== bodyDigest) { json(res, 409, result('conflict')); return }
+              const failure = await pending.done
+              if (failure !== undefined) { json(res, 400, failure); return }
+              continue
+            }
+            let complete!: (failure: Json | undefined) => void
+            inFlight.set(key, { digest: bodyDigest, done: new Promise<Json | undefined>(resolve => { complete = resolve }) })
+            releaseRequest = failure => { inFlight.delete(key); complete(failure) }
+            break
+          }
+        }
+        const retired = retiredBindings.get(body.dsh_session_id)
+        if (retired) {
+          if (retired.voiceSessionId !== body.voice_session_id) { json(res, 404, result('not_found')); return }
+          if (path === 'session.open' || path === 'session.resume') { json(res, 409, result('conflict')); return }
+          if (path === 'session.retire' && retired.epoch === body.epoch) {
+            const conflict = retired.requestId === body.request_id && retired.digest !== bodyDigest
+            json(res, 200, result(conflict ? 'conflict' : 'duplicate')); return
+          }
+          json(res, 409, result('stale')); return
+        }
         const existing = bindings.get(body.dsh_session_id)
         const prior = existing?.requests.get(body.request_id)
-        const bodyDigest = digest(body)
-        if (prior) { json(res, 200, prior.digest === bodyDigest ? result('duplicate', { original: prior.response }) : result('conflict')); return }
+        if (prior) {
+          if (prior.digest !== bodyDigest) { json(res, 200, result('conflict')); return }
+          if (prior.flushPending) {
+            if (!await ctx.sessions.flush(existing!.handle!.agent.session)) throw new Error('DSH session persistence did not confirm task delivery')
+            prior.flushPending = false
+          }
+          json(res, 200, result('duplicate', { original: prior.response })); return
+        }
         if (path === 'session.open' || path === 'session.resume') {
           if (existing) { json(res, 409, result('conflict')); return }
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
@@ -119,10 +160,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           json(res, 200, response); return
         }
         if (!existing || existing.voiceSessionId !== body.voice_session_id) { json(res, 404, result('not_found')); return }
-        if (path === 'session.retire' && existing.epoch === body.epoch && existing.state === 'retired') {
-          json(res, 200, result('duplicate')); return
-        }
-        if (existing.epoch !== body.epoch || existing.state === 'retired') { json(res, 409, result('stale')); return }
+        // 没有退役回执的 retired（已停止准入）绑定仍可能正在或等待重试收尾，不能提前确认完成。
+        if (existing.epoch !== body.epoch || existing.state === 'retired' && path !== 'session.retire') { json(res, 409, result('stale')); return }
         if (path.startsWith('context.') || path === 'wake') {
           const previous = existing.contextOperation ?? Promise.resolve()
           existing.contextOperation = new Promise<void>(resolve => { releaseContext = resolve })
@@ -244,10 +283,19 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
               }],
               source: { kind: 'schedule' },
             }, occurrenceId)
-            existing.handle!.agent.followup(message)
+            const deliveries = ctx.sessionProjections.stateOf(existing.handle!.agent.session, 'voiceTaskDeliveries')
+            const committed = deliveries && Object.hasOwn(deliveries, occurrenceId) ? deliveries[occurrenceId] : undefined
+            if (committed !== undefined && committed !== digest(message.content)) {
+              json(res, 200, result('conflict')); return
+            }
+            if (committed === undefined) existing.handle!.agent.followup(message)
+            response = result(committed === undefined ? 'accepted' : 'duplicate', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
+            // 加入官方收件箱后即记录提交身份；磁盘确认失败时只补落盘，不再次执行副作用。
+            const delivery = { digest: bodyDigest, response, flushPending: true }
+            existing.requests.set(body.request_id, delivery)
             const flushed = await ctx.sessions.flush(existing.handle!.agent.session)
             if (!flushed) throw new Error('DSH session persistence did not confirm task delivery')
-            response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
+            delivery.flushPending = false
           }
         } else if (path === 'session.cancel') {
           stopRuntimeActivity(existing)
@@ -257,17 +305,29 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           if (!await ctx.sessions.flush(existing.handle!.agent.session)) throw new Error('session cancel persistence failed')
           response = result('accepted')
         } else if (path === 'session.retire') {
+          // 先关闭准入再等待空闲和落盘；失败仍保留绑定，允许退役重试完成收尾。
+          existing.state = 'retired'
           stopRuntimeActivity(existing)
           stopRuntimeReminder(existing, true); existing.handle!.agent.cancel({ kind: 'hook', reason: 'voice-terminal-retire' }, { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId
           await existing.handle!.agent.whenIdle()
           if (!await ctx.sessions.flush(existing.handle!.agent.session)) throw new Error('session retire persistence failed')
-          existing.state = 'retired'
           // Retire（解绑归档）后的后台回执不再属于活跃会话，取消并等待释放。
           await existing.callbacks?.dispose()
           await existing.actionQueue
           existing.exportSnapshot = undefined
           const voiceLabel = existing.voiceSessionId.replace(/^conversation[-_]/, '').slice(0, 8)
           ctx.sessionTitle.rename(existing.handle!.agent.session, `Voice Shadow · ${voiceLabel} · epoch ${existing.epoch} · retired`)
+          retiredBindings.set(existing.dshSessionId, {
+            voiceSessionId: existing.voiceSessionId, dshSessionId: existing.dshSessionId,
+            epoch: existing.epoch, requestId: body.request_id, digest: bodyDigest,
+          })
+          bindings.delete(existing.dshSessionId)
+          // 官方 Agent（执行代理）及持久历史继续由 DSH（后台执行宿主）管理；仅释放桥接自有副本。
+          existing.requests.clear()
+          existing.records.length = 0
+          existing.pendingTools.clear()
+          existing.pendingToolActivations.clear()
+          existing.toolArguments?.clear()
           response = result('accepted')
         } else if (path === 'session.state') {
           response = result('accepted', {
@@ -323,12 +383,16 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
             })
           }
         } else response = result('not_found')
-        existing.requests.set(body.request_id, { digest: bodyDigest, response })
+        if (!readOnly && existing.state === 'active' && record(response).result !== 'not_found') {
+          existing.requests.set(body.request_id, { digest: bodyDigest, response })
+        }
         json(res, response && record(response).result === 'not_found' ? 404 : 200, response)
       } catch (error) {
-        json(res, 400, result('conflict', { message: String(error instanceof Error ? error.message : error).slice(0, 160) }))
+        requestFailure = result('conflict', { message: String(error instanceof Error ? error.message : error).slice(0, 160) })
+        json(res, 400, requestFailure)
       } finally {
         releaseContext?.()
+        releaseRequest?.(requestFailure)
       }
     },
   }

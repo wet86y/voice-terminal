@@ -21,6 +21,20 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
+def _request_payload(provider: Any, messages, schema, reasoning_effort: str) -> dict[str, Any]:
+    """生成同一份 wire payload（线上请求正文），供轻量摘要与完整诊断共用。"""
+    frozen_messages = [dict(message) for message in messages]
+    if (getattr(provider, "transport", "chat_completions") == "responses"
+            and callable(getattr(provider, "_responses_payload", None))):
+        return provider._responses_payload(
+            frozen_messages, model=str(getattr(provider, "model", "")), schema=schema,
+            schema_name="voice_decision_v06", reasoning_effort=reasoning_effort,
+            max_output_tokens=int(getattr(provider, "max_output_tokens", 8192)),
+        )
+    return {"model": str(getattr(provider, "model", "")), "messages": frozen_messages,
+            "json_mode": True, "schema": dict(schema), "reasoning_effort": reasoning_effort}
+
+
 def build_context_snapshot(
     provider: Any,
     messages: Sequence[Mapping[str, Any]],
@@ -45,25 +59,7 @@ def build_context_snapshot(
 
     frozen_messages = [dict(message) for message in messages]
     transport = str(getattr(provider, "transport", "chat_completions"))
-    if transport == "responses" and callable(getattr(provider, "_responses_payload", None)):
-        wire_payload = provider._responses_payload(
-            frozen_messages,
-            model=str(getattr(provider, "model", "")),
-            schema=schema,
-            schema_name="voice_decision_v06",
-            reasoning_effort=reasoning_effort,
-            max_output_tokens=int(getattr(provider, "max_output_tokens", 8192)),
-        )
-    else:
-        # This fallback remains exact at the model-facing message level for
-        # providers without a public payload builder.
-        wire_payload = {
-            "model": str(getattr(provider, "model", "")),
-            "messages": frozen_messages,
-            "json_mode": True,
-            "schema": dict(schema),
-            "reasoning_effort": reasoning_effort,
-        }
+    wire_payload = _request_payload(provider, frozen_messages, schema, reasoning_effort)
     manifest = []
     lane_chars: dict[str, int] = {}
     for index, message in enumerate(frozen_messages):
@@ -102,7 +98,7 @@ def build_context_snapshot(
         "messages": safe_messages,
         "schema": dict(schema),
         "wire_payload": safe_wire,
-        "wire_sha256": _digest(wire_payload),
+        "wire_sha256": hashlib.sha256(wire_serialized.encode("utf-8")).hexdigest(),
         "wire_bytes": len(wire_serialized.encode("utf-8")),
         "schema_sha256": _digest(schema),
         "message_count": len(frozen_messages),
@@ -113,11 +109,14 @@ def build_context_snapshot(
     }
 
 
-def capture_context_snapshot(*args, **kwargs) -> str | None:
+def capture_context_snapshot(provider, messages, schema, **metadata) -> str | None:
     """Append one exact context record and return its wire digest."""
 
     try:
-        record = build_context_snapshot(*args, **kwargs)
+        if not logger.isEnabledFor(logging.INFO):
+            # 关闭完整诊断时仍保留现有事件的请求摘要；不生成逐消息清单和脱敏副本。
+            return _digest(_request_payload(provider, messages, schema, metadata["reasoning_effort"]))
+        record = build_context_snapshot(provider, messages, schema, **metadata)
         logger.info(_canonical(record))
         return str(record["wire_sha256"])
     except Exception as exc:
@@ -136,6 +135,8 @@ def capture_request_outcome(
 ) -> None:
     """Append a full-fidelity terminal record correlated to one request."""
 
+    if not logger.isEnabledFor(logging.INFO):
+        return
     try:
         record = {
             "record_type": "request_outcome",

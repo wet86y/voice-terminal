@@ -45,12 +45,7 @@ class EpisodeController(RealtimeController):
         self._endpoint_context = None
         self._barge_trace_state = None
         self._aec_recovery_task: asyncio.Task | None = None
-        self.episode_history: dict[str, str] = {}
-        self._input_history_committed: set[str] = set()
-        self._refinement_events: set[str] = set()
-        self._refinement_agent_events: set[str] = set()
         self._committed_workspaces: dict[str, object] = {}
-        self._settled_turns: set[str] = set()
         self._owner_barge_candidate_id: str | None = None
         self._owner_barge_start_sample: int | None = None
         self._owner_barge_started_at: float | None = None
@@ -1251,8 +1246,6 @@ class EpisodeController(RealtimeController):
             if ws.token != token or self.workspace is not ws:
                 return True
             ws.episode_id = self.episode.episode_id
-            if ws.episode_id:
-                self.episode_history[ws.turn_id] = ws.episode_id
             # 兼容尚未投递的精修稿；声学闭段精修通常已在业务确认之前投递。
             if ws.refinement_available and ws.refined_text and not hasattr(ws, "_published_refinement"):
                 await self._refinement_completed(ws, {
@@ -1281,7 +1274,7 @@ class EpisodeController(RealtimeController):
         await self._ensure_workspace_episode(ws)
         if getattr(ws, "generation", None) != generation:
             return None
-        if ws.turn_id in self._input_history_committed:
+        if ws.history_committed:
             return next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
         self.history.commit_input(ws.turn_id, ws.final_text, details={
             "raw_text": getattr(ws, "raw_final_text", "") or ws.final_text, "hotwords": dict(getattr(ws, "hotword_final", {})),
@@ -1309,7 +1302,7 @@ class EpisodeController(RealtimeController):
                          "speaker_summary": dict(getattr(ws, "speaker_summary", {}) or {}),
                         "transcript_updates": [dict(item) for item in ws.transcript_updates]},
         })
-        self._input_history_committed.add(ws.turn_id)
+        ws.history_committed = True
         self._committed_workspaces[ws.turn_id] = ws
         if len(self._committed_workspaces) > 64:
             self._committed_workspaces.pop(next(iter(self._committed_workspaces)), None)
@@ -1371,12 +1364,12 @@ class EpisodeController(RealtimeController):
     async def _settle_committed_turn(self, turn_id, *, outcome, speech_id=None, latency=None):
         """Emit one terminal record for a committed turn after its true outcome."""
 
-        if not turn_id or turn_id in self._settled_turns:
+        if not turn_id:
             return
         ws = self._committed_workspaces.get(turn_id)
-        if ws is None:
+        if ws is None or ws.settled:
             return
-        self._settled_turns.add(turn_id)
+        ws.settled = True
         ws.timings.setdefault("completed", time.monotonic())
         speaker_audit("turn_settled（轮次最终结算）", turn_id=turn_id, outcome=outcome,
                       speech_id=speech_id, timings=dict(ws.timings))
@@ -1523,11 +1516,9 @@ class EpisodeController(RealtimeController):
                                    source=source, source_revision=revision,
                                    analysis=dict(ws.analysis), output_generation=ws.generation,
                                    input_finished_at=ws.timings.get("commit"), sentences=list(ws.segments))
-        self.episode_history[ws.turn_id] = ws.episode_id
 
     async def _ensure_workspace_episode(self, ws):
         if ws.episode_id:
-            self.episode_history[ws.turn_id] = ws.episode_id
             return ws.episode_id
         text = ws.final_text or ws.paraformer_final or ws.raw_partial or "".join(
             segment.get("text", "") for segment in ws.segments
@@ -1546,8 +1537,6 @@ class EpisodeController(RealtimeController):
                                                audio_cues=list(ws.audio_cues),
                                                analysis=dict(ws.analysis))
             ws.episode_id = self.episode.episode_id
-        if ws.episode_id:
-            self.episode_history[ws.turn_id] = ws.episode_id
         return ws.episode_id
 
     async def _finish_v2(self, ws, response):
@@ -1556,7 +1545,7 @@ class EpisodeController(RealtimeController):
         await self._ensure_workspace_episode(ws)
         delivery = {"status": "none", "termination": "completed", "heard_text": "",
                     "uncertain_text": "", "unheard_text": "", "precision": "complete"}
-        if ws.turn_id not in self._input_history_committed:
+        if not ws.history_committed:
             self.history.commit_input(ws.turn_id, ws.final_text, details={"segments": list(ws.segments),
                                       "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                                       "refined_text": ws.refined_text,
@@ -1571,7 +1560,7 @@ class EpisodeController(RealtimeController):
                                       "refinement_source": getattr(ws, "_published_refinement", ("paraformer_offline",))[0],
                                       "transcript_updates": list(ws.transcript_updates),
                                                              "refinement_available": ws.refinement_available}})
-            self._input_history_committed.add(ws.turn_id)
+            ws.history_committed = True
             # Same rule as the commit path: the user's line enters the ordered
             # conversation where the user said it, never where the turn settled.
             if ws.final_text:
@@ -1643,7 +1632,7 @@ class EpisodeController(RealtimeController):
             self._cancel_tts_hold_fallback()
         if reason != "completed":
             await self._cancel_tts_prewarm(ws.turn_id if ws else None)
-        if record and ws and ws.turn_id not in self._input_history_committed:
+        if record and ws and not ws.history_committed:
             await self._ensure_workspace_episode(ws)
             admitted = (self.speaker_policy.admitted_text(ws.turn_id) if getattr(ws,"speaker_mode","off") == "filter"
                         else ws.final_text or ws.raw_partial)
@@ -1653,7 +1642,7 @@ class EpisodeController(RealtimeController):
                 "delivery": {"termination": reason, "status": "none"},
                 "conversation_id": ws.episode_id,
             })
-            self._input_history_committed.add(ws.turn_id)
+            ws.history_committed = True
             # A turn cancelled before its transcript became final has no line
             # yet; this is its one line, created where the capture stopped.
             self._record_user_turn(
@@ -1777,6 +1766,7 @@ class EpisodeController(RealtimeController):
             await self.episode.speech_activity(None, interrupt_reason="reset")
             await self.episode.end("reset")
         await self.output.close()
+        self._committed_workspaces.clear()
         await self._cancel_tts_prewarm()
         if getattr(self, "hotwords", None) is not None:
             self.hotwords.clear()

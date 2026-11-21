@@ -312,11 +312,6 @@ def _repair_policy(program: Path, data: Path, archive: Archive) -> None:
         ResourcePolicy.load(path)
 
 
-def _restore_default_voices(program: Path, data: Path, candidate: dict) -> None:
-    """AnifLive 默认参考随已验证模型包提供；不修改旧音色资料。"""
-    return
-
-
 def _archive_session(data: Path, archive: Archive) -> None:
     pending = _safe(data, "state/compatibility-session-archive.json")
     if pending.exists():
@@ -364,7 +359,6 @@ def repair(program: Path, data: Path, *, reset_devices: bool = False) -> dict:
     if affected:
         # 音色索引是选择的依据；不能保留指向已归档音色的产品设置引用。
         atomic_json(_safe(data, "config/product-settings.json"), candidate)
-    _restore_default_voices(program, data, candidate)
     record_settings_validation(_safe(data, "config/product-settings.json"), candidate["schema_version"])
     return {"ready": True, "settings_schema": candidate["schema_version"],
             "archived_items": len(archive.rows), "archive": archive.relative if archive.rows else None,

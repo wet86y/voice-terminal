@@ -104,6 +104,30 @@ it('远程待补参考通过客户端原生选择器上传，再沿用服务端�
   wrapper.unmount()
 })
 
+it('导入页卸载后，迟到的转写启动回执只取消原任务且不再轮询', async () => {
+  state.host = { recovery: ref({ suspended: false }), snapshot: ref({ remote_mode: true }) }
+  vi.spyOn(bridge, 'desktopPort').mockReturnValue({ available: true } as never)
+  vi.spyOn(nativeDeviceApi, 'remoteManagementRequest').mockResolvedValue(remoteResponse('resource.jobs', []))
+  vi.spyOn(productApi, 'pendingAnifLiveImports').mockResolvedValue({ jobs: [{
+    task_id: 'remote-task', status: 'pending_reference', phase: '等待参考录音',
+  }] })
+  vi.spyOn(nativeDeviceApi, 'remoteTtsAssetImport').mockResolvedValue({ asset: { asset_id: 'reference', duration_ms: 5000 } } as never)
+  let resolveStart!: (value: never) => void
+  vi.spyOn(productApi, 'startTtsTranscribe').mockImplementation(() => new Promise(resolve => { resolveStart = resolve }))
+  const cancel = vi.spyOn(productApi, 'cancelTtsOperation').mockResolvedValue({} as never)
+  const query = vi.spyOn(productApi, 'getTtsOperation')
+  const wrapper = mount(AnifLiveModelImport, { props: { open: true } })
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text() === '从客户端导入参考录音')!.trigger('click')
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text() === '按现有音色库流程识别转写')!.trigger('click')
+  wrapper.unmount()
+  resolveStart({ operation_id: 'late-transcribe', state: 'running' } as never)
+  await flushPromises()
+  expect(cancel).toHaveBeenCalledExactlyOnceWith('late-transcribe')
+  expect(query).not.toHaveBeenCalled()
+})
+
 it('取消远程参考文件选择时保留待补状态且不启动转写', async () => {
   state.host = { recovery: ref({ suspended: false }), snapshot: ref({ remote_mode: true }) }
   vi.spyOn(bridge, 'desktopPort').mockReturnValue({ available: true } as never)

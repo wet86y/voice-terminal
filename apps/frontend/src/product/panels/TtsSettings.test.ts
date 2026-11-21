@@ -214,6 +214,20 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(save).not.toHaveBeenCalled()
     wrapper.unmount()
   })
+  it('试听启动回执迟到时，离开页面仍能取消且不继续查询', async () => {
+    let resolveStart!: (value: never) => void
+    vi.spyOn(productApi, 'startMinimaxTtsPreview').mockImplementation(() => new Promise(resolve => { resolveStart = resolve }))
+    const cancel = vi.spyOn(productApi, 'cancelTtsOperation').mockResolvedValue({} as never)
+    const query = vi.spyOn(productApi, 'getTtsOperation').mockResolvedValue({} as never)
+    const wrapper = render()
+    await wrapper.find('.online-voice-row input').setValue('voice')
+    await wrapper.find('.online-tts-buttons button').trigger('click')
+    wrapper.unmount()
+    resolveStart({ operation_id: 'late-preview', state: 'running' } as never)
+    await flushPromises()
+    expect(cancel).toHaveBeenCalledExactlyOnceWith('late-preview')
+    expect(query).not.toHaveBeenCalled()
+  })
   it('官方音色库按钮使用固定链接打开', async () => {
     const open = vi.spyOn(window, 'open').mockReturnValue(null)
     const wrapper = render()

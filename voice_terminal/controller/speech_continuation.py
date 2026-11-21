@@ -100,14 +100,22 @@ class SpeechContinuationMixin:
 
     def _release_speech_resources(self, h):
         """物理播放和续写窗口均退出后，释放音色及模型租约，且只释放一次。"""
-        if h.resources_released:
+        if h.resources_released or not h.task.done():
             return
         h.resources_released = True
-        if h.tts_voice_release is not None:
-            h.tts_voice_release()
-            h.tts_voice_release = None
-        if hasattr(self.tts, "release"):
-            self.tts.release(h.tts_backend)
+        self._delivery_resolvers.pop(h.speech_id, None)
+        try:
+            if h.tts_voice_release is not None:
+                release_voice, h.tts_voice_release = h.tts_voice_release, None
+                release_voice()
+        finally:
+            try:
+                if hasattr(self.tts, "release"):
+                    self.tts.release(h.tts_backend)
+            finally:
+                release_origin = getattr(self.runtime, "release_request_origin", None)
+                if callable(release_origin):
+                    release_origin(h.identity)
 
     def _invalidate_revision_window(self):
         h, self._continuation_handle = self._continuation_handle, None

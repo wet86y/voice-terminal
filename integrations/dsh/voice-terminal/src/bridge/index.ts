@@ -9,8 +9,9 @@ import { createBridgeRoute } from './http.js'
 import { stopRuntimeReminder } from './context.js'
 import { registerExtendedActivity } from './runtime-details.js'
 import { registerVoiceContextProjection } from './image-history.js'
+import { taskDeliveryProjection } from './task-delivery.js'
 import { registerVoiceImageSummaryGuard } from './images.js'
-import type { Binding, Config } from './contracts.js'
+import type { Binding, Config, RetiredBinding } from './contracts.js'
 export type { Config } from './contracts.js'
 export const name = BRIDGE_NAME
 export const inject = ['webServer', 'agents', 'sessions', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'llm', 'attachments', 'sessionTitle', 'settings', 'credentials', 'workspaceRegistry', 'loader', 'approval', 'jobs', 'deviceControl']
@@ -20,7 +21,9 @@ export function apply(ctx: Context, config: Config): void {
   if (!CALLBACK_ORIGIN.startsWith('http://127.0.0.1:')) throw new Error('VOICE_DSH_CALLBACK_ORIGIN must be loopback HTTP')
   if (!config.routePrefix.startsWith('/') || config.routePrefix.endsWith('/')) throw new Error('invalid routePrefix')
   const bindings = new Map<string, Binding>()
+  const retiredBindings = new Map<string, RetiredBinding>() // retiredBindings（仅供旧回执去重的退役身份）。
   registerVoiceContextProjection(ctx)
+  ctx.sessionProjections.register(taskDeliveryProjection)
   registerVoiceImageSummaryGuard(ctx, bindings)
   let startupError: unknown
   const settingsReady = initializeVoiceTerminalSettings(ctx, config).catch((error) => {
@@ -34,7 +37,7 @@ export function apply(ctx: Context, config: Config): void {
 
   registerSessionEvents(ctx, bindings)
   registerExtendedActivity(ctx, bindings)
-  const route = createBridgeRoute(ctx, config, bindings, settingsReady, () => startupError)
+  const route = createBridgeRoute(ctx, config, bindings, settingsReady, () => startupError, retiredBindings)
   ctx.effect(() => {
     const dispose = ctx.webServer.register(route)
     return async () => {
@@ -47,6 +50,7 @@ export function apply(ctx: Context, config: Config): void {
       await Promise.all([...bindings.values()].map(binding => binding.callbacks?.dispose()))
       await Promise.all([...bindings.values()].map(binding => binding.actionQueue))
       bindings.clear()
+      retiredBindings.clear()
     }
   }, `voice-terminal-shadow-bridge: ${config.routePrefix}`)
 }

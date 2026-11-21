@@ -12,6 +12,7 @@ import { useProductContext } from '../product-context'
 import { isRecord } from '../../record'
 import type { ProductLocalTtsModelId, ProductLocalTtsStatus, ProductMutationResult, ProductOnlineTtsModelId, ProductTtsSettings } from '../types'
 import { useLocalTtsStatus } from '../useLocalTtsStatus'
+import { createTtsOperationScope, isTtsOperationAborted } from '../tts-operation'
 
 const props = withDefaults(defineProps<{ demo?: boolean }>(), { demo: false })
 const emit = defineEmits<{ 'open-aniflive-components': [] }>()
@@ -38,7 +39,6 @@ const savingControls = ref(false) // savingControls（全局语音调节开关�
 const savingQuality = ref(false) // savingQuality（本地合成质量保存状态）。
 const onlineModelDraft = ref<ProductOnlineTtsModelId>(settings.tts.online_model ?? 'speech-2.8-hd')
 const onlineVoiceIdDraft = ref(settings.tts.online_voice_id ?? 'female-shaonv')
-let onlinePreviewOperationId: string | undefined
 let selectionGeneration = 0 // selectionGeneration（选择请求代次）：连续操作保留最后目标。
 const error = ref('')
 const demoStatus = reactive<ProductLocalTtsStatus>({ backend: 'minimax', local_model: 'minimax-female-shaonv-zh', loaded_model: null, load_state: 'disabled', error: null,
@@ -85,9 +85,8 @@ watch(() => status.value, value => {
     if (!saving.value && draftFollowedPreviousEffective) selected.value = nextEffective
   }
 })
-onBeforeUnmount(() => {
-  if (onlinePreviewOperationId) void productApi.cancelTtsOperation(onlinePreviewOperationId).catch(() => {})
-})
+const onlinePreviewScope = createTtsOperationScope() // onlinePreviewScope（本页在线试听的生命周期）。
+onBeforeUnmount(() => onlinePreviewScope.dispose())
 onMounted(() => { if (!props.demo) void live.refresh() })
 function refreshStatus() { if (!props.demo) void live.refresh() }
 async function setSpeechControl(enabled: boolean) {
@@ -187,18 +186,14 @@ async function previewOnlineVoice() {
   if (props.demo) { error.value = '演示界面未连接在线语音接口，无法试听。'; return }
   previewingOnline.value = true
   try {
-    let operation = await productApi.startMinimaxTtsPreview(onlineModelDraft.value, voiceId)
-    onlinePreviewOperationId = operation.operation_id
-    while (operation.state === 'running') {
-      await new Promise(resolve => window.setTimeout(resolve, 300))
-      operation = await productApi.getTtsOperation(operation.operation_id)
-    }
+    const operation = await onlinePreviewScope.run(
+      () => productApi.startMinimaxTtsPreview(onlineModelDraft.value, voiceId), 300,
+    )
     if (operation.state !== 'succeeded') throw new Error(operation.error || 'MiniMax 在线音色试听失败。')
     context?.setNotice('MiniMax 在线音色试听完成。')
   } catch (failure) {
-    error.value = failure instanceof Error ? failure.message : 'MiniMax 在线音色试听失败。'
+    if (!isTtsOperationAborted(failure)) error.value = failure instanceof Error ? failure.message : 'MiniMax 在线音色试听失败。'
   } finally {
-    onlinePreviewOperationId = undefined
     previewingOnline.value = false
   }
 }

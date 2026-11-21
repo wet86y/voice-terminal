@@ -815,6 +815,23 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.last_applied_revision, 3)
         self.assertEqual(len(events), 1)
 
+    async def test_callback_identity_window_is_bounded_and_recent_replays_still_deduplicate(self) -> None:
+        await self.session.request_wake()
+        for index in range(4100):
+            payload = {
+                "protocol_version": "2.0", "request_id": f"request-window-{index}",
+                "event_id": f"event-window-{index}", "voice_session_id": "voice-session",
+                "dsh_session_id": self.session.dsh_session_id, "epoch": 1,
+                "context_revision": 2, "activation_id": self.session.activation_id,
+                "event": {"type": "progress", "text": f"进度 {index}"},
+            }
+            self.assertEqual(await self.session.accept_event(payload), "accepted")
+        self.assertEqual(len(self.session._accepted_events), 4096)
+        self.assertEqual(len(self.session._accepted_requests), 4096)
+        self.assertNotIn("event-window-0", self.session._accepted_events)
+        self.assertEqual(await self.session.accept_event(payload), "duplicate")
+        self.assertEqual(await self.session.accept_event({**payload, "event": {"type": "progress", "text": "冲突正文"}}), "conflict")
+
     async def test_event_requires_exact_binding_epoch_revision_and_activation(self) -> None:
         await self.session.request_wake()
         payload = {

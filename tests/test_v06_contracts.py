@@ -449,6 +449,7 @@ class RailWorkspace(SimpleNamespace):
             turn_id=turn_id, final_text=text, raw_partial=raw_partial, episode_id=episode_id,
             segments=[], audio_cues=[], analysis={}, refined_text="", refinement_available=False,
             speaker_decision={}, transcript_updates=[], paraformer_final="", timings={},
+            history_committed=False, settled=False,
         )
 
 

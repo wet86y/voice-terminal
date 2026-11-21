@@ -15,6 +15,7 @@ from ..tts.controls import DEFAULT_CONTROLS
 from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
+from ..tts.call_options import call_tts_hook
 from ..quiet_hours import PassiveQuietSuppressed
 from ..devices.contracts import PlaybackOutcomeUnknown, PlaybackReplacementTicket, PlaybackReplacementResult
 
@@ -207,6 +208,13 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
     @property
     def active(self):
         return self.handle is not None and not self.handle.task.done() and self.handle.reason is None
+
+    def retains_request(self, identity):
+        """retains_request（仍持有请求）：播放结算及续写窗口结束前保留来源关联。"""
+        handles = list(self._handles_by_token.values())
+        if self._continuation_handle is not None:
+            handles.append(self._continuation_handle)
+        return any(h.identity == identity and not h.resources_released for h in handles)
 
     @property
     def busy(self):
@@ -408,28 +416,19 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         if h is not None and callable(getattr(client, "prepare_speech_controls", None)):
             from ..tts.controlled_session import ControlledTtsSession
             def factory(values, isolated):
-                return client.session(fresh=isolated, controls=values, **correlation)
+                return call_tts_hook(client.session, fresh=isolated, controls=values, **correlation)
             session = ControlledTtsSession(client, factory(self._handle_controls(h), fresh),
                                            lambda: self._handle_controls(h), factory)
             h.tts_session = session
             if h is self.handle:
                 self._tts_session = session
             return session
-        try:
-            if h is not None and getattr(h, "tts_voice_snapshot", None) is not None:
-                session = client.session(voice_snapshot=h.tts_voice_snapshot,
-                                         inference_steps=h.tts_inference_steps, **correlation)
-            else:
-                session = client.session(fresh=fresh, emotion=h.emotion_applied if h else "calm",
-                                         **correlation)
-        except TypeError:  # Non-MiniMax/test providers retain the old API.
-            try:
-                session = client.session(fresh=fresh, turn_id=ws.turn_id)
-            except TypeError:
-                try:
-                    session = client.session(fresh=fresh)
-                except TypeError:
-                    session = client.session()
+        if h is not None and getattr(h, "tts_voice_snapshot", None) is not None:
+            session = call_tts_hook(client.session, voice_snapshot=h.tts_voice_snapshot,
+                                    inference_steps=h.tts_inference_steps, **correlation)
+        else:
+            session = call_tts_hook(client.session, fresh=fresh, emotion=h.emotion_applied if h else "calm",
+                                    **correlation)
         if h is not None and getattr(client, 'supports_local_audio_controls', False):
             from ..tts.aniflive_audio_session import AnifLiveAudioSession
             session = AnifLiveAudioSession(client, session)
@@ -637,8 +636,7 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
                     self._pending.remove(handle)
                 except ValueError:
                     pass
-            if self.handle is not handle:
-                self._handles_by_token.pop(handle.workspace.token, None)
+            self._handles_by_token.pop(handle.workspace.token, None)
         h.task.add_done_callback(forget_finished)
         # Register the candidate before awaiting emotion preparation.  User
         # speech can arrive during that await; keeping the handle visible lets
@@ -648,11 +646,11 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         if getattr(h.tts_client, "resolve_voice", None) is not None or getattr(h.tts_client, "freeze_session_at_admission", False):
             try:
                 if _continuation_parent is not None and (getattr(h.tts_client, "freeze_session_at_admission", False) or _continuation_parent.tts_voice_snapshot is not None):
-                    h.tts_session = h.tts_client.session(voice_snapshot=_continuation_parent.tts_voice_snapshot,
+                    h.tts_session = call_tts_hook(h.tts_client.session, voice_snapshot=_continuation_parent.tts_voice_snapshot,
                                                         inference_steps=_continuation_parent.tts_inference_steps,
                                                         turn_id=turn_id, speech_id=h.speech_id)
                 else:
-                    h.tts_session = h.tts_client.session(turn_id=turn_id, speech_id=h.speech_id)
+                    h.tts_session = call_tts_hook(h.tts_client.session, turn_id=turn_id, speech_id=h.speech_id)
                 if getattr(h.tts_client, 'supports_local_audio_controls', False):
                     from ..tts.aniflive_audio_session import AnifLiveAudioSession
                     h.tts_session = AnifLiveAudioSession(h.tts_client, h.tts_session)
@@ -787,13 +785,9 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
         if callable(prepare_controls):
             await prepare_controls(self._handle_controls(h), detach_active=h.force_fresh_tts_session)
         if prepare is not None and not getattr(h.tts_client, "supports_speech_controls", False):
-            try:
-                h.emotion_applied = await prepare(
-                    h.emotion_requested,
-                    detach_active=h.force_fresh_tts_session,
-                )
-            except TypeError:  # third-party/test providers use the old hook
-                h.emotion_applied = await prepare(h.emotion_requested)
+            h.emotion_applied = await call_tts_hook(
+                prepare, h.emotion_requested, detach_active=h.force_fresh_tts_session,
+            )
         # A barge-in/reset may have cancelled this handle while an emotion
         # provider yielded.  Do not revive its TTS permission afterwards.
         if h.reason or h.task.done():
@@ -1506,7 +1500,6 @@ class EpisodeSpeechOutput(SpeechControlMixin, SpeechContinuationMixin, SpeechFro
             )
             if self.handle is h:
                 self.handle = None
-            self._handles_by_token.pop(h.workspace.token, None)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict) and h.workspace.generation == self.generation:
                 source_timings.update(h.workspace.timings)

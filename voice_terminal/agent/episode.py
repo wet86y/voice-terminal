@@ -1476,6 +1476,17 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         if not speech_ids:
             self._speech_transactions_by_request.pop(str(request_id), None)
 
+    def release_request_origin(self, identity) -> None:
+        """release_request_origin（释放请求来源）：活动请求、恢复及输出仍持有时延后释放。"""
+        if identity == self.active_request_identity:
+            return
+        retains = getattr(self.output, "retains_request", None)
+        if callable(retains) and retains(identity):
+            return
+        if any(signal.source_request_id == identity[1] for signal in self.recovery_queue):
+            return
+        self._identity_turns.pop(identity, None)
+
     def _bind_pending_silence_request(self, identity, turn_id, *, allow_rebind=False) -> None:
         pending = self._pending_silence_anchor
         if not self.defer_silence_until_output or not isinstance(pending, dict):
@@ -2815,7 +2826,11 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 self._system_check_turn_ids.discard(system_check_id)
                 await self._settle_final_system_check(system_check_id)
         self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
-        await self.emit("agent.episode", self.snapshot(include_history=False))
+        try:
+            await self.emit("agent.episode", self.snapshot(include_history=False))
+        finally:
+            for request_identity in tuple(self._identity_turns):
+                self.release_request_origin(request_identity)
 
     async def _run(self):
         """Serialise runtime state while an independent thread owns the clock."""
@@ -4278,6 +4293,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         self.pending.clear()
         self._pending_silence_anchor = None
         self._speech_transactions_by_request.clear()
+        self._identity_turns.clear()
         self._immediate_system_check = None
         self._system_check_speeches.clear()
         self._system_check_turn_ids.clear()

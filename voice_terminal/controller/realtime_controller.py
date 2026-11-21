@@ -28,6 +28,7 @@ from ..speaker.router import SpeakerRouter
 from ..speaker.session import SessionSpeakerPolicy
 from ..speaker.audit import audit as speaker_audit, transcript_audit
 from ..config import SpeakerConfig
+from ..tts.call_options import call_tts_hook
 from ..speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 
 logger = logging.getLogger(__name__)
@@ -342,10 +343,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
                 ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
                 await self._publish_tts_prewarm(ws, ws.tts_prewarm_status, reason="unsupported")
                 return
-            try:
-                result = await prewarm(turn_id=ws.turn_id)
-            except TypeError:
-                result = await prewarm()
+            result = await call_tts_hook(prewarm, turn_id=ws.turn_id)
             if isinstance(result, dict) and result.get("status") == "READY":
                 ws.timings["tts_prewarm_ready"] = time.monotonic()
                 ws.tts_prewarm_status = "READY"
@@ -418,10 +416,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
         if self.tts is not None:
             discard = getattr(self.tts, "discard_prewarm", None)
             if callable(discard):
-                try:
-                    await discard(turn_id=turn_id)
-                except TypeError:
-                    await discard()
+                await call_tts_hook(discard, turn_id=turn_id)
 
     def _tts_session_for_controller(self):
         """Return an output-owned session without assuming the controller type."""
@@ -1065,10 +1060,7 @@ class RealtimeController(AudioEnhancementsMixin, InputOwnershipMixin, SpeechPipe
             if not ws.final_text:
                 await self._finish_v2(ws, "")
                 return
-            await self._state_event(TerminalState.THINKING, listening=True, turn_id=ws.turn_id)
-            response = await self._answer(ws, token)
-            if self._valid(token):
-                await self._finish_v2(ws, response)
+            raise RuntimeError("识别输入未由会话控制器接管，无法完成本轮输入。")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

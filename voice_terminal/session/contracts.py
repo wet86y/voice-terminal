@@ -6,6 +6,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+EVENT_IDEMPOTENCY_WINDOW = 4096  # EVENT_IDEMPOTENCY_WINDOW（事件去重窗口）：回调缓存与持久台账保持一致。
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

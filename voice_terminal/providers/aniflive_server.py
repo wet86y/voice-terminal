@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -9,6 +10,7 @@ import subprocess
 import sys
 
 from ..process_host import interpreter_command
+from ..process_log import AsyncProcessLog
 from ..tts.aniflive_models import AnifLiveModelRegistry
 from ..tts.aniflive_native import contained
 
@@ -92,18 +94,21 @@ class AnifLiveTtsServer:
     async def _read(self, ready, nonce):
         # 每次进程启动保留独立诊断，切换失败后恢复旧模型不能覆盖失败现场。
         log = self.local / 'cache/logs' / f'aniflive-service-{nonce}.log'
-        log.parent.mkdir(parents=True, exist_ok=True)
+        sink = None
         try:
-            with log.open('w', encoding='utf-8') as stream:
-                async for line in self._process.stdout:
-                    text = line.decode('utf-8', errors='replace')
-                    stream.write(text)
-                    stream.flush()
-                    if text.startswith('ANIFLIVE_READY=') and not ready.done():
-                        value = json.loads(text.removeprefix('ANIFLIVE_READY='))
-                        if value['nonce'] != nonce or value['pid'] != self._process.pid or type(value['port']) is not int or not 1 <= value['port'] <= 65535:
-                            raise RuntimeError('本地语音服务就绪身份不匹配。')
-                        ready.set_result(f'http://127.0.0.1:{value["port"]}')
+            sink = AsyncProcessLog(log)
+        except Exception:
+            logging.getLogger(__name__).warning("aniflive.log_unavailable（诊断不可用，继续读取服务输出）", exc_info=True)
+        try:
+            async for line in self._process.stdout:
+                text = line.decode('utf-8', errors='replace')
+                if sink is not None:
+                    sink.write(text)  # 仅非阻塞入队；故障就绪行也保留诊断，协议解析不等磁盘。
+                if text.startswith('ANIFLIVE_READY=') and not ready.done():
+                    value = json.loads(text.removeprefix('ANIFLIVE_READY='))
+                    if value['nonce'] != nonce or value['pid'] != self._process.pid or type(value['port']) is not int or not 1 <= value['port'] <= 65535:
+                        raise RuntimeError('本地语音服务就绪身份不匹配。')
+                    ready.set_result(f'http://127.0.0.1:{value["port"]}')
             if not ready.done():
                 ready.set_exception(RuntimeError('本地语音服务在就绪前退出，详见服务日志。'))
             elif self._state == 'ready':
@@ -112,6 +117,10 @@ class AnifLiveTtsServer:
             if not ready.done():
                 ready.set_exception(error)
             raise
+        finally:
+            if sink is not None:
+                sink.stop()
+                await asyncio.to_thread(sink.close)
 
     async def switch_model(self, model_id, revision=None):
         previous, previous_revision = self.local_model, self.revision

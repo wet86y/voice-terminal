@@ -483,17 +483,24 @@ def test_cancelling_handoff_during_emotion_preparation_cleans_registered_success
 def test_empty_window_expiration_releases_resources_without_new_audio():
     async def scenario():
         harness = ContinuationHarness()
-        _agent(harness)
+        runtime = _agent(harness)
+        harness.runtime.release_request_origin = runtime.release_request_origin
+        runtime._identity_turns[harness.identity] = harness.turn_id
         try:
             first = await harness.first()
+            runtime.release_request_origin(harness.identity)
+            assert runtime._identity_turns[harness.identity] == harness.turn_id
             await complete(harness, first)
             worker = harness.output._continuation_task
             assert harness.output.continuation_active
             assert not first.resources_released
+            assert first.speech_id in harness.output._delivery_resolvers
             expire(first)
             await asyncio.wait_for(asyncio.shield(worker), HANDOFF_TIMEOUT_SECONDS)
             assert not harness.output.continuation_active
             assert first.resources_released
+            assert not harness.output._delivery_resolvers
+            assert not runtime._identity_turns
             assert len(harness.tts.sessions) == 1
         finally:
             await harness.close()

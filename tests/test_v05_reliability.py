@@ -373,7 +373,7 @@ class TurnSettlementTests(unittest.IsolatedAsyncioTestCase):
         controller._settled_turns = set()
         controller._committed_workspaces = {
             "turn_a": SimpleNamespace(turn_id="turn_a", final_text="已定稿", episode_id="conversation_a",
-                                      started_at=time.monotonic(), timings={}, tts_prewarm_status="DISABLED"),
+                                      started_at=time.monotonic(), timings={}, tts_prewarm_status="DISABLED", settled=False),
         }
         controller._turn_timings = {}
         controller.history = SessionLedger()

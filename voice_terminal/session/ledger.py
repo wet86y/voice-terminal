@@ -11,7 +11,7 @@ from .storage import SessionJournal, StoredSequence, StoredSet
 from .secondary_mailbox import SecondaryMailbox
 from ..screen_capture import ScreenCaptureService
 
-from .contracts import DeliveryReport, ToolExchange
+from .contracts import DeliveryReport, ToolExchange, EVENT_IDEMPOTENCY_WINDOW
 from .context_frames import ContextFrame, ContextLane
 from .conversation_log import ConversationLog
 from ..core.events import utc_now_iso
@@ -132,7 +132,7 @@ class SessionLedger:
                 restored_records = [InputRecord(**item) for item in state["records"]][:self.limit]
                 restored_conversation = ConversationLog(limit=self.conversation.limit)
                 restored_conversation.restore(state["conversation"])
-                restored_events = deque(state["committed_shadow_event_ids"][-4096:])
+                restored_events = deque(state["committed_shadow_event_ids"][-EVENT_IDEMPOTENCY_WINDOW:])
             for name, sequence in prepared.items():
                 for value in getattr(self, name):
                     if isinstance(sequence, StoredSet):
@@ -752,7 +752,7 @@ class SessionLedger:
         if event_id:
             self._committed_shadow_event_ids.add(event_id)
             self._committed_shadow_event_order.append(event_id)
-            while len(self._committed_shadow_event_order) > 4096:
+            while len(self._committed_shadow_event_order) > EVENT_IDEMPOTENCY_WINDOW:
                 expired = self._committed_shadow_event_order.popleft()
                 self._committed_shadow_event_ids.discard(expired)
         if event.kind == "progress":

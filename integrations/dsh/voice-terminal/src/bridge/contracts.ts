@@ -24,7 +24,20 @@ export interface Config {
   readonly fallbackNotice: Volatile<string>
 }
 
-export interface StoredRequest { digest: string; response: Json }
+export interface StoredRequest {
+  digest: string
+  response: Json
+  /** flushPending（待确认落盘）：副作用已执行，重试只能补确认，不能再次投递。 */
+  flushPending?: boolean
+}
+/** RetiredBinding（退役身份回执）：保留重复解绑确认，不持有执行句柄或完整响应缓存。 */
+export interface RetiredBinding {
+  voiceSessionId: string // voiceSessionId（语音会话编号）。
+  dshSessionId: string // dshSessionId（后台会话编号）。
+  epoch: number // epoch（会话代次）。
+  requestId: string // requestId（最终退役请求编号）。
+  digest: string // digest（退役请求摘要）。
+}
 export interface ObserverRecord { trace_revision: number; type: string; data: Json }
 export interface PendingContext {
   messageId: string
