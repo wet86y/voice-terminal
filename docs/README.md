@@ -27,8 +27,7 @@
 
 ## 说明
 
-- [代理调试模式](guides/agent-debug.md)
-
+- [代理调试模式与调用入口](guides/agent-debug.md)
 - [开发资产治理与覆盖更新](development/asset-governance.md)
 - [开发、构建与同包交付流程](development/desktop-pipeline.md)
 - [更新日志填写规范](development/release-notes.md)
@@ -64,6 +63,7 @@
 ## 测试
 
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [代理调试连接与调用工具验收（2026-11-20）](testing/agent-debug-20261120.md)
 - [远程模式首音延迟本地计算（2026-11-19）](testing/remote-latency-local-20261119.md)
 - [远程后台轨迹与授权按钮映射（2026-11-19）](testing/remote-shadow-approval-20261119.md)
 - [远程媒体恢复与日志修订验证（2026-11-19）](testing/remote-device-recovery-20261119.md)

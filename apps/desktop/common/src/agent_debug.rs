@@ -1,4 +1,5 @@
 //! 正式入口与宿主共用的代理调试授权和本机传输。
+pub mod session;
 use crate::{installation, system_feature, workspace};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -307,6 +308,48 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -
     writer.flush().await
 }
 
+/// relay_stream（标准流转发）：标准输入结束只关闭请求方向，等待宿主明确确认回执排空。
+pub async fn relay_stream<S, W>(
+    pipe: S,
+    mut input: tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    mut output: W,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (read, mut write) = tokio::io::split(pipe);
+    let mut reader = BufReader::new(read);
+    let send = async {
+        while let Some(line) = input.recv().await {
+            let mut line = line?;
+            if !line.ends_with(b"\n") { line.push(b'\n'); }
+            write.write_all(&line).await?;
+        }
+        write_frame(&mut write, &json!({"jsonrpc":"2.0","method":"transport.finish"})).await
+    };
+    let receive = async {
+        loop {
+            let line = match read_frame(&mut reader).await {
+                Ok(Some(line)) => line,
+                Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "调试连接提前关闭，未收到传输完成确认；请查询业务状态，避免重复提交。")),
+                Err(error) => return Err(error),
+            };
+            if serde_json::from_slice::<Value>(&line)
+                .is_ok_and(|value| value["method"] == "transport.finished") {
+                return Ok::<_, io::Error>(());
+            }
+            output.write_all(&line).await?;
+            output.flush().await?;
+        }
+    };
+    tokio::pin!(send, receive);
+    tokio::select! {
+        result = &mut receive => result,
+        result = &mut send => { result?; receive.await },
+    }
+}
+
 pub fn relay(root: &Path) -> Result<(), String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -314,8 +357,7 @@ pub fn relay(root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .block_on(async {
             let (pipe, _) = Endpoint::new(root)?.connect().await?;
-            let (read, mut write) = tokio::io::split(pipe);
-            let (forward, mut input) = tokio::sync::mpsc::channel(16);
+            let (forward, input) = tokio::sync::mpsc::channel(16);
             // 控制端撤销会话时，退出不等待另一个进程关闭它的标准输入。
             std::thread::spawn(move || {
                 let input = io::stdin();
@@ -337,52 +379,8 @@ pub fn relay(root: &Path) -> Result<(), String> {
                     }
                 }
             });
-            let mut output = tokio::io::stdout();
-            let mut reader = BufReader::new(read);
-            let send = async {
-                while let Some(line) = input.recv().await {
-                    let mut line = line?;
-                    if !line.ends_with(b"\n") {
-                        line.push(b'\n');
-                    }
-                    write.write_all(&line).await?;
-                }
-                write_frame(
-                    &mut write,
-                    &json!({"jsonrpc":"2.0","method":"transport.finish"}),
-                )
-                .await
-            };
-            let receive = async {
-                loop {
-                    match read_frame(&mut reader).await {
-                        Ok(Some(line)) => {
-                            if serde_json::from_slice::<Value>(&line)
-                                .is_ok_and(|value| value["method"] == "transport.finished")
-                            {
-                                break;
-                            }
-                            output.write_all(&line).await?;
-                            output.flush().await?;
-                        }
-                        Ok(None) => break,
-                        Err(error) if matches!(error.raw_os_error(), Some(109 | 232 | 233)) => {
-                            break
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok::<_, io::Error>(())
-            };
-            tokio::pin!(send, receive);
-            tokio::select! {
-                result = &mut receive => result,
-                result = &mut send => match result {
-                    Ok(()) => receive.await,
-                    Err(error) => Err(error),
-                },
-            }
-            .map_err(|error| error.to_string())
+            relay_stream(pipe, input, tokio::io::stdout()).await
+                .map_err(|error| format!("代理调试传输失败：{error}"))
         })
 }
 

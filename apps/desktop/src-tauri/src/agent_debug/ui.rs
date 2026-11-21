@@ -247,10 +247,29 @@ fn accessible(node: &Value) -> Option<Value> {
         return None;
     }
     let disabled = property("disabled") == Some(Value::Bool(true));
+    let mut state = json!({
+        "checked":property("checked"),"selected":property("selected"),
+        "expanded":property("expanded"),
+        "value":if protected {Value::Null} else {node["value"]["value"].clone()}
+    });
+    // 可访问状态来自浏览器标准属性；新按钮、设置及状态无需调试层逐项登记。
+    // 仅保留标量状态，节点关系不展开；受保护输入的可读值也继续脱敏。
+    for item in properties.into_iter().flatten() {
+        let (Some(name), Some(value)) = (item["name"].as_str(), item["value"].get("value")) else {
+            continue;
+        };
+        if name == "value" || value.is_array() || value.is_object() {
+            continue;
+        }
+        state[name] = if protected && name.to_ascii_lowercase().contains("value") {
+            Value::Null
+        } else {
+            value.clone()
+        };
+    }
     Some(json!({
         "id": id, "name":name,"role":role,
-        "state":{"checked":property("checked"),"selected":property("selected"),
-            "expanded":property("expanded"),"value":if protected {Value::Null} else {node["value"]["value"].clone()}},
+        "state":state,
         "disabled":disabled,"actions":if disabled {vec![]} else {actions}
     }))
 }
@@ -435,8 +454,9 @@ fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'sta
                 == Some(voice_desktop_common::device_config::RunMode::Remote)
         })
     {
-        let imports: Value = serde_json::from_str(include_str!("../../capabilities/remote-import.json"))
-            .map_err(|error| error.to_string())?;
+        let imports: Value =
+            serde_json::from_str(include_str!("../../capabilities/remote-import.json"))
+                .map_err(|error| error.to_string())?;
         if let (Some(commands), Some(imports)) = (
             capability["permissions"].as_array_mut(),
             imports["permissions"].as_array(),
@@ -558,3 +578,59 @@ pub async fn call(
 
 // 仅使用正式页面的同源宿主和本次运行配置中的核心地址，沿用现有会话门禁。
 const SERVICE: &str = include_str!("service.js");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_controls_and_scalar_states_need_no_business_registration() {
+        let control = accessible(&json!({
+            "backendDOMNodeId":703,"role":{"value":"button"},"name":{"value":"新增设置"},
+            "properties":[{"name":"pressed","value":{"value":true}},
+                {"name":"busy","value":{"value":false}},
+                {"name":"future_standard_state","value":{"value":"ready"}},
+                {"name":"controls","value":{"value":[{"id":5}]}}]
+        }))
+        .unwrap();
+        assert_eq!(control["name"], "新增设置");
+        assert_eq!(control["actions"], json!(["click", "press"]));
+        assert_eq!(control["state"]["pressed"], true);
+        assert_eq!(control["state"]["busy"], false);
+        assert_eq!(control["state"]["future_standard_state"], "ready");
+        assert!(control["state"].get("controls").is_none());
+        assert!(control["state"]["checked"].is_null());
+    }
+
+    #[test]
+    fn protected_controls_keep_new_readable_values_redacted() {
+        let control = accessible(&json!({
+            "backendDOMNodeId":704,"role":{"value":"textbox"},"name":{"value":"密钥"},
+            "value":{"value":"private-value"},
+            "properties":[{"name":"valuetext","value":{"value":"private-readable-value"}},
+                {"name":"readonly","value":{"value":true}}]
+        }))
+        .unwrap();
+        assert!(control["state"]["value"].is_null());
+        assert!(control["state"]["valuetext"].is_null());
+        assert_eq!(control["state"]["readonly"], true);
+        assert!(!control.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn new_focusable_roles_use_generic_actions_and_disabled_state_still_blocks_them() {
+        let mut node = json!({"backendDOMNodeId":705,"role":{"value":"future-role"},
+            "name":{"value":"新交互控件"},"properties":[{"name":"focusable","value":{"value":true}}]});
+        assert_eq!(
+            accessible(&node).unwrap()["actions"],
+            json!(["click", "focus", "press"])
+        );
+        node["properties"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"disabled","value":{"value":true}}));
+        assert_eq!(accessible(&node).unwrap()["actions"], json!([]));
+        node["ignored"] = json!(true);
+        assert!(accessible(&node).is_none());
+    }
+}

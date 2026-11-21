@@ -32,6 +32,8 @@ async (request) => {
       parameters: definition?.parameters ?? [],
     })),
     realtime_operations: commands,
+    // schemas（对象约束定义）：保留正式接口描述中的引用，新增字段无需调试层逐项适配。
+    schemas: schema?.components?.schemas ?? {},
     core_ready: Boolean(schema) || config?.business_ready === true,
   }
   if (config?.remote_mode) {

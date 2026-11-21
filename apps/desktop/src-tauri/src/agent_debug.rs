@@ -4,7 +4,7 @@ mod ui;
 use super::{Desktop, FrontendMode};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,15 +14,12 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use tokio::{
-    io::BufReader,
     net::windows::named_pipe::NamedPipeServer,
-    sync::{broadcast, mpsc, oneshot},
-    task::JoinSet,
+    sync::{broadcast, oneshot},
 };
 use voice_desktop_common::agent_debug as wire;
 
 const MAX_CONNECTIONS: usize = 24;
-const MAX_REQUESTS: usize = 16;
 const HOLD: Duration = Duration::from_secs(20);
 
 struct Pending {
@@ -225,121 +222,47 @@ impl AgentDebug {
         state: Arc<Desktop>,
         same_session: bool,
     ) {
+        use wire::session::{Dispatch, Limits};
         let session = self.next_id();
-        let (reader, mut writer) = tokio::io::split(pipe);
-        let mut reader = BufReader::new(reader);
-        let mut bytes = Vec::new();
-        let (output, mut messages) = mpsc::channel(64);
-        let mut writer_task = tokio::spawn(async move {
-            while let Some(value) = messages.recv().await {
-                wire::write_frame(&mut writer, &value).await?;
-            }
-            Ok::<_, std::io::Error>(())
-        });
-        let mut revision = self.revision.subscribe();
-        let mut subscription = None;
-        let mut requests = JoinSet::new();
-        let mut ids = HashSet::new();
-        let mut finish = false;
-        let mut stopping = false;
-        loop {
-            tokio::select! {
-                _ = &mut writer_task => break,
-                _ = revision.changed() => break,
-                done = requests.join_next(), if !requests.is_empty() => {
-                    if let Some(Ok(id)) = done { ids.remove(&id); }
-                }
-                event = next_event(&mut subscription), if subscription.is_some() => {
-                    if let Some(event) = event {
-                        if output.try_send(event).is_err() { break; }
+        let stopping = wire::session::serve(
+            pipe,
+            self.revision.subscribe(),
+            |request, subscription| {
+                let method = request["method"].as_str().unwrap_or_default();
+                let params = &request["params"];
+                let enabled = self.allowed();
+                let result = match method {
+                    "instance.status" if enabled => Ok(json!({
+                        "mode":if self.mode {"agent-debug"} else {"normal"},
+                        "pid":std::process::id(),
+                        "stopping":state.stopping.load(Ordering::Acquire),
+                        "window_ready":app.webview_windows().values().any(|window|window.is_visible().unwrap_or(false))
+                    })),
+                    "instance.exit" if enabled || same_session => {
+                        return Dispatch::Stop(Ok(json!({"accepted":true})));
                     }
-                }
-                frame = wire::read_frame_into(&mut reader, &mut bytes), if !finish => {
-                    let Ok(Some(frame)) = frame else { break; };
-                    let request: Value = match serde_json::from_slice(&frame) {
-                        Ok(request) => request,
-                        Err(_) => {
-                            if output.try_send(reply(Value::Null, Err("调试消息不是有效的 JSON。".into()))).is_err() { break; }
-                            continue;
-                        }
-                    };
-                    let id = request["id"].clone();
-                    let method = request["method"].as_str().unwrap_or_default();
-                    let params = &request["params"];
-                    if request["jsonrpc"] != "2.0" {
-                        if output.try_send(reply(id, Err("调试协议版本无效。".into()))).is_err() { break; }
-                        continue;
+                    _ if !enabled || !self.mode => Err("当前实例未开放该调试操作。".into()),
+                    "trace.subscribe" => {
+                        *subscription = Some(self.events.subscribe());
+                        Ok(json!({"subscribed":true}))
                     }
-                    if method == "transport.finish" {
-                        finish = true;
-                        break;
+                    "hook.arm" => {
+                        subscription.get_or_insert_with(|| self.events.subscribe());
+                        self.arm(session, params)
                     }
-                    if !id.is_string() && !id.is_i64() && !id.is_u64() {
-                        if output.try_send(reply(Value::Null, Err("调试请求需要字符串或整数编号。".into()))).is_err() { break; }
-                        continue;
+                    "hook.resume" => self.resume(session, params),
+                    _ => {
+                        let (debug, state, app) = (self.clone(), state.clone(), app.clone());
+                        return Dispatch::Pending(Box::pin(async move {
+                            debug.dispatch(&app, &state, &request).await
+                        }));
                     }
-                    let enabled = self.allowed();
-                    let immediate = match method {
-                        "instance.status" if enabled => Ok(json!({
-                            "mode":if self.mode {"agent-debug"} else {"normal"},
-                            "pid":std::process::id(),
-                            "stopping":state.stopping.load(Ordering::Acquire),
-                            "window_ready":app.webview_windows().values().any(|window|window.is_visible().unwrap_or(false))
-                        })),
-                        "instance.exit" if enabled || same_session => {
-                            stopping = true;
-                            Ok(json!({"accepted":true}))
-                        }
-                        _ if !enabled || !self.mode => Err("当前实例未开放该调试操作。".into()),
-                        "trace.subscribe" => {
-                            subscription = Some(self.events.subscribe());
-                            Ok(json!({"subscribed":true}))
-                        }
-                        "hook.arm" => {
-                            subscription.get_or_insert_with(|| self.events.subscribe());
-                            self.arm(session, params)
-                        }
-                        "hook.resume" => self.resume(session, params),
-                        _ => {
-                            if requests.len() >= MAX_REQUESTS || !ids.insert(id.clone()) {
-                                if output.try_send(reply(id, Err("调试请求过多或请求编号重复。".into()))).is_err() { break; }
-                                continue;
-                            }
-                            let (debug, state, app, output) = (self.clone(), state.clone(), app.clone(), output.clone());
-                            requests.spawn(async move {
-                                let outcome = debug.dispatch(&app, &state, &request).await;
-                                let _ = output.send(reply(id.clone(), outcome)).await;
-                                id
-                            });
-                            continue;
-                        }
-                    };
-                    if output.try_send(reply(id, immediate)).is_err() { break; }
-                    if stopping { break; }
-                }
-            }
-        }
-        self.release(session);
-        if finish {
-            while requests.join_next().await.is_some() {}
-            let _ = output
-                .send(json!({"jsonrpc":"2.0","method":"transport.finished"}))
-                .await;
-        } else {
-            requests.abort_all();
-        }
-        drop(output);
-        if !writer_task.is_finished()
-            && tokio::time::timeout(Duration::from_secs(2), &mut writer_task)
-                .await
-                .is_err()
-        {
-            writer_task.abort();
-        }
-        if finish || stopping {
-            let _ =
-                tokio::time::timeout(Duration::from_secs(1), wire::read_frame(&mut reader)).await;
-        }
+                };
+                Dispatch::Reply(result)
+            },
+            || self.release(session),
+            Limits::default(),
+        ).await;
         if stopping {
             state.shutdown(&app);
         }
@@ -484,23 +407,6 @@ pub async fn agent_debug_trace_native(
         _ => return Err("无效的原生命令调试阶段。".into()),
     };
     Ok(json!({"call_id":id,"replacement":replacement}))
-}
-
-async fn next_event(subscription: &mut Option<broadcast::Receiver<Value>>) -> Option<Value> {
-    match subscription.as_mut()?.recv().await {
-        Ok(value) => Some(value),
-        Err(broadcast::error::RecvError::Lagged(dropped)) => {
-            Some(json!({"jsonrpc":"2.0","method":"trace.gap","params":{"dropped":dropped}}))
-        }
-        Err(broadcast::error::RecvError::Closed) => None,
-    }
-}
-
-fn reply(id: Value, result: Result<Value, String>) -> Value {
-    match result {
-        Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
-        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error}}),
-    }
 }
 
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {

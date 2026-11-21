@@ -9,6 +9,8 @@
     "apps/frontend"
   ],
   "scripts": {
+    "agent:call": "node scripts/agent-call.mjs",
+    "agent:check": "node --test tests/agent-call.test.mjs tests/agent-debug-contract.test.mjs",
     "assets:audit": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py audit",
     "assets:check": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py check-index",
     "assets:prune": ".local\\runtimes\\python\\python.exe -B -X utf8 scripts/workspace-assets.py prune",
@@ -31,7 +33,7 @@
     "build": "npm run desktop:build",
     "frontend:build": "npm run build --workspace @voice-terminal/frontend",
     "typecheck": "npm run typecheck --workspace @voice-terminal/frontend",
-    "test": "npm run test --workspace @voice-terminal/frontend && node --test tests/frontend-dev.test.mjs"
+    "test": "npm run test --workspace @voice-terminal/frontend && node --test tests/frontend-dev.test.mjs tests/agent-call.test.mjs tests/agent-debug-contract.test.mjs"
   },
   "engines": {
     "node": ">=20"

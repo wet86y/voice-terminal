@@ -10,6 +10,56 @@ class SettingsWrite(BaseModel):
     text: str
 
 
+class FutureSettings(BaseModel):
+    """模拟后续业务自行新增的字段，调试入口不登记字段名。"""
+    enabled: bool
+    nested: dict[str, list[str]]
+
+
+def test_new_production_route_and_fields_are_observed_and_keep_formal_validation(monkeypatch, tmp_path):
+    from voice_terminal.config import AppConfig, PersonaConfig
+    from voice_terminal.server.product import ProductSettingsStore
+    from voice_terminal.server.websocket import SessionRuntime, create_app
+
+    events, saved = [], []
+
+    def exchange(point, stage, value, call_id):
+        events.append((point, stage, value, call_id))
+        return {"call_id": call_id or 41}
+
+    monkeypatch.setattr(agent_debug, "ENABLED", True)
+    monkeypatch.setattr(agent_debug, "_exchange", exchange)
+    config = AppConfig(model_dir=tmp_path / "models", persona=PersonaConfig(directory=tmp_path / "persona"))
+    store = ProductSettingsStore(path=tmp_path / "config/product-settings.json", config=config)
+    runtime = SessionRuntime(config, product_settings=store, runtime_data_dir=tmp_path / "runtime")
+    app = create_app(runtime, product_settings=store)
+
+    # 只注册正式业务路由；正式应用工厂自动接入观察和目录，不另写调试路由。
+    @app.put("/api/v1/future-settings/{panel}")
+    async def new_settings(panel: str, settings: FutureSettings):
+        saved.append(settings.model_dump())
+        return {"panel": panel, "settings": settings.model_dump()}
+
+    client = TestClient(app)
+    body = {"enabled": True, "nested": {"new_field": ["中文值"]}}
+    response = client.put("/api/v1/future-settings/current", json=body, headers={"X-Voice-Agent-Call": "41"})
+    assert response.status_code == 200
+    assert response.json()["settings"] == body
+    assert [(name, stage, call) for name, stage, _, call in events] == [
+        ("PUT /api/v1/future-settings/{panel}", "input", 41),
+        ("PUT /api/v1/future-settings/{panel}", "result", 41),
+    ]
+    schema = client.get("/openapi.json").json()
+    assert "/api/v1/future-settings/{panel}" in schema["paths"]
+    assert "nested" in schema["components"]["schemas"]["FutureSettings"]["properties"]
+    invalid = client.put("/api/v1/future-settings/current", json={"enabled": {}, "nested": {}},
+                         headers={"X-Voice-Agent-Call": "42"})
+    assert invalid.status_code == 422
+    assert saved == [body]
+    assert events[-1][0:2] == ("PUT /api/v1/future-settings/{panel}", "error")
+    assert events[-1][3] == 42
+
+
 def test_registered_route_accepts_debug_input_with_production_validation(monkeypatch):
     events = []
 

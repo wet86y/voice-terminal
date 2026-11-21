@@ -15,20 +15,31 @@ def _between(source: str, start: str, end: str) -> str:
     return source[start_index:end_index]
 
 
-def test_registered_desktop_commands_are_in_the_permission_manifest() -> None:
+def test_registered_desktop_commands_share_permissions_dispatch_and_debug_catalog() -> None:
     desktop = ROOT / "apps/desktop/src-tauri"
     registrations = _between(
-        (desktop / "src/main.rs").read_text(encoding="utf-8"),
-        "tauri::generate_handler![", "\n    ];",
+        (desktop / "src/commands.rs").read_text(encoding="utf-8"),
+        "$apply![", "\n        ]",
     ).split("[", 1)[1]
-    handlers = {item.strip().rsplit("::", 1)[-1] for item in registrations.split(",") if item.strip()}
-    manifest = _between(
-        (desktop / "build.rs").read_text(encoding="utf-8"),
-        "app_manifest(command_manifest(&[", "\n        ]",
-    )
-    manifest_commands = set(re.findall(r'"([a-z][a-z0-9_]+)"', manifest))
-    assert handlers
-    assert handlers == manifest_commands
+    handlers = [item.strip().rsplit("::", 1)[-1] for item in registrations.split(",") if item.strip()]
+    assert handlers and len(handlers) == len(set(handlers)), "正式命令名不能为空或重复。"
+    declared = set()
+    for source in (desktop / "src").rglob("*.rs"):
+        declared.update(re.findall(
+            r"#\[tauri::command(?:\([^\]]*\))?\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)",
+            source.read_text(encoding="utf-8"),
+        ))
+    assert set(handlers) == declared, "每个正式命令须登记一次，不能遗漏处理器或登记不存在的函数。"
+    main = (desktop / "src/main.rs").read_text(encoding="utf-8")
+    build = (desktop / "build.rs").read_text(encoding="utf-8")
+    assert 'include!("commands.rs")' in main
+    assert 'desktop_command_registry!(desktop_handler)' in main
+    assert 'include!("src/commands.rs")' in build
+    assert 'desktop_command_registry!(command_manifest_from_registry)' in build
+    assert 'commands.join("\\n")' in build and 'desktop-commands.txt' in build
+    assert 'include_str!(concat!(env!("OUT_DIR"), "/desktop-commands.txt"))' in (
+        desktop / "src/agent_debug/ui.rs"
+    ).read_text(encoding="utf-8")
 
 
 def test_frontend_product_operations_reach_native_and_server_allowlists() -> None:

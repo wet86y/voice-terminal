@@ -1,4 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+include!("commands.rs");
+// desktop_handler（正式命令分发）：与构建期权限及调试目录共用注册表。
+macro_rules! desktop_handler {
+    ($($command:path),* $(,)?) => { tauri::generate_handler![$($command),*] };
+}
+
 mod app_icon;
 mod agent_debug;
 mod integrity_commands;
@@ -10181,27 +10187,7 @@ fn run() -> Result<(), String> {
         qualification_control && args.iter().any(|value| value == "--qualification-exit");
     let instance_state = state.clone();
     let build_state = state.clone();
-    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
-        agent_debug_set_allowed,agent_debug::agent_debug_trace_native,
-        desktop_status,desktop_page_ready,device_config_status,device_config_save,device_discovery_search,device_pairing_window_open,device_pairing_window_close,device_pairing_window_status,device_pairing_connect,device_worker_start,device_worker_status,device_worker_audio_devices,device_worker_desktop_helper_health,
-            device_worker_capture_start,device_worker_capture_next,device_worker_capture_stop,
-        device_worker_playback_start,device_worker_playback_enqueue,device_worker_playback_snapshot,device_worker_playback_stop,
-            device_ssh_probe,device_ssh_identity_create,device_ssh_identity_status,device_ssh_identity_delete,
-            device_ssh_transport_identity_import,device_ssh_transport_identity_status,device_ssh_transport_identity_delete,
-            device_ssh_connect,device_ssh_pairing_request,device_ssh_request,device_ssh_management_request,device_ssh_import_start,device_ssh_import_cancel,device_ssh_tts_asset_import,device_ssh_disconnect,device_ssh_status,device_ssh_task_channel,device_ssh_media_channel,device_ssh_voice_forwarder,
-            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
-            skip_startup,
-            export_logs,
-            open_console,
-            exit_application,
-            focus_main,
-            desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
-            model_credentials_status,model_credentials_save,inference_selection_save,tts_selection_status,tts_selection_save,audio_enhancements_settings,
-            resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
-            workspace_info,workspace_choose,workspace_link,workspace_migrate,workspace_cleanup,app_integrity_status,app_integrity_download,app_integrity_check,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
-            resource_inventory,resource_jobs,resource_system_feature_status,resource_system_feature_enable,resource_system_feature_access,resource_download,resource_download_required,resource_import,resource_import_choose_sources,resource_import_start,resource_import_confirm,resource_open_source,resource_cancel,resource_reset_plan,resource_reset,
-            aniflive_import_choose_folder,aniflive_import_start
-    ];
+    let handler: fn(tauri::ipc::Invoke) -> bool = desktop_command_registry!(desktop_handler);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(move |app, arguments, _| {
             if arguments.iter().any(|value|value=="--exit")||qualification_control

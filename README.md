@@ -149,7 +149,7 @@ Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
 完整文档按架构、说明、测试与交付四类整理，目录说明与分类索引见 **[文档索引](docs/README.md)**。
 
 - **架构** — [架构与生命周期](docs/architecture/architecture.md) · [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md) · [WebSocket 协议](docs/architecture/websocket-protocol.md) · [上下文与工具](docs/architecture/context-and-tools.md) · [连续性底座](docs/architecture/continuity-foundation.md)
-- **说明** — [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md)
+- **说明** — [代理调试模式与调用入口](docs/guides/agent-debug.md) · [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md)
 - **测试** — [测试、启动与现场验收入口](docs/testing/operations-and-quality.md) · [当前已知问题](docs/testing/known-issues.md)
 - **交付** — [当前交付](docs/releases/current-release.md) · [v0.9.12 发行说明](docs/releases/v0.9.12.md) · [GitHub 发布流程](docs/development/github-release.md)
 
@@ -162,6 +162,8 @@ Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
 ## 开发者速查
 
 以下内容面向在源码上工作的开发者。日常开发复用现有环境，常规更新采用固定位置覆盖。
+
+开发、维护、排障及界面与业务验收优先使用项目专用调试入口。调试模式、调用方法及新界面、新设置和新业务接口的默认接入方式统一见[代理调试模式与调用入口](docs/guides/agent-debug.md)。Codex（开发代理）电脑控制仅在专用接口无法覆盖所需操作时作为补充。
 
 ### 本地开发
 
