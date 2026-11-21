@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import json
 import os
-import socket
 import sys
 from dataclasses import replace
 from dataclasses import asdict, dataclass
@@ -28,10 +27,18 @@ def _check(name: str, ok: bool, message: str, *, warning: bool = False) -> Check
     return Check(name, "PASS" if ok else ("WARN" if warning else "FAIL"), message)
 
 
-def _port_in_use(host: str, port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.25)
-        return sock.connect_ex((host, port)) == 0
+def _port_allocation_checks(config) -> list[Check]:
+    """检查系统动态绑定能力；不把独立调试首选端口占用误报为产品故障。"""
+    from .application.ports import bind_loopback
+    checks = []
+    for name, host in (("port:voice-server", config.server.host), ("port:asr-worker", config.asr_worker.host)):
+        try:
+            listener, _ = bind_loopback(0, host=host)
+            listener.close()
+            checks.append(_check(name, True, "系统可分配回环端口；运行时请读取宿主登记的实际端点"))
+        except (OSError, ValueError) as exc:
+            checks.append(_check(name, False, f"动态回环端口绑定失败：{exc}"))
+    return checks
 
 
 def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | None = None) -> list[Check]:
@@ -125,27 +132,7 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     else:
         checks.append(_check(f"kws:{wake_name}", True, "disabled by wake.enabled=false"))
 
-    voice_port_busy = _port_in_use(config.server.host, config.server.port)
-    checks.append(
-        _check(
-            "port:voice-server",
-            not voice_port_busy,
-            f"{config.server.host}:{config.server.port} is available"
-            if not voice_port_busy
-            else f"{config.server.host}:{config.server.port} is already listening",
-            warning=True,
-        )
-    )
-    worker_port_busy = _port_in_use(config.asr_worker.host, config.asr_worker.port)
-    checks.append(
-        _check(
-            "port:asr-worker",
-            True,
-            f"{config.asr_worker.host}:{config.asr_worker.port} is listening"
-            if worker_port_busy
-            else f"{config.asr_worker.host}:{config.asr_worker.port} is available; start.ps1 will launch the worker",
-        )
-    )
+    checks.extend(_port_allocation_checks(config))
 
     for env_name in (config.llm.api_key_env, config.tts.api_key_env):
         configured = bool(os.environ.get(env_name, "").strip())

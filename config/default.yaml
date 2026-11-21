@@ -219,10 +219,12 @@ text_bridge:
   preferred_breaks: "。！？；"
 
 server:
+  # 此处端口用于独立调试；统一宿主管理的内部服务在绑定时请求系统分配端口。
   host: 127.0.0.1
   port: 8765
 
 asr_worker:
+  # port（独立调试首选端口）；受管启动使用宿主登记的实际端点。
   host: 127.0.0.1
   port: 8766
 

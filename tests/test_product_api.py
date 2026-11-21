@@ -82,6 +82,8 @@ class ProductApiTests(unittest.TestCase):
         )
         runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=self.root / ".local")
         self.runtime = runtime
+        from tests.device_gateway_support import configure_test_gateway
+        self.gateway_port = configure_test_gateway(runtime)
         # 仅此测试进程模拟桌面原生层写入隔离临时信任库；正式服务保持只读。
         assert self.runtime.device_trust_store is not None
         self.runtime.device_trust_store._read_only = False
@@ -119,7 +121,7 @@ class ProductApiTests(unittest.TestCase):
 
     async def _gateway_request(self, method: str, path: str, **kwargs) -> httpx.Response:
         transport = httpx.ASGITransport(app=self.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18765") as client:
+        async with httpx.AsyncClient(transport=transport, base_url=f"http://127.0.0.1:{self.gateway_port}") as client:
             return await client.request(method, path, **kwargs)
 
     @staticmethod
@@ -370,7 +372,7 @@ class ProductApiTests(unittest.TestCase):
                 challenge=challenge["challenge"], timestamp_ms=timestamp, payload={"protocol_version": 1, **query},
             )
             headers = {
-                "host": "127.0.0.1:18765", "x-voice-terminal-device-id": device_id,
+                "host": f"127.0.0.1:{self.gateway_port}", "x-voice-terminal-device-id": device_id,
                 "x-voice-terminal-core-session-id": challenge["core_session_id"],
                 "x-voice-terminal-challenge": challenge["challenge"], "x-voice-terminal-timestamp-ms": str(timestamp),
                 "x-voice-terminal-signature": base64.b64encode(key.sign(proof)).decode("ascii"),
@@ -382,7 +384,7 @@ class ProductApiTests(unittest.TestCase):
                 "scheme": "ws", "root_path": "", "path": path, "raw_path": path.encode(),
                 "query_string": "&".join(f"{name}={value}" for name, value in query.items()).encode(),
                 "headers": [(key.encode(), value.encode()) for key, value in headers.items()],
-                "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 18765), "subprotocols": [],
+                "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", self.gateway_port), "subprotocols": [],
             }
 
             async def command(name, request_id):

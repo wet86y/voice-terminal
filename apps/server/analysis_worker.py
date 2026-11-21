@@ -23,7 +23,7 @@ from voice_terminal.model_process import ModelProcess
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.application.managed import report, report_endpoint, run_uvicorn
-from voice_terminal.application.ports import bind_loopback, endpoint_url
+from voice_terminal.application.ports import bind_loopback, endpoint_url, managed_bind_port
 
 if __name__ == "__main__":
     worker_imports_ready("analysis")
@@ -43,7 +43,9 @@ def main():
             config=config,
         ).effective_config()
     address = urlparse(config.smart_turn.analysis_url)
-    listener, actual_port = bind_loopback(address.port or 8767, host=address.hostname or "127.0.0.1")
+    listener, actual_port = bind_loopback(
+        managed_bind_port(address.port if address.port is not None else 8767),
+        host=address.hostname or "127.0.0.1")
     report_endpoint("analysis", endpoint_url("analysis", actual_port))
     if __name__ != "__main__":
         configure_logging(paths.logs / "analysis-worker.log")

@@ -24,7 +24,7 @@ from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.application.managed import report, report_endpoint, wait_for_shutdown
-from voice_terminal.application.ports import bind_loopback, endpoint_url
+from voice_terminal.application.ports import bind_loopback, endpoint_url, managed_bind_port
 
 if __name__ == "__main__":
     worker_imports_ready("asr")
@@ -46,7 +46,7 @@ async def run(config_path: Path | None = None) -> None:
             path=paths.config / "product-settings.json",
             config=config,
         ).effective_config()
-    listener, actual_port = bind_loopback(config.asr_worker.port, host=config.asr_worker.host)
+    listener, actual_port = bind_loopback(managed_bind_port(config.asr_worker.port), host=config.asr_worker.host)
     report_endpoint("asr", endpoint_url("asr", actual_port))
     engine = AsrWorkerEngine(
         model_dir=config.asr_model_dir,

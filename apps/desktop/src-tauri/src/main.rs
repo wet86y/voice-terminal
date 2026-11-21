@@ -571,6 +571,8 @@ struct Desktop {
     #[cfg(feature = "ssh-device")]
     remote_services: Mutex<Option<Arc<remote_services::RemoteServices>>>, // remote_services（广播开启期间的原生管理与文件回环服务）。
     #[cfg(feature = "ssh-device")]
+    service_endpoints: Arc<voice_desktop_common::service_endpoints::EndpointDirectory>, // service_endpoints（当前工作区正式服务端点目录）。
+    #[cfg(feature = "ssh-device")]
     remote_import_transfers: Mutex<HashMap<String, Arc<AtomicBool>>>, // remote_import_transfers（客户端当前 FILE 上传及取消信号）。
     #[cfg(feature = "ssh-device")]
     discovery_targets: Mutex<
@@ -687,7 +689,9 @@ impl Desktop {
     }
 
     fn stop_service(&self) -> Result<(), String> {
-        self.service_epoch.fetch_add(1, Ordering::SeqCst);
+        let epoch = self.service_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(feature = "ssh-device")]
+        self.service_endpoints.begin_gateway_epoch(epoch);
         let _ = self.send(serde_json::json!({"protocol":1,"kind":"shutdown","budget_ms":14000}));
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1822,6 +1826,75 @@ fn device_core_restart_required(
 }
 
 #[cfg(feature = "ssh-device")]
+fn state_gateway_endpoint(
+    directory: &voice_desktop_common::service_endpoints::EndpointDirectory,
+    row: &serde_json::Value,
+    epoch: u64,
+    revision: u64,
+) {
+    use voice_desktop_common::service_endpoints::ServiceEndpoint;
+    let endpoint = (|| {
+        let url = row["url"].as_str()?.parse::<tauri::Url>().ok()?;
+        if url.scheme() != "http" || url.host_str() != Some("127.0.0.1")
+            || !url.username().is_empty() || url.password().is_some()
+            || url.query().is_some() || url.fragment().is_some() || url.path() != "/"
+        { return None; }
+        let port = url.port().filter(|port| *port > 0)?;
+        let pid = u32::try_from(row["pid"].as_u64()?).ok()?;
+        let created = row["created_at"].as_f64()?;
+        let generation = row["generation"].as_str()?;
+        let (actual_created, _) = voice_desktop_common::workspace::process_identity(pid).ok()??;
+        // FILETIME（系统创建时间）转为 Unix（统一纪元）秒，与后端已核验报告比对。
+        let actual_seconds = actual_created as f64 / 10_000_000.0 - 11_644_473_600.0;
+        if !created.is_finite() || (created - actual_seconds).abs() > 2.0 { return None; }
+        let endpoint = ServiceEndpoint { address: ([127, 0, 0, 1], port).into(), pid,
+            created_at: actual_created, generation: generation.into() };
+        endpoint.validate().ok()?;
+        Some(endpoint)
+    })();
+    let _ = directory.update_gateway(epoch, revision, endpoint);
+}
+
+#[cfg(feature = "ssh-device")]
+#[cfg(test)]
+mod gateway_endpoint_tests {
+    use super::*;
+    use voice_desktop_common::service_endpoints::{BridgeChannel, EndpointDirectory};
+
+    #[test]
+    fn private_gateway_reports_require_current_process_identity_and_endpoint_revision() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let directory = EndpointDirectory::default();
+        directory.begin_gateway_epoch(7);
+        let pid = std::process::id();
+        let (created, _) = voice_desktop_common::workspace::process_identity(pid).unwrap().unwrap();
+        let row = serde_json::json!({"url":format!("http://{}",listener.local_addr().unwrap()),
+            "pid":pid,"created_at":created as f64 / 10_000_000.0 - 11_644_473_600.0,"generation":"voice-generation"});
+        state_gateway_endpoint(&directory, &row, 7, 1);
+        assert_eq!(directory.resolve(BridgeChannel::Gateway).unwrap().address, listener.local_addr().unwrap());
+        let mut foreign = row.clone();
+        foreign["url"] = serde_json::json!("http://192.168.1.5:12345");
+        state_gateway_endpoint(&directory, &foreign, 7, 2);
+        assert!(directory.resolve(BridgeChannel::Gateway).is_err());
+        state_gateway_endpoint(&directory, &row, 7, 1);
+        assert!(directory.resolve(BridgeChannel::Gateway).is_err());
+        state_gateway_endpoint(&directory, &row, 7, 3);
+        let mut invalid_generation = row.clone();
+        invalid_generation["generation"] = serde_json::json!("invalid generation");
+        state_gateway_endpoint(&directory, &invalid_generation, 7, 4);
+        assert!(directory.resolve(BridgeChannel::Gateway).is_err());
+        state_gateway_endpoint(&directory, &row, 7, 5);
+        let mut stale = row.clone();
+        stale["created_at"] = serde_json::json!(1.0);
+        state_gateway_endpoint(&directory, &stale, 7, 6);
+        assert!(directory.resolve(BridgeChannel::Gateway).is_err());
+        directory.begin_gateway_epoch(8);
+        state_gateway_endpoint(&directory, &row, 7, 999);
+        assert!(directory.resolve(BridgeChannel::Gateway).is_err());
+    }
+}
+
+#[cfg(feature = "ssh-device")]
 async fn set_local_device_gateway(state: &Arc<Desktop>, enabled: bool) -> Result<(), String> {
     let epoch = state.service_epoch.load(Ordering::Acquire);
     let (id, receive) = state.gateway_control.begin()?;
@@ -2668,6 +2741,8 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
         .lock()
         .map(|snapshot| snapshot["ready"] == true)
         .unwrap_or(false);
+    let gateway_ready = gateway_ready && state.service_endpoints
+        .resolve(voice_desktop_common::service_endpoints::BridgeChannel::Gateway).is_ok();
     let state_name = if gateway_ready { "ready" } else { "starting" };
     let remote_services_active = state
         .remote_services
@@ -2684,6 +2759,11 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
             .is_some_and(|publication| publication.state_name() == state_name)
     {
         return Ok(());
+    }
+    // 重建任何附属入口前撤销旧公告，失败不能继续保留 ready（已就绪）的旧状态。
+    if let Some(publication) = state.discovery_publication.lock()
+        .map_err(|_| "局域网公告状态不可用。")?.take() {
+        publication.stop()?;
     }
     let epoch = state.service_epoch.load(Ordering::Acquire);
     let cached = state
@@ -2743,6 +2823,9 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
         .clone()
         .ok_or("远程原生服务控制器尚未初始化。")?;
     remote_services.start(&context.data, &config.device_id)?;
+    if !remote_services.is_running() {
+        return Err("原生管理、文件或端点查询入口未就绪，未发布局域网公告。".into());
+    }
     let token = config
         .device_id
         .chars()
@@ -2786,6 +2869,10 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
             return Err(error);
         }
     };
+    if !remote_services.is_running() {
+        drop(publication);
+        return Err("附属网络入口在公告准备期间退出，已撤销本轮公告。".into());
+    }
     if state.stopping.load(Ordering::Acquire)
         || state.workspace_busy.load(Ordering::Acquire)
         || epoch != state.service_epoch.load(Ordering::Acquire)
@@ -3241,7 +3328,7 @@ async fn device_ssh_connect(
             "host_key_sha256":host.host_key_sha256,"gateway_port":voice_desktop_common::ssh_device::DEFAULT_GATEWAY_PORT,
             "transport_credential_ref":transport_credential_ref,
             "fields":{"state":"原生 SSH 设备连接状态","device_id":"本机设备编号","address":"已连接主机名称或 IP 地址",
-                "port":"SSH 端口","host_key_sha256":"已确认的主机公钥指纹","gateway_port":"主机回环业务网关端口",
+                "port":"SSH 端口","host_key_sha256":"已确认的主机公钥指纹","gateway_port":"业务请求地址的兼容端口，实际监听由服务端解析",
                 "transport_credential_ref":"单独用于 OpenSSH 账户登录的凭据引用；为空时沿用产品设备身份"}}),
         )
         }.await;
@@ -9385,6 +9472,8 @@ fn start_service_for(
         return Ok(());
     }
     let epoch = state.service_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    #[cfg(feature = "ssh-device")]
+    state.service_endpoints.begin_gateway_epoch(epoch);
     state
         .recovery
         .lock()
@@ -9434,6 +9523,7 @@ fn start_service_for(
     let read_state = state.clone();
     let read_app = app.clone();
     std::thread::spawn(move || {
+        let mut endpoint_revision = 0; // endpoint_revision（当前核心代次已消费的端点版本）。
         for line in reader.lines() {
             if read_state.service_epoch.load(Ordering::Acquire) != epoch {
                 return;
@@ -9681,6 +9771,14 @@ fn start_service_for(
                     });
                 }
                 Some("endpoints") => {
+                    let Some(revision) = message["endpoint_revision"].as_u64() else { continue };
+                    if revision < endpoint_revision { continue; }
+                    endpoint_revision = revision;
+                    #[cfg(feature = "ssh-device")]
+                    {
+                        let row = &message["endpoints"]["gateway"];
+                        state_gateway_endpoint(&read_state.service_endpoints, row, epoch, revision);
+                    }
                     let origin = message["endpoints"]["dsh"]["url"]
                         .as_str()
                         .and_then(|value| value.parse::<tauri::Url>().ok())
@@ -9702,6 +9800,8 @@ fn start_service_for(
         if read_state.service_epoch.load(Ordering::Acquire) == epoch
             && !read_state.stopping.load(Ordering::SeqCst)
         {
+            #[cfg(feature = "ssh-device")]
+            let _ = read_state.service_endpoints.update_gateway(epoch, u64::MAX, None);
             if !read_state.recovery.lock().unwrap().preserves_page() {
                 *read_state.origin.lock().unwrap() = None;
             }
@@ -10103,6 +10203,8 @@ fn run() -> Result<(), String> {
         discovery_publication: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         remote_services: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        service_endpoints: Arc::new(voice_desktop_common::service_endpoints::EndpointDirectory::default()),
         #[cfg(feature = "ssh-device")]
         remote_import_transfers: Mutex::new(HashMap::new()),
         #[cfg(feature = "ssh-device")]
@@ -11017,6 +11119,8 @@ mod tests {
             pairing_listener: tokio::sync::Mutex::new(None),
             discovery_publication: std::sync::Mutex::new(None),
             remote_services: std::sync::Mutex::new(None),
+            #[cfg(feature = "ssh-device")]
+            service_endpoints: Arc::new(voice_desktop_common::service_endpoints::EndpointDirectory::default()),
             remote_import_transfers: std::sync::Mutex::new(std::collections::HashMap::new()),
             discovery_targets: std::sync::Mutex::new(std::collections::HashMap::new()),
             discovery_search_expires_at_ms: std::sync::atomic::AtomicU64::new(0),

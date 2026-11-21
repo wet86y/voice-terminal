@@ -36,7 +36,7 @@ export default defineConfig({
   },
   server: {
     host: '127.0.0.1',
-    port: 5173,
+    port: 0, // port（默认监听请求端口）：由受管外层服务注入实际端口。
     strictPort: true,
     open: false,
     watch: {

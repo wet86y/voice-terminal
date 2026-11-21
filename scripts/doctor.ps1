@@ -29,11 +29,10 @@ try {
         status = "PASS"
         message = ".local/build/dsh/source; .local/data/dsh"
       }
-      $Listener = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 3081 -State Listen -ErrorAction SilentlyContinue
       $DshChecks += [pscustomobject]@{
-        name = "port:dsh"
-        status = $(if ($Listener) { "WARN" } else { "PASS" })
-        message = $(if ($Listener) { "127.0.0.1:3081 is listening (PID $($Listener.OwningProcess)); runtime ownership check required" } else { "127.0.0.1:3081 is free" })
+        name = "dsh:port-policy"
+        status = "PASS"
+        message = "受管 DSH（代理宿主）使用系统动态端口；运行状态请经正式代理调试入口查询当前端点表。"
       }
       $DshChecks += [pscustomobject]@{
         name = "dsh:path"
@@ -43,12 +42,7 @@ try {
     } else {
       Write-Host "Checking project-isolated DSH..." -ForegroundColor Cyan
       & (Join-Path $PSScriptRoot "setup-dsh.ps1") -ValidateOnly
-      $Listener = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 3081 -State Listen -ErrorAction SilentlyContinue
-      if ($Listener) {
-        Write-Host "Project DSH port 3081 is listening (PID $($Listener.OwningProcess)); verify it belongs to the current Voice Server." -ForegroundColor Yellow
-      } else {
-        Write-Host "Project DSH port 3081 is currently free." -ForegroundColor DarkGray
-      }
+      Write-Host "受管 DSH（代理宿主）使用系统动态端口；运行状态请经正式代理调试入口查询当前端点表。" -ForegroundColor DarkGray
       if ($RepoRoot -match '[^\x00-\x7F]') {
         Write-Host "DSH CLI validation succeeded from the non-ASCII repository path." -ForegroundColor Green
       }

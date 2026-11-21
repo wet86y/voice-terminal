@@ -37,7 +37,7 @@ class ApplicationState:
             "endpoint_revision": 0,  # endpoint_revision（端点版本）：每次地址或代次变化时递增。
             "voice_api_ready": False,  # voice_api_ready（轻量业务接口已监听，独立于模型与会话就绪）。
             "device_gateway_enabled": False,  # device_gateway_enabled（本次启动是否请求共享设备网关）。
-            "device_gateway_ready": False,  # device_gateway_ready（共享设备网关是否成功监听固定回环端口）。
+            "device_gateway_ready": False,  # device_gateway_ready（共享设备网关是否成功监听本轮实际回环端口）。
             "device_gateway_error": "",  # device_gateway_error（网关未就绪的非敏感原因）。
             "sampled_at": None, "total_memory_rss_bytes": None,
             "total_memory_private_commit_bytes": None,  # 去重后的受管进程私有提交内存（字节）。

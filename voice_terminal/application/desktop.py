@@ -92,6 +92,9 @@ class DesktopControl:
     async def _set_device_gateway(self, request_id: int, enabled: bool) -> None:
         try:
             result = await self.application.set_device_gateway(enabled)
+            # 先交接实际端点，再确认开关完成，避免桌面立即发布广播时仍使用旧地址。
+            snapshot = self.application.state.snapshot()
+            self.send("endpoints", endpoints=snapshot["endpoints"], endpoint_revision=snapshot["endpoint_revision"])
             self.send("device_gateway_result", request_id=request_id, ok=True, status=result)
         except Exception as exc:
             self.send("device_gateway_result", request_id=request_id, ok=False, error=str(exc)[:240])

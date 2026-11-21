@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -24,15 +27,29 @@ from pathlib import Path
 import websockets
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
-URL = "ws://127.0.0.1:8765/ws"
 TIMEOUT_S = float(sys.argv[1]) if len(sys.argv) > 1 else 300.0
 
 
 async def main() -> int:
+    node = os.environ.get("VOICE_NODE_EXECUTABLE") or shutil.which("node")
+    if not node:
+        raise RuntimeError("诊断需要当前项目已有的 Node（脚本运行环境）。")
+    result = await asyncio.to_thread(subprocess.run,
+        [node, str(ROOT / "scripts/dsh-diagnose/lib/current-endpoints.mjs"), "voice"],
+        cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "正式宿主尚未提供语音端点。")
+    origin = result.stdout.strip()
+    from urllib.parse import urlsplit
+    address = urlsplit(origin)
+    if address.scheme != "http" or address.hostname != "127.0.0.1" or not address.port:
+        raise RuntimeError("正式调试回执中的语音端点无效。")
+    url = f"ws://{address.netloc}/ws"  # url（当前实际语音实时接口）。
     request_id = str(uuid.uuid4())
-    print(f"connecting {URL}")
+    print(f"connecting {url}")
     events: list[dict] = []
-    async with websockets.connect(URL, max_size=16 * 1024 * 1024) as socket:
+    async with websockets.connect(url, max_size=16 * 1024 * 1024) as socket:
         await socket.send(json.dumps({
             "type": "command", "request_id": str(uuid.uuid4()),
             "command": "subscribe", "payload": {},

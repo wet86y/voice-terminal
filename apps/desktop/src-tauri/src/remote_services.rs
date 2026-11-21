@@ -1,4 +1,4 @@
-//! RemoteServices（远程原生服务）：为已开启广播的本地模式提供固定回环管理和文件通道。
+//! RemoteServices（远程原生服务）：为已开启广播的本地模式提供动态回环管理和文件通道。
 use crate::{
     remote_import::RemoteImportCoordinator, remote_management::RemoteManagementService,
     resource_commands::ResourceManager,
@@ -23,16 +23,16 @@ use voice_desktop_common::{
         FILE_TRANSFER_GATEWAY_PATH,
     },
     device_trust::DeviceTrustStore,
+    service_endpoints::{BridgeChannel, EndpointDirectory, EndpointServer},
 };
 
-const MANAGEMENT_ADDRESS: &str = "127.0.0.1:18768"; // MANAGEMENT_ADDRESS（固定回环管理入口）。
-const FILE_ADDRESS: &str = "127.0.0.1:18769"; // FILE_ADDRESS（固定回环文件入口）。
-const CORE_FILE_GATEWAY_ADDRESS: &str = "127.0.0.1:18765"; // CORE_FILE_GATEWAY_ADDRESS（只代理到固定 Python 业务网关）。
+const DYNAMIC_LOOPBACK: &str = "127.0.0.1:0"; // DYNAMIC_LOOPBACK（由系统分配的回环监听地址）。
 
 /// RemoteServices（远程原生服务集合）：管理 RPC 和文件传输只在产品本地广播期间运行。
 pub struct RemoteServices {
     manager: Arc<ResourceManager>, // manager（复用正式服务端资源任务和事务）。
     running: Mutex<Option<RunningServices>>, // running（当前固定回环服务与停止句柄）。
+    endpoints: Arc<EndpointDirectory>, // endpoints（正式宿主共用的当前端点目录）。
 }
 
 struct RunningServices {
@@ -41,6 +41,19 @@ struct RunningServices {
     management: crate::remote_management::RemoteManagementHandle, // management（独立管理服务句柄）。
     file_shutdown: Arc<AtomicBool>, // file_shutdown（文件 listener（监听器）停止信号）。
     file_worker: Option<JoinHandle<()>>, // file_worker（文件 listener（监听器）线程）。
+    _endpoint_server: EndpointServer, // _endpoint_server（广播期间允许 SSH 桥接查询当前实际端口）。
+}
+
+impl RunningServices {
+    fn is_running(&self) -> bool {
+        services_are_running(
+            self.management.is_running(),
+            self.file_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished()),
+            self._endpoint_server.is_running(),
+        )
+    }
 }
 
 struct ValidatingFileReceiver {
@@ -51,14 +64,16 @@ struct ValidatingFileReceiver {
     owner_sid: String,                   // owner_sid（本次正式程序当前 Windows 账户 SID）。
     build: String,                       // build（当前正式程序构建编号）。
     file_gateways: Mutex<HashMap<String, TcpStream>>, // file_gateways（每条 FILE 会话复用的固定 loopback HTTP keep-alive 连接）。
+    endpoints: Arc<EndpointDirectory>,                // endpoints（文件代理只连接当前受管网关）。
 }
 
 impl RemoteServices {
     /// new（建立服务控制器）：不监听网络，直到保存配置明确开启本机广播。
-    pub fn new(manager: Arc<ResourceManager>) -> Self {
+    pub fn new(manager: Arc<ResourceManager>, endpoints: Arc<EndpointDirectory>) -> Self {
         Self {
             manager,
             running: Mutex::new(None),
+            endpoints,
         }
     }
 
@@ -84,12 +99,7 @@ impl RemoteServices {
         {
             let running = self.running.lock().map_err(|_| "远程服务状态不可用。")?;
             if running.as_ref().is_some_and(|current| {
-                current.host_id == host_id
-                    && current.data_root == data_root
-                    && current
-                        .file_worker
-                        .as_ref()
-                        .is_some_and(|worker| !worker.is_finished())
+                current.host_id == host_id && current.data_root == data_root && current.is_running()
             }) {
                 return Ok(());
             }
@@ -107,12 +117,34 @@ impl RemoteServices {
             trust,
             coordinator.clone(),
         )?;
-        let listener = TcpListener::bind(FILE_ADDRESS)
+        let listener = TcpListener::bind(DYNAMIC_LOOPBACK)
             .map_err(|error| format!("无法启动回环文件服务：{error}"))?;
-        let address = MANAGEMENT_ADDRESS
+        let file_address = listener.local_addr().map_err(|error| error.to_string())?;
+        let address = DYNAMIC_LOOPBACK
             .parse::<SocketAddr>()
             .map_err(|_| "远程管理固定回环地址无效。")?;
         let management_handle = management.start(address)?;
+        let generation = format!(
+            "native-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "系统时间无效。")?
+                .as_nanos()
+        );
+        self.endpoints.register(
+            BridgeChannel::Management,
+            management_handle.local_addr(),
+            std::process::id(),
+            &generation,
+        )?;
+        self.endpoints.register(
+            BridgeChannel::File,
+            file_address,
+            std::process::id(),
+            &generation,
+        )?;
+        let endpoint_server = EndpointServer::start(&context.install, self.endpoints.clone())?;
 
         let current_sid = voice_desktop_common::system_feature::current_user_sid()?;
         let release = voice_desktop_common::resources::load(&context.program.join("release.json"))?;
@@ -129,6 +161,7 @@ impl RemoteServices {
             owner_sid: current_sid,
             build,
             file_gateways: Mutex::new(HashMap::new()),
+            endpoints: self.endpoints.clone(),
         });
         let file_shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = file_shutdown.clone();
@@ -148,12 +181,15 @@ impl RemoteServices {
             management: management_handle,
             file_shutdown,
             file_worker: Some(file_worker),
+            _endpoint_server: endpoint_server,
         });
         Ok(())
     }
 
     /// stop（停止固定回环服务）：不停止微软 SSH 系统服务或修改其其他用途。
     pub fn stop(&self) -> Result<bool, String> {
+        self.endpoints.remove(BridgeChannel::Management);
+        self.endpoints.remove(BridgeChannel::File);
         let Some(mut running) = self
             .running
             .lock()
@@ -173,28 +209,22 @@ impl RemoteServices {
         Ok(true)
     }
 
-    /// is_running（检查实际状态）：只检查两个已绑定回环服务线程，不代表 SSH 已配置。
+    /// is_running（检查实际状态）：管理、文件和端点查询入口必须都存活。
     pub fn is_running(&self) -> bool {
         self.running
             .lock()
             .ok()
-            .and_then(|running| {
-                running.as_ref().map(|current| {
-                    services_are_running(
-                        current.management.is_running(),
-                        current
-                            .file_worker
-                            .as_ref()
-                            .is_some_and(|worker| !worker.is_finished()),
-                    )
-                })
-            })
+            .and_then(|running| running.as_ref().map(RunningServices::is_running))
             .unwrap_or(false)
     }
 }
 
-fn services_are_running(management_running: bool, file_running: bool) -> bool {
-    management_running && file_running
+fn services_are_running(
+    management_running: bool,
+    file_running: bool,
+    endpoints_running: bool,
+) -> bool {
+    management_running && file_running && endpoints_running
 }
 
 impl ValidatingFileReceiver {
@@ -281,8 +311,9 @@ impl FileReceiver for ValidatingFileReceiver {
             return Err("文件网关签名设备编号与 SSH forced-command 桥接身份不一致。".into());
         }
         let body = serde_json::to_value(&request).map_err(|_| "固定文件网关开始请求无法编码。")?;
-        let mut stream = connect_file_gateway()?;
-        let (status, response) = file_gateway_exchange(&mut stream, &body, Some(&authorization), None)?;
+        let mut stream = connect_file_gateway(&self.endpoints)?;
+        let (status, response) =
+            file_gateway_exchange(&mut stream, &body, Some(&authorization), None)?;
         if status != 200 {
             return Err(file_gateway_error(status, &response));
         }
@@ -612,7 +643,7 @@ impl FileReceiver for ValidatingFileReceiver {
             .map_err(|_| "固定文件网关连接状态不可用。")?
             .remove(&session.channel_token);
         if stream.is_none() {
-            stream = Some(connect_file_gateway()?);
+            stream = Some(connect_file_gateway(&self.endpoints)?);
         }
         let mut stream = stream.ok_or("固定文件网关取消连接不可用。")?;
         let (status, response) = file_gateway_exchange(&mut stream, &payload, None, None)?;
@@ -689,12 +720,8 @@ fn send_file_gateway_action(
     file_gateway_exchange(stream, &payload, None, None)
 }
 
-fn connect_file_gateway() -> Result<TcpStream, String> {
-    let address = CORE_FILE_GATEWAY_ADDRESS
-        .parse::<SocketAddr>()
-        .map_err(|_| "固定设备文件网关回环地址无效。".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|_| "固定设备文件网关尚未就绪。".to_string())?;
+fn connect_file_gateway(endpoints: &EndpointDirectory) -> Result<TcpStream, String> {
+    let stream = endpoints.connect(BridgeChannel::Gateway)?;
     stream
         .set_nodelay(true)
         .map_err(|_| "无法配置固定文件网关连接。")?;
@@ -731,25 +758,33 @@ fn file_gateway_exchange(
         );
     }
     let (content_type, length) = match chunk {
-        Some(chunk) if payload.len() <= 4096 => ("application/octet-stream", 4 + payload.len() + chunk.len()),
+        Some(chunk) if payload.len() <= 4096 => {
+            ("application/octet-stream", 4 + payload.len() + chunk.len())
+        }
         Some(_) => return Err("设备文件二进制分块元数据超过大小上限。".into()),
         None => ("application/json", payload.len()),
     };
+    let authority = stream
+        .peer_addr()
+        .map_err(|_| "无法确认受管网关实际地址。")?;
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18765\r\nAccept: application/json\r\nContent-Type: {content_type}\r\n{headers}Connection: keep-alive\r\nContent-Length: {length}\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nContent-Type: {content_type}\r\n{headers}Connection: keep-alive\r\nContent-Length: {length}\r\n\r\n",
     );
     stream
         .write_all(request.as_bytes())
         .map_err(|_| "固定设备文件网关请求头写入失败。")?;
     if chunk.is_some() {
-        stream.write_all(&(payload.len() as u32).to_be_bytes())
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
             .map_err(|_| "固定设备文件网关二进制元数据长度写入失败。")?;
     }
     stream
         .write_all(&payload)
         .map_err(|_| "固定设备文件网关请求体写入失败。")?;
     if let Some(chunk) = chunk {
-        stream.write_all(chunk).map_err(|_| "固定设备文件网关原始分块写入失败。")?;
+        stream
+            .write_all(chunk)
+            .map_err(|_| "固定设备文件网关原始分块写入失败。")?;
     }
     stream
         .flush()
@@ -844,11 +879,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fixed_listener_addresses_are_loopback_only() {
-        let management = super::MANAGEMENT_ADDRESS
-            .parse::<std::net::SocketAddr>()
-            .unwrap();
-        let file = super::FILE_ADDRESS.parse::<std::net::SocketAddr>().unwrap();
+    fn dynamic_listeners_are_distinct_and_loopback_only() {
+        let management_listener = std::net::TcpListener::bind(super::DYNAMIC_LOOPBACK).unwrap();
+        let file_listener = std::net::TcpListener::bind(super::DYNAMIC_LOOPBACK).unwrap();
+        let management = management_listener.local_addr().unwrap();
+        let file = file_listener.local_addr().unwrap();
+        assert_ne!(management.port(), file.port());
+        assert!(management.port() > 0 && file.port() > 0);
         assert_eq!(
             management.ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -861,9 +898,10 @@ mod tests {
 
     #[test]
     fn broadcast_service_requires_both_management_and_file_listeners() {
-        assert!(!super::services_are_running(false, false));
-        assert!(!super::services_are_running(false, true));
-        assert!(!super::services_are_running(true, false));
-        assert!(super::services_are_running(true, true));
+        assert!(!super::services_are_running(false, false, true));
+        assert!(!super::services_are_running(false, true, true));
+        assert!(!super::services_are_running(true, false, true));
+        assert!(!super::services_are_running(true, true, false));
+        assert!(super::services_are_running(true, true, true));
     }
 }

@@ -14,7 +14,7 @@ import secrets
 import time
 from pathlib import Path
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, quote
 from uuid import uuid4
 
@@ -302,16 +302,19 @@ _GATEWAY_WEBSOCKET_PATHS = frozenset({"/v1/media", "/v1/voice"})
 
 
 class LoopbackDeviceGatewayGuard:
-    """LoopbackDeviceGatewayGuard（回环网关路径白名单）：18765 只暴露登记的轻量端点。"""
+    """LoopbackDeviceGatewayGuard（回环网关路径白名单）：实际网关监听只暴露登记的端点。"""
 
-    def __init__(self, app: Any, *, gateway_port: int, allowed_paths: frozenset[str]) -> None:
+    def __init__(self, app: Any, *, gateway_port: int | Callable[[], int | None], allowed_paths: frozenset[str]) -> None:
         self.app = app
         self.gateway_port = gateway_port
         self.allowed_paths = allowed_paths
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         server = scope.get("server")
-        if isinstance(server, (tuple, list)) and len(server) == 2 and server[1] == self.gateway_port:
+        port = self.gateway_port() if callable(self.gateway_port) else self.gateway_port
+        scope.pop("voice_terminal.device_gateway", None)
+        if port is not None and isinstance(server, (tuple, list)) and len(server) == 2 and server[1] == port:
+            scope["voice_terminal.device_gateway"] = True  # 仅由实际监听器门禁写入，不读取客户端请求头。
             if scope.get("type") != "http":
                 if scope.get("type") == "websocket":
                     path = scope.get("path")
@@ -535,8 +538,7 @@ async def _device_gateway_challenge_payload(request: Any) -> dict[str, Any]:
 
 def _require_device_gateway_port(request: Any) -> None:
     """_require_device_gateway_port（设备网关端口）：禁止业务端点暴露在普通 HTTP 端口。"""
-    server = request.scope.get("server")
-    if not isinstance(server, (tuple, list)) or len(server) != 2 or server[1] != 18_765:
+    if request.scope.get("voice_terminal.device_gateway") is not True:
         raise HTTPException(status_code=404, detail="设备业务请求只允许通过受限 SSH 回环网关。")
 
 
@@ -958,10 +960,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     except ImportError:  # pragma: no cover - FastAPI installs middleware with the app
         pass
 
-    # 18765（主机回环网关端口）复用此 ASGI（异步服务接口），但仅通过直连套接字提供显式允许的状态入口。
+    # 独立设备网关复用此 ASGI（异步服务接口），按实际绑定端口执行路径白名单。
     app.add_middleware(
         LoopbackDeviceGatewayGuard,
-        gateway_port=18_765,
+        gateway_port=lambda: getattr(runtime, "_device_gateway_port", None),
         allowed_paths=frozenset({"/v1/challenge", "/v1/status", "/v1/devices", "/v1/pairing/request",
                                  "/v1/session/open", "/v1/session/poll", "/v1/session/complete",
                                  "/v1/session/reconcile", "/v1/session/heartbeat", "/v1/session/close",
@@ -1991,9 +1993,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.post("/v1/pairing/request")
     async def device_gateway_pairing_request(request: Request) -> JSONResponse:
         """device_gateway_pairing_request（SSH 配对申请）：只接受限时码和设备私钥签名。"""
-        server = request.scope.get("server")
-        if not isinstance(server, (tuple, list)) or len(server) != 2 or server[1] != 18_765:
-            raise HTTPException(status_code=404, detail="配对申请只允许通过受限设备回环网关。")
+        _require_device_gateway_port(request)
         payload = await _device_pairing_payload(request)
         manager = getattr(runtime, "device_pairing_manager", None)
         trust_store = getattr(runtime, "device_trust_store", None)

@@ -1,8 +1,9 @@
-//! DeviceBridge（设备桥接）：SSH 强制命令早期入口，仅把有界会话转给本机固定网关。
+//! DeviceBridge（设备桥接）：SSH 强制命令早期入口，仅把有界会话转给当前受管端点。
 use crate::{
     device_config::{self, LoadResult, RunMode},
     device_management_contract::DeviceBridgePrelude,
     device_trust::DeviceTrustStore,
+    service_endpoints::{self, BridgeChannel, ServiceEndpoint},
     LaunchContext,
 };
 use std::{
@@ -14,9 +15,6 @@ const CONTROL_MARKER: &str = "voice-terminal-v1-control"; // CONTROL_MARKER（�
 const MEDIA_MARKER: &str = "voice-terminal-v1-media"; // MEDIA_MARKER（固定媒体通道标记）。
 const MANAGEMENT_MARKER: &str = "voice-terminal-v1-management"; // MANAGEMENT_MARKER（固定独立管理通道标记）。
 const FILE_MARKER: &str = "voice-terminal-v1-file"; // FILE_MARKER（固定文件通道标记）。
-const LOCAL_GATEWAY: &str = "127.0.0.1:18765"; // LOCAL_GATEWAY（唯一允许访问的本机回环业务入口）。
-const LOCAL_MANAGEMENT: &str = "127.0.0.1:18768"; // LOCAL_MANAGEMENT（独立管理服务的本机回环入口）。
-const LOCAL_FILE_CHANNEL: &str = "127.0.0.1:18769"; // LOCAL_FILE_CHANNEL（受限资源文件通道的本机回环入口）。
 
 #[derive(Debug)]
 struct BridgeArguments {
@@ -90,8 +88,9 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let marker = std::env::var("SSH_ORIGINAL_COMMAND")
         .map_err(|_| "OpenSSH 未提供原始会话标记；交互式 shell 被拒绝。".to_string())?;
-    let (target, send_prelude) = bridge_target(&marker)?;
+    let (channel, send_prelude) = bridge_target(&marker)?;
     verify_ssh_connection_scope(&marker)?;
+    let endpoint = service_endpoints::query(&context.install, &expected_executable, channel)?;
     let prelude = if send_prelude {
         let prelude = DeviceBridgePrelude {
             message_type: "bridge.prelude".into(),
@@ -118,16 +117,11 @@ fn run(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
-    relay_fixed_loopback(target, prelude.as_ref())
+    relay_registered_loopback(&endpoint, prelude.as_ref())
 }
 
-fn bridge_target(marker: &str) -> Result<(&'static str, bool), String> {
-    match marker {
-        CONTROL_MARKER | MEDIA_MARKER => Ok((LOCAL_GATEWAY, false)),
-        MANAGEMENT_MARKER => Ok((LOCAL_MANAGEMENT, true)),
-        FILE_MARKER => Ok((LOCAL_FILE_CHANNEL, true)),
-        _ => Err("OpenSSH 请求了未登记的桥接通道；命令、shell 和子系统均被拒绝。".into()),
-    }
+fn bridge_target(marker: &str) -> Result<(BridgeChannel, bool), String> {
+    BridgeChannel::from_marker(marker)
 }
 
 fn parse_arguments(args: &[String]) -> Result<BridgeArguments, String> {
@@ -255,9 +249,11 @@ fn ip_in_scope(address: IpAddr, scope: &str) -> bool {
     }
 }
 
-fn relay_fixed_loopback(target: &str, prelude: Option<&DeviceBridgePrelude>) -> Result<(), String> {
-    let mut upstream = std::net::TcpStream::connect(target)
-        .map_err(|_| "本机受限设备网关尚未运行；SSH 桥接没有访问其他地址。".to_string())?;
+fn relay_registered_loopback(
+    endpoint: &ServiceEndpoint,
+    prelude: Option<&DeviceBridgePrelude>,
+) -> Result<(), String> {
+    let mut upstream = endpoint.connect()?;
     upstream
         .set_nodelay(true)
         .map_err(|_| "无法配置本机桥接套接字。".to_string())?;
@@ -617,14 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn bridge_markers_route_only_to_fixed_loopback_services() {
-        assert_eq!(bridge_target(CONTROL_MARKER), Ok((LOCAL_GATEWAY, false)));
-        assert_eq!(bridge_target(MEDIA_MARKER), Ok((LOCAL_GATEWAY, false)));
+    fn bridge_markers_route_only_to_registered_services() {
+        assert_eq!(
+            bridge_target(CONTROL_MARKER),
+            Ok((BridgeChannel::Gateway, false))
+        );
+        assert_eq!(
+            bridge_target(MEDIA_MARKER),
+            Ok((BridgeChannel::Gateway, false))
+        );
         assert_eq!(
             bridge_target(MANAGEMENT_MARKER),
-            Ok((LOCAL_MANAGEMENT, true))
+            Ok((BridgeChannel::Management, true))
         );
-        assert_eq!(bridge_target(FILE_MARKER), Ok((LOCAL_FILE_CHANNEL, true)));
+        assert_eq!(bridge_target(FILE_MARKER), Ok((BridgeChannel::File, true)));
         assert!(bridge_target("127.0.0.1:9999").is_err());
         assert!(bridge_target("arbitrary-command").is_err());
     }

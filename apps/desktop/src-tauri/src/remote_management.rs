@@ -22,7 +22,7 @@ use voice_desktop_common::{
     device_trust::DeviceTrustStore,
 };
 
-const DEFAULT_REMOTE_MANAGEMENT_ADDRESS: &str = "127.0.0.1:18768"; // DEFAULT_REMOTE_MANAGEMENT_ADDRESS（仅回环监听地址）。
+const DEFAULT_REMOTE_MANAGEMENT_ADDRESS: &str = "127.0.0.1:0"; // DEFAULT_REMOTE_MANAGEMENT_ADDRESS（系统分配的回环监听地址）。
 const MAX_OPEN_LINE_BYTES: usize = 16 * 1024; // MAX_OPEN_LINE_BYTES（握手行最大字节数）。
 const MAX_REQUEST_LINE_BYTES: usize = 528 * 1024; // MAX_REQUEST_LINE_BYTES（512 KiB 参数上限外加管理信封空间）。
 const MAX_RESPONSE_LINE_BYTES: usize = 2 * 1024 * 1024; // MAX_RESPONSE_LINE_BYTES（管理响应行最大字节数）。
@@ -121,7 +121,7 @@ impl RemoteManagementService {
         }))
     }
 
-    /// start（启动服务）：只允许绑定 loopback（回环）地址；默认地址为 127.0.0.1:18768。
+    /// start（启动服务）：只允许绑定 loopback（回环）地址，支持端口 0（系统分配）。
     pub fn start(
         self: &Arc<Self>,
         bind_addr: SocketAddr,
@@ -235,7 +235,7 @@ impl RemoteManagementService {
         })
     }
 
-    /// start_default（启动默认服务）：只绑定 127.0.0.1:18768。
+    /// start_default（启动默认服务）：绑定 127.0.0.1:0 并返回实际端口。
     pub fn start_default(self: &Arc<Self>) -> Result<RemoteManagementHandle, String> {
         let address = DEFAULT_REMOTE_MANAGEMENT_ADDRESS
             .parse::<SocketAddr>()

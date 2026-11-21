@@ -16,6 +16,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from ..config import DshConfig
+from ..application.ports import managed_bind_port
 from ..paths import AppPaths, atomic_json
 from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
@@ -66,7 +67,7 @@ class DshRuntimeManager:
             raise ValueError("DSH callback origin must be loopback HTTP")
         self._bridge_token = new_bridge_token()
         self.bridge = DshBridgeClient(
-            origin=f"http://{config.host}:{config.port or 1}",
+            origin=f"http://{config.host}:{managed_bind_port(config.port) or 1}",
             token=self._bridge_token,
             timeout_ms=config.bridge_timeout_ms,
         )
@@ -97,7 +98,7 @@ class DshRuntimeManager:
             profile=self.config.profile,
             ui_origin=(self._actual_origin or (
                 f"http://{self.config.host}:{self.config.port}"
-                if self.config.enabled and self.config.port > 0 else None
+                if self.config.enabled and managed_bind_port(self.config.port) > 0 else None
             )),
             message=self._message,
         )
@@ -137,12 +138,13 @@ class DshRuntimeManager:
         self._actual_host = None
         self._actual_port = None
         self._actual_origin = None
-        self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
+        self.bridge.set_origin(f"http://{self.config.host}:{managed_bind_port(self.config.port) or 1}")
         self._launch_event.clear()
         self._closing = False
         try:
             node, cli = await self._validate_installation()
-            if self.config.port > 0 and self._port_in_use():
+            bind_port = managed_bind_port(self.config.port)  # bind_port（本轮监听请求端口）。
+            if bind_port > 0 and self._port_in_use():
                 raise RuntimeError(f"端口 {self.config.port} 已被未知进程占用；拒绝附着。")
             self.config.home_dir.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
@@ -174,7 +176,7 @@ class DshRuntimeManager:
                 if self._managed_shutdown:
                     command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
                 command += [str(cli), "web", "--host", self.config.host,
-                            "--port", str(self.config.port), "--no-open"]
+                            "--port", str(bind_port), "--no-open"]
             else:
                 if node is None:
                     raise RuntimeError("DSH 运行目录缺少 Node.js（脚本运行环境）。")
@@ -182,7 +184,7 @@ class DshRuntimeManager:
                 if self._managed_shutdown:
                     command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
                 command += [str(cli), "web", "--host", self.config.host,
-                            "--port", str(self.config.port), "--no-open"]
+                            "--port", str(bind_port), "--no-open"]
             self._process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.repo_root), env=env,
@@ -481,7 +483,7 @@ class DshRuntimeManager:
                 or port is None or not 1 <= port <= 65535 or address.path not in ("", "/")
                 or address.username or address.password or not address.query.startswith("token=")):
             raise RuntimeError("DSH 启动地址未绑定有效的本机端口。")
-        if self.config.port > 0 and port != self.config.port:
+        if managed_bind_port(self.config.port) > 0 and port != self.config.port:
             raise RuntimeError("DSH 标准输出端口与请求的固定端口不一致。")
         host = self.config.host
         origin = f"http://{host}:{port}"
@@ -533,7 +535,7 @@ class DshRuntimeManager:
             self._actual_host = None
             self._actual_port = None
             self._actual_origin = None
-            self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
+            self.bridge.set_origin(f"http://{self.config.host}:{managed_bind_port(self.config.port) or 1}")
             logger.warning("%s", self._message)
             self._process = None
             readers, self._reader_tasks = self._reader_tasks, []
@@ -606,7 +608,7 @@ class DshRuntimeManager:
         self._actual_host = None
         self._actual_port = None
         self._actual_origin = None
-        self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
+        self.bridge.set_origin(f"http://{self.config.host}:{managed_bind_port(self.config.port) or 1}")
 
     @staticmethod
     def extract_launch_url(line: str) -> str | None:

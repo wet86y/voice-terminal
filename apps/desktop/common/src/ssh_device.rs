@@ -38,7 +38,7 @@ use std::{
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use zeroize::Zeroizing;
 
-pub const DEFAULT_GATEWAY_PORT: u16 = 18_765; // DEFAULT_GATEWAY_PORT（主机回环业务网关端口）。
+pub const DEFAULT_GATEWAY_PORT: u16 = 18_765; // DEFAULT_GATEWAY_PORT（旧客户端 HTTP 请求地址的兼容端口；服务端按通道标记解析实际监听）。
 const CONTROL_BRIDGE_MARKER: &str = "voice-terminal-v1-control"; // CONTROL_BRIDGE_MARKER（受限 SSH 控制桥接标记）。
 const MEDIA_BRIDGE_MARKER: &str = "voice-terminal-v1-media"; // MEDIA_BRIDGE_MARKER（受限 SSH 媒体桥接标记）。
 const MANAGEMENT_BRIDGE_MARKER: &str = "voice-terminal-v1-management"; // MANAGEMENT_BRIDGE_MARKER（独立 SSH 原生管理桥接标记）。
@@ -97,7 +97,7 @@ pub struct SshDeviceTarget {
     pub port: u16,               // port（主机 SSH 端口）。
     pub username: String,        // username（受管 SSH 登录账户）。
     pub host_key_sha256: String, // host_key_sha256（用户已确认的 SHA-256 主机指纹）。
-    pub gateway_port: u16,       // gateway_port（主机回环业务网关端口）。
+    pub gateway_port: u16,       // gateway_port（HTTP 请求地址的兼容端口，不用于选择服务端监听器）。
 }
 
 impl SshDeviceTarget {

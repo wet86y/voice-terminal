@@ -25,7 +25,7 @@ from ..log_budget import enforce_log_budget
 from ..devices.diagnostics import device_event
 from ..resources import ResourcePolicy
 from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
-from .ports import validate_endpoint_report
+from .ports import validate_endpoint_report, preferred_endpoint_url
 
 log = logging.getLogger(__name__)
 
@@ -182,9 +182,9 @@ class ApplicationHost:
             return False
         key = payload.get("component")
         generation = payload.get("generation")
-        if not isinstance(key, str) or key not in {"voice", "speaker", "dsh", "asr", "analysis"} or self.state.snapshot()["stopping"]:
+        if not isinstance(key, str) or key not in {"voice", "speaker", "dsh", "asr", "analysis", "gateway"} or self.state.snapshot()["stopping"]:
             return False
-        owner = "voice" if key in {"speaker", "dsh"} else key
+        owner = "voice" if key in {"speaker", "dsh", "gateway"} else key
         if generation != self.generations.get(owner):
             return False
         endpoint = payload.get("endpoint")
@@ -210,6 +210,8 @@ class ApplicationHost:
                 self.manifest["speaker_url"] = detail["url"]
             elif key == "dsh":
                 self.manifest["dsh_url"] = detail["url"]
+        if key == "gateway":
+            return endpoint_url is not None or endpoint is not None
         row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
         self.state.component(key, phase=str(payload.get("phase", ""))[:200],
             **({"state": "starting"} if row["state"] == "waiting" else {}))
@@ -217,7 +219,7 @@ class ApplicationHost:
 
     def _endpoint_pid_is_owned(self, key: str, pid: int, created_at: float | None) -> bool:
         """Confirm a reporting PID belongs to this service generation's process tree."""
-        process_key = "voice" if key in {"speaker", "dsh"} else key
+        process_key = "voice" if key in {"speaker", "dsh", "gateway"} else key
         owner = self.processes.get(process_key)
         if owner is None or owner.poll() is not None:
             return False
@@ -246,7 +248,7 @@ class ApplicationHost:
         if key in {"voice", "asr", "analysis"}:
             self.state.clear_endpoint(key, generation=generation)
         if key == "voice":
-            for dependent in ("speaker", "dsh"):
+            for dependent in ("speaker", "dsh", "gateway"):
                 self.state.clear_endpoint(dependent, generation=generation)
         snapshot = self.state.snapshot()
         endpoint_table = {
@@ -387,10 +389,10 @@ class ApplicationHost:
         if self.manifest["voice_host"] not in {"127.0.0.1", "localhost"}:
             raise RuntimeError("应用模式的语音服务必须绑定本机回环地址。")
         api = f"http://127.0.0.1:{self.manifest['voice_port']}"
-        self.state.set_endpoint("voice", None, preferred_url=api)
-        self.state.set_endpoint("asr", None, preferred_url=self.manifest["asr_url"])
-        self.state.set_endpoint("analysis", None, preferred_url=self.manifest["analysis_url"])
-        self.state.set_endpoint("speaker", None, preferred_url=self.manifest.get("speaker_url", ""))
+        self.state.set_endpoint("voice", None, preferred_url=preferred_endpoint_url("voice", api))
+        self.state.set_endpoint("asr", None, preferred_url=preferred_endpoint_url("asr", self.manifest["asr_url"]))
+        self.state.set_endpoint("analysis", None, preferred_url=preferred_endpoint_url("analysis", self.manifest["analysis_url"]))
+        self.state.set_endpoint("speaker", None, preferred_url=preferred_endpoint_url("speaker", self.manifest.get("speaker_url", "")))
         dsh_url = self.manifest.get("dsh_url")
         if dsh_url:
             self.state.set_endpoint("dsh", None, preferred_url=dsh_url)
@@ -527,6 +529,8 @@ class ApplicationHost:
         self.state.update(device_gateway_enabled=result.get("enabled") is True,
                           device_gateway_ready=result.get("ready") is True,
                           device_gateway_error=str(result.get("error") or "")[:240])
+        if result.get("ready") is not True:
+            self.state.clear_endpoint("gateway", generation=self.generations.get("voice"))
         return result
 
     def create_wake_task(self, payload: dict) -> dict:
@@ -657,6 +661,8 @@ class ApplicationHost:
             gateway = data.get("device_gateway", {})
             if not isinstance(gateway, dict):
                 gateway = {}
+            if gateway.get("ready") is not True:
+                self.state.clear_endpoint("gateway", generation=self.generations.get("voice"))
             self.state.update(
                 device_gateway_enabled=gateway.get("enabled") is True,
                 device_gateway_ready=gateway.get("ready") is True,
@@ -745,7 +751,7 @@ class ApplicationHost:
             if process.poll() is not None:
                 self.state.clear_endpoint(key, generation=generation)
                 if key == "voice":
-                    for dependent in ("speaker", "dsh"):
+                    for dependent in ("speaker", "dsh", "gateway"):
                         self.state.clear_endpoint(dependent, generation=generation)
                 if using_gpu and not force_cpu:
                     log.warning("显卡解释器启动失败，%s（组件）恢复中央处理器环境。", key)
@@ -773,7 +779,7 @@ class ApplicationHost:
         self.stop_group(key)
         self.state.clear_endpoint(key, generation=generation)
         if key == "voice":
-            for dependent in ("speaker", "dsh"):
+            for dependent in ("speaker", "dsh", "gateway"):
                 self.state.clear_endpoint(dependent, generation=generation)
         if using_gpu and not force_cpu:
             return await self.start_service(key, entry_only=entry_only, force_cpu=True)
@@ -1256,6 +1262,7 @@ class ApplicationHost:
                         if key in {"voice", "asr"}:
                             self.state.update(core_available=False)
                         if key == "voice":
+                            self.state.clear_endpoint("gateway", generation=self.generations.get("voice"))
                             for name in ("dsh", "speaker"):
                                 self.state.clear_endpoint(name, generation=self.generations.get("voice"))
                                 self.state.component(name, state="blocked", phase="语音服务已退出", pid=None)

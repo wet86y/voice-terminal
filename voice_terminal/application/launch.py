@@ -285,15 +285,14 @@ async def run(args, root):
     desktop = None
     frontend = root / ".local/build/frontend" if (root / "apps/desktop/Cargo.toml").is_file() else root / "apps/frontend/dist"
     app.frontend_directory = frontend  # frontend_directory（界面路径）：服务、状态和重试共用。
-    host_preferred_port = 8764 if args.dev else 5173
-    host = HostWeb(app, frontend, port=host_preferred_port, continuity=continuity)
+    # 首次启动由系统分配端口；同一窗口恢复由私有管道交接原实际地址。
+    host = HostWeb(app, frontend, continuity=continuity)
     app.origin = host.origin  # origin（宿主内部地址）：业务组件报告与内部 Bearer 校验使用此地址。
     app.frontend_origin = host.origin  # frontend_origin（实际界面地址）：启动后更新为 Node 开发界面地址。
     host_created_at = _process_created_at()
-    app.state.set_endpoint("host", host.origin, preferred_url=f"http://127.0.0.1:{host_preferred_port}",
+    app.state.set_endpoint("host", host.origin,
         generation=app.state.value["instance_id"], pid=os.getpid(), created_at=host_created_at)
     app.state.set_endpoint("web", None,
-        preferred_url=f"http://127.0.0.1:{5173 if args.dev else host_preferred_port}",
         generation=app.state.value["instance_id"], pid=os.getpid(), created_at=host_created_at)
     host.start()
     for key in ("host", "web"):
@@ -323,7 +322,7 @@ async def run(args, root):
             if continuity and app.frontend_origin != continuity["frontend_origin"]:
                 raise RuntimeError("恢复后的开发界面来源与当前窗口不匹配。")
             app.state.set_endpoint("web", app.frontend_origin,
-                preferred_url="http://127.0.0.1:5173", generation=app.state.value["instance_id"],
+                generation=app.state.value["instance_id"],
                 pid=process.pid, created_at=process.created_at)
             app.state.component("web", state="ready", phase="开发界面已完成本实例握手",
                 pid=process.pid, created_at=process.created_at, shared_with=None, error="")
@@ -336,13 +335,13 @@ async def run(args, root):
             # 开发界面失败时保持本实例 Host（宿主）的会话受控诊断页。
             app.frontend_origin = host.origin
             app.state.set_endpoint("web", host.origin,
-                preferred_url=f"http://127.0.0.1:{host_preferred_port}", generation=app.state.value["instance_id"],
+                generation=app.state.value["instance_id"],
                 pid=os.getpid(), created_at=host_created_at)
             app.state.component("web", state="failed", phase="开发界面启动失败", error=str(exc), pid=os.getpid())
 
     if not args.dev:
         app.state.set_endpoint("web", host.origin,
-            preferred_url=f"http://127.0.0.1:{host_preferred_port}", generation=app.state.value["instance_id"],
+            generation=app.state.value["instance_id"],
             pid=os.getpid(), created_at=host_created_at)
 
     registry = app.paths.application_state / "instance.json"
@@ -376,18 +375,19 @@ async def run(args, root):
         reported_endpoints = -1  # reported_endpoints（已发送给桌面的端点版本）。
         while not app.exit_event.is_set():
             status = app.state.snapshot()
+            if desktop and status["endpoint_revision"] != reported_endpoints:
+                # 先交接实际端点，再发布依赖该地址的就绪状态或公告。
+                desktop.send("endpoints", endpoints=status["endpoints"], endpoint_revision=status["endpoint_revision"])
+                reported_endpoints = status["endpoint_revision"]
             current_runtime = (status["core_available"], status["state"],
-                status["device_gateway_enabled"], status["device_gateway_ready"], status["device_gateway_error"])
+                status["device_gateway_enabled"], status["device_gateway_ready"], status["device_gateway_error"],
+                status["endpoint_revision"])
             if desktop and status["startup_complete"] and current_runtime != reported_runtime:
                 desktop.send("runtime_status", core_available=status["core_available"], state=status["state"],
                     device_gateway_enabled=status["device_gateway_enabled"],
                     device_gateway_ready=status["device_gateway_ready"],
                     device_gateway_error=status["device_gateway_error"])
                 reported_runtime = current_runtime
-            if desktop and status["endpoint_revision"] != reported_endpoints:
-                # 端点均由宿主核验过进程归属；私有管道只传不含令牌的来源。
-                desktop.send("endpoints", endpoints=status["endpoints"], endpoint_revision=status["endpoint_revision"])
-                reported_endpoints = status["endpoint_revision"]
             if status["startup_complete"] and not reported_startup:
                 # startup-result（启动快照）字段带同一进程身份，供磁盘状态核对，不作为实时状态来源。
                 result = {"schema": 1, "instance_id": status["instance_id"], "state": status["state"],

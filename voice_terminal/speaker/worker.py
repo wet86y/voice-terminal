@@ -31,7 +31,7 @@ from ..logging_setup import configure_logging
 from ..server.product import ProductSettingsStore
 from ..compute import process_memory_bytes
 from ..application.managed import report_endpoint, wait_for_shutdown
-from ..application.ports import bind_loopback, endpoint_url
+from ..application.ports import bind_loopback, endpoint_url, managed_bind_port
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +351,7 @@ async def run(config_path: Path | None = None) -> None:
             path=AppPaths.resolve(root).config / "product-settings.json",
             config=config,
         ).effective_config()
-    listener, actual_port = bind_loopback(config.speaker_worker.port, host=config.speaker_worker.host)
+    listener, actual_port = bind_loopback(managed_bind_port(config.speaker_worker.port), host=config.speaker_worker.host)
     model_path = config.speaker_model_path
     engine = SpeakerWorkerEngine(
         model_path, sample_rate=config.audio.sample_rate,

@@ -42,7 +42,8 @@ function trustedHost(value) {
 
 /** createDesktopServer（建立受管开发服务）。
  * root（源码根目录）；mode（产品或样例模式）；cookieName（会话凭据名称）；session（会话随机值）；
- * instanceId（所属实例编号）；hostOrigin（产品宿主地址）；port（端口，仅供本地自动测试注入）。
+ * instanceId（所属实例编号）；hostOrigin（产品宿主地址）；port（监听请求端口，默认由系统分配）；
+ * strictPort（连续窗口恢复时必须保留原端口）。
  */
 export async function createDesktopServer({ root, mode, cookieName, session, instanceId, hostOrigin, port, strictPort = false }) {
   if (!['product', 'ui-preview'].includes(mode)) throw new Error('桌面开发模式无效。')
@@ -137,7 +138,7 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     if (server.listening) await new Promise(resolveClose => server.close(resolveClose))
   }
   try {
-    const preferredPort = port ?? (preview ? 5174 : 5173)
+    const preferredPort = port ?? 0
     const listen = selectedPort => new Promise((resolveListen, rejectListen) => {
       const onError = error => rejectListen(error)
       server.once('error', onError)
@@ -151,7 +152,8 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     } catch (error) {
       // The bind itself is authoritative; on a collision ask the OS for an
       // available ephemeral port instead of probing and racing another process.
-      if (strictPort || error.code !== 'EADDRINUSE') throw error
+      const unavailable = error.code === 'EADDRINUSE' || (process.platform === 'win32' && error.code === 'EACCES')
+      if (strictPort || preferredPort === 0 || !unavailable) throw error
       await listen(0)
     }
     const actualPort = server.address().port

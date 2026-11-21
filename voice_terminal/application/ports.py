@@ -18,6 +18,7 @@ ENDPOINT_PATHS = {
     "analysis": "/analysis",
     "speaker": "/speaker",
     "dsh": "/",
+    "gateway": "/",  # gateway（受保护的设备回环网关）。
 }
 ENDPOINT_SCHEMES = {
     "host": {"http"},
@@ -27,6 +28,7 @@ ENDPOINT_SCHEMES = {
     "analysis": {"ws"},
     "speaker": {"ws"},
     "dsh": {"http"},
+    "gateway": {"http"},
 }
 ENDPOINT_ENV = "VOICE_APP_ENDPOINTS"  # VOICE_APP_ENDPOINTS（受管端点表）。
 
@@ -34,6 +36,18 @@ ENDPOINT_ENV = "VOICE_APP_ENDPOINTS"  # VOICE_APP_ENDPOINTS（受管端点表）
 def is_address_in_use(exc: OSError) -> bool:
     """Recognize EADDRINUSE on POSIX and Winsock（Windows 套接字错误码）."""
     return exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048
+
+
+def is_port_unavailable(exc: OSError) -> bool:
+    """Recognize port collisions（端口冲突）and Windows（操作系统）的独占或保留端口。"""
+    return is_address_in_use(exc) or getattr(exc, "winerror", None) == 10013
+
+
+def managed_bind_port(configured_port: int) -> int:
+    """Managed services（受管服务）请求系统分配端口；独立调试沿用配置端口。"""
+    if type(configured_port) is not int or not 0 <= configured_port <= 65535:
+        raise ValueError("配置端口必须为 0 到 65535 之间的整数。")
+    return 0 if os.environ.get("VOICE_APP_ORIGIN") else configured_port
 
 
 def bind_loopback(preferred_port: int, *, host: str = "127.0.0.1") -> tuple[socket.socket, int]:
@@ -66,7 +80,7 @@ def bind_loopback(preferred_port: int, *, host: str = "127.0.0.1") -> tuple[sock
     try:
         listener = create(preferred_port)
     except OSError as exc:
-        if preferred_port == 0 or not is_address_in_use(exc):
+        if preferred_port == 0 or not is_port_unavailable(exc):
             raise
         listener = create(0)
     return listener, int(listener.getsockname()[1])
@@ -80,11 +94,11 @@ def endpoint_url(component: str, port: int, *, host: str = "127.0.0.1") -> str:
         raise ValueError("端点主机必须是本机回环地址。")
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("已绑定端口必须为 1 到 65535 之间的整数。")
-    scheme = "http" if component in {"host", "web", "voice", "dsh"} else "ws"
+    scheme = "http" if component in {"host", "web", "voice", "dsh", "gateway"} else "ws"
     return urlunsplit((scheme, f"{host}:{port}", ENDPOINT_PATHS[component], "", "")).rstrip("/")
 
 
-def validate_endpoint_url(component: str, value: object) -> dict[str, object]:
+def validate_endpoint_url(component: str, value: object, *, allow_unbound: bool = False) -> dict[str, object]:
     """Validate and describe an actual endpoint URL（实际端点地址）."""
     if component not in ENDPOINT_PATHS or not isinstance(value, str):
         raise ValueError("端点组件或地址无效。")
@@ -96,7 +110,7 @@ def validate_endpoint_url(component: str, value: object) -> dict[str, object]:
     expected_path = ENDPOINT_PATHS[component]
     if (address.scheme not in ENDPOINT_SCHEMES[component]
             or address.hostname not in {"127.0.0.1", "localhost"}
-            or port is None or not 1 <= port <= 65535
+            or port is None or not (0 if allow_unbound else 1) <= port <= 65535
             or address.username or address.password or address.query or address.fragment
             or address.path not in ({"", "/"} if expected_path == "/" else {expected_path})):
         raise ValueError("端点地址不符合本机协议约束。")
@@ -107,6 +121,14 @@ def validate_endpoint_url(component: str, value: object) -> dict[str, object]:
         "port": port,  # port（实际监听端口）。
         "path": expected_path,  # path（组件协议路径）。
     }
+
+
+def preferred_endpoint_url(component: str, value: str) -> str | None:
+    """Validate a configured address（配置地址）；端口 0 在绑定前没有可发布的首选地址。"""
+    if not value:
+        return None
+    detail = validate_endpoint_url(component, value, allow_unbound=True)
+    return str(detail["url"]) if detail["port"] else None
 
 
 def validate_endpoint_report(component: str, payload: dict) -> dict[str, object]:

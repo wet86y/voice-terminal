@@ -126,7 +126,7 @@ def _simulate_native_trust_write(runtime: SessionRuntime, device_id: str, public
 
 async def _signed_gateway_post(app, private_key, device_id: str, path: str, payload: dict):
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18765") as client:
+    async with httpx.AsyncClient(transport=transport, base_url=app.state.test_gateway_origin) as client:
         challenge_response = await client.post("/v1/challenge", json={
             "protocol_version": 1, "device_id": device_id, "method": "POST", "path": path,
         })
@@ -174,6 +174,8 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         )
         settings = ProductSettingsStore(path=tmp_path / "config" / "product-settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".local")
+        from tests.device_gateway_support import configure_test_gateway
+        gateway_port = configure_test_gateway(runtime)
         async def keep_test_tts_state() -> bool:
             return True
         runtime.refresh_client_tts_service = keep_test_tts_state
@@ -182,6 +184,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         )
         with patch.dict(os.environ, {"VOICE_WEB_ORIGINS": "http://127.0.0.1:9123"}):
             app = create_app(runtime, model_registry=model_registry, product_settings=settings)
+            app.state.test_gateway_origin = f"http://127.0.0.1:{gateway_port}"
 
         accepted_pcm: list[bytes] = []
         playback_progress: list[dict] = []
@@ -264,7 +267,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         }
         challenge_transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=challenge_transport,
-                                     base_url="http://127.0.0.1:18765") as client:
+                                     base_url=app.state.test_gateway_origin) as client:
             challenge_response = await client.post("/v1/challenge", json={
                 "protocol_version": 1,
                 "device_id": "client-media",
@@ -280,7 +283,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
             timestamp_ms=timestamp_ms, payload=handshake,
         )
         headers = [
-            (b"host", b"127.0.0.1:18765"),
+            (b"host", f"127.0.0.1:{gateway_port}".encode()),
             (b"x-voice-terminal-device-id", b"client-media"),
             (b"x-voice-terminal-core-session-id", challenge["core_session_id"].encode("ascii")),
             (b"x-voice-terminal-challenge", challenge["challenge"].encode("ascii")),
@@ -445,7 +448,7 @@ def test_signed_media_websocket_maps_device_clock_and_client_tts_direct_output(
         scope = {
             "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
             "scheme": "ws", "path": "/v1/media", "raw_path": b"/v1/media",
-            "query_string": query, "headers": headers, "server": ("127.0.0.1", 18_765),
+            "query_string": query, "headers": headers, "server": ("127.0.0.1", gateway_port),
             "client": ("127.0.0.1", 49152), "subprotocols": [], "state": {},
         }
         try:

@@ -10,7 +10,6 @@ import math
 import os
 from pathlib import Path
 import re
-import socket
 
 from .aniflive_native import contained
 
@@ -207,14 +206,13 @@ def main():
         from .aniflive_diagnostics import install_step_candidate
         install_step_candidate(streaming, upstream, args.diagnostic_step_candidate, package, local)
     install_bridge(app, upstream, library, token)
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(('127.0.0.1', 0))
-    listener.listen(128)
+    from ..application.ports import bind_loopback
+    listener, actual_port = bind_loopback(0)
     original_lifespan = app.router.lifespan_context
     @asynccontextmanager
     async def lifespan(app):
         async with original_lifespan(app):
-            print('ANIFLIVE_READY=' + json.dumps({'port': listener.getsockname()[1], 'nonce': args.nonce, 'pid': os.getpid()}), flush=True)
+            print('ANIFLIVE_READY=' + json.dumps({'port': actual_port, 'nonce': args.nonce, 'pid': os.getpid()}), flush=True)
             yield
     app.router.lifespan_context = lifespan
     import uvicorn

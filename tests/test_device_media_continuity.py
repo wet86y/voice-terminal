@@ -25,6 +25,8 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
         config = AppConfig(model_dir=tmp_path / "models", persona=PersonaConfig(directory=tmp_path / "persona"))
         settings = ProductSettingsStore(path=tmp_path / "settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / "runtime")
+        from tests.device_gateway_support import configure_test_gateway
+        gateway_port = configure_test_gateway(runtime)
         route = SelectableCapturePort(_LocalCapture())
         runtime._capture_router = route
 
@@ -49,7 +51,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
                      "connection_generation": connection.connection_generation,
                      "executor_generation": connection.executor_generation,
                      "interaction_generation": lease.interaction_generation}
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:18765") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=f"http://127.0.0.1:{gateway_port}") as client:
             response = await client.post("/v1/challenge", json={"protocol_version": 1, "device_id": device_id,
                                                                 "method": "GET", "path": "/v1/media"})
         assert response.status_code == 200
@@ -57,7 +59,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
         timestamp = time.time_ns() // 1_000_000
         proof = device_request_proof_message(method="GET", path="/v1/media", device_id=device_id,
             core_session_id=runtime.core_session_id, challenge=challenge["challenge"], timestamp_ms=timestamp, payload=handshake)
-        headers = [(b"host", b"127.0.0.1:18765"), (b"x-voice-terminal-device-id", device_id.encode()),
+        headers = [(b"host", f"127.0.0.1:{gateway_port}".encode()), (b"x-voice-terminal-device-id", device_id.encode()),
                    (b"x-voice-terminal-core-session-id", runtime.core_session_id.encode()),
                    (b"x-voice-terminal-challenge", challenge["challenge"].encode()),
                    (b"x-voice-terminal-timestamp-ms", str(timestamp).encode()),
@@ -116,7 +118,7 @@ def test_authenticated_media_survives_ten_minutes_and_ten_input_restarts(tmp_pat
 
         scope = {"type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "ws",
                  "path": "/v1/media", "raw_path": b"/v1/media", "query_string": urlencode(handshake).encode(),
-                 "headers": headers, "server": ("127.0.0.1", 18765), "client": ("127.0.0.1", 45123),
+                 "headers": headers, "server": ("127.0.0.1", gateway_port), "client": ("127.0.0.1", 45123),
                  "subprotocols": [], "state": {}}
         try:
             await asyncio.wait_for(app(scope, incoming.get, send), 5)

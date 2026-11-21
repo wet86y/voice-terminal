@@ -13,13 +13,14 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { currentEndpoint } from './lib/current-endpoints.mjs'
 
 const browserInfo = JSON.parse(readFileSync(join(process.env.LOCALAPPDATA, 'ego-lite-linux', 'browser.json'), 'utf8'))
 const ENDPOINT = `http://127.0.0.1:${browserInfo.port}`
-const CONSOLE_ORIGIN = '127.0.0.1:3081'
+const CONSOLE_ORIGIN = await currentEndpoint('dsh')
 
 const targets = await (await fetch(`${ENDPOINT}/json/list`)).json()
-const target = targets.find(item => item.type === 'page' && item.url.includes(CONSOLE_ORIGIN))
+const target = targets.find(item => item.type === 'page' && URL.canParse(item.url) && new URL(item.url).origin === CONSOLE_ORIGIN)
 if (!target) throw new Error(`no DSH console page open at ${CONSOLE_ORIGIN}; open it from the Voice Terminal top bar first`)
 
 const socket = new WebSocket(target.webSocketDebuggerUrl)

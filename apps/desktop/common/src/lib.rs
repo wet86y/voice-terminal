@@ -19,7 +19,8 @@ mod component_upgrade; // component_upgrade（组件兼容迁移）：由本体�
 pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
 pub mod device_audio; // device_audio（原生音频端点）：读取 WASAPI 默认端点格式，不采集或播放。
 #[cfg(feature = "ssh-device")]
-pub mod device_bridge; // device_bridge（SSH 强制命令早期入口，只访问固定回环业务网关）。
+pub mod device_bridge; // device_bridge（SSH 强制命令早期入口，只访问受管回环业务网关）。
+pub mod service_endpoints; // service_endpoints（正式本机端点目录与按工作区隔离的查询管道）。
 pub mod device_config; // device_config（设备配置）：独立格式及保留原件的兼容校验。
 #[cfg(feature = "ssh-device")]
 pub mod device_discovery; // device_discovery（局域网 mDNS 发现）：公告固定能力和服务身份，不公布密钥。

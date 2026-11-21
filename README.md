@@ -214,7 +214,7 @@ MINIMAX_API_KEY=
 ### 默认入口
 
 - 产品界面：通过桌面程序打开；普通浏览器访问本机地址只显示启动说明。
-- 语音服务：使用宿主端点表中的实际地址，首选端口 8765 被占用时由系统分配。
+- 语音服务：由系统在启动时分配回环端口，连接使用宿主端点表中的实际地址。
 - WebSocket：使用实际语音服务地址的 `/ws`。
 - 健康检查：使用实际语音服务地址的 `/health`；可应答不代表全部模型推理已就绪。
 - 后台执行控制台：从工作台「后台协作」面板底部的「代理控制台」进入。
@@ -231,7 +231,7 @@ MINIMAX_API_KEY=
 
 下列 `.local/data` 路径描述开发渠道；分发渠道的对应位置为所选工作区的 `data` 目录。
 
-- `config/default.yaml`：默认运行参数、首选端口、模型、唤醒词、音频和后台执行配置；分发程序使用工作区 `app/config/default.yaml`。
+- `config/default.yaml`：默认运行参数、独立调试端口、模型、唤醒词、音频和后台执行配置；受管内部组件由系统分配端口，分发程序使用工作区 `app/config/default.yaml`。
 - `.local/data/config/local.yaml`：保存当前非密钥运行参数，不提交真实凭据。
 - `.local/data/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）；通过设置页保存后立即对后续请求生效。源码 `config/templates/persona/` 只用于补齐缺失资料。
 - `config/shadow_agent/`：后台执行指令和工具策略。

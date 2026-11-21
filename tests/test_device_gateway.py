@@ -16,6 +16,25 @@ from voice_terminal.server.http_api import (
 )
 
 
+def test_live_gateway_port_switch_preserves_whitelist_and_rejects_old_port():
+    runtime = SimpleNamespace(_device_gateway_port=43127, health_payload=lambda: {"same_core": True})
+    app = create_app(runtime)
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:43127") as client:
+            assert (await client.get("/health")).status_code == 404
+            # 无凭据不通过业务鉴权，但请求已通过当前网关端口门禁。
+            payload = {"protocol_version": 1, "device_id": "client", "method": "POST", "path": "/v1/status"}
+            assert (await client.post("/v1/challenge", json=payload, headers={"Host": "127.0.0.1:18765"})).status_code == 503
+            runtime._device_gateway_port = 43128
+            assert (await client.post("/v1/challenge", json={}, headers={"Host": "127.0.0.1:43128"})).status_code == 404
+            assert (await client.get("/health")).json() == {"same_core": True}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:43128") as client:
+            assert (await client.get("/health")).status_code == 404
+            runtime._device_gateway_port = None
+            assert (await client.post("/v1/challenge", json={})).status_code == 404
+    asyncio.run(scenario())
+
+
 def _scope(port: int, *, method: str = "GET", path: str = "/health", kind: str = "http"):
     return {
         "type": kind,
@@ -111,7 +130,10 @@ def test_file_gateway_accepts_raw_upload_chunks_on_the_original_ticket(tmp_path)
         registry = DeviceRegistry()
         connection = registry.connect("client-a", capabilities=("file_transfer",))
         store = DeviceFileTransferStore(tmp_path)
-        app = create_app(SimpleNamespace(device_registry=registry, device_file_transfer_store=store))
+        runtime = SimpleNamespace(device_registry=registry, device_file_transfer_store=store)
+        from tests.device_gateway_support import configure_test_gateway
+        port = configure_test_gateway(runtime)
+        app = create_app(runtime)
         raw = bytes(range(256)) * 256
         sha256 = hashlib.sha256(raw).hexdigest()
         ticket = {
@@ -128,7 +150,7 @@ def test_file_gateway_accepts_raw_upload_chunks_on_the_original_ticket(tmp_path)
         packed = json.dumps(metadata).encode("utf-8")
         framed = len(packed).to_bytes(4, "big") + packed + raw
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18765") as client:
+        async with httpx.AsyncClient(transport=transport, base_url=f"http://127.0.0.1:{port}") as client:
             headers = {"content-type": "application/octet-stream"}
             url = "/v1/file-transfer"
             response = await client.post(url, content=framed[:-1] + b"\x00", headers=headers)

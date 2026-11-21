@@ -58,7 +58,7 @@ function upgrade(origin, headers = {}, path = '/') {
 }
 
 test('浏览器无会话只见说明，桌面凭据单次消费，热更新连接也校验会话', async () => {
-  const server = await createDesktopServer({ root, mode: 'ui-preview', port: 0 })
+  const server = await createDesktopServer({ root, mode: 'ui-preview' })
   let fallbackServer
   try {
     const hint = await request(server.origin, '/')
@@ -106,6 +106,27 @@ test('浏览器无会话只见说明，桌面凭据单次消费，热更新连�
   } finally {
     try { await fallbackServer?.close() }
     finally { await server.close() }
+  }
+})
+
+test('Windows 独占或保留端口访问拒绝时改用动态端口，连续窗口恢复保留失败', { skip: process.platform !== 'win32' }, async () => {
+  const listen = http.Server.prototype.listen
+  let server
+  http.Server.prototype.listen = function (options, ...args) {
+    if (options?.port === 1) {
+      queueMicrotask(() => this.emit('error', Object.assign(new Error('测试端口访问被拒绝'), { code: 'EACCES' })))
+      return this
+    }
+    return listen.call(this, options, ...args)
+  }
+  try {
+    server = await createDesktopServer({ root, mode: 'ui-preview', port: 1 })
+    assert.ok(Number(new URL(server.origin).port) > 1)
+    assert.equal((await request(server.origin, '/')).status, 200)
+    await assert.rejects(createDesktopServer({ root, mode: 'ui-preview', port: 1, strictPort: true }), { code: 'EACCES' })
+  } finally {
+    http.Server.prototype.listen = listen
+    await server?.close()
   }
 })
 

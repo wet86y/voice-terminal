@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .. import agent_debug
 import re
 
-from .ports import is_address_in_use
+from .ports import is_port_unavailable
 
 from .startup_page import loading_page, render_startup_page
 
@@ -150,7 +150,7 @@ class HostWeb:
 
     launch_token_lifetime_seconds = 60  # launch_token_lifetime_seconds（入口令牌有效秒数）。
 
-    def __init__(self, application, directory: Path, *, port: int = 5173, continuity: dict | None = None) -> None:
+    def __init__(self, application, directory: Path, *, port: int = 0, continuity: dict | None = None) -> None:
         self.application = application
         self.directory = directory.resolve()
         self.instance_id = str(application.state.value["instance_id"])  # instance_id（应用实例标识）。
@@ -491,7 +491,7 @@ class HostWeb:
         try:
             self.server = OwnedServer(("127.0.0.1", port), Handler)
         except OSError as exc:
-            if continuity or not is_address_in_use(exc):
+            if continuity or port == 0 or not is_port_unavailable(exc):
                 raise
             # The bind itself arbitrates availability; keep the selected
             # socket open so no other process can claim the returned port.

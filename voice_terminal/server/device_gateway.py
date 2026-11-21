@@ -7,13 +7,15 @@ from contextlib import nullcontext
 import uvicorn
 
 from ..application.ports import bind_loopback
+from ..application.managed import report_endpoint
+from ..application.ports import endpoint_url
 
 
 class DeviceGateway:
-    def __init__(self, app, runtime, *, port: int = 18_765) -> None:
+    def __init__(self, app, runtime, *, port: int = 0) -> None:
         self.app = app
         self.runtime = runtime
-        self.port = port  # port（固定回环端口；测试可注入独立端口）。
+        self.port = port  # port（监听请求端口；默认由系统分配）。
         self.lock = asyncio.Lock()  # lock（开关和退出共用的监听交接锁）。
         self.server = None
         self.task = None
@@ -32,10 +34,9 @@ class DeviceGateway:
                 await self._stop()
             try:
                 listener, actual_port = bind_loopback(self.port, host="127.0.0.1")
-                if actual_port != self.port:
-                    listener.close()
-                    raise OSError("设备回环网关端口已占用。")
                 self.socket = listener
+                # 路径白名单必须在开始处理请求前绑定实际端口。
+                self.runtime._device_gateway_port = actual_port
 
                 class GatewayServer(uvicorn.Server):
                     def capture_signals(self):
@@ -45,7 +46,7 @@ class DeviceGateway:
                 self.server = GatewayServer(uvicorn.Config(
                     self.app, lifespan="off", log_config=None, access_log=False,
                     timeout_graceful_shutdown=1, ws_max_size=270_336,
-                    host="127.0.0.1", port=self.port,
+                    host="127.0.0.1", port=actual_port,
                 ))
                 self.task = asyncio.create_task(self.server.serve(sockets=[listener]))
                 async with asyncio.timeout(3):
@@ -56,6 +57,7 @@ class DeviceGateway:
                         await asyncio.sleep(.01)
                 self.runtime._device_gateway_listener_socket = listener
                 self.runtime._device_gateway_bind_error = None
+                report_endpoint("gateway", endpoint_url("gateway", actual_port))
             except Exception as exc:
                 await self._stop()
                 self.runtime._device_gateway_bind_error = str(exc)[:240] or type(exc).__name__
@@ -81,3 +83,4 @@ class DeviceGateway:
         if self.socket is not None:
             self.socket.close()
         self.socket = self.server = self.task = None
+        self.runtime._device_gateway_port = None

@@ -28,7 +28,7 @@ from voice_terminal.config import PersonaConfig, load_config
 from voice_terminal.paths import AppPaths
 from voice_terminal.application.managed import run_uvicorn, report as application_report
 from voice_terminal.application.managed import report_endpoint
-from voice_terminal.application.ports import bind_loopback, endpoint_url
+from voice_terminal.application.ports import bind_loopback, endpoint_url, managed_bind_port
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
@@ -101,7 +101,7 @@ def build_application(config_path: Path | None = None, *, bind_listener: bool = 
     if bind_listener:
         # listener（监听套接字）先于 SessionRuntime（会话运行时）和模型初始化绑定，防止端口探测后再绑定的竞态。
         bound_socket, actual_port = bind_loopback(
-            preferred_port if preferred_port is not None else config.server.port,
+            managed_bind_port(preferred_port if preferred_port is not None else config.server.port),
             host=preferred_host or config.server.host,
         )
         config = replace(config, server=replace(config.server, host="127.0.0.1", port=actual_port))

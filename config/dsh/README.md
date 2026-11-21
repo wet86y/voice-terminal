@@ -30,9 +30,9 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注册器）的 `default`（部署默认预设字段）
 设为默认项。DSH 0.2.1-rc.5 不再读取 DSH_HOME（数据目录）中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
 
-项目 DSH Web Host（DSH 网页服务）仅监听 `127.0.0.1:3081`，由 Voice Server（语音服务）管理。
+项目 DSH Web Host（DSH 网页服务）由 Voice Server（语音服务）管理，受管启动使用系统分配的回环端口，实际地址经统一宿主端点表发布。
 从桌面程序打开 Voice Terminal，再使用工作台“后台协作”面板底部的“代理控制台”入口取得一次性访问地址；
-直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
+直接访问实际端口、不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
 `?token=` 的完整地址。
 
 `voice-terminal-shadow-bridge`（保留的桥接加载行与设置命名空间）使用 DSH v0.2.1-rc.5 的公开插件接口。

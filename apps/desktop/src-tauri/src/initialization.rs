@@ -71,7 +71,7 @@ pub fn install_manager(
             .remote_services
             .lock()
             .map_err(|_| "远程原生服务状态不可用。")? = Some(Arc::new(
-            super::remote_services::RemoteServices::new(manager.clone()),
+            super::remote_services::RemoteServices::new(manager.clone(), state.service_endpoints.clone()),
         ));
     }
     app.manage(manager.clone());

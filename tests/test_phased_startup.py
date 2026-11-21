@@ -382,7 +382,7 @@ def test_gateway_toggle_keeps_core_and_lifespan_and_closes_its_connections():
     asyncio.run(run())
 
 
-def test_gateway_port_conflict_can_retry_without_restarting_core():
+def test_gateway_port_conflict_uses_a_new_listener_without_restarting_core():
     from voice_terminal.server.device_gateway import DeviceGateway
     from voice_terminal.application.ports import bind_loopback
     occupied, port = bind_loopback(0)
@@ -391,9 +391,13 @@ def test_gateway_port_conflict_can_retry_without_restarting_core():
         raise AssertionError("冲突失败不应初始化业务")
     async def run():
         gateway = DeviceGateway(app, runtime, port=port)
-        blocked = await gateway.set_enabled(True)
-        assert not blocked["ready"] and "占用" in blocked["error"]
-        assert gateway.socket is None and gateway.task is None
+        result = await gateway.set_enabled(True)
+        assert result["ready"] and result["error"] is None
+        assert runtime._device_gateway_port != port
+        assert gateway.socket.getsockname()[1] == runtime._device_gateway_port
+        assert occupied.getsockname()[1] == port
+        await gateway.set_enabled(False)
+        assert runtime._device_gateway_port is None
         occupied.close()
         assert (await gateway.set_enabled(True))["ready"]
         await gateway.set_enabled(False)
