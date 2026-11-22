@@ -74,6 +74,7 @@ export interface TtsReferenceImportJob { task_id: string; status: string; phase:
 export interface ProductTtsOperation {
   operation_id: string; model: ProductLocalTtsModelId | ProductOnlineTtsModelId; kind: string // 操作标识、本地或在线模型、任务种类。
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'; error?: string | null // 状态和错误。
+  phase?: string // phase（当前准备、合成、播放或恢复阶段）。
   result?: { asset_id?: string; duration_ms?: number; voice_id?: string; text?: string; voice?: Partial<ProductTtsVoice>;
     route?: string; fallback_reason?: string | null; punctuation_status?: string; punctuation_error?: string | null } // 实际识别路线、回退原因及标点状态。
 }

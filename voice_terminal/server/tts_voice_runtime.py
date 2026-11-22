@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -13,6 +14,9 @@ from ..tts.voices import (VoiceLibraryError, ResolvedLocalTtsVoice, safe_voice_d
                          DESIGN_INFERENCE_STEPS, DESIGN_GENERATION_RECIPE)
 from .product import PRODUCT_MINIMAX_TTS_MODELS
 from .runtime_operations import runtime_operation, runtime_operations
+from .tts_preview_playback import TtsPreviewPlayback
+
+logger = logging.getLogger(__name__)
 
 DESIGN_SAMPLE_TEXT = "你好，很高兴认识你。现在开始测试这个音色，我会用自然的语气清楚地说话。"
 OPERATION_LABELS = {"preview": "音色生成与试音", "minimax_preview": "在线音色试听",
@@ -40,11 +44,14 @@ class VoiceOperation:
     completed_monotonic: float | None = None  # 完成时刻，用于回收过期操作记录。
     ticket: Any = None  # ticket（同步预约的运行操作）。
     playback_outcome: str | None = None  # playback_outcome（音频设备停止结果：stopped（已确认）或 unknown（未知））。
+    started_monotonic: float = field(default_factory=time.monotonic)  # started_monotonic（任务接纳时刻）。
+    timings_ms: dict[str, float] = field(default_factory=dict)  # timings_ms（各阶段距接纳的毫秒数）。
+    phase: str = '正在准备任务…'  # phase（供界面展示的当前阶段）。
 
     def payload(self):
         return {"operation_id": self.id, "kind": self.kind, "state": self.state,
                 "model": self.request["model"], "result": self.result, "error": self.error,
-                "playback_outcome": self.playback_outcome}
+                "playback_outcome": self.playback_outcome, "phase": self.phase}
 
 class TtsVoiceOperationManager:
     """TtsVoiceOperationManager（音色任务管理）：同一运行时仅一个音色操作。"""
@@ -63,6 +70,20 @@ class TtsVoiceOperationManager:
 
     def owns_capture(self, capture_id):
         return False
+
+    @staticmethod
+    def _mark(operation, phase):
+        elapsed = (time.monotonic() - operation.started_monotonic) * 1000
+        operation.timings_ms[phase] = round(elapsed, 1)
+        labels = {'prepared': '正在准备音频…', 'connecting': '正在连接在线语音…', 'session_ready': '正在合成音频…',
+                  'model_loading': '正在加载本地模型…', 'model_ready': '正在准备参考音色…',
+                  'first_audio': '正在接收音频…', 'first_enqueued': '正在播放试听音频…',
+                  'synthesis_finished': '正在播放试听音频…', 'restoring_reference': '正在播放并恢复参考音色…',
+                  'output_finished': '正在恢复原运行状态…', 'completed': '已完成'}
+        if phase in labels:
+            operation.phase = labels[phase]
+        logger.info('tts_voice.timing operation_id（操作编号）=%s kind（任务类型）=%s phase（阶段）=%s elapsed_ms（接纳后毫秒）=%.1f',
+                    operation.id, operation.kind, phase, elapsed)
 
     def get(self, operation_id):
         self._prune()
@@ -103,6 +124,7 @@ class TtsVoiceOperationManager:
                                          phase="processing", pause=pause, wait_output=pause, on_release=release,
                                          ticket=item.ticket):
                 try:
+                    self._mark(item, 'prepared')
                     result = await runner(item)
                 finally:
                     if self._active_id == item.id:
@@ -110,6 +132,7 @@ class TtsVoiceOperationManager:
             if item.state != "cancelled":
                 item.result = result
                 item.state = "succeeded"
+                self._mark(item, 'completed')
         except asyncio.CancelledError:
             item.state = "cancelled"
         except Exception as exc:
@@ -246,62 +269,45 @@ class TtsVoiceOperationManager:
         )
         session = client.session(fresh=True)
         operation.session = session
-        audio = bytearray()
+        playback = TtsPreviewPlayback(player, operation.id, online_sample_rate,
+            on_first_enqueue=lambda: self._mark(operation, 'first_enqueued'))
 
         async def collect_audio():
             async for chunk in session.audio_chunks():
-                audio.extend(chunk)
-                if len(audio) > online_sample_rate * 2 * 30:
+                if not playback.input_bytes:
+                    self._mark(operation, 'first_audio')
+                if playback.input_bytes + len(chunk) > online_sample_rate * 2 * 30:
                     raise TtsVoiceOperationError("试听音频超过 30 秒，已停止播放。")
+                await playback.write(chunk)
 
         reader = None
-        player_allowed = False
         try:
+            self._mark(operation, 'connecting')
             session = await client.start_session_with_retry(session)
             operation.session = session
+            self._mark(operation, 'session_ready')
             reader = asyncio.create_task(collect_audio(), name=f"minimax-voice-preview-reader-{operation.id[:8]}")
             await session.send_text(operation.request["text"])
             await session.finish()
             await reader
-            if not audio:
+            self._mark(operation, 'synthesis_finished')
+            if not playback.input_bytes:
                 raise TtsVoiceOperationError("MiniMax 没有返回试听音频，请检查音色 ID 后重试。")
-            import numpy as np
-            from fractions import Fraction
-            from scipy.signal import resample_poly
-            mono = np.frombuffer(bytes(audio), dtype="<i2")
-            if online_sample_rate != int(player.sample_rate):
-                ratio = Fraction(int(player.sample_rate), online_sample_rate)
-                mono = np.clip(np.rint(resample_poly(mono.astype(np.float32), ratio.numerator, ratio.denominator)),
-                               -32768, 32767).astype(np.int16)
-            if int(player.channels) == 2:
-                pcm = np.repeat(mono.reshape(-1, 1), 2, axis=1).astype("<i2", copy=False).tobytes()
-            else:
-                pcm = mono.astype("<i2", copy=False).tobytes()
-            duration = len(pcm) / max(1, int(player.sample_rate) * int(player.channels) * 2)
-            self._allow_user_initiated_playback(player, operation.id)
-            player_allowed = True
-            enqueue_async = getattr(player, "enqueue_async", None)
-            if callable(enqueue_async):
-                await enqueue_async(operation.id, pcm)
-            else:
-                player.enqueue(operation.id, pcm)
-            finish_stream = getattr(player, "finish_stream_async", None)
-            if callable(finish_stream):
-                await finish_stream(operation.id)
-            await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
-            if not player.has_started(operation.id):
-                raise TtsVoiceOperationError("试听音频未从当前输出设备播放，请检查静音策略或设备状态。")
-            return {"duration_ms": round(duration * 1000), "voice_id": operation.request["voice_id"]}
+            await playback.finish()
+            await playback.wait()
+            self._mark(operation, 'output_finished')
+            return {"duration_ms": round(playback.duration * 1000), "voice_id": operation.request["voice_id"]}
         except BaseException:
             if reader is not None:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if player is not None and player_allowed and operation.playback_outcome != "stopped":
+            if playback.started and operation.playback_outcome != "stopped":
                 await self._confirm_playback_stop(operation, player)
             raise
         finally:
             operation.session = None
             await session.close()
+            self._mark(operation, 'session_closed')
 
     def start_play(self, model, asset_id):
         self._require_library(model).playback_source(asset_id)
@@ -339,32 +345,45 @@ class TtsVoiceOperationManager:
             raise TtsVoiceOperationError("AnifLive 使用参考录音与准确转写克隆音色。")
         source = voice.get("reference_asset_id")
         snapshot = library.resolve_draft(model, {**voice, "name": voice.get("name") or "新音色", "source": "import"})
-        async with self._preview_client(model, library) as client:
-            await client.ensure_ready()
-            pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"])
-        asset = await asyncio.to_thread(library.put_pcm, pcm, sample_rate=16000)
-        if high_fidelity is not None:
-            native_pcm, native_rate = high_fidelity
-            try:
-                stored = await asyncio.to_thread(
-                    library.put_high_fidelity_pcm, asset["asset_id"], native_pcm, sample_rate=native_rate)
-                if stored:
-                    asset["high_fidelity"] = stored
-            except Exception as exc:  # noqa: BLE001 - 高保真副本失败不能作废候选样音。
-                import logging
-                logging.getLogger(__name__).warning(
-                    "tts_voice.high_fidelity_store_failed asset=%s error_type=%s error=%s",
-                    asset["asset_id"], type(exc).__name__, str(exc)[:200])
-        payload = {"name": voice.get("name") or "新音色", "source": "import",
-            "reference_asset_id": source, "reference_text": snapshot.reference_text,
-            "reference_language": snapshot.reference_language}
-        operation.result = {**asset, "voice": payload}
-        operation.request["asset_id"] = asset["asset_id"]
-        await self._play(operation)
-        return operation.result
+        player = getattr(self.runtime, 'player', None)
+        if player is None:
+            raise TtsVoiceOperationError('程序播放器尚未启动。')
+        playback = None
+        try:
+            async with self._preview_client(model, library) as client:
+                self._mark(operation, 'model_loading')
+                await client.ensure_ready()
+                self._mark(operation, 'model_ready')
+                playback = TtsPreviewPlayback(player, operation.id, int(getattr(client, 'sample_rate', 16000)),
+                    on_first_enqueue=lambda: self._mark(operation, 'first_enqueued'))
+                pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"], playback=playback)
+            if not pcm:
+                raise TtsVoiceOperationError('本地模型没有返回试听音频。')
+            asset = await asyncio.to_thread(library.put_pcm, pcm, sample_rate=16000)
+            if high_fidelity is not None:
+                native_pcm, native_rate = high_fidelity
+                try:
+                    stored = await asyncio.to_thread(
+                        library.put_high_fidelity_pcm, asset["asset_id"], native_pcm, sample_rate=native_rate)
+                    if stored:
+                        asset["high_fidelity"] = stored
+                except Exception as exc:  # noqa: BLE001 - 高保真副本失败不能作废候选样音。
+                    logger.warning("tts_voice.high_fidelity_store_failed asset=%s error_type=%s error=%s",
+                        asset["asset_id"], type(exc).__name__, str(exc)[:200])
+            payload = {"name": voice.get("name") or "新音色", "source": "import",
+                "reference_asset_id": source, "reference_text": snapshot.reference_text,
+                "reference_language": snapshot.reference_language}
+            operation.result = {**asset, "voice": payload}
+            operation.request["asset_id"] = asset["asset_id"]
+            await playback.wait()
+            self._mark(operation, 'output_finished')
+            return operation.result
+        finally:
+            if playback is not None and playback.started and operation.playback_outcome != 'stopped':
+                await self._confirm_playback_stop(operation, player, terminate_stream=not playback.completed)
 
     async def _collect_speech(self, operation: VoiceOperation, client, snapshot: ResolvedLocalTtsVoice,
-                              text: str) -> tuple[bytes, tuple[bytes, int] | None]:
+                              text: str, *, playback: TtsPreviewPlayback | None = None) -> tuple[bytes, tuple[bytes, int] | None]:
         """返回 (16 kHz 编码器素材, 原生率高保真副本或 None)。
 
         编码器固定读 16 kHz，所以主素材必须是 16 kHz；原生 48 kHz 样音另存
@@ -386,9 +405,13 @@ class TtsVoiceOperationManager:
 
         async def collect() -> None:
             async for pcm in session.audio_chunks():
+                if not output and playback is not None:
+                    self._mark(operation, 'first_audio')
                 output.extend(pcm)
                 if len(output) > int(getattr(client, "sample_rate", 16000)) * 2 * 17:
                     raise TtsVoiceOperationError("生成音频超过 15 秒，请缩短正文后重新生成。")
+                if playback is not None:
+                    await playback.write(pcm)
 
         reader = None
         try:
@@ -397,6 +420,9 @@ class TtsVoiceOperationManager:
             await session.send_text(text)
             await session.finish()
             await reader
+            if playback is not None:
+                self._mark(operation, 'synthesis_finished')
+                await playback.finish()
             rate = int(getattr(client, "sample_rate", 16000))
             native = bytes(output)
             if rate != 16000:
@@ -411,6 +437,8 @@ class TtsVoiceOperationManager:
             if reader is not None:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
+            if playback is not None and playback.started and operation.playback_outcome != 'stopped':
+                await self._confirm_playback_stop(operation, self.runtime.player)
             await session.cancel()
             raise
         finally:
@@ -418,6 +446,8 @@ class TtsVoiceOperationManager:
             client._warmed = False
             try:
                 await session.close()
+                if playback is not None:
+                    self._mark(operation, 'restoring_reference')
                 await self._restore_formal_reference(client)
             finally:
                 operation.session = None
@@ -432,25 +462,30 @@ class TtsVoiceOperationManager:
         path, digest = library.playback_source(asset_id)
         sample_rate, channels = player.sample_rate, player.channels
         pcm = await asyncio.to_thread(self._decode_playback_audio, path, digest, sample_rate, channels)
+        self._mark(operation, 'audio_decoded')
         duration = len(pcm) / (sample_rate * channels * 2)
         if operation.state == "cancelled":
             return {}
         self._allow_user_initiated_playback(player, operation.id)
+        completed = False  # completed（已确认本次样音输出完成）。
         try:
             enqueue_async = getattr(player, "enqueue_async", None)
             if callable(enqueue_async):
                 await enqueue_async(operation.id, pcm)
             else:
                 player.enqueue(operation.id, pcm)
+            self._mark(operation, 'first_enqueued')
             finish_stream = getattr(player, "finish_stream_async", None)
             if callable(finish_stream):
                 await finish_stream(operation.id)
             await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
             if not player.has_started(operation.id):
                 raise TtsVoiceOperationError("音频未从当前输出设备播放，请检查静音策略或设备状态。")
+            self._mark(operation, 'output_finished')
+            completed = True
         finally:
             if operation.playback_outcome != "stopped":
-                await self._confirm_playback_stop(operation, player)
+                await self._confirm_playback_stop(operation, player, terminate_stream=not completed)
         return {"asset_id": asset_id, "duration_ms": round(duration * 1000)}
 
     @staticmethod
@@ -459,7 +494,6 @@ class TtsVoiceOperationManager:
         try:
             import numpy as np
             import soundfile as sf
-            from scipy.signal import resample_poly
             with path.open("rb") as handle:
                 if digest is not None:
                     if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
@@ -472,16 +506,14 @@ class TtsVoiceOperationManager:
             raise TtsVoiceOperationError("参考音频无法解码。") from exc
         mono = samples.astype(np.int32).mean(axis=1).astype(np.int16)
         if rate != sample_rate:
-            from fractions import Fraction
-            ratio = Fraction(int(sample_rate), int(rate))
-            converted = resample_poly(mono.astype(np.float32), ratio.numerator, ratio.denominator)
-            mono = np.clip(np.rint(converted), -32768, 32767).astype(np.int16)
+            import soxr
+            mono = soxr.resample(mono, rate, sample_rate, quality='HQ').astype('<i2', copy=False)
         if channels == 2:
             mono = np.repeat(mono.reshape(-1, 1), 2, axis=1)
         return mono.astype("<i2", copy=False).tobytes()
 
-    @staticmethod
-    async def _confirm_playback_stop(operation, player):
+    async def _confirm_playback_stop(self, operation, player, *, terminate_stream=True):
+        """terminate_stream（中止未播完的流）：完成后的正常释放不登记失败。"""
         stop = getattr(player, "stop_and_snapshot_confirmed", None)
         if not callable(stop):
             operation.playback_outcome = "unknown"
@@ -489,6 +521,9 @@ class TtsVoiceOperationManager:
             return None
         try:
             snapshot = await stop(operation.id)
+            terminate = getattr(self.runtime, 'terminate_remote_playback', None)
+            if terminate_stream and callable(terminate):
+                await terminate(operation.id)
         except Exception as exc:
             operation.playback_outcome = "unknown"
             operation.error = operation.error or f"播放停止结果未知：{type(exc).__name__}。"

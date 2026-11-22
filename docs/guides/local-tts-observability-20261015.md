@@ -4,6 +4,8 @@
 
 现行本地后端为 AnifLive（本地语音引擎），当前事件为 `aniflive_tts.session_ready`（会话就绪）、`aniflive_tts.segment_timing`（文本段时延）、`aniflive_tts.first_pcm_timing`（首个 PCM 音频块时延）和 `aniflive_tts.first_pcm_consumed`（播放器取走首块）；字段说明见 [TTS 运行说明](tts-runtime.md)。下文的 `audio_cpp_tts.*`（旧本地语音事件）和原生跟踪参数只适用于保留的 audio.cpp 兼容路径，不描述当前 AnifLive 运行行为。日志容量预算部分仍说明当前通用日志回收规则。
 
+在线与本地试音另通过 `tts_voice.timing`（音色任务阶段耗时）记录准备、加载、连接、首块接收、入队、输出及恢复。按 `operation_id`（操作编号）关联同一任务，并区分引擎推理首音与点击到播放的整条链路；节点及字段说明见[试听延迟日志](tts-runtime.md#试听延迟日志)。
+
 ## 日志关联与隐私边界
 
 正式本地播报事件用 `turn=`（用户轮次）、`speech=`（播报事务）和 `session=`（原生上下文）关联，事务预建会话也携带这些标识。预热会话没有正式播报事务，`speech=None`（无正式播报事务）属于预期，按已有轮次与会话号关联。服务生命周期按 `pid`（原生进程编号）关联。用户输入定稿事件使用当前输入轮次，避免沿用上一输出所有者。

@@ -67,10 +67,11 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
 
         client = SimpleNamespace(ensure_ready=ready, inference_steps_by_model={"voxcpm2": 20})
         runtime = SimpleNamespace(voice_library=owner, tts=SimpleNamespace(local=client),
+            player=SimpleNamespace(sample_rate=16000, channels=1, wait_until_output_complete=AsyncMock(), has_started=lambda _: True),
             config=SimpleNamespace(tts=SimpleNamespace(backend="aniflive", local_model="tangyuge-v2pp-d78cf598")))
         manager = TtsVoiceOperationManager(runtime)
 
-        async def synthesize(operation, local_client, snapshot, text):
+        async def synthesize(operation, local_client, snapshot, text, *, playback):
             snapshots.append(snapshot)
             assert local_client is client and text == "目标样音正文。"
             # 返回 (16 kHz 编码器素材, 原生率高保真副本或 None)。
@@ -99,6 +100,65 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
         assert snapshot.reference_text == transcript.strip()
         assert snapshot.reference_path == restored.asset_path(source["asset_id"])
         assert not manager.busy
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('fail_after_first', [False, True])
+def test_local_preview_plays_before_synthesis_finishes_and_keeps_candidate(tmp_path, fail_after_first):
+    async def scenario():
+        owner = ModelVoiceLibraries(tmp_path / 'tts')
+        library = owner.for_model('local-model')
+        source = library.put_import(_wav_bytes(), 'reference.wav')
+        enqueued = asyncio.Event()  # enqueued（实际收到首块，允许模型继续生成）。
+        chunks = []  # chunks（实际播放器采样）。
+
+        class Session:
+            start = AsyncMock()
+            send_text = AsyncMock()
+            finish = AsyncMock()
+            close = AsyncMock()
+            cancel = AsyncMock()
+
+            async def audio_chunks(self):
+                yield b'\x00\x10' * 8000
+                await asyncio.wait_for(enqueued.wait(), 1)
+                if fail_after_first:
+                    raise RuntimeError('本地合成中途失败')
+                yield b'\x00\x20' * 8000
+
+        def enqueue(key, pcm):
+            chunks.append((key, pcm))
+            enqueued.set()
+
+        player = SimpleNamespace(sample_rate=16000, channels=1, allow_user_initiated=lambda _: None,
+            enqueue_async=AsyncMock(side_effect=enqueue), finish_stream_async=AsyncMock(),
+            wait_until_output_complete=AsyncMock(), has_started=lambda _: True,
+            stop_and_snapshot_confirmed=AsyncMock())
+        client = SimpleNamespace(sample_rate=16000, ensure_ready=AsyncMock(), session=lambda **_: Session(), prepare_reference=AsyncMock())
+        async def restore_reference():
+            if fail_after_first:
+                player.stop_and_snapshot_confirmed.assert_awaited_once()
+        client.prepare_reference.side_effect = restore_reference
+        runtime = SimpleNamespace(voice_library=owner, player=player, tts=SimpleNamespace(local=client),
+            config=SimpleNamespace(tts=SimpleNamespace(backend='aniflive', local_model='local-model')))
+        manager = TtsVoiceOperationManager(runtime)
+        operation = manager.start_preview('local-model', {'reference_asset_id': source['asset_id'], 'reference_text': '参考正文。'}, '试听正文。')
+        item = manager._items[operation['operation_id']]
+        await item.task
+        if fail_after_first:
+            assert item.state == 'failed' and '中途失败' in item.error
+            assert item.playback_outcome == 'stopped'
+            player.stop_and_snapshot_confirmed.assert_awaited_once_with(item.id)
+            client.prepare_reference.assert_awaited_once()
+            return
+        assert item.state == 'succeeded', item.error
+        assert b''.join(pcm for _, pcm in chunks) == b'\x00\x10' * 8000 + b'\x00\x20' * 8000
+        assert all(key == item.id for key, _ in chunks)
+        assert library.asset_path(item.result['asset_id']).is_file()
+        assert item.timings_ms['first_enqueued'] <= item.timings_ms['synthesis_finished']
+        player.finish_stream_async.assert_awaited_once_with(item.id)
+        player.stop_and_snapshot_confirmed.assert_awaited_once_with(item.id)
+        client.prepare_reference.assert_awaited_once()
     asyncio.run(scenario())
 
 

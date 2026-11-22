@@ -42,7 +42,7 @@
 - [应用生命周期](guides/application-lifecycle.md)
 - [ASR（自动语音识别）热词](guides/asr-hotwords.md)
 - [ASR 延迟与 CUDA（显卡计算平台）配置](guides/asr-latency-and-cuda.md)
-- [桌面应用开发与分发](guides/desktop-application.md)
+- [桌面应用开发、更新日志与分发](guides/desktop-application.md)
 - [DSH（代理执行宿主）控制台](guides/dsh-console.md)
 - [DSH npm（包管理器）分发与安装](guides/dsh-npm-distribution.md)
 - [DSH 插件维护](guides/dsh-plugin-maintenance.md)

@@ -470,6 +470,48 @@ def test_finished_outbox_key_rejects_late_audio_and_cannot_be_forgotten_while_pe
     asyncio.run(scenario())
 
 
+def test_stopped_remote_previews_discard_late_audio_and_reclaim_binding_capacity() -> None:
+    async def scenario() -> None:
+        outbox = RemotePlaybackOutbox(
+            device_id='device-a', core_session_id='core-a', connection_generation=2,
+            executor_generation=3, interaction_generation=4, stream_id='media-a', max_frames=4,
+        )
+        runtime = object.__new__(SessionRuntime)
+        runtime._remote_playback_lock = asyncio.Lock()
+        runtime._remote_playback_bindings = {}
+        runtime._remote_playback_finished = set()
+        runtime._remote_playback_progress = {}
+        runtime._remote_client_tts_progress = {}
+        for index in range(260):
+            key = f'cancelled-preview-{index}'
+            runtime._reserve_remote_playback_binding()
+            runtime._remote_playback_bindings[key] = ('device-a', outbox)
+            await outbox.enqueue(key, 16000, b'\x00\x10' * 320)
+            frame = await outbox.next_frame()
+            assert frame is not None
+            if index % 2 == 0:
+                await outbox.finish_key(key)  # 已生成完但设备尚未播完时，也必须丢弃后续发送。
+            assert await runtime.terminate_remote_playback(key)
+            assert key in runtime._remote_playback_finished
+            assert runtime._remote_playback_bindings[key] == ('device-a', outbox)
+            with pytest.raises(RuntimeError, match='已经停止'):
+                await outbox.enqueue(key, 16000, b'\x00\x10' * 320)
+            assert not outbox.forget_settled_key(key)  # 未确认的在途帧继续保护。
+            assert outbox.acknowledge(frame.sequence, cancelled=True)
+            assert outbox.record_buffer(frame.sequence + 1, 0)  # 模拟设备停止后的零缓冲回执。
+        assert len(runtime._remote_playback_bindings) <= 256
+        # 终结未发送片段时只丢弃，不调用会生成编码尾音的 finish_key（正常结束）。
+        await outbox.enqueue('queued-cancel', 16000, b'\x00\x10' * 320)
+        runtime._remote_playback_bindings['queued-cancel'] = ('device-a', outbox)
+        assert await runtime.terminate_remote_playback('queued-cancel')
+        await outbox.enqueue('new-preview', 16000, b'\x00\x20' * 320)
+        next_frame = await outbox.next_frame()
+        assert next_frame is not None and next_frame.playback_key == 'new-preview'
+        assert not outbox.has_pending_audio('queued-cancel')
+        await outbox.close()
+    asyncio.run(scenario())
+
+
 def test_remote_output_waiter_does_not_finish_while_network_frames_are_unacknowledged() -> None:
     async def scenario() -> None:
         outbox = RemotePlaybackOutbox(

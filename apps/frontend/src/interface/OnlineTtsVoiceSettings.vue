@@ -7,6 +7,7 @@ const voiceId = defineModel<string>('voiceId', { required: true }) // voiceId（
 const props = withDefaults(defineProps<{
   saving?: boolean // saving（正在验证与保存）。
   previewing?: boolean // previewing（正在试听）。
+  previewPhase?: string // previewPhase（试听当前阶段）。
   disabled?: boolean // disabled（目标切换期间暂不可操作）。
   demo?: boolean // demo（仅演示界面，不提交真实配置）。
   lookupVoiceName?: (id: string) => Promise<{ voice_id: string; voice_name: string | null }> // 在线音色名称查询接口。
@@ -80,7 +81,7 @@ const onlineModels: Array<{ id: ProductOnlineTtsModelId; label: string; hint: st
         <button class="outline-button online-voice-link" type="button" :disabled="saving || previewing || disabled" @click="emit('openLibrary')">官方音色库 ↗</button>
       </div>
       <div class="online-tts-actions">
-        <p class="instruction-hint">{{ demo ? '演示模式：可调整模型与音色标识；名称窗口不连接在线查询，保存仅用于当前展示。' : '输入音色 ID（音色标识）后自动查询 MiniMax（在线语音服务）名称；保存时会再次验证，验证通过后用于后续播报。' }}</p>
+        <p class="instruction-hint" :role="previewing ? 'status' : undefined" :aria-live="previewing ? 'polite' : undefined">{{ previewing ? previewPhase || '正在试听…' : demo ? '演示模式：可调整模型与音色标识；名称窗口不连接在线查询，保存仅用于当前展示。' : '输入音色 ID（音色标识）后自动查询 MiniMax（在线语音服务）名称；保存时会再次验证，验证通过后用于后续播报。' }}</p>
         <div class="online-tts-buttons"><button class="outline-button" type="button" :disabled="previewing || saving || disabled || !voiceId.trim()" @click="emit('preview')">{{ previewing ? '正在试听…' : '试音' }}</button><button class="save-button" type="button" :disabled="previewing || saving || disabled || !voiceId.trim()" @click="emit('save')">{{ saving ? '正在验证并保存…' : '保存' }}</button></div>
       </div>
     </div>

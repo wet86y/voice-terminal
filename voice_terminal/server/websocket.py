@@ -824,6 +824,16 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             self._remote_playback_finished.add(playback_key)
             return True
 
+    async def terminate_remote_playback(self, playback_key: str) -> bool:
+        """terminate_remote_playback（停止确认后的流终结）：丢弃待发片段，不冲刷编码尾音；保留固定目标防迟到改投。"""
+        async with self._remote_playback_lock:
+            binding = self._remote_playback_bindings.get(playback_key)
+            if binding is None:
+                return False
+            binding[1].fail(playback_key, '试听播放已经停止，后续音频已丢弃。')
+            self._remote_playback_finished.add(playback_key)
+            return True
+
     async def unbind_empty_remote_playback_target(
         self, playback_key: str, lease: InteractionLease,
     ) -> bool:

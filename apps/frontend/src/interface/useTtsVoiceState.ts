@@ -14,6 +14,7 @@ export interface VoiceDraft {
   candidate: Partial<ProductTtsVoice> | null; signature: string // 生成候选及输入签名。
   expanded: boolean; busy: boolean; generation: number; operationId?: string // 展开、任务状态、代次、操作标识。
   error: string; notice: string // 当前卡片的错误和反馈。
+  phase?: string // phase（音色任务当前阶段）。
   references: ProductTtsReference[] // references（情绪参考草稿）。
 }
 export interface TtsVoiceState {

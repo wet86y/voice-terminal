@@ -241,6 +241,26 @@ describe('音色设置只提供资源完整的本地模型', () => {
     expect(cancel).toHaveBeenCalledExactlyOnceWith('late-preview')
     expect(query).not.toHaveBeenCalled()
   })
+  it('试听等待期间显示真实连接和播放阶段，播完后恢复按钮', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(productApi, 'startMinimaxTtsPreview').mockResolvedValue({
+      operation_id: 'phase-preview', state: 'running', phase: '正在连接在线语音…',
+    } as never)
+    vi.spyOn(productApi, 'getTtsOperation')
+      .mockResolvedValueOnce({ operation_id: 'phase-preview', state: 'running', phase: '正在播放试听音频…' } as never)
+      .mockResolvedValueOnce({ operation_id: 'phase-preview', state: 'succeeded', phase: '已完成' } as never)
+    const wrapper = render()
+    try {
+      await wrapper.find('.online-voice-row input').setValue('voice')
+      await wrapper.find('.online-tts-buttons button').trigger('click')
+      await flushPromises()
+      expect(wrapper.get('.online-tts-actions [role="status"]').text()).toBe('正在连接在线语音…')
+      await vi.advanceTimersByTimeAsync(300)
+      expect(wrapper.get('.online-tts-actions [role="status"]').text()).toBe('正在播放试听音频…')
+      await vi.advanceTimersByTimeAsync(300)
+      expect(wrapper.get('.online-tts-buttons button').text()).toBe('试音')
+    } finally { wrapper.unmount(); vi.useRealTimers() }
+  })
   it('官方音色库按钮使用固定链接打开', async () => {
     const open = vi.spyOn(window, 'open').mockReturnValue(null)
     const wrapper = render()

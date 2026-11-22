@@ -47,9 +47,11 @@ describe('语音任务沿页面和目标连接生命周期收尾', () => {
     const client = { getTtsOperation: vi.fn().mockResolvedValue(operation('succeeded')),
       cancelTtsOperation: vi.fn().mockResolvedValue(undefined) }
     const scope = createTtsOperationScope(client)
-    const result = scope.run(async () => operation('running'), 300)
+    const onUpdate = vi.fn()
+    const result = scope.run(async () => operation('running'), 300, onUpdate)
     await vi.advanceTimersByTimeAsync(300)
     expect((await result).state).toBe('succeeded')
+    expect(onUpdate.mock.calls.map(([value]) => value.state)).toEqual(['running', 'succeeded'])
     scope.dispose()
     expect(client.cancelTtsOperation).not.toHaveBeenCalled()
     expect(vi.getTimerCount()).toBe(0)

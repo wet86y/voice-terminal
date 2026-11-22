@@ -26,6 +26,7 @@ export function createTtsOperationScope(client: TtsOperationClient = productApi)
     async run(
       start: (assertActive: () => void) => Promise<ProductTtsOperation>,
       intervalMs = 400,
+      onUpdate?: (operation: ProductTtsOperation) => void, // onUpdate（在同一页面与目标仍有效时更新任务阶段）。
     ): Promise<ProductTtsOperation> {
       const controller = new AbortController()
       const target = ttsOperationTarget()
@@ -48,6 +49,7 @@ export function createTtsOperationScope(client: TtsOperationClient = productApi)
         assertActive()
         operation = await start(assertActive)
         assertActive() // 启动回执迟到时，finally（收尾）仍会取消刚取得编号的旧任务。
+        onUpdate?.(operation)
         while (operation.state === 'running') {
           await new Promise<void>((resolve, reject) => {
             const abort = () => {
@@ -63,6 +65,7 @@ export function createTtsOperationScope(client: TtsOperationClient = productApi)
           assertActive()
           operation = await client.getTtsOperation(operation.operation_id)
           assertActive()
+          onUpdate?.(operation)
         }
         return operation
       } catch (error) {

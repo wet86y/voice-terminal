@@ -93,7 +93,8 @@ def paths_for(stage: str, optimization='release', components='desktop,bootstrap'
               '.cargo/config.toml',
               '.local/tools/rust/cargo/config.toml']
     if stage == 'frontend':
-        return (['apps/frontend', 'apps/desktop/boot', 'package.json', 'package-lock.json'],
+        release_notes = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / 'docs/releases').glob('v*.md'))]  # release_notes（随界面打包的版本日志）。
+        return (['apps/frontend', 'apps/desktop/boot', 'package.json', 'package-lock.json', *release_notes],
                 ['.local/build/frontend'])
     if stage == 'plugin':
         return (['integrations/dsh/voice-terminal', 'config/dsh', 'config/shadow_agent',

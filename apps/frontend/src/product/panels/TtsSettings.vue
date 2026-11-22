@@ -35,6 +35,7 @@ const localDraft = ref<ProductLocalTtsModelId>(settings.tts.local_model || 'mini
 const saving = ref(false)
 const savingOnline = ref(false)
 const previewingOnline = ref(false)
+const onlinePreviewPhase = ref('') // onlinePreviewPhase（当前在线试听阶段）。
 const savingControls = ref(false) // savingControls（全局语音调节开关保存状态）。
 const savingQuality = ref(false) // savingQuality（本地合成质量保存状态）。
 const onlineModelDraft = ref<ProductOnlineTtsModelId>(settings.tts.online_model ?? 'speech-2.8-hd')
@@ -185,9 +186,11 @@ async function previewOnlineVoice() {
   if (!voiceId) { error.value = '请输入音色 ID（音色标识）。'; return }
   if (props.demo) { error.value = '演示界面未连接在线语音接口，无法试听。'; return }
   previewingOnline.value = true
+  onlinePreviewPhase.value = '正在准备试听…'
   try {
     const operation = await onlinePreviewScope.run(
       () => productApi.startMinimaxTtsPreview(onlineModelDraft.value, voiceId), 300,
+      operation => { onlinePreviewPhase.value = operation.phase || '正在试听…' },
     )
     if (operation.state !== 'succeeded') throw new Error(operation.error || 'MiniMax 在线音色试听失败。')
     context?.setNotice('MiniMax 在线音色试听完成。')
@@ -195,6 +198,7 @@ async function previewOnlineVoice() {
     if (!isTtsOperationAborted(failure)) error.value = failure instanceof Error ? failure.message : 'MiniMax 在线音色试听失败。'
   } finally {
     previewingOnline.value = false
+    onlinePreviewPhase.value = ''
   }
 }
 async function openOfficialVoiceLibrary() {
@@ -221,7 +225,7 @@ async function openOfficialVoiceLibrary() {
       <p v-if="selected === 'minimax'" class="instruction-hint">在线接口密钥与账号用量可在“组件设置 → 语音合成”中管理。</p>
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
-    <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :disabled="saving" :demo="demo" :lookup-voice-name="productApi.minimaxVoiceName" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
+    <OnlineTtsVoiceSettings v-if="selected === 'minimax'" v-model:model="onlineModelDraft" v-model:voice-id="onlineVoiceIdDraft" :saving="savingOnline" :previewing="previewingOnline" :preview-phase="onlinePreviewPhase" :disabled="saving" :demo="demo" :lookup-voice-name="productApi.minimaxVoiceName" @save="saveOnlineSettings" @preview="previewOnlineVoice" @open-library="openOfficialVoiceLibrary" />
     <div v-if="selected !== 'minimax'" class="tts-model-row">
       <label v-if="status?.models.length" class="form-field"><span>本地模型</span><select v-model="selected" :disabled="unavailable" @change="localDraft = selected"><option v-for="model in status.models" :key="model.id" :value="model.id" :disabled="!model.available">{{ model.name }}{{ model.available ? '' : '（未就绪）' }}</option></select></label>
       <div v-else class="tts-model-link"><p class="instruction-hint">{{ remoteMode ? '暂无已登记的本地模型，请在服务端导入。' : '暂无已登记的本地模型，请先导入。' }}</p><button v-if="!remoteMode" class="outline-button" type="button" :disabled="demo" @click="emit('open-aniflive-components')">模型导入</button></div>

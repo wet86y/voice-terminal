@@ -307,11 +307,13 @@ async function monitor(draft: VoiceDraft, start: () => Promise<ProductTtsOperati
     return operation
   }
   draft.operationId = operation.operation_id
+  draft.phase = operation.phase
   while (operation.state === 'running') {
     await new Promise(resolve => window.setTimeout(resolve, 400))
     if (!isCurrent()) return operation
     operation = await productApi.getTtsOperation(operation.operation_id)
     if (!isCurrent()) return operation
+    draft.phase = operation.phase
   }
   if (operation.state === 'failed') { draft.error = operation.error || '音色任务失败。'; if (!operation.result?.voice) throw new Error(draft.error) }
   return operation
@@ -319,10 +321,10 @@ async function monitor(draft: VoiceDraft, start: () => Promise<ProductTtsOperati
 async function run(draft: VoiceDraft, action: (generation: number) => Promise<void>) {
   if (draft.busy || globalBusy.value) return
   const generation = draft.generation
-  draft.busy = true; draft.error = ''; draft.notice = ''
+  draft.busy = true; draft.error = ''; draft.notice = ''; draft.phase = ''
   try { await action(generation) }
   catch (error) { if (draft.generation === generation) draft.error = error instanceof Error ? error.message : '音色操作失败。' }
-  finally { draft.busy = false; draft.operationId = undefined }
+  finally { draft.busy = false; draft.operationId = undefined; draft.phase = '' }
 }
 async function transcribe(draft: VoiceDraft) {
   const model = props.model; const asset = draft.source; const initialText = draft.transcript
@@ -589,7 +591,7 @@ async function cancel(draft: VoiceDraft) {
         <p v-if="saveBlockReason(draft)" class="instruction-hint">{{ saveBlockReason(draft) }}</p>
         <p v-if="!draft.name.trim()" class="instruction-hint">未填写名称时，将保存为“{{ voiceName(draft) }}”。</p>
       </div>
-      <div v-if="draft.busy" class="voice-task" role="status"><span>{{ referencePlayback?.draft === draft ? '正在试听参考音频…' : '正在处理音色…' }}</span><button type="button" @click="cancel(draft)">取消任务</button></div>
+      <div v-if="draft.busy" class="voice-task" role="status"><span>{{ draft.phase || (referencePlayback?.draft === draft ? '正在试听参考音频…' : '正在处理音色…') }}</span><button type="button" @click="cancel(draft)">取消任务</button></div>
       <p v-if="draft.error" class="instruction-error" role="alert">{{ draft.error }}</p><p v-if="draft.notice" class="instruction-hint" role="status">{{ draft.notice }}</p>
     </article>
   </section>

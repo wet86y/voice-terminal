@@ -54,6 +54,22 @@ def test_inputs_changed_during_build_are_not_registered(tmp_path, state):
     assert not state.run(tmp_path, 'check', 'product')
 
 
+def test_frontend_rebuilds_for_version_logs_but_not_internal_delivery_receipts(tmp_path, monkeypatch):
+    module = load_script('desktop-build-state')
+    monkeypatch.setattr(module, 'ROOT', tmp_path)
+    releases = tmp_path / 'docs/releases'
+    releases.mkdir(parents=True)
+    version = releases / 'v1.0.0.md'
+    version.write_text('用户可感知的更新内容', encoding='utf-8')
+    before = module.inventory(tmp_path, module.paths_for('frontend')[0])
+    (releases / 'current-release.md').write_text('内部交付回执', encoding='utf-8')
+    assert module.inventory(tmp_path, module.paths_for('frontend')[0]) == before
+    version.write_text('修正后的用户更新内容', encoding='utf-8')
+    assert module.inventory(tmp_path, module.paths_for('frontend')[0]) != before
+    (releases / 'v1.1.0.md').write_text('新增发行内容', encoding='utf-8')
+    assert 'docs/releases/v1.1.0.md' in module.inventory(tmp_path, module.paths_for('frontend')[0])
+
+
 def test_inventory_hashes_overlapping_inputs_once(tmp_path, monkeypatch):
     module = load_script('desktop-build-state')
     folder = tmp_path / 'source'; folder.mkdir()

@@ -223,9 +223,11 @@ def test_minimax_voice_lookup_rejects_unknown_id_and_api_errors(monkeypatch):
     assert no_key.value.status_code == 422
 
 
-def test_minimax_preview_uses_selected_model_voice_and_default_sample(monkeypatch):
+@pytest.mark.parametrize('ending', ['success', 'failure', 'cancel'])
+def test_minimax_preview_uses_selected_model_voice_and_default_sample(monkeypatch, ending):
     async def scenario():
         observed = {}
+        first_enqueued = asyncio.Event()  # first_enqueued（首块已经入队，后续音频仍未生成）。
 
         class FakeSession:
             async def send_text(self, text):
@@ -235,6 +237,12 @@ def test_minimax_preview_uses_selected_model_voice_and_default_sample(monkeypatc
                 return None
 
             async def audio_chunks(self):
+                yield b"\0\0" * 160
+                await asyncio.wait_for(first_enqueued.wait(), 1)
+                if ending == 'failure':
+                    raise RuntimeError('模拟音频中途断开')
+                if ending == 'cancel':
+                    await asyncio.Event().wait()
                 yield b"\0\0" * 160
 
             async def close(self):
@@ -260,7 +268,8 @@ def test_minimax_preview_uses_selected_model_voice_and_default_sample(monkeypatc
                 observed["allow"] = operation_id
 
             def enqueue(self, operation_id, pcm):
-                observed["pcm"] = (operation_id, pcm)
+                observed.setdefault('pcm', []).append((operation_id, pcm))
+                first_enqueued.set()
 
             async def wait_until_output_complete(self, *, timeout_seconds):
                 observed["timeout"] = timeout_seconds
@@ -271,20 +280,40 @@ def test_minimax_preview_uses_selected_model_voice_and_default_sample(monkeypatc
             def stop_and_snapshot(self, operation_id):
                 observed["stopped"] = operation_id
 
+            async def stop_and_snapshot_confirmed(self, operation_id):
+                observed['confirmed_stop'] = operation_id
+
         monkeypatch.setattr(tts_voice_runtime, "MiniMaxTtsClient", FakeClient)
         runtime = SimpleNamespace(config=AppConfig(), _api_key=lambda _: "test-secret", player=FakePlayer(), voice_library=None)
+        async def terminate(key):
+            assert observed.get('confirmed_stop') == key
+            observed['terminated'] = key
+        runtime.terminate_remote_playback = terminate
         manager = tts_voice_runtime.TtsVoiceOperationManager(runtime)
         payload = manager.start_minimax_preview("speech-2.8-turbo", "  future-clone-01  ")
         operation = manager._items[payload["operation_id"]]
+        if ending == 'cancel':
+            await asyncio.wait_for(first_enqueued.wait(), 1)
+            await manager.cancel_confirmed(operation.id)
         await operation.task
         finished = manager.get(payload["operation_id"])
+        if ending != 'success':
+            assert finished['state'] == ('cancelled' if ending == 'cancel' else 'failed')
+            assert observed['confirmed_stop'] == operation.id
+            assert observed['terminated'] == operation.id
+            assert finished['playback_outcome'] == 'stopped'
+            assert observed['closed'] is True
+            assert not manager.busy
+            return
         assert finished["state"] == "succeeded"
         assert finished["result"]["voice_id"] == "future-clone-01"
         assert observed["client"]["model"] == "speech-2.8-turbo"
         assert observed["client"]["voice_id"] == "future-clone-01"
         assert observed["client"]["api_key"] == "test-secret"
         assert observed["text"] == tts_voice_runtime.DESIGN_SAMPLE_TEXT
-        assert observed["pcm"][1] == b"\0\0" * 160
+        assert b''.join(pcm for _, pcm in observed['pcm']) == b"\0\0" * 320
+        assert all(key == payload['operation_id'] for key, _ in observed['pcm'])
+        assert operation.timings_ms['first_enqueued'] <= operation.timings_ms['synthesis_finished']
         assert observed["closed"] is True
 
     asyncio.run(scenario())
