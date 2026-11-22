@@ -98,6 +98,7 @@
 
 ### 专项验收与历史记录
 
+- [SSH（安全远程连接）默认解释器桥接修复与本机验证（2026-11-22）](testing/ssh-bridge-shell-20261122.md)
 - [项目文档梳理与发行对照（2026-11-22）](testing/documentation-review-20261122.md)
 - [公共弹窗嵌套布局回归核验（2026-11-22）](testing/ui-dialog-layout-regression-20261122.md)
 - [SSH（安全外壳协议）自动配置审计与本机验收（2026-11-21）](testing/ssh-auto-configuration-audit-20261121.md)

@@ -1444,11 +1444,7 @@ fn manage_project_device_key(
         String::new()
     };
     let line = if add {
-        let command =
-            format!(
-            "\"{}\" --ssh-device-bridge --workspace-id {} --owner-sid {} --device-id {} --bridge-protocol {}",
-            executable.display(), workspace_id, owner_sid, device_id, crate::compatibility::DEVICE_BRIDGE_PROTOCOL_VERSION,
-        );
+        let command = project_device_bridge_command(&executable, workspace_id, owner_sid, device_id);
         let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
         format!("from=\"{scopes}\",restrict,command=\"{escaped_command}\" {public_key} {marker}")
     } else {
@@ -1495,6 +1491,40 @@ fn manage_project_device_key(
         }
     }
     Ok(())
+}
+
+// project_device_bridge_command（固定桥接启动命令）：外层只含 ASCII（基本字符集）命令和编码参数，
+// 兼容 sshd（安全外壳服务）的 cmd.exe（默认命令行）及 PowerShell（脚本环境）默认解释器。
+// Process（原生进程）直接继承三个标准句柄，避免 PowerShell 文本管道改写媒体和文件字节。
+#[cfg(feature = "ssh-device")]
+fn project_device_bridge_command(
+    executable: &std::path::Path, // executable（已核验的受管桌面程序绝对路径）。
+    workspace_id: &str,           // workspace_id（已经过格式检查的工作区编号）。
+    owner_sid: &str,              // owner_sid（已经过格式检查的账户安全标识符）。
+    device_id: &str,              // device_id（已经过格式检查的设备编号）。
+) -> String {
+    let executable_b64 =
+        base64::engine::general_purpose::STANDARD.encode(executable.to_string_lossy().as_bytes());
+    let script = format!(
+        "$ErrorActionPreference='Stop';try{{\
+         $start=[Diagnostics.ProcessStartInfo]::new();\
+         $start.FileName=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{executable_b64}'));\
+         $start.Arguments='--ssh-device-bridge --workspace-id {workspace_id} --owner-sid {owner_sid} --device-id {device_id} --bridge-protocol {protocol}';\
+         $start.UseShellExecute=$false;\
+         $process=[Diagnostics.Process]::Start($start);\
+         $process.WaitForExit();$code=$process.ExitCode;$process.Dispose();exit $code\
+         }}catch{{\
+         $message=[Text.Encoding]::UTF8.GetBytes($_.Exception.Message+[Environment]::NewLine);\
+         $errorOutput=[Console]::OpenStandardError();$errorOutput.Write($message,0,$message.Length);exit 1}}",
+        protocol = crate::compatibility::DEVICE_BRIDGE_PROTOCOL_VERSION,
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")
 }
 
 #[cfg(feature = "ssh-device")]
@@ -1805,6 +1835,171 @@ pub(crate) fn execute_maintenance_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "ssh-device"))]
+    #[test]
+    fn fixed_bridge_command_preserves_binary_stdio_and_identity_under_windows_shells() {
+        use std::{
+            io::Write,
+            os::windows::process::CommandExt,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+
+        let owner = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp");
+        let temp = owner.join(format!("ssh-command-{}", crate::workspace::new_id()));
+        // 覆盖中文、空格及两种解释器的元字符；路径只能作为编码数据传入。
+        let directory = temp.join("中文 路径 & '$`%!(测试)");
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("bridge fixture.exe");
+        let path_b64 = base64::engine::general_purpose::STANDARD
+            .encode(executable.to_string_lossy().as_bytes());
+        let fixture = r#"
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@@PATH@@'))
+$ErrorActionPreference = 'Stop'
+Add-Type -OutputAssembly $path -OutputType WindowsApplication -TypeDefinition @'
+using System;
+using System.Text;
+public class BridgeFixture {
+    public static int Main(string[] args) {
+        var output = Console.OpenStandardOutput();
+        var header = new UTF8Encoding(false).GetBytes(String.Join("|", args) + "\n" + Environment.GetEnvironmentVariable("SSH_ORIGINAL_COMMAND") + "\n");
+        output.Write(header, 0, header.Length);
+        output.Flush();
+        Console.OpenStandardInput().CopyTo(output);
+        output.Flush();
+        var error = new UTF8Encoding(false).GetBytes("桥接诊断\n");
+        Console.OpenStandardError().Write(error, 0, error.Length);
+        return Int32.Parse(Environment.GetEnvironmentVariable("BRIDGE_FIXTURE_EXIT_CODE"));
+    }
+}
+'@
+"#.replace("@@PATH@@", &path_b64);
+        let root = crate::powershell::windows_root().unwrap();
+        let windows_powershell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let compiled = Command::new(&windows_powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &encode_powershell(&fixture),
+            ])
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "夹具编译失败：{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let executable = crate::canonical_path(&executable).unwrap();
+        let command = project_device_bridge_command(
+            &executable,
+            "18dcc2d519a4a938-81ec",
+            "S-1-5-21-42",
+            "device-test",
+        );
+        assert!(command.is_ascii());
+        let input = (0..=255_u8).collect::<Vec<_>>(); // input（包含空字节、非文本字节和换行的完整单字节集合）。
+        let header = format!(
+            "--ssh-device-bridge|--workspace-id|18dcc2d519a4a938-81ec|--owner-sid|S-1-5-21-42|--device-id|device-test|--bridge-protocol|{}\nvoice-terminal-v1-file\n",
+            crate::compatibility::DEVICE_BRIDGE_PROTOCOL_VERSION,
+        );
+        let expected = [header.as_bytes(), &input].concat();
+        let mut shells = vec![
+            ("cmd", root.join(r"System32\cmd.exe")),
+            ("Windows PowerShell 5.1", windows_powershell),
+        ];
+        let selected = powershell_executable().unwrap();
+        if !shells
+            .iter()
+            .any(|(_, path)| crate::canonical_path(path).unwrap() == selected)
+        {
+            shells.push(("selected PowerShell", selected));
+        }
+        for (name, shell) in shells {
+            for exit_code in [0, 23] {
+                let mut launch = Command::new(&shell);
+                if name == "cmd" {
+                    launch.raw_arg("/d /s /c ").raw_arg(&command);
+                } else {
+                    launch.args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &command,
+                    ]);
+                }
+                let mut child = launch
+                    .env("SSH_ORIGINAL_COMMAND", "voice-terminal-v1-file")
+                    .env("BRIDGE_FIXTURE_EXIT_CODE", exit_code.to_string())
+                    .creation_flags(0x0800_0000)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(&input).unwrap();
+                let started = Instant::now();
+                while child.try_wait().unwrap().is_none() {
+                    if started.elapsed() > Duration::from_secs(30) {
+                        let _ = child.kill();
+                        panic!(
+                            "{name}: 固定桥接命令未在期限内完成；夹具保留于 {}",
+                            temp.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert_eq!(
+                    output.stdout,
+                    expected,
+                    "{name}: 二进制标准输入输出或固定身份参数发生变化；错误输出：{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.stderr,
+                    "桥接诊断\n".as_bytes(),
+                    "{name}: 标准错误必须保持独立原始字节"
+                );
+                // PowerShell（外层解释器）将最后一个原生命令的非零退出码映射为 1；cmd 保留原码。
+                let expected_code = if name == "cmd" || exit_code == 0 {
+                    exit_code
+                } else {
+                    1
+                };
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_code),
+                    "{name}: 必须保留桥接成功或失败状态"
+                );
+            }
+        }
+        let missing_command = project_device_bridge_command(
+            &directory.join("不存在.exe"),
+            "18dcc2d519a4a938-81ec",
+            "S-1-5-21-42",
+            "device-test",
+        );
+        let mut arguments = missing_command.split_ascii_whitespace();
+        let failure = Command::new(arguments.next().unwrap())
+            .args(arguments)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(failure.stdout.is_empty(), "启动失败不能污染桥接协议输出");
+        assert!(
+            !std::str::from_utf8(&failure.stderr)
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "启动失败必须返回 UTF-8（统一字符编码）诊断"
+        );
+        crate::workspace::remove_owned(&temp, &owner).unwrap();
+    }
 
     #[test]
     fn valid_broadcast_permission_is_reused_without_any_maintenance() {
