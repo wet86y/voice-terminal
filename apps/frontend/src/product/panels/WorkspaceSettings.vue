@@ -43,6 +43,7 @@ const progress = computed(() => {
 const controlsBusy = computed(() => pickerBusy.value || cleanupBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
 const updateStatus = computed(() => props.controller.appUpdate.value)
 const debugPort = props.storagePort ?? desktopPort() as DesktopPort & DesktopWorkspacePort
+const localVersion = ref('') // localVersion（本机程序版本，不随远端目标切换）。
 const localRoot = ref('') // localRoot（客户端本机工作区，与远端服务分离）。
 const debugAccess = ref<boolean | null>(null)
 const debugSaving = ref(false)
@@ -53,6 +54,7 @@ onMounted(async () => {
   try {
     const info = await debugPort.workspaceInfo()
     localRoot.value = info.root
+    localVersion.value = info.version
     debugAccess.value = info.allow_external_debug ?? null
   } catch (error) {
     debugError.value = error instanceof Error ? error.message : '无法读取外部调试设置。'
@@ -171,10 +173,10 @@ function cancelJob() {
   <section class="workspace-settings" aria-labelledby="workspace-settings-title">
     <SettingsPageHeader section="workspace" title-id="workspace-settings-title" />
 
-    <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
+    <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="localVersion || workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
 
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
-    <p v-if="controller.workspaceError.value && !controller.remoteMode?.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
+    <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
 
     <WorkspaceLocationCard v-if="localRoot || workspace" :root="localRoot || workspace?.root || ''" :can-manage="canManage" :can-cleanup="Boolean(localRoot)" :expanded="storageOpen" :disabled="controlsBusy" :choosing="pickerBusy" :cleaning="cleanupBusy" @cleanup="toggleStorage" @migrate="chooseTarget" />
     <section v-if="storageOpen" id="local-storage-panel" class="workspace-job-card settings-stack" aria-label="本机空间管理" :aria-busy="cleanupBusy">

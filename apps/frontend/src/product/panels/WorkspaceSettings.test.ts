@@ -133,7 +133,6 @@ describe('WorkspaceSettings（关于页面）', () => {
 
   it('远程模式下页内确认本机卸载，通过本机维护入口查询进度并刷新', async () => {
     const actions = Object.assign(controller({ root:'远端路径',data_dir:'',version:'1.1.0',can_manage:false },false),{remoteMode:ref(true)})
-    actions.workspaceError.value = '远程服务端状态不可用，本机资源操作已停用。'
     const resource = 'tts-aniflive-fixture'
     const plan = {root:'本机路径',token:'scan',entries:[],total_bytes:0,removed_bytes:0,removed_count:0,skipped:[],components:[{resource_id:resource,label:'测试模型',bytes:64,installed:true},{resource_id:'tts-aniflive-missing',label:'未安装的模型',bytes:32,installed:false}]}
     const scan = vi.fn().mockResolvedValueOnce(plan).mockResolvedValue({...plan,components:plan.components.map(item=>({...item,installed:false}))})
@@ -141,11 +140,11 @@ describe('WorkspaceSettings（关于页面）', () => {
     const start = vi.fn().mockResolvedValue({job_id:'reset-uninstall-'+resource})
     const query = vi.fn().mockResolvedValue({job:{job_id:'reset-uninstall-'+resource,resource_id:resource,state:'complete',phase:'完成',error:null}})
     const legacyJobs = vi.fn().mockRejectedValue(new Error('远程模式禁止访问旧任务接口'))
-    const port = vi.spyOn(desktop,'desktopPort').mockReturnValue({available:true,workspaceInfo:async()=>({root:'本机路径'}),storageScan:scan,uninstallPlan:preview,uninstallResource:start,uninstallJobStatus:query,resourceJobSnapshots:legacyJobs} as never)
+    const port = vi.spyOn(desktop,'desktopPort').mockReturnValue({available:true,workspaceInfo:async()=>({root:'本机路径',version:'1.1.1'}),storageScan:scan,uninstallPlan:preview,uninstallResource:start,uninstallJobStatus:query,resourceJobSnapshots:legacyJobs} as never)
     const wrapper = mount(WorkspaceSettings,{props:{controller:actions}})
     try {
       await flushPromises()
-      expect(wrapper.text()).not.toContain('本机资源操作已停用')
+      expect(wrapper.text()).toContain('当前版本 v1.1.1')
       await wrapper.get('.workspace-cleanup-action').trigger('click');await flushPromises()
       expect(wrapper.findAll('.storage-component')).toHaveLength(1)
       expect(wrapper.text()).not.toContain('未安装的模型')

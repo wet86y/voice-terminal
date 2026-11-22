@@ -14,6 +14,7 @@ import { useProductControls } from './useProductControls'
 import { nativeDeviceApi } from './native-device-api'
 import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
+import WorkspaceSettings from './panels/WorkspaceSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import SpeakerSettings from './panels/SpeakerSettings.vue'
 import { SPEAKER_CONTROL_DEFAULTS, SPEAKER_FIELDS } from './speaker-policy'
@@ -1063,16 +1064,23 @@ describe('正式界面的真实控件交互', () => {
     wrapper.unmount()
   })
 
-  it('远程配对模式通过独立管理和文件通道操作服务端资源，不调用客户端本机资源接口', async () => {
+  it('远程组件仍映射服务端，关于页独立读取本机版本并执行本机更新', async () => {
     application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true } as ApplicationSnapshot
     const inventoryRead = vi.fn(async () => [])
     const workspaceRead = vi.fn(async () => ({ root: 'D:/客户端', data_dir: 'D:/客户端/data', version: '1.0', can_manage: true }))
+    const checkLocalUpdate = vi.fn(async () => ({state:'available',current_version:'1.0',target_version:'2.0',fields:{}}))
+    const downloadLocalUpdate = vi.fn(async () => ({state:'downloading',current_version:'1.0',fields:{}}))
+    const downloadLocalIntegrity = vi.fn(async () => ({state:'downloading',current_version:'1.0',fields:{}}))
+    const checkLocalIntegrity = vi.fn(async () => ({state:'checking',current_version:'1.0',fields:{}}))
     const localImport = vi.fn(async () => ({ job_id: 'client-local-import' }))
     const openSource = vi.fn(async () => {})
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
       available: true,
       resourceInventory: inventoryRead,
       workspaceInfo: workspaceRead,
+      integrityStatus: async () => ({state:'idle',current_version:'1.0',fields:{}}),
+      checkAppUpdate:checkLocalUpdate, downloadAppUpdate:downloadLocalUpdate,
+      downloadIntegrity:downloadLocalIntegrity, checkIntegrity:checkLocalIntegrity,
       importResource: localImport,
       openResourceSource: openSource,
       listen: async () => () => undefined,
@@ -1094,19 +1102,31 @@ describe('正式界面的真实控件交互', () => {
     let resources!: ReturnType<typeof useWorkspaceResources>
     const wrapper = render({ setup() {
       resources = useWorkspaceResources()
-      return () => h('div')
+      return () => h(WorkspaceSettings,{controller:resources})
     } })
     await flushPromises()
     expect(resources.resourcesCanManage.value).toBe(true)
-    expect(resources.canManage.value).toBe(false)
-    expect(resources.workspaceError.value).toContain('远程服务端组件状态暂不可用')
+    expect(resources.canManage.value).toBe(true)
+    expect(resources.workspace.value?.root).toBe('D:/客户端')
+    expect(resources.appUpdate.value.current_version).toBe('1.0')
+    expect(resources.workspaceError.value).toBe('')
+    expect(wrapper.text()).toContain('当前版本 v1.0')
+    expect(wrapper.get<HTMLButtonElement>('.update-action').element.disabled).toBe(false)
+    expect(wrapper.get<HTMLButtonElement>('.integrity-action').element.disabled).toBe(false)
+    await wrapper.get('.update-action').trigger('click'); await flushPromises()
+    await wrapper.get('.update-action').trigger('click'); await flushPromises()
+    await resources.downloadIntegrity(); await resources.checkIntegrity()
+    expect(checkLocalUpdate).toHaveBeenCalledOnce()
+    expect(downloadLocalUpdate).toHaveBeenCalledOnce()
+    expect(downloadLocalIntegrity).toHaveBeenCalledOnce()
+    expect(checkLocalIntegrity).toHaveBeenCalledOnce()
     await resources.openResourceSource('paraformer-offline')
     expect(openSource).not.toHaveBeenCalled()
     expect(resources.resourceError.value).toContain('远程模式暂不支持从客户端打开服务端组件来源链接')
     await resources.importResource('paraformer-offline')
     await flushPromises()
     expect(inventoryRead).not.toHaveBeenCalled()
-    expect(workspaceRead).not.toHaveBeenCalled()
+    expect(workspaceRead).toHaveBeenCalledTimes(2)
     expect(localImport).not.toHaveBeenCalled()
     expect(invoke).toHaveBeenCalledWith('device_ssh_import_start', { resource_id: 'paraformer-offline' })
     expect(invoke.mock.calls.some(([command, args]) => command === 'device_ssh_management_request'

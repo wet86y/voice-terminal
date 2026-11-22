@@ -41,7 +41,7 @@ export function useWorkspaceResources() {
   const remoteMode = ref(typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.remote_mode === true)
   let targetResolved = remoteMode.value || !locateNativeInvoker()
   let targetResolution: Promise<boolean> | null = null
-  const remoteResourceNotice = '远程服务端组件状态暂不可用。本机资源操作已停用，以免修改客户端组件。'
+  const remoteResourceNotice = '远程服务端组件状态暂不可用。组件设置仅管理服务端，不修改客户端组件。'
   const remoteConnected = computed(() => application.snapshot.value?.remote_mode === true
     && application.snapshot.value.management_connected === true)
   const connectionNotice = computed(() => !remoteMode.value || remoteConnected.value ? ''
@@ -121,7 +121,6 @@ export function useWorkspaceResources() {
     }
     if (remoteMode.value) {
       resourceError.value = remoteResourceNotice
-      workspaceError.value = remoteResourceNotice
       return false
     }
     return true
@@ -148,8 +147,8 @@ export function useWorkspaceResources() {
     return result.body as unknown as T
   }
 
-  // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
-  const canManage = computed(() => port.available && !remoteMode.value && workspace.value?.can_manage)
+  // canManage（本机工作区管理权限）与远端组件目标独立，由正式本机程序提供。
+  const canManage = computed(() => port.available && workspace.value?.can_manage)
   const resourcesCanManage = computed(() => port.available && (!remoteMode.value || remoteConnected.value))
   const activeWorkspaceJob = computed(() => [...workspaceJobs.value].reverse().find(job => !TERMINAL_JOB_STATES.has(job.state)))
   const latestWorkspaceJob = computed(() => workspaceJobs.value.at(-1) ?? null)
@@ -242,7 +241,6 @@ export function useWorkspaceResources() {
 
   async function refreshWorkspace() {
     if (!port.available) return
-    if (!localResourceTargetAllowed()) return
     try {
       workspace.value = await port.workspaceInfo()
       if (!appUpdate.value.current_version) appUpdate.value.current_version = workspace.value.version
@@ -323,7 +321,7 @@ export function useWorkspaceResources() {
       )
       workspaceUnlisten = await port.listen<WorkspaceJob>(
         WORKSPACE_PROGRESS_EVENT,
-        event => { if (!remoteMode.value) upsertWorkspaceJob(event.payload) },
+        event => { upsertWorkspaceJob(event.payload) },
       )
       updateUnlisten = await port.listen<AppUpdateStatus>(
         APP_UPDATE_EVENT,
@@ -353,15 +351,17 @@ export function useWorkspaceResources() {
     window.addEventListener('focus', refreshOnFocus)
     void (async () => {
       const remote = await resolveRemoteMode()
+      // 关于页的工作区、版本和完整性状态始终读取本机；仅组件清单和组件任务随远端切换。
+      const localMaintenance = [refreshWorkspace(), Promise.resolve().then(() => port.integrityStatus())
+        .then(value => { if (mounted) integrity.value = value })
+        .catch(error => { if (mounted) integrity.value.error = String(error) })]
       if (remote) {
-        workspaceError.value = remoteResourceNotice
-        unlistenRequests = [subscribe(), refreshJobSnapshots(), refreshInventory()]
+        unlistenRequests = [...localMaintenance, subscribe(), refreshJobSnapshots(), refreshInventory()]
         await Promise.all(unlistenRequests)
         schedulePoll()
         return
       }
-      unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined),
-        Promise.resolve().then(() => port.integrityStatus()).then(value => { if (mounted) integrity.value = value }).catch(error => { if (mounted) integrity.value.error = String(error) })]
+      unlistenRequests = [...localMaintenance, subscribe(), refreshJobSnapshots(), refreshInventory()]
       await Promise.all(unlistenRequests)
       schedulePoll()
     })().finally(() => { loading.value = false })
@@ -415,12 +415,12 @@ export function useWorkspaceResources() {
   }
 
   async function downloadIntegrity() {
-    if (!port.available || remoteMode.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     try { integrity.value = await port.downloadIntegrity() }
     catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error) } }
   }
   async function checkIntegrity() {
-    if (!port.available || remoteMode.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     try { integrity.value = await port.checkIntegrity() }
     catch (error) { integrity.value = { ...integrity.value, state: 'failed', error: String(error), installer_ready: false } }
   }
@@ -438,7 +438,7 @@ export function useWorkspaceResources() {
   }
 
   async function chooseWorkspace() {
-    if (!localResourceTargetAllowed()) return null
+    if (!port.available) return null
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
     workspaceError.value = ''
     try {
@@ -450,7 +450,7 @@ export function useWorkspaceResources() {
   }
 
   async function cleanupWorkspace(confirmation?: string) {
-    if (!localResourceTargetAllowed() || !canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
+    if (!port.available || !canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
     workspaceOperationStarting.value = true
     workspaceError.value = ''
     try {
@@ -464,7 +464,7 @@ export function useWorkspaceResources() {
   }
 
   async function linkWorkspace(targetRoot: string) {
-    if (!localResourceTargetAllowed()) return
+    if (!port.available) return
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     workspaceOperationStarting.value = true
     workspaceError.value = ''
@@ -481,7 +481,7 @@ export function useWorkspaceResources() {
   }
 
   async function migrateWorkspace(targetRoot: string) {
-    if (!localResourceTargetAllowed()) return
+    if (!port.available) return
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return
     workspaceOperationStarting.value = true
     workspaceError.value = ''

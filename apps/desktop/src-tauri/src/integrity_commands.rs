@@ -41,7 +41,7 @@ pub fn app_integrity_status(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<Desktop>>,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let context = state.context().ok_or("缺少工作区")?;
     let ready = app_update::retained(
         &context.install,
@@ -76,7 +76,7 @@ pub fn app_integrity_download(
     state: tauri::State<'_, Arc<Desktop>>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     reserve_maintenance(
         &state.maintenance_gate,
         &state.workspace_busy,
@@ -131,7 +131,7 @@ pub fn app_integrity_check(
     state: tauri::State<'_, Arc<Desktop>>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let context = state.context().ok_or("缺少工作区")?;
     let retained = app_update::retained(
         &context.install,

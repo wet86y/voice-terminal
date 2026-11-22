@@ -199,9 +199,41 @@ pub struct ResourceManager {
     tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
     resetting: AtomicBool,       // resetting（重置独占准入）。
+    cleanup_active: AtomicBool, // cleanup_active（空间维护独占准入）：不占用任务快照锁。
     batch_active: AtomicBool,    // batch_active（一键维护中）：整批结束后才恢复服务。
     accepting_jobs: AtomicBool, // accepting_jobs（接受新任务）：迁移排空前原子关闭，防止排空后再写旧工作区。
     validation_failures: Mutex<HashMap<String, String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
+}
+
+// CleanupReservation（空间维护预留）：只在准入和收尾时短暂持锁，停机、扫描及删除不占任务快照锁。
+struct CleanupReservation<'a> {
+    jobs: &'a Mutex<HashMap<String, JobControl>>,
+    active: &'a AtomicBool,
+    changed: &'a Condvar,
+}
+fn require_no_cleanup(active: &AtomicBool) -> Result<(), String> {
+    if active.load(Ordering::Acquire) { Err("本机空间维护正在执行，请等待完成。".into()) } else { Ok(()) }
+}
+impl<'a> CleanupReservation<'a> {
+    fn begin(jobs: &'a Mutex<HashMap<String, JobControl>>, accepting: &AtomicBool,
+        resetting: &AtomicBool, active: &'a AtomicBool, changed: &'a Condvar) -> Result<Self, String> {
+        let locked = jobs.try_lock().map_err(|_| "资源任务状态正在更新，请稍后清理。")?;
+        require_no_cleanup(active)?;
+        if !accepting.load(Ordering::Acquire) || resetting.load(Ordering::Acquire)
+            || locked.values().any(|job| !terminal(&job.snapshot.state)) {
+            return Err("组件任务正在处理，请等待结束后清理工作区。".into());
+        }
+        active.store(true, Ordering::Release);
+        Ok(Self { jobs, active, changed })
+    }
+}
+impl Drop for CleanupReservation<'_> {
+    fn drop(&mut self) {
+        // 与排空等待使用同一把短锁，避免等待者检查状态与进入等待之间丢失通知。
+        let _locked = self.jobs.lock().unwrap_or_else(|poisoned|poisoned.into_inner());
+        self.active.store(false, Ordering::Release);
+        self.changed.notify_all();
+    }
 }
 
 impl ResourceManager {
@@ -310,6 +342,7 @@ impl ResourceManager {
             management_core_status_revision: AtomicU64::new(0),
             resume_pending: Mutex::new(false),
             resetting: AtomicBool::new(false),
+            cleanup_active: AtomicBool::new(false),
             batch_active: AtomicBool::new(false),
             accepting_jobs: AtomicBool::new(true),
             validation_failures: Mutex::new(HashMap::new()),
@@ -1050,7 +1083,8 @@ impl ResourceManager {
         }
         {
             let jobs = self.jobs.lock().map_err(|_| "任务状态不可用")?;
-            if jobs.values().any(|j| !terminal(&j.snapshot.state))
+            if self.cleanup_active.load(Ordering::Acquire)
+                || jobs.values().any(|j| !terminal(&j.snapshot.state))
                 || self.resetting.swap(true, Ordering::AcqRel)
             {
                 return Err("请等待当前组件任务完成。".into());
@@ -1572,9 +1606,10 @@ impl ResourceManager {
     }
 
     pub fn has_active_jobs(&self) -> bool {
+        if self.cleanup_active.load(Ordering::Acquire) { return true; }
         self.jobs
             .lock()
-            .map(|jobs| jobs.values().any(|job| !terminal(&job.snapshot.state)))
+            .map(|jobs| self.cleanup_active.load(Ordering::Acquire) || jobs.values().any(|job| !terminal(&job.snapshot.state)))
             .unwrap_or(true)
     }
 
@@ -1583,7 +1618,9 @@ impl ResourceManager {
             let mut lease = self.pause_service()?;
             self.remember_service_was_running(lease.was_running())?;
             let result = voice_desktop_common::workspace_cleanup::run_selected(&self.context, env!("CARGO_PKG_VERSION"), Some(token), true, Some(entries));
-            self.maybe_resume_service(&mut lease)?;
+            let resumed = self.maybe_resume_service(&mut lease)?;
+            clear_resume_intent_if_resumed(&self.resume_pending, resumed);
+            if resumed { self.finish_recovery(None); }
             result
         })
     }
@@ -1591,13 +1628,8 @@ impl ResourceManager {
         &self,
         operation: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let jobs = self.jobs.try_lock().map_err(|_| "资源任务状态正在更新，请稍后清理。")?;
-        if !self.accepting_jobs.load(Ordering::Acquire)
-            || self.resetting.load(Ordering::Acquire)
-            || jobs.values().any(|job| !terminal(&job.snapshot.state))
-        {
-            return Err("组件任务正在处理，请等待结束后清理工作区。".into());
-        }
+        let _reservation = CleanupReservation::begin(&self.jobs, &self.accepting_jobs,
+            &self.resetting, &self.cleanup_active, &self.jobs_changed)?;
         operation()
     }
     pub fn configure_runtime(self: &Arc<Self>, group: String) -> Result<Value, String> {
@@ -2509,7 +2541,7 @@ impl ResourceManager {
 
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
-        while jobs.values().any(|job| !terminal(&job.snapshot.state)) {
+        while self.cleanup_active.load(Ordering::Acquire) || jobs.values().any(|job| !terminal(&job.snapshot.state)) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("资源仍在原子安装，当前不能切换工作区。".into());
@@ -2519,7 +2551,7 @@ impl ResourceManager {
                 .wait_timeout(jobs, remaining)
                 .map_err(|_| "资源任务状态不可用。")?;
             jobs = next;
-            if timeout.timed_out() && jobs.values().any(|job| !terminal(&job.snapshot.state)) {
+            if timeout.timed_out() && (self.cleanup_active.load(Ordering::Acquire) || jobs.values().any(|job| !terminal(&job.snapshot.state))) {
                 return Err("资源仍在原子安装，当前不能切换工作区。".into());
             }
         }
@@ -3541,6 +3573,7 @@ impl ResourceManager {
         }
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
+            require_no_cleanup(&self.cleanup_active)?;
             if self.resetting.load(Ordering::Acquire) && !job_id.starts_with("reset-") {
                 return Err("组件正在重置，请等待完成。".into());
             }
@@ -4820,13 +4853,14 @@ fn schedule_after_system_feature_confirmation<T>(
 }
 
 #[tauri::command]
-pub fn resource_jobs(
+pub async fn resource_jobs(
     window: WebviewWindow,
     desktop: State<'_, Arc<super::Desktop>>,
     manager: State<'_, Arc<ResourceManager>>,
 ) -> Result<Vec<Value>, String> {
     command_allowed(&window, &desktop)?;
-    Ok(manager.snapshots())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.snapshots()).await.map_err(|error|error.to_string())
 }
 
 /// resource_system_feature_status（读取系统功能状态）：显式管理页调用，角色不符时拒绝。
@@ -5363,6 +5397,50 @@ mod service_tests {
         ));
     }
     use super::*;
+
+    #[test]
+    fn cleanup_reservation_keeps_snapshots_available_and_rejects_new_maintenance() {
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let accepting = AtomicBool::new(true);
+        let resetting = AtomicBool::new(false);
+        let active = AtomicBool::new(false);
+        let changed = Condvar::new();
+        let reservation = CleanupReservation::begin(&jobs,&accepting,&resetting,&active,&changed).unwrap();
+        let snapshot_jobs = jobs.clone();
+        let (sent,received) = std::sync::mpsc::channel();
+        let ui = thread::spawn(move || {
+            let snapshot = snapshot_jobs.lock().unwrap();
+            sent.send(snapshot.len()).unwrap();
+        });
+        // 模拟维护线程等待主线程回调：读取任务快照必须在维护结束之前返回。
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(),0);
+        assert!(require_no_cleanup(&active).is_err());
+        assert!(CleanupReservation::begin(&jobs,&accepting,&resetting,&active,&changed).is_err());
+        ui.join().unwrap();
+        drop(reservation);
+        assert!(require_no_cleanup(&active).is_ok());
+        assert!(CleanupReservation::begin(&jobs,&accepting,&resetting,&active,&changed).is_ok());
+    }
+
+    #[test]
+    fn cleanup_reservation_releases_admission_after_unwind_and_preserves_closed_admission() {
+        let jobs = Mutex::new(HashMap::new());
+        let accepting = AtomicBool::new(true);
+        let resetting = AtomicBool::new(false);
+        let active = AtomicBool::new(false);
+        let changed = Condvar::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = CleanupReservation::begin(&jobs,&accepting,&resetting,&active,&changed).unwrap();
+            panic!("模拟维护中断");
+        }));
+        assert!(result.is_err());
+        assert!(!active.load(Ordering::Acquire));
+        assert!(jobs.try_lock().is_ok());
+        accepting.store(false,Ordering::Release);
+        assert!(CleanupReservation::begin(&jobs,&accepting,&resetting,&active,&changed).is_err());
+        assert!(!accepting.load(Ordering::Acquire));
+        assert!(!active.load(Ordering::Acquire));
+    }
 
     #[test]
     fn required_batch_reserves_jobs_and_only_admits_its_own_children() {

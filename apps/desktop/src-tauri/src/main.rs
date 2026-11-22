@@ -8915,7 +8915,7 @@ async fn workspace_choose(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<Desktop>>,
 ) -> Result<Option<serde_json::Value>, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let locator = state.locator.clone().ok_or("缺少本地工作区身份")?;
     tauri::async_runtime::spawn_blocking(move || {
         let chosen = voice_desktop_common::native_ui::choose_folder(
@@ -8936,7 +8936,7 @@ async fn workspace_operation(
     target_root: String,
     kind: &'static str,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     reserve_maintenance(
         &state.maintenance_gate,
         &state.workspace_busy,
@@ -9056,7 +9056,7 @@ async fn workspace_cleanup(
     manager: tauri::State<'_, Arc<ResourceManager>>,
     confirmation: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let context = state.context().ok_or("缺少工作区上下文")?;
     let state = state.inner().clone();
     let manager = manager.inner().clone();
@@ -9067,8 +9067,8 @@ async fn workspace_cleanup(
     .map_err(|error| error.to_string())?
 }
 
-// require_local_storage（本机空间维护授权）：连接远端不改变此命令的本机目标。
-fn require_local_storage(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
+// require_local_workspace（本机关于页授权）：更新、完整性维护及工作区操作始终绑定本机。
+fn require_local_workspace(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     trusted(window, state)?;
     require_command(state.mode, DesktopCommand::FocusMain)?;
     if state.stopping.load(Ordering::Acquire) { return Err("应用正在退出。".into()); }
@@ -9077,7 +9077,7 @@ fn require_local_storage(window: &WebviewWindow, state: &Desktop) -> Result<(), 
 #[tauri::command(rename_all = "snake_case")]
 async fn workspace_storage_scan(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
     manager: tauri::State<'_, Arc<ResourceManager>>) -> Result<serde_json::Value, String> {
-    require_local_storage(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let context = state.context().ok_or("缺少本机工作区")?;
     let state = state.inner().clone(); let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -9098,7 +9098,7 @@ async fn workspace_storage_scan(window: WebviewWindow, state: tauri::State<'_, A
 #[tauri::command(rename_all = "snake_case")]
 async fn workspace_storage_cleanup(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
     manager: tauri::State<'_, Arc<ResourceManager>>, token: String, entry_ids: Vec<String>) -> Result<serde_json::Value, String> {
-    require_local_storage(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let context = state.context().ok_or("缺少本机工作区")?;
     let state = state.inner().clone(); let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -9112,7 +9112,7 @@ async fn workspace_storage_cleanup(window: WebviewWindow, state: tauri::State<'_
 
 #[tauri::command(rename_all = "snake_case")]
 fn resource_uninstall_plan(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>, manager: tauri::State<'_, Arc<ResourceManager>>, resource_id: String, job_id: Option<String>) -> Result<serde_json::Value, String> {
-    require_local_storage(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     // job_id（本机卸载任务编号）：仅查询此维护入口创建的任务，不放宽原有资源任务的模式门禁。
     if let Some(job_id) = job_id {
         let expected = if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {"env-remove-gpu".into()} else {format!("reset-uninstall-{resource_id}")};
@@ -9124,7 +9124,7 @@ fn resource_uninstall_plan(window: WebviewWindow, state: tauri::State<'_, Arc<De
 }
 #[tauri::command(rename_all = "snake_case")]
 fn resource_uninstall(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>, manager: tauri::State<'_, Arc<ResourceManager>>, resource_id: String, token: String) -> Result<serde_json::Value, String> {
-    require_local_storage(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     manager.inner().uninstall_resource(resource_id, token)
 }
 
@@ -9151,7 +9151,7 @@ fn project_open_repository(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<Desktop>>,
 ) -> Result<(), String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     voice_desktop_common::windows::open_url("https://github.com/wet86y/voice-terminal")
 }
 #[tauri::command]
@@ -9169,7 +9169,7 @@ async fn app_update_check(
     state: tauri::State<'_, Arc<Desktop>>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     if state
         .app_update
         .busy
@@ -9223,7 +9223,7 @@ async fn app_update_download(
     state: tauri::State<'_, Arc<Desktop>>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     let manifest = state
         .app_update
         .manifest
@@ -9264,7 +9264,7 @@ fn app_update_cancel(
     window: WebviewWindow,
     state: tauri::State<Arc<Desktop>>,
 ) -> Result<(), String> {
-    require_workspace(&window, &state)?;
+    require_local_workspace(&window, &state)?;
     state.app_update.request_cancel()
 }
 fn download_and_handoff_update(
