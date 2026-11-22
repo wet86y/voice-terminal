@@ -45,7 +45,7 @@ describe('AppUpdateCard（应用更新卡片）', () => {
     await trigger.trigger('click')
     expect(wrapper.get('[role="dialog"]').text()).toContain('更新日志')
     const versions = wrapper.findAll('.release-history-version').map(row => row.text())
-    expect(versions[0]).toBe('v1.1.0')
+    expect(versions[0]).toBe('v1.1.1')
     expect(versions.indexOf('v1.0.0')).toBeGreaterThan(0)
     expect(versions.indexOf('v0.9.12')).toBeLessThan(versions.indexOf('v0.9.9'))
     expect(wrapper.findAll('.release-history-body')).toHaveLength(0)

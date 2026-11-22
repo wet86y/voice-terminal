@@ -200,6 +200,7 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v1.1.1 发行说明](releases/v1.1.1.md)
 - [v1.1.0 发行说明](releases/v1.1.0.md)
 - [v1.0.0 发行说明](releases/v1.0.0.md)
 - [v0.9.12 发行说明](releases/v0.9.12.md)
