@@ -9,6 +9,36 @@ from ..resource_distribution import ResourceCatalog, ResourceError
 from ..model_installation import inspect_installed_model, model_update_available
 
 
+def inspect_asr_runtime(status: Mapping[str, Any]) -> list[str]:
+    """inspect_asr_runtime（识别子通道广播准入）：启用的精修及必需标点须实际加载并预热。"""
+    blockers: list[str] = []
+    for key, label in (("offline", "双路精修"), ("punctuation", "流式标点")):
+        lane = status.get(key)
+        if not isinstance(lane, Mapping):
+            continue  # 旧健康回执缺少子通道时，仍由进程和必要资源门禁负责。
+        if key == "offline" and lane.get("status") == "DISABLED":
+            continue
+        if (lane.get("status") != "READY" or lane.get("model_loaded") is not True
+                or lane.get("model_warmed") is not True):
+            blockers.append(label)
+    return blockers
+
+
+def inspect_analysis_runtime(status: Mapping[str, Any], enabled: Mapping[str, bool]) -> list[str]:
+    """inspect_analysis_runtime（分析通道广播准入）：使用核心当前设置与工作进程实际加载状态。"""
+    blockers: list[str] = []
+    for key, label in (("endpoint", "语音结束判断"), ("emotion", "情绪背景"), ("acoustic", "声学事件")):
+        if enabled.get(key) is False:
+            continue
+        lane = status.get(key)
+        if enabled.get(key) is not True and (not isinstance(lane, Mapping) or lane.get("status") == "DISABLED"):
+            continue
+        if (not isinstance(lane, Mapping) or lane.get("status") != "READY"
+                or lane.get("model_loaded") is not True or lane.get("model_warmed") is not True):
+            blockers.append(label)
+    return blockers
+
+
 def required_model_resources(config: Any) -> dict[str, list[str]]:
     """Return selected resource ids（已选资源编号）for each model-loading role."""
     requirements: dict[str, list[str]] = {

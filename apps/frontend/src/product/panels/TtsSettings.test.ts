@@ -6,6 +6,7 @@ import { provideProductContext } from '../product-context'
 import { productApi } from '../api'
 import * as desktopBridge from '../desktop-port'
 import TtsSettings from './TtsSettings.vue'
+import { useApplicationHost } from '../application-host'
 import type { ProductLocalTtsStatus, ProductTtsSettings } from '../types'
 
 const state = vi.hoisted(() => ({ live: undefined as unknown }))
@@ -26,6 +27,18 @@ describe('音色设置只提供资源完整的本地模型', () => {
     return mount(defineComponent({ setup() { provideProductContext({ settings, setNotice: vi.fn() } as never); return () => h(TtsSettings) } }),
       { global: { stubs: { TtsVoiceLibrary: true, ...stubs } } })
   }
+  it('远程客户端没有本地模型时仅提示在服务端导入', async () => {
+    const host = useApplicationHost()
+    const previous = host.snapshot.value
+    host.snapshot.value = { remote_mode: true } as never
+    ;(state.live as { status: { value: ProductLocalTtsStatus } }).status.value.models = []
+    const wrapper = render()
+    try {
+      await wrapper.get('[aria-label="语音播放目标"] button:last-child').trigger('click')
+      expect(wrapper.text()).toContain('请在服务端导入')
+      expect(wrapper.findAll('button').some(button => button.text() === '模型导入')).toBe(false)
+    } finally { wrapper.unmount(); host.snapshot.value = previous }
+  })
   it('语音调节缺省开启，保存关闭后保持界面与配置一致', async () => {
     const save = vi.spyOn(productApi, 'saveTts').mockResolvedValue({ settings: { tts: { speech_control_enabled: false } } } as never)
     const wrapper = render()

@@ -10,9 +10,9 @@ export const settingsSections = [
 ] as const;
 export type SettingsSection = (typeof settingsSections)[number]["id"];
 
-/** desktopSettingsSections（桌面管理分区）：仅正式管理界面提供设备角色维护。 */
+/** desktopSettingsSections（桌面管理分区）：仅正式管理界面提供设备连接设置。 */
 export const desktopSettingsSections = [
   ...settingsSections,
-  { id: "devices", label: "设备与角色", hint: "本机、共享主机与远端连接", description: "管理设备身份、主机信任和 SSH 连接", icon: "⌘" },
+  { id: "devices", label: "设备连接", hint: "选择本地运行或远程配对", description: "选择本地运行或远程配对", icon: "⌘" },
 ] as const;
 export type DesktopSettingsSection = (typeof desktopSettingsSections)[number]["id"];

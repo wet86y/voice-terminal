@@ -32,11 +32,6 @@ import { FLOATING_WINDOW_CONTROL_EVENT, FLOATING_WINDOW_ERROR_EVENT, FLOATING_WI
 const controls = useProductControls();
 const application = useApplicationHost();
 provideProductContext(controls);
-const remoteVoiceStatusLabel = computed(() => controls.voice.connection.value === 'connected'
-  ? '语音实时通道已连接'
-  : controls.voice.connection.value === 'connecting' ? '正在连接服务端语音实时通道' : '服务端语音实时通道已断开') // remoteVoiceStatusLabel（与管理连接分开的语音 WebSocket 状态）。
-const remoteVoiceStatusError = computed(() => application.snapshot.value?.remote_voice_error
-  || controls.voice.connectionError.value || '') // remoteVoiceStatusError（本机语音转发或套接字错误）。
 const workspaceResources = useWorkspaceResources();
 const {
   applicationSnapshot,
@@ -167,16 +162,6 @@ function exportLogs() {
     :runtime="runtimeState"
   >
     <template #banner>
-      <div v-if="applicationSnapshot?.remote_mode" class="remote-host-banner" role="status">
-        <strong>正在管理：{{ applicationSnapshot.host_name || '已配对服务端' }}</strong>
-        <span>{{ applicationSnapshot.management_connected ? '管理通道已连接' : applicationSnapshot.remote_connection_state === 'unpaired' ? '请在设备与角色中搜索并配对服务端' : applicationSnapshot.remote_connection_state === 'paused' ? '自动重连已暂停，可在设备与角色中恢复连接' : '正在等待服务端连接' }}</span>
-        <span>{{ remoteVoiceStatusLabel }}</span>
-        <span v-if="remoteVoiceStatusError">{{ remoteVoiceStatusError }}</span>
-        <span v-if="!applicationSnapshot.remote_business_ready">{{ applicationSnapshot.remote_error || '服务端业务状态暂不可用' }}</span>
-        <span v-else-if="applicationSnapshot.core_phase === 'ready'">服务端语音核心已就绪</span>
-        <span v-else-if="applicationSnapshot.core_phase === 'starting'">服务端语音核心准备中</span>
-        <span v-else>服务端语音核心不可用</span>
-      </div>
       <div
         v-if="!applicationSnapshot?.remote_mode && (applicationSnapshot?.state === 'degraded' || application.runtimeFailure.value)"
         class="application-degraded"
@@ -192,6 +177,7 @@ function exportLogs() {
     <Workbench
       v-show="activePage === 'home'"
       :model="workbenchModel"
+      :remote-mode="applicationSnapshot?.remote_mode === true"
       :console-enabled="dsh.state === 'ready'"
       :console-label="dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
       @settings="activePage = 'settings'"
@@ -226,7 +212,7 @@ function exportLogs() {
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
         <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" :expand-anif-live-tts="expandAnifLiveTtsCard" />
         <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" />
-        <DeviceSettings v-if="activeSettingsTab === 'devices'" /></article
+        <DeviceSettings v-if="activeSettingsTab === 'devices'" @notice="setNotice" /></article
     ></SettingsFrame>
     <template #overlays>
       <LanVersionDialog />

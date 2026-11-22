@@ -7,6 +7,7 @@ import ConversationMessage from "./ConversationMessage.vue";
 import VoiceOrb from "./VoiceOrb.vue";
 const props = defineProps<{
   model: WorkbenchModel; // model（工作台呈现数据）。
+  remoteMode?: boolean; // remoteMode（已保存的远程配对运行模式）。
   consoleEnabled?: boolean; // consoleEnabled（代理控制台是否可用）。
   consoleLabel?: string; // consoleLabel（代理控制台按钮文案）。
 }>();
@@ -221,7 +222,7 @@ onBeforeUnmount(() => {
           <h2 id="voice-panel-title" class="panel-kicker">语音助手</h2>
           <div class="voice-heading-actions">
             <span class="status-pill">{{
-              model.state === "offline"
+              remoteMode ? "远程配对" : model.state === "offline"
                 ? "离线"
                 : model.state === "error"
                   ? "需检查"

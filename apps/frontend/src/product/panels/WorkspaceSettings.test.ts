@@ -4,6 +4,7 @@ import { computed, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import WorkspaceSettings from './WorkspaceSettings.vue'
+import * as desktop from '../desktop-port'
 
 function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResources>['workspace']['value']>, canManage: boolean) {
   return {
@@ -31,6 +32,27 @@ function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResourc
 }
 
 describe('WorkspaceSettings（关于页面）', () => {
+  it('外部调试使用底部滑块，保存失败时恢复原开关状态', async () => {
+    const save = vi.fn().mockRejectedValueOnce(new Error('无法保存调试授权')).mockResolvedValueOnce(undefined)
+    const port = vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true,
+      workspaceInfo: async () => ({ allow_external_debug: true }), setAgentDebugAllowed: save } as never)
+    const wrapper = mount(WorkspaceSettings, { props: { controller: controller({
+      root: 'D:\\测试工作区', data_dir: 'D:\\测试工作区\\data', version: '1.0.0', can_manage: true }, true) } })
+    try {
+      await flushPromises()
+      expect(wrapper.findAll('.workspace-settings > section').at(-1)!.classes()).toContain('debug-access-card')
+      const control = wrapper.get<HTMLInputElement>('input[role="switch"][aria-label="允许外部调试"]')
+      expect(control.element.checked).toBe(true)
+      await control.setValue(false)
+      await flushPromises()
+      expect(save).toHaveBeenCalledWith(false)
+      expect(control.element.checked).toBe(true)
+      expect(wrapper.get('[role="alert"]').text()).toContain('无法保存调试授权')
+      await control.setValue(false)
+      await flushPromises()
+      expect(control.element.checked).toBe(false)
+    } finally { wrapper.unmount(); port.mockRestore() }
+  })
   it('更新位于首栏，工作区只展示根目录，没有管理权限时隐藏迁移操作', () => {
     const wrapper = mount(WorkspaceSettings, {
       props: {

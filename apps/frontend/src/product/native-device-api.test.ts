@@ -8,6 +8,21 @@ afterEach(() => {
 })
 
 describe('远程管理会话生命周期', () => {
+  it('移除配对使用固定服务端编号，迟到管理状态不能复活已移除的会话', async () => {
+    let complete!: (value: unknown) => void
+    const pending = new Promise(resolve => { complete = resolve })
+    const invoke = vi.fn(async (command: string) => command === 'device_config_status'
+      ? { runtime: { mode: 'remote' }, device_config: { mode: 'remote', paired_host: { host_id: 'server-remove' } } }
+      : command === 'device_ssh_management_request' ? pending : undefined)
+    window.__TAURI_INTERNALS__ = { invoke: invoke as never }
+    const result = nativeDeviceApi.remoteManagementRequest('management.status', {})
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    await nativeDeviceApi.removePairedHost('server-remove', true)
+    expect(invoke).toHaveBeenCalledWith('device_pairing_remove', { expectedHostId: 'server-remove', confirmed: true })
+    complete({ status: 200, fields: {} })
+    await expect(result).rejects.toThrow('已丢弃旧管理状态')
+  })
+
   it('断开后的迟到管理状态不能复活旧会话', async () => {
     let complete!: (value: unknown) => void
     const pending = new Promise(resolve => { complete = resolve })
@@ -32,6 +47,16 @@ describe('nativeDeviceApi.enableOpenSshServer（本机 SSH 准备确认）', () 
     await expect(nativeDeviceApi.enableOpenSshServer(true)).resolves.toEqual(response)
     expect(invoke).toHaveBeenCalledOnce()
     expect(invoke).toHaveBeenCalledWith('resource_system_feature_enable', { confirmed: true })
+  })
+})
+
+describe('nativeDeviceApi.controlInboundDevice（入站连接控制）', () => {
+  it('使用正式命令携带客户端身份、登记代次和确认值', async () => {
+    const invoke = vi.fn().mockResolvedValue({device_id:'client-a', action:'disconnect', completed:true, fields:{}})
+    window.__TAURI_INTERNALS__ = {invoke}
+    await nativeDeviceApi.controlInboundDevice('host-a', 'client-a', 'a'.repeat(64), 'disconnect')
+    expect(invoke).toHaveBeenCalledWith('device_inbound_control', {expectedHostId:'host-a', deviceId:'client-a',
+      expectedRecordToken:'a'.repeat(64), action:'disconnect', confirmed:true})
   })
 })
 

@@ -25,6 +25,13 @@ function fixture(footprintPid = 1, footprintCreated = 10) {
 }
 
 describe('共享模型的内存归属估算', () => {
+  it('远程客户端不使用进程明细或旧组件快照分摊内存', () => {
+    const { snapshot, compute } = fixture()
+    snapshot.remote_mode = true
+    expect(componentResources(snapshot, compute).size).toBe(0)
+    expect(componentResources({ ...snapshot, resource_processes: undefined,
+      components: [{ id: 'asr', pid: 2, memory_rss_bytes: 500 }] } as ApplicationSnapshot, compute).size).toBe(0)
+  })
   /** totals（分组总量）：检查归属变化前后的常驻、提交内存及显存守恒。 */
   function totals(result: ReturnType<typeof componentResources>) {
     return (['memory_rss_bytes', 'memory_private_commit_bytes', 'gpu_dedicated_bytes'] as const)

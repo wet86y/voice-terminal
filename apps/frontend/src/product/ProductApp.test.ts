@@ -617,7 +617,7 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = render(ProductApp)
     await flushPromises()
     await wrapper.get('.compact-settings-button').trigger('click')
-    const devices = wrapper.get('button[aria-label="设备与角色"]')
+    const devices = wrapper.get('button[aria-label="设备连接"]')
     await devices.trigger('click')
     await flushPromises()
 
@@ -656,8 +656,9 @@ describe('正式界面的真实控件交互', () => {
     const workbench = wrapper.findComponent(Workbench)
     expect(workbench.props('consoleEnabled')).toBe(true)
     expect(workbench.props('consoleLabel')).toBe('代理控制台')
-    expect(wrapper.get('.remote-host-banner').text()).toContain('管理通道已连接')
-    expect(wrapper.get('.remote-host-banner').text()).toContain('服务端语音实时通道已断开')
+    expect(wrapper.find('.remote-host-banner').exists()).toBe(false)
+    expect(workbench.props('remoteMode')).toBe(true)
+    expect(workbench.get('.voice-heading .status-pill').text()).toBe('远程配对')
   })
 
   it('管理通道在线但语音实时套接字断开时禁用语音操作并保留设置草稿', async () => {
@@ -1146,8 +1147,40 @@ describe('正式界面的真实控件交互', () => {
     expect(manager).toHaveBeenCalledTimes(2)
     const card = await expandComponent(wrapper, 'paraformer', 'speech')
     await flushPromises()
-    expect(card.get('button[aria-label="Paraformer（流式识别）：下载"]').attributes('disabled')).toBeUndefined()
+    expect(card.find('button[aria-label="Paraformer（流式识别）：下载"]').exists()).toBe(false)
+    expect(wrapper.find('.resource-download-required').exists()).toBe(false)
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
     expect(inventory).not.toHaveBeenCalled()
+  })
+
+  it('客户端不展示服务端的部分进程内存、加载增量和资源导入入口；本地模式仍展示', async () => {
+    let controls!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() {
+      controls = useProductControls(); provideProductContext(controls)
+      return () => h(ComputeSettings)
+    } })
+    application.businessReady.value = true
+    controls.computeStatus.value = { models: {
+      paraformer: { service: 'READY', runtime: 'PyTorch（推理框架）', device: 'cpu',
+        resource_status: { pid: 123, rss_bytes: 1024 ** 3, private_commit_bytes: 2 * 1024 ** 3 } },
+      emotion: { service: 'READY', resource_footprint: { rss_bytes: 3000 } },
+    } } as never
+    application.snapshot.value = { remote_mode: true, management_connected: true, remote_business_ready: true,
+      startup_complete: true, components: [], total_memory_rss_bytes: 4 * 1024 ** 3,
+    } as unknown as ApplicationSnapshot
+    const remote = await expandComponent(wrapper, 'paraformer', 'speech')
+    await expandComponent(wrapper, 'emotion', 'extensions')
+    await expandComponent(wrapper, 'tts-aniflive', 'tts')
+    expect(remote.text()).toContain('PyTorch（推理框架）')
+    expect(wrapper.findAll('[data-metric="memory"]')).toHaveLength(0)
+    expect(wrapper.find('.local-memory-summary').exists()).toBe(false)
+    expect(wrapper.text()).not.toMatch(/常驻内存|提交内存|显存|情绪模型加载增量/)
+    expect(wrapper.find('#aniflive-model-import').exists()).toBe(false)
+
+    application.snapshot.value = { startup_complete: true, components: [] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(remote.get('[data-metric="memory"]').text()).toContain('1 GB / 2 GB')
+    expect(wrapper.find('#aniflive-model-import').exists()).toBe(true)
   })
 
   it('运行中的组件页把随包更新显示为必需更新操作，并复用既有下载计划', async () => {

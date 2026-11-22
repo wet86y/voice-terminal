@@ -162,7 +162,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const sharedEstimate = ['kws', 'voice_vad', 'smart_turn', 'emotion'].includes(item.id)
     const countedHere = !sharedEstimate || resources.value.has(item.id)
     const metrics = resources.value.get(sharedEstimate ? item.id : owners[item.id])
-    const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
+    const legacyResource = !remoteTarget.value && application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
     // ownerUnavailable（所属进程不可用）：停止、阻塞或无进程编号的失败会使旧模型快照失效；
     // 仍有 pid（进程编号）的 failed（失败）表示宿主仍报告进程存在，Voice（语音服务）核心门禁也会这样标记，模型状态应独立展示。
@@ -370,8 +370,8 @@ const rows = computed<LocalComponentRow[]>(() => {
         ? localModelMetrics.gpu_dedicated_bytes : undefined,
     } : undefined,
     description: registeredLocalModels.length
-      ? `${registeredLocalModels.length} 款已转换并登记的 AnifLive-TTS 模型；名称、下载和导入入口位于卡片详情。`
-      : '暂无已转换并登记的 AnifLive-TTS 模型；可在卡片详情中导入。',
+      ? `${registeredLocalModels.length} 款已转换并登记的 AnifLive-TTS 模型；${remoteTarget.value ? '下载与导入请在服务端处理。' : '名称、下载和导入入口位于卡片详情。'}`
+      : remoteTarget.value ? '暂无已转换并登记的 AnifLive-TTS 模型；请在服务端导入。' : '暂无已转换并登记的 AnifLive-TTS 模型；可在卡片详情中导入。',
     error: localTtsFailed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
     facts: [], runtimeDependencies: localRuntime ? [localRuntime] : [], settingsSection: 'tts',
     note: '本地语音进程的常驻内存、提交内存和显存只计入当前运行模型；模型列表不重复累计。',
@@ -452,7 +452,7 @@ const model = computed<LocalComponentsModel>(() => {
     state: waitingRemote ? snapshot?.management_connected && snapshot.core_phase === 'failed' ? 'failed' : 'loading'
       : failed ? 'failed' : loading ? 'loading' : 'ready',
     sampledAt: snapshot?.sampled_at == null ? '—' : new Date(snapshot.sampled_at * 1000).toLocaleString('zh-CN', { hour12: false }),
-    resources: [
+    resources: remoteTarget.value ? [] : [
       { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
       { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
       { id: 'vram', label: '显存', used: typeof snapshot?.total_gpu_dedicated_bytes === 'number' && snapshot.total_gpu_dedicated_bytes > 0 ? formatComponentMemory(snapshot.total_gpu_dedicated_bytes) : undefined, total: formatComponentMemory(gpu?.total_bytes) },
@@ -483,7 +483,7 @@ const model = computed<LocalComponentsModel>(() => {
     }),
     remoteTarget: props.resourceController?.remoteMode.value ?? (application.snapshot.value?.remote_mode === true),
     integrityAvailable: !(props.resourceController?.remoteMode.value ?? (application.snapshot.value?.remote_mode === true)),
-    resourceActionsAvailable: props.resourceController?.resourcesCanManage.value ?? false,
+    resourceActionsAvailable: !remoteTarget.value && (props.resourceController?.resourcesCanManage.value ?? false),
     downloadResources: (props.resourceController?.resources.value ?? [])
       .map(resource => managedResource(resource.resource_id))
       .filter((resource): resource is ManagedResourceRow => Boolean(resource)),
@@ -495,7 +495,13 @@ const model = computed<LocalComponentsModel>(() => {
     resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
       || props.resourceController?.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
     resourceBatchRetry: props.resourceController?.resourceJobs.value.some(job => job.resource_id === 'batch' && job.state === 'failed') ?? false,
-    rows: waitingRemote ? waitingRows : remoteTarget.value ? rows.value.map(row => ({ ...row, location: '服务端', retryable: false })) : rows.value,
+    rows: waitingRemote ? waitingRows : remoteTarget.value ? rows.value.map(row => ({
+      ...row, location: '服务端', retryable: false,
+      residentMemory: undefined, privateMemory: undefined, vram: undefined, resourceBytes: undefined,
+      runtimeDependencyMetrics: undefined,
+      facts: row.facts.filter(fact => !/内存|显存|加载增量/.test(fact.label)),
+      note: row.note && /内存|显存|加载增量/.test(row.note) ? undefined : row.note,
+    })) : rows.value,
     error: enhancementError.value || application.error.value, refreshing: refreshing.value,
   }
 })
@@ -545,12 +551,13 @@ function openResourceSource(id: string) { void props.resourceController?.openRes
 function cancelResource(id: string) { void props.resourceController?.cancelJob(id) }
 </script>
 <template>
-  <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
+  <ResourceInstallDialog v-if="resourceController && !remoteTarget" :controller="resourceController" />
   <LocalComponents :model="model" :saving="saving" :expand-anif-live-tts="props.expandAnifLiveTts" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" @integrity="resourceController?.requestIntegrity()">
     <template #aniflive-tts>
       <AnifLiveTtsManagement
         :models="tts.status.value?.models ?? []"
         :open-import="props.expandAnifLiveTts"
+        :import-available="!remoteTarget"
         :disabled="Boolean(tts.status.value?.pending_selection)"
         @import-completed="handleAnifLiveModelImportCompleted"
         @refresh="void tts.refresh(true)"

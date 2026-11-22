@@ -35,6 +35,7 @@ git diff --check
 | 启动首屏、错误兜底、维护进度及窗口交接 | [启动与维护界面连续性验收](startup-ui-continuity.md)，含模块超时、迟到挂载、渲染异常及入口重试回归 |
 | 能力就绪分档、探测去抖与能力级恢复 | `tests/test_state.py`、`tests/test_application_host.py`、`tests/test_capability_recovery.py`、`tests/test_listening_capability_gate.py`、`apps/frontend/src/product/application-host.test.ts`、`apps/frontend/src/product/ProductApp.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
+| 设备设置、名称、入站连接与缺组件本机管理 | `apps/frontend/src/management/DeviceSettings.test.ts`、`apps/frontend/src/product/device-display-name.test.ts`、`apps/frontend/src/product/remote-client-runtime.test.ts`；原生 `device_config`（设备配置）、`device_trust`（设备信任）、`device_management_contract`（管理契约）、`connection_control`（连接通知）测试；后端 `tests/test_product_api.py`（入站控制）及 `tests/test_startup_resource_readiness.py`（广播准入）。操作与状态定义见[设备连接指南](../guides/device-connection.md)。 |
 | 构建内容复用、同包交付、安装失败与进度 | `tests/test_desktop_pipeline.py`、`scripts/test-start-desktop-build-arguments.ps1`；执行规范见[同包交付流程](../development/desktop-pipeline.md) |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | 资源下载、复制、摘要与首次安装启动 | `apps/frontend/src/management/ManagementApp.test.ts`（管理页状态回归）；`cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common -p voice-terminal-desktop --locked`（原生资源与宿主回归）；公共模块可增加 `--features qualification`（隔离下载验收） |

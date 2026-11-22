@@ -31,6 +31,7 @@ class ApplicationState:
             "startup_complete": False, "startup_skipped": False, "core_available": False,
             "core_phase": "starting",  # core_phase（核心能力阶段）：ready（就绪）、starting（加载中）或 failed（失败）。
             "unavailable_capabilities": [],  # unavailable_capabilities（能力行）：来自语音服务的分能力状态。
+            "worker_broadcast_blockers": {},  # worker_broadcast_blockers（按工作进程分别登记未就绪子通道中文名称）。
             "stopping": False,
             "voice_api_url": "", "voice_ws_url": "", "capabilities": {},
             "endpoints": {},  # endpoints（端点表）：url（实际地址）、preferred_url（首选地址）、scheme（协议）、host（主机）、port（端口）、path（路径）、generation（代次）、pid（进程编号）、created_at（创建时间）。
@@ -66,6 +67,16 @@ class ApplicationState:
             scheduled = [c for c in result["components"] if c["enabled"]]
             result["completed_components"] = sum(c["state"] in TERMINAL for c in scheduled)
             result["total_components"] = len(scheduled)
+            # broadcast_ready（广播准入）：必要核心和所有已启用功能均就绪，停用的可选组件不阻塞。
+            blockers = [c["name"] for c in scheduled
+                        if c["state"] not in {"ready", "external", "disabled"} or c["retrying"]]
+            blockers.extend(c.get("label") or c["id"] for c in result["unavailable_capabilities"]
+                            if c.get("state") != "DISABLED")
+            for worker_blockers in result["worker_broadcast_blockers"].values():
+                blockers.extend(worker_blockers)
+            result["broadcast_blockers"] = list(dict.fromkeys(blockers))  # broadcast_blockers（未就绪功能中文名称）。
+            result["broadcast_ready"] = (result["startup_complete"] and result["core_available"]
+                                         and not result["stopping"] and not blockers)
             setup_ready = next(c for c in result["components"] if c["id"] == "setup")["state"] == "ready"
             voice_running = next(c for c in result["components"] if c["id"] == "voice")["pid"] is not None
             for c in result["components"]:
@@ -80,6 +91,11 @@ class ApplicationState:
             self.value.update(values)
             self.value["revision"] += 1
             self.condition.notify_all()
+
+    def worker_broadcast_status(self, worker: str, blockers: list[str]) -> None:
+        """worker_broadcast_status（更新工作进程广播准入）：各进程结果互不覆盖。"""
+        with self.condition:
+            self.update(worker_broadcast_blockers={**self.value["worker_broadcast_blockers"], worker: list(blockers)})
 
     def component(self, key: str, **values) -> None:
         with self.condition:

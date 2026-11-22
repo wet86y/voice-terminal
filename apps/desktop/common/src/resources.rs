@@ -1259,6 +1259,29 @@ fn aniflive_model_revision_ready(
 pub fn startup_readiness(context: &LaunchContext) -> Result<Value, String> {
     startup_readiness_with_progress(context, &AtomicBool::new(false), &mut |_, _, _| {})
 }
+/// require_broadcast_readiness（广播组件准入）：沿用组件盘点，并核对当前启用的可选增强，不下载或修复。
+pub fn require_broadcast_readiness(context: &LaunchContext) -> Result<(), String> {
+    let rows = inventory(context)?;
+    let selected = specs(context)?.into_iter()
+        .filter(|item| item["selected_enhancement"] == true)
+        .filter_map(|item| item["resource_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    require_broadcast_inventory(&rows, &selected)
+}
+fn require_broadcast_inventory(rows: &[Value], selected: &[String]) -> Result<(), String> {
+    let mut checked = rows.to_vec();
+    for id in selected {
+        let row = checked.iter_mut().find(|row| row["resource_id"] == id.as_str())
+            .ok_or_else(|| format!("已启用组件未在本机清单中登记：{id}。"))?;
+        row["required"] = json!(true);
+    }
+    let readiness = readiness_from_inventory(&checked);
+    if readiness["ready"] == true { return Ok(()); }
+    let labels = readiness["missing"].as_array().into_iter().flatten()
+        .filter_map(|row| row["label"].as_str()).collect::<Vec<_>>();
+    Err(if labels.is_empty() { "本地组件状态尚未确认，广播未启动。".into() }
+        else { format!("本地组件未就绪：{}。请在本机组件管理中处理后再开启广播。", labels.join("、")) })
+}
 /// startup_readiness_with_progress（启动校验进度）：只盘点必要入口及兼容状态，不读取大组件完整内容。
 pub fn startup_readiness_with_progress(
     context: &LaunchContext,
@@ -4157,6 +4180,23 @@ mod download_tests {
                 assert_eq!(readiness["missing"], json!([]));
             }
         }
+    }
+
+    #[test]
+    fn broadcast_checks_required_and_selected_resources_without_blocking_unused_optional_models() {
+        let server = json!({"resource_id":"voice-server","label":"语音服务","required":true,"can_start":true});
+        let optional = json!({"resource_id":"paraformer-offline","label":"离线精修","required":false,"can_start":false});
+        assert!(require_broadcast_inventory(&[server.clone(), optional.clone()], &[]).is_ok());
+        let selected = vec!["paraformer-offline".to_string()];
+        assert!(require_broadcast_inventory(&[server.clone(), optional.clone()], &selected).unwrap_err().contains("离线精修"));
+        let mut ready = optional.clone();
+        ready["can_start"] = json!(true);
+        assert!(require_broadcast_inventory(&[server.clone(), ready], &selected).is_ok());
+        assert!(require_broadcast_inventory(&[server.clone()], &selected).is_err());
+        let mut missing = server;
+        missing["can_start"] = json!(false);
+        assert!(require_broadcast_inventory(&[missing], &[]).is_err());
+        assert!(require_broadcast_inventory(&[], &[]).is_err());
     }
 
     #[test]

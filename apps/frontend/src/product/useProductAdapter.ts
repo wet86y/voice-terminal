@@ -362,7 +362,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (sync && (sync.instance_id !== settings.sync?.instance_id || sync.revision > settings.sync.revision)) requestSettingsRefresh()
   })
 
-  watch([() => application.snapshot.value?.host_id, () => application.snapshot.value?.endpoint_revision], () => {
+  watch([
+    () => application.snapshot.value?.remote_mode === true,
+    () => application.snapshot.value?.host_id,
+    () => application.snapshot.value?.endpoint_revision,
+    () => application.snapshot.value?.voice_api_url,
+  ], () => {
     settingsConnectionGeneration++
     settings.sync = undefined
     retiredSettingsInstances.clear()
@@ -436,8 +441,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       applySnapshot(value, requestedRegistryRevision, requestedDshRevision, requestedAudioEnhancementRevision, requestedInstructionRevision,
         versioned || requestedResponseRevision === settingsResponseRevision)
       if (refreshAuxiliary) await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
-      if (refreshAuxiliary) lastError.value = ''
-    }).catch(error => { if (refreshAuxiliary) setError(error) }).finally(() => {
+      if (refreshAuxiliary && !adapterDisposed && requestedConnectionGeneration === settingsConnectionGeneration) lastError.value = ''
+    }).catch(error => {
+      // 端点交接已安排读取当前快照；旧读取失败与旧成功回执一样不再影响新目标。
+      if (refreshAuxiliary && !adapterDisposed && requestedConnectionGeneration === settingsConnectionGeneration) setError(error)
+    }).finally(() => {
       if (refreshAuxiliary) loading.value = false
       snapshotRequest = null
       if (snapshotRefreshNeeded) { snapshotRefreshNeeded = false; requestSettingsRefresh() }
@@ -449,11 +457,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (!application.businessReady.value) return
     const revision = computeStatusRevision
     const request = ++computeStatusRequest
+    const connectionGeneration = settingsConnectionGeneration // connectionGeneration（读取时绑定的端点代次）。
     try {
       const value = await productApi.computeStatus(refreshCapabilities)
-      if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) computeStatus.value = value
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration && revision === computeStatusRevision && request === computeStatusRequest) computeStatus.value = value
     } catch (error) {
-      if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) setError(error)
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration && revision === computeStatusRevision && request === computeStatusRequest) setError(error)
     }
   }
 
@@ -549,11 +558,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     // 唤醒任务由 DSH（代理执行宿主）提供；缺失资源或正在启动时先等待组件就绪。
     const dsh = application.snapshot.value?.components.find(component => component.id === 'dsh')
     if (!dsh || !['ready', 'external'].includes(dsh.state)) return
+    const connectionGeneration = settingsConnectionGeneration
     wakeTasksRequest = (async () => {
       try {
         const result = await productApi.wakeTasks()
-        if (!adapterDisposed) wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
-      } catch (error) { if (!adapterDisposed) setError(error) }
+        if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration) wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
+      } catch (error) { if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration) setError(error) }
     })()
     try { await wakeTasksRequest } finally { wakeTasksRequest = null }
   }
@@ -744,27 +754,29 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   async function refreshSpeaker() {
     if (!application.businessReady.value) return
     const revision = ++speakerStatusRevision
+    const connectionGeneration = settingsConnectionGeneration
     try {
       const [status, profile] = await Promise.all([
         productApi.speakerStatus(), productApi.speakerProfile(),
       ])
-      if (adapterDisposed) return
+      if (adapterDisposed || connectionGeneration !== settingsConnectionGeneration) return
       if (revision === speakerStatusRevision) speakerStatus.value = status
       speakerProfile.value = profile
     } catch (error) {
       // The sidecar is optional; do not make the main product snapshot fail.
-      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
     }
   }
 
   async function refreshSpeakerStatus() {
     if (!application.businessReady.value) return
     const revision = ++speakerStatusRevision
+    const connectionGeneration = settingsConnectionGeneration
     try {
       const status = await productApi.speakerStatus()
-      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = status
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration && revision === speakerStatusRevision) speakerStatus.value = status
     } catch (error) {
-      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
     }
   }
 
@@ -983,11 +995,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshRegistry() {
+    const connectionGeneration = settingsConnectionGeneration
     try {
-      applyRegistry(await productApi.registry())
+      const registry = await productApi.registry()
+      if (adapterDisposed || connectionGeneration !== settingsConnectionGeneration) return
+      applyRegistry(registry)
       lastError.value = ''
     } catch (error) {
-      setError(error)
+      if (!adapterDisposed && connectionGeneration === settingsConnectionGeneration) setError(error)
     }
   }
 

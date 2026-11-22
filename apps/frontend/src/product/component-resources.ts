@@ -13,6 +13,8 @@ const separateOwners = new Set(['asr', 'analysis', 'speaker', 'dsh', 'local-tts'
 export function resourceGroup(owner: string) { return separateOwners.has(owner) ? owner : 'voice-system' }
 
 export function componentResources(snapshot: ApplicationSnapshot | null, compute?: ProductComputeStatus | null): Map<string, ComponentResources> {
+  // 远程快照没有服务端统一采样；禁止把部分进程指标当作客户端或服务端完整占用。
+  if (snapshot?.remote_mode) return new Map()
   const groups = new Map<string, ComponentResources[]>()
   const processes = snapshot?.resource_processes ?? snapshot?.components.filter(row => row.pid && !row.external)
     .map(row => ({ ...row, component_id: row.id })) ?? []

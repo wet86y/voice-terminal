@@ -175,6 +175,25 @@ pub fn auto_start(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Stri
             });
         }
     }
+    #[cfg(feature = "ssh-device")]
+    if !state.client_discovery_started.swap(true, Ordering::AcqRel) {
+        let weak_state = Arc::downgrade(&state);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Some(current) = weak_state.upgrade() else { break };
+                if current.stopping.load(Ordering::Acquire) { break; }
+                let client_publication = current.discovery_publication.lock().ok().is_some_and(|publication|
+                    publication.as_ref().is_some_and(|value| value.state_name().starts_with("client:")));
+                if client_publication || current.context().is_some_and(|context| voice_desktop_common::device_config::inspect(&context.data).mode
+                    == Some(voice_desktop_common::device_config::RunMode::Remote)) {
+                    // 只刷新客户端存在公告；网络地址至多每分钟重读一次，不检查或启用 SSH（安全外壳协议）。
+                    let _ = super::sync_local_discovery(current.clone()).await;
+                }
+                drop(current);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
     Ok(())
 }
 

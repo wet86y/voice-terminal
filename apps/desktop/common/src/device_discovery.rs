@@ -10,6 +10,30 @@ use std::{
 pub const SERVICE_TYPE: &str = "_voiceterminal._tcp.local."; // SERVICE_TYPE（Voice Terminal 局域网服务类型）。
 pub const DISCOVERY_PROTOCOL_VERSION: u16 = 1; // DISCOVERY_PROTOCOL_VERSION（服务发现协议版本）。
 
+pub const CLIENT_SERVICE_TYPE: &str = "_vtclient._udp.local."; // CLIENT_SERVICE_TYPE（已配对客户端的存在公告，不提供入站业务入口）。
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscoveredClient {
+    pub device_id: String, // device_id（客户端稳定编号）。
+    pub display_name: String, // display_name（客户端显示名称）。
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundClient {
+    pub device_id: String, // device_id（本机可信客户端编号）。
+    pub display_name: Option<String>, // display_name（当前局域网存在公告名称）。
+    pub online: bool, // online（可发现客户端，可由客户端恢复连接；不表示服务端可主动拨入）。
+}
+
+/// inbound_clients（可信条目投影）：未登记或已撤销的广播不能增加客户端条目。
+pub fn inbound_clients(trust: &crate::device_trust::TrustSnapshot, discovered: &[DiscoveredClient]) -> Result<Vec<InboundClient>, String> {
+    if trust.state == "invalid" { return Err(trust.error.clone().unwrap_or_else(|| "设备信任登记无效。".into())); }
+    Ok(trust.devices.iter().filter(|device| device.state == "trusted").map(|device| {
+        let found = discovered.iter().find(|client| client.device_id == device.device_id);
+        InboundClient { device_id: device.device_id.clone(), display_name: found.map(|client| client.display_name.clone()), online: found.is_some() }
+    }).collect())
+}
+
 /// DiscoveredDevice（发现的服务端）：公开可路由地址仅供原生层连接，不含密钥或配对码。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveredDevice {
@@ -31,11 +55,18 @@ pub struct DiscoveryPublication {
     daemon: ServiceDaemon,
     fullname: String,
     state: String, // state（公告实际发布的核心准备状态）。
+    display_name: String, // display_name（本轮公告使用的服务端显示名称）。
+    checked_at: Instant, // checked_at（客户端网络地址最近核对时间，不检查 SSH 系统服务）。
 }
 
 impl DiscoveryPublication {
     pub fn state_name(&self) -> &str {
         &self.state
+    }
+
+    /// display_name（公告显示名称）：改名后不能复用旧名称的发布租约。
+    pub fn display_name(&self) -> &str {
+        &self.display_name
     }
 
     pub fn stop(self) -> Result<(), String> {
@@ -134,7 +165,98 @@ pub fn publish(
         daemon,
         fullname,
         state: state.to_owned(),
+        display_name: display_name.to_owned(),
+        checked_at: Instant::now(),
     })
+}
+
+/// refresh_client（客户端存在公告）：只公开已配对身份；端口为零，不增加监听器或连接权限。
+pub fn refresh_client(
+    mut previous: Option<DiscoveryPublication>, device_id: &str, host_id: &str, display_name: &str,
+) -> Result<DiscoveryPublication, String> {
+    validate_host_id(device_id)?;
+    validate_host_id(host_id)?;
+    if !valid_display(display_name) { return Err("客户端显示名称无效。".into()); }
+    let prefix = format!("client:{device_id}@{host_id}:");
+    if previous.as_ref().is_some_and(|value| value.state.starts_with(&prefix)
+        && value.display_name == display_name && value.checked_at.elapsed() < Duration::from_secs(60)) {
+        return Ok(previous.take().unwrap());
+    }
+    let addresses = private_physical_addresses()?;
+    let key = format!("{prefix}{}", addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+    if let Some(value) = previous.as_mut() {
+        if value.state == key && value.display_name == display_name {
+            value.checked_at = Instant::now();
+            return Ok(previous.take().unwrap());
+        }
+    }
+    drop(previous);
+    if addresses.is_empty() { return Err("当前没有可发布客户端状态的私有物理局域网。".into()); }
+    use sha2::{Digest, Sha256};
+    let identity = format!("{:x}", Sha256::digest(device_id.as_bytes()));
+    let hostname = format!("vtc-{}.local.", &identity[..48]);
+    let properties = [("device_id", device_id), ("host_id", host_id), ("display_name", display_name), ("protocol_version", "1")];
+    let service = ServiceInfo::new(CLIENT_SERVICE_TYPE, &format!("VTClient-{}", &identity[..32]),
+        &hostname, addresses.as_slice(), 0, properties.as_slice())
+        .map_err(|error| format!("建立客户端存在公告失败：{error}"))?;
+    let fullname = service.get_fullname().to_owned();
+    let daemon = ServiceDaemon::new().map_err(|error| format!("启动客户端存在公告失败：{error}"))?;
+    // 限制 mDNS（多播域名系统）收发到已核对的物理私有网络接口。
+    daemon.disable_interface(mdns_sd::IfKind::All).map_err(|error| error.to_string())?;
+    for address in &addresses { daemon.enable_interface(mdns_sd::IfKind::Addr(*address)).map_err(|error| error.to_string())?; }
+    daemon.register(service).map_err(|error| format!("发布客户端存在公告失败：{error}"))?;
+    Ok(DiscoveryPublication { daemon, fullname, state: key, display_name: display_name.to_owned(), checked_at: Instant::now() })
+}
+
+/// private_physical_addresses（轻量私有物理网络查询）：不读取 SSH、签名、系统可选功能或防火墙规则。
+fn private_physical_addresses() -> Result<Vec<IpAddr>, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$physical = @(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty ifIndex)
+$private = @(Get-NetConnectionProfile | Where-Object { [string]$_.NetworkCategory -in @('Private','DomainAuthenticated') } | Select-Object -ExpandProperty InterfaceIndex)
+$addresses = @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -Type Unicast | Where-Object { $physical -contains $_.InterfaceIndex -and $private -contains $_.InterfaceIndex } | Select-Object -ExpandProperty IPAddress)
+ConvertTo-Json -InputObject $addresses -Compress
+"#;
+    let host = crate::powershell::select(crate::powershell::Purpose::System)?;
+    let (code, output, _) = crate::powershell::execute(&host, script, Duration::from_secs(15), &mut |_| {})?;
+    if code != 0 { return Err("无法读取私有物理局域网地址。".into()); }
+    let values: Vec<String> = serde_json::from_str(output.trim()).map_err(|_| "私有物理网络地址回执无效。")?;
+    Ok(values.iter().filter_map(|value| value.parse::<IpAddr>().ok()).filter(|value| is_private_lan_address(*value))
+        .collect::<BTreeSet<_>>().into_iter().collect())
+}
+
+fn parse_client(service: &mdns_sd::ResolvedService, host_id: &str) -> Option<DiscoveredClient> {
+    if service.ty_domain != CLIENT_SERVICE_TYPE || !service.is_valid() || service.port != 0
+        || !service.addresses.iter().any(|address| is_private_lan_address(address.to_ip_addr())) { return None; }
+    let properties = &service.txt_properties;
+    if properties.get_property_val_str("host_id")? != host_id || properties.get_property_val_str("protocol_version")? != "1" { return None; }
+    let device_id = properties.get_property_val_str("device_id")?;
+    let display_name = properties.get_property_val_str("display_name")?;
+    validate_host_id(device_id).ok()?;
+    if !valid_display(display_name) { return None; }
+    Some(DiscoveredClient { device_id: device_id.to_owned(), display_name: display_name.to_owned() })
+}
+
+/// search_clients（发现本机已配对客户端）：公告仅用于可达状态，不授予设备认证或业务权限。
+pub fn search_clients(host_id: &str, timeout: Duration) -> Result<Vec<DiscoveredClient>, String> {
+    validate_host_id(host_id)?;
+    if timeout.is_zero() || timeout > Duration::from_secs(10) { return Err("客户端发现等待时长无效。".into()); }
+    let daemon = ServiceDaemon::new().map_err(|error| error.to_string())?;
+    let receiver = daemon.browse(CLIENT_SERVICE_TYPE).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut found = BTreeMap::new();
+    while Instant::now() < deadline {
+        if let Ok(event) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250))) {
+            match event {
+                ServiceEvent::ServiceResolved(service) => { if let Some(client) = parse_client(&service, host_id) { found.insert(service.fullname.clone(), client); } }
+                ServiceEvent::ServiceRemoved(_, fullname) => { found.remove(&fullname); }
+                _ => {}
+            }
+        }
+    }
+    let _ = daemon.stop_browse(CLIENT_SERVICE_TYPE);
+    let _ = daemon.shutdown();
+    Ok(found.into_values().collect())
 }
 
 /// search（搜索服务端）：限定最长十秒，不按主机名/IP 排除同机的独立工作区。
@@ -289,6 +411,61 @@ pub fn is_private_lan_address(address: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client_service(host_id: &str, device_id: &str) -> mdns_sd::ResolvedService {
+        let properties = [("host_id", host_id), ("device_id", device_id), ("display_name", "中文客户端"), ("protocol_version", "1")];
+        ServiceInfo::new(CLIENT_SERVICE_TYPE, "Client", "client.local.", "192.168.1.20", 0, properties.as_slice())
+            .unwrap().as_resolved_service()
+    }
+
+    #[test]
+    fn client_presence_requires_exact_paired_host_private_address_and_protocol() {
+        let service = client_service("host-a", "client-a");
+        assert_eq!(parse_client(&service, "host-a").unwrap().display_name, "中文客户端");
+        assert!(parse_client(&service, "host-b").is_none());
+        let mut invalid = service.clone();
+        invalid.port = 22;
+        assert!(parse_client(&invalid, "host-a").is_none());
+        invalid = service.clone();
+        invalid.addresses = [mdns_sd::ScopedIp::from("8.8.8.8".parse::<IpAddr>().unwrap())].into_iter().collect();
+        assert!(parse_client(&invalid, "host-a").is_none());
+        assert!(parse_client(&client_service("host-a", "非法编号"), "host-a").is_none());
+        assert!(parse_resolved_service(&service).is_none(), "客户端公告不能进入服务端配对搜索");
+    }
+
+    #[test]
+    fn inbound_projection_keeps_trusted_offline_devices_and_excludes_untrusted_broadcasts() {
+        let record = |id: &str, state: &str| crate::device_trust::TrustedDevice {
+            device_id: id.into(), public_key: "private-test-value".into(), fingerprint: "not-for-ui".into(),
+            state: state.into(), trusted_at_ms: 1, revoked_at_ms: None,
+        };
+        let mut trust = crate::device_trust::TrustSnapshot { state: "valid", error: None,
+            devices: vec![record("online", "trusted"), record("offline", "trusted"), record("revoked", "revoked")] };
+        let discovered = ["online", "revoked", "unknown"].map(|id| DiscoveredClient { device_id: id.into(), display_name: "同名设备".into() });
+        let rows = inbound_clients(&trust, &discovered).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].online);
+        assert!(!rows[1].online);
+        let encoded = serde_json::to_string(&rows).unwrap();
+        assert!(!encoded.contains("private-test-value") && !encoded.contains("not-for-ui"));
+        assert!(!encoded.contains("revoked") && !encoded.contains("unknown"));
+        assert!(inbound_clients(&trust, &[]).unwrap().iter().all(|device| !device.online));
+        trust.state = "invalid";
+        assert!(inbound_clients(&trust, &discovered).is_err());
+    }
+
+    #[test]
+    #[ignore = "需要真实物理私有局域网，按需执行存在公告验收"]
+    fn client_presence_live_publication_discovery_and_withdrawal() {
+        let device_id = format!("presence-client-{}", std::process::id());
+        let host_id = format!("presence-host-{}", std::process::id());
+        let publication = refresh_client(None, &device_id, &host_id, "客户端存在验收").unwrap();
+        let clients = search_clients(&host_id, Duration::from_secs(5)).unwrap();
+        assert_eq!(clients.iter().find(|client| client.device_id == device_id).unwrap().display_name, "客户端存在验收");
+        assert!(search_clients("different-host", Duration::from_secs(1)).unwrap().is_empty());
+        publication.stop().unwrap();
+        assert!(!search_clients(&host_id, Duration::from_secs(3)).unwrap().iter().any(|client| client.device_id == device_id));
+    }
 
     #[test]
     fn accepts_only_private_physical_network_ranges() {

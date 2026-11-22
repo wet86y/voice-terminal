@@ -63,6 +63,8 @@ pub struct HostTrust {
 pub struct DeviceConfig {
     pub schema_version: u32, // schema_version（格式版本）。
     pub device_id: String,   // device_id（稳定设备编号）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_name: String, // server_name（支持中文的服务端显示名称；空值沿用默认名称）。
     #[serde(default)]
     pub mode: RunMode, // mode（本地运行或远程配对）。
     #[serde(default)]
@@ -148,6 +150,16 @@ pub fn credential_reference_for_device(device_id: &str) -> Result<String, String
 }
 
 impl DeviceConfig {
+    /// server_display_name（服务端公开名称）：发现公告和配对回执使用同一名称，不改变稳定编号。
+    pub fn server_display_name(&self) -> String {
+        if !self.server_name.is_empty() {
+            return self.server_name.clone();
+        }
+        let suffix = self.device_id.chars().rev().take(6).collect::<String>()
+            .chars().rev().collect::<String>();
+        format!("Voice Terminal {suffix}")
+    }
+
     /// validate（校验）：不尝试修复、不接收未知版本或隐式改变角色。
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SCHEMA_VERSION {
@@ -155,6 +167,12 @@ impl DeviceConfig {
         }
         if !valid_identifier(&self.device_id, 128) {
             return Err("设备编号无效".into());
+        }
+        if self.server_name.trim() != self.server_name
+            || self.server_name.chars().count() > 32
+            || self.server_name.chars().any(char::is_control)
+        {
+            return Err("服务端名称无效：最多 32 个字符，不能包含首尾空白或控制字符。".into());
         }
         if self
             .reconnect_suspended_reason
@@ -326,6 +344,36 @@ pub fn save(data_root: &Path, config: &DeviceConfig) -> Result<RuntimeSnapshot, 
     save_with_recovery(data_root, config, false)
 }
 
+/// remove_paired_host（移除指定配对）：先持久暂停重连，清理密钥成功后再删除身份和地址；失败保留可重试的条目。
+pub fn remove_paired_host(
+    data_root: &Path,
+    expected_host_id: &str, // expected_host_id（用户确认移除的稳定服务端编号）。
+    mut delete_key: impl FnMut(&str) -> Result<(), String>, // delete_key（仅删除已校验配置引用的本机密钥）。
+) -> Result<RuntimeSnapshot, String> {
+    let mut config = match load_from_root(data_root) {
+        LoadResult::Valid(config) => config,
+        _ => return Err("设备配置不可用，未移除配对资料。".into()),
+    };
+    if config.mode != RunMode::Remote {
+        return Err("请在远程配对模式下移除服务端。".into());
+    }
+    let host = config.host.clone().ok_or("该配对条目已不存在。")?;
+    if host.host_id.as_deref() != Some(expected_host_id) {
+        return Err("配对服务端已变化，未删除其他服务端的资料。".into());
+    }
+    config.reconnect_suspended_reason = Some("正在移除服务端配对".into());
+    save(data_root, &config)?;
+    delete_key(&host.credential_ref)?;
+    if let Some(reference) = host.transport_credential_ref.as_deref() {
+        if reference != host.credential_ref {
+            delete_key(reference)?;
+        }
+    }
+    config.host = None;
+    config.reconnect_suspended_reason = None;
+    save(data_root, &config)
+}
+
 /// save_with_recovery（显式修复并存档）：只在用户确认后移动未知原件到受管归档。
 pub fn save_with_recovery(
     data_root: &Path,
@@ -478,11 +526,11 @@ pub fn actual_role(
     }
 }
 
-/// require_role_runtime（角色运行能力门禁）：保存本机核心角色前确认解释器入口存在。
-/// 这里只检查最低启动能力，模型和组件就绪仍由正式启动流程验证。
+/// require_role_runtime（广播角色最低门禁）：独立本地模式可先进入组件管理，只有共享主机要求解释器。
+/// 必要资源与已启用功能的完整广播准入继续由正式发布入口验证。
 pub fn require_role_runtime(role: Role, local_core_available: bool) -> Result<(), String> {
-    if role != Role::RemoteClient && !local_core_available {
-        return Err("当前工作区缺少本机核心运行组件，只能保存“远端客户端”角色；独立运行或共享主机请使用具备核心组件的完整工作区。".into());
+    if role == Role::SharedHost && !local_core_available {
+        return Err("本机核心运行组件尚未完备，不能开启广播；可先切换本地运行，在组件设置中下载或导入。".into());
     }
     Ok(())
 }
@@ -491,13 +539,13 @@ pub fn require_role_runtime(role: Role, local_core_available: bool) -> Result<()
 mod tests {
     use super::*;
     #[test]
-    fn lightweight_workspace_cannot_save_a_local_core_role() {
-        for role in [Role::Standalone, Role::SharedHost] {
-            assert!(require_role_runtime(role, false).is_err());
+    fn lightweight_workspace_can_enter_local_management_but_cannot_broadcast() {
+        for role in [Role::Standalone, Role::RemoteClient] {
+            assert!(require_role_runtime(role, false).is_ok());
             assert!(require_role_runtime(role, true).is_ok());
         }
-        assert!(require_role_runtime(Role::RemoteClient, false).is_ok());
-        assert!(require_role_runtime(Role::RemoteClient, true).is_ok());
+        assert!(require_role_runtime(Role::SharedHost, false).is_err());
+        assert!(require_role_runtime(Role::SharedHost, true).is_ok());
     }
 
     #[test]
@@ -525,6 +573,7 @@ mod tests {
         let valid = DeviceConfig {
             schema_version: SCHEMA_VERSION,
             device_id: "device-1".into(),
+            server_name: String::new(),
             mode: RunMode::Local,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -610,6 +659,7 @@ mod tests {
         let mut config = DeviceConfig {
             schema_version: SCHEMA_VERSION,
             device_id: "device-1".into(),
+            server_name: String::new(),
             mode: RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -647,6 +697,66 @@ mod tests {
     }
 
     #[test]
+    fn server_name_is_optional_unicode_and_never_changes_device_identity() {
+        let raw = serde_json::json!({
+            "schema_version": 3, "device_id": "device-123456", "mode": "local",
+            "broadcast_enabled": false, "client_online_tts_local": true, "audio_compression": false,
+            "desired_role": "standalone", "audio_mode": "pcm", "paired_host": null
+        });
+        let mut config: DeviceConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(config.server_display_name(), "Voice Terminal 123456");
+        assert!(serde_json::to_value(&config).unwrap().get("server_name").is_none());
+        config.server_name = "书房语音服务端🎙".into();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.server_display_name(), "书房语音服务端🎙");
+        assert_eq!(config.device_id, "device-123456");
+        for invalid in [" 名称".into(), "名称\n".into(), "中".repeat(33)] {
+            config.server_name = invalid;
+            assert!(config.validate().is_err());
+        }
+        config.server_name = "中".repeat(32);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn pairing_removal_validates_target_and_keeps_retry_metadata_until_keys_are_deleted() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../.local/tmp").join(format!("pairing-remove-{}", crate::workspace::new_id()));
+        let identity = credential_reference_for_device("client-remove").unwrap();
+        let transport = format!("VoiceTerminal/ssh-transport/{}", "b".repeat(64));
+        let config = DeviceConfig {
+            schema_version: SCHEMA_VERSION, device_id: "client-remove".into(), server_name: String::new(),
+            mode: RunMode::Remote, broadcast_enabled: false, client_online_tts_local: true,
+            audio_compression: false, reconnect_suspended_reason: None, desired_role: Role::RemoteClient,
+            audio_mode: AudioMode::Pcm,
+            host: Some(HostTrust {
+                host_id: Some("server-remove".into()), display_name: Some("测试服务端".into()),
+                addresses: vec!["192.168.1.2".into()], address: "192.168.1.2".into(), port: 22,
+                username: "tester".into(), host_key_sha256: format!("SHA256:{}",
+                    base64::engine::general_purpose::STANDARD_NO_PAD.encode([7_u8; 32])),
+                credential_ref: identity.clone(), transport_credential_ref: Some(transport.clone()),
+            }),
+        };
+        save(&root, &config).unwrap();
+        assert!(remove_paired_host(&root, "other-server", |_| panic!("不能删除其他服务端的密钥")).is_err());
+        assert_eq!(load_from_root(&root), LoadResult::Valid(config.clone()));
+        assert!(remove_paired_host(&root, "server-remove", |_| Err("模拟密钥被占用".into())).is_err());
+        let LoadResult::Valid(pending) = load_from_root(&root) else { panic!("应保留可重试的配置") };
+        assert_eq!(pending.host, config.host);
+        assert_eq!(pending.reconnect_suspended_reason.as_deref(), Some("正在移除服务端配对"));
+        let mut deleted = Vec::new();
+        remove_paired_host(&root, "server-remove", |reference| { deleted.push(reference.to_owned()); Ok(()) }).unwrap();
+        assert_eq!(deleted, vec![identity, transport]);
+        let LoadResult::Valid(removed) = load_from_root(&root) else { panic!("移除后配置仍应有效") };
+        assert!(removed.host.is_none());
+        assert!(removed.reconnect_suspended_reason.is_none());
+        assert_eq!(removed.device_id, config.device_id);
+        assert_eq!(removed.mode, RunMode::Remote);
+        assert_eq!(removed.client_online_tts_local, config.client_online_tts_local);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn save_round_trips_current_schema_and_never_overwrites_invalid_original() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../.local/tmp")
@@ -654,6 +764,7 @@ mod tests {
         let valid = DeviceConfig {
             schema_version: SCHEMA_VERSION,
             device_id: "local-save-test".into(),
+            server_name: String::new(),
             mode: RunMode::Local,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -699,6 +810,7 @@ mod tests {
         let remote = DeviceConfig {
             schema_version: SCHEMA_VERSION,
             device_id: "remote-device".into(),
+            server_name: String::new(),
             mode: RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,

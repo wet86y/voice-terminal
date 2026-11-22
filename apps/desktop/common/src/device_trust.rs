@@ -77,7 +77,44 @@ impl DeviceTrustStore {
             .map(|record| record.public_key.as_str())
     }
 
+    /// record_token（登记代次摘要）：供界面确认固定登记，不能用于认证或还原密钥。
+    pub fn record_token(&self, device_id: &str) -> Option<String> {
+        self.records.iter().find(|record| record.device_id == device_id).map(|record| {
+            let bytes = serde_json::to_vec(record).expect("trusted record serialization");
+            format!("{:x}", Sha256::digest(bytes))
+        })
+    }
+
+    /// remove_expected（移除指定登记）：重新配对或外部写入后，旧页面不能删除新身份。
+    pub fn remove_expected(&mut self, device_id: &str, expected_token: &str) -> Result<(), String> {
+        self.require_record(device_id, expected_token)?;
+        self.verify_unchanged()?;
+        self.persist(self.records.iter().filter(|record| record.device_id != device_id).cloned().collect())
+    }
+
+    pub fn require_record(&self, device_id: &str, expected_token: &str) -> Result<(), String> {
+        validate_device_id(device_id)?;
+        if self.state != "valid" || self.record_token(device_id).as_deref() != Some(expected_token) {
+            return Err("客户端登记已变化，请刷新后重新确认。".into());
+        }
+        self.verify_unchanged()
+    }
+
     pub fn approve(&mut self, device_id: &str, public_key: &str) -> Result<TrustedDevice, String> {
+        self.approve_identity(device_id, public_key, false)
+    }
+
+    /// approve_paired（重新配对登记）：仅供已通过一次性配对码验证的正式回调替换同一设备的旧公钥。
+    pub fn approve_paired(&mut self, device_id: &str, public_key: &str) -> Result<TrustedDevice, String> {
+        self.approve_identity(device_id, public_key, true)
+    }
+
+    fn approve_identity(
+        &mut self,
+        device_id: &str,
+        public_key: &str,
+        replace_paired: bool, // replace_paired（已通过配对码验证时允许替换旧公钥）。
+    ) -> Result<TrustedDevice, String> {
         validate_device_id(device_id)?;
         let (canonical_key, fingerprint) = validate_public_key(public_key)?;
         if self.state == "invalid" {
@@ -91,6 +128,7 @@ impl DeviceTrustStore {
             if record.device_id == device_id
                 && record.public_key != canonical_key
                 && record.state == "trusted"
+                && !replace_paired
             {
                 return Err("设备公钥变化；先撤销旧身份，再通过配对流程登记。".into());
             }
@@ -335,6 +373,29 @@ mod tests {
     }
 
     #[test]
+    fn verified_repairing_rotates_the_same_device_key_without_weakening_normal_approval() {
+        let root = root();
+        let mut store = DeviceTrustStore::open(&root).unwrap();
+        let key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
+            .unwrap().public_key().to_openssh().unwrap();
+        let old_key = key();
+        let new_key = key();
+        let other_key = key();
+        store.approve("device-a", &old_key).unwrap();
+        store.approve("device-b", &other_key).unwrap();
+        assert!(store.approve("device-a", &new_key).unwrap_err().contains("先撤销旧身份"));
+        assert_eq!(store.trusted_public_key("device-a"), Some(old_key.as_str()));
+        assert!(store.approve_paired("device-a", &other_key).is_err());
+        store.approve_paired("device-a", &new_key).unwrap();
+        assert_eq!(store.trusted_public_key("device-a"), Some(new_key.as_str()));
+        assert_eq!(store.trusted_public_key("device-b"), Some(other_key.as_str()));
+        let reopened = DeviceTrustStore::open(&root).unwrap();
+        assert_eq!(reopened.trusted_public_key("device-a"), Some(new_key.as_str()));
+        assert_eq!(reopened.snapshot().devices.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn damaged_native_trust_file_is_preserved_and_keeps_authorization_closed() {
         let root = root();
         fs::create_dir_all(root.join("state")).unwrap();
@@ -345,6 +406,45 @@ mod tests {
         assert_eq!(store.snapshot().state, "invalid");
         assert!(store.approve("device-a", "invalid").is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_record_erases_its_key_and_rejects_stale_pairing_tokens() {
+        let root = root();
+        let mut store = DeviceTrustStore::open(&root).unwrap();
+        let key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap().public_key().to_openssh().unwrap();
+        store.approve("device-a", &key()).unwrap();
+        store.approve("device-b", &key()).unwrap();
+        let stale = store.record_token("device-a").unwrap();
+        store.approve_paired("device-a", &key()).unwrap();
+        assert!(store.remove_expected("device-a", &stale).is_err());
+        assert!(store.trusted_public_key("device-a").is_some());
+        let current = store.record_token("device-a").unwrap();
+        store.remove_expected("device-a", &current).unwrap();
+        let reopened = DeviceTrustStore::open(&root).unwrap();
+        assert!(reopened.record_token("device-a").is_none());
+        assert!(reopened.snapshot().devices.iter().all(|record| record.device_id != "device-a"));
+        assert!(reopened.trusted_public_key("device-b").is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revoked_cleanup_is_retryable_and_does_not_restore_authorization() {
+        let root = root();
+        let mut store = DeviceTrustStore::open(&root).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap().public_key().to_openssh().unwrap();
+        store.approve("device-a", &key).unwrap();
+        let old = store.record_token("device-a").unwrap();
+        store.revoke("device-a").unwrap();
+        // 系统授权清理尚未成功时，持久撤销状态仍然拒绝应用认证并允许按新代次重试。
+        let mut retry = DeviceTrustStore::open(&root).unwrap();
+        assert!(retry.trusted_public_key("device-a").is_none());
+        assert_eq!(retry.snapshot().devices[0].state, "revoked");
+        assert!(retry.remove_expected("device-a", &old).is_err());
+        let token = retry.record_token("device-a").unwrap();
+        retry.remove_expected("device-a", &token).unwrap();
+        assert!(DeviceTrustStore::open(&root).unwrap().snapshot().devices.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

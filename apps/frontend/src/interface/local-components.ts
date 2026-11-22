@@ -158,7 +158,7 @@ export interface LocalDownloadItem {
 
 /** ManagedResourceJob（资源任务进度）：前端从桌面事件投影出的展示信息。 */
 export interface ManagedResourceJob {
-  /** operation（任务类型）：系统功能使用设备与角色中的专用操作，不进入组件恢复。 */
+  /** operation（任务类型）：系统功能使用设备连接中的专用操作，不进入组件恢复。 */
   operation?: 'install' | 'reset' | 'system_feature'
   /** recovery（统一组件恢复结果与下一步）。 */
   recovery?: import('./component-recovery').ComponentRecovery | null

@@ -118,15 +118,6 @@ function formatBytes(value: number | null | undefined) {
 
     <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
 
-    <section v-if="debugAccess !== null || debugError" class="workspace-job-card">
-      <label v-if="debugAccess !== null" class="workspace-job-heading">
-        <span>允许外部调试</span>
-        <input type="checkbox" :checked="debugAccess" :disabled="debugSaving" @change="changeDebugAccess" />
-      </label>
-      <p>允许同一系统账户查询状态和切换启动模式。调试模式下可操作此程序的控件和业务接口。</p>
-      <p v-if="debugError" class="workspace-error" role="alert">{{ debugError }}</p>
-    </section>
-
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
     <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
 
@@ -144,6 +135,14 @@ function formatBytes(value: number | null | undefined) {
     </section>
 
     <p v-if="controller.eventError.value" class="workspace-error" role="status">{{ controller.eventError.value }}</p>
+
+    <section v-if="debugAccess !== null || debugError" class="workspace-job-card debug-access-card">
+      <label v-if="debugAccess !== null" class="switch-row debug-access-toggle">
+        <div><strong>允许外部调试</strong><span>允许同一系统账户查询状态和切换启动模式。调试模式下可操作此程序的控件和业务接口。</span></div>
+        <input type="checkbox" role="switch" aria-label="允许外部调试" :checked="debugAccess" :disabled="debugSaving" @change="changeDebugAccess" /><i aria-hidden="true"></i>
+      </label>
+      <p v-if="debugError" class="workspace-error" role="alert">{{ debugError }}</p>
+    </section>
 
     <UiDialog :open="Boolean(cleanupPlan)" title="清理工作区" @close="cleanupPlan = null">
       <div v-if="cleanupPlan" class="workspace-confirm-copy">
@@ -175,6 +174,10 @@ function formatBytes(value: number | null | undefined) {
 .workspace-empty{padding:16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted)}
 .workspace-error{margin:0;color:var(--danger);font-size:var(--font-caption);overflow-wrap:anywhere;white-space:pre-wrap}
 .workspace-job-card{display:grid;gap:8px}
+.debug-access-toggle{padding:0;border:0;background:transparent}
+.debug-access-toggle strong{font-size:var(--font-body)}
+.debug-access-toggle span{font-size:var(--font-caption);line-height:1.5}
+.debug-access-toggle input{right:0}
 .workspace-job-card.failed{border-color:color-mix(in srgb,var(--danger) 35%,transparent)}
 .workspace-job-heading>div{justify-content:flex-start;flex-wrap:wrap}
 .workspace-job-heading strong{font-size:var(--font-body)}

@@ -141,14 +141,17 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     wrapper.unmount()
   })
 
-  it('远程组件卡片隐藏服务端来源跳转并说明限制', async () => {
+  it('远程组件卡片隐藏下载和导入入口，并引导在服务端处理', async () => {
     const value = dualPassModel()
     value.remoteTarget = true
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'speech', 'paraformer')
     expect(card.findAll('button[aria-label$="：跳转"]')).toHaveLength(0)
-    expect(card.text()).toContain('远程模式暂不支持从客户端打开服务端组件来源链接。')
-    expect(card.findAll('button[aria-label="离线精修模型：下载"]')).toHaveLength(1)
+    expect(card.text()).toContain('请在服务端组件管理中准备离线模型。')
+    expect(card.findAll('button[aria-label="离线精修模型：下载"]')).toHaveLength(0)
+    expect(wrapper.find('.resource-download-required').exists()).toBe(false)
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
+    expect(wrapper.findAll('button[aria-label$="：导入"]')).toHaveLength(0)
     wrapper.unmount()
   })
 
@@ -389,7 +392,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.text()).not.toContain('自动准备共用运行程序')
     wrapper.unmount()
   })
-  it('远程 AnifLive 模型卡只允许下载，不提供客户端目录导入按钮', async () => {
+  it('远程 AnifLive 模型卡不提供下载或客户端目录导入按钮', async () => {
     const value = model()
     value.remoteTarget = true
     value.rows = [{ id: 'tts-aniflive', category: 'tts', name: 'TTS（语音合成）', state: 'failed', status: '待配置', available: true,
@@ -399,9 +402,9 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'tts', 'tts-aniflive')
     const resource = card.get('[data-model-resource="tts-aniflive-tangyuge-v2pp-d78cf598"]')
-    expect(resource.find('button[aria-label="唐语歌（AnifLive 本地语音）：下载"]').exists()).toBe(true)
+    expect(resource.find('button[aria-label="唐语歌（AnifLive 本地语音）：下载"]').exists()).toBe(false)
     expect(resource.find('button[aria-label="唐语歌（AnifLive 本地语音）：导入"]').exists()).toBe(false)
-    expect(resource.text()).toContain('不能上传客户端模型目录')
+    expect(resource.text()).toContain('模型下载与导入请在服务端组件管理中完成。')
     wrapper.unmount()
   })
   it('全部安装就绪后保留批量导入，并保持语音服务详情入口与运行时摘要', async () => {

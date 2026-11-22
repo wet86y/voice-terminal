@@ -33,6 +33,28 @@ from voice_terminal.application.windows import Job, ManagedProcess, SingleInstan
 
 
 class ApplicationStateTests(unittest.TestCase):
+    def test_broadcast_requires_enabled_functions_but_not_disabled_optional_components(self):
+        state = ApplicationState()
+        for row in state.snapshot()["components"]:
+            state.component(row["id"], state="ready")
+        state.update(core_available=True, startup_complete=True)
+        self.assertTrue(state.snapshot()["broadcast_ready"])
+        state.component("speaker", state="disabled", enabled=False)
+        self.assertTrue(state.snapshot()["broadcast_ready"])
+        for phase in ("starting", "failed", "blocked", "stopped"):
+            state.component("dsh", state=phase, enabled=True)
+            self.assertFalse(state.snapshot()["broadcast_ready"])
+            self.assertIn("DSH（代理执行宿主）", state.snapshot()["broadcast_blockers"])
+        state.component("dsh", state="ready")
+        state.update(unavailable_capabilities=[{"id": "speaker", "label": "声纹", "state": "ERROR"}])
+        self.assertFalse(state.snapshot()["broadcast_ready"])
+        state.update(unavailable_capabilities=[{"id": "speaker", "state": "DISABLED"}])
+        self.assertTrue(state.snapshot()["broadcast_ready"])
+        state.update(core_available=False)
+        self.assertFalse(state.snapshot()["broadcast_ready"])
+        state.update(core_available=True, stopping=True)
+        self.assertFalse(state.snapshot()["broadcast_ready"])
+
     def test_replaced_pid_clears_previous_identity_and_metrics(self):
         state = ApplicationState()
         state.component("dsh", state="ready", pid=10, created_at=100,
@@ -107,6 +129,39 @@ class WebTests(unittest.TestCase):
         self.assertTrue(standalone._shared_host_role_is_saved())
         path.write_text(json.dumps({**value, "broadcast_enabled": False}), encoding="utf-8")
         self.assertFalse(standalone._shared_host_role_is_saved())
+
+    def test_custom_server_name_keeps_saved_broadcast_and_gateway_handoff_valid(self):
+        path = self.app.paths.config / "device-runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = {"schema_version": 3, "device_id": "host-a", "server_name": "书房服务端",
+                 "desired_role": "shared_host", "mode": "local", "broadcast_enabled": True,
+                 "audio_mode": "pcm", "paired_host": None}
+        path.write_text(json.dumps(value), encoding="utf-8")
+        self.assertTrue(self.app._shared_host_role_is_saved())
+        self.app.state.update(voice_api_url="http://127.0.0.1:43876")
+        with patch.object(self.app, "http", AsyncMock(return_value={"enabled": True, "ready": True})) as http:
+            result = asyncio.run(self.app.set_device_gateway(True))
+        self.assertTrue(result["ready"])
+        self.assertEqual(http.await_args.kwargs["payload"], {"enabled": True, "host_id": "host-a"})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), value)
+
+    def test_server_name_compatibility_accepts_only_the_native_character_boundaries(self):
+        path = self.app.paths.config / "device-runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {"schema_version": 3, "device_id": "host-a", "desired_role": "shared_host",
+                "mode": "local", "broadcast_enabled": True, "audio_mode": "pcm", "paired_host": None}
+        for name in [None, "", "中" * 32]:
+            value = base if name is None else {**base, "server_name": name}
+            path.write_text(json.dumps(value), encoding="utf-8")
+            self.assertTrue(self.app._shared_host_role_is_saved())
+        for name in [None, 123, "中" * 33, " 前导空白", "尾部空白 ", "控制\u0085字符"]:
+            with self.subTest(name=name):
+                raw = json.dumps({**base, "server_name": name})
+                path.write_text(raw, encoding="utf-8")
+                self.assertFalse(self.app._shared_host_role_is_saved())
+                self.assertEqual(path.read_text(encoding="utf-8"), raw)
+        path.write_text(json.dumps({**base, "server_name": "合法名称", "unknown_field": True}), encoding="utf-8")
+        self.assertFalse(self.app._shared_host_role_is_saved())
 
     def test_saved_shared_host_configuration_requires_explicit_gateway_launch_flag(self):
         path = self.app.paths.config / "device-runtime.json"

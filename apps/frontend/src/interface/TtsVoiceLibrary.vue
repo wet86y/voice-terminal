@@ -505,7 +505,7 @@ async function cancel(draft: VoiceDraft) {
 
 <template>
   <section class="voice-library" aria-label="本地音色库">
-    <header class="library-heading"><div><h3>音色库</h3><p>音色按基础模型独立管理，启用后用于下一次回答。</p></div><div class="library-actions"><button type="button" class="outline-button" :disabled="demo" @click="emit('modelImport')">模型导入</button><button type="button" class="outline-button" @click="add">＋ 添加音色</button></div></header>
+    <header class="library-heading"><div><h3>音色库</h3><p>音色按基础模型独立管理，启用后用于下一次回答。</p></div><div class="library-actions"><button v-if="!remoteMode" type="button" class="outline-button" :disabled="demo" @click="emit('modelImport')">模型导入</button><button type="button" class="outline-button" @click="add">＋ 添加音色</button></div></header>
     <p v-if="libraryError" class="instruction-error" role="alert">{{ libraryError }}</p>
     <p v-if="!drafts.length" class="instruction-hint">暂无已登记参考音频。导入模型或添加录音后，可选择默认合成参考。</p>
     <article v-for="draft in drafts" :key="draft.key" class="voice-card" :class="{ enabled: stored(draft)?.enabled }">

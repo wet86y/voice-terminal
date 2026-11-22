@@ -243,6 +243,7 @@ describe('远程音色卡片文件导入', () => {
       asset: { asset_id: 'remote-reference', duration_ms: 5680 },
     })
     const view = harness(port, nativeDeviceApi.remoteTtsAssetImport); await flushPromises()
+    expect(view.wrapper.findAll('button').some(button => button.text() === '模型导入')).toBe(false)
     await button(view.wrapper, '＋ 添加音色').trigger('click')
 
     expect(view.wrapper.findAll('input[type="file"]')).toHaveLength(0)

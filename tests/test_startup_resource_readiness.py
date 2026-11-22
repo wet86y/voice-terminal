@@ -10,12 +10,53 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from voice_terminal.application.resource_readiness import (
+    inspect_asr_runtime,
+    inspect_analysis_runtime,
     inspect_dsh_runtime,
     inspect_model_resources,
     required_model_resources,
 )
 from voice_terminal.application.state import ApplicationState
 from voice_terminal.application.supervisor import ApplicationHost
+
+
+class BroadcastRuntimeReadinessTests(unittest.TestCase):
+    def test_enabled_lanes_must_load_and_warm_without_blocking_disabled_refinement(self):
+        ready = {"status": "READY", "model_loaded": True, "model_warmed": True}
+        self.assertEqual(inspect_asr_runtime({"offline": ready, "punctuation": ready}), [])
+        self.assertEqual(inspect_asr_runtime({"offline": {"status": "DISABLED"}, "punctuation": ready}), [])
+        for lane, label in (("offline", "双路精修"), ("punctuation", "流式标点")):
+            for unavailable in ({**ready, "status": "DEGRADED"}, {**ready, "model_loaded": False},
+                                {**ready, "model_warmed": False}):
+                self.assertEqual(inspect_asr_runtime({lane: unavailable}), [label])
+        self.assertEqual(inspect_asr_runtime({"punctuation": {"status": "DISABLED"}}), ["流式标点"])
+        state = ApplicationState()
+        for row in state.snapshot()["components"]:
+            state.component(row["id"], state="ready")
+        state.update(core_available=True, startup_complete=True)
+        state.worker_broadcast_status("asr", ["双路精修"])
+        self.assertFalse(state.snapshot()["broadcast_ready"])
+        self.assertEqual(state.snapshot()["broadcast_blockers"], ["双路精修"])
+        state.worker_broadcast_status("asr", [])
+        self.assertTrue(state.snapshot()["broadcast_ready"])
+
+    def test_analysis_checks_runtime_enabled_lanes_and_keeps_other_worker_failures(self):
+        ready = {"status": "READY", "model_loaded": True, "model_warmed": True}
+        enabled = {"endpoint": True, "emotion": True, "acoustic": False}
+        status = {"endpoint": ready, "emotion": {"status": "DISABLED"}, "acoustic": {"status": "DEGRADED"}}
+        self.assertEqual(inspect_analysis_runtime(status, enabled), ["情绪背景"])
+        status["emotion"] = ready
+        self.assertEqual(inspect_analysis_runtime(status, enabled), [])
+        for lane, label in (("endpoint", "语音结束判断"), ("emotion", "情绪背景"), ("acoustic", "声学事件")):
+            self.assertEqual(inspect_analysis_runtime({lane: {**ready, "model_warmed": False}}, {lane: True}), [label])
+            self.assertEqual(inspect_analysis_runtime({}, {lane: True}), [label])
+            self.assertEqual(inspect_analysis_runtime({lane: {"status": "DEGRADED"}}, {lane: False}), [])
+        state = ApplicationState()
+        state.worker_broadcast_status("asr", ["双路精修"])
+        state.worker_broadcast_status("analysis", ["情绪背景"])
+        self.assertEqual(state.snapshot()["worker_broadcast_blockers"], {"asr": ["双路精修"], "analysis": ["情绪背景"]})
+        state.worker_broadcast_status("analysis", [])
+        self.assertIn("双路精修", state.snapshot()["broadcast_blockers"])
 
 
 class StartupResourceReadinessTests(unittest.TestCase):

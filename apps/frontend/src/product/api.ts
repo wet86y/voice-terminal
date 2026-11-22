@@ -119,7 +119,7 @@ export interface ProductDeviceSnapshot {
   devices: Array<{
     device_id: string // device_id（稳定设备编号；local 表示核心主机）。
     name: string // name（设备显示名称）。
-    connected: boolean // connected（设备是否在线）。
+    connected: boolean // connected（设备是否已建立有效连接；区别于局域网公告可见）。
     connection_generation: number // connection_generation（设备连接代次）。
     executor_generation: number // executor_generation（设备执行器代次）。
     capabilities: string[] // capabilities（当前已登记的设备能力）。

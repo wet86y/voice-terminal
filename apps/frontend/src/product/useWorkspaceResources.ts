@@ -45,8 +45,8 @@ export function useWorkspaceResources() {
   const remoteConnected = computed(() => application.snapshot.value?.remote_mode === true
     && application.snapshot.value.management_connected === true)
   const connectionNotice = computed(() => !remoteMode.value || remoteConnected.value ? ''
-    : application.snapshot.value?.remote_connection_state === 'unpaired' ? '请先在设备与角色中配对服务端，再查看服务端组件。'
-      : application.snapshot.value?.remote_connection_state === 'paused' ? '自动重连已暂停，请在设备与角色中恢复连接。'
+    : application.snapshot.value?.remote_connection_state === 'unpaired' ? '请先在设备连接中配对服务端，再查看服务端组件。'
+      : application.snapshot.value?.remote_connection_state === 'paused' ? '自动重连已暂停，请在设备连接中恢复连接。'
         : '正在等待服务端连接，连接后自动读取服务端组件和任务进度。')
   const workspace = ref<WorkspaceInfo | null>(null)
   const resources = ref<ResourceStatus[]>([])

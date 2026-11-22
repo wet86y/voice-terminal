@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { settingsSections, type SettingsSection } from './settings'
+import { desktopSettingsSections, type DesktopSettingsSection } from './settings'
 
 const props = defineProps<{
   /** section（当前设置分区）：标题与导航保持一致。 */
-  section: SettingsSection
+  section: DesktopSettingsSection
   /** titleId（标题元素标识）：供页面的无障碍说明关联。 */
   titleId?: string
   /** title（自定义标题）：用于合并页面中的独立设置区域。 */
@@ -15,7 +15,7 @@ const props = defineProps<{
   compact?: boolean
 }>()
 // heading（当前页面文案）：各页面共用名称与简短说明。
-const heading = computed(() => settingsSections.find(item => item.id === props.section)!)
+const heading = computed(() => desktopSettingsSections.find(item => item.id === props.section)!)
 const headingTitle = computed(() => props.title ?? heading.value.label) // headingTitle（显示标题）：优先采用区域标题。
 const headingDescription = computed(() => props.description ?? heading.value.description) // headingDescription（显示说明）：优先采用区域说明。
 </script>

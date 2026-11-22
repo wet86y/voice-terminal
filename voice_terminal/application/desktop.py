@@ -99,6 +99,13 @@ class DesktopControl:
         except Exception as exc:
             self.send("device_gateway_result", request_id=request_id, ok=False, error=str(exc)[:240])
 
+    async def _control_inbound_device(self, request_id: int, payload: dict) -> None:
+        try:
+            result = await self.application.control_inbound_device(payload)
+            self.send("device_inbound_result", request_id=request_id, ok=True, status=result)
+        except Exception as exc:
+            self.send("device_inbound_result", request_id=request_id, ok=False, error=str(exc)[:240])
+
     def _settle_device_helper(self, message: dict) -> None:
         request_id = message.get("request_id")
         if not isinstance(request_id, str):
@@ -149,6 +156,11 @@ class DesktopControl:
                     if type(message.get("request_id")) is int and type(message.get("enabled")) is bool:
                         asyncio.run_coroutine_threadsafe(
                             self._set_device_gateway(message["request_id"], message["enabled"]), self.application.loop)
+                    continue
+                if kind == "device_inbound_control":
+                    if type(message.get("request_id")) is int and isinstance(message.get("payload"), dict):
+                        asyncio.run_coroutine_threadsafe(
+                            self._control_inbound_device(message["request_id"], message["payload"]), self.application.loop)
                     continue
                 if kind == "device_helper_response":
                     loop = self.application.loop

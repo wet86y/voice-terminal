@@ -79,6 +79,7 @@ pub struct RemoteManagementService {
     import_coordinator: Arc<RemoteImportCoordinator>, // import_coordinator（校验 FILE 通道设备绑定和摘要的导入协调器）。
     state: Mutex<ServiceState>,                       // state（管理会话和幂等记录）。
     requests_changed: Condvar, // requests_changed（唤醒等待同一操作首次分派结果的重试连接）。
+    pub controls: crate::connection_control::ConnectionControl, // controls（已认证客户端的断开和配对失效通知）。
 }
 
 /// RemoteManagementHandle（远程管理服务句柄）：负责停止回环 listener（监听器）及其连接。
@@ -118,6 +119,7 @@ impl RemoteManagementService {
                 requests: HashMap::new(),
             }),
             requests_changed: Condvar::new(),
+            controls: Default::default(),
         }))
     }
 
@@ -274,6 +276,9 @@ impl RemoteManagementService {
             return Err("SSH 桥接前导帧设备编号与强制命令绑定身份不一致。".into());
         }
         self.validate_bridge_identity(&prelude)?;
+        let _active_connection = self.controls.enter(&prelude.client_device_id)?;
+        let initial_identity = DeviceTrustStore::open(&self.manager.context().data)?
+            .record_token(&prelude.client_device_id).ok_or("客户端登记已失效。")?;
 
         let open_bytes = read_line_bounded(&mut reader, MAX_OPEN_LINE_BYTES)?
             .ok_or("远程管理连接未发送会话申请。")?;
@@ -307,6 +312,21 @@ impl RemoteManagementService {
                 return Err("管理操作代次不属于当前已认证连接，已拒绝请求。".into());
             }
             // 持续管理通道每次操作重新确认当前构建与设备信任，撤销后不能继续使用旧连接。
+            request.validate()?;
+            if request.target_host_id != self.target_host_id { return Err("管理通知目标不匹配。".into()); }
+            let fresh = DeviceTrustStore::open(&self.manager.context().data)?;
+            if fresh.snapshot().state == "invalid" { return Err("设备信任登记无效，连接已关闭。".into()); }
+            if fresh.record_token(&prelude.client_device_id).as_deref() != Some(initial_identity.as_str()) {
+                // 仅此前已认证的固定 SSH 连接能收到此回执；发现广播及普通认证错误无权触发清理。
+                let notice = voice_desktop_common::device_management_contract::ConnectionNotice {
+                    control_id: rand::random::<[u8; 16]>().iter().map(|byte| format!("{byte:02x}")).collect(), host_id: self.target_host_id.clone(),
+                    client_device_id: prelude.client_device_id.clone(),
+                    action: voice_desktop_common::device_management_contract::ConnectionAction::Remove,
+                };
+                write_json_line(&mut writer.try_clone().map_err(|_| "无法写入配对失效通知。")?,
+                    &response(&request, 410, connection_notice_body(&notice)), MAX_RESPONSE_LINE_BYTES)?;
+                return Ok(());
+            }
             self.validate_bridge_identity(&prelude)?;
             let response = self.dispatch_request(request);
             write_json_line(
@@ -420,6 +440,19 @@ impl RemoteManagementService {
         authenticated_client_device_id: &str,
     ) -> (u16, Value) {
         let args = &request.arguments;
+        if request.operation == "management.connection.ack" {
+            let notice = serde_json::from_value::<voice_desktop_common::device_management_contract::ConnectionNotice>(args.clone());
+            return match notice.and_then(|notice| {
+                notice.validate(&self.target_host_id, authenticated_client_device_id).map_err(serde::de::Error::custom)?;
+                self.controls.acknowledge(authenticated_client_device_id, &notice, request.session_generation).map_err(serde::de::Error::custom)
+            }) {
+                Ok(()) => (200, json!({"acknowledged":true,"fields":{"acknowledged":"客户端已保存暂停意图并确认通知"}})),
+                Err(error) => (409, error_body(error.to_string())),
+            };
+        }
+        if let Some(notice) = self.controls.pending(authenticated_client_device_id, request.session_generation) {
+            return (if notice.action == voice_desktop_common::device_management_contract::ConnectionAction::Remove { 410 } else { 409 }, connection_notice_body(&notice));
+        }
         match request.operation.as_str() {
             "management.status" if exact_keys(args, &[], &[]) => {
                 (200, self.manager.remote_management_status())
@@ -1053,6 +1086,12 @@ fn error_body(error: impl Into<String>) -> Value {
             "error": "服务端返回的实际失败原因",
         }
     })
+}
+
+fn connection_notice_body(notice: &voice_desktop_common::device_management_contract::ConnectionNotice) -> Value {
+    json!({"connection_notice":notice,"persistent_management":true,"fields":{"connection_notice":"已认证服务端对当前客户端的连接控制通知",
+        "persistent_management":"保留已认证管理通道以确认本次连接通知",
+        "control_id":"本次通知编号","host_id":"已配对服务端编号","client_device_id":"当前客户端编号","action":"断开暂停或移除配对"}})
 }
 
 fn open_response_fields() -> std::collections::BTreeMap<String, String> {

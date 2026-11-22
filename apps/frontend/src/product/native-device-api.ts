@@ -58,6 +58,7 @@ export interface NativePlaybackSnapshot {
 export interface DeviceConfig {
   schema_version: 3 // schema_version（设备配置格式版本）。
   device_id: string // device_id（稳定本机设备编号）。
+  server_name?: string // server_name（支持中文的服务端显示名称；旧配置缺省时使用默认名称）。
   mode: 'local' | 'remote' // mode（本地运行或远程配对）。
   broadcast_enabled: boolean // broadcast_enabled（本机是否广播并接受配对）。
   client_online_tts_local: boolean // client_online_tts_local（在线语音是否由客户端本地合成播放）。
@@ -380,6 +381,27 @@ export const nativeDeviceApi = {
     devices: DiscoveredDevice[] // devices（局域网内可配对服务端）。
     fields: Record<string, string> // fields（字段的中文说明）。
   }>('device_discovery_search', { timeoutMs }),
+  /** inboundStatus（入站客户端）：本机可信登记与局域网存在公告；连接认证仍由正式通道确认。 */
+  inboundStatus: () => call<{
+    host_id: string // host_id（本机稳定服务端编号）。
+    discovery_available: boolean // discovery_available（本机广播及设备入口正常，已执行局域网发现）。
+    devices: Array<{
+      device_id: string // device_id（可信客户端稳定编号）。
+      display_name: string | null // display_name（当前局域网公告中的客户端显示名称）。
+      online: boolean // online（局域网可发现，可由客户端发起或恢复连接；不表示已认证连接）。
+      connected: boolean // connected（实际打开的已认证管理连接）。
+      record_token: string // record_token（用户确认的登记代次摘要，不具备认证能力）。
+      removal_pending?: boolean // removal_pending（授权已撤销，系统公钥清理尚未完成，可重试移除）。
+    }> // devices（本机信任清单中的客户端状态）。
+    fields: Record<string, string> // fields（字段中文说明）。
+  }>('device_inbound_status'),
+  /** controlInboundDevice（入站连接操作）：固定本机、客户端和登记代次，原生端再次校验实际连接。 */
+  controlInboundDevice: (expectedHostId: string, deviceId: string, expectedRecordToken: string, action: 'disconnect' | 'remove') => call<{
+    device_id: string // device_id（本次操作的稳定客户端编号）。
+    action: 'disconnect' | 'remove' // action（断开或移除）。
+    completed: boolean // completed（原生操作是否已完成）。
+    fields: Record<string, string> // fields（字段中文说明）。
+  }>('device_inbound_control', { expectedHostId, deviceId, expectedRecordToken, action, confirmed: true }),
   /** openPairingWindow（开启本机配对窗口）：六位码仅在本次回执中返回。 */
   versionCheck: () => call<DeviceVersionCheck>('device_version_check'),
   versionSync: (expectedHostId: string, expectedRemoteVersion: string) => call<import('../interface/app-update').AppUpdateStatus>(
@@ -397,6 +419,11 @@ export const nativeDeviceApi = {
   pairWithDiscoveredDevice: (hostId: string, pairingCode: string) => call<DevicePairingResult>(
     'device_pairing_connect', { hostId, pairingCode },
   ),
+  /** removePairedHost（移除已断开的服务端）：原生端校验固定目标后清理其本机密钥和配对资料。 */
+  removePairedHost: async (expectedHostId: string, confirmed: boolean) => {
+    await call<void>('device_pairing_remove', { expectedHostId, confirmed })
+    resetRemoteManagementSession()
+  },
   /** openSshServerStatus（读取 OpenSSH Server 状态）：仅共享主机管理页显式读取。 */
   openSshServerStatus: (refresh = false) => call<OpenSshServerStatus>('resource_system_feature_status', { refresh }),
   /** enableOpenSshServer（启动本机 SSH 系统功能任务）：把用户的明确确认值传给原生端复核。 */

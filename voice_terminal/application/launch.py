@@ -381,9 +381,10 @@ async def run(args, root):
                 reported_endpoints = status["endpoint_revision"]
             current_runtime = (status["core_available"], status["state"],
                 status["device_gateway_enabled"], status["device_gateway_ready"], status["device_gateway_error"],
-                status["endpoint_revision"])
+                status["endpoint_revision"], status["broadcast_ready"], tuple(status["broadcast_blockers"]))
             if desktop and status["startup_complete"] and current_runtime != reported_runtime:
                 desktop.send("runtime_status", core_available=status["core_available"], state=status["state"],
+                    broadcast_ready=status["broadcast_ready"], broadcast_blockers=status["broadcast_blockers"],
                     device_gateway_enabled=status["device_gateway_enabled"],
                     device_gateway_ready=status["device_gateway_ready"],
                     device_gateway_error=status["device_gateway_error"])
@@ -392,6 +393,7 @@ async def run(args, root):
                 # startup-result（启动快照）字段带同一进程身份，供磁盘状态核对，不作为实时状态来源。
                 result = {"schema": 1, "instance_id": status["instance_id"], "state": status["state"],
                     "core_available": status["core_available"], "pid": os.getpid(),
+                    "broadcast_ready": status["broadcast_ready"], "broadcast_blockers": status["broadcast_blockers"],
                     "device_gateway_enabled": status["device_gateway_enabled"],
                     "device_gateway_ready": status["device_gateway_ready"],
                     "device_gateway_error": status["device_gateway_error"],

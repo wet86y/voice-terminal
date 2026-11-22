@@ -1532,6 +1532,37 @@ class ProductApiTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_inbound_control_requires_desktop_auth_and_current_session_identity(self) -> None:
+        async def scenario():
+            from types import SimpleNamespace
+            connection = SimpleNamespace(connected=True, connection_generation=3, executor_generation=4)
+            token = "inbound-control-test-token"
+            path = "/internal/application/device-inbound"
+            with patch.dict(os.environ, {"VOICE_APP_INTERNAL_TOKEN": token}), \
+                    patch.object(self.runtime.device_registry, "connection", return_value=connection), \
+                    patch.object(self.runtime, "close_remote_device_session", new_callable=AsyncMock, return_value=True) as close:
+                status_args = {"action": "status", "device_id": "client-a"}
+                denied = await self._request("POST", path, json=status_args)
+                assert denied.status_code == 403
+                headers = {"Authorization": f"Bearer {token}"}
+                status = await self._request("POST", path, json=status_args, headers=headers)
+                assert status.status_code == 200
+                assert status.json()["connected"] is True
+                args = {"action": "disconnect", "device_id": "client-a",
+                        "expected_core_session_id": self.runtime.core_session_id,
+                        "expected_connection_generation": 3, "expected_executor_generation": 4}
+                for field, bad in (("expected_core_session_id", "old-core"),
+                                   ("expected_connection_generation", 2), ("expected_executor_generation", 3)):
+                    stale = await self._request("POST", path, json={**args, field: bad}, headers=headers)
+                    assert stale.status_code == 409
+                    close.assert_not_awaited()
+                invalid = await self._request("POST", path, json={**args, "command": "anything"}, headers=headers)
+                assert invalid.status_code == 422
+                result = await self._request("POST", path, json=args, headers=headers)
+                assert result.status_code == 200 and result.json()["connected"] is False
+                close.assert_awaited_once_with("client-a", 3)
+        asyncio.run(scenario())
+
     def test_device_pairing_requires_desktop_auth_and_explicit_host_approval(self) -> None:
         async def scenario():
             token = "test-device-pairing-token"
@@ -1763,6 +1794,26 @@ class ProductApiTests(unittest.TestCase):
             await capture_route.stop()
             await self.runtime.device_remote_sessions.close_all()
 
+        asyncio.run(scenario())
+
+    def test_device_snapshot_does_not_report_expired_remote_session_as_connected(self) -> None:
+        from voice_terminal.devices.remote_session import REMOTE_SESSION_IDLE_SECONDS
+
+        async def scenario():
+            hub = self.runtime.device_remote_sessions
+            connection = await hub.open("client-presence", ["desktop_control"])
+            try:
+                initial = await self._request("GET", "/api/v1/devices")
+                row = next(item for item in initial.json()["devices"] if item["device_id"] == "client-presence")
+                assert row["connected"] is True
+                hub._sessions["client-presence"].last_seen -= REMOTE_SESSION_IDLE_SECONDS + 1
+                assert self.runtime.device_registry.connection("client-presence").connected is True
+                expired = await self._request("GET", "/api/v1/devices")
+                row = next(item for item in expired.json()["devices"] if item["device_id"] == "client-presence")
+                assert row["connected"] is False
+                assert row["connection_generation"] == connection.connection_generation
+            finally:
+                await hub.close_all()
         asyncio.run(scenario())
 
     def test_dsh_device_list_requires_current_authorized_activation(self) -> None:

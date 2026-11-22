@@ -2210,6 +2210,40 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return await runtime.application_control(payload["action"], endpoint_table=endpoint_table,
                                                  capability=capability)
 
+    @app.post("/internal/application/device-inbound")
+    async def application_device_inbound(request: Request) -> dict:
+        """application_device_inbound（入站会话控制）：信任写入仍只由原生宿主执行。"""
+        authorize_application(request)
+        payload = await request.json()
+        if (not isinstance(payload, dict)
+                or payload.get("action") not in {"status", "disconnect"}
+                or not isinstance(payload.get("device_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", payload["device_id"])
+                or payload["device_id"] == "local"):
+            raise HTTPException(status_code=422, detail="入站客户端操作或设备编号无效。")
+        required = {"action", "device_id"}
+        if payload["action"] == "disconnect":
+            required |= {"expected_core_session_id", "expected_connection_generation", "expected_executor_generation"}
+        if set(payload) != required:
+            raise HTTPException(status_code=422, detail="入站客户端操作字段无效。")
+        device_id = payload["device_id"]
+        connection = runtime.device_registry.connection(device_id)
+        connected = connection is not None and connection.connected
+        if payload["action"] == "disconnect" and connected:
+            if (payload["expected_core_session_id"] != runtime.core_session_id
+                    or type(payload["expected_connection_generation"]) is not int
+                    or type(payload["expected_executor_generation"]) is not int
+                    or payload["expected_connection_generation"] != connection.connection_generation
+                    or payload["expected_executor_generation"] != connection.executor_generation):
+                raise HTTPException(status_code=409, detail="客户端连接代次已变化，请刷新后重新确认。")
+            await runtime.close_remote_device_session(device_id, connection.connection_generation)
+        return {"device_id": device_id, "connected": connected if payload["action"] == "status" else False,
+                "core_session_id": runtime.core_session_id,
+                "connection_generation": connection.connection_generation if connection is not None else None,
+                "executor_generation": connection.executor_generation if connection is not None else None,
+                "fields": {"device_id": "本次控制的客户端编号", "connected": "当前实际会话连接状态",
+                           "core_session_id": "当前核心运行编号", "connection_generation": "客户端连接代次", "executor_generation": "客户端执行器代次"}}
+
     @app.post("/internal/application/device-pairing")
     async def application_device_pairing(request: Request) -> JSONResponse:
         """application_device_pairing（桌面宿主配对控制）：仅受管桌面进程可管理主机信任。"""
@@ -2366,8 +2400,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         state = runtime.state
         pending = registry.pending
         listen_intent = runtime.listening_intent_pending()
+        sessions = getattr(runtime, "device_remote_sessions", None)
         devices = [{"device_id": item.device_id, "name": "本机" if item.device_id == "local" else item.device_id,
-                    "connected": item.connected, "connection_generation": item.connection_generation,
+                    "connected": item.connected and (item.device_id == "local" or sessions is None or sessions.is_connected(
+                        item.device_id, item.connection_generation, item.executor_generation)),
+                    "connection_generation": item.connection_generation,
                     "executor_generation": item.executor_generation,
                     "capabilities": sorted((set(item.capabilities) - {"screen_capture"})
                                      | ({"desktop_control", "terminal_control", "file_transfer"} if item.device_id == "local"

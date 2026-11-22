@@ -75,6 +75,8 @@ export interface ApplicationSnapshot {
   host_name?: string | null // host_name（当前远程服务端显示名称）。
   management_connected?: boolean // management_connected（SSH 管理及任务会话是否就绪）。
   remote_business_ready?: boolean // remote_business_ready（服务端产品业务接口是否可访问）。
+  broadcast_ready?: boolean // broadcast_ready（本机核心和已启用功能均通过广播准入）。
+  broadcast_blockers?: string[] // broadcast_blockers（尚未就绪功能的中文名称）。
   remote_error?: string | null // remote_error（远程目标暂不可用的原因）。
   remote_voice_error?: string | null // remote_voice_error（本机远程语音 WebSocket 转发错误）。
   remote_connection_state?: 'unpaired' | 'paused' | 'connecting' | 'connected' // remote_connection_state（配对、重连暂停、连接中或管理已连接）。
@@ -399,6 +401,7 @@ async function remoteApplicationSnapshot(): Promise<ApplicationSnapshot | null> 
     total_memory_rss_bytes: null,
     total_memory_private_commit_bytes: null,
     total_gpu_dedicated_bytes: null,
+    resource_processes: [], // resource_processes（远程客户端不提供服务端统一进程采样）。
     completed_components: 0,
     total_components: 0,
     components: [],

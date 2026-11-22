@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-device-inbound-control"
+description = "Enables the device_inbound_control command without any pre-configured scope."
+commands.allow = ["device_inbound_control"]
+
+[[permission]]
+identifier = "deny-device-inbound-control"
+description = "Denies the device_inbound_control command without any pre-configured scope."
+commands.deny = ["device_inbound_control"]

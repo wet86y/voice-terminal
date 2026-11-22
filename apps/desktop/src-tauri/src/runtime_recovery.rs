@@ -8,6 +8,8 @@ pub struct RuntimeRecovery {
     pub result: Option<(u64, Value)>, // result（服务代次对应的真实启动终态）。
     pub require_core: bool,        // require_core（更新前核心能力可用，恢复不能退化为不可用）。
     pub current_core: Option<bool>, // current_core（当前宿主通过私有管道上报的核心能力）。
+    pub broadcast_ready: Option<bool>, // broadcast_ready（当前代次的必要核心和已启用功能均就绪）。
+    pub broadcast_blockers: Vec<String>, // broadcast_blockers（广播准入未通过的功能中文名称）。
     suspended: bool,               // suspended（网页宿主暂时离线，前端暂停连接）。
     revision: u64,                 // revision（窗口内单调递增状态版本）。
     sequence: u64,                 // sequence（运行操作编号）。

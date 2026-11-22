@@ -21,6 +21,8 @@
     "allow-device-config-save",
     "allow-device-config-status",
     "allow-device-discovery-search",
+    "allow-device-inbound-status",
+    "allow-device-inbound-control",
     "allow-device-pairing-window-open",
     "allow-device-pairing-window-close",
     "allow-device-pairing-window-status",

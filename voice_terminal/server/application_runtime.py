@@ -105,6 +105,11 @@ class ApplicationRuntimeMixin:
             "local_tts": {"pid": local_tts_pid, "created_at": getattr(local_tts_server, 'created_at', None)},  # 编号及创建时间共同确认本地语音进程。
             # capabilities（分能力行）：宿主与界面据此显示“启动中/不可用”并单独恢复。
             "capabilities": self.capability_rows(),
+            "analysis_enabled": {  # analysis_enabled（当前设置启用的分析通道，供宿主核对实际加载状态）。
+                "endpoint": getattr(getattr(self.config, "smart_turn", None), "smart_turn", False),
+                "emotion": getattr(getattr(self.config, "audio_enhancements", None), "emotion", False),
+                "acoustic": getattr(getattr(self.config, "audio_enhancements", None), "acoustic_events", False),
+            },
         }
 
     def _apply_managed_endpoints(self, endpoint_table: dict | None) -> None:

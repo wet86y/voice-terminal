@@ -16,6 +16,7 @@ const props = defineProps<{
   models: ProductLocalTtsStatus['models'] // models（本机 AnifLive 模型状态）。
   openImport?: boolean // openImport（跨页跳入时展开导入区）。
   disabled?: boolean // disabled（模型选择或组件任务进行时锁定操作）。
+  importAvailable?: boolean // importAvailable（当前运行模式是否允许模型下载与导入）。
 }>()
 
 const emit = defineEmits<{
@@ -87,7 +88,7 @@ async function saveModelName(model: ProductLocalTtsStatus['models'][number]) {
         <h5>已转换并登记的模型</h5>
         <span>{{ registeredModels.length }} 款</span>
       </div>
-      <p v-if="!registeredModels.length" class="instruction-hint">暂无已转换并登记的模型，可使用下方“导入”添加。</p>
+      <p v-if="!registeredModels.length" class="instruction-hint">{{ importAvailable === false ? '暂无已转换并登记的模型，请在服务端导入。' : '暂无已转换并登记的模型，可使用下方“导入”添加。' }}</p>
       <article v-for="model in registeredModels" :key="model.id" class="aniflive-registered-model" :data-model-id="model.id">
         <div class="aniflive-registered-model-copy">
           <strong>{{ model.name }}</strong>
@@ -107,7 +108,7 @@ async function saveModelName(model: ProductLocalTtsStatus['models'][number]) {
       <p v-if="notice" class="instruction-hint" role="status">{{ notice }}</p>
     </section>
 
-    <section id="aniflive-model-import" class="aniflive-download-card">
+    <section v-if="importAvailable !== false" id="aniflive-model-import" class="aniflive-download-card">
       <div class="aniflive-model-list-heading"><h5>模型下载与导入</h5><button class="outline-button" type="button" :aria-expanded="importOpen" @click="importOpen = !importOpen">{{ importOpen ? '关闭导入' : '导入' }}</button></div>
       <AnifLiveModelImport :open="importOpen" embedded @update:open="importOpen = $event" @completed="handleModelImportCompleted" />
     </section>

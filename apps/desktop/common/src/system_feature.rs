@@ -1345,9 +1345,10 @@ pub fn install_project_device_key(
     )
 }
 
-/// remove_project_device_key（撤销受限项目公钥）：仅删除精确拥有标记的授权行。
+/// remove_project_device_key（撤销受限项目公钥）：只删除拥有标记和预期公钥均吻合的授权行。
 #[cfg(feature = "ssh-device")]
 pub fn remove_project_device_key(
+    expected_public_key: &str, // expected_public_key（本轮已撤销登记的公钥，保护等待授权期间登记的新身份）。
     workspace_id: &str,
     device_id: &str,
     build: &str,
@@ -1356,7 +1357,7 @@ pub fn remove_project_device_key(
 ) -> Result<(), String> {
     manage_project_device_key(
         false,
-        "",
+        expected_public_key,
         workspace_id,
         device_id,
         build,
@@ -1383,12 +1384,14 @@ fn manage_project_device_key(
     validate_ascii_id(device_id, 128, "设备编号")?;
     validate_ascii_id(build, 128, "程序构建编号")?;
     validate_sid(owner_sid)?;
-    if add {
-        let key = russh::keys::PublicKey::from_openssh(public_key)
+    let key = russh::keys::PublicKey::from_openssh(public_key)
             .map_err(|_| "项目授权公钥不是有效 OpenSSH 格式。".to_string())?;
-        if key.algorithm() != russh::keys::Algorithm::Ed25519 {
-            return Err("项目受限 SSH 密钥只接受 Ed25519 公钥。".into());
-        }
+    if key.algorithm() != russh::keys::Algorithm::Ed25519 {
+        return Err("项目受限 SSH 密钥只接受 Ed25519 公钥。".into());
+    }
+    let canonical_public_key = key.to_openssh().map_err(|_| "项目授权公钥无法规范编码。")?;
+    let public_key = canonical_public_key.as_str();
+    if add {
         if network_scopes.is_empty()
             || network_scopes
                 .iter()
@@ -1625,6 +1628,9 @@ try {
         if ($otherRows | Where-Object { $_.IndexOf($publicKey, [StringComparison]::Ordinal) -ge 0 }) { throw '该公钥已在非本程序授权行中出现；为避免通用 SSH 权限，未登记。' }
         $rows = @($otherRows + $line)
     } elseif ($action -eq 'remove') {
+        if ($owned | Where-Object { -not $_.EndsWith(" $publicKey $marker", [StringComparison]::Ordinal) }) {
+            throw '该设备的授权公钥已变化，拒绝移除新身份；请刷新后重新确认。'
+        }
         $rows = $otherRows
     } else { throw '不支持的固定授权公钥操作。' }
     if ($action -eq 'remove' -and $owned.Count -eq 0) { Write-Output 'VoiceTerminalAuthorizedKeyUpdated'; exit 0 }
@@ -2760,6 +2766,15 @@ function icacls.exe {{ $global:LASTEXITCODE=0 }}
 "#,
                     acl_owner = if admin { "S-1-5-32-544" } else { sid.as_str() }
                 );
+                if action == "remove" {
+                    let original_bytes = std::fs::read(&target).unwrap();
+                    let mismatched = script.replace(
+                        &base64::engine::general_purpose::STANDARD.encode(b"ssh-ed25519 TEST"),
+                        &base64::engine::general_purpose::STANDARD.encode(b"ssh-ed25519 DIFFERENT"));
+                    assert!(run_powershell(&(setup.clone() + &mismatched), std::time::Duration::from_secs(10))
+                        .unwrap_err().contains("授权公钥已变化"));
+                    assert_eq!(std::fs::read(&target).unwrap(), original_bytes);
+                }
                 let result =
                     run_powershell(&(setup + &script), std::time::Duration::from_secs(10)).unwrap();
                 assert_eq!(result, "VoiceTerminalAuthorizedKeyUpdated");

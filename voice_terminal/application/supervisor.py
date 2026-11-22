@@ -24,7 +24,7 @@ from ..core.state import SERVICE_LABELS, SERVICE_LOADING_STATES, SERVICE_READY_S
 from ..log_budget import enforce_log_budget
 from ..devices.diagnostics import device_event
 from ..resources import ResourcePolicy
-from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
+from .resource_readiness import inspect_model_resources, inspect_dsh_runtime, inspect_asr_runtime, inspect_analysis_runtime
 from .ports import validate_endpoint_report, preferred_endpoint_url
 
 log = logging.getLogger(__name__)
@@ -82,6 +82,7 @@ class ApplicationHost:
         self._probe_failures: dict[str, int] = {}
         self._probe_failure_since: dict[str, float] = {}
         self.capability_rows: list[dict] = []  # capability_rows（语音服务上报的分能力状态）。
+        self.analysis_broadcast_enabled: dict[str, bool] = {}  # analysis_broadcast_enabled（核心当前启用的分析通道）。
 
     def enqueue(self, coroutine):
         if self.loop is None:
@@ -533,6 +534,13 @@ class ApplicationHost:
             self.state.clear_endpoint("gateway", generation=self.generations.get("voice"))
         return result
 
+    async def control_inbound_device(self, payload: dict) -> dict:
+        """control_inbound_device（入站会话控制）：只经外壳私有管道和宿主授权入口关闭当前会话。"""
+        snapshot = self.state.snapshot()
+        if snapshot.get("stopping") or not snapshot.get("voice_api_url"):
+            raise RuntimeError("本地语音服务入口尚未建立，不能检查入站会话。")
+        return await self.http(snapshot["voice_api_url"] + "/internal/application/device-inbound", payload=payload, timeout=8)
+
     def create_wake_task(self, payload: dict) -> dict:
         """create_wake_task（手动创建任务）：仅由已校验桌面会话的网页线程调用。"""
         snapshot = self.state.snapshot()
@@ -621,8 +629,13 @@ class ApplicationHost:
                 and (value["schema_version"] != 2 or self.share_device_gateway)
                 and ((value["schema_version"] == 2 and set(value) == {"schema_version", "device_id", "desired_role", "audio_mode", "host"})
                      or (value["schema_version"] == 3 and value.get("mode") == "local" and value.get("broadcast_enabled") is True
-                         and set(value) <= {"schema_version", "device_id", "mode", "broadcast_enabled", "client_online_tts_local",
+                         and set(value) <= {"schema_version", "device_id", "server_name", "mode", "broadcast_enabled", "client_online_tts_local",
                                             "audio_compression", "reconnect_suspended_reason", "desired_role", "audio_mode", "paired_host", "host"}))
+                # server_name（服务端显示名称）：与原生设备配置保持相同的可选字段及字符边界。
+                and isinstance(value.get("server_name", ""), str)
+                and len(value.get("server_name", "")) <= 32
+                and value.get("server_name", "").strip() == value.get("server_name", "")
+                and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value.get("server_name", ""))
                 and isinstance(value.get("device_id"), str)
                 and 1 <= len(value["device_id"]) <= 128
                 and value["device_id"].strip() == value["device_id"]
@@ -646,6 +659,7 @@ class ApplicationHost:
                     self.manifest["hardware_capabilities"] = data["hardware_capabilities"]
                 if data.get("request_id") != request_id:
                     return False
+                self.state.worker_broadcast_status("asr", inspect_asr_runtime(data))
                 if data.get("status") == "STARTING":
                     # STARTING（启动中）是模型切换/重载的正常阶段，不累计为健康故障。
                     return None
@@ -654,6 +668,7 @@ class ApplicationHost:
             url = urlsplit(self.manifest["analysis_url"])
             data = await self.http(f"http://{url.netloc}/health")
             endpoint = data.get("endpoint", {})
+            self.state.worker_broadcast_status("analysis", inspect_analysis_runtime(data, self.analysis_broadcast_enabled))
             self.manifest.setdefault("cpu_restart", {})[key] = endpoint.get("device") == "cpu" and endpoint.get("tensor_cuda_build") is True
             return all(data.get(lane, {}).get("status") == "READY" for lane in self.manifest["analysis_lanes"])
         if key == "voice":
@@ -840,6 +855,9 @@ class ApplicationHost:
         created = local_tts.get('created_at') if isinstance(local_tts, dict) else None
         self.local_tts_created_at = float(created) if type(created) in {int, float} and created > 0 else None
         reported = data.get("capabilities", [])
+        enabled = data.get("analysis_enabled")
+        if isinstance(enabled, dict) and all(type(enabled.get(key)) is bool for key in ("endpoint", "emotion", "acoustic")):
+            self.analysis_broadcast_enabled = {key: enabled[key] for key in ("endpoint", "emotion", "acoustic")}
         # 兼容旧核心缺少字段；只采用已知能力的状态行，不因诊断附加字段拒绝整个状态请求。
         known = {"audio", "asr", "llm", "tts", "kws", "speaker", "dsh", "analysis"}
         self.capability_rows = [dict(row) for row in reported

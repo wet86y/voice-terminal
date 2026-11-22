@@ -40,13 +40,14 @@ export function ensureRemoteClientRuntime(): Promise<RemoteClientRuntimeState> {
     }
     versionBlockedHost = null
 
+    // 每轮读取已认证管理状态，让服务端断开通知在任务和语音均运行时也能及时交接。
+    const manager = await nativeDeviceApi.remoteManagementRequest('management.status', {})
+    if (manager.status !== 200 || !matchesRemoteManagementEnvelope(manager, config.paired_host.host_id, 'management.status')) {
+      throw new Error(typeof manager.body?.detail === 'string' ? manager.body.detail : '服务端原生管理服务尚未就绪。')
+    }
+    const core = manager.body.core_state
     let task = await nativeDeviceApi.remoteTaskChannel('status')
     if (task.state !== 'running') {
-      const manager = await nativeDeviceApi.remoteManagementRequest('management.status', {})
-      if (manager.status !== 200 || !matchesRemoteManagementEnvelope(manager, config.paired_host.host_id, 'management.status')) {
-        throw new Error(typeof manager.body?.detail === 'string' ? manager.body.detail : '服务端原生管理服务尚未就绪。')
-      }
-      const core = manager.body.core_state
       if (core !== 'ready') {
         return { state: 'management_only', core_state: core === 'starting' ? 'starting' : 'unavailable' } as const
       }

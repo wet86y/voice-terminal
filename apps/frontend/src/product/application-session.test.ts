@@ -4,7 +4,7 @@ import { createApp, h, nextTick } from 'vue'
 import { flushPromises } from '@vue/test-utils'
 import { useApplicationHost, type ApplicationSnapshot, type DesktopRecovery } from './application-host'
 import * as desktop from './desktop-port'
-import { productApi } from './api'
+import { productApi, ProductApiError } from './api'
 import { nativeDeviceApi, type DeviceConfigStatus, type RemoteManagementOperation, type RemoteManagementResponse, type RemoteVoiceForwarderResult } from './native-device-api'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { useProductAdapter } from './useProductAdapter'
@@ -141,6 +141,41 @@ afterEach(() => {
 })
 
 describe('Host 会话失效处理', () => {
+  it.each([
+    { change: '端点代次', next: { endpoint_revision: 2 } },
+    { change: '接口地址', next: { voice_api_url: 'http://127.0.0.1:43877' } },
+  ])('启动后$change交接丢弃旧读取失败并自动接续当前快照，不遗留错误条', async ({ next }) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ ...readySnapshot, endpoint_revision: 1 }) }))
+    await host.start(); await flushPromises()
+    vi.mocked(productApi.snapshot).mockClear()
+    let failOld!: (error: Error) => void
+    vi.mocked(productApi.snapshot).mockImplementationOnce(() => new Promise((_, reject) => { failOld = reject }))
+      .mockResolvedValue(productSnapshot)
+    const pending = adapter.loadSnapshot()
+    expect(productApi.snapshot).toHaveBeenCalledOnce()
+    FakeEventSource.instances[0]!.onmessage?.({ data: JSON.stringify({ ...readySnapshot, revision: 2, endpoint_revision: 1, ...next }) } as MessageEvent)
+    failOld(new ProductApiError('请求目标已变化', 409, undefined, 'STALE_SERVICE_TARGET'))
+    await pending; await flushPromises()
+    expect(productApi.snapshot).toHaveBeenCalledTimes(2)
+    expect(adapter.lastError.value).toBe('')
+    expect(host.businessReady.value).toBe(true)
+  })
+
+  it('旧端点的计算状态失败不覆盖新目标，当前端点的真实故障仍正常提示', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ ...readySnapshot, endpoint_revision: 1 }) }))
+    await host.start(); await flushPromises()
+    let failOld!: (error: Error) => void
+    vi.mocked(productApi.computeStatus).mockImplementationOnce(() => new Promise((_, reject) => { failOld = reject }))
+    const pending = adapter.refreshComputeStatus()
+    FakeEventSource.instances[0]!.onmessage?.({ data: JSON.stringify({ ...readySnapshot, revision: 2, endpoint_revision: 2 }) } as MessageEvent)
+    failOld(new ProductApiError('请求目标已变化', 409, undefined, 'STALE_SERVICE_TARGET'))
+    await pending; await flushPromises()
+    expect(adapter.lastError.value).toBe('')
+    vi.mocked(productApi.computeStatus).mockRejectedValueOnce(new Error('当前设备状态读取失败'))
+    await adapter.refreshComputeStatus()
+    expect(adapter.lastError.value).toBe('当前设备状态读取失败')
+  })
+
   it('组件维护保留页面，丢弃旧鉴权失败，在新宿主加载期间重接并持续显示热切换', async () => {
     let deliver!: (event: { payload: DesktopRecovery }) => void
     const operation = { id: 'native-update', revision: 1, target: 'resources', label: '本地组件',

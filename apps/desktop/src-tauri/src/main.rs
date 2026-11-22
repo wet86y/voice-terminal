@@ -27,6 +27,8 @@ mod remote_import;
 mod remote_management;
 #[cfg(feature = "ssh-device")]
 mod remote_services;
+#[cfg(feature = "ssh-device")]
+mod connection_control;
 mod resource_commands;
 mod runtime_recovery;
 use credential_commands::{
@@ -496,10 +498,13 @@ fn frontend_capability(
             permissions.push(serde_json::json!("allow-device-worker-playback-stop"));
             #[cfg(feature = "ssh-device")]
             for permission in [
+                "allow-device-inbound-status",
+                "allow-device-inbound-control",
                 "allow-device-pairing-window-open",
                 "allow-device-pairing-window-close",
                 "allow-device-pairing-window-status",
                 "allow-device-pairing-connect",
+                "allow-device-pairing-remove",
                 "allow-device-ssh-probe",
                 "allow-device-ssh-identity-create",
                 "allow-device-ssh-identity-status",
@@ -572,6 +577,8 @@ struct Desktop {
     #[cfg(feature = "ssh-device")]
     discovery_publication:
         Mutex<Option<voice_desktop_common::device_discovery::DiscoveryPublication>>, // discovery_publication（当前 mDNS 公告租约）。
+    #[cfg(feature = "ssh-device")]
+    client_discovery_started: AtomicBool, // client_discovery_started（每个桌面实例只运行一个客户端公告监督任务）。
     #[cfg(feature = "ssh-device")]
     remote_services: Mutex<Option<Arc<remote_services::RemoteServices>>>, // remote_services（广播开启期间的原生管理与文件回环服务）。
     #[cfg(feature = "ssh-device")]
@@ -1800,6 +1807,8 @@ async fn device_config_save(
             config.broadcast_enabled,
         )?
     };
+    #[cfg(feature = "ssh-device")]
+    let publish_client = config.mode == voice_desktop_common::device_config::RunMode::Remote;
     let outcome = save_device_config_inner(
         app,
         state.inner().clone(),
@@ -1810,7 +1819,65 @@ async fn device_config_save(
     )
     .await;
     operation.finish(outcome.as_ref().err().cloned());
+    #[cfg(feature = "ssh-device")]
+    if outcome.is_ok() && publish_client {
+        let presence_state = state.inner().clone();
+        tauri::async_runtime::spawn(async move { let _ = sync_local_discovery(presence_state).await; });
+    }
     outcome
+}
+
+/// device_pairing_remove（移除已断开的服务端）：固定目标和设备任务互斥先于密钥及配对资料清理。
+#[tauri::command]
+async fn device_pairing_remove(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<Desktop>>,
+    expected_host_id: String, // expected_host_id（用户确认移除的稳定服务端编号）。
+    confirmed: bool, // confirmed（用户已确认移除本机密钥及连接资料）。
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || !confirmed {
+        return Err("请在正式程序中确认移除服务端。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        let operation = {
+            let _gate = state.maintenance_gate.lock().map_err(|_| "维护操作锁不可用。")?;
+            if state.stopping.load(Ordering::Acquire) || state.workspace_busy.load(Ordering::Acquire)
+                || state.app_update.busy.load(Ordering::Acquire)
+            {
+                return Err("应用退出或工作区交接期间不能移除配对。".into());
+            }
+            state.device_operation.begin("remote", false)?
+        };
+        let outcome = async {
+            if state.ssh_device.connected().await || state.remote_client_connected.load(Ordering::Acquire) {
+                return Err("请先断开服务端，再移除配对。".into());
+            }
+            let context = state.context().ok_or("缺少正式工作区")?;
+            if !matches!(voice_desktop_common::device_config::load_from_root(&context.data),
+                voice_desktop_common::device_config::LoadResult::Valid(ref config)
+                    if config.mode == voice_desktop_common::device_config::RunMode::Remote
+                    && config.host.as_ref().and_then(|host| host.host_id.as_deref()) == Some(expected_host_id.as_str()))
+            {
+                return Err("配对服务端已变化，未移除其他服务端的资料。".into());
+            }
+            stop_remote_device_runtime(state.inner()).await?;
+            operation.phase("removing_pairing", "正在清理该服务端的本机密钥与连接资料");
+            let snapshot = voice_desktop_common::device_config::remove_paired_host(
+                &context.data, &expected_host_id,
+                |reference| voice_desktop_common::credentials::delete_device_ssh_key_at(Some(&context.data), reference),
+            )?;
+            serde_json::to_value(snapshot).map_err(|_| "配对移除结果编码失败。".to_string())
+        }.await;
+        operation.finish(outcome.as_ref().err().cloned());
+        outcome
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    {
+        let _ = expected_host_id;
+        Err("当前产品构建未包含设备配对能力。".into())
+    }
 }
 
 /// device_core_restart_required（核心重启条件）：广播与本地共享角色由附属入口热交接。
@@ -1967,6 +2034,12 @@ async fn save_device_config_inner(
         }
     };
     let runtime_change = device_core_restart_required(old_config.as_ref(), &config, force_restart);
+    // 仅更新显示名称时复用已验证的广播入口，不重新执行系统功能及网络规则检查。
+    let name_only_change = !force_restart && old_config.as_ref().is_some_and(|previous| {
+        let mut renamed = previous.clone();
+        renamed.server_name = config.server_name.clone();
+        renamed == config
+    });
     // 必须在触发 UAC（管理员授权）前完成准入，避免授权后才发现切换不可执行。
     if runtime_change {
         if state.service_starting.load(Ordering::Acquire) {
@@ -1981,7 +2054,13 @@ async fn save_device_config_inner(
     }
     if config.mode == voice_desktop_common::device_config::RunMode::Local
         && config.broadcast_enabled
+        && !name_only_change
     {
+        operation.phase("checking_components", "正在校验广播所需的本地组件");
+        let component_context = context.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            voice_desktop_common::resources::require_broadcast_readiness(&component_context)
+        }).await.map_err(|_| "广播组件检查任务无法启动。".to_string())??;
         operation.phase(
             "preparing_access",
             "正在检查局域网配置；确认需要系统修复时才请求管理员授权",
@@ -2136,6 +2215,165 @@ async fn save_device_config_inner(
     serde_json::to_value(snapshot).map_err(|_| "设备配置结果编码失败。".into())
 }
 
+/// device_inbound_status（入站客户端登记与发现）：显示可信登记和待清理撤销记录，公告不能增加授权。
+#[tauri::command]
+async fn device_inbound_status(
+    window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || state.stopping.load(Ordering::Acquire) {
+        return Err("当前应用状态不能读取入站客户端。".into());
+    }
+    #[cfg(feature = "ssh-device")]
+    {
+        let context = state.context().ok_or("缺少正式工作区")?;
+        let config = match voice_desktop_common::device_config::load_from_root(&context.data) {
+            voice_desktop_common::device_config::LoadResult::Valid(config)
+                if config.mode == voice_desktop_common::device_config::RunMode::Local => config,
+            _ => return Err("仅本地运行模式可读取入站客户端。".into()),
+        };
+        let discovery_available = config.broadcast_enabled
+            && state.discovery_publication.lock().map_err(|_| "局域网公告状态不可用。")?.as_ref()
+                .is_some_and(|publication| matches!(publication.state_name(), "ready" | "starting"))
+            && state.remote_services.lock().map_err(|_| "设备入口状态不可用。")?.as_ref().is_some_and(|services| services.is_running());
+        let management = state.remote_services.lock().map_err(|_| "设备入口状态不可用。")?.as_ref()
+            .and_then(|services| services.management_service());
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = voice_desktop_common::device_trust::DeviceTrustStore::open(&context.data)?;
+            let trust = store.snapshot();
+            if trust.state == "invalid" { return Err(trust.error.unwrap_or_else(|| "设备信任登记无效。".into())); }
+            let discovered = if discovery_available {
+                voice_desktop_common::device_discovery::search_clients(&config.device_id, Duration::from_millis(1500))?
+            } else { Vec::new() };
+            let devices = voice_desktop_common::device_discovery::inbound_clients(&trust, &discovered)?;
+            let mut devices = devices.iter().map(|device| serde_json::json!({"device_id":device.device_id,
+                "display_name":device.display_name,"online":device.online,"record_token":store.record_token(&device.device_id),
+                "removal_pending":false,
+                "connected":management.as_ref().is_some_and(|service| service.controls.connected(&device.device_id))})).collect::<Vec<_>>();
+            // 撤销后系统授权清理被取消或失败时保留重试条目，不重新授予连接权限。
+            devices.extend(trust.devices.iter().filter(|record| record.state == "revoked").map(|record| serde_json::json!({
+                "device_id":record.device_id,"display_name":null,"online":false,"record_token":store.record_token(&record.device_id),
+                "removal_pending":true,"connected":management.as_ref().is_some_and(|service| service.controls.connected(&record.device_id))})));
+            Ok(serde_json::json!({"host_id":config.device_id,"devices":devices,"discovery_available":discovery_available,
+                "fields":{"host_id":"本机稳定服务端编号","devices":"本机可信登记客户端及待清理撤销记录","device_id":"客户端稳定编号",
+                    "discovery_available":"本机广播与设备入口正在运行，已执行当前局域网发现",
+                    "record_token":"登记代次摘要，不具备认证能力","connected":"已认证管理连接实际打开状态","removal_pending":"配对已撤销，系统公钥清理尚未完成，可重试移除",
+                    "display_name":"当前局域网公告显示名称","online":"已发现对应本机配对身份的客户端，可由客户端发起或恢复连接；不代表已认证连接"}}))
+        }).await.map_err(|_| "入站客户端发现任务无法启动。".to_string())?
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    Err("当前程序未包含局域网客户端发现能力。".into())
+}
+
+#[cfg(feature = "ssh-device")]
+async fn control_local_inbound(state: &Arc<Desktop>, device_id: &str, action: &str, expected: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    if state.service_starting.load(Ordering::Acquire) { return Err("语音服务正在交接，请稍后重试。".into()); }
+    let running = state.service.lock().map_err(|_| "语音服务状态不可用。")?.as_mut()
+        .is_some_and(|service| matches!(service.child.try_wait(), Ok(None)));
+    if !running { return Ok(serde_json::json!({"device_id":device_id,"connected":false})); }
+    let epoch = state.service_epoch.load(Ordering::Acquire);
+    let (id, receive) = state.gateway_control.begin()?;
+    let mut payload = serde_json::json!({"action":action,"device_id":device_id});
+    if let Some(expected) = expected {
+        payload["expected_core_session_id"] = expected["core_session_id"].clone();
+        payload["expected_connection_generation"] = expected["connection_generation"].clone();
+        payload["expected_executor_generation"] = expected["executor_generation"].clone();
+    }
+    let sent = state.send(serde_json::json!({"protocol":1,"kind":"device_inbound_control","request_id":id,"payload":payload}));
+    let result = if let Err(error) = sent { Err(error) } else {
+        tokio::time::timeout(Duration::from_secs(12), receive).await
+            .map_err(|_| "入站会话操作超时，请刷新实际连接状态。".to_string())
+            .and_then(|reply| reply.map_err(|_| "入站会话控制管道已关闭。".to_string()))
+    };
+    state.gateway_control.forget(id);
+    let reply = result?;
+    if epoch != state.service_epoch.load(Ordering::Acquire) { return Err("语音服务代次已变化，请刷新后重试。".into()); }
+    if reply["ok"] != true { return Err(reply["error"].as_str().unwrap_or("入站会话操作失败。").into()); }
+    if reply["status"]["device_id"] != device_id || !reply["status"]["connected"].is_boolean() {
+        return Err("入站会话回执与当前设备不匹配。".into());
+    }
+    Ok(reply["status"].clone())
+}
+
+/// device_inbound_control（入站连接操作）：普通断开保留登记，移除只删除用户确认的同一代身份。
+#[tauri::command]
+async fn device_inbound_control(
+    window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
+    expected_host_id: String, device_id: String, expected_record_token: String,
+    action: voice_desktop_common::device_management_contract::ConnectionAction, confirmed: bool,
+) -> Result<serde_json::Value, String> {
+    trusted(&window, &state)?;
+    if state.mode != FrontendMode::Product || !confirmed { return Err("请在正式程序中确认入站客户端操作。".into()); }
+    #[cfg(feature = "ssh-device")]
+    {
+        use voice_desktop_common::{device_config::{self, LoadResult, RunMode}, device_management_contract::ConnectionAction, device_trust::DeviceTrustStore};
+        let operation = {
+            let _gate = state.maintenance_gate.lock().map_err(|_| "维护操作锁不可用。")?;
+            if state.stopping.load(Ordering::Acquire) || state.workspace_busy.load(Ordering::Acquire) || state.app_update.busy.load(Ordering::Acquire) {
+                return Err("程序退出或工作区交接期间不能管理入站客户端。".into());
+            }
+            state.device_operation.begin("local", false)?
+        };
+        let result = async {
+            let context = state.context().ok_or("缺少正式工作区")?;
+            let config = match device_config::load_from_root(&context.data) {
+                LoadResult::Valid(config) if config.mode == RunMode::Local && config.device_id == expected_host_id => config,
+                _ => return Err("本机服务端身份已变化，请刷新后重试。".into()),
+            };
+            let mut trust = DeviceTrustStore::open(&context.data)?;
+            trust.require_record(&device_id, &expected_record_token)?;
+            let management = state.remote_services.lock().map_err(|_| "设备入口状态不可用。")?.as_ref().and_then(|services| services.management_service());
+            let core = control_local_inbound(state.inner(), &device_id, "status", None).await?;
+            if action == ConnectionAction::Remove {
+                if core["connected"] == true || management.as_ref().is_some_and(|service| service.controls.connected(&device_id)) {
+                    return Err("请先断开该客户端，再移除配对。".into());
+                }
+                operation.phase("removing_client", "正在清理该客户端的受限公钥及配对登记");
+                // 先持久撤销应用授权；系统清理失败保留撤销记录，界面可按新代次重试。
+                trust.revoke(&device_id)?;
+                let cleanup_token = trust.record_token(&device_id).ok_or("客户端撤销登记缺失。")?;
+                let cleanup_public_key = trust.snapshot().devices.into_iter().find(|record| record.device_id == device_id)
+                    .ok_or("客户端撤销公钥缺失。")?.public_key;
+                let build = voice_desktop_common::resources::load(&context.program.join("release.json"))?["build"].as_str()
+                    .filter(|value| !value.is_empty()).ok_or("正式程序缺少有效构建编号。")?.to_owned();
+                let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+                let owner_sid = voice_desktop_common::system_feature::current_user_sid()?;
+                let workspace_id = context.workspace_id.clone(); let key_device_id = device_id.clone();
+                tauri::async_runtime::spawn_blocking(move || voice_desktop_common::system_feature::remove_project_device_key(
+                    &cleanup_public_key, &workspace_id, &key_device_id, &build, &executable, &owner_sid))
+                    .await.map_err(|_| "客户端公钥清理任务无法启动。".to_string())??;
+                trust.remove_expected(&device_id, &cleanup_token)?;
+                // 关闭检查间隙新建的核心会话；已存在的认证管理连接会收到明确的配对失效回执。
+                let latest = control_local_inbound(state.inner(), &device_id, "status", None).await?;
+                control_local_inbound(state.inner(), &device_id, "disconnect", Some(&latest)).await?;
+            } else {
+                if trust.trusted_public_key(&device_id).is_none() { return Err("该客户端授权已撤销，请继续完成移除。".into()); }
+                operation.phase("disconnecting_client", "正在通知客户端暂停自动重连并关闭会话");
+                let service = management.ok_or("客户端管理通道未运行，请刷新连接状态。")?;
+                if !service.controls.connected(&device_id) { return Err("客户端管理连接已关闭，请刷新连接状态。".into()); }
+                let notice = service.controls.begin(&config.device_id, &device_id, ConnectionAction::Disconnect)?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while !service.controls.acknowledged(&notice) && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !service.controls.acknowledged(&notice) {
+                    service.controls.finish(&notice);
+                    return Err("客户端尚未确认暂停，断开请求已结束；请刷新后重试。".into());
+                }
+                let closed = control_local_inbound(state.inner(), &device_id, "disconnect", Some(&core)).await;
+                service.controls.finish(&notice);
+                closed?;
+            }
+            Ok(serde_json::json!({"device_id":device_id,"action":action,"completed":true,
+                "fields":{"device_id":"本次操作的客户端编号","action":"断开或移除","completed":"原生操作已完成"}}))
+        }.await;
+        operation.finish(result.as_ref().err().cloned());
+        result
+    }
+    #[cfg(not(feature = "ssh-device"))]
+    { let _ = (expected_host_id, device_id, expected_record_token, action); Err("当前程序未包含入站连接管理能力。".into()) }
+}
+
 /// device_discovery_search（搜索局域网服务端）：只读 mDNS 发现，不排除同机不同工作区。
 #[tauri::command]
 async fn device_discovery_search(
@@ -2271,18 +2509,7 @@ async fn device_pairing_window_open(
             .iter()
             .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
             .collect::<Vec<_>>();
-        let display_name = format!(
-            "Voice Terminal {}",
-            config
-                .device_id
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        );
+        let display_name = config.server_display_name();
         let server_info = voice_desktop_common::device_pairing::PairingServerInfo {
             host_id: config.device_id.clone(),
             display_name,
@@ -2371,11 +2598,8 @@ async fn device_pairing_window_open(
                 let old_record = snapshot.devices.iter().find(|record| {
                     record.device_id == identity.device_id && record.state == "trusted"
                 });
-                if old_record.is_some_and(|record| record.public_key != identity.public_key) {
-                    return Err(
-                        "该设备编号已经绑定另一把公钥；请先在服务端撤销旧信任再重新配对。".into(),
-                    );
-                }
+                // 此回调只在一次性配对码验证成功后执行；受管授权行按设备标记替换旧公钥。
+                let replace_identity = old_record.is_none_or(|record| record.public_key != identity.public_key);
                 voice_desktop_common::system_feature::install_project_device_key(
                     &identity.public_key,
                     &workspace_id,
@@ -2388,8 +2612,8 @@ async fn device_pairing_window_open(
                 if desktop.stopping.load(Ordering::Acquire) {
                     return Err("配对期间程序开始退出，设备尚未加入信任。".into());
                 }
-                if old_record.is_none() {
-                    if let Err(error) = trust.approve(&identity.device_id, &identity.public_key) {
+                if replace_identity {
+                    if let Err(error) = trust.approve_paired(&identity.device_id, &identity.public_key) {
                         // 公钥只允许受限桥接，桥接还会核对独立设备信任；登记失败保持拒绝。
                         // 不在错误清理中再发起 UAC（管理员授权），下次相同身份配对可幂等修复该受管行。
                         return Err(format!("受限公钥已写入，但设备信任保存失败，本次设备未获程序授权；请检查资料目录后重新配对：{error}"));
@@ -2624,6 +2848,7 @@ async fn device_pairing_connect(
         let mut config = previous.unwrap_or(voice_desktop_common::device_config::DeviceConfig {
             schema_version: voice_desktop_common::device_config::SCHEMA_VERSION,
             device_id: device_id.clone(),
+            server_name: String::new(),
             mode: voice_desktop_common::device_config::RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -2685,6 +2910,10 @@ async fn device_pairing_connect(
         )
         }.await;
         operation.finish(outcome.as_ref().err().cloned());
+        if outcome.is_ok() {
+            let presence_state = state.inner().clone();
+            tauri::async_runtime::spawn(async move { let _ = sync_local_discovery(presence_state).await; });
+        }
         outcome
     }
     #[cfg(not(feature = "ssh-device"))]
@@ -2726,11 +2955,27 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
             stop_local_remote_services(&state).await?;
             return Ok(());
         }
-        voice_desktop_common::device_config::LoadResult::Invalid(error) => return Err(error),
+        voice_desktop_common::device_config::LoadResult::Invalid(error) => {
+            if let Some(publication) = state.discovery_publication.lock().map_err(|_| "局域网公告状态不可用。")?.take() {
+                publication.stop()?;
+            }
+            return Err(error);
+        }
     };
-    if config.mode != voice_desktop_common::device_config::RunMode::Local
-        || !config.broadcast_enabled
-    {
+    if config.mode == voice_desktop_common::device_config::RunMode::Remote {
+        stop_local_remote_services(&state).await?;
+        let previous = state.discovery_publication.lock().map_err(|_| "局域网公告状态不可用。")?.take();
+        if let Some(host_id) = config.host.as_ref().and_then(|host| host.host_id.as_deref()) {
+            let host_id = host_id.to_owned();
+            let name = config.server_display_name();
+            let publication = tauri::async_runtime::spawn_blocking(move || {
+                voice_desktop_common::device_discovery::refresh_client(previous, &config.device_id, &host_id, &name)
+            }).await.map_err(|_| "客户端状态公告任务无法启动。".to_string())??;
+            *state.discovery_publication.lock().map_err(|_| "局域网公告状态不可用。")? = Some(publication);
+        }
+        return Ok(());
+    }
+    if !config.broadcast_enabled {
         if let Some(publication) = state
             .discovery_publication
             .lock()
@@ -2741,6 +2986,22 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
         }
         stop_local_remote_services(&state).await?;
         return Ok(());
+    }
+    // 普通启动可以先进入界面；必要核心和已启用功能未就绪时不发布可连接公告。
+    let (components_ready, component_blockers) = {
+        let runtime = state.recovery.lock().map_err(|_| "运行状态不可用。")?;
+        (runtime.broadcast_ready, runtime.broadcast_blockers.clone())
+    };
+    if components_ready != Some(true) {
+        if let Some(publication) = state.discovery_publication.lock()
+            .map_err(|_| "局域网公告状态不可用。")?.take() {
+            publication.stop()?;
+        }
+        // 只撤销发现公告；模型切换或恢复期间保留已建立的独立管理连接。
+        // 首次加载尚未上报结果，保留广播意图，等待同一正式启动状态消息继续。
+        if components_ready.is_none() { return Ok(()); }
+        return Err(if component_blockers.is_empty() { "本地语音核心未就绪，广播未启动。".into() }
+            else { format!("本地功能未就绪：{}。广播未启动。", component_blockers.join("、")) });
     }
     let gateway_ready = state
         .device_gateway_status
@@ -2762,7 +3023,8 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
             .lock()
             .map_err(|_| "局域网公告状态不可用。")?
             .as_ref()
-            .is_some_and(|publication| publication.state_name() == state_name)
+            .is_some_and(|publication| publication.state_name() == state_name
+                && publication.display_name() == config.server_display_name())
     {
         return Ok(());
     }
@@ -2770,6 +3032,12 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
     if let Some(publication) = state.discovery_publication.lock()
         .map_err(|_| "局域网公告状态不可用。")?.take() {
         publication.stop()?;
+    }
+    let component_context = context.clone();
+    if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+        voice_desktop_common::resources::require_broadcast_readiness(&component_context)
+    }).await.map_err(|_| "广播组件检查任务无法启动。".to_string())? {
+        return Err(error);
     }
     let epoch = state.service_epoch.load(Ordering::Acquire);
     let cached = state
@@ -2795,6 +3063,7 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
         || state.workspace_busy.load(Ordering::Acquire)
         || epoch != state.service_epoch.load(Ordering::Acquire)
         || state.device_operation.snapshot()["revision"] != operation["revision"]
+        || state.recovery.lock().map_err(|_| "运行状态不可用。")?.broadcast_ready != Some(true)
         || voice_desktop_common::device_config::load_from_root(&context.data)
             != voice_desktop_common::device_config::LoadResult::Valid(config.clone())
     {
@@ -2842,17 +3111,7 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
         return Err("本机设备编号不能用于局域网服务名称。".into());
     }
     let host_id = config.device_id.clone();
-    let display_name = format!(
-        "Voice Terminal {}",
-        host_id
-            .chars()
-            .rev()
-            .take(6)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>()
-    );
+    let display_name = config.server_display_name();
     let hostname = format!("voice-terminal-{token}.local.");
     let publication = tauri::async_runtime::spawn_blocking(move || {
         voice_desktop_common::device_discovery::publish(
@@ -2882,8 +3141,13 @@ async fn sync_local_discovery(state: Arc<Desktop>) -> Result<(), String> {
     if state.stopping.load(Ordering::Acquire)
         || state.workspace_busy.load(Ordering::Acquire)
         || epoch != state.service_epoch.load(Ordering::Acquire)
+        || state.recovery.lock().map_err(|_| "运行状态不可用。")?.broadcast_ready != Some(true)
+        || state.device_operation.snapshot()["revision"] != operation["revision"]
+        || voice_desktop_common::device_config::load_from_root(&context.data)
+            != voice_desktop_common::device_config::LoadResult::Valid(config.clone())
     {
         drop(publication);
+        if !remote_services_active { remote_services.stop()?; }
         return Ok(());
     }
     let mut slot = state
@@ -3313,7 +3577,7 @@ async fn device_ssh_connect(
                 }
             }
         }
-        state
+        let connected = state
             .ssh_device
             .connect(
                 &identity_credential_ref,
@@ -3322,7 +3586,17 @@ async fn device_ssh_connect(
                 target,
                 std::time::Duration::from_millis(timeout),
             )
-            .await?;
+            .await;
+        if let Err(error) = connected {
+            let reason = ssh_trust_failure_reason(&error);
+            if let Some(reason) = reason {
+                require_remote_request_context(state.inner(), &context.data, &config)?;
+                let mut paused = config.clone(); paused.reconnect_suspended_reason = Some(reason.into());
+                voice_desktop_common::device_config::save(&context.data, &paused)?;
+                return Err(format!("{error} 已保留旧配对资料，请在远程配对区域输入有效配对码重新配对。"));
+            }
+            return Err(error);
+        }
         if !matches!(voice_desktop_common::device_config::load_from_root(&context.data),
             voice_desktop_common::device_config::LoadResult::Valid(ref current) if current == &config)
         {
@@ -3611,7 +3885,7 @@ async fn device_ssh_management_request(
             || operation.starts_with("resource.")
             || operation.starts_with("system.ssh.")
         {
-            let response = state
+            let response_result = state
                 .ssh_device
                 .management_request(
                     &request_id,
@@ -3620,8 +3894,25 @@ async fn device_ssh_management_request(
                     arguments,
                     Duration::from_secs(60),
                 )
-                .await?;
+                .await;
+            let response = match response_result {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(reason) = ssh_trust_failure_reason(&error) {
+                        require_remote_request_context(state.inner(), &context.data, &expected_config)?;
+                        let mut paused = expected_config.clone(); paused.reconnect_suspended_reason = Some(reason.into());
+                        voice_desktop_common::device_config::save(&context.data, &paused)?;
+                        stop_remote_device_runtime(state.inner()).await?;
+                        return Err(format!("{error} 已保留旧配对资料，请输入有效配对码重新配对。"));
+                    }
+                    return Err(error);
+                }
+            };
             require_remote_request_context(state.inner(), &context.data, &expected_config)?;
+            if consume_connection_notice(state.inner(), &context.data, &expected_config, &response).await? {
+                return Err(if response.status == 410 { "服务端已移除此配对，本机旧配对资料已清理，请重新配对。" }
+                    else { "服务端已断开连接，自动重连已暂停；可手动连接恢复。" }.into());
+            }
             return Ok(serde_json::json!({
                 "request_id": response.request_id,
                 "target_host_id": response.target_host_id,
@@ -3741,6 +4032,49 @@ fn require_remote_request_context(
         return Err("远程请求期间工作区或设备配置已切换，已丢弃旧回执。".into());
     }
     Ok(())
+}
+
+/// consume_connection_notice（消费固定主机的已认证通知）：普通错误、广播公告和其他设备回执不具备清理权限。
+#[cfg(feature = "ssh-device")]
+async fn consume_connection_notice(
+    state: &Arc<Desktop>, data: &std::path::Path,
+    expected: &voice_desktop_common::device_config::DeviceConfig,
+    response: &voice_desktop_common::device_management_contract::RemoteManagementResponse,
+) -> Result<bool, String> {
+    use voice_desktop_common::{device_config, device_management_contract::{ConnectionAction, ConnectionNotice}};
+    let host_id = expected.host.as_ref().and_then(|host| host.host_id.as_deref()).ok_or("配对服务端身份缺失。")?;
+    let Some(notice) = ConnectionNotice::from_response(response, host_id, &expected.device_id)? else { return Ok(false); };
+    let operation = state.device_operation.begin("remote", false)?;
+    let result = async {
+        require_remote_request_context(state, data, expected)?;
+        let mut paused = expected.clone();
+        paused.reconnect_suspended_reason = Some(if notice.action == ConnectionAction::Remove { "server_removed_pairing" } else { "server_disconnected" }.into());
+        device_config::save(data, &paused)?;
+        // 管理回执已通过固定 SSH 主机身份和完整信封验证；确认只声明持久暂停成功。
+        let ack_id: String = rand::random::<[u8; 16]>().iter().map(|byte| format!("{byte:02x}")).collect();
+        let ack = state.ssh_device.management_request(&ack_id, host_id, "management.connection.ack",
+            serde_json::to_value(&notice).map_err(|_| "连接通知确认编码失败。")?, Duration::from_secs(5)).await;
+        stop_remote_device_runtime(state).await?;
+        if notice.action == ConnectionAction::Disconnect && !ack.is_ok_and(|reply| reply.status == 200 && reply.body["acknowledged"] == true) {
+            return Err("已保存暂停重连并断开；服务端确认回执未完成，请刷新后重试。".into());
+        }
+        if notice.action == ConnectionAction::Remove {
+            require_remote_request_context(state, data, &paused)?;
+            device_config::remove_paired_host(data, host_id,
+                |reference| voice_desktop_common::credentials::delete_device_ssh_key_at(Some(data), reference))?;
+        }
+        client_event(state, "client.disconnected", serde_json::json!({"reason":if notice.action == ConnectionAction::Remove { "server_removed_pairing" } else { "server_disconnected" }}));
+        Ok::<_, String>(true)
+    }.await;
+    operation.finish(result.as_ref().err().cloned());
+    result
+}
+
+#[cfg(feature = "ssh-device")]
+fn ssh_trust_failure_reason(error: &str) -> Option<&'static str> {
+    if error.starts_with("服务端主机密钥已变化") { Some("host_key_changed") }
+    else if matches!(error, "SSH 公钥认证失败。" | "SSH 公钥未获主机接受。") { Some("authentication_failed") }
+    else { None }
 }
 
 #[cfg(feature = "ssh-device")]
@@ -9552,11 +9886,12 @@ fn start_service_for(
     let epoch = state.service_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     #[cfg(feature = "ssh-device")]
     state.service_endpoints.begin_gateway_epoch(epoch);
-    state
-        .recovery
-        .lock()
-        .map_err(|_| "运行状态不可用。")?
-        .current_core = None;
+    {
+        let mut runtime = state.recovery.lock().map_err(|_| "运行状态不可用。")?;
+        runtime.current_core = None;
+        runtime.broadcast_ready = None;
+        runtime.broadcast_blockers.clear();
+    }
     *state
         .device_gateway_status
         .lock()
@@ -9698,7 +10033,7 @@ fn start_service_for(
                     }
                 }
                 #[cfg(feature = "ssh-device")]
-                Some("device_gateway_result") => {
+                Some("device_gateway_result" | "device_inbound_result") => {
                     if let Some(id) = message["request_id"].as_u64() {
                         read_state.gateway_control.settle(id, message);
                     }
@@ -9706,6 +10041,9 @@ fn start_service_for(
                 Some("startup_result") => {
                     let mut recovery = read_state.recovery.lock().unwrap();
                     recovery.current_core = message["core_available"].as_bool();
+                    recovery.broadcast_ready = message["broadcast_ready"].as_bool();
+                    recovery.broadcast_blockers = message["broadcast_blockers"].as_array().into_iter().flatten()
+                        .filter_map(|value| value.as_str().map(str::to_owned)).collect();
                     recovery.started = true;
                     recovery.result = Some((epoch, message.clone()));
                     *read_state.device_gateway_status.lock().unwrap() = serde_json::json!({
@@ -9724,8 +10062,13 @@ fn start_service_for(
                     }
                 }
                 Some("runtime_status") => {
-                    read_state.recovery.lock().unwrap().current_core =
-                        message["core_available"].as_bool();
+                    {
+                        let mut recovery = read_state.recovery.lock().unwrap();
+                        recovery.current_core = message["core_available"].as_bool();
+                        recovery.broadcast_ready = message["broadcast_ready"].as_bool();
+                        recovery.broadcast_blockers = message["broadcast_blockers"].as_array().into_iter().flatten()
+                            .filter_map(|value| value.as_str().map(str::to_owned)).collect();
+                    }
                     *read_state.device_gateway_status.lock().unwrap() = serde_json::json!({
                         "enabled":message["device_gateway_enabled"].as_bool().unwrap_or(false),
                         "ready":message["device_gateway_ready"].as_bool().unwrap_or(false),
@@ -10142,6 +10485,7 @@ fn launch_device_config(
         LoadResult::Missing => DeviceConfig {
             schema_version: device_config::SCHEMA_VERSION,
             device_id: format!("device-{}", voice_desktop_common::workspace::new_id()),
+            server_name: String::new(),
             mode: RunMode::Local,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -10279,6 +10623,8 @@ fn run() -> Result<(), String> {
         pairing_listener: tokio::sync::Mutex::new(None),
         #[cfg(feature = "ssh-device")]
         discovery_publication: Mutex::new(None),
+        #[cfg(feature = "ssh-device")]
+        client_discovery_started: AtomicBool::new(false),
         #[cfg(feature = "ssh-device")]
         remote_services: Mutex::new(None),
         #[cfg(feature = "ssh-device")]
@@ -10604,6 +10950,7 @@ mod tests {
         let remote = DeviceConfig {
             schema_version: device_config::SCHEMA_VERSION,
             device_id: "device-launch-test".into(),
+            server_name: String::new(),
             mode: RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -10691,6 +11038,7 @@ mod tests {
         let remote = DeviceConfig {
             schema_version: device_config::SCHEMA_VERSION,
             device_id: "device-remote-gate".into(),
+            server_name: String::new(),
             mode: RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -10849,6 +11197,7 @@ mod tests {
         let mut config = DeviceConfig {
             schema_version: SCHEMA_VERSION,
             device_id: "device-client-tts".into(),
+            server_name: String::new(),
             mode: RunMode::Remote,
             broadcast_enabled: false,
             client_online_tts_local: true,
@@ -11174,6 +11523,63 @@ mod tests {
     }
 
     #[cfg(feature = "ssh-device")]
+    #[test]
+    fn device_connection_notice_pauses_without_deleting_and_only_explicit_remove_clears_pairing() {
+        use voice_desktop_common::{device_config::{self, DeviceConfig, HostTrust, RunMode, Role, AudioMode},
+            device_management_contract::{ConnectionAction, ConnectionNotice, RemoteManagementResponse}};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp")
+            .join(format!("native-connection-notice-{}", voice_desktop_common::workspace::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let data = root.join("data");
+        let desktop = replacement_test_desktop(Vec::new());
+        *desktop.context.lock().unwrap() = Some(voice_desktop_common::LaunchContext {
+            channel: voice_desktop_common::LaunchChannel::Product, workspace_id: "notice-test".into(),
+            install: root.clone(), program: root.clone(), data: data.clone(), python: root.join("missing-python.exe"),
+            models: None, webview2: None, dsh: None, node: None, dev: false, diagnostic: false,
+        });
+        let identity = voice_desktop_common::ssh_device::create_device_identity_in(Some(&data), "notice-client").unwrap();
+        let config = DeviceConfig { schema_version: 3, device_id: "notice-client".into(), server_name: String::new(),
+            mode: RunMode::Remote, broadcast_enabled: false, client_online_tts_local: true, audio_compression: false,
+            reconnect_suspended_reason: None, desired_role: Role::RemoteClient, audio_mode: AudioMode::Pcm,
+            host: Some(HostTrust { host_id: Some("notice-host".into()), display_name: Some("测试服务端".into()),
+                addresses: vec!["192.168.1.20".into()], address: "192.168.1.20".into(), port: 22, username: "tester".into(),
+                host_key_sha256: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                credential_ref: identity.credential_ref, transport_credential_ref: None }) };
+        device_config::save(&data, &config).unwrap();
+        let notice = ConnectionNotice { control_id: "b".repeat(32), host_id: "notice-host".into(),
+            client_device_id: "notice-client".into(), action: ConnectionAction::Disconnect };
+        let mut reply = RemoteManagementResponse { protocol_version: 1, request_id: "a".repeat(32), target_host_id: "notice-host".into(),
+            session_generation: 3, operation: "management.status".into(), status: 409,
+            body: serde_json::json!({"connection_notice":notice}), fields: Default::default() };
+        tauri::async_runtime::block_on(async {
+            let mut forged = reply.clone(); forged.body["connection_notice"]["client_device_id"] = serde_json::json!("other-client");
+            assert!(super::consume_connection_notice(&desktop, &data, &config, &forged).await.is_err());
+            assert_eq!(device_config::load_from_root(&data), device_config::LoadResult::Valid(config.clone()));
+            assert!(super::consume_connection_notice(&desktop, &data, &config, &reply).await.unwrap_err().contains("已保存暂停重连"));
+            let device_config::LoadResult::Valid(paused) = device_config::load_from_root(&data) else { panic!("missing paused config") };
+            assert_eq!(paused.reconnect_suspended_reason.as_deref(), Some("server_disconnected"));
+            assert_eq!(paused.host, config.host);
+            assert!(voice_desktop_common::ssh_device::device_identity_status_in(Some(&data), "notice-client").unwrap().is_some());
+            reply.status = 410; reply.body["connection_notice"]["action"] = serde_json::json!("remove");
+            assert!(super::consume_connection_notice(&desktop, &data, &config, &reply).await.is_err()); // 旧配置不能清除新代次。
+            assert!(super::consume_connection_notice(&desktop, &data, &paused, &reply).await.unwrap());
+            let device_config::LoadResult::Valid(removed) = device_config::load_from_root(&data) else { panic!("missing unpaired config") };
+            assert!(removed.host.is_none());
+            assert!(voice_desktop_common::ssh_device::device_identity_status_in(Some(&data), "notice-client").unwrap().is_none());
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "ssh-device")]
+    #[test]
+    fn device_trust_failures_pause_only_identity_and_authentication_errors() {
+        assert_eq!(super::ssh_trust_failure_reason("服务端主机密钥已变化，自动连接已暂停；请使用有效配对码重新配对。"), Some("host_key_changed"));
+        assert_eq!(super::ssh_trust_failure_reason("SSH 公钥未获主机接受。"), Some("authentication_failed"));
+        assert_eq!(super::ssh_trust_failure_reason("SSH 公钥认证超时。"), None);
+        assert_eq!(super::ssh_trust_failure_reason("SSH 连接失败，请检查服务端和网络。"), None);
+    }
+
+    #[cfg(feature = "ssh-device")]
     fn replacement_test_desktop_with_manager(
         responses: Vec<serde_json::Value>,
         ssh_device: voice_desktop_common::ssh_device::SshDeviceManager,
@@ -11198,6 +11604,8 @@ mod tests {
             pairing_window: std::sync::Mutex::new(None),
             pairing_listener: tokio::sync::Mutex::new(None),
             discovery_publication: std::sync::Mutex::new(None),
+            #[cfg(feature = "ssh-device")]
+            client_discovery_started: std::sync::atomic::AtomicBool::new(false),
             remote_services: std::sync::Mutex::new(None),
             #[cfg(feature = "ssh-device")]
             service_endpoints: Arc::new(voice_desktop_common::service_endpoints::EndpointDirectory::default()),
@@ -12224,6 +12632,8 @@ mod tests {
                 "device_config_status",
                 "device_config_save",
                 "device_discovery_search",
+                "device_inbound_status",
+                "device_inbound_control",
                 "device_pairing_window_open",
                 "device_pairing_window_close",
                 "device_pairing_window_status",
@@ -14331,6 +14741,7 @@ mod broadcast_lifecycle_tests {
         let local = DeviceConfig {
             schema_version: 3,
             device_id: "host-a".into(),
+            server_name: String::new(),
             mode: RunMode::Local,
             broadcast_enabled: false,
             client_online_tts_local: true,

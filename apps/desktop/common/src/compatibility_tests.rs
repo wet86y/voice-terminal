@@ -265,6 +265,7 @@ fn invalid_or_unprepared_device_role_is_a_preserved_startup_compatibility_blocke
     let remote = DeviceConfig {
         schema_version: crate::device_config::SCHEMA_VERSION,
         device_id: "remote-device".into(),
+        server_name: String::new(),
         mode: RunMode::Remote,
         broadcast_enabled: false,
         client_online_tts_local: true,

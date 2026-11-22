@@ -1562,6 +1562,7 @@ pub async fn probe_host_key(address: &str, port: u16, timeout: Duration) -> Resu
 struct PinnedHostHandler {
     expected_fingerprint: String, // expected_fingerprint（已确认的主机指纹）。
     bridge_stderr: Arc<Mutex<Vec<u8>>>, // bridge_stderr（固定桥接的有界错误输出，只保留在当前连接内存）。
+    host_key_rejected: Arc<AtomicBool>, // host_key_rejected（主机确实返回了与已配对身份不同的公钥）。
 }
 
 impl client::Handler for PinnedHostHandler {
@@ -1571,10 +1572,12 @@ impl client::Handler for PinnedHostHandler {
         &mut self,
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(host_fingerprint_matches(
+        let matches = host_fingerprint_matches(
             server_public_key,
             &self.expected_fingerprint,
-        ))
+        );
+        if !matches { self.host_key_rejected.store(true, Ordering::Release); }
+        Ok(matches)
     }
 
     async fn extended_data(
@@ -1642,9 +1645,11 @@ impl SshDeviceConnection {
         }
 
         let bridge_stderr = Arc::new(Mutex::new(Vec::new()));
+        let host_key_rejected = Arc::new(AtomicBool::new(false));
         let handler = PinnedHostHandler {
             expected_fingerprint: target.host_key_sha256.clone(),
             bridge_stderr: bridge_stderr.clone(),
+            host_key_rejected: host_key_rejected.clone(),
         };
         let config = Arc::new(device_ssh_client_config());
         let mut handle = tokio::time::timeout(
@@ -1653,7 +1658,9 @@ impl SshDeviceConnection {
         )
         .await
         .map_err(|_| "SSH 连接或主机指纹验证超时。".to_string())?
-        .map_err(|_| "SSH 连接失败或主机指纹不匹配。".to_string())?;
+        .map_err(|_| if host_key_rejected.load(Ordering::Acquire) {
+            "服务端主机密钥已变化，自动连接已暂停；请使用有效配对码重新配对。".to_string()
+        } else { "SSH 连接失败，请检查服务端和网络。".to_string() })?;
 
         let key = PrivateKeyWithHashAlg::new(Arc::new(private_key), Some(HashAlg::Sha256));
         let auth = tokio::time::timeout(
@@ -1845,9 +1852,11 @@ impl SshDeviceConnection {
             {
                 return Err("服务端管理回执与请求编号、目标、会话或操作不匹配。".into());
             }
-            if request.operation == "management.status" {
+            let notice = crate::device_management_contract::ConnectionNotice::from_response(
+                &response, &open_request.target_host_id, &open_request.client_device_id)?;
+            if request.operation == "management.status" || notice.is_some() {
                 self.management_reuse_allowed =
-                    response.status == 200 && response.body["persistent_management"] == true;
+                    (response.status == 200 || notice.is_some()) && response.body["persistent_management"] == true;
             }
             if self.management_reuse_allowed {
                 *self.management_channel.get_mut() = Some((stream, opened));
@@ -3884,15 +3893,20 @@ mod tests {
 
     #[tokio::test]
     async fn management_reuses_a_pinned_ssh_channel_and_rotates_only_after_lease_expiry() {
-        assert_management_reuse(true).await;
+        assert_management_reuse(true, false).await;
     }
 
     #[tokio::test]
     async fn legacy_management_keeps_lease_identity_but_revalidates_each_new_channel() {
-        assert_management_reuse(false).await;
+        assert_management_reuse(false, false).await;
     }
 
-    async fn assert_management_reuse(persistent: bool) {
+    #[tokio::test]
+    async fn connection_notice_keeps_the_authenticated_management_channel_for_acknowledgement() {
+        assert_management_reuse(true, true).await;
+    }
+
+    async fn assert_management_reuse(persistent: bool, connection_notice: bool) {
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::net::TcpListener;
         let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3933,14 +3947,21 @@ mod tests {
                     stream.read_line(&mut line).await.unwrap();
                     let request: RemoteManagementRequest = serde_json::from_str(&line).unwrap();
                     assert_eq!(request.session_generation, generation);
+                    let notify = connection_notice && request.request_id == format!("{:032x}", 1);
+                    let acknowledge = connection_notice && request.request_id == format!("{:032x}", 2);
+                    if acknowledge { assert_eq!(request.operation, "management.connection.ack"); }
+                    let body = if notify { serde_json::json!({"persistent_management":true,"connection_notice":{
+                        "control_id":"b".repeat(32),"host_id":"server-a","client_device_id":"test-device","action":"disconnect"}}) }
+                        else if acknowledge { serde_json::json!({"acknowledged":true}) }
+                        else { serde_json::json!({"core_state":"ready","persistent_management":persistent}) };
                     let response = RemoteManagementResponse {
                         protocol_version: 1,
                         request_id: request.request_id,
                         target_host_id: request.target_host_id,
                         session_generation: generation,
                         operation: request.operation,
-                        status: 200,
-                        body: serde_json::json!({"core_state":"ready","persistent_management":persistent}),
+                        status: if notify { 409 } else { 200 },
+                        body,
                         fields: BTreeMap::new(),
                     };
                     write_management_line(stream.get_mut(), &response, MAX_RESPONSE_BYTES)
@@ -4012,13 +4033,14 @@ mod tests {
                 .management_request(
                     &format!("{id:032x}"),
                     "server-a",
-                    "management.status",
-                    serde_json::json!({}),
+                    if connection_notice && id == 2 { "management.connection.ack" } else { "management.status" },
+                    if connection_notice && id == 2 { serde_json::json!({"control_id":"b".repeat(32),"host_id":"server-a","client_device_id":"test-device","action":"disconnect"}) } else { serde_json::json!({}) },
                     Duration::from_secs(5),
                 )
                 .await
                 .unwrap();
             assert_eq!(result.session_generation, if id == 3 { 8 } else { 7 });
+            if connection_notice && id == 2 { assert_eq!(result.body["acknowledged"], true); }
         }
         served.await.unwrap();
         manager.disconnect().await.unwrap();
@@ -4676,13 +4698,14 @@ mod tests {
         let login_key_text = login_key.to_openssh(LineEnding::LF).unwrap();
         let mut wrong_target = target.clone();
         wrong_target.host_key_sha256 = format!("SHA256:{}", "A".repeat(43));
-        assert!(SshDeviceConnection::connect(
+        let rejected = SshDeviceConnection::connect(
             wrong_target,
             &login_key_text,
             Duration::from_secs(5)
         )
         .await
-        .is_err());
+        .err().expect("wrong pinned host key must be rejected");
+        assert!(rejected.starts_with("服务端主机密钥已变化"));
 
         let manager = SshDeviceManager::default();
         manager

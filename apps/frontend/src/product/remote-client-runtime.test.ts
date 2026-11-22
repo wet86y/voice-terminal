@@ -102,6 +102,16 @@ describe('remote-client-runtime（远程客户端运行监督）', () => {
     expect(connect).not.toHaveBeenCalled()
   })
 
+  it('任务通道运行时也读取已认证管理状态，服务端暂停通知不会被绕过', async () => {
+    mockReadyManager()
+    vi.spyOn(nativeDeviceApi, 'remoteTaskChannel').mockResolvedValue(runningTask('device-a'))
+    vi.spyOn(nativeDeviceApi, 'remoteMediaChannel').mockResolvedValue(runningMedia('device-a', 1))
+    vi.mocked(nativeDeviceApi.remoteManagementRequest).mockRejectedValue(new Error('服务端已断开连接，自动重连已暂停'))
+    await expect(ensureRemoteClientRuntime()).rejects.toThrow('自动重连已暂停')
+    expect(nativeDeviceApi.remoteManagementRequest).toHaveBeenCalledWith('management.status', {})
+    expect(nativeDeviceApi.remoteMediaChannel).not.toHaveBeenCalled()
+  })
+
   it('核心未就绪时保持原生管理连接，不尝试启动核心依赖的设备通道', async () => {
     vi.spyOn(nativeDeviceApi, 'deviceConfigStatus').mockResolvedValue(remoteStatus(true, false))
     vi.spyOn(nativeDeviceApi, 'sshHostStatus').mockResolvedValue({ state: 'connected', connected: true, fields: {} })
@@ -151,7 +161,8 @@ describe('remote-client-runtime（远程客户端运行监督）', () => {
     expect(media.mock.calls.filter(([action]) => action === 'start')).toHaveLength(1)
     expect(tasks).not.toHaveBeenCalledWith('stop')
     expect(disconnect).not.toHaveBeenCalled()
-    expect(nativeDeviceApi.remoteManagementRequest).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.remoteManagementRequest).toHaveBeenCalledTimes(2)
+    expect(nativeDeviceApi.remoteManagementRequest).toHaveBeenNthCalledWith(2, 'management.status', {})
 
     deviceState.value = { ...deviceState.value, pending_device_id: id, interaction_generation: 13 }
     media.mockImplementation(async action => action === 'start' ? runningMedia(id, 13) : { state: 'stopped', fields: {} })

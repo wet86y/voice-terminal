@@ -39,6 +39,7 @@ struct RunningServices {
     host_id: String,    // host_id（当前本机服务端稳定编号）。
     data_root: PathBuf, // data_root（当前工作区受管数据根目录）。
     management: crate::remote_management::RemoteManagementHandle, // management（独立管理服务句柄）。
+    management_service: Arc<RemoteManagementService>, // management_service（已认证客户端的连接控制入口）。
     file_shutdown: Arc<AtomicBool>, // file_shutdown（文件 listener（监听器）停止信号）。
     file_worker: Option<JoinHandle<()>>, // file_worker（文件 listener（监听器）线程）。
     _endpoint_server: EndpointServer, // _endpoint_server（广播期间允许 SSH 桥接查询当前实际端口）。
@@ -181,6 +182,7 @@ impl RemoteServices {
             host_id: host_id.to_owned(),
             data_root: data_root.to_path_buf(),
             management: management_handle,
+            management_service: management,
             file_shutdown,
             file_worker: Some(file_worker),
             _endpoint_server: endpoint_server,
@@ -212,6 +214,10 @@ impl RemoteServices {
     }
 
     /// is_running（检查实际状态）：管理、文件和端点查询入口必须都存活。
+    pub fn management_service(&self) -> Option<Arc<RemoteManagementService>> {
+        self.running.lock().ok()?.as_ref().map(|running| running.management_service.clone())
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
             .lock()

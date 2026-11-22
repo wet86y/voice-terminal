@@ -6,6 +6,45 @@ use std::collections::BTreeMap;
 pub const DEVICE_MANAGEMENT_PROTOCOL_VERSION: u32 = 1; // DEVICE_MANAGEMENT_PROTOCOL_VERSION（独立管理协议版本）。
 pub const MAX_DEVICE_MANAGEMENT_ARGUMENT_BYTES: usize = 512 * 1024; // MAX_DEVICE_MANAGEMENT_ARGUMENT_BYTES（单个管理请求参数上限）。
 
+/// ConnectionNotice（已认证连接通知）：仅在固定 SSH 主机身份及完整管理回执校验后消费。
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionNotice {
+    pub control_id: String, // control_id（本次控制通知的唯一编号）。
+    pub host_id: String, // host_id（发送通知的已配对服务端编号）。
+    pub client_device_id: String, // client_device_id（通知所属的本机客户端编号）。
+    pub action: ConnectionAction, // action（暂停连接或移除配对）。
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionAction {
+    Disconnect, // Disconnect（断开并暂停自动重连，保留配对）。
+    Remove, // Remove（服务端已移除配对，需要清理旧配对）。
+}
+
+impl ConnectionNotice {
+    pub fn validate(&self, host_id: &str, client_device_id: &str) -> Result<(), String> {
+        if !valid_request_id(&self.control_id) || self.host_id != host_id
+            || self.client_device_id != client_device_id {
+            return Err("服务端连接通知的编号或配对身份不匹配。".into());
+        }
+        Ok(())
+    }
+
+    pub fn from_response(response: &RemoteManagementResponse, host_id: &str, client_device_id: &str) -> Result<Option<Self>, String> {
+        let Some(raw) = response.body.get("connection_notice") else { return Ok(None); };
+        let notice: Self = serde_json::from_value(raw.clone()).map_err(|_| "服务端连接通知格式无效。")?;
+        notice.validate(host_id, client_device_id)?;
+        let expected_status = if notice.action == ConnectionAction::Remove { 410 } else { 409 };
+        if response.protocol_version != DEVICE_MANAGEMENT_PROTOCOL_VERSION || response.target_host_id != host_id
+            || response.session_generation == 0 || !valid_request_id(&response.request_id) || response.status != expected_status {
+            return Err("服务端连接通知状态、代次或目标不匹配。".into());
+        }
+        Ok(Some(notice))
+    }
+}
+
 /// DeviceBridgePrelude（受限 SSH 桥接前导帧）：由本机正式 forced-command（强制命令）桥接生成。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +226,24 @@ fn valid_sid(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_identity_bound_notices_authorize_pairing_cleanup() {
+        let notice = ConnectionNotice { control_id: "b".repeat(32), host_id: "host-a".into(),
+            client_device_id: "client-a".into(), action: ConnectionAction::Remove };
+        let mut reply = RemoteManagementResponse { protocol_version: 1, request_id: "a".repeat(32),
+            target_host_id: "host-a".into(), session_generation: 3, operation: "management.status".into(),
+            status: 410, body: serde_json::json!({"connection_notice":notice}), fields: BTreeMap::new() };
+        assert_eq!(ConnectionNotice::from_response(&reply, "host-a", "client-a").unwrap(), Some(notice));
+        assert!(ConnectionNotice::from_response(&reply, "host-b", "client-a").is_err());
+        assert!(ConnectionNotice::from_response(&reply, "host-a", "client-b").is_err());
+        reply.session_generation = 0;
+        assert!(ConnectionNotice::from_response(&reply, "host-a", "client-a").is_err());
+        reply.session_generation = 3; reply.status = 200;
+        assert!(ConnectionNotice::from_response(&reply, "host-a", "client-a").is_err());
+        reply.status = 410; reply.body = serde_json::json!({"error":"认证失败"});
+        assert_eq!(ConnectionNotice::from_response(&reply, "host-a", "client-a").unwrap(), None);
+    }
 
     #[test]
     fn management_request_binds_fixed_ids_fields_and_bounded_object_arguments() {
