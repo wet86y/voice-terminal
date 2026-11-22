@@ -64,6 +64,8 @@ const selectedHostId = ref('')
 const searchingDevices = ref(false)
 const connection = ref<'connected' | 'disconnected' | 'unavailable'>('disconnected')
 const pairedAvailability = ref<'unknown' | 'available' | 'starting' | 'incompatible' | 'missing'>('unknown') // pairedAvailability（已配对服务端的局域网发现状态）。
+const pairedHostDiscovery = ref<Pick<DiscoveredDevice, 'host_id' | 'display_name'> | null>(null) // pairedHostDiscovery（按稳定服务端编号绑定的最新公告名称，仅用于显示）。
+let pairedDiscoveryGeneration = 0 // pairedDiscoveryGeneration（配对显示范围代次，拒绝切换目标或模式后迟到的发现结果）。
 let pairedDiscoveryRequest: Promise<void> | null = null // pairedDiscoveryRequest（自动发现的单次请求，避免与手动搜索重叠）。
 let connectionPolling = false // connectionPolling（连接状态轻量补查互斥，不触发系统功能检查）。
 const taskChannel = ref<'running' | 'stopped' | 'error'>('stopped')
@@ -107,7 +109,9 @@ const discoveredDeviceRows = computed(() => discoveredDevices.value.map(device =
 })).sort((a, b) => a.displayName.localeCompare(b.displayName, 'zh-CN', { numeric: true })))
 const pairedHostName = computed(() => {
   const host = status.value?.device_config?.paired_host
-  return host ? deviceDisplayName(host.display_name, host.host_id) : ''
+  if (!host) return ''
+  const name = pairedHostDiscovery.value?.host_id === host.host_id ? pairedHostDiscovery.value.display_name : host.display_name
+  return deviceDisplayName(name, host.host_id)
 })
 const openSshStatus = ref<OpenSshServerStatus | null>(null)
 const maxVisibleSshRuleDetails = 5 // maxVisibleSshRuleDetails（展开时最多显示的入站规则摘要条数）。
@@ -157,6 +161,11 @@ const remoteOpenSshJobCreatedAt = computed(() => {
   return createdAt === undefined ? null : new Date(createdAt)
 }) // remoteOpenSshJobCreatedAt（服务端任务创建时间；旧服务端未提供时不推测日期）。
 const isRemote = computed(() => mode.value === 'remote')
+watch([mode, () => status.value?.device_config?.paired_host?.host_id], () => {
+  pairedDiscoveryGeneration++
+  pairedHostDiscovery.value = null
+  pairedAvailability.value = 'unknown'
+}, { flush: 'sync' })
 // canDisconnect（允许断开）：底层 SSH（安全远程连接）已认证时，管理握手失败也必须保留恢复入口。
 const canDisconnect = computed(() => isRemote.value && !!status.value?.device_config?.paired_host
   && (connection.value === 'connected' || status.value?.device_runtime?.remote_client_connected === true))
@@ -363,16 +372,30 @@ async function refresh() {
   }
 }
 
-/** refreshPairedAvailability（自动发现已配对服务端）：只观察可用性，不建立连接，也不更改配对区域的搜索结果。 */
+/** applyPairedDiscovery（同步配对显示）：发现只更新同编号设备的名称与可用性，不写入配对信任资料。 */
+function applyPairedDiscovery(devices: DiscoveredDevice[]) {
+  const hostId = status.value?.device_config?.paired_host?.host_id
+  if (disposed || !isRemote.value || !hostId) return
+  const found = devices.find(device => device.host_id === hostId)
+  pairedAvailability.value = !found || found.state === 'unavailable' ? 'missing'
+    : !found.compatible ? 'incompatible' : found.state === 'ready' ? 'available' : 'starting'
+  if (!found) return
+  pairedHostDiscovery.value = { host_id: hostId, display_name: found.display_name }
+  // 配对区域已列出的同一服务端同步名称；不新增搜索条目或改变用户选择。
+  discoveredDevices.value = discoveredDevices.value.map(device => device.host_id === hostId
+    ? { ...device, display_name: found.display_name } : device)
+}
+
+/** refreshPairedAvailability（自动发现已配对服务端）：连接中也补查名称，不建立连接或改写配对资料。 */
 async function refreshPairedAvailability() {
   const hostId = status.value?.device_config?.paired_host?.host_id
-  if (disposed || !isRemote.value || !hostId || connection.value === 'connected' || searchingDevices.value || selectedHostId.value || pairedDiscoveryRequest) return
+  if (disposed || !isRemote.value || !hostId || searchingDevices.value || pairedDiscoveryRequest) return
+  const generation = pairedDiscoveryGeneration
   pairedDiscoveryRequest = (async () => {
     try {
-      const found = (await nativeDeviceApi.searchDevices(1000)).devices.find(device => device.host_id === hostId)
-      if (disposed || !isRemote.value || status.value?.device_config?.paired_host?.host_id !== hostId) return
-      pairedAvailability.value = !found || found.state === 'unavailable' ? 'missing'
-        : !found.compatible ? 'incompatible' : found.state === 'ready' ? 'available' : 'starting'
+      const result = await nativeDeviceApi.searchDevices(1000)
+      if (disposed || !isRemote.value || generation !== pairedDiscoveryGeneration || status.value?.device_config?.paired_host?.host_id !== hostId) return
+      applyPairedDiscovery(result.devices)
     } catch { /* 多播暂不可用不能证明服务端离线；保留最近发现状态，仍允许按已保存资料连接。 */ }
   })().finally(() => { pairedDiscoveryRequest = null })
   await pairedDiscoveryRequest
@@ -393,7 +416,6 @@ async function pollRemoteConnection() {
       remoteCoreState.value = 'unknown'; taskChannel.value = 'stopped'; mediaChannel.value = 'stopped'
       mediaCaptureActive.value = null
       clearRemoteOpenSshSnapshot()
-      await refreshPairedAvailability()
     } else if (connection.value !== 'connected') {
       const management = await nativeDeviceApi.remoteManagementRequest('management.status', {})
       if (!current() || management.status !== 200 || !matchesRemoteManagementEnvelope(management, hostId, 'management.status')) return
@@ -406,7 +428,10 @@ async function pollRemoteConnection() {
       mediaCaptureActive.value = media.capture_active ?? null
     }
   } catch { /* 暂时无法读取时保留最近状态，下一轮补查。 */ }
-  finally { connectionPolling = false }
+  finally {
+    if (current()) await refreshPairedAvailability()
+    connectionPolling = false
+  }
 }
 
 async function refreshDeviceChannels() {
@@ -651,7 +676,7 @@ async function enableRemoteOpenSshServer() {
   const confirmedGeneration = remoteOpenSshGeneration
   if (!await requestConfirmation({
     title: '准备服务端 SSH 服务', confirmLabel: '确认准备服务端 SSH',
-    message: `配对服务端“${status.value?.device_config?.paired_host?.display_name || '已配对服务端'}”的 OpenSSH Server（安全外壳服务端）尚未就绪。继续后会在该服务端安装或启动微软 OpenSSH Server；缺失时由服务端通过 Windows Update（系统更新）下载，并可能在服务端显示管理员授权窗口。`,
+    message: `配对服务端“${pairedHostName.value || '已配对服务端'}”的 OpenSSH Server（安全外壳服务端）尚未就绪。继续后会在该服务端安装或启动微软 OpenSSH Server；缺失时由服务端通过 Windows Update（系统更新）下载，并可能在服务端显示管理员授权窗口。`,
   })) return
   // 确认等待期间可能断线或更换配对目标；旧确认不得用于另一台服务端。
   if (disposed || confirmedGeneration !== remoteOpenSshGeneration || !isRemote.value
@@ -1050,8 +1075,11 @@ async function searchForDevices() {
     if (status.value?.device_config?.mode !== 'remote') {
       if (!await saveConfig()) throw new Error(error.value || '无法保存远程配对模式。')
     }
+    const generation = pairedDiscoveryGeneration
     const result = await nativeDeviceApi.searchDevices(3000)
+    if (disposed || !isRemote.value || generation !== pairedDiscoveryGeneration) return
     discoveredDevices.value = result.devices
+    applyPairedDiscovery(result.devices)
     selectedHostId.value = result.devices.find(device => device.compatible && device.state !== 'unavailable')?.host_id || ''
     notify(result.devices.length === 0
       ? '没有发现可配对服务端。请确认服务端已开启本地广播。'
@@ -1152,7 +1180,7 @@ async function connectHost(automatic = false) {
       mediaChannelError.value = ''
       mediaCaptureActive.value = null
     }
-    if (!automatic && runtime.state === 'ready') notify(`已连接到 ${status.value?.device_config?.paired_host?.display_name || '已配对服务端'}。`)
+    if (!automatic && runtime.state === 'ready') notify(`已连接到 ${pairedHostName.value || '已配对服务端'}。`)
     if (!automatic && runtime.state === 'management_only') {
       notify(runtime.core_state === 'starting'
         ? '服务端管理已连接，语音核心正在准备；组件管理仍可使用。'
@@ -1196,7 +1224,7 @@ async function removeHost() {
   if (!host || controlsLocked.value || canDisconnect.value) return
   if (!await requestConfirmation({
     title: '移除服务端', confirmLabel: '确认移除',
-    message: `移除“${host.display_name}”及其在本机保存的密钥、地址和配对资料。再次连接需要重新输入配对码。`,
+    message: `移除“${pairedHostName.value}”及其在本机保存的密钥、地址和配对资料。再次连接需要重新输入配对码。`,
   })) return
   if (disposed || canDisconnect.value || status.value?.device_config?.paired_host?.host_id !== host.host_id) return
   await runDeviceSettingsOperation(async () => {

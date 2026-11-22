@@ -311,6 +311,127 @@ describe('DeviceSettings（设备设置）', () => {
     expect(wrapper.text()).not.toContain('服务端管理连接：')
   })
 
+  it.each([true, false])('服务端重命名后自动更新客户端名称，连接状态为 %s 时不被旧配对配置覆盖', async connected => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    sshConnected = connected
+    const savedConfig = structuredClone(currentStatus.device_config)
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '书房服务端' },
+    ] })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const name = () => wrapper!.get('.remote-channel-status .remote-device-title strong').text()
+    expect(name()).toBe('书房服务端')
+
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '超级服务器' },
+    ] })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(name()).toBe('超级服务器')
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(name()).toBe('超级服务器')
+    expect(wrapper!.get('.server-connection-row .connection-state').text()).toBe(connected ? '已连接' : '可连接')
+
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: 'Voice Terminal rver-a' },
+    ] })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(name()).toBe('Voice Terminal rver-a')
+    expect(currentStatus.device_config).toEqual(savedConfig)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.connectSshHost).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.pairWithDiscoveredDevice).not.toHaveBeenCalled()
+    expect(nativeDeviceApi.remoteTaskChannel).not.toHaveBeenCalledWith('start')
+    expect(nativeDeviceApi.remoteMediaChannel).not.toHaveBeenCalledWith('start')
+  })
+
+  it('手动搜索及刷新同步已配对名称，已有搜索选择不阻止后续自动更新', async () => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const name = () => wrapper!.get('.remote-channel-status .remote-device-title strong').text()
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '搜索后的服务端' },
+    ] })
+    await wrapper.get('.remote-pairing-card header button').trigger('click')
+    await flushPromises()
+    expect(name()).toBe('搜索后的服务端')
+    expect(wrapper.get<HTMLSelectElement>('.remote-pairing-card select').element.value).toBe(foundHost.host_id)
+
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '再次重命名' },
+    ] })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(name()).toBe('再次重命名')
+    expect(wrapper.get('.remote-pairing-card select option').text()).toContain('再次重命名')
+
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '刷新后的服务端' },
+    ] })
+    await wrapper.get('.remote-channel-status header button').trigger('click')
+    await flushPromises()
+    expect(name()).toBe('刷新后的服务端')
+  })
+
+  it.each([false, true])('发现失败时保留名称，目标切换后的迟到结果失效（切回原目标：%s）', async returnToOriginal => {
+    vi.useFakeTimers()
+    prepareRemoteHost()
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, display_name: '最新服务端名称' },
+    ] })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    const name = () => wrapper!.get('.remote-channel-status .remote-device-title strong').text()
+    expect(name()).toBe('最新服务端名称')
+    vi.mocked(nativeDeviceApi.searchDevices).mockRejectedValue(new Error('多播暂不可用'))
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(name()).toBe('最新服务端名称')
+    vi.mocked(nativeDeviceApi.searchDevices).mockResolvedValue({ protocol_version: 1, fields: {}, devices: [
+      { ...foundHost, host_id: 'another-host', display_name: '其他服务端' },
+    ] })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(name()).toBe('最新服务端名称')
+
+    let finishDiscovery!: (result: Awaited<ReturnType<typeof nativeDeviceApi.searchDevices>>) => void
+    vi.mocked(nativeDeviceApi.searchDevices).mockImplementationOnce(() => new Promise(resolve => { finishDiscovery = resolve }))
+    await vi.advanceTimersByTimeAsync(10000)
+    const originalStatus = structuredClone(currentStatus)
+    currentStatus = structuredClone(currentStatus)
+    currentStatus.device_config!.paired_host!.host_id = 'new-paired-host'
+    currentStatus.device_config!.paired_host!.display_name = '新配对服务端'
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(name()).toBe('新配对服务端')
+    if (returnToOriginal) {
+      currentStatus = originalStatus
+      await vi.advanceTimersByTimeAsync(1500)
+    }
+    finishDiscovery({ protocol_version: 1, fields: {}, devices: [{ ...foundHost, display_name: '迟到的旧服务端名称' }] })
+    await flushPromises()
+    expect(name()).toBe(returnToOriginal ? foundHost.display_name : '新配对服务端')
+  })
+
+  it('客户端重命名后服务端刷新入站名称，并保留同一连接与登记', async () => {
+    vi.useFakeTimers()
+    currentStatus = makeConfig('local', true)
+    const recordToken = 'f'.repeat(64) // recordToken（同一客户端的可信登记代次）。
+    vi.mocked(nativeDeviceApi.inboundStatus).mockResolvedValue({ host_id: 'device-a', discovery_available: true, fields: {}, devices: [
+      { device_id: 'client-a', display_name: '原客户端名称', online: true, connected: true, record_token: recordToken },
+    ] })
+    wrapper = mount(DeviceSettings)
+    await flushPromises()
+    expect(wrapper.get('.inbound-clients-card .remote-device-title strong').text()).toBe('原客户端名称')
+    vi.mocked(nativeDeviceApi.inboundStatus).mockResolvedValue({ host_id: 'device-a', discovery_available: true, fields: {}, devices: [
+      { device_id: 'client-a', display_name: '客厅终端', online: true, connected: true, record_token: recordToken },
+    ] })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(wrapper.get('.inbound-clients-card .remote-device-title strong').text()).toBe('客厅终端')
+    expect(wrapper.get('.inbound-clients-card .connection-state').text()).toBe('已连接')
+    expect(wrapper.find('[aria-label="断开 客厅终端"]').exists()).toBe(true)
+    expect(nativeDeviceApi.saveDeviceConfig).not.toHaveBeenCalled()
+  })
+
   it('入站客户端按实际连接、局域网发现和持久登记显示三态，不再显示语音设备标记', async () => {
     vi.useFakeTimers()
     currentStatus = makeConfig('local', true)
