@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { formatBytes } from '../../interface/format-bytes'
 import { computed, ref, watch } from 'vue'
 import UiDialog from '../../interface/UiDialog.vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import type { LocalDownloadItem } from '../../interface/local-components'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
-const deletingModel = computed(() => /^tts-aniflive-(?!runtime$)/.test(props.controller.pendingResetPlan.value?.resource_id ?? '')) // deletingModel（登记模型删除确认）。
+const deletingModel = computed(() => /^tts-aniflive-(?!(?:runtime|converter)$)/.test(props.controller.pendingResetPlan.value?.resource_id ?? '')) // deletingModel（登记模型删除确认）。
 const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'paraformer-offline', 'yamnet', 'fsmn-vad', 'streaming-punctuation', 'campplus-zh-cn-common', 'smart-turn', 'emotion2vec-plus-base'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
@@ -77,9 +78,9 @@ function confirmBundle() {
   </UiDialog>
   <UiDialog v-if="controller.pendingDownloadPlan.value" open class="install-plan-dialog" title-id="install-plan-title" :title="`${updatePending ? '准备更新' : '准备下载'} ${controller.pendingDownloadPlan.value.title}`" @close="controller.pendingDownloadPlan.value = null">
       <p v-if="controller.pendingDownloadPlan.value.download_sources?.length">下载来源：{{ controller.pendingDownloadPlan.value.download_sources.join('、') }}。优先使用镜像，不可用时尝试原站；所有文件按固定大小和摘要校验。</p>
-      <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
+      <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ formatBytes(controller.pendingDownloadPlan.value.model_bytes) }}。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
-      <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
+      <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ formatBytes(shared.download_bytes) }}。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
       <p v-if="controller.pendingDownloadPlan.value.resource_id.startsWith('tts-aniflive-')">此任务下载固定来源的权重、参考录音与隔离运行依赖，并在本机生成推理引擎。构建阶段会暂停当前语音服务；通过数值与真实合成验证后才登记模型，不会改变播放目标。</p>
       <p v-if="!controller.pendingDownloadPlan.value.environment && !controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
       <template v-if="controller.pendingDownloadPlan.value.environment">
@@ -88,9 +89,9 @@ function confirmBundle() {
           {{ lightweightVadPlan ? '轻量语音检测所需运行依赖已就绪，将检查并复用本地依赖。' : voiceServerUpdatePending ? '语音运行环境依赖已就绪，将按当前随包版本重新检查并复用本地依赖。' : '现用完整运行环境已就绪，将检测并复用已安装依赖。' }}
         </p>
         <template v-else>
-          <p v-if="lightweightVadPlan">本次将补齐轻量语音检测所需运行依赖。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ (controller.pendingDownloadPlan.value.environment.total_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。</p>
-          <p v-else-if="voiceServerUpdatePending">本次将更新语音运行环境，并核对全部语音依赖的随包版本。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ (controller.pendingDownloadPlan.value.environment.total_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。</p>
-          <p v-else>一次检测并配置 Python（后端解释器）3.12.10 和全部语音依赖。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ (controller.pendingDownloadPlan.value.environment.total_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。</p>
+          <p v-if="lightweightVadPlan">本次将补齐轻量语音检测所需运行依赖。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ formatBytes(controller.pendingDownloadPlan.value.environment.total_bytes) }}。</p>
+          <p v-else-if="voiceServerUpdatePending">本次将更新语音运行环境，并核对全部语音依赖的随包版本。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ formatBytes(controller.pendingDownloadPlan.value.environment.total_bytes) }}。</p>
+          <p v-else>一次检测并配置 Python（后端解释器）3.12.10 和全部语音依赖。优先复用符合条件的本地依赖，只下载缺失内容，最多 {{ formatBytes(controller.pendingDownloadPlan.value.environment.total_bytes) }}。</p>
           <details>
             <summary>{{ controller.pendingDownloadPlan.value.environment.wheels.length }} 个运行依赖</summary>
             <p v-for="wheel in controller.pendingDownloadPlan.value.environment.wheels" :key="wheel.name">{{ wheel.name }}（依赖包） {{ wheel.version }}</p>
@@ -117,19 +118,19 @@ function confirmBundle() {
           <span v-if="entry.note">{{ entry.note }}</span>
           <template v-if="planFor(entry)">
             <span v-if="entry.forcePlan && entry.state === 'installed' && !entry.updateAvailable">本地模型已就绪，此计划用于补齐缺失的共享运行程序。</span>
-            <span v-else-if="planFor(entry)?.model_bytes">组件文件最多 {{ ((planFor(entry)?.model_bytes ?? 0) / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）</span>
+            <span v-else-if="planFor(entry)?.model_bytes">组件文件最多 {{ formatBytes((planFor(entry)?.model_bytes ?? 0)) }}</span>
             <span v-else>配置语音运行环境</span>
             <span v-if="planFor(entry)?.download_sources?.length">下载来源：{{ planFor(entry)?.download_sources?.join('、') }}；镜像不可用时尝试原站。</span>
-            <span v-for="shared in planFor(entry)?.shared_resources ?? []" :key="shared.resource_id">共用资源：{{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）</span>
+            <span v-for="shared in planFor(entry)?.shared_resources ?? []" :key="shared.resource_id">共用资源：{{ shared.title }}，最多 {{ formatBytes(shared.download_bytes) }}</span>
           </template>
           <span v-if="entry.id && entry.busy">当前下载或修复任务会继续运行。</span>
         </li>
       </ul>
-      <p v-for="shared in bundleSharedResources" :key="shared.resource_id">共用资源复用：{{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。</p>
+      <p v-for="shared in bundleSharedResources" :key="shared.resource_id">共用资源复用：{{ shared.title }}，最多 {{ formatBytes(shared.download_bytes) }}。</p>
       <template v-if="bundleEnvironment">
         <p v-if="bundleEnvironment.already_ready">现有完整语音运行环境已就绪，将先核对并复用。</p>
         <template v-else>
-          <p>本次会检查并准备共享语音环境，最多 {{ (bundleEnvironment.total_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）；符合条件的已安装依赖会复用。</p>
+          <p>本次会检查并准备共享语音环境，最多 {{ formatBytes(bundleEnvironment.total_bytes) }}；符合条件的已安装依赖会复用。</p>
           <details>
             <summary>{{ bundleEnvironment.wheels.length }} 个运行依赖</summary>
             <p v-for="wheel in bundleEnvironment.wheels" :key="wheel.name">{{ wheel.name }}（依赖包） {{ wheel.version }}</p>

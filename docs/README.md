@@ -98,6 +98,7 @@
 
 ### 专项验收与历史记录
 
+- [本机空间管理、正常卸载与依赖分层验收（2026-11-22）](testing/workspace-storage-20261122.md)
 - [系统脚本执行与编码边界修复（2026-11-22）](testing/system-shell-hardening-20261122.md)
 - [SSH（安全远程连接）默认解释器桥接修复与本机验证（2026-11-22）](testing/ssh-bridge-shell-20261122.md)
 - [项目文档梳理与发行对照（2026-11-22）](testing/documentation-review-20261122.md)

@@ -1029,7 +1029,20 @@ impl ResourceManager {
         resource_id: String,
         token: String,
     ) -> Result<Value, String> {
-        let plan = voice_desktop_common::component_reset::plan(&self.context, &resource_id)?;
+        let uninstall = voice_desktop_common::component_reset::pending(&self.context)?.is_some_and(|value|value["uninstall"] == true && value["resource_id"] == resource_id);
+        self.remove_resource(resource_id, token, uninstall)
+    }
+    pub(crate) fn uninstall_resource(self: &Arc<Self>, resource_id: String, token: String) -> Result<Value, String> {
+        if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {
+            let plan = voice_desktop_common::component_reset::uninstall_plan(&self.context, &resource_id)?;
+            if plan["token"] != token { return Err("卸载范围已变化，请重新扫描。".into()); }
+            return self.configure_runtime_child("remove-gpu".into(), None);
+        }
+        self.remove_resource(resource_id, token, true)
+    }
+    fn remove_resource(self: &Arc<Self>, resource_id: String, token: String, uninstall: bool) -> Result<Value, String> {
+        let plan = if uninstall { voice_desktop_common::component_reset::uninstall_plan(&self.context, &resource_id)? }
+            else { voice_desktop_common::component_reset::plan(&self.context, &resource_id)? };
         if plan["token"] != token
             && voice_desktop_common::component_reset::pending(&self.context)?.is_none()
         {
@@ -1043,13 +1056,15 @@ impl ResourceManager {
                 return Err("请等待当前组件任务完成。".into());
             }
         }
-        let job_id = format!("reset-{resource_id}");
-        let result=self.start_job(job_id.clone(),resource_id.clone(),"准备重置组件".into(),false,move|manager,id|{
+        let job_id = if uninstall { format!("reset-uninstall-{resource_id}") } else { format!("reset-{resource_id}") };
+        let result=self.start_job(job_id.clone(),resource_id.clone(),if uninstall {"准备卸载组件"} else {"准备重置组件"}.into(),false,move|manager,id|{
             let result=(||{
                 let mut lease=manager.pause_service()?;
                 manager.remember_service_was_running(lease.was_running())?;
                 lease.keep_stopped();
-                let removed=voice_desktop_common::component_reset::execute(&manager.context,&resource_id,&token,&mut|phase,done,total|manager.set_phase(&id,phase,false,done,if total==0{None}else{Some(total)}))?;
+                let mut progress=|phase: &str,done,total|manager.set_phase(&id,phase,false,done,if total==0{None}else{Some(total)});
+                let removed=if uninstall { voice_desktop_common::component_reset::uninstall(&manager.context,&resource_id,&token,&mut progress)? }
+                    else { voice_desktop_common::component_reset::execute(&manager.context,&resource_id,&token,&mut progress)? };
                 if let Ok(mut failures)=manager.validation_failures.lock(){for resource in &removed{failures.remove(resource);}}
                 let old=manager.snapshots();for job in old{if job["job_id"]!=id&&removed.iter().any(|r|job["resource_id"]==*r){if let Some(key)=job["job_id"].as_str(){manager.update_job(key,|row|row.recovery=Some(json!({"event":"reset","state":"resolved","next_action":"none","message":"组件已重置，等待下载或导入。"})));}}}
                 if removed.len()==1{manager.maybe_resume_service(&mut lease)?;}
@@ -1563,6 +1578,15 @@ impl ResourceManager {
             .unwrap_or(true)
     }
 
+    pub(crate) fn cleanup_local_storage(&self, token: &str, entries: &[String]) -> Result<Value, String> {
+        self.with_idle_cleanup(|| {
+            let mut lease = self.pause_service()?;
+            self.remember_service_was_running(lease.was_running())?;
+            let result = voice_desktop_common::workspace_cleanup::run_selected(&self.context, env!("CARGO_PKG_VERSION"), Some(token), true, Some(entries));
+            self.maybe_resume_service(&mut lease)?;
+            result
+        })
+    }
     pub(crate) fn with_idle_cleanup<T>(
         &self,
         operation: impl FnOnce() -> Result<T, String>,
@@ -2561,7 +2585,7 @@ impl ResourceManager {
                 installed: installed.clone(),
             },
         )?;
-        if item["preparation"] == "aniflive_runtime" {
+        if item["preparation"] == "aniflive_runtime" || item["preparation"] == "aniflive_converter" {
             let _shared = acquire_environment_lock(&self.tts_runtime, &cancel, &mut progress)
                 .map_err(|message| JobError::Failed {
                     message,
@@ -2572,7 +2596,7 @@ impl ResourceManager {
                 self.context.install.clone().into_os_string(),
                 OsString::from("--program"),
                 self.context.program.clone().into_os_string(),
-                OsString::from("--prepare-runtime"),
+                OsString::from(if item["preparation"] == "aniflive_runtime" {"--prepare-inference"} else {"--prepare-conversion"}),
                 OsString::from("--native-ack"),
             ];
             installed.extend(self.run_aniflive_task(job_id, &args, cancel)?);
@@ -3492,6 +3516,9 @@ impl ResourceManager {
     where
         F: FnOnce(Arc<ResourceManager>, String) -> Result<Vec<String>, JobError> + Send + 'static,
     {
+        if self.context.install.join("tmp/storage-model-cleanup.json").exists() {
+            return Err("请先在清理页面完成上次模型维护。".into());
+        }
         if !job_id.starts_with("reset-")
             && voice_desktop_common::component_reset::pending(&self.context)?.is_some()
         {
@@ -3659,7 +3686,9 @@ impl ResourceManager {
         let (state, phase, error, installed) = match result {
             Ok(installed) => (
                 "complete",
-                if job_id.starts_with("reset-") {
+                if job_id.starts_with("reset-uninstall-") {
+                    "卸载完成，用户资料已保留"
+                } else if job_id.starts_with("reset-") {
                     "重置完成，等待下载或导入"
                 } else {
                     "资源处理完成"
@@ -4317,6 +4346,8 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
     });
     value["operation"] = json!(if is_system_feature_job(&snapshot.job_id) {
         "system_feature"
+    } else if snapshot.job_id.starts_with("reset-uninstall-") || snapshot.job_id.starts_with("history-reset-uninstall-") {
+        "uninstall"
     } else if snapshot.job_id.starts_with("reset-") || snapshot.job_id.starts_with("history-reset-")
     {
         "reset"

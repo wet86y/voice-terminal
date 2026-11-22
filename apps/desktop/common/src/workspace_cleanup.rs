@@ -12,7 +12,7 @@ use std::{
 const WEEK: Duration = Duration::from_secs(7 * 24 * 3600); // WEEK（失败下载续传保留时间）。
 const DAY: Duration = Duration::from_secs(24 * 3600); // DAY（近期写入保护时间）。
 const GIB: u64 = 1024 * 1024 * 1024; // GIB（二进制吉字节）。
-const RETIRED_DOWNLOADS: &[&str] = &["tts-voxcpm1", "tts-voxcpm2", "tts-audiocpp-runtime"];
+const RETIRED_DOWNLOADS: &[&str] = &["tts-voxcpm1", "tts-voxcpm2", "tts-audiocpp-runtime", "sensevoice-small", "wespeaker-cnceleb-resnet34"];
 
 struct Entry {
     relative: String,     // relative（工作区相对路径）。
@@ -153,7 +153,8 @@ fn limit(mut group: Vec<Entry>, budget: u64, candidates: &mut Vec<Entry>) {
     }
 }
 
-fn component_guard(root: &Path) -> Result<[fs::File; 2], String> {
+/// component_file_guards（跨进程组件维护锁）：清理和正常卸载共用后端任务的文件锁区间。
+pub(crate) fn component_file_guards(root: &Path) -> Result<[fs::File; 2], String> {
     let lock = |relative: &str| {
         let guard = fs::OpenOptions::new()
             .read(true)
@@ -168,15 +169,19 @@ fn component_guard(root: &Path) -> Result<[fs::File; 2], String> {
             .map_err(|_| "组件正在准备、构建或提交，请等待任务结束。")?;
         Ok::<_, String>(guard)
     };
-    let guards = [
+    Ok([
         lock("tmp/aniflive-task.lock")?,
         lock("tmp/resource-distribution.lock")?,
-    ];
+    ])
+}
+fn component_guard(root: &Path) -> Result<[fs::File; 2], String> {
+    let guards = component_file_guards(root)?;
     for relative in [
         "tmp/update-transaction.json",
         "tmp/native-install.json",
         "tmp/resource-transaction.json",
         "runtimes/aniflive-tts/dependency-transaction.json",
+        "runtimes/aniflive-tts/layout-transaction.json",
     ] {
         match fs::symlink_metadata(workspace::safe_path(root, relative)?) {
             Ok(_) => return Err("工作区有未收尾的安装事务，请完成或修复后再清理。".into()),
@@ -214,7 +219,7 @@ fn duplicate_update(root: &Path, version: &str) -> Result<Option<Entry>, String>
     )
 }
 
-fn scan(context: &LaunchContext, version: &str, manual: bool) -> (Vec<Entry>, Vec<String>) {
+fn scan(context: &LaunchContext, version: &str, manual: bool, extended: bool) -> (Vec<Entry>, Vec<String>) {
     let root = &context.install;
     let mut entries = vec![];
     let mut skipped = vec![];
@@ -246,9 +251,12 @@ fn scan(context: &LaunchContext, version: &str, manual: bool) -> (Vec<Entry>, Ve
                 &mut entries,
                 &mut skipped,
             );
+        } else if extended {
+            skipped.push(format!("{relative}：未登记的下载目录，保留原件。"));
         }
     }
     if manual {
+        if extended { collect(root, "cache/cuda", "可重新生成的显卡编译缓存", &mut entries, &mut skipped); }
         entries.append(&mut retry);
     } else {
         limit(retry, 8 * GIB, &mut entries);
@@ -358,6 +366,18 @@ fn scan(context: &LaunchContext, version: &str, manual: bool) -> (Vec<Entry>, Ve
         }
     }
     for name in children(root, "tmp/process", &mut skipped) {
+        if manual && extended {
+            if let Some(pid) = name.strip_prefix("voice-initialization-installer-").and_then(|suffix|suffix.parse::<u32>().ok()) {
+                match workspace::process_identity(pid) {
+                    Ok(None) => {
+                        let mut legacy = vec![];
+                        collect(root, &format!("tmp/process/{name}"), "已退出安装器的历史网页缓存", &mut legacy, &mut skipped);
+                        entries.extend(legacy.into_iter().filter(|entry| age(entry) >= WEEK));
+                    }
+                    _ => skipped.push(format!("tmp/process/{name}：进程仍存在或无法确认，保留现场。")),
+                }
+            }
+        }
         let generated = name
             .strip_prefix("worker-")
             .and_then(|name| name.rsplit_once('.'));
@@ -412,7 +432,7 @@ fn scan(context: &LaunchContext, version: &str, manual: bool) -> (Vec<Entry>, Ve
                     legacy_receipts += 1;
                 }
             }
-            if !signed.is_empty() {
+            if !signed.is_empty() && !extended {
                 skipped.push(format!(
                     "{} 个已登记的本地语音模型版本含旧导出暂存，暂存已计入模型完整性清单。",
                     signed.len()
@@ -420,6 +440,41 @@ fn scan(context: &LaunchContext, version: &str, manual: bool) -> (Vec<Entry>, Ve
             }
             if legacy_receipts > 0 {
                 skipped.push(format!("{legacy_receipts} 份旧模型通用安装收据仍在模型总清单中，需要按模型完整性流程处理。"));
+            }
+        }
+    }
+    if manual && extended && !root.join("tmp/storage-model-cleanup.json").exists() {
+        for relative in ["models/analysis/sensevoice", "models/audiocpp/runtime"] {
+            let id = if relative.ends_with("sensevoice") {"sensevoice-small"} else {"tts-audiocpp-runtime"};
+            if declared.is_some_and(|rows| !rows.iter().any(|row|row["resource_id"] == id)) {
+                collect(root, relative, "受管模型维护清理", &mut entries, &mut skipped);
+            }
+        }
+        if let Ok(manifest) = resources::load(&root.join("models/manifest.json")) {
+            let mut stages = std::collections::BTreeSet::new();
+            for row in manifest["files"].as_array().into_iter().flatten() {
+                if let Some(path) = row["path"].as_str() {
+                    let parts = path.split('/').collect::<Vec<_>>();
+                    if parts.len() >= 6 && parts[0] == "aniflive-tts" && parts[1] == "packages" && parts[4].starts_with(".export-stages-") {
+                        stages.insert(format!("models/{}",parts[..5].join("/")));
+                    }
+                }
+            }
+            for stage in stages { collect(root, &stage, "受管模型维护清理", &mut entries, &mut skipped); }
+        }
+    }
+    if manual && extended {
+        collect(root, "tmp/storage-model-cleanup.json", "受管模型维护清理", &mut entries, &mut skipped);
+        if let Some(entry) = entries.iter_mut().find(|row|row.relative == "tmp/storage-model-cleanup.json") {
+            entry.size = 0; // 恢复入口展示尚未删除的暂存容量，不把事务元数据算作回收收益。
+            match measure(root,"tmp/storage-model-cleanup-old","待收尾模型暂存") {
+                Ok(Some(backup)) => {
+                    let mut identity = Sha256::new(); identity.update(entry.identity); identity.update(backup.identity);
+                    entry.identity = identity.finalize().into();
+                    if resources::load(&root.join(&entry.relative)).is_ok_and(|v|v["state"] == "committed") { entry.size = backup.size; }
+                },
+                Ok(None) => {},
+                Err(error) => skipped.push(format!("模型维护收尾暂存：{error}")),
             }
         }
     }
@@ -495,17 +550,111 @@ fn collect_legacy_dictionaries(root: &Path, entries: &mut Vec<Entry>, skipped: &
     }
 }
 
+/// storage_protected（固定保护区占用）：只读展示，不产生可删除编号。
+pub fn storage_protected(c: &LaunchContext) -> Value {
+    let mut rows = [("data","用户资料","配置、会话、音色、录音和导入资料保持保留。"),
+        ("backups","滚动备份","备份不参与垃圾清理及组件卸载。"),
+        ("cache/aniflive-tts/inputs","模型原始输入","保留用于重装和重新转换的原始权重与输入。"),
+        ("models/aniflive-tts/shared","本地语音共享资源","保留现用模型共用的文本、语言与音频资源。")]
+        .into_iter().map(|(path,label,reason)| json!({"path":path,"label":label,"reason":reason,
+            "bytes":measure(&c.install,path,"受保护内容").ok().flatten().map(|r|r.size),
+            "fields":{"path":"受保护路径","label":"用途","reason":"保留原因","bytes":"估算逻辑字节数，无法读取时为空"}})).collect::<Vec<_>>();
+    if let Ok(specs) = resources::specs(c) {
+        for spec in specs.into_iter().filter(|row| row["required"] == true) {
+            if let Ok(path) = resources::destination(c, &spec) {
+                if let Ok(relative) = path.strip_prefix(&c.install) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    rows.push(json!({"path":relative,"label":spec["title"],"reason":"必需组件，保留供基础功能使用。",
+                        "bytes":measure(&c.install,&relative,"必需组件").ok().flatten().map(|r|r.size)}));
+                }
+            }
+        }
+    }
+    let python = measure(&c.install,"runtimes/python","必需语音环境").ok().flatten().map(|r|r.size);
+    let gpu = crate::runtime::status(c).ok().is_some_and(|value| value["components"].as_array().into_iter().flatten().any(|r|r["resource_id"] == crate::runtime::GPU_RESOURCE && r["files_installed"] == true));
+    let optional = if gpu {measure(&c.install,"runtimes/python/Lib/site-packages/torch","单列显卡依赖").ok().flatten().map(|r|r.size).unwrap_or(0)} else {0};
+    rows.push(json!({"path":"runtimes/python","label":"必需语音环境","reason":"保留基础语音依赖，占用已扣除单列的可选显卡依赖。","bytes":python.map(|bytes|bytes.saturating_sub(optional))}));
+    json!(rows)
+}
+
+/// storage_components（本机可选组件及容量）：归属由正式资源目录产生。
+pub fn storage_components(c: &LaunchContext, garbage: &Value) -> Result<Value, String> {
+    let mut rows = vec![];
+    for item in resources::specs(c)? {
+        if item["required"] != false { continue; }
+        let id = item["resource_id"].as_str().ok_or("组件编号缺失")?;
+        let path = resources::destination(c, &item)?;
+        let relative = path.strip_prefix(&c.install).map_err(|_|"组件路径越界")?.to_string_lossy().replace('\\', "/");
+        let measured = measure(&c.install, &relative, "可选组件");
+        let mut bytes = measured.as_ref().ok().and_then(|v|v.as_ref()).map(|v|v.size).unwrap_or(0);
+        let conversion_libraries = measure(&c.install, "runtimes/aniflive-tts/conversion-libs", "转换动态库").ok().flatten().map(|r| r.size).unwrap_or(0);
+        if id == "tts-aniflive-converter" { bytes = bytes.saturating_add(conversion_libraries); }
+        if id == "tts-aniflive-runtime" {
+            let conversion = measure(&c.install, "runtimes/aniflive-tts/export-packages", "转换依赖").ok().flatten().map(|r|r.size).unwrap_or(0);
+            bytes = bytes.saturating_sub(conversion).saturating_sub(conversion_libraries);
+        }
+        // 旧布局尚未显式迁移时，构建器仍在推理目录；盘点按其正式文件收据预归属到转换层。
+        if matches!(id, "tts-aniflive-runtime" | "tts-aniflive-converter") {
+            let receipt_path = workspace::safe_path(&c.install,"runtimes/aniflive-tts/packages/aniflive-packages.json")?;
+            if let Ok(receipt) = resources::load(&receipt_path) {
+                let mut legacy = 0u64;
+                for row in receipt["files"].as_array().into_iter().flatten() {
+                    let Some(name) = row["path"].as_str().and_then(|p|p.strip_prefix("tensorrt_libs/")) else {continue};
+                    if !name.contains('/') && name.starts_with("nvinfer_builder_resource_") && name.ends_with("_11.dll") {
+                        legacy = legacy.saturating_add(measure(&c.install,&format!("runtimes/aniflive-tts/packages/tensorrt_libs/{name}"),"旧布局转换动态库").ok().flatten().map(|r|r.size).unwrap_or(0));
+                    }
+                }
+                if id == "tts-aniflive-runtime" { bytes = bytes.saturating_sub(legacy); }
+                else { bytes = bytes.saturating_add(legacy); }
+            }
+        }
+        for row in garbage.as_array().into_iter().flatten() {
+            if row["path"].as_str().is_some_and(|path| path == relative || path.starts_with(&(relative.clone()+"/"))) {
+                bytes = bytes.saturating_sub(row["bytes"].as_u64().unwrap_or(0));
+            }
+        }
+        let error = measured.as_ref().err().cloned();
+        let plan = crate::component_reset::uninstall_plan(c, id);
+        let (label,purpose,impact) = if id == "tts-aniflive-runtime" {
+            (json!("本地 TTS（语音合成）推理框架"), "执行已有模型的语音合成。", "同时卸载转换框架，保留已转换模型和用户资料。")
+        } else if id == "tts-aniflive-converter" {
+            (item["title"].clone(), "导入和转换模型，构建推理引擎。", "保留推理框架和已有模型；下次导入时重新配置。")
+        } else if item["preparation"] == "aniflive_local_build" {
+            (item["title"].clone(), "已转换的本地语音模型。", "移除该模型全部转换版本，保留编号、别名、音色和原始资料。")
+        } else { (item["title"].clone(), "可选增强能力。", "移除组件文件；重新启用时需要安装。") };
+        rows.push(json!({"resource_id":id,"label":label,"purpose":purpose,"impact":impact,"bytes":bytes,"installed":path.exists(),
+            "blocked_reason":error.or_else(||plan.err()),"fields":{"resource_id":"组件编号","label":"组件名称","bytes":"估算逻辑字节数","installed":"文件已安装","blocked_reason":"卸载阻止原因"}}));
+    }
+    let gpu = crate::runtime::status(c)?;
+    let installed = gpu["components"].as_array().into_iter().flatten().any(|r| r["resource_id"] == crate::runtime::GPU_RESOURCE && r["files_installed"] == true);
+    let bytes = measure(&c.install, "runtimes/python/Lib/site-packages/torch", "显卡张量依赖").ok().flatten().map(|r|r.size).unwrap_or(0);
+    rows.push(json!({"resource_id":crate::runtime::GPU_RESOURCE,"label":"GPU（图形处理器）运行依赖","purpose":"使用显卡加速语音识别。","impact":"通过增量任务切换到处理器依赖，保留基础语音环境。","installed":installed,"bytes":if installed {bytes}else{0},
+        "blocked_reason":crate::component_reset::uninstall_check(c, crate::runtime::GPU_RESOURCE).err()}));
+    Ok(json!(rows))
+}
+
 pub fn run(
     context: &LaunchContext,
     version: &str,
     confirmation: Option<&str>,
     manual: bool,
 ) -> Result<Value, String> {
+    run_impl(context, version, confirmation, manual, None, false)
+}
+
+/// run_selected（按用户勾选的受管条目回收）；空选择不会回收任何内容。
+pub fn run_selected(
+    context: &LaunchContext, version: &str, confirmation: Option<&str>, manual: bool,
+    selected: Option<&[String]>, // selected（仅接受本轮盘点中已有的相对路径编号）。
+) -> Result<Value, String> {
+    run_impl(context, version, confirmation, manual, selected, true)
+}
+fn run_impl(context: &LaunchContext, version: &str, confirmation: Option<&str>, manual: bool, selected: Option<&[String]>, extended: bool) -> Result<Value,String> {
     let _guard = component_guard(&context.install)?;
     if crate::component_reset::pending(context)?.is_some() {
         return Err("工作区有未收尾的组件重置，请完成后再清理。".into());
     }
-    let (entries, mut skipped) = scan(context, version, manual);
+    let (entries, mut skipped) = scan(context, version, manual, extended);
     let mut hash = Sha256::new();
     hash.update(context.install.to_string_lossy().as_bytes());
     let mut total = 0u64;
@@ -513,20 +662,61 @@ pub fn run(
         hash.update(entry.identity);
         total = total.saturating_add(entry.size);
     }
-    let token = format!("{:x}", hash.finalize());
+    let token = if extended {
+        let identities = entries.iter().map(|entry| (entry.relative.clone(), entry.identity.iter().map(|b| format!("{b:02x}")).collect::<String>())).collect::<std::collections::BTreeMap<_,_>>();
+        json!({"root":context.install.to_string_lossy(),"identities":identities}).to_string()
+    } else { format!("{:x}", hash.finalize()) };
     let mut removed_bytes = 0u64;
     let mut removed_count = 0;
     if !manual || confirmation.is_some() {
-        if manual && confirmation != Some(token.as_str()) {
-            return Err("工作区文件在检查后发生变化，请重新检查。".into());
+        let approved = if extended {
+            let value: Value = serde_json::from_str(confirmation.filter(|text|text.len() <= 1024*1024).ok_or("缺少有效盘点确认值")?).map_err(|_|"盘点确认值无效")?;
+            if value["root"].as_str() != Some(context.install.to_string_lossy().as_ref()) || !value["identities"].is_object() {
+                return Err("盘点不属于本机工作区，请重新扫描。".into());
+            }
+            Some(value)
+        } else {
+            if manual && confirmation != Some(token.as_str()) { return Err("工作区文件在检查后发生变化，请重新检查。".into()); }
+            None
+        };
+        if let Some(selected) = selected {
+            if selected.iter().any(|path| approved.as_ref().map_or_else(
+                || !entries.iter().any(|entry| entry.relative == *path),
+                |value| value["identities"].get(path).is_none())) {
+                return Err("所选项目不属于本轮盘点，请重新扫描。".into());
+            }
+            for path in selected.iter().filter(|path| !entries.iter().any(|entry| entry.relative == **path)) {
+                skipped.push(format!("{path}：内容已变化、已移除或不再符合回收条件，已跳过。"));
+            }
         }
         for entry in &entries {
-            match remove_entry(&context.install, entry) {
-                Ok(()) => {
-                    removed_bytes = removed_bytes.saturating_add(entry.size);
-                    removed_count += 1;
+            if selected.is_some_and(|paths| !paths.contains(&entry.relative)) { continue; }
+            if let Some(approved) = &approved {
+                let identity = entry.identity.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                if approved["identities"][&entry.relative] != identity {
+                    skipped.push(format!("{}：文件已变化，请重新扫描后再选中。", entry.relative));
+                    continue;
                 }
-                Err(error) => skipped.push(format!("{}：{error}", entry.relative)),
+            }
+            let removal = if entry.reason == "受管模型维护清理" {
+                crate::runtime::worker(context, &context.python, "storage-model-cleanup", &[
+                    "--target".into(), context.install.to_string_lossy().into_owned(),
+                    "--program".into(), context.installed_program().to_string_lossy().into_owned(),
+                    "--model".into(), entry.relative.clone()
+                ], &std::sync::atomic::AtomicBool::new(false)).map(|value| (value["removed_bytes"].as_u64().unwrap_or(0), value["error"].as_str().map(str::to_owned)))
+            } else { remove_entry(&context.install, entry).map(|_| (entry.size, None)) };
+            match removal {
+                Ok((bytes, error)) => {
+                    removed_bytes = removed_bytes.saturating_add(bytes);
+                    if let Some(error) = error { skipped.push(format!("{}：{error}", entry.relative)); }
+                    else { removed_count += 1; }
+                }
+                Err(error) => {
+                    if let Ok(Some(remaining)) = measure(&context.install, &entry.relative, entry.reason) {
+                        removed_bytes = removed_bytes.saturating_add(entry.size.saturating_sub(remaining.size));
+                    }
+                    skipped.push(format!("{}：{error}", entry.relative));
+                },
             }
         }
     }
@@ -573,6 +763,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn selected_cleanup_keeps_unselected_and_rejects_foreign_paths() {
+        let fixture = Fixture::new();
+        fixture.write("tmp/resource-downloads/model-a/keep.bin", b"keep");
+        fixture.write("tmp/resource-downloads/sensevoice-small/old.bin", b"old");
+        let context = fixture.context();
+        let plan = run_selected(&context, "1.0.0", None, true, None).unwrap();
+        fixture.write("tmp/resource-downloads/model-a/keep.bin", b"unselected changed");
+        assert!(run_selected(&context,"1.0.0",plan["token"].as_str(),true,Some(&["data/user".into()])).is_err());
+        let selected = vec!["tmp/resource-downloads/sensevoice-small".to_owned()];
+        let result = run_selected(&context,"1.0.0",plan["token"].as_str(),true,Some(&selected)).unwrap();
+        assert_eq!(result["removed_bytes"],3);
+        assert!(fixture.0.join("tmp/resource-downloads/model-a/keep.bin").exists());
+        assert!(!fixture.0.join(&selected[0]).exists());
     }
 
     #[test]

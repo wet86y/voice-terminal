@@ -511,7 +511,7 @@ def check(names, lock=None, compatible_gpu=False, tensor_device=None):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','delta-plan','install','prune','check','gpu','tts-selection','inference-selection','compatibility-repair'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['storage-model-cleanup','aniflive-layout','interpreter','reuse','inventory','delta-plan','install','prune','check','gpu','tts-selection','inference-selection','compatibility-repair'])
     parser.add_argument('--reset-devices', action='store_true') # reset_devices（重建环境后回退计算设备）。
     parser.add_argument('--repair-local',action='store_true') # repair_local（只重建内容损坏的已登记依赖）。
     parser.add_argument('--data') # data（当前工作区数据目录）。
@@ -526,7 +526,17 @@ def main():
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from voice_terminal.tensor_runtime import activate_tensor_runtime
         activate_tensor_runtime(args.tensor_device or ('cuda' if args.gpu_lock or args.operation == 'gpu' or args.compatible_gpu else 'cpu'))
-    if args.operation=='compatibility-repair':
+    if args.operation=='storage-model-cleanup':
+        sys.path.insert(0,args.program)
+        from voice_terminal.storage_cleanup import execute
+        result=execute(Path(args.target),args.model)
+    elif args.operation=='aniflive-layout':
+        sys.path.insert(0,args.program)
+        from voice_terminal.tts.aniflive_layout import split
+        # 此操作由原生维护入口持有两个跨进程组件锁，子进程不得重复获取同一锁。
+        split(Path(args.target))
+        result={'ready':True}
+    elif args.operation=='compatibility-repair':
         sys.path.insert(0,args.program)
         from voice_terminal.compatibility import repair
         result=repair(Path(args.program),Path(args.data),reset_devices=args.reset_devices)

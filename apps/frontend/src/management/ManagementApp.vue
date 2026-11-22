@@ -327,7 +327,7 @@ function exportLogs() {
           <LocalComponents :model="model" @refresh="refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
         </template>
         <DeviceSettings v-else-if="section === 'devices'" />
-        <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
+        <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" @open-settings="section = $event" />
         <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>
       </article>
     </SettingsFrame>

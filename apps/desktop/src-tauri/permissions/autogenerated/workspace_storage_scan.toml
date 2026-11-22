@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-storage-scan"
+description = "Enables the workspace_storage_scan command without any pre-configured scope."
+commands.allow = ["workspace_storage_scan"]
+
+[[permission]]
+identifier = "deny-workspace-storage-scan"
+description = "Denies the workspace_storage_scan command without any pre-configured scope."
+commands.deny = ["workspace_storage_scan"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-storage-cleanup"
+description = "Enables the workspace_storage_cleanup command without any pre-configured scope."
+commands.allow = ["workspace_storage_cleanup"]
+
+[[permission]]
+identifier = "deny-workspace-storage-cleanup"
+description = "Denies the workspace_storage_cleanup command without any pre-configured scope."
+commands.deny = ["workspace_storage_cleanup"]

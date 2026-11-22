@@ -540,7 +540,7 @@ async function cancel(draft: VoiceDraft) {
                 </button>
               </div>
               <p v-else class="instruction-hint" role="status">模型默认参考音频暂不可用，请在下方选择另一条已就绪参考音频。</p>
-              <small class="reference-hint">支持 3–10 秒清晰单声道参考录音，保留原采样率，最大 20 MiB（二进制兆字节）。</small>
+              <small class="reference-hint">支持 3–10 秒清晰单声道参考录音，保留原采样率，最大 20 MB。</small>
             </div>
           </template>
           <p v-else class="instruction-hint" role="status">当前没有模型默认参考音频。请在下方选择一段已就绪参考音频，设为默认后会显示在这里。</p>

@@ -40,6 +40,9 @@ fn ids(id: &str) -> Vec<String> {
     }
 }
 fn targets(c: &LaunchContext, id: &str) -> Result<Vec<String>, String> {
+    if id == "tts-aniflive-converter" {
+        return Ok(vec!["runtimes/aniflive-tts/export-packages".into(), "runtimes/aniflive-tts/conversion-libs".into()]);
+    }
     if id == "tts-aniflive-runtime" {
         // 隔离依赖目录与模型、输入缓存、音色资料分开重置。
         resources::spec(c, id)?;
@@ -250,17 +253,57 @@ fn delete_model_voices(c: &LaunchContext, model: &str) -> Result<(), String> {
     Ok(())
 }
 pub fn plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
+    let uninstall = pending(c)?.is_some_and(|v| v["uninstall"] == true && v["resource_id"] == id);
+    plan_mode(c, id, uninstall)
+}
+/// uninstall_plan（正常卸载）：保留用户资料，必需组件禁止卸载。
+pub fn uninstall_plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
+    if c.install.join("tmp/storage-model-cleanup.json").exists() { return Err("请先在清理页面完成上次模型维护。".into()); }
+    if id == crate::runtime::GPU_RESOURCE {
+        let settings = gpu_uninstall_settings(c)?;
+        let environment = crate::runtime::plan(c, "remove-gpu")?;
+        let record = resources::load(&c.install.join("runtimes/python/runtime.json"))?;
+        let token = format!("{:x}", Sha256::digest(json!([c.workspace_id,settings,record,environment]).to_string().as_bytes()));
+        return Ok(json!({"resource_id":id,"resource_ids":[id],"token":token,"paths":["runtimes/python/Lib/site-packages"],"environment":environment,
+            "message":"将通过增量事务恢复处理器依赖并移除显卡依赖；基础语音环境和用户资料保留。缺失的处理器包通过正式组件任务补齐。",
+            "fields":{"resource_id":"组件编号","resource_ids":"卸载组件","token":"范围确认值","paths":"增量维护目录，不会整体删除","environment":"处理器依赖准备计划","message":"卸载影响"}}));
+    }
+    plan_mode(c, id, true)
+}
+fn gpu_uninstall_settings(c: &LaunchContext) -> Result<Value,String> {
+    let settings = resources::load(&safe_path(&c.data,"config/product-settings.json")?)?;
+    fn gpu(v: &Value) -> bool { match v { Value::String(s) => s == "cuda" || s == "auto", Value::Object(o) => o.values().any(gpu), Value::Array(a) => a.iter().any(gpu), _ => false } }
+    if gpu(&settings["compute"]) { return Err("请先将本机计算设备及回退设备全部切换到 CPU（中央处理器）。".into()); }
+    Ok(settings)
+}
+/// uninstall_check（只读卸载准入）：空间盘点不启动解释器探测或下载准备。
+pub fn uninstall_check(c: &LaunchContext, id: &str) -> Result<(),String> {
+    if id == crate::runtime::GPU_RESOURCE { gpu_uninstall_settings(c).map(|_|()) }
+    else { uninstall_plan(c,id).map(|_|()) }
+}
+fn plan_mode(c: &LaunchContext, id: &str, uninstall: bool) -> Result<Value, String> {
+    if uninstall {
+        let item = resources::spec(c, id)?;
+        if item["required"] != false { return Err("必需组件不能卸载。".into()); }
+        let settings = resources::load(&safe_path(&c.data, "config/product-settings.json")?)?;
+        let enabled = resources::audio_enhancements(&c.data, None)?;
+        let flag = match id { "paraformer-offline" => "dual_pass", "emotion2vec-plus-base" => "emotion", "yamnet" => "acoustic_events", _ => "" };
+        if enabled[flag] == true { return Err("请先在组件设置中停用对应增强功能。".into()); }
+        if id == "tts-aniflive-runtime" && settings["tts"]["backend"] == "aniflive" {
+            return Err("请先在语音与音色设置中切换播放目标。".into());
+        }
+    }
     let v = load(c)?;
     let model = id
         .strip_prefix("tts-aniflive-")
-        .filter(|model| *model != "runtime");
+        .filter(|model| !matches!(*model, "runtime" | "converter"));
     let registry = if model.is_some() {
         resources::load(&safe_path(&c.data, "config/aniflive-models.json")?)?
     } else {
         Value::Null
     };
     let registered = model.is_some_and(|model| registry["models"][model].is_object());
-    let (voice_index, assets) = if registered {
+    let (voice_index, assets) = if registered && !uninstall {
         voice_removal(c, model.unwrap())?
     } else {
         (Value::Null, vec![])
@@ -281,7 +324,7 @@ pub fn plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
             return Err("该模型是当前播放目标，请先在音色设置中切换播放目标后再删除。".into());
         }
     }
-    if !registered && !v["faults"][id].is_string() {
+    if !uninstall && !registered && !v["faults"][id].is_string() {
         return Err("当前组件没有待重置的维护异常。".into());
     }
     let paths = targets(c, id)?;
@@ -306,14 +349,19 @@ pub fn plan(c: &LaunchContext, id: &str) -> Result<Value, String> {
                 transaction,
                 registry,
                 voice_index,
-                v["faults"][id]
+                v["faults"][id], uninstall
             ])
             .to_string()
             .as_bytes()
         )
     );
     let mut result = json!({"resource_id":id,"resource_ids":ids(id),"paths":paths,"token":token,"reason":v["faults"][id],"message":if ids(id).len()>1{"将删除整个 CPU（中央处理器）和 GPU（图形处理器）共享环境及下载缓存；模型与用户资料保留。"}else{"将删除此组件及对应下载缓存；其他组件和用户资料保留。"},"fields":{"resource_id":"请求的组件编号","resource_ids":"实际重置的组件组","paths":"工作区内受管删除目录","token":"本次范围确认身份","reason":"维护异常原因","message":"删除影响中文说明"}});
-    if registered {
+    if uninstall && id == "tts-aniflive-runtime" {
+        result["message"] = json!("将同时卸载本地语音推理框架和转换框架；已转换模型、音色、录音及原始资料保留。");
+    }
+    result["uninstall"] = json!(uninstall);
+    result["fields"]["uninstall"] = json!("正常卸载并保留用户资料");
+    if registered && !uninstall {
         result["voice_paths"] = json!(voice_paths);
         result["message"] = json!(
             "将删除此模型全部版本、该模型的音色包和独占参考录音；其他模型仍在引用的共享录音保留。"
@@ -327,16 +375,24 @@ pub fn pending(c: &LaunchContext) -> Result<Option<Value>, String> {
     let v = load(c)?;
     Ok(v["pending"].is_object().then(|| v["pending"].clone()))
 }
+pub fn uninstall(c: &LaunchContext, id: &str, token: &str, progress: &mut resources::Progress) -> Result<Vec<String>, String> {
+    execute_mode(c, id, token, progress, true)
+}
 pub fn execute(
     c: &LaunchContext,
     id: &str,
     token: &str,
     progress: &mut resources::Progress,
 ) -> Result<Vec<String>, String> {
-    let fresh = plan(c, id)?;
+    let uninstall = pending(c)?.is_some_and(|v| v["uninstall"] == true && v["resource_id"] == id);
+    execute_mode(c, id, token, progress, uninstall)
+}
+fn execute_mode(c: &LaunchContext, id: &str, token: &str, progress: &mut resources::Progress, uninstall: bool) -> Result<Vec<String>, String> {
+    let _guards = crate::workspace_cleanup::component_file_guards(&c.install)?;
+    let fresh = plan_mode(c, id, uninstall)?;
     let existing = pending(c)?;
     if existing.is_none() && fresh["token"] != token {
-        return Err("组件范围已经变化，请重新确认重置。".into());
+        return Err("组件维护范围已经变化，请重新确认。".into());
     }
     if let Some(p) = &existing {
         if p["paths"] != fresh["paths"] {
@@ -384,10 +440,24 @@ pub fn execute(
         v["enforcement"] = json!({"phase":"settings_pending","reset_devices":true,"reason":"用户重置共享运行环境，重新安装后完成设备设置维护。"});
         atomic_json(&state, &v)?;
     }
+    if uninstall && id == "tts-aniflive-converter" {
+        crate::runtime::worker(c, &c.python, "aniflive-layout", &[
+            "--target".into(), c.install.to_string_lossy().into_owned(),
+            "--program".into(), c.installed_program().to_string_lossy().into_owned()
+        ], &std::sync::atomic::AtomicBool::new(false))?;
+    }
     for relative in fresh["paths"].as_array().unwrap() {
         let relative = relative.as_str().unwrap();
-        progress(&format!("正在重置：{relative}（受管路径）"), 0, 0);
+        progress(&format!("正在{}：{relative}（受管路径）", if uninstall {"卸载"} else {"重置"}), 0, 0);
         remove_owned(&safe_path(&c.install, relative)?, &c.install)?;
+    }
+    if uninstall && id == "tts-aniflive-converter" {
+        let p = safe_path(&c.install, "runtimes/aniflive-tts/packages/aniflive-packages.json")?;
+        if p.is_file() {
+            let mut receipt = resources::load(&p)?;
+            receipt["conversion_installed"] = json!(false);
+            atomic_json(&p, &receipt)?;
+        }
     }
     progress("更新组件登记", 0, 0);
     let removed = ids(id);
@@ -404,7 +474,7 @@ pub fn execute(
         rows.retain(|r| r["kind"] != kind);
     }
     atomic_json(&release_path, &release)?;
-    if kind.is_empty() && id != "tts-aniflive-runtime" {
+    if kind.is_empty() && !matches!(id, "tts-aniflive-runtime" | "tts-aniflive-converter") {
         let item = resources::spec(c, id)?;
         let prefix = format!("{}/", item["destination"].as_str().ok_or("模型目录缺失")?);
         let p = c.install.join("models/manifest.json");
@@ -463,15 +533,16 @@ pub fn execute(
     }
     if let Some(model) = id
         .strip_prefix("tts-aniflive-")
-        .filter(|model| *model != "runtime")
+        .filter(|model| !matches!(*model, "runtime" | "converter"))
     {
-        delete_model_voices(c, model)?;
+        if !uninstall { delete_model_voices(c, model)?; }
         let p = safe_path(&c.data, "config/aniflive-models.json")?;
         let mut registry = resources::load(&p)?;
-        registry["models"]
-            .as_object_mut()
-            .ok_or("模型登记格式无效")?
-            .remove(model);
+        if uninstall {
+            registry["models"][model]["installation_state"] = json!("uninstalled");
+        } else {
+            registry["models"].as_object_mut().ok_or("模型登记格式无效")?.remove(model);
+        }
         atomic_json(&p, &registry)?;
     }
     if id == "dsh" {
@@ -685,6 +756,33 @@ mod reset_scenarios {
             .any(|row| row["preparation"] == "aniflive_local_build"));
         remove_owned(&root, root.parent().unwrap()).unwrap();
     }
+    #[test]
+    fn normal_model_uninstall_preserves_alias_voice_and_original_recording() {
+        let (root, c) = setup();
+        let catalog = c.installed_program().join("config/resources/catalog.json");
+        let mut value = resources::load(&catalog).unwrap();
+        value["resources"].as_array_mut().unwrap().push(json!({"resource_id":"tts-aniflive-template","required":false,"model_id":"template","kind":"model","preparation":"aniflive_local_build","destination":"aniflive-tts/packages/template","files":[]}));
+        atomic_json(&catalog,&value).unwrap();
+        atomic_json(&c.data.join("config/aniflive-models.json"),&json!({"schema":1,"models":{"mine":{"name":"我的别名","versions":{},"current_revision":"test"}}})).unwrap();
+        atomic_json(&c.data.join("config/product-settings.json"),&json!({"tts":{"backend":"minimax","local_model":"mine"}})).unwrap();
+        put(&root,"models/aniflive-tts/packages/mine/test/engine.bin");
+        put(&root,"data/tts/aniflive/voices/assets/original.source");
+        put(&root,"data/tts/aniflive/voices/index.json");
+        let approved = uninstall_plan(&c,"tts-aniflive-mine").unwrap();
+        let guard = crate::workspace_cleanup::component_file_guards(&root).unwrap();
+        assert!(uninstall(&c,"tts-aniflive-mine",approved["token"].as_str().unwrap(),&mut|_,_,_|{}).unwrap_err().contains("组件正在"));
+        assert!(root.join("models/aniflive-tts/packages/mine/test/engine.bin").is_file());
+        drop(guard);
+        uninstall(&c,"tts-aniflive-mine",approved["token"].as_str().unwrap(),&mut|_,_,_|{}).unwrap();
+        assert!(!root.join("models/aniflive-tts/packages/mine").exists());
+        assert_eq!(fs::read(root.join("data/tts/aniflive/voices/assets/original.source")).unwrap(),b"keep");
+        assert_eq!(fs::read(root.join("data/tts/aniflive/voices/index.json")).unwrap(),b"keep");
+        let registry=resources::load(&c.data.join("config/aniflive-models.json")).unwrap();
+        assert_eq!(registry["models"]["mine"]["name"],"我的别名");
+        assert_eq!(registry["models"]["mine"]["installation_state"],"uninstalled");
+        remove_owned(&root,root.parent().unwrap()).unwrap();
+    }
+
     fn setup() -> (std::path::PathBuf, LaunchContext) {
         let (root, c) = super::tests::fixture();
         fs::create_dir_all(root.join("app/config/resources")).unwrap();

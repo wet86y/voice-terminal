@@ -616,7 +616,7 @@ fn worker_result(
 pub fn plan(context: &LaunchContext, group: &str) -> Result<Value, String> {
     let existing = resources::load(&context.install.join("runtimes/python/runtime.json"))
         .unwrap_or(Value::Null);
-    let gpu = gpu_requested(group) || managed_gpu(&existing);
+    let gpu = group != "remove-gpu" && (gpu_requested(group) || managed_gpu(&existing));
     let lock = effective_lock(context, gpu)?;
     let names = requested(&lock, "all")?;
     let state = status(context)?;
@@ -910,7 +910,7 @@ pub fn configure_with_activation(
 ) -> Result<Vec<String>, String> {
     if !matches!(
         group,
-        "all" | "base" | "cpu" | CPU_RESOURCE | "gpu" | GPU_RESOURCE
+        "all" | "base" | "cpu" | CPU_RESOURCE | "gpu" | GPU_RESOURCE | "remove-gpu"
     ) && !ENVIRONMENT_GROUPS.contains(&group)
     {
         return Err("未知的语音运行依赖卡片".into());
@@ -927,7 +927,7 @@ pub fn repair_with_activation(
 ) -> Result<Vec<String>, String> {
     if !matches!(
         group,
-        "all" | "base" | "cpu" | CPU_RESOURCE | "gpu" | GPU_RESOURCE
+        "all" | "base" | "cpu" | CPU_RESOURCE | "gpu" | GPU_RESOURCE | "remove-gpu"
     ) && !ENVIRONMENT_GROUPS.contains(&group)
     {
         return Err("未知的语音运行依赖卡片".into());
@@ -990,10 +990,10 @@ fn configure_inner_reported(
     let old = safe_path(&context.install, "runtimes/python")?;
     safe_path(&old, "python.exe")?;
     let existing = resources::load(&safe_path(&old, "runtime.json")?).unwrap_or(Value::Null);
-    let gpu = gpu_requested(group) || managed_gpu(&existing);
+    let gpu = group != "remove-gpu" && (gpu_requested(group) || managed_gpu(&existing));
     let lock = effective_lock(context, gpu)?;
     let requested = requested(&lock, "all")?;
-    let compatible_gpu = allow_reuse
+    let compatible_gpu = group != "remove-gpu" && allow_reuse
         && (existing["compatible_gpu"] == true
             || (existing["schema"] == 1 && existing["profile"] == "cu128"));
     if allow_reuse && context.python.is_file() {
@@ -1006,7 +1006,7 @@ fn configure_inner_reported(
             return Err("现用运行依赖需要完整性校验确定修复范围；原环境和故障记录保持不变，不自动扫描整个环境。".into());
         }
         resources::check_cancel(&cancel)?;
-        if current_for_upgrade(context)?
+        if group != "remove-gpu" && current_for_upgrade(context)?
             && (!gpu_requested(group) || gpu_current(context, &existing))
         {
             progress("复用已登记语音环境", 1, 1);
@@ -1015,7 +1015,7 @@ fn configure_inner_reported(
         }
         // 普通更新只规划变化包；旧登记无效或变更文件异常直接报错，不能转成整环境重装。
         let compatible_gpu =
-            compatible_gpu || allow_reuse && registered_gpu_environment(context, &old);
+            compatible_gpu || group != "remove-gpu" && allow_reuse && registered_gpu_environment(context, &old);
         return update::configure(
             context,
             &existing,

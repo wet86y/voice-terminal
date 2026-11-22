@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--root', type=Path, default=default_root, help='root（受管安装根目录；自动识别源码和已安装布局）')
     parser.add_argument('--program', type=Path, default=PROGRAM, help='program（本体程序目录）')
     parser.add_argument('--prepare-runtime', action='store_true', help='prepare-runtime（准备固定源码与隔离依赖）')
+    parser.add_argument('--prepare-inference', action='store_true', help='prepare-inference（仅配置推理框架）')
+    parser.add_argument('--prepare-conversion', action='store_true', help='prepare-conversion（配置转换框架及必要推理依赖）')
     parser.add_argument('--preset', help='preset（准备预设模型输入）')
     parser.add_argument('--registered-model', help='registered-model（从受管原始输入修复已登记导入模型）')
     parser.add_argument('--convert', action='store_true', help='convert（执行完整转换、验证与登记）')
@@ -31,16 +33,17 @@ def main():
         with task_guard(args.root):
             task = AnifLiveInstallTask(args.program, args.root)
             task.native_ack = args.native_ack
-            if args.prepare_runtime:
+            preparing = args.prepare_runtime or args.prepare_inference or args.prepare_conversion
+            if preparing:
                 task.prepare_source()
-                task.prepare_dependencies()
+                task.prepare_dependencies(inference_only=args.prepare_inference and not args.prepare_runtime and not args.prepare_conversion)
             inputs = task.prepare_inputs(args.preset) if args.preset else None
             if args.registered_model:
                 inputs = task.registered_inputs(args.registered_model)
             name = None
             if args.input_spec:
                 inputs, name = task.import_inputs(args.input_spec)
-            result = {'runtime_ready': args.prepare_runtime, 'inputs': str(inputs) if inputs else None}
+            result = {'runtime_ready': preparing, 'inputs': str(inputs) if inputs else None}
             if args.convert:
                 if inputs is None:
                     raise ValueError('转换任务缺少预设或兼容权重输入。')

@@ -51,7 +51,7 @@ def configure(local: Path, program: Path, role: str, *, scratch: Path | None = N
     """configure（配置子进程）：必须在加载任何计算依赖前调用。"""
     if any(name in sys.modules for name in ("torch", "transformers", "tokenizers", "huggingface_hub", "tensorrt")):
         raise RuntimeError("计算依赖已加载，不能在当前进程切换 AnifLive 依赖角色。")
-    if (local / 'runtimes/aniflive-tts/dependency-transaction.json').exists():
+    if any((local / ('runtimes/aniflive-tts/' + name)).exists() for name in ('dependency-transaction.json', 'layout-transaction.json')):
         raise RuntimeError('隔离运行依赖存在未完成组件事务，请在组件列表中修复后再加载模型。')
     directories = package_paths(local, role)
     versions = validate_versions(directories, role)
@@ -74,6 +74,10 @@ def configure(local: Path, program: Path, role: str, *, scratch: Path | None = N
     sys.path[:] = [str(p) for p in [*directories, program, root / "src", source,
                                   source / "GPT_SoVITS", *stdlib]]
     if os.name == 'nt':
+        conversion = contained(local, local / 'runtimes/aniflive-tts/conversion-libs')
+        if role == 'export' and conversion.is_dir():
+            _DLL_HANDLES.append(os.add_dll_directory(str(conversion)))
+            os.environ['PATH'] = str(conversion) + os.pathsep + os.environ.get('PATH', '')
         for directory in directories:
             native = contained(local, directory / 'lib/site-packages/MeCab')
             if native.is_dir():

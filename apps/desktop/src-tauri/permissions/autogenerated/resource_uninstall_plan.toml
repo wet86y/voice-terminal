@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-uninstall-plan"
+description = "Enables the resource_uninstall_plan command without any pre-configured scope."
+commands.allow = ["resource_uninstall_plan"]
+
+[[permission]]
+identifier = "deny-resource-uninstall-plan"
+description = "Denies the resource_uninstall_plan command without any pre-configured scope."
+commands.deny = ["resource_uninstall_plan"]

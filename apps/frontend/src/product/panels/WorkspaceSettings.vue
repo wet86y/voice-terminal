@@ -1,20 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { formatBytes } from '../../interface/format-bytes'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import ManagedResourceProgress from '../../interface/ManagedResourceProgress.vue'
+import type { ManagedResourceJob } from '../../interface/local-components'
 import UiDialog from '../../interface/UiDialog.vue'
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
 import AppUpdateCard from '../../interface/AppUpdateCard.vue'
 import WorkspaceLocationCard from '../../interface/WorkspaceLocationCard.vue'
 import { desktopPort, type DesktopPort, type DesktopWorkspacePort, type WorkspaceCleanup } from '../desktop-port'
+import type { DesktopSettingsSection } from '../../interface/settings'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 
-const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
+const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources>; storagePort?: DesktopPort & DesktopWorkspacePort }>()
+const emit = defineEmits<{ 'open-settings': [section: DesktopSettingsSection] }>()
 const candidateRoot = ref('')
 const pickerBusy = ref(false)
 const migrationConfirm = ref(false)
 const cleanupPlan = ref<WorkspaceCleanup | null>(null)
 const cleanupResult = ref<WorkspaceCleanup | null>(null)
 const cleanupBusy = ref(false)
+const cleanupExecuting = ref(false) // cleanupExecuting（所选垃圾正在执行回收）。
+const storageOpen = ref(false) // storageOpen（本机空间管理展开状态）。
+const selectedEntries = ref<string[]>([]) // selectedEntries（用户明确勾选的垃圾条目）。
+const storageError = ref('') // storageError（本机维护错误）。
+const uninstallPlan = ref<Awaited<ReturnType<DesktopWorkspacePort['uninstallPlan']>> | null>(null)
+const uninstallProgress = ref<ManagedResourceJob | null>(null) // uninstallProgress（正式本机卸载任务的进度投影）。
+const uninstallJob = ref<string | null>(null) // uninstallJob（等待完成的本机卸载任务）。
+
 const canManage = computed(() => props.controller.canManage.value)
+const installedComponents = computed(() => (cleanupPlan.value?.components ?? []).filter(item => item.installed)) // installedComponents（仅展示本机已安装的可选组件）。
 const workspace = computed(() => props.controller.workspace.value)
 const activeJob = computed(() => props.controller.activeWorkspaceJob.value)
 const latestJob = computed(() => props.controller.latestWorkspaceJob.value)
@@ -28,7 +42,8 @@ const progress = computed(() => {
 })
 const controlsBusy = computed(() => pickerBusy.value || cleanupBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
 const updateStatus = computed(() => props.controller.appUpdate.value)
-const debugPort = desktopPort() as DesktopPort & DesktopWorkspacePort
+const debugPort = props.storagePort ?? desktopPort() as DesktopPort & DesktopWorkspacePort
+const localRoot = ref('') // localRoot（客户端本机工作区，与远端服务分离）。
 const debugAccess = ref<boolean | null>(null)
 const debugSaving = ref(false)
 const debugError = ref('')
@@ -37,6 +52,7 @@ onMounted(async () => {
   if (!debugPort.available) return
   try {
     const info = await debugPort.workspaceInfo()
+    localRoot.value = info.root
     debugAccess.value = info.allow_external_debug ?? null
   } catch (error) {
     debugError.value = error instanceof Error ? error.message : '无法读取外部调试设置。'
@@ -81,20 +97,64 @@ async function confirmMigration() {
 }
 
 async function scanCleanup() {
-  if (controlsBusy.value || !canManage.value) return
+  if (cleanupBusy.value) return
   cleanupBusy.value = true
-  cleanupResult.value = null
-  try { cleanupPlan.value = await props.controller.cleanupWorkspace() }
+  storageError.value = ''
+  selectedEntries.value = []
+  uninstallPlan.value = null
+  try { cleanupPlan.value = await debugPort.storageScan() }
+  catch (error) { storageError.value = String(error) }
   finally { cleanupBusy.value = false }
 }
-
+async function toggleStorage() {
+  storageOpen.value = !storageOpen.value
+  if (storageOpen.value) await scanCleanup()
+}
 async function confirmCleanup() {
-  if (controlsBusy.value || !cleanupPlan.value?.entries.length) return
-  const { token } = cleanupPlan.value
+  if (cleanupBusy.value || !cleanupPlan.value || !selectedEntries.value.length) return
   cleanupBusy.value = true
-  cleanupPlan.value = null
-  try { cleanupResult.value = await props.controller.cleanupWorkspace(token) }
-  finally { cleanupBusy.value = false }
+  storageError.value = ''
+  let failure = ''
+  cleanupExecuting.value = true
+  try { cleanupResult.value = await debugPort.storageCleanup(cleanupPlan.value.token, selectedEntries.value) }
+  catch (error) { failure = String(error) }
+  finally { cleanupBusy.value = false; cleanupExecuting.value = false }
+  await scanCleanup()
+  if (failure) storageError.value = failure
+}
+async function previewUninstall(id: string) {
+  storageError.value = ''
+  try { uninstallPlan.value = await debugPort.uninstallPlan(id) }
+  catch (error) { storageError.value = String(error) }
+}
+let storagePoll: ReturnType<typeof setTimeout> | undefined
+let disposed = false
+onBeforeUnmount(() => { disposed = true; clearTimeout(storagePoll) })
+async function confirmUninstall() {
+  const plan = uninstallPlan.value
+  if (!plan || cleanupBusy.value || uninstallJob.value) return
+  uninstallPlan.value = null
+  try {
+    uninstallJob.value = (await debugPort.uninstallResource(plan.resource_id, plan.token)).job_id
+    const poll = async () => {
+      try {
+        const { job } = await debugPort.uninstallJobStatus(plan.resource_id, uninstallJob.value!)
+        if (disposed) return
+        if (job) uninstallProgress.value = { id:job.job_id, resourceId:job.resource_id, label:'组件卸载', state:job.state,
+          phase:['complete','completed'].includes(job.state) ? '卸载完成，用户资料已保留。' : job.phase, canCancel:false,
+          completedBytes:job.completed_bytes, totalBytes:job.total_bytes, error:job.error || undefined }
+        if (job && ['complete','completed','failed','cancelled'].includes(job.state)) {
+          const failure = job.error || ''
+          uninstallJob.value = null
+          await scanCleanup()
+          if (failure) storageError.value = failure
+          return
+        }
+        storagePoll = setTimeout(poll, 1000)
+      } catch (error) { storageError.value = String(error); uninstallJob.value = null }
+    }
+    await poll()
+  } catch (error) { storageError.value = String(error); uninstallJob.value = null }
 }
 
 function cancelJob() {
@@ -103,13 +163,8 @@ function cancelJob() {
   if (job) void props.controller.cancelJob(job.job_id)
 }
 
-function formatBytes(value: number | null | undefined) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB（吉字节）`
-  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB（兆字节）`
-  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB（千字节）`
-  return `${Math.round(value)} B（字节）`
-}
+
+
 </script>
 
 <template>
@@ -119,9 +174,47 @@ function formatBytes(value: number | null | undefined) {
     <AppUpdateCard :status="updateStatus" :integrity="controller.integrity.value" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @download-integrity="controller.downloadIntegrity()" @check-integrity="controller.checkIntegrity()" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" @repository="controller.openProjectRepository()" />
 
     <div v-if="controller.loading.value && !workspace" class="workspace-empty" role="status">正在读取工作区信息…</div>
-    <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
+    <p v-if="controller.workspaceError.value && !controller.remoteMode?.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
 
-    <WorkspaceLocationCard v-if="workspace" :root="workspace.root" :can-manage="canManage" :disabled="controlsBusy" :choosing="pickerBusy" :cleaning="cleanupBusy" @cleanup="scanCleanup" @migrate="chooseTarget" />
+    <WorkspaceLocationCard v-if="localRoot || workspace" :root="localRoot || workspace?.root || ''" :can-manage="canManage" :can-cleanup="Boolean(localRoot)" :expanded="storageOpen" :disabled="controlsBusy" :choosing="pickerBusy" :cleaning="cleanupBusy" @cleanup="toggleStorage" @migrate="chooseTarget" />
+    <section v-if="storageOpen" id="local-storage-panel" class="workspace-job-card settings-stack" aria-label="本机空间管理" :aria-busy="cleanupBusy">
+      <div class="workspace-job-heading"><strong>本机空间管理</strong><button type="button" class="outline-button" :disabled="cleanupBusy || Boolean(uninstallJob)" @click="scanCleanup">重新扫描</button></div>
+      <p>本机 · {{ cleanupPlan?.root || localRoot }}</p>
+      <details v-if="cleanupPlan?.protected?.length"><summary>保留内容占用</summary><p v-for="item in cleanupPlan.protected" :key="item.path">{{ item.label }} · {{ formatBytes(item.bytes) }}<br />{{ item.reason }}</p></details>
+      <p v-if="cleanupBusy" role="status">{{ cleanupExecuting ? '正在清理所选项目…' : '正在扫描本机工作区…' }}</p>
+      <p v-if="storageError" role="alert">{{ storageError }}</p>
+      <ManagedResourceProgress v-if="uninstallProgress" :job="uninstallProgress" label="组件卸载" />
+      <p v-else-if="uninstallJob" role="status">正在卸载组件，请等待任务完成…</p>
+      <template v-if="cleanupPlan">
+        <h3>垃圾清理</h3><p>占用为估算逻辑容量，仅清理勾选项目。</p>
+        <p v-if="!cleanupPlan.entries.length">当前未发现可清理的工作区文件。</p>
+        <label v-for="entry in cleanupPlan.entries" :key="entry.path" class="storage-entry">
+          <input v-model="selectedEntries" type="checkbox" :value="entry.path" :disabled="cleanupBusy || Boolean(uninstallJob)" :aria-label="`清理 ${entry.path}`" />
+          <span><strong>{{ entry.reason }} · {{ formatBytes(entry.bytes) }}</strong><br />{{ entry.path }}</span>
+        </label>
+        <button class="save-button workspace-confirm-button" type="button" :disabled="!selectedEntries.length || cleanupBusy || Boolean(uninstallJob)" @click="confirmCleanup">清理所选</button>
+        <details v-if="cleanupPlan.skipped.length"><summary>保留及跳过原因</summary><ul><li v-for="message in cleanupPlan.skipped" :key="message">{{ message }}</li></ul></details>
+        <h3>组件卸载</h3><p>用户音色、录音与原始资料保留；使用中的组件请先在设置中停用。</p>
+        <p v-if="!installedComponents.length" role="status">本机暂无已安装的可选组件。</p>
+        <div v-for="item in installedComponents" :key="item.resource_id" class="storage-component">
+          <strong>{{ item.label }}</strong><p>{{ formatBytes(item.bytes) }}</p>
+          <p v-if="item.purpose">{{ item.purpose }}</p><p v-if="item.impact">{{ item.impact }}</p>
+          <p v-if="item.blocked_reason">{{ item.blocked_reason }}</p>
+          <button v-if="item.blocked_reason" type="button" class="text-action" @click="emit('open-settings', controller.remoteMode?.value ? 'devices' : item.resource_id.startsWith('tts-aniflive-') ? 'tts' : 'compute')">{{ controller.remoteMode?.value ? '切换本机运行模式' : '前往相关设置' }}</button>
+          <button class="outline-button" type="button" :disabled="Boolean(item.blocked_reason) || cleanupBusy || Boolean(uninstallJob)" @click="previewUninstall(item.resource_id)">卸载</button>
+          <div v-if="uninstallPlan?.resource_id === item.resource_id" role="group" aria-label="确认本机组件卸载">
+            <p>{{ uninstallPlan.message }}</p><ul><li v-for="path in uninstallPlan.paths" :key="path">{{ path }}</li></ul>
+            <details v-if="uninstallPlan.environment"><summary>处理器依赖准备 · 最多 {{ formatBytes(uninstallPlan.environment.total_bytes) }}</summary>
+              <p>优先复用本机已校验依赖，仅下载缺失内容；实际下载量会减少。</p>
+              <ul><li v-for="wheel in uninstallPlan.environment.wheels" :key="wheel.name">{{ wheel.name }} {{ wheel.version }} · {{ formatBytes(wheel.size) }}</li></ul>
+            </details>
+            <button type="button" class="outline-button" @click="uninstallPlan = null">取消</button>
+            <button type="button" class="save-button" @click="confirmUninstall">确认卸载</button>
+          </div>
+        </div>
+      </template>
+    </section>
+
     <div v-if="cleanupResult" class="workspace-job-card" role="status">
       <strong>已清理 {{ cleanupResult.removed_count }} 项，共 {{ formatBytes(cleanupResult.removed_bytes) }}</strong>
       <details v-if="cleanupResult.skipped.length"><summary>{{ cleanupResult.skipped.length }} 项已跳过</summary><ul><li v-for="message in cleanupResult.skipped" :key="message">{{ message }}</li></ul></details>
@@ -144,17 +237,6 @@ function formatBytes(value: number | null | undefined) {
       <p v-if="debugError" class="workspace-error" role="alert">{{ debugError }}</p>
     </section>
 
-    <UiDialog :open="Boolean(cleanupPlan)" title="清理工作区" @close="cleanupPlan = null">
-      <div v-if="cleanupPlan" class="workspace-confirm-copy">
-        <p v-if="cleanupPlan.entries.length">发现 {{ cleanupPlan.entries.length }} 项可清理内容，共 {{ formatBytes(cleanupPlan.total_bytes) }}。清理后的组件暂存可能需要重新下载。</p>
-        <p v-else>当前未发现可清理的工作区文件。</p>
-        <ul v-if="cleanupPlan.entries.length" class="cleanup-entries">
-          <li v-for="entry in cleanupPlan.entries" :key="entry.path"><strong>{{ entry.path }}</strong><span>{{ entry.reason }} · {{ formatBytes(entry.bytes) }}</span></li>
-        </ul>
-        <details v-if="cleanupPlan.skipped.length"><summary>{{ cleanupPlan.skipped.length }} 项已跳过</summary><ul><li v-for="message in cleanupPlan.skipped" :key="message">{{ message }}</li></ul></details>
-      </div>
-      <template #actions><button class="outline-button" type="button" @click="cleanupPlan = null">关闭</button><button v-if="cleanupPlan?.entries.length" class="save-button workspace-confirm-button" type="button" @click="confirmCleanup">清理所列项目</button></template>
-    </UiDialog>
 
     <UiDialog :open="migrationConfirm" title="迁移并清理旧工作区？" @close="migrationConfirm = false">
       <div class="workspace-confirm-copy"><p>将工作区数据从当前目录复制到所选位置。</p><dl><div><dt>当前目录</dt><dd>{{ workspace?.root }}</dd></div><div><dt>目标目录</dt><dd>{{ candidateRoot }}</dd></div></dl><p>只有复制和校验成功后才会切换，并清理旧位置。</p></div>
@@ -164,6 +246,7 @@ function formatBytes(value: number | null | undefined) {
 </template>
 
 <style scoped>
+.storage-entry{display:flex;gap:12px;align-items:flex-start;padding:12px 0;overflow-wrap:anywhere}.storage-component{padding:16px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
 .workspace-settings{display:grid;gap:18px;min-width:0}
 .workspace-job-card{min-width:0;border:1px solid var(--line);border-radius:14px;background:#ffffff02;padding:18px}
 .workspace-job-heading,.workspace-job-heading>div{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}

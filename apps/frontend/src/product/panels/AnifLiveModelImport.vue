@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatBytes } from '../../interface/format-bytes'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { productApi, type AnifLiveImportJob, type AnifLiveImportScan } from '../api'
 import { desktopPort, type DesktopPort, type DesktopWorkspacePort, type ResourceJob, type ResourceStatus } from '../desktop-port'
@@ -435,10 +436,7 @@ async function retryConversion(job: AnifLiveImportJob) {
 }
 
 function sizeLabel(size?: number | null) {
-  if (typeof size !== 'number') return '大小未知'
-  if (size >= 1024 ** 3) return `${(size / 1024 ** 3).toFixed(2)} GiB（吉二进制字节）`
-  if (size >= 1024 ** 2) return `${(size / 1024 ** 2).toFixed(1)} MiB（二进制兆字节）`
-  return `${Math.max(1, Math.ceil(size / 1024))} KiB（二进制千字节）`
+  return typeof size === 'number' ? formatBytes(size) : '大小未知'
 }
 </script>
 

@@ -25,6 +25,9 @@ export interface WorkspaceChoice {
 
 /** WorkspaceCleanup（工作区清理盘点及执行结果）。 */
 export interface WorkspaceCleanup {
+  root?: string // root（本机工作区完整路径）。
+  protected?: Array<{path: string; label: string; bytes: number | null; reason: string}> // protected（受保护内容及占用）。
+  components?: Array<{resource_id: string; label: string; bytes: number; installed: boolean; purpose?: string; impact?: string; blocked_reason?: string | null}> // components（本机可选组件）；purpose（用途）、impact（卸载影响）。
   token: string // token（与本轮盘点绑定的确认值）。
   total_bytes: number // total_bytes（候选文件逻辑字节数）。
   entries: Array<{ path: string; bytes: number; reason: string }> // entries（相对路径、字节数和回收原因）。
@@ -69,7 +72,7 @@ export interface ResourceStatus {
 
 /** ResourceJob（资源任务）：下载、导入及取消状态的桌面事件负载。 */
 export interface ResourceJob {
-  operation?: 'install' | 'reset' | 'system_feature' // operation（组件安装、用户确认的重置或独立系统功能任务）。
+  operation?: 'install' | 'reset' | 'uninstall' | 'system_feature' // operation（组件安装、用户确认的重置或独立系统功能任务）。
   first_error?: string | null // first_error（本轮首次错误）。
   failure_resource_id?: string | null // failure_resource_id（实际失败的依赖组件）。
   /** recovery（组件共用恢复结果）：普通传输／占用错误与内容一致性异常分别引导。 */
@@ -175,6 +178,11 @@ export interface DesktopWorkspacePort {
   migrateWorkspace(targetRoot: string): Promise<{ job_id: string }>
   /** workspace_cleanup（扫描可回收项，收到确认值后执行清理）。 */
   cleanupWorkspace(confirmation?: string): Promise<WorkspaceCleanup>
+  uninstallPlan(resourceId: string): Promise<{resource_id: string; token: string; message: string; paths: string[]; environment?: EnvironmentPlan}> // uninstallPlan（本机卸载预览）；environment（处理器依赖准备内容）。
+  uninstallResource(resourceId: string, token: string): Promise<{job_id: string}> // uninstallResource（执行本机卸载）。
+  uninstallJobStatus(resourceId: string, jobId: string): Promise<{job: ResourceJob}> // uninstallJobStatus（查询该组件的本机卸载进度，远程模式同样绑定本机）。
+  storageScan(): Promise<WorkspaceCleanup> // storageScan（仅盘点本机）。
+  storageCleanup(token: string, entryIds: string[]): Promise<WorkspaceCleanup> // storageCleanup（仅清理所选本机条目）。
   /** resource_inventory（资源清单）：返回固定模型与 DSH（代理执行宿主）的独立安装状态。 */
   resourceInventory(): Promise<ResourceStatus[]>
   /** resourceJobSnapshots（轻量任务快照）：定时补查进度，不执行环境扫描。 */
@@ -304,6 +312,11 @@ export function desktopPort(): DesktopPort {
     chooseWorkspace: () => call<WorkspaceChoice | null>('workspace_choose'),
     linkWorkspace: targetRoot => call<{ job_id: string }>('workspace_link', { target_root: targetRoot }),
     migrateWorkspace: targetRoot => call<{ job_id: string }>('workspace_migrate', { target_root: targetRoot }),
+    uninstallPlan: resource_id => call('resource_uninstall_plan', { resource_id }),
+    uninstallResource: (resource_id, token) => call('resource_uninstall', { resource_id, token }),
+    uninstallJobStatus: (resource_id, job_id) => call('resource_uninstall_plan', { resource_id, job_id }),
+    storageScan: () => call<WorkspaceCleanup>('workspace_storage_scan', {}),
+    storageCleanup: (token, entry_ids) => call<WorkspaceCleanup>('workspace_storage_cleanup', { token, entry_ids }),
     cleanupWorkspace: confirmation => call<WorkspaceCleanup>('workspace_cleanup', { confirmation }),
     resourceInventory: () => call<ResourceStatus[]>('resource_inventory'),
     resourceJobSnapshots: () => call<ResourceJob[]>('resource_jobs'),

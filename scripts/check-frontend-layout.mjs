@@ -128,7 +128,7 @@ try {
   for (const [scene, open, selector, count] of [
     ['resource', null, '.install-bundle-list li', 30],
     ['hotword', 'text=导入词表', null, 0],
-    ['workspace', '.workspace-cleanup-action', '.cleanup-entries li', 40],
+    ['workspace', '.workspace-cleanup-action', '.storage-entry', 40],
     ['sync', null, null, 0],
     ['image', '.capture-thumbnail', null, 0],
     ['long', null, '.dialog-body>p', 60],
@@ -137,6 +137,15 @@ try {
     if (open) await click(open)
     for (const [width, height] of [[1200, 900], [390, 600], [800, 360]]) {
       await viewport(width, height)
+      if (scene === 'workspace') {
+        assert.equal(await evaluate('Boolean(document.querySelector("dialog:modal"))'), false, '本机空间管理应在页内展开。')
+        await listGeometry(selector, count, false)
+        assert.ok(await evaluate('(()=>{const p=document.querySelector("#local-storage-panel");return p.clientWidth>0&&p.scrollWidth<=p.clientWidth+1})()'), '本机空间管理不能横向裁切。')
+        await evaluate('document.querySelector("#local-storage-panel button.workspace-confirm-button").scrollIntoView({block:"end"})')
+        await screenshot(`${scene}-${width}x${height}.png`)
+        checks.push(`本机空间管理 ${width}×${height}：40项自然展开、无弹窗、操作可达`)
+        continue
+      }
       const bounds = await dialogBounds()
       if (selector) await listGeometry(selector, count, scene !== 'long')
       if (scene === 'hotword') assert.ok(await evaluate('document.querySelector("dialog textarea").clientHeight >= 220'))

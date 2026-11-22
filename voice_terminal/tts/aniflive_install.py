@@ -167,14 +167,25 @@ class AnifLiveInstallTask:
         artifact(row, cache, local=self.local, program=self.program)
         return prepare_source(cache, self.local, allow_upgrade=True, before_activate=self.acquire_gpu)
 
-    def prepare_dependencies(self):
+    def prepare_dependencies(self, *, inference_only=False):
+        from .aniflive_layout import split, CONVERSION_PACKAGES
+        split(self.local)
+        if not inference_only and (self.runtime/'packages/aniflive-packages.json').is_file():
+            from .aniflive_layout import prepare_libraries
+            def fetch_builder():
+                row = next(row for row in self.lock['wheels'] if row['name'] == 'tensorrt-cu12-libs')
+                return artifact(row, self.local/'cache/aniflive-wheels'/row['file'], local=self.local, program=self.program)
+            prepare_libraries(self.local, fetch_builder)
+        self.lock['export'] = {**{k:v for k,v in self.lock['runtime'].items() if k in CONVERSION_PACKAGES}, **self.lock['export']}
+        self.lock['runtime'] = {k:v for k,v in self.lock['runtime'].items() if k not in CONVERSION_PACKAGES}
+        roles = [('runtime', 'packages')] if inference_only else [('runtime', 'packages'), ('export', 'export-packages')]
         unresolved = [r['name'] for r in self.lock['wheels'] if r.get('needs_build') or r.get('resolution_error')]
         if unresolved:
             raise RuntimeError('开发构建尚未准备完整的固定依赖：' + '、'.join(unresolved))
         from .aniflive_transactions import recover_dependencies
         recover_dependencies(self.runtime)
         current_by_role = {}
-        for role, folder in [('runtime', 'packages'), ('export', 'export-packages')]:
+        for role, folder in roles:
             target = contained(self.local, self.runtime / folder)
             receipt = target / 'aniflive-packages.json'
             try:
@@ -185,18 +196,29 @@ class AnifLiveInstallTask:
                 expected = {name: version for name, version in self.lock[role].items()
                             if role == 'runtime' or self.lock['runtime'].get(name) != version}
                 # 普通转换复用已登记依赖；逐文件内容检查由主动完整性校验承担。
-                valid = (current.get('schema') == 1 and current.get('role') == role
+                valid = (current.get('schema') in {1, 2} and current.get('role') == role
                          and current.get('packages') == expected and isinstance(records, list) and bool(records))
                 current_by_role[role] = valid
             except (ValueError, KeyError, TypeError, OSError):
                 current_by_role[role] = False
         if all(current_by_role.values()):
+            if not inference_only:
+                runtime_receipt = self.runtime / 'packages/aniflive-packages.json'
+                receipt = json.loads(runtime_receipt.read_text('utf-8'))
+                export_receipt = self.runtime / 'export-packages/aniflive-packages.json'
+                export = json.loads(export_receipt.read_text('utf-8'))
+                export['libraries'] = receipt.get('conversion_libraries', [])
+                export.setdefault('fields', {})['libraries'] = '转换专用动态库的原包路径、大小与摘要'
+                atomic_json(export_receipt, export)
+                receipt['conversion_installed'] = True
+                receipt.setdefault('fields', {})['conversion_installed'] = '转换框架已配置'
+                atomic_json(runtime_receipt, receipt)
             emit('复用已登记的隔离运行与导出依赖')
             self.clean_wheel_cache()
             return
         self.require_build_space()
         rows = {(r['name'], r['version']): r for r in self.lock['wheels']}
-        required = {(name, version) for role in ('runtime', 'export') if not current_by_role[role]
+        required = {(name, version) for role, _ in roles if not current_by_role[role]
                     for name, version in self.lock[role].items()
                     if role == 'runtime' or self.lock['runtime'].get(name) != version}
         cache = self.local / 'cache/aniflive-wheels'
@@ -211,7 +233,7 @@ class AnifLiveInstallTask:
         spec.loader.exec_module(worker)
         pending = []
         try:
-            for role, folder in [('runtime', 'packages'), ('export', 'export-packages')]:
+            for role, folder in roles:
                 target = contained(self.local, self.runtime / folder)
                 wanted = self.lock[role]
                 if current_by_role[role]:
@@ -250,6 +272,25 @@ class AnifLiveInstallTask:
                     stage = contained(self.runtime, self.runtime / row['stage'])
                     if stage.exists():
                         shutil.rmtree(stage)
+        export_receipt = self.runtime / 'export-packages/aniflive-packages.json'
+        created_export = inference_only and not export_receipt.exists()
+        if created_export:
+            atomic_json(export_receipt, {'schema':2, 'role':'export', 'packages':{}, 'files':[]})
+        split(self.local)
+        runtime_receipt = self.runtime / 'packages/aniflive-packages.json'
+        receipt = json.loads(runtime_receipt.read_text('utf-8'))
+        receipt['conversion_installed'] = not created_export
+        receipt.setdefault('fields', {})['conversion_installed'] = '转换框架已配置'
+        if not created_export and export_receipt.is_file():
+            export = json.loads(export_receipt.read_text('utf-8'))
+            export['libraries'] = receipt.get('conversion_libraries', [])
+            export.setdefault('fields', {})['libraries'] = '转换专用动态库的原包路径、大小与摘要'
+            atomic_json(export_receipt, export)
+        atomic_json(runtime_receipt, receipt)
+        if created_export:
+            from ..local_files import remove_tree
+            for folder in ('export-packages','conversion-libs'):
+                remove_tree(contained(self.local, self.runtime/folder), self.local)
         self.clean_wheel_cache()
 
     def clean_wheel_cache(self):

@@ -2,6 +2,8 @@
 withDefaults(defineProps<{
   /** root（当前工作区根目录）。 */ root: string
   /** canManage（是否允许迁移工作区）。 */ canManage?: boolean
+  /** canCleanup（仅允许本机清理，不授予迁移权限）。 */ canCleanup?: boolean
+  /** expanded（本机管理区域已展开）。 */ expanded?: boolean
   /** disabled（正在执行互斥操作）。 */ disabled?: boolean
   /** choosing（正在选择迁移目标）。 */ choosing?: boolean
   /** cleaning（正在扫描或清理）。 */ cleaning?: boolean
@@ -21,9 +23,9 @@ const emit = defineEmits<{
         <dl class="workspace-paths"><div><dt>工作区根目录</dt><dd :title="root">{{ root }}</dd></div></dl>
       </div>
     </div>
-    <div v-if="canManage" class="workspace-actions">
-      <button class="outline-button workspace-cleanup-action" type="button" :disabled="disabled" @click="emit('cleanup')">{{ cleaning ? '处理中…' : '清理' }}</button>
-      <button class="outline-button workspace-migrate-action" type="button" :disabled="disabled" @click="emit('migrate')">{{ choosing ? '正在选择…' : '迁移工作区' }}</button>
+    <div v-if="canManage || canCleanup" class="workspace-actions">
+      <button v-if="canManage || canCleanup" :aria-expanded="expanded || false" aria-controls="local-storage-panel" class="outline-button workspace-cleanup-action" type="button" :disabled="disabled" @click="emit('cleanup')">{{ cleaning ? '处理中…' : '清理' }}</button>
+      <button v-if="canManage" class="outline-button workspace-migrate-action" type="button" :disabled="disabled" @click="emit('migrate')">{{ choosing ? '正在选择…' : '迁移工作区' }}</button>
     </div>
   </section>
 </template>

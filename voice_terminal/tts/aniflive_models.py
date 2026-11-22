@@ -118,6 +118,8 @@ class AnifLiveModelRegistry:
 
     def resolve(self, model_id: str, revision: str | None = None, *, verify_hashes=False):
         validate_model_id(model_id)
+        if (self.local / 'tmp/storage-model-cleanup.json').exists():
+            raise ValueError('本机模型维护尚未收尾，请在清理页面继续处理。')
         entry = self.read()['models'].get(model_id)
         if not isinstance(entry, dict):
             raise ValueError('所选 AnifLive 模型尚未安装并验证。')
@@ -178,6 +180,7 @@ class AnifLiveModelRegistry:
                 raise ValueError('模型版本身份冲突，保留原登记。')
             entry['versions'][revision] = {'state': 'validated', 'identity': identity}
             entry['current_revision'] = revision
+            entry['installation_state'] = 'installed'
             # 已登记名称是用户可编辑的持久别名；新版本登记不得覆盖它。
             if not isinstance(entry.get('name'), str) or not entry['name'].strip():
                 entry['name'] = str(name)[:80]

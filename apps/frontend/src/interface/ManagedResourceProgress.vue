@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatBytes } from './format-bytes'
 import { computed } from 'vue'
 import type { ManagedResourceJob } from './local-components'
 
@@ -22,13 +23,7 @@ const percent = computed(() => props.job.progressKind && ['install', 'waiting'].
   ? undefined : typeof props.job.percentage === 'number' && Number.isFinite(props.job.percentage)
     ? Math.max(0, Math.min(100, Math.round(props.job.percentage))) : progressPercent(done.value, total.value))
 const stageLabel = computed(() => kind.value === 'download' ? '下载：' : kind.value === 'verify' ? '校验：' : '')
-function formatBytes(value: number | null | undefined) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GiB`
-  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`
-  if (value >= 1024) return `${(value / 1024).toFixed(1)} KiB`
-  return `${Math.round(value)} B`
-}
+
 </script>
 
 <template>

@@ -103,22 +103,65 @@ describe('WorkspaceSettings（关于页面）', () => {
     wrapper.unmount()
   })
 
-  it('展示可回收清单，并在确认后提交同一轮清理确认值', async () => {
-    const actions = controller({ root: 'D:\\测试工作区', data_dir: 'D:\\测试工作区\\data', version: '1.0.0', can_manage: true }, true)
-    const plan = { token: 'scan-1', total_bytes: 7, entries: [{ path: 'tmp/resource-downloads/example', bytes: 7, reason: '可重新下载' }], removed_bytes: 0, removed_count: 0, skipped: [] }
-    vi.mocked(actions.cleanupWorkspace).mockResolvedValueOnce(plan).mockResolvedValueOnce({ ...plan, removed_count: 1, removed_bytes: 7 })
+  it('展开本机清理区域，默认不选中，且仅提交勾选项', async () => {
+    const actions = controller({ root: '远端路径', data_dir: '', version: '1.1.0', can_manage: false }, false)
+    const plan = { root: '本机路径', token: 'scan-1', total_bytes: 7, entries: [{ path: 'tmp/resource-downloads/example', bytes: 1024, reason: '可重新下载' }], removed_bytes: 0, removed_count: 0, skipped: [], components: [] }
+    const scan = vi.fn().mockResolvedValue(plan)
+    const clean = vi.fn().mockResolvedValue({ ...plan, removed_count: 1, removed_bytes: 7 })
+    const port = vi.spyOn(desktop, 'desktopPort').mockReturnValue({ available: true, workspaceInfo: async () => ({root:'本机路径'}), storageScan: scan, storageCleanup: clean } as never)
     const wrapper = mount(WorkspaceSettings, { props: { controller: actions }, attachTo: document.body })
-    await wrapper.get('.workspace-cleanup-action').trigger('click')
-    await flushPromises()
-    expect(actions.cleanupWorkspace).toHaveBeenCalledExactlyOnceWith()
-    expect(document.body.textContent).toContain('tmp/resource-downloads/example')
-    const confirm = [...document.querySelectorAll('button')].find(button => button.textContent === '清理所列项目')
-    expect(confirm).toBeDefined()
-    confirm?.click()
-    await flushPromises()
-    expect(actions.cleanupWorkspace).toHaveBeenLastCalledWith('scan-1')
-    expect(wrapper.text()).toContain('已清理 1 项')
-    wrapper.unmount()
+    try {
+      await flushPromises()
+      await wrapper.get('.workspace-cleanup-action').trigger('click')
+      await flushPromises()
+      expect(scan).toHaveBeenCalledExactlyOnceWith()
+      expect(wrapper.get('[aria-label="本机空间管理"]').text()).toContain('本机路径')
+      expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+      expect(wrapper.text()).toContain('本机暂无已安装的可选组件。')
+      expect(wrapper.get('.storage-entry').text()).toContain('1 KB')
+      expect(wrapper.get('.storage-entry').text()).not.toMatch(/字节|KiB|MiB|GiB/)
+      expect(wrapper.get<HTMLButtonElement>('.workspace-confirm-button').element.disabled).toBe(true)
+      await wrapper.get('input[type="checkbox"]').setValue(true)
+      await wrapper.get('.workspace-confirm-button').trigger('click')
+      await flushPromises()
+      expect(clean).toHaveBeenCalledExactlyOnceWith('scan-1', ['tmp/resource-downloads/example'])
+      expect(actions.cleanupWorkspace).not.toHaveBeenCalled()
+      expect(scan).toHaveBeenCalledTimes(2)
+      expect(wrapper.text()).toContain('已清理 1 项')
+    } finally { wrapper.unmount(); port.mockRestore() }
+  })
+
+  it('远程模式下页内确认本机卸载，通过本机维护入口查询进度并刷新', async () => {
+    const actions = Object.assign(controller({ root:'远端路径',data_dir:'',version:'1.1.0',can_manage:false },false),{remoteMode:ref(true)})
+    actions.workspaceError.value = '远程服务端状态不可用，本机资源操作已停用。'
+    const resource = 'tts-aniflive-fixture'
+    const plan = {root:'本机路径',token:'scan',entries:[],total_bytes:0,removed_bytes:0,removed_count:0,skipped:[],components:[{resource_id:resource,label:'测试模型',bytes:64,installed:true},{resource_id:'tts-aniflive-missing',label:'未安装的模型',bytes:32,installed:false}]}
+    const scan = vi.fn().mockResolvedValueOnce(plan).mockResolvedValue({...plan,components:plan.components.map(item=>({...item,installed:false}))})
+    const preview = vi.fn().mockResolvedValue({resource_id:resource,token:'uninstall',message:'保留音色，移除全部模型版本。',paths:['models/aniflive-tts/packages/fixture']})
+    const start = vi.fn().mockResolvedValue({job_id:'reset-uninstall-'+resource})
+    const query = vi.fn().mockResolvedValue({job:{job_id:'reset-uninstall-'+resource,resource_id:resource,state:'complete',phase:'完成',error:null}})
+    const legacyJobs = vi.fn().mockRejectedValue(new Error('远程模式禁止访问旧任务接口'))
+    const port = vi.spyOn(desktop,'desktopPort').mockReturnValue({available:true,workspaceInfo:async()=>({root:'本机路径'}),storageScan:scan,uninstallPlan:preview,uninstallResource:start,uninstallJobStatus:query,resourceJobSnapshots:legacyJobs} as never)
+    const wrapper = mount(WorkspaceSettings,{props:{controller:actions}})
+    try {
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('本机资源操作已停用')
+      await wrapper.get('.workspace-cleanup-action').trigger('click');await flushPromises()
+      expect(wrapper.findAll('.storage-component')).toHaveLength(1)
+      expect(wrapper.text()).not.toContain('未安装的模型')
+      await wrapper.get('.storage-component .outline-button').trigger('click');await flushPromises()
+      expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+      expect(wrapper.get('[aria-label="确认本机组件卸载"]').text()).toContain('保留音色')
+      await wrapper.get('[aria-label="确认本机组件卸载"] .save-button').trigger('click');await flushPromises()
+      expect(start).toHaveBeenCalledExactlyOnceWith(resource,'uninstall')
+      expect(query).toHaveBeenCalledExactlyOnceWith(resource,'reset-uninstall-'+resource)
+      expect(legacyJobs).not.toHaveBeenCalled()
+      expect(scan).toHaveBeenCalledTimes(2)
+      expect(wrapper.text()).toContain('卸载完成，用户资料已保留。')
+      expect(wrapper.findAll('.storage-component')).toHaveLength(0)
+      expect(wrapper.text()).toContain('本机暂无已安装的可选组件。')
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    } finally {wrapper.unmount();port.mockRestore()}
   })
 
   it('选择目录后先确认源与目标，确认后仅调用迁移', async () => {

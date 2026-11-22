@@ -475,7 +475,7 @@ fn frontend_capability(
     let mut capability = if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-workspace-cleanup","allow-resource-inventory","allow-resource-jobs","allow-resource-system-feature-status","allow-resource-system-feature-enable","allow-resource-system-feature-access","allow-device-discovery-search","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-choose-sources","allow-resource-import-start","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-workspace-cleanup","allow-workspace-storage-scan","allow-workspace-storage-cleanup","allow-resource-uninstall-plan","allow-resource-uninstall","allow-resource-inventory","allow-resource-jobs","allow-resource-system-feature-status","allow-resource-system-feature-enable","allow-resource-system-feature-access","allow-device-discovery-search","allow-resource-download", "allow-resource-download-required", "allow-inference-selection-save","allow-tts-selection-status", "allow-tts-selection-save","allow-audio-enhancements-settings","allow-resource-reset-plan","allow-resource-reset","allow-resource-import","allow-resource-import-choose-sources","allow-resource-import-start","allow-resource-import-confirm","allow-aniflive-import-choose-folder","allow-aniflive-import-start","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-integrity-status","allow-app-integrity-download","allow-app-integrity-check","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
     };
     if mode == FrontendMode::Product {
         if let Some(permissions) = capability["permissions"].as_array_mut() {
@@ -9065,6 +9065,67 @@ async fn workspace_cleanup(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+// require_local_storage（本机空间维护授权）：连接远端不改变此命令的本机目标。
+fn require_local_storage(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
+    trusted(window, state)?;
+    require_command(state.mode, DesktopCommand::FocusMain)?;
+    if state.stopping.load(Ordering::Acquire) { return Err("应用正在退出。".into()); }
+    Ok(())
+}
+#[tauri::command(rename_all = "snake_case")]
+async fn workspace_storage_scan(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
+    manager: tauri::State<'_, Arc<ResourceManager>>) -> Result<serde_json::Value, String> {
+    require_local_storage(&window, &state)?;
+    let context = state.context().ok_or("缺少本机工作区")?;
+    let state = state.inner().clone(); let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = state.maintenance_gate.try_lock().map_err(|_|"另一项维护正在执行。")?;
+        if state.workspace_busy.load(Ordering::Acquire) || state.app_update.busy.load(Ordering::Acquire) || state.stopping.load(Ordering::Acquire) {
+            return Err("工作区正在迁移、更新或退出，请稍后扫描。".into());
+        }
+        let mut result = manager.with_idle_cleanup(|| voice_desktop_common::workspace_cleanup::run_selected(&context, env!("CARGO_PKG_VERSION"), None, true, None))?;
+        result["components"] = voice_desktop_common::workspace_cleanup::storage_components(&context, &result["entries"])?;
+        result["protected"] = voice_desktop_common::workspace_cleanup::storage_protected(&context);
+        result["fields"]["protected"] = serde_json::json!("受保护内容占用与保留原因");
+        result["fields"]["components"] = serde_json::json!("本机可选组件卸载清单");
+        result["root"] = serde_json::json!(context.install);
+        result["fields"]["root"] = serde_json::json!("本机工作区完整路径");
+        Ok(result)
+    }).await.map_err(|e|e.to_string())?
+}
+#[tauri::command(rename_all = "snake_case")]
+async fn workspace_storage_cleanup(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>,
+    manager: tauri::State<'_, Arc<ResourceManager>>, token: String, entry_ids: Vec<String>) -> Result<serde_json::Value, String> {
+    require_local_storage(&window, &state)?;
+    let context = state.context().ok_or("缺少本机工作区")?;
+    let state = state.inner().clone(); let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = state.maintenance_gate.try_lock().map_err(|_|"另一项维护正在执行。")?;
+        if state.workspace_busy.load(Ordering::Acquire) || state.app_update.busy.load(Ordering::Acquire) || state.stopping.load(Ordering::Acquire) {
+            return Err("工作区正在迁移、更新或退出，请稍后清理。".into());
+        }
+        manager.cleanup_local_storage(&token, &entry_ids)
+    }).await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn resource_uninstall_plan(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>, manager: tauri::State<'_, Arc<ResourceManager>>, resource_id: String, job_id: Option<String>) -> Result<serde_json::Value, String> {
+    require_local_storage(&window, &state)?;
+    // job_id（本机卸载任务编号）：仅查询此维护入口创建的任务，不放宽原有资源任务的模式门禁。
+    if let Some(job_id) = job_id {
+        let expected = if resource_id == voice_desktop_common::runtime::GPU_RESOURCE {"env-remove-gpu".into()} else {format!("reset-uninstall-{resource_id}")};
+        if job_id != expected { return Err("任务编号不属于此本机卸载组件。".into()); }
+        let job = manager.snapshots().into_iter().find(|value| value["job_id"] == job_id).ok_or("本机卸载任务不存在，请重新扫描。")?;
+        return Ok(serde_json::json!({"resource_id":resource_id,"job":job,"fields":{"resource_id":"本机维护组件编号","job":"本机卸载任务进度快照"}}));
+    }
+    voice_desktop_common::component_reset::uninstall_plan(&state.context().ok_or("缺少本机工作区")?, &resource_id)
+}
+#[tauri::command(rename_all = "snake_case")]
+fn resource_uninstall(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>, manager: tauri::State<'_, Arc<ResourceManager>>, resource_id: String, token: String) -> Result<serde_json::Value, String> {
+    require_local_storage(&window, &state)?;
+    manager.inner().uninstall_resource(resource_id, token)
 }
 
 fn app_update_payload(

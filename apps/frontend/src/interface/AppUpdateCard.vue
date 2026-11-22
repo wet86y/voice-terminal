@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatBytes } from './format-bytes'
 import { computed, ref } from 'vue'
 import type { AppUpdateStatus } from './app-update'
 import UiDialog from './UiDialog.vue'
@@ -80,13 +81,7 @@ function runAction() {
   else if (canDownload.value) emit('download')
   else emit('check')
 }
-function formatBytes(value: number | null | undefined) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '—'
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB（吉字节）`
-  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB（兆字节）`
-  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB（千字节）`
-  return `${Math.round(value)} B（字节）`
-}
+
 </script>
 
 <template>

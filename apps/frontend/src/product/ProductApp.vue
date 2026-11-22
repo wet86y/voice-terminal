@@ -211,7 +211,7 @@ function exportLogs() {
         <HotwordSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
         <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" :operations="operations" :expand-anif-live-tts="expandAnifLiveTtsCard" />
-        <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" />
+        <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" @open-settings="setSettingsTab" />
         <DeviceSettings v-if="activeSettingsTab === 'devices'" @notice="setNotice" /></article
     ></SettingsFrame>
     <template #overlays>

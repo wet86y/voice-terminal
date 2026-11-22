@@ -155,6 +155,12 @@ pub fn specs(context: &LaunchContext) -> Result<Vec<Value>, String> {
         .as_array()
         .ok_or("资源目录格式无效")?
         .clone();
+    if let Some(mut converter) = items.iter().find(|row| row["preparation"] == "aniflive_runtime").cloned() {
+        converter["resource_id"] = json!("tts-aniflive-converter");
+        converter["preparation"] = json!("aniflive_converter");
+        converter["title"] = json!("AnifLive（本地语音）转换框架");
+        items.push(converter);
+    }
     let registry =
         load(&safe_path(&context.data, "config/aniflive-models.json")?).unwrap_or(Value::Null);
     let template = items
@@ -267,6 +273,9 @@ pub fn download_bytes(item: &Value) -> u64 {
         })
 }
 pub(crate) fn destination(context: &LaunchContext, spec: &Value) -> Result<PathBuf, String> {
+    if spec["preparation"] == "aniflive_converter" {
+        return safe_path(&context.install, "runtimes/aniflive-tts/export-packages");
+    }
     if spec["preparation"] == "aniflive_runtime" {
         return safe_path(&context.install, "runtimes/aniflive-tts");
     }
@@ -742,7 +751,7 @@ pub fn native_runtime_status(context: &LaunchContext) -> Result<Value, String> {
         rules["schema"] == 1
             && contract["revision"] == 1
             && source["schema"] == 1
-            && receipt["schema"] == 1
+            && matches!(receipt["schema"].as_u64(), Some(1 | 2))
             && receipt["role"] == "runtime"
             && source["upstream_commit"] == contract["upstream_commit"]
             && contract["source_patch_revisions"]
@@ -774,6 +783,7 @@ pub fn native_runtime_status(context: &LaunchContext) -> Result<Value, String> {
     };
     let installed = compatible
         && !root.join("dependency-transaction.json").exists()
+        && !root.join("layout-transaction.json").exists()
         && receipt["files"]
             .as_array()
             .is_some_and(|files| !files.is_empty());
@@ -794,12 +804,23 @@ fn verify_aniflive_runtime(
     let mut batches = vec![];
     for role in ["packages", "export-packages"] {
         let directory = safe_path(&root, role)?;
+        if role == "export-packages" && !directory.exists() && load(&root.join("packages/aniflive-packages.json"))?["conversion_installed"] == false { continue; }
         let receipt = load(&safe_path(&directory, "aniflive-packages.json")?)?;
         let records = receipt["files"]
             .as_array()
             .filter(|files| !files.is_empty())
             .ok_or("AnifLive（本地语音）缺少隔离依赖文件登记")?
             .clone();
+        if role == "export-packages" {
+            if let Some(libraries) = receipt["libraries"].as_array() {
+                let mut records = vec![];
+                for row in libraries {
+                    let name = row["path"].as_str().and_then(|p| p.strip_prefix("tensorrt_libs/")).ok_or("转换动态库路径无效")?;
+                    let mut record = row.clone(); record["path"] = json!(name); records.push(record);
+                }
+                if !records.is_empty() { batches.push(crate::verification::Batch { root: safe_path(&root,"conversion-libs")?, records, exact:false, python:false }); }
+            }
+        }
         batches.push(crate::verification::Batch {
             root: directory,
             records,
@@ -858,7 +879,25 @@ pub(crate) fn inventory_raw(context: &LaunchContext) -> Result<Vec<Value>, Strin
         let root = destination(context, &item)?;
         // 先以收据/旧总清单的字节数快检；只有目标文件记录变化时才复核旧文件 SHA-256（摘要）。
         let (result, installed_version, update_available) =
-            if item["preparation"] == "aniflive_runtime" {
+            if item["preparation"] == "aniflive_converter" {
+                let result = (|| -> Result<(),String> {
+                    let receipt = load(&safe_path(&root,"aniflive-packages.json")?)?;
+                    if !matches!(receipt["schema"].as_u64(),Some(1|2)) || receipt["role"] != "export"
+                        || !receipt["files"].as_array().is_some_and(|files|!files.is_empty()) {
+                        return Err("转换框架未配置，下次导入模型时可重新配置。".into());
+                    }
+                    for row in receipt["libraries"].as_array().into_iter().flatten() {
+                        let name = row["path"].as_str().and_then(|p|p.strip_prefix("tensorrt_libs/")).ok_or("转换动态库归属无效")?;
+                        if name.contains('/') || !name.starts_with("nvinfer_builder_resource_") || !name.ends_with("_11.dll") { return Err("转换动态库归属无效".into()); }
+                        let path = safe_path(&context.install,&format!("runtimes/aniflive-tts/conversion-libs/{name}"))?;
+                        if !path.is_file() || path.metadata().map_err(|e|e.to_string())?.len() != row["size"].as_u64().ok_or("转换动态库长度登记无效")? {
+                            return Err("转换动态库缺失，下次导入模型时可重新配置。".into());
+                        }
+                    }
+                    Ok(())
+                })();
+                (result, None, false)
+            } else if item["preparation"] == "aniflive_runtime" {
                 let status = native_runtime_status(context)?;
                 (
                     if status["can_start"] == true {
@@ -1108,6 +1147,7 @@ fn aniflive_model_revision_ready(
     {
         return Ok(false);
     }
+    if context.install.join("tmp/storage-model-cleanup.json").exists() { return Ok(false); }
     if context
         .install
         .join("tmp/resource-transaction.json")
@@ -1326,7 +1366,7 @@ pub(crate) fn prepare_maintenance_verification(
         }
         if matches!(
             item["preparation"].as_str(),
-            Some("aniflive_local_build" | "aniflive_runtime")
+            Some("aniflive_local_build" | "aniflive_runtime" | "aniflive_converter")
         ) {
             continue;
         } // 生成引擎及隔离依赖按实际收据单独核验。
@@ -1435,7 +1475,7 @@ pub(crate) fn maintenance_issues(
             continue;
         }
         let valid = if full && root.is_dir() {
-            if item["preparation"] == "aniflive_runtime" {
+            if item["preparation"] == "aniflive_runtime" || item["preparation"] == "aniflive_converter" {
                 verify_aniflive_runtime(context, cancel, progress)
             } else if item["preparation"] == "aniflive_local_build" {
                 aniflive_model_ready(context, item["model_id"].as_str().unwrap_or(""), true)

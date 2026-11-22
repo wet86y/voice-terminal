@@ -35,6 +35,7 @@ const workspace = { // workspace（工作区只读状态）：清理只返回固
     return { token: 'fixture', entries: Array.from({ length: 40 }, (_, index) => ({ path: `cache/测试条目-${index}`, reason: '可重新生成的测试文件', bytes: 1024 })), skipped: [], total_bytes: 40960 }
   },
 }
+const storagePort = { available: true, workspaceInfo: async () => ({root:'D:/测试工作区'}), storageScan: () => workspace.cleanupWorkspace(), storageCleanup: () => deny('真实本机清理'), uninstallPlan: () => deny('真实卸载预览'), uninstallResource: () => deny('真实组件卸载') } // storagePort（仅注入固定本机盘点，不连接业务）。
 const picture = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800"><rect width="1200" height="800" fill="#202530"/><path d="M0 600L320 250 650 550 920 150 1200 450V800H0Z" fill="#6974b8"/></svg>') // picture（内置测试图片）。
 
 window.__UI_LAYOUT__ = {
@@ -67,7 +68,7 @@ createApp({
       scene.value === 'history' && h(AppUpdateCard, { status: { state: 'idle', current_version: '1.0.0', fields: {} }, currentVersion: '1.0.0' }),
       scene.value === 'resource' && h(ResourceInstallDialog, { controller: resource }),
       scene.value === 'hotword' && h(HotwordSettings),
-      scene.value === 'workspace' && h(WorkspaceSettings, { controller: workspace }),
+      scene.value === 'workspace' && h(WorkspaceSettings, { controller: workspace, storagePort }),
       scene.value === 'sync' && h(LanVersionDialog),
       scene.value === 'image' && h(CaptureImages, { attachments: [{ attachment_id: 'fixture', conversation_id: 'fixture', role: 'global', mime_type: 'image/png', width: 1200, height: 800, bytes: 100, sha256: '', preview_url: picture }] }),
       scene.value === 'long' && h(UiDialog, { open: true, title: '长说明与确认', onClose: () => { scene.value = 'history' } }, {
