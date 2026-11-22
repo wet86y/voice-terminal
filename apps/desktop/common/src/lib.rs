@@ -57,6 +57,7 @@ pub mod native_opus; // native_opus（固定 libopus 1.6.1 编解码器）：原
 pub mod native_ui;
 #[cfg(windows)]
 pub mod native_vad; // native_vad（原生 WebRTC VAD）：静态链接固定 C 源码，不加载 Python。
+pub(crate) mod system_text; // system_text（系统代码页与统一字符编码转换）。
 pub mod powershell; // powershell（按能力自动选择的脚本宿主）。
 pub mod process_host;
 pub mod remote_import_contract; // remote_import_contract（远程导入契约）：服务端暂存编号、相对路径清单及摘要边界。

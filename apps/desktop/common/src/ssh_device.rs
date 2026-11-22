@@ -1698,7 +1698,7 @@ impl SshDeviceConnection {
     // bridge_failure（专用单通道失败说明）：不把错误输出混入文件或网页协议，也不另写日志。
     fn bridge_failure(&self, fallback: &str) -> String {
         let reason = self.bridge_stderr.lock().ok().map(|bytes| {
-            String::from_utf8_lossy(&bytes).chars()
+            crate::system_text::diagnostic(&bytes).chars()
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
                 .take(512).collect::<String>().trim().to_owned()
         }).unwrap_or_default();

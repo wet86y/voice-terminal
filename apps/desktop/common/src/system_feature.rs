@@ -1444,7 +1444,7 @@ fn manage_project_device_key(
         String::new()
     };
     let line = if add {
-        let command = project_device_bridge_command(&executable, workspace_id, owner_sid, device_id);
+        let command = project_device_bridge_command(&executable, workspace_id, owner_sid, device_id)?;
         let escaped_command = command.replace('\\', "\\\\").replace('"', "\\\"");
         format!("from=\"{scopes}\",restrict,command=\"{escaped_command}\" {public_key} {marker}")
     } else {
@@ -1493,7 +1493,7 @@ fn manage_project_device_key(
     Ok(())
 }
 
-// project_device_bridge_command（固定桥接启动命令）：外层只含 ASCII（基本字符集）命令和编码参数，
+// project_device_bridge_command（固定桥接启动命令）：使用已核验的系统绝对路径和编码参数，
 // 兼容 sshd（安全外壳服务）的 cmd.exe（默认命令行）及 PowerShell（脚本环境）默认解释器。
 // Process（原生进程）直接继承三个标准句柄，避免 PowerShell 文本管道改写媒体和文件字节。
 #[cfg(feature = "ssh-device")]
@@ -1502,7 +1502,82 @@ fn project_device_bridge_command(
     workspace_id: &str,           // workspace_id（已经过格式检查的工作区编号）。
     owner_sid: &str,              // owner_sid（已经过格式检查的账户安全标识符）。
     device_id: &str,              // device_id（已经过格式检查的设备编号）。
-) -> String {
+) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let host = crate::powershell::ssh_bridge_host()?;
+        bridge_command_for_shell(
+            executable,
+            workspace_id,
+            owner_sid,
+            device_id,
+            &host,
+            ssh_default_shell()?,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (executable, workspace_id, owner_sid, device_id);
+        Err("SSH 桥接命令只支持 Windows（操作系统）。".into())
+    }
+}
+
+#[cfg(feature = "ssh-device")]
+#[derive(Clone, Copy)]
+enum SshShell {
+    Cmd,
+    PowerShell,
+} // SshShell（系统 SSH 默认解释器的调用语义）。
+
+#[cfg(all(feature = "ssh-device", windows))]
+fn ssh_default_shell() -> Result<SshShell, String> {
+    use windows_sys::Win32::System::Registry::*;
+    let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut buffer = [0u16; 32768];
+    let mut size = (buffer.len() * 2) as u32;
+    let code = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(r"SOFTWARE\OpenSSH").as_ptr(),
+            wide("DefaultShell").as_ptr(),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_SUBKEY_WOW6464KEY,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if code == 2 {
+        return Ok(SshShell::Cmd);
+    } // ERROR_FILE_NOT_FOUND（未配置时使用系统默认命令行）。
+    if code != 0 {
+        return Err(format!("无法读取 SSH 默认解释器，系统错误码：{code}。"));
+    }
+    let shell =
+        String::from_utf16(&buffer[..buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len())])
+            .map_err(|_| "SSH 默认解释器路径编码无效。")?;
+    match shell
+        .replace('/', "\\")
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cmd.exe" => Ok(SshShell::Cmd),
+        "powershell.exe" | "pwsh.exe" => Ok(SshShell::PowerShell),
+        _ => Err("SSH 使用尚不支持的自定义默认解释器；未修改系统配置或登记公钥。".into()),
+    }
+}
+
+#[cfg(feature = "ssh-device")]
+fn bridge_command_for_shell(
+    executable: &std::path::Path,
+    workspace_id: &str,
+    owner_sid: &str,
+    device_id: &str,
+    host: &std::path::Path, // host（已验证签名的系统解释器绝对路径）。
+    shell: SshShell,        // shell（系统当前默认解释器的调用规则）。
+) -> Result<String, String> {
     let executable_b64 =
         base64::engine::general_purpose::STANDARD.encode(executable.to_string_lossy().as_bytes());
     let script = format!(
@@ -1524,7 +1599,19 @@ fn project_device_bridge_command(
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>(),
     );
-    format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    let path = host.to_str().ok_or("桥接解释器路径编码无效。")?;
+    let invocation = match shell {
+        SshShell::Cmd => {
+            if path.contains(['%', '!', '"', '\r', '\n']) {
+                return Err("系统解释器路径包含不支持的命令行展开字符，未登记授权。".into());
+            }
+            format!("\"{path}\"")
+        }
+        SshShell::PowerShell => format!("& '{}'", path.replace('\'', "''")),
+    };
+    Ok(format!(
+        "{invocation} -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
+    ))
 }
 
 #[cfg(feature = "ssh-device")]
@@ -1893,13 +1980,9 @@ public class BridgeFixture {
             String::from_utf8_lossy(&compiled.stderr)
         );
         let executable = crate::canonical_path(&executable).unwrap();
-        let command = project_device_bridge_command(
-            &executable,
-            "18dcc2d519a4a938-81ec",
-            "S-1-5-21-42",
-            "device-test",
-        );
-        assert!(command.is_ascii());
+        let host = crate::powershell::ssh_bridge_host().unwrap();
+        // 同名文件位于当前目录及搜索路径首位，也必须使用已核验的系统入口。
+        std::fs::copy(&executable, directory.join("powershell.exe")).unwrap();
         let input = (0..=255_u8).collect::<Vec<_>>(); // input（包含空字节、非文本字节和换行的完整单字节集合）。
         let header = format!(
             "--ssh-device-bridge|--workspace-id|18dcc2d519a4a938-81ec|--owner-sid|S-1-5-21-42|--device-id|device-test|--bridge-protocol|{}\nvoice-terminal-v1-file\n",
@@ -1919,9 +2002,24 @@ public class BridgeFixture {
         }
         for (name, shell) in shells {
             for exit_code in [0, 23] {
+                let command = bridge_command_for_shell(
+                    &executable,
+                    "18dcc2d519a4a938-81ec",
+                    "S-1-5-21-42",
+                    "device-test",
+                    &host,
+                    if name == "cmd" {
+                        SshShell::Cmd
+                    } else {
+                        SshShell::PowerShell
+                    },
+                )
+                .unwrap();
                 let mut launch = Command::new(&shell);
                 if name == "cmd" {
-                    launch.raw_arg("/d /s /c ").raw_arg(&command);
+                    launch
+                        .raw_arg("/d /s /c ")
+                        .raw_arg(format!("\"{command}\""));
                 } else {
                     launch.args([
                         "-NoLogo",
@@ -1932,6 +2030,15 @@ public class BridgeFixture {
                     ]);
                 }
                 let mut child = launch
+                    .current_dir(&directory)
+                    .env(
+                        "PATH",
+                        format!(
+                            "{};{}",
+                            directory.display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
                     .env("SSH_ORIGINAL_COMMAND", "voice-terminal-v1-file")
                     .env("BRIDGE_FIXTURE_EXIT_CODE", exit_code.to_string())
                     .creation_flags(0x0800_0000)
@@ -1977,15 +2084,22 @@ public class BridgeFixture {
                 );
             }
         }
-        let missing_command = project_device_bridge_command(
+        let missing_command = bridge_command_for_shell(
             &directory.join("不存在.exe"),
             "18dcc2d519a4a938-81ec",
             "S-1-5-21-42",
             "device-test",
-        );
-        let mut arguments = missing_command.split_ascii_whitespace();
-        let failure = Command::new(arguments.next().unwrap())
-            .args(arguments)
+            &host,
+            SshShell::PowerShell,
+        )
+        .unwrap();
+        let failure = Command::new(&host)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &missing_command,
+            ])
             .creation_flags(0x0800_0000)
             .output()
             .unwrap();

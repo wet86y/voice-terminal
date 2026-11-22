@@ -260,7 +260,21 @@ impl DeviceTerminalManager {
         }
         let start =
             usize::try_from(offset - state.output_base).map_err(|_| "终端输出偏移无效。")?;
-        let length = (state.output.len().saturating_sub(start)).min(MAX_READ_BYTES);
+        if state
+            .output
+            .get(start)
+            .is_some_and(|byte| byte & 0xc0 == 0x80)
+        {
+            return Err("终端输出偏移必须位于 UTF-8（统一字符编码）字符边界。".into());
+        }
+        let mut length = (state.output.len().saturating_sub(start)).min(MAX_READ_BYTES);
+        while state
+            .output
+            .get(start + length)
+            .is_some_and(|byte| byte & 0xc0 == 0x80)
+        {
+            length -= 1;
+        }
         let bytes = state
             .output
             .iter()
@@ -274,11 +288,11 @@ impl DeviceTerminalManager {
             "state": state.state,
             "offset": offset,
             "next_offset": next_offset,
-            "output": String::from_utf8_lossy(&bytes).into_owned(),
-            "output_encoding": "UTF-8 loss replacement（无效编码以替代字符呈现）",
+            "output": std::str::from_utf8(&bytes).map_err(|_| "终端输出编码状态无效。")?,
+            "output_encoding": "UTF-8（统一字符编码）",
             "more": next_offset < state.output_total,
             "fields": {"terminal_id":"设备终端会话编号","state":"命令会话状态","offset":"请求输出字节偏移",
-                "next_offset":"下次增量读取字节偏移","output":"受限长度的命令输出增量","output_encoding":"无效 UTF-8 字节呈现方式",
+                "next_offset":"下次增量读取字节偏移","output":"受限长度的命令输出增量","output_encoding":"规范化后的输出编码",
                 "more":"是否还有未读取输出"}
         }))
     }
@@ -443,21 +457,24 @@ fn session_snapshot_locked(terminal_id: &str, state: &SessionState) -> Value {
             "created_elapsed_ms":"终端会话创建后的毫秒数","error":"受限任务执行错误"}})
 }
 
-fn append_output(state: &Arc<Mutex<SessionState>>, bytes: &[u8]) {
-    if bytes.is_empty() {
+fn append_output(state: &Arc<Mutex<SessionState>>, text: &str) {
+    if text.is_empty() {
         return;
     }
     let Ok(mut state) = state.lock() else { return };
-    let accepted = bytes.len().min(MAX_OUTPUT_BYTES);
-    let bytes = &bytes[..accepted];
-    for byte in bytes {
-        state.output.push_back(*byte);
+    let mut start = text.len().saturating_sub(MAX_OUTPUT_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
-    state.output_total = state.output_total.saturating_add(bytes.len() as u64);
+    state.output.extend(text[start..].as_bytes());
+    state.output_total = state.output_total.saturating_add(text.len() as u64);
     while state.output.len() > MAX_OUTPUT_BYTES {
         state.output.pop_front();
-        state.output_base = state.output_base.saturating_add(1);
     }
+    while state.output.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
+        state.output.pop_front();
+    }
+    state.output_base = state.output_total - state.output.len() as u64;
 }
 
 #[cfg(windows)]
@@ -467,8 +484,7 @@ fn run_fixed_command(
     cancel: &AtomicBool,
 ) -> Result<(i32, bool, bool), String> {
     use std::os::windows::process::CommandExt;
-    let system_root = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录。")?;
-    let system32 = std::path::Path::new(&system_root).join("System32");
+    let system32 = crate::powershell::windows_root()?.join("System32");
     let (program, arguments): (&str, &[&str]) = match command_id {
         "hostname" => ("hostname.exe", &[]),
         "identity" => ("whoami.exe", &[]),
@@ -499,6 +515,7 @@ fn run_fixed_command(
     let status = loop {
         if cancel.load(Ordering::Acquire) {
             cancelled = true;
+            job.terminate();
             let _ = child.kill();
             break child
                 .wait()
@@ -506,6 +523,7 @@ fn run_fixed_command(
         }
         if started.elapsed() >= COMMAND_TIMEOUT {
             timed_out = true;
+            job.terminate();
             let _ = child.kill();
             break child
                 .wait()
@@ -521,6 +539,7 @@ fn run_fixed_command(
             }
         }
     };
+    job.terminate(); // 脚本结束时也释放可能被后代保留的输出句柄。
     let _ = out.join();
     let _ = err.join();
     Ok((status.code().unwrap_or(-1), cancelled, timed_out))
@@ -528,13 +547,15 @@ fn run_fixed_command(
 
 #[cfg(windows)]
 fn copy_capped_output(mut stream: impl Read, state: Arc<Mutex<SessionState>>) {
+    let mut decoder = crate::system_text::Decoder::new(crate::system_text::console_code_page());
     let mut buffer = [0_u8; 4096];
     while let Ok(read) = stream.read(&mut buffer) {
         if read == 0 {
             break;
         }
-        append_output(&state, &buffer[..read]);
+        append_output(&state, &decoder.push(&buffer[..read], false));
     }
+    append_output(&state, &decoder.push(&[], true));
 }
 
 #[cfg(not(windows))]
@@ -549,6 +570,80 @@ fn run_fixed_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn native_console_stream_decodes_split_chinese_before_buffering() {
+        let manager = DeviceTerminalManager::default();
+        manager
+            .execute(
+                "terminal.create",
+                &json!({"terminal_id":"native-text"}),
+                1,
+                1,
+            )
+            .unwrap();
+        let session = manager.get("native-text", 1, 1).unwrap();
+        // 构造跨 4096 字节读取边界的系统代码页文本；不读取或保存真实网络资料。
+        if crate::system_text::console_code_page() != 936 {
+            return;
+        }
+        let mut bytes = vec![b'a'; 4095];
+        bytes.extend_from_slice(&[0xd6, 0xd0, 0xce, 0xc4]);
+        copy_capped_output(std::io::Cursor::new(bytes), session.state.clone());
+        let result = manager
+            .execute(
+                "terminal.output",
+                &json!({"terminal_id":"native-text","offset":0}),
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(result["output"], "a".repeat(4095) + "中文");
+    }
+
+    #[test]
+    fn terminal_unicode_reads_and_rolling_buffer_keep_character_boundaries() {
+        let manager = DeviceTerminalManager::default();
+        manager
+            .execute("terminal.create", &json!({"terminal_id":"unicode"}), 1, 1)
+            .unwrap();
+        let session = manager.get("unicode", 1, 1).unwrap();
+        let text = "a".repeat(MAX_READ_BYTES - 1) + "中文🙂";
+        append_output(&session.state, &text);
+        let first = manager
+            .execute(
+                "terminal.output",
+                &json!({"terminal_id":"unicode","offset":0}),
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first["next_offset"], (MAX_READ_BYTES - 1) as u64);
+        let second = manager
+            .execute(
+                "terminal.output",
+                &json!({"terminal_id":"unicode","offset":first["next_offset"]}),
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(second["output"], "中文🙂");
+        assert!(manager
+            .execute(
+                "terminal.output",
+                &json!({"terminal_id":"unicode","offset":MAX_READ_BYTES}),
+                1,
+                1
+            )
+            .is_err());
+        append_output(&session.state, &"中".repeat(MAX_OUTPUT_BYTES));
+        let state = session.state.lock().unwrap();
+        assert!(state.output.len() <= MAX_OUTPUT_BYTES);
+        let bytes = state.output.iter().copied().collect::<Vec<_>>();
+        assert!(std::str::from_utf8(&bytes).is_ok());
+        assert_eq!(state.output_base + bytes.len() as u64, state.output_total);
+    }
 
     #[test]
     fn terminal_actions_reject_unknown_operations_and_shell_commands() {

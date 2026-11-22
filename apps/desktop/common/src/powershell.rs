@@ -233,7 +233,40 @@ Write-Output 'VoiceTerminalPowerShellReady'"#
     Ok(host)
 }
 
-/// execute（有界执行）：长脚本经输入管道传递，不落盘；同时排空标准和错误输出并保留退出码。
+const MAX_SCRIPT_OUTPUT: usize = 4 * 1024 * 1024; // MAX_SCRIPT_OUTPUT（每条输出管道的内存上限）。
+const SCRIPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2); // SCRIPT_CLEANUP_TIMEOUT（超时后的收尾上限）。
+
+fn read_capped(
+    mut stream: impl std::io::Read,
+    overflow: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    let mut result = Vec::new();
+    let mut buffer = [0; 8192];
+    while !stop.load(Ordering::Acquire) {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let accepted = count.min(MAX_SCRIPT_OUTPUT - result.len());
+        result.extend_from_slice(&buffer[..accepted]);
+        if accepted != count {
+            overflow.store(true, Ordering::Release);
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn cancel_thread_io<T>(thread: &std::thread::JoinHandle<T>) {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle().cast());
+    }
+}
+
+/// execute（有界执行）：先登记受管作业；超时或脚本结束时回收后代，限时排空管道。
 pub fn execute(
     host: &Host,
     script: &str,
@@ -241,65 +274,133 @@ pub fn execute(
     on_wait: &mut dyn FnMut(Duration),
 ) -> Result<(u32, String, String), String> {
     use std::{
-        io::{Read, Write},
+        io::Write,
         process::Stdio,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
         thread,
         time::Instant,
     };
-    let mut child = host.command().args(["-STA", "-Command", "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ([scriptblock]::Create([Console]::In.ReadToEnd()))"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| format!("无法启动脚本宿主：{error}"))?;
+    if timeout.is_zero() {
+        return Err("脚本执行时限必须大于零。".into());
+    }
+    let mut command = host.command();
+    command.args(["-STA", "-Command", "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); & ([scriptblock]::Create([Console]::In.ReadToEnd()))"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    let job = crate::windows::Job::new()?;
+    #[cfg(windows)]
+    let mut child = job.spawn(&mut command)?;
+    #[cfg(not(windows))]
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动脚本宿主：{error}"))?;
     let mut input = child.stdin.take().ok_or("脚本输入管道不可用。")?;
+    let output = child.stdout.take().ok_or("脚本输出管道不可用。")?;
+    let errors = child.stderr.take().ok_or("脚本错误管道不可用。")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::new(AtomicBool::new(false));
     let script = script.as_bytes().to_vec();
-    let writer = thread::spawn(move || input.write_all(&script));
-    let mut output = child.stdout.take().ok_or("脚本输出管道不可用。")?;
-    let mut errors = child.stderr.take().ok_or("脚本错误管道不可用。")?;
-    let output = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).map(|_| bytes)
+    let writing_stop = stop.clone();
+    let writer = thread::spawn(move || {
+        for chunk in script.chunks(8192) {
+            if writing_stop.load(Ordering::Acquire) {
+                break;
+            }
+            input.write_all(chunk)?;
+        }
+        Ok::<_, std::io::Error>(())
     });
-    let errors = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        errors.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    let (reading_stop, reading_overflow) = (stop.clone(), overflow.clone());
+    let output = thread::spawn(move || read_capped(output, &reading_overflow, &reading_stop));
+    let (reading_stop, reading_overflow) = (stop.clone(), overflow.clone());
+    let errors = thread::spawn(move || read_capped(errors, &reading_overflow, &reading_stop));
     let started = Instant::now();
     let mut reported = started;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("无法读取脚本状态：{error}"))?
-        {
-            writer
-                .join()
-                .map_err(|_| "脚本写入线程异常。")?
-                .map_err(|error| format!("脚本写入失败：{error}"))?;
-            let stdout = output
-                .join()
-                .map_err(|_| "脚本输出线程异常。")?
-                .map_err(|error| error.to_string())?;
-            let stderr = errors
-                .join()
-                .map_err(|_| "脚本错误线程异常。")?
-                .map_err(|error| error.to_string())?;
-            return Ok((
-                status.code().unwrap_or(1) as u32,
-                String::from_utf8_lossy(&stdout).trim().to_owned(),
-                String::from_utf8_lossy(&stderr).trim().to_owned(),
-            ));
+    let mut status = None;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(value) => status = value,
+            Err(error) => break Err(format!("无法读取脚本状态：{error}")),
+        }
+        if overflow.load(Ordering::Acquire) {
+            break Err("脚本输出超过容量限制；任务已停止，未返回截断的成功回执。".to_owned());
+        }
+        if status.is_some() {
+            // 脚本结束后不允许后台后代继续持有本轮管道。
+            #[cfg(windows)]
+            job.terminate();
+            if writer.is_finished() && output.is_finished() && errors.is_finished() {
+                break Ok(());
+            }
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = writer.join();
-            let _ = output.join();
-            let _ = errors.join();
-            return Err("脚本执行超时；结果未知，未切换解释器重复执行。".into());
+            break Err("脚本执行超时；结果未知，未切换解释器重复执行。".to_owned());
         }
         if reported.elapsed() >= Duration::from_secs(15) {
             on_wait(started.elapsed());
             reported = Instant::now();
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
+    };
+    #[cfg(windows)]
+    job.terminate();
+    if status.is_none() {
+        let _ = child.kill();
     }
+    if outcome.is_err() {
+        stop.store(true, Ordering::Release);
+    }
+    let cleanup = Instant::now();
+    while !(writer.is_finished() && output.is_finished() && errors.is_finished())
+        || status.is_none()
+    {
+        if status.is_none() {
+            status = child.try_wait().ok().flatten();
+        }
+        if cleanup.elapsed() >= SCRIPT_CLEANUP_TIMEOUT {
+            return Err(format!(
+                "{} 管道收尾未在期限内完成。",
+                outcome.err().unwrap_or_else(|| "脚本进程已结束。".into())
+            ));
+        }
+        #[cfg(windows)]
+        {
+            cancel_thread_io(&writer);
+            cancel_thread_io(&output);
+            cancel_thread_io(&errors);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let written = writer.join().map_err(|_| "脚本写入线程异常。")?;
+    let stdout = output.join().map_err(|_| "脚本输出线程异常。")?;
+    let stderr = errors.join().map_err(|_| "脚本错误线程异常。")?;
+    outcome?;
+    if overflow.load(Ordering::Acquire) {
+        return Err("脚本输出超过容量限制；未返回截断的成功回执。".into());
+    }
+    written.map_err(|error| format!("脚本写入失败：{error}"))?;
+    Ok((
+        status.unwrap().code().unwrap_or(1) as u32,
+        String::from_utf8_lossy(&stdout.map_err(|error| error.to_string())?)
+            .trim()
+            .to_owned(),
+        String::from_utf8_lossy(&stderr.map_err(|error| error.to_string())?)
+            .trim()
+            .to_owned(),
+    ))
+}
+
+/// ssh_bridge_host（受限桥接解释器）：只定位系统固定入口，不搜索当前目录或 PATH（程序搜索路径）。
+#[cfg(windows)]
+pub(crate) fn ssh_bridge_host() -> Result<PathBuf, String> {
+    let path = crate::canonical_path(
+        &windows_root()?.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )?;
+    verify_signature(&path)?;
+    Ok(path)
 }
 
 #[cfg(windows)]
@@ -497,6 +598,71 @@ fn verify_catalog_signature(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn script_deadline_and_normal_exit_reclaim_pipe_holding_descendants() {
+        use std::time::Instant;
+        let host = Host {
+            executable: ssh_bridge_host().unwrap(),
+            module_path: String::new(),
+        };
+        let owner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/tmp");
+        let directory = owner.join(format!("script-reclaim-{}", crate::workspace::new_id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for timeout in [true, false] {
+            let pid_file = directory.join(format!("child-{timeout}.pid"));
+            let script = format!("$s=[Diagnostics.ProcessStartInfo]::new();$s.FileName='{}';$s.Arguments='-NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 20\"';$s.UseShellExecute=$false;$p=[Diagnostics.Process]::Start($s);[IO.File]::WriteAllText('{}',[string]$p.Id);{}", host.executable.display().to_string().replace('\'', "''"), pid_file.display().to_string().replace('\'', "''"), if timeout { "Start-Sleep -Seconds 20" } else { "Write-Output 'done'" });
+            let started = Instant::now();
+            let result = execute(&host, &script, Duration::from_secs(2), &mut |_| {});
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "后代持有管道不能突破执行和收尾时限"
+            );
+            if timeout {
+                assert!(result.unwrap_err().contains("超时"));
+            } else {
+                let (code, output, _) = result.unwrap();
+                assert_eq!(code, 0);
+                assert_eq!(output, "done");
+            }
+            let pid = std::fs::read_to_string(pid_file)
+                .expect("子进程必须已在超时前启动")
+                .parse::<u32>()
+                .unwrap();
+            use windows_sys::Win32::{
+                Foundation::{CloseHandle, WAIT_OBJECT_0},
+                System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+            };
+            let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if !process.is_null() {
+                let wait = unsafe { WaitForSingleObject(process, 1000) };
+                unsafe {
+                    CloseHandle(process);
+                }
+                assert_eq!(wait, WAIT_OBJECT_0, "脚本后代必须已被回收");
+            }
+        }
+        crate::workspace::remove_owned(&directory, &owner).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn excessive_script_output_is_a_bounded_failure() {
+        let host = Host {
+            executable: ssh_bridge_host().unwrap(),
+            module_path: String::new(),
+        };
+        let script = format!(
+            "[Console]::Out.Write(('x' * {}));",
+            MAX_SCRIPT_OUTPUT + 65536
+        );
+        assert!(
+            execute(&host, &script, Duration::from_secs(10), &mut |_| {})
+                .unwrap_err()
+                .contains("容量限制")
+        );
+    }
+
     #[test]
     fn explicit_preference_is_not_silently_replaced() {
         assert_eq!(
