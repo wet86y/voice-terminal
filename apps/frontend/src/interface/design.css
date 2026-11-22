@@ -1,3 +1,4 @@
+@import "../../../desktop/boot/startup.css";
 /* 共享设计系统：正式页面与视觉预览使用同一份颜色、尺寸、布局与动效。 */
 :root {
   color-scheme: dark;
@@ -30,6 +31,11 @@
   --font-metric: 1.375rem; /* font-metric（响应数字）：默认 22 像素。 */
   --control-height: 2.5rem; /* control-height（主要按钮最小高度）：默认 40 像素。 */
   --compact-control-height: 2rem; /* compact-control-height（次要按钮最小高度）：默认 32 像素。 */
+  --dialog-backdrop: #05070bbd; /* dialog-backdrop（模态遮罩）：所有业务弹窗共用。 */
+  --dialog-width: 500px; /* dialog-width（普通弹窗宽度上限）。 */
+  --dialog-wide-width: 900px; /* dialog-wide-width（编辑与长内容弹窗宽度上限）。 */
+  --dialog-gap: 20px; /* dialog-gap（弹窗标题、内容与操作区间距）。 */
+  --dialog-padding: 24px; /* dialog-padding（弹窗内容边距）。 */
 }
 * {
   box-sizing: border-box;
@@ -77,7 +83,9 @@ textarea {
     border-color var(--duration),
     background-color var(--duration),
     color var(--duration),
-    opacity var(--duration);
+    opacity var(--duration),
+    filter var(--button-feedback-duration),
+    translate var(--button-feedback-duration);
 }
 button:focus-visible,
 input:focus-visible,
@@ -301,9 +309,7 @@ select option {
   padding: 6px;
   color: var(--muted);
 }
-.time-picker-trigger:hover:not(:disabled),
 .time-picker.opened .time-picker-trigger,
-.date-picker-trigger:hover:not(:disabled),
 .date-picker.opened .date-picker-trigger {
   color: var(--accent);
   background: #b2baff12;
@@ -385,9 +391,6 @@ select option {
   line-height: 1.5;
   font-variant-numeric: tabular-nums;
 }
-.time-picker-options button:hover:not(:disabled) {
-  background: #b2baff12;
-}
 .time-picker-options button[aria-selected="true"] {
   color: var(--accent);
   background: #b2baff20;
@@ -430,9 +433,6 @@ select option {
   color: var(--text);
   font-size: var(--font-body);
   font-variant-numeric: tabular-nums;
-}
-.date-picker-panel button:hover:not(:disabled) {
-  background: #b2baff12;
 }
 .date-picker-panel button:focus-visible {
   outline: 1px solid #b2baff80;
@@ -516,9 +516,6 @@ select option {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.weekday-picker:hover:not(:disabled) {
-  border-color: #b2baff50;
-}
 .weekday-picker.opened,
 .weekday-picker:focus-visible {
   border-color: var(--accent);
@@ -575,9 +572,6 @@ select option {
   line-height: 1.5;
   text-align: start;
 }
-.weekday-picker-options button:hover:not(:disabled) {
-  background: #b2baff12;
-}
 .weekday-picker-options button[aria-selected="true"] {
   color: var(--accent);
   background: #b2baff20;
@@ -599,9 +593,6 @@ select option {
   border-radius: 6px;
   color: var(--accent);
   font-size: var(--font-body);
-}
-.weekday-picker-done:hover {
-  background: #b2baff12;
 }
 fieldset {
   border: 1px solid var(--line);
@@ -712,9 +703,15 @@ time {
   color: var(--muted);
   border-color: var(--line-strong);
 }
+.button-danger {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
 .button-danger,
 .danger-action,
 .confirm-delete-action {
+  --button-feedback-color: var(--danger);
+  --button-hover-wash: color-mix(in srgb, var(--button-feedback-color) 8%, transparent);
   color: var(--danger);
 }
 .ghost-action,
@@ -726,11 +723,6 @@ time {
   min-height: var(--compact-control-height);
   font-size: var(--font-caption);
   line-height: 1.5;
-}
-.ghost-action:hover,
-.outline-button:hover {
-  color: var(--text);
-  background: #ffffff05;
 }
 .workbench {
   /* 三栏等宽；breakpoint（布局阈值）只改变展示数量，不改变会话与代理状态。 */
@@ -800,12 +792,6 @@ time {
 }
 .conversation-column .workbench-settings-button {
   align-self: flex-start;
-}
-.workbench-settings-button:hover,
-.settings-back-button:hover {
-  border-color: #b2baff45;
-  background: #b2baff0e;
-  color: var(--text);
 }
 .compact-settings-button {
   display: none;
@@ -1024,13 +1010,10 @@ time {
   gap: 10px;
 }
 .voice-stop-button {
+  --button-hover-wash: #efa0b10b;
   color: var(--text);
   background: #ffffff06;
   border-color: var(--line-strong);
-}
-.voice-stop-button:hover:not(:disabled) {
-  background: #efa0b10b;
-  border-color: #efa0b14a;
 }
 .voice-stop-icon {
   width: 8px;
@@ -1572,10 +1555,6 @@ time {
   color: var(--subtle);
   font-size: 10px;
 }
-.settings-sidebar-actions button:hover {
-  color: var(--text);
-  background: #ffffff05;
-}
 .settings-tabs button {
   display: grid;
   grid-template-columns: 30px minmax(0, 1fr);
@@ -1598,9 +1577,6 @@ time {
   display: block;
   font-size: var(--font-caption);
   margin-top: 2px;
-}
-.settings-tabs button:hover {
-  background: #ffffff04;
 }
 .settings-tabs button.active {
   color: #e1e4ff;
@@ -1695,6 +1671,18 @@ time {
 .instruction-toggle input:focus-visible + i {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
+}
+/* 开关反馈只改变轨道亮度，保留滑块自身的启停位移。 */
+:is(.switch-row, .instruction-toggle, .voice-toggle) input + :is(i, span) {
+  transition: background-color var(--duration), filter var(--button-feedback-duration);
+}
+@media (hover: hover) {
+  :is(.switch-row, .instruction-toggle, .voice-toggle) input:enabled:hover + :is(i, span) {
+    filter: brightness(var(--button-hover-brightness));
+  }
+}
+:is(.switch-row, .instruction-toggle, .voice-toggle) input:enabled:active + :is(i, span) {
+  filter: brightness(var(--button-press-brightness));
 }
 .form-field {
   display: block;
@@ -2991,10 +2979,6 @@ time {
 .wake-task-summary .wake-task-button.danger-action {
   color: var(--danger);
 }
-.wake-task-summary .wake-task-button.danger-action:hover:not(:disabled) {
-  border-color: #efa0b150;
-  background: #efa0b108;
-}
 .wake-task-editor {
   display: grid;
   gap: 16px;
@@ -3165,39 +3149,86 @@ time {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 1001;
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
   display: grid;
   place-items: center;
-  padding: 24px;
-  background: #05070bbd;
+  padding: clamp(12px, 3vw, 24px);
+  overflow: hidden;
+  color: var(--text);
+  background: var(--dialog-backdrop);
 }
+.modal-backdrop:not([open]) { display: none; }
+.modal-backdrop::backdrop { background: transparent; }
 .apply-dialog {
-  max-width: 500px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--dialog-gap);
+  max-width: var(--dialog-width);
   width: 100%;
-  max-height: calc(100vh - 48px);
-  overflow: auto;
-  padding: 28px;
+  min-width: 0;
+  max-height: 100%;
+  overflow: hidden;
+  padding: var(--dialog-padding);
   border: 1px solid var(--line-strong);
-  border-radius: 20px;
+  border-radius: var(--radius);
   background: var(--panel);
-  box-shadow: 0 24px 70px #0009;
+  box-shadow: 0 16px 48px #0006;
+  outline: none;
+  animation: dialog-appear var(--duration) ease-out;
 }
 .apply-dialog-wide {
-  max-width: min(900px, calc(100vw - 48px));
+  max-width: var(--dialog-wide-width);
 }
-.apply-dialog h2 {
-  margin: 8px 0 14px;
-}
-.apply-dialog > p:not(.panel-kicker),
-.apply-dialog li {
-  color: var(--muted);
-  font-size: 11px;
-}
-.apply-dialog > footer {
+.dialog-header {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  flex: none;
+}
+.dialog-heading { min-width: 0; }
+.dialog-heading .panel-kicker { margin-bottom: 6px; }
+.dialog-heading h2 { font-size: var(--font-heading); line-height: 1.4; overflow-wrap: anywhere; }
+.dialog-header-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.dialog-body {
+  /* 保持插槽内容的自然高度，不向嵌套列表传递可压缩的网格行高。 */
+  display: block;
+  color: var(--muted);
+  font-size: var(--font-body);
+  line-height: 1.65;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+.dialog-body > :where(:not([hidden]) ~ :not([hidden])) { margin-block-start: 12px; }
+.dialog-body > p,
+.dialog-body li {
+  color: var(--muted);
+  font-size: var(--font-body);
+}
+/* 滚动边缘也保留完整焦点边线。 */
+.dialog-body :focus-visible { outline-offset: -2px; }
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   justify-content: end;
-  margin-top: 24px;
+  flex: none;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.dialog-actions button { min-height: var(--compact-control-height); padding: 6px 12px; font-size: var(--font-body); }
+@keyframes dialog-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (max-width: 480px), (max-height: 480px) {
+  .modal-backdrop { --dialog-padding: 16px; --dialog-gap: 14px; }
 }
 .application-degraded {
   width: calc(100% - var(--shell-inset) * 2);
@@ -3206,17 +3237,13 @@ time {
   flex: none;
 }
 .save-notice-enter-active,
-.save-notice-leave-active,
-.dialog-enter-active,
-.dialog-leave-active {
+.save-notice-leave-active {
   transition:
     opacity 160ms,
     transform 160ms;
 }
 .save-notice-enter-from,
-.save-notice-leave-to,
-.dialog-enter-from,
-.dialog-leave-to {
+.save-notice-leave-to {
   opacity: 0;
   transform: translateY(8px);
 }
@@ -3473,5 +3500,4 @@ time {
 .fixed-credentials-footer p { color: var(--subtle); font-size: var(--font-caption); line-height: 1.7; }
 .wake-task-tabs { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); background: #ffffff02; padding: 4px; border-radius: 10px; }
 .wake-task-tabs button { min-height: var(--compact-control-height); padding: 5px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); font-size: var(--font-body); }
-.wake-task-tabs button:hover { background: #ffffff06; color: var(--text); }
 .wake-task-tabs button.active { color: var(--accent); background: #b2baff12; border-color: #b2baff20; }

@@ -159,7 +159,7 @@ function formatBytes(value: number | null | undefined) {
 .update-error{margin:0;padding:10px 12px;border-radius:9px;background:#efa0b10a;color:var(--danger);font-size:var(--font-body);line-height:1.6;overflow-wrap:anywhere;white-space:pre-wrap}
 .update-about{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:14px;border-top:1px solid var(--line);font-size:var(--font-body);color:var(--muted)}
 .update-about strong{margin-left:6px;font-weight:500;color:var(--text)}
-.release-history{display:grid;gap:10px;min-height:0;max-height:min(60vh,640px);overflow:auto;padding:2px 6px 2px 0;margin-top:18px}
+.release-history{display:grid;grid-auto-rows:max-content;gap:10px;min-width:0}
 .release-history-entry{min-width:0;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .release-history-toggle{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 16px;width:100%;padding:16px 18px;border:0;border-radius:0;text-align:left;background:var(--panel-soft);color:var(--text)}
 .release-history-version{display:flex;align-items:center;gap:10px;font-size:var(--font-section);font-weight:600}

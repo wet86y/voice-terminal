@@ -229,7 +229,6 @@ function add() {
 .hotword-pagination{grid-column:2;grid-row:1;justify-self:end;display:flex;align-items:center;gap:4px;min-width:0;max-width:100%;overflow-x:auto;white-space:nowrap}
 .hotword-pagination .hotword-page-edge{min-height:30px;padding:4px 7px;font-size:var(--font-caption);white-space:nowrap}
 .hotword-page-number{display:inline-flex;align-items:center;justify-content:center;flex:0 0 30px;min-width:30px;height:30px;padding:0 4px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted);font:inherit;font-size:var(--font-caption);cursor:pointer}
-.hotword-page-number:hover{border-color:var(--line-strong);color:var(--text)}
 .hotword-page-number.is-current{border-color:var(--accent);background:#ffffff0a;color:var(--accent);font-weight:600}
 .hotword-page-ellipsis{display:inline-flex;align-items:center;justify-content:center;flex:0 0 14px;color:var(--muted);font-size:var(--font-caption)}
 .hotword-count{white-space:nowrap}

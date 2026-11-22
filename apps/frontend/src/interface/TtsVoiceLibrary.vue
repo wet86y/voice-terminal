@@ -626,7 +626,6 @@ async function cancel(draft: VoiceDraft) {
 .expression-card { flex: 0 0 auto; min-width: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .expression-summary { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 7px 12px; }
 .expression-expand { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; min-height: 30px; padding: 3px 2px; border: 0; background: transparent; color: inherit; text-align: left; }
-.expression-expand:hover { color: var(--accent); }
 .expression-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .expression-expand span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .expression-chevron { width: 12px; height: 12px; flex: 0 0 12px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: transform 140ms; }
@@ -646,7 +645,7 @@ async function cancel(draft: VoiceDraft) {
 .voice-inputs .form-field { min-width: 0; }
 .voice-reference { display: grid; gap: 8px; min-width: 0; }.reference-input { min-width: 0; }
 .attachment-upload { position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 72px; padding: 12px; border: 1px dashed var(--line-strong); background: #10141d; border-radius: 10px; cursor: pointer; }
-.attachment-upload:hover:not(.disabled),.attachment-upload:focus-within { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, #10141d); }
+label.attachment-upload:hover:not(.disabled),.attachment-upload:focus-within { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, #10141d); }
 .attachment-upload:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
 .attachment-upload.disabled { opacity: .45; cursor: not-allowed; }.attachment-upload input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: inherit; }
 .attachment-upload svg { width: 22px; height: 22px; fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }

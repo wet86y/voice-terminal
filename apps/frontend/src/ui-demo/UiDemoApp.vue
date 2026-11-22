@@ -321,33 +321,19 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
           ></template
         ></UiDialog
       >
-      <div
-        v-if="overlay === 'startup'"
-        class="application-startup"
-        @click.self="closeOverlays"
+      <UiDialog
+        :open="overlay === 'startup'"
+        :title="scene === 'error' ? '启动需要检查' : scene === 'empty' ? '等待启动系统' : '正在启动系统'"
+        kicker="启动检查"
+        wide
+        @close="closeOverlays"
       >
-        <section
-          class="application-startup-card"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="preview-startup-title"
-        >
-          <span class="application-brand">VOICE TERMINAL（语音终端）</span>
-          <h1 id="preview-startup-title">
-            {{
-              scene === "error"
-                ? "启动需要检查"
-                : scene === "empty"
-                  ? "等待启动系统"
-                  : "正在启动系统"
-            }}
-          </h1>
-          <div class="application-startup-progress">
+          <div class="preview-startup-progress">
             <span>已完成 {{ scene === "empty" ? 0 : 3 }} / 5 项启动检查</span
             ><span>已耗时 8 秒</span>
           </div>
-          <progress :value="scene === 'empty' ? 0 : 3" max="5"></progress>
-          <ul>
+          <progress class="preview-startup-bar" :value="scene === 'empty' ? 0 : 3" max="5" aria-label="启动检查进度"></progress>
+          <ul class="preview-startup-checks">
             <li
               v-for="(component, index) in demoSystemComponents"
               :key="component.id"
@@ -370,8 +356,10 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
               <small>{{ component.phase }}</small>
             </li>
           </ul>
-          <div class="application-startup-actions">
+          <template #actions>
+            <button class="outline-button" type="button" @click="closeOverlays">关闭预览</button>
             <button
+              class="outline-button"
               type="button"
               @click="
                 page = 'compute';
@@ -380,6 +368,7 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
             >
               查看本地组件</button
             ><button
+              class="save-button"
               type="button"
               @click="
                 notify('重试启动组件');
@@ -387,10 +376,9 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
               "
             >
               重试失败组件</button
-            ><button type="button" @click="closeOverlays">关闭预览蒙版</button>
-          </div>
-        </section>
-      </div>
+            >
+          </template>
+      </UiDialog>
       <button
         v-if="!toolsOpen"
         class="preview-tools-trigger"

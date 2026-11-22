@@ -190,7 +190,7 @@ function formatBytes(value: number | null | undefined) {
 .workspace-confirm-copy{display:grid;gap:14px;margin:16px 0;color:var(--muted);font-size:var(--font-body);line-height:1.55}
 .workspace-confirm-copy dl{padding:12px;border:1px solid var(--line);border-radius:10px}
 .workspace-confirm-button{min-height:var(--compact-control-height);padding:7px 14px}
-.cleanup-entries{display:grid;gap:10px;max-height:40vh;overflow:auto;list-style:none;margin:0;padding:12px;border:1px solid var(--line);border-radius:10px}
+.cleanup-entries{display:grid;grid-auto-rows:max-content;gap:10px;list-style:none;margin:0;padding:12px;border:1px solid var(--line);border-radius:10px}
 .cleanup-entries li{display:grid;gap:2px;overflow-wrap:anywhere}
 .cleanup-entries strong{color:var(--text);font-weight:600}
 .cleanup-entries span{font-size:var(--font-caption)}

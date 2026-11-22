@@ -30,6 +30,7 @@ const draft = ref(display.value) // draft（直接输入的日期文字）。
 const editing = ref(false), opened = ref(false) // editing（输入中）、opened（日历已展开）。
 const month = ref(current.value), focused = ref(dateValue(current.value)) // month（展示月份）、focused（键盘所在日期）。
 const field = ref<HTMLInputElement>(), trigger = ref<HTMLButtonElement>(), panel = ref<HTMLElement>()
+const panelTarget = computed(() => trigger.value?.closest('dialog') ?? 'body') // panelTarget（面板挂载位置）：留在模态区域内以保持可操作。
 const instance = useId(), panelId = `date-picker-${instance}`, monthId = `${panelId}-month`
 const anchorName = `--date-picker-${instance}` // anchorName（日历定位锚点）。
 const weekdays = ['一', '二', '三', '四', '五', '六', '日']
@@ -150,7 +151,7 @@ function panelKeydown(event: KeyboardEvent) {
     <input ref="field" :value="draft" type="text" placeholder="年/月/日" maxlength="10" autocomplete="off" spellcheck="false" :aria-label="label" role="combobox" aria-haspopup="dialog" aria-autocomplete="none" :aria-expanded="opened" :aria-controls="panelId" :disabled="disabled" @focus="editing = true" @input="inputDate" @blur="commitEdit" @keydown="fieldKeydown" />
     <button ref="trigger" class="date-picker-trigger" type="button" :popovertarget="panelId" :aria-label="`选择${label}`" :title="`选择${label}`" aria-haspopup="dialog" :aria-expanded="opened" :aria-controls="panelId" :disabled="disabled"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="14" rx="2" /><path d="M8 3v6m8-6v6M4 11h16" /></svg></button>
   </div>
-  <Teleport to="body">
+  <Teleport :to="panelTarget">
     <div :id="panelId" ref="panel" class="date-picker-panel" popover="auto" role="dialog" :aria-label="`${label}选择`" :style="{ 'position-anchor': anchorName }" @beforetoggle="beforeToggle" @toggle="afterToggle" @keydown="panelKeydown" @wheel="containPickerWheel">
       <div class="date-picker-heading">
         <button type="button" aria-label="上个月" :disabled="month.getFullYear() === 1000 && month.getMonth() === 0" @click="moveMonth(-1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg></button>

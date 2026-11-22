@@ -6,6 +6,7 @@ import { computed, reactive, ref, toRef, watch } from 'vue'
 import SilenceTimeoutControl from '../interface/SilenceTimeoutControl.vue'
 import LocalComponents from '../interface/LocalComponents.vue'
 import SettingsPageHeader from '../interface/SettingsPageHeader.vue'
+import UiDialog from '../interface/UiDialog.vue'
 import AppUpdateCard from '../interface/AppUpdateCard.vue'
 import WorkspaceLocationCard from '../interface/WorkspaceLocationCard.vue'
 import type { AppUpdateStatus } from '../interface/app-update'
@@ -307,9 +308,7 @@ function cancelTask(item: DemoWakeTask) {
       <AppUpdateCard :status="updatePreview" :integrity="integrityPreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消下载')" @download-integrity="integrityReady = true; feedback('模拟已下载本地 v0.9.0 对应构建的校验程序')" @check-integrity="feedback('模拟关闭程序，由对应版本分发器校验并修复工作区')" @repository="feedback('项目仓库：https://github.com/wet86y/voice-terminal')" />
       <WorkspaceLocationCard :root="scene === 'long' ? `D:\\语音终端\\${longIdentifier}\\工作区` : 'D:\\语音终端\\工作区'" can-manage @cleanup="feedback('模拟检查工作区的可回收文件')" @migrate="feedback('模拟选择目标目录并确认工作区迁移')" />
     </template>
-    <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">
-      <section role="dialog" aria-modal="true" aria-labelledby="demo-bundle-title" class="demo-bundle-dialog">
-        <h3 id="demo-bundle-title">准备下载 {{ pendingDemoBundle.title }}</h3>
+    <UiDialog v-if="pendingDemoBundle" open class="demo-bundle-dialog" :title="`准备下载 ${pendingDemoBundle.title}`" @close="pendingDemoBundle = null">
         <p>清单列出本分类组件与共享依赖；已就绪的资源会跳过。演示不会执行真实下载。</p>
         <ul><li v-for="entry in pendingDemoBundle.entries" :key="entry.id || entry.label">
           <label v-if="entry.optional && entry.id && (entry.state !== 'installed' || entry.updateAvailable)" class="demo-bundle-choice"><input type="checkbox" :checked="selectedDemoResources.has(entry.id)" @change="selectDemoResource(entry.id, ($event.target as HTMLInputElement).checked)"><strong>{{ entry.label }}</strong></label>
@@ -317,9 +316,8 @@ function cancelTask(item: DemoWakeTask) {
           <span>{{ entry.busy ? '任务处理中' : entry.updateAvailable ? '需更新' : entry.state === 'installed' ? '已就绪，跳过' : entry.status || '待下载' }}</span>
           <small v-if="entry.note">{{ entry.note }}</small>
         </li></ul>
-        <div class="demo-bundle-actions"><button class="outline-button" type="button" @click="confirmDemoBundle">确认清单</button><button class="outline-button" type="button" @click="pendingDemoBundle = null">返回</button></div>
-      </section>
-    </div>
+        <template #actions><button class="outline-button" type="button" @click="pendingDemoBundle = null">返回</button><button class="save-button" type="button" @click="confirmDemoBundle">确认清单</button></template>
+    </UiDialog>
   </article>
 </template>
 
@@ -329,5 +327,5 @@ function cancelTask(item: DemoWakeTask) {
 </style>
 
 <style scoped>
-.demo-bundle-backdrop{position:fixed;inset:0;z-index:100;background:#000a;display:grid;place-items:center;padding:24px}.demo-bundle-dialog{width:min(640px,100%);max-height:80vh;overflow:auto;padding:24px;border:1px solid var(--line-strong);border-radius:18px;background:var(--panel)}.demo-bundle-dialog>p,.demo-bundle-dialog li{font-size:var(--font-caption);line-height:1.7;color:var(--muted)}.demo-bundle-dialog ul{display:grid;gap:8px;padding:0;list-style:none}.demo-bundle-dialog li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px}.demo-bundle-dialog li strong{color:var(--text)}.demo-bundle-choice{display:flex;gap:8px;align-items:center}.demo-bundle-choice input{accent-color:var(--accent)}.demo-bundle-actions{display:flex;gap:8px;justify-content:flex-end}
+.demo-bundle-dialog{--dialog-width:640px}.demo-bundle-dialog ul{display:grid;gap:8px;padding:0;margin:0;list-style:none}.demo-bundle-dialog li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px}.demo-bundle-dialog li strong{color:var(--text)}.demo-bundle-choice{display:flex;gap:8px;align-items:center}.demo-bundle-choice input{accent-color:var(--accent)}
 </style>

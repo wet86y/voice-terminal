@@ -65,7 +65,6 @@ function toggle(event: Event) {
 .instruction-card.enabled{border-color:color-mix(in srgb,var(--mint) 42%,transparent)}
 .instruction-heading{display:flex;align-items:center;gap:10px;min-width:0}
 .instruction-name{flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:0;padding:6px 0;font-weight:570;color:var(--text);cursor:pointer}
-.instruction-name:hover{color:var(--accent)}
 .instruction-name:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:4px}
 .instruction-name-input{flex:1;min-width:0;max-width:100%;height:32px;min-height:32px;padding:5px 9px;font-weight:570}
 .instruction-collapse{flex-shrink:0;padding:6px 11px}

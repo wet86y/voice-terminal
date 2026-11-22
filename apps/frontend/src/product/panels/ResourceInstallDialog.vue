@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import UiDialog from '../../interface/UiDialog.vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 import type { LocalDownloadItem } from '../../interface/local-components'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
@@ -64,20 +65,17 @@ function confirmBundle() {
 }
 </script>
 <template>
-  <div v-if="controller.pendingResetPlan?.value" class="install-plan-backdrop">
-    <section role="dialog" aria-modal="true" aria-labelledby="reset-plan-title" class="install-plan panel">
-      <h2 id="reset-plan-title">{{ deletingModel ? '删除模型' : '重置组件' }}</h2>
+  <UiDialog v-if="controller.pendingResetPlan?.value" open class="install-plan-dialog" title-id="reset-plan-title" :title="deletingModel ? '删除模型' : '重置组件'" @close="controller.pendingResetPlan.value = null">
       <p>{{ controller.pendingResetPlan.value.message }}</p>
       <p>{{ deletingModel ? '确认后将删除模型和所属音色包，开始删除后不可取消。再次使用需重新导入。' : '确认后将完全删除以下组件文件与缓存，开始删除后不可取消。完成后请自行选择下载或导入。' }}</p>
       <ul><li v-for="path in controller.pendingResetPlan.value.paths" :key="path">{{ path }}</li></ul>
       <template v-if="deletingModel"><p>同时移除该模型全部音色条目、历史版本和默认参考设置。</p><ul><li v-for="path in controller.pendingResetPlan.value.voice_paths" :key="path">{{ path }}</li></ul></template>
-      <button class="outline-button" @click="controller.pendingResetPlan.value = null">取消</button>
-      <button class="outline-button" @click="controller.confirmReset()">{{ deletingModel ? '确认删除' : '确认重置' }}</button>
-    </section>
-  </div>
-  <div v-if="controller.pendingDownloadPlan.value" class="install-plan-backdrop">
-    <section role="dialog" aria-modal="true" aria-labelledby="install-plan-title" class="install-plan panel">
-      <h2 id="install-plan-title">{{ updatePending ? '准备更新' : '准备下载' }} {{ controller.pendingDownloadPlan.value.title }}</h2>
+      <template #actions><div class="install-plan-actions">
+        <button class="outline-button" type="button" @click="controller.pendingResetPlan.value = null">取消</button>
+        <button class="outline-button danger-action" type="button" @click="controller.confirmReset()">{{ deletingModel ? '确认删除' : '确认重置' }}</button>
+      </div></template>
+  </UiDialog>
+  <UiDialog v-if="controller.pendingDownloadPlan.value" open class="install-plan-dialog" title-id="install-plan-title" :title="`${updatePending ? '准备更新' : '准备下载'} ${controller.pendingDownloadPlan.value.title}`" @close="controller.pendingDownloadPlan.value = null">
       <p v-if="controller.pendingDownloadPlan.value.download_sources?.length">下载来源：{{ controller.pendingDownloadPlan.value.download_sources.join('、') }}。优先使用镜像，不可用时尝试原站；所有文件按固定大小和摘要校验。</p>
       <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
@@ -99,17 +97,14 @@ function confirmBundle() {
           </details>
         </template>
       </template>
-      <div class="install-plan-actions">
-        <button class="outline-button" @click="controller.confirmDownload">
+      <template #actions><div class="install-plan-actions">
+        <button class="outline-button" type="button" @click="controller.pendingDownloadPlan.value = null">返回</button>
+        <button class="save-button" type="button" @click="controller.confirmDownload">
           {{ controller.pendingDownloadPlan.value.environment ? updatePending ? (lightweightVadPlan ? '开始更新并补齐依赖' : '开始更新并配置') : (lightweightVadPlan ? '开始下载并补齐依赖' : '开始下载并配置') : updatePending ? '开始更新' : '开始下载' }}
         </button>
-        <button class="outline-button" @click="controller.pendingDownloadPlan.value = null">返回</button>
-      </div>
-    </section>
-  </div>
-  <div v-if="controller.pendingDownloadBundlePlan.value" class="install-plan-backdrop">
-    <section role="dialog" aria-modal="true" aria-labelledby="install-bundle-title" class="install-plan panel">
-      <h2 id="install-bundle-title">准备下载 {{ controller.pendingDownloadBundlePlan.value.title }}</h2>
+      </div></template>
+  </UiDialog>
+  <UiDialog v-if="controller.pendingDownloadBundlePlan.value" open class="install-plan-dialog" title-id="install-bundle-title" :title="`准备下载 ${controller.pendingDownloadBundlePlan.value.title}`" @close="controller.pendingDownloadBundlePlan.value = null">
       <p>清单包含本分类资源、在线配置项和内置能力。已安装资源会跳过；确认后所选资源会并行启动下载，共用运行环境由资源管理器协调与复用。</p>
       <ul class="install-bundle-list">
         <li v-for="entry in bundleEntries" :key="entry.id || entry.label">
@@ -141,12 +136,27 @@ function confirmBundle() {
           </details>
         </template>
       </template>
-      <div class="install-plan-actions">
-        <button class="outline-button" :disabled="!selectedBundlePlans.length" @click="confirmBundle">{{ selectedBundlePlans.length ? `开始下载 ${selectedBundlePlans.length} 项` : bundlePlans.length ? hasOptionalBundlePlans ? '请选择可选组件' : '暂无可下载资源' : bundleOnlyBusy ? '已有任务处理中' : '资源已就绪，无需下载' }}</button>
-        <button class="outline-button" @click="controller.pendingDownloadBundlePlan.value = null">返回</button>
-      </div>
-    </section>
-  </div>
-  <div v-if="controller.pendingImport.value" class="install-plan-backdrop"><section role="dialog" aria-modal="true" aria-label="确认导入内容" class="install-plan panel"><h2>已识别的资源</h2><p>整包文件与固定版本校验已通过。相同且完整的资源会跳过；导入未附带的运行依赖需要另行配置。</p><p v-for="item in controller.pendingImport.value.import_preview" :key="item.resource_id">{{ item.title }} · {{ item.version }}（固定版本）</p><div class="install-plan-actions"><button class="outline-button" @click="controller.confirmImport(true)">开始导入</button><button class="outline-button" @click="controller.confirmImport(false)">取消</button></div></section></div>
+      <template #actions><div class="install-plan-actions">
+        <button class="outline-button" type="button" @click="controller.pendingDownloadBundlePlan.value = null">返回</button>
+        <button class="save-button" type="button" :disabled="!selectedBundlePlans.length" @click="confirmBundle">{{ selectedBundlePlans.length ? `开始下载 ${selectedBundlePlans.length} 项` : bundlePlans.length ? hasOptionalBundlePlans ? '请选择可选组件' : '暂无可下载资源' : bundleOnlyBusy ? '已有任务处理中' : '资源已就绪，无需下载' }}</button>
+      </div></template>
+  </UiDialog>
+  <UiDialog v-if="controller.pendingImport.value" open class="install-plan-dialog" title="已识别的资源" @close="controller.confirmImport(false)">
+    <p>整包文件与固定版本校验已通过。相同且完整的资源会跳过；导入未附带的运行依赖需要另行配置。</p>
+    <p v-for="item in controller.pendingImport.value.import_preview" :key="item.resource_id">{{ item.title }} · {{ item.version }}（固定版本）</p>
+    <template #actions><div class="install-plan-actions">
+      <button class="outline-button" type="button" @click="controller.confirmImport(false)">取消</button>
+      <button class="save-button" type="button" @click="controller.confirmImport(true)">开始导入</button>
+    </div></template>
+  </UiDialog>
 </template>
-<style scoped>.install-plan-backdrop{position:fixed;inset:0;background:#000a;z-index:100;display:grid;place-items:center;padding:24px}.install-plan{padding:24px;max-width:640px;max-height:80vh;overflow:auto;width:100%}.install-plan p{font-size:12px;color:#a4aec0;line-height:1.8}.install-plan h2{font-size:17px}.install-bundle-list{display:grid;gap:10px;padding:0;list-style:none}.install-bundle-list li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:12px;color:#a4aec0;line-height:1.7}.install-bundle-list strong{font-size:13px;color:var(--text)}.install-bundle-choice{display:flex;align-items:center;gap:9px}.install-bundle-choice input{accent-color:var(--accent)}.bundle-entry-state{font-weight:600;color:var(--text)}.install-plan-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px}</style>
+<style scoped>
+.install-plan-dialog{--dialog-width:640px}
+.install-bundle-list{display:grid;gap:10px;margin:0;padding:0;list-style:none}
+.install-bundle-list li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:var(--font-body);color:var(--muted);line-height:1.7}
+.install-bundle-list strong{font-size:var(--font-body);color:var(--text)}
+.install-bundle-choice{display:flex;align-items:center;gap:9px}
+.install-bundle-choice input{accent-color:var(--accent)}
+.bundle-entry-state{font-weight:600;color:var(--text)}
+.install-plan-actions{display:contents}
+</style>

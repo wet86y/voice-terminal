@@ -1,3 +1,45 @@
+/* 最小共享界面层：独立入口直接加载，完整界面从 design.css（设计系统）导入。 */
+:root {
+  --button-feedback-duration: 120ms; /* button-feedback-duration（按钮反馈时长）。 */
+  --button-feedback-color: #ffffff; /* button-feedback-color（悬停叠色）：危险操作可使用危险色。 */
+  --button-hover-wash: color-mix(in srgb, var(--button-feedback-color) 6%, transparent); /* button-hover-wash（悬停薄层）。 */
+  --button-press-wash: #00000024; /* button-press-wash（按下薄层）。 */
+  --button-press-offset: 1px; /* button-press-offset（按下位移）：不改变布局与原有变换。 */
+  --button-hover-brightness: 1.06; /* button-hover-brightness（悬停亮度）：按钮与开关共用。 */
+  --button-press-brightness: .94; /* button-press-brightness（按下亮度）。 */
+}
+:is(button, input[type="button"], input[type="submit"], input[type="reset"], [role="button"], summary) {
+  cursor: pointer;
+  transition: border-color var(--button-feedback-duration), background-color var(--button-feedback-duration),
+    color var(--button-feedback-duration), opacity var(--button-feedback-duration),
+    filter var(--button-feedback-duration), translate var(--button-feedback-duration);
+}
+/* 叠色保留原背景、选中态及日期标记；独立 translate（位移）保留选择器的居中变换。 */
+@media (hover: hover) {
+  :is(button:enabled, input[type="button"]:enabled, input[type="submit"]:enabled, input[type="reset"]:enabled, [role="button"], summary):not(:disabled, [aria-disabled="true"], [aria-busy="true"], .dragging):hover {
+    background-image: linear-gradient(var(--button-hover-wash), var(--button-hover-wash));
+    filter: brightness(var(--button-hover-brightness));
+  }
+}
+:is(button:enabled, input[type="button"]:enabled, input[type="submit"]:enabled, input[type="reset"]:enabled, [role="button"], summary):not(:disabled, [aria-disabled="true"], [aria-busy="true"], .dragging):active {
+  background-image: linear-gradient(var(--button-press-wash), var(--button-press-wash));
+  filter: brightness(var(--button-press-brightness));
+  translate: 0 var(--button-press-offset);
+}
+:is(button, input[type="button"], input[type="submit"], input[type="reset"], [role="button"], summary):focus-visible {
+  outline: 2px solid var(--accent, #b2baff);
+  outline-offset: 3px;
+}
+:is(button, input[type="button"], input[type="submit"], input[type="reset"], [role="button"]):is(:disabled, [aria-disabled="true"]) {
+  cursor: not-allowed;
+  opacity: .45;
+}
+@media (prefers-reduced-motion: reduce) {
+  :is(button, input[type="button"], input[type="submit"], input[type="reset"], [role="button"], summary) {
+    --button-press-offset: 0px;
+    transition: none;
+  }
+}
 /* Startup screen（启动画面）：原生入口、桌面预检与产品共用。 */
 .startup-screen{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:32px 24px;overflow:auto;box-sizing:border-box;color:var(--text,#edf0f7);background:var(--bg,#0e1118);font-family:Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color-scheme:dark}
 .startup-content{width:min(320px,100%);margin:auto;text-align:center}
@@ -17,8 +59,7 @@
 .startup-progress-fill{display:block;height:100%;border-radius:inherit;background:var(--mint,#88dbc3);transition:width 220ms ease}
 .startup-progress[data-indeterminate="true"] .startup-progress-fill{width:32%;animation:startup-travel 1.6s ease-in-out infinite}
 .startup-actions{display:flex;justify-content:center;align-items:center;flex-wrap:wrap;gap:12px;margin-top:20px}
-.startup-button{min-height:32px;padding:6px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted,#a3adbf);font:12px/1.5 Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;cursor:pointer;transition:background-color 160ms,color 160ms}
-.startup-button:hover:not(:disabled){color:var(--text,#edf0f7);background:var(--panel-soft,#202530)}
+.startup-button{min-height:32px;padding:6px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted,#a3adbf);font:12px/1.5 Inter,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;cursor:pointer}
 .startup-button:focus-visible{outline:2px solid var(--accent,#b2baff);outline-offset:3px}
 .startup-button:disabled{opacity:.45;cursor:default}
 .startup-screen [hidden]{display:none!important}

@@ -32,6 +32,7 @@ const editing = ref(false); // editing（是否正在直接输入）。
 const opened = ref(false); // opened（时间面板是否展开）。
 const field = ref<HTMLInputElement>(); // field（时间输入框）。
 const trigger = ref<HTMLButtonElement>(); // trigger（时钟按钮）。
+const panelTarget = computed(() => trigger.value?.closest('dialog') ?? 'body'); // panelTarget（面板挂载位置）：保持在当前模态区域内。
 const panel = ref<HTMLElement>(); // panel（浮动时间面板）。
 const instanceId = useId(); // instanceId（每个时间控件的唯一标识）。
 const panelId = `time-picker-${instanceId}`;
@@ -187,7 +188,7 @@ function columnKeydown(event: KeyboardEvent, part: TimePart) {
       :disabled="disabled"
     ><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 7v5l3 2" /></svg></button>
   </div>
-  <Teleport to="body">
+  <Teleport :to="panelTarget">
     <div
       :id="panelId"
       ref="panel"

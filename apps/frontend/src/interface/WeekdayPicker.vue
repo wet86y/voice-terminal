@@ -17,6 +17,7 @@ const selectedDays = computed(() => [...new Set(props.modelValue.split(',').filt
 const summary = computed(() => selectedDays.value.length === 7 ? '周一至周日' : selectedDays.value.map(day => labels[day - 1]).join('、')) // summary（收起后的选择摘要）。
 const opened = ref(false), focusedDay = ref(1) // opened（面板已展开）、focusedDay（键盘所在星期）。
 const trigger = ref<HTMLButtonElement>(), panel = ref<HTMLElement>() // trigger（选择框）、panel（浮动面板）。
+const panelTarget = computed(() => trigger.value?.closest('dialog') ?? 'body') // panelTarget（面板挂载位置）：保持在当前模态区域内。
 const instance = useId(), panelId = `weekday-picker-${instance}`
 const anchorName = `--weekday-picker-${instance}` // anchorName（面板定位锚点）。
 
@@ -80,7 +81,7 @@ function panelKeydown(event: KeyboardEvent) {
   <button ref="trigger" class="weekday-picker" :class="{ opened, empty: !summary }" type="button" :style="{ 'anchor-name': anchorName }" :popovertarget="panelId" :title="summary || '选择星期'" :aria-label="`星期：${summary || '未选择'}`" aria-haspopup="dialog" :aria-expanded="opened" :aria-controls="panelId" :disabled="disabled" @keydown="triggerKeydown">
     <span class="weekday-picker-value">{{ summary || '选择星期' }}</span><i aria-hidden="true"></i>
   </button>
-  <Teleport to="body">
+  <Teleport :to="panelTarget">
     <div :id="panelId" ref="panel" class="weekday-picker-panel" popover="auto" role="dialog" aria-label="选择星期" :style="{ 'position-anchor': anchorName }" @beforetoggle="beforeToggle" @toggle="afterToggle" @keydown="panelKeydown" @wheel="containPickerWheel">
       <header class="weekday-picker-heading"><span>选择星期</span><small>可多选</small></header>
       <div class="weekday-picker-options" role="listbox" aria-label="每周触发日期" aria-multiselectable="true" @keydown="optionsKeydown">

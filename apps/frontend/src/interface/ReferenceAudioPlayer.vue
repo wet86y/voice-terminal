@@ -80,7 +80,6 @@ button { display: inline-flex; align-items: center; justify-content: center; fle
 svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .audio-play { width: 36px; height: 36px; padding: 8px; border-radius: 50%; border-color: color-mix(in srgb, var(--accent) 25%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
 .audio-attachment.compact .audio-play { width: 32px; height: 32px; padding: 7px; }
-.audio-play:hover:enabled { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 .audio-details { flex: 1; min-width: 0; display: grid; gap: 7px; }
 .audio-summary { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .audio-summary strong { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: .75rem; }
@@ -94,7 +93,6 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .audio-timeline input::-moz-range-progress { height: 3px; background: var(--accent); }
 .audio-timeline input::-moz-range-thumb { height: 9px; width: 9px; border: 0; border-radius: 50%; background: var(--accent); }
 .audio-timeline small { flex-shrink: 0; font-size: .625rem; font-variant-numeric: tabular-nums; }
-.audio-remove { width: 26px; height: 26px; border-radius: 8px; padding: 4px; color: var(--muted); }
-.audio-remove:hover:enabled { color: var(--danger); border-color: var(--danger); }
+.audio-remove { --button-hover-wash: color-mix(in srgb, var(--danger) 8%, transparent); width: 26px; height: 26px; border-radius: 8px; padding: 4px; color: var(--danger); }
 @media (max-width: 400px) { .audio-attachment { gap: 8px; padding: 10px; }.audio-summary { flex-wrap: wrap; gap: 2px; }.audio-summary strong { flex-basis: 100%; } }
 </style>

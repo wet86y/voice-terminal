@@ -28,6 +28,7 @@
 ## 说明
 
 - [代理调试模式与调用入口](guides/agent-debug.md)
+- [UI（用户界面）资产与开发规范](development/ui-standards.md)
 - [开发资产治理与覆盖更新](development/asset-governance.md)
 - [开发、构建与同包交付流程](development/desktop-pipeline.md)
 - [更新日志填写规范](development/release-notes.md)
@@ -63,6 +64,7 @@
 
 ## 测试
 
+- [公共弹窗嵌套布局回归核验（2026-11-22）](testing/ui-dialog-layout-regression-20261122.md)
 - [测试、启动与现场验收入口](testing/operations-and-quality.md)
 - [代理调试连接与调用工具验收（2026-11-20）](testing/agent-debug-20261120.md)
 - [远程模式首音延迟本地计算（2026-11-19）](testing/remote-latency-local-20261119.md)

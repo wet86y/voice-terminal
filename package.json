@@ -32,8 +32,9 @@
     "github:release:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1 -UpdateLocal",
     "build": "npm run desktop:build",
     "frontend:build": "npm run build --workspace @voice-terminal/frontend",
+    "frontend:check-layout": "node scripts/check-frontend-layout.mjs",
     "typecheck": "npm run typecheck --workspace @voice-terminal/frontend",
-    "test": "npm run test --workspace @voice-terminal/frontend && node --test tests/frontend-dev.test.mjs tests/agent-call.test.mjs tests/agent-debug-contract.test.mjs"
+    "test": "npm run test --workspace @voice-terminal/frontend && node --test tests/frontend-dev.test.mjs tests/agent-call.test.mjs tests/agent-debug-contract.test.mjs && npm run frontend:check-layout"
   },
   "engines": {
     "node": ">=20"
