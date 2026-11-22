@@ -13,7 +13,7 @@
 
 | Component（组件） | Use（用途） | License and retained notice（适用许可及保留声明） |
 | --- | --- | --- |
-| [dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)（远端桌面控制插件） | 设备控制观察缓存派生源码；设备执行工具尚未接入。 | MIT；保留 [上游许可证](licenses/dsh-windows-remote-ssh-MIT.txt)，固定提交、原件摘要及修改记录见 [上游锁](config/dsh/remote-ssh-upstream.lock.json)。构建 DSH（代理执行宿主）功能包时复制该许可证。 |
+| [dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)（远端桌面控制插件） | 设备控制观察缓存的选择性派生源码；项目设备控制子入口现已集成观察、动作、终端、文件及原任务查询，具体边界见[统一插件说明](integrations/dsh/voice-terminal/README.md)。 | MIT（宽松开源许可证）；保留 [上游许可证](licenses/dsh-windows-remote-ssh-MIT.txt)，固定提交、原件摘要及修改记录见 [上游锁](config/dsh/remote-ssh-upstream.lock.json)。构建 DSH（代理执行宿主）功能包时复制该许可证。 |
 | tiktoken（分词器）词表 | 固定摘要的 o200k_base（分词词表）随程序交付，避免首次运行下载。 | MIT；保留 [词表许可证](config/resources/assets/tokenizers/LICENSE) 和原始文件；来源及摘要见 `config/download-sources.json`（下载来源配置）。 |
 | [DesktopUpdateKit](https://github.com/wet86y/DesktopUpdateKit) | 固定版本的 Windows 本机 WinHTTP（Windows 网络通信接口）传输层，用于资源下载、取消、续传和摘要校验。应用更新仍由 Voice Terminal（语音终端）的工作区安装事务处理。 | MIT；见 [许可证文本](licenses/DesktopUpdateKit-MIT.txt)。上游修订记录见 [config/update-kit.lock.json](config/update-kit.lock.json)（更新组件锁）。 |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp/tree/v0.9.1)（退役的原生语音组件） | 旧兼容源码补丁保留在 `config/resources/patches/audiocpp-quality.patch`（源码补丁文件）；当前桌面程序不再使用 audio.cpp（旧语音框架）作为运行后端，`config/resources/assets/audiocpp/`（旧组件资源目录）不进入正式程序包。 | Apache-2.0；见 [许可证文本](licenses/audio.cpp-Apache-2.0.txt)。固定来源及修订见 `config/resources/catalog.json`（资源目录）和 `scripts/prepare-audiocpp-patch.py`（补丁准备脚本）；补丁生成的上游文件仍保留其来源许可。 |

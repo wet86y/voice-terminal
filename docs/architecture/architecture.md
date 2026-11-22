@@ -54,11 +54,11 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 主要入口：
 
 - `ApplicationHost`（应用宿主）：管理整套系统的启动、恢复、健康检查、指标采样和退出，保留失败时的独立诊断入口。
-- `SessionRuntime`：创建和关闭服务资源，管理 session、设置、KWS、Shadow 和 provider。
-- `EpisodeController`：拥有一次语音 episode 的输入、调度、TTS 和 reset 语义。
-- `AgentEpisodeRuntime`：拥有唯一活动 LLM 请求和调度循环；确定性时钟、提示文本和流式语音准入由内部协作模块实现。
-- `EpisodeSpeechOutput`：维护 speak transaction、发送前沿、TTS 分段、播放和 delivery 结算。
-- `SessionLedger`：记录用户输入、已传达 assistant 文本、有效 refinement、工具结果和有语义影响的打断。
+- `SessionRuntime`（会话运行时）：创建和关闭服务资源，管理 session（会话）、设置、KWS（关键词唤醒）、Shadow（后台代理）和 provider（模型供应方）。
+- `EpisodeController`（语音轮次控制器）：拥有一次语音 episode（交互轮次）的输入、调度、TTS（语音合成）和 reset（重置）语义。
+- `AgentEpisodeRuntime`（代理轮次运行时）：拥有唯一活动 LLM（大语言模型）请求和调度循环；确定性时钟、提示文本和流式语音准入由内部协作模块实现。
+- `EpisodeSpeechOutput`（语音输出管理器）：维护 speak transaction（播报事务）、发送前沿、TTS（语音合成）分段、播放和 delivery（实际交付）结算。
+- `SessionLedger`（会话账本）：记录用户输入、已传达 assistant（助手）文本、有效 refinement（转写精修）、工具结果和有语义影响的打断。
 - `ShadowRuntime`（后台运行实例）：每个 session（会话）一个，与语音交互共同构成同一助手；异步执行当前后端已授予的工具和状态观察。原生业务工具保持只读，DSH（后台执行宿主）使用实际执行环境权限；后台不拥有语音控制权，DSH 根执行环节仅有提前静默请求这一受限例外。
 
 ## 任务状态与资源释放边界

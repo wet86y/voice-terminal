@@ -1,6 +1,6 @@
 # 分布式设备实施与验收交接（2026-11-18）
 
-本文是当前分布式设备工作的实施快照，具体产品决定和阶段计划以[分布式运行实施跟踪](distributed-device-implementation-plan.md)为准，架构边界以[分布式设备运行架构](../architecture/distributed-device-runtime.md)为准。本文件不另行授予代码协作、系统管理、发布或数据处理权限。
+本文保留 2026-11-18、product-54 阶段的实施与验收快照，下文“当前”“待完成”均指当时状态，不代表最新交付。现行操作见[设备连接指南](../guides/device-connection.md)，最新版本与构建见[当前交付](../releases/current-release.md)；产品决定和阶段计划以[分布式运行实施跟踪](distributed-device-implementation-plan.md)为准，架构边界以[分布式设备运行架构](../architecture/distributed-device-runtime.md)为准。本文件不另行授予代码协作、系统管理、发布或数据处理权限。
 
 ## 当前交付状态
 

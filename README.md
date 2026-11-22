@@ -89,6 +89,12 @@ TTS 的播放权限由本地 VAD 和主语音大模型**共同控制**：模型�
 
 通过 GitHub 分发完成系统在线更新，带内容摘要校验与回滚。
 
+### 11. 局域网设备协作
+
+在“设备连接”中选择本地运行或远程配对。本地设备可按需广播，客户端搜索服务端并输入六位配对码后，复用服务端的模型、设置和后台执行能力；麦克风与扬声器留在当前交互设备。
+
+已配对客户端支持代理控制台、远程语音、文件与屏幕附件，以及经授权的设备桌面操作。连接、断开、移除和双方程序版本同步均从正式界面完成，详见[设备连接指南](docs/guides/device-connection.md)。
+
 ---
 
 ## 环境配置
@@ -96,14 +102,18 @@ TTS 的播放权限由本地 VAD 和主语音大模型**共同控制**：模型�
 - **Windows 10 / 11 x64** —— 桌面程序仅支持 Windows。
 - **Node.js `>= 20`** —— 源码开发需要；后台执行宿主锁定 `^22.19.0 || >=24.0.0`。正式程序由组件管理自动安装，不用手动准备。
 - **WebView2** —— 使用系统自带版本，Windows 10 / 11 已预装。
-- **DeepSeek API 密钥** —— 主语音模型必需。在组件页填写，凭据交给 Windows 凭据管理器保存，不写进配置文件。
-- **MiniMax API 密钥** —— 仅使用在线 TTS 时需要；本地语音模型则不需要。
+- **DeepSeek API（深度求索接口）密钥** —— 选择 DeepSeek 主语音推理时需要。在组件页填写，凭据交给 Windows（操作系统）凭据管理器保存，不写进配置文件。
+- **MiniMax API（在线模型接口）密钥** —— 选择 MiniMax 主语音推理或在线 TTS（语音合成）时需要，两者共用同一密钥；本地语音合成本身不需要此密钥。后端选择与切换见[主语音双后端与共享凭据](docs/development/inference-backends.md)。
 - **NVIDIA 显卡** —— 本地TTS模型推理框架仅支持**NVIDIA 显卡**
 
 ## 运行模式
 
-- `fast`（快速，默认）：主 LLM 使用 `reasoning.effort=none`。
-- `deep`（深度）：主请求直接使用 `reasoning.effort=low`。
+DeepSeek（深度求索）主语音推理提供以下模式：
+
+- `fast`（快速，默认）：主 LLM（大语言模型）使用 `reasoning.effort=none`（关闭思考）。
+- `deep`（深度）：主请求使用 `reasoning.effort=low`（低强度思考）。
+
+MiniMax（在线模型供应方）主语音请求固定使用低强度思考，界面隐藏运行模式选择；切回 DeepSeek 后恢复已保存的快速或深度选择。
 
 ---
 
@@ -122,13 +132,12 @@ TTS 的播放权限由本地 VAD 和主语音大模型**共同控制**：模型�
 ## 后续开发路线图
 
 1. **长记忆模块** —— 服务于低延迟的记忆处理模块。
-2. **局域网互联** —— 多设备场景下，由一台设备承担算力消耗，为其他设备提供更低占用的语音交互能力。
 
 ---
 
 ## 快速开始
 
-**1. 下载安装器**（Windows 10 / 11 x64，~115 MB）
+**1. 下载安装器**（Windows 10 / 11 x64，操作系统与处理器平台；文件大小以发行页为准）
 
 ```powershell
 Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
@@ -136,11 +145,11 @@ Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
 
 **2. 安装并启动** —— 启动安装器，选择工作区、展开程序、创建桌面快捷方式，启动主程序。
 
-**3.组件下载** —— 打开程序进组件管理页，点「一键下载」或者单独下载，程序检查并补齐语音环境开启组件下载任务，本地TTS以及可选组件按需配置。
+**3. 组件配置** —— 打开组件管理页，使用“一键下载”或单独组件卡片准备必要环境；本地 TTS（语音合成）模型及可选增强组件按需配置。安装器只安装程序本体，组件任务由正式程序执行。
 
-**4. 密钥配置** —— 组件下载完毕后配置deepseek api密钥，按需配置minmax api密钥。
+**4. 密钥配置** —— 按当前主语音推理供应方配置 DeepSeek 或 MiniMax API（在线模型接口）密钥；在线语音合成使用 MiniMax 时共用其密钥，可在组件任务进行期间填写。
 
-**5. 启动程序** —— 组件下载完毕后点击启动程序完成程序启动。
+**5. 启动程序** —— 必要环境、当前所选模型和密钥就绪后点击“启动程序”；使用其他设备算力时，从设备连接页选择远程配对。
 
 ---
 
@@ -151,11 +160,11 @@ Start-Process "https://github.com/wet86y/voice-terminal/releases/latest"
 - **架构** — [架构与生命周期](docs/architecture/architecture.md) · [Bridge 2.0 桥接协议](docs/architecture/bridge-2.0-protocol.md) · [WebSocket 协议](docs/architecture/websocket-protocol.md) · [上下文与工具](docs/architecture/context-and-tools.md) · [连续性底座](docs/architecture/continuity-foundation.md)
 - **说明** — [代理调试模式与调用入口](docs/guides/agent-debug.md) · [本地目录与覆盖发布](docs/guides/local-layout.md) · [统一正式程序与分发安装器](docs/guides/unified-product-installer.md) · [组件设置](docs/guides/component-settings.md) · [声纹增强](docs/guides/speaker-enhancement.md) · [热词替换](docs/guides/asr-hotwords.md) · [本地 TTS 运行](docs/guides/tts-runtime.md) · [本地模型运行设备](docs/guides/local-model-compute.md)
 - **测试** — [测试、启动与现场验收入口](docs/testing/operations-and-quality.md) · [当前已知问题](docs/testing/known-issues.md)
-- **交付** — [当前交付](docs/releases/current-release.md) · [v0.9.12 发行说明](docs/releases/v0.9.12.md) · [GitHub 发布流程](docs/development/github-release.md)
+- **交付** — [当前交付](docs/releases/current-release.md) · [发行说明与历史版本](docs/README.md#交付) · [GitHub（代码托管平台）发布流程](docs/development/github-release.md)
 
 **运行环境要求**：Windows 10 / 11 x64；系统 WebView2；本地语音合成需兼容的 NVIDIA（英伟达）显卡，并预留足够的显存、内存与磁盘空间。
 
-**安全边界**：默认服务只绑定 `127.0.0.1`。当前管理 API、WebSocket 和模型探测接口不适合直接暴露到局域网或公网；需要远程部署时，先完成[当前已知问题](docs/testing/known-issues.md)中的认证和 SSRF 防护工作。
+**安全边界**：内部语音服务绑定本机回环地址，管理 API（应用编程接口）、WebSocket（实时双向连接）和模型探测接口不直接对外开放。正式局域网协作经设备配对、受限 SSH（安全外壳协议）及固定设备网关完成；不使用任意端口转发或路由器公网映射。自行直接暴露内部服务前，仍需处理[当前已知问题](docs/testing/known-issues.md)中的认证及 SSRF（服务端请求伪造）防护。
 
 ---
 
@@ -221,7 +230,7 @@ MINIMAX_API_KEY=
 
 ### 组件与资源
 
-语音服务、模型和后台执行宿主按随包清单区分必需与可选组件。更新由用户点击卡片中的更新或导入入口触发；待更新的必需组件会阻止整体服务启动。模型版本、文件摘要校验、事务恢复和安装验证见[程序升级与必需组件更新](docs/guides/model-resource-updates.md)。
+语音服务、模型和后台执行宿主按随包清单区分必需与可选组件。更新由用户点击卡片中的更新或导入入口触发；普通启动只检查必要入口、当前所选模型及事务状态，可选组件缺失或待更新不阻塞无关功能。模型版本、文件摘要校验、事务恢复和安装验证见[程序升级与必需组件更新](docs/guides/model-resource-updates.md)。
 
 本地语音引擎的接入、导出、引擎编译与登记过程见 [AnifLive 本地语音接入记录](docs/development/aniflive-integration.md)。
 
@@ -229,7 +238,7 @@ MINIMAX_API_KEY=
 
 ### 主要配置
 
-下列 `.local/data` 路径描述开发渠道；分发渠道的对应位置为所选工作区的 `data` 目录。
+下列 `.local/data` 路径对应本仓库的正式工作区；安装到其他位置时，对应所选工作区的 `data`（用户数据）目录。
 
 - `config/default.yaml`：默认运行参数、独立调试端口、模型、唤醒词、音频和后台执行配置；受管内部组件由系统分配端口，分发程序使用工作区 `app/config/default.yaml`。
 - `.local/data/config/local.yaml`：保存当前非密钥运行参数，不提交真实凭据。

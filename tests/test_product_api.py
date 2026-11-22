@@ -1073,7 +1073,8 @@ class ProductApiTests(unittest.TestCase):
                 assert response["status"] == 202, response["body"]
                 started = response["body"]
                 assert started["kind"] == "play" and started["result"] is None
-                assert set(started) == {"operation_id", "kind", "state", "model", "result", "error", "playback_outcome"}
+                assert set(started) == {"operation_id", "kind", "state", "model", "result", "error", "playback_outcome", "phase"}
+                assert started["phase"] == "正在准备任务…"  # phase（试听任务当前阶段）。
                 operation_id = started["operation_id"]
                 await asyncio.wait_for(self.runtime.tts_voice_operations._items[operation_id].task, 5)
                 completed = await management("tts.operation.read", {"operation_id": operation_id})
@@ -1092,6 +1093,7 @@ class ProductApiTests(unittest.TestCase):
                     media.reset_mock()
                     completed = await play(identifier)
                     assert completed["state"] == "succeeded", completed
+                    assert completed["phase"] == "已完成"
                     assert completed["playback_outcome"] == "stopped"
                     assert completed["result"] == {"asset_id": identifier, "duration_ms": 12_500}
                     calls = media.await_args_list

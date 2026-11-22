@@ -6,17 +6,17 @@
 
 运行快照新增 `quiet_hours`（被动静默状态），包含 `passive_quiet`（当前抑制主动语音）、`user_interaction`（用户交互窗口开启）、`within_quiet_hours`（当前处于配置时段）三个布尔值。旧客户端可以忽略。待传达槽位没有正文事件或读取命令；`session.reset`（重置会话）先完成成对归档和交接整理，失败返回 `HANDOFF_RESET_FAILED`（会话重置失败）并保留旧会话；`session.clear`（清除会话）将旧衔接材料随会话归档，失败返回 `SESSION_CLEAR_FAILED`（会话清除失败）并通过原有恢复标记继续提交。设置接口与恢复规则见[交接说明](continuity-foundation.md)。
 
-默认连接：
+正式受管服务由系统分配回环端口，客户端从宿主端点表读取当前地址。独立后端调试采用配置端口时，连接示例如下：
 
 ```text
 ws://127.0.0.1:8765/ws
 ```
 
-当前协议按本机开发服务设计，默认绑定回环地址，尚未提供远程客户端认证。不要把服务直接暴露到局域网或公网；远程部署前必须先完成认证、Origin allowlist 和管理 API 防护。
+本节描述内部语音服务协议，默认绑定回环地址，接口本身不提供独立远程认证。正式远程客户端通过已配对设备的受限 SSH（安全外壳协议）、签名网关和原生桥接访问受控业务，见[分布式设备运行架构](distributed-device-runtime.md)；不要直接把内部服务暴露到局域网或公网。自行暴露前仍须完成认证、Origin allowlist（网页来源白名单）和管理 API（应用编程接口）防护。
 
-## Envelope
+## 消息封装（Envelope）
 
-客户端命令是 JSON 对象，至少包含非空 `request_id`、命令名和对象型 `payload`。服务端事件使用统一 envelope：
+客户端命令是 JSON（结构化数据）对象，至少包含非空 `request_id`（请求编号）、命令名和对象型 `payload`（参数对象）。服务端事件使用统一消息封装：
 
 ```json
 {
@@ -30,11 +30,11 @@ ws://127.0.0.1:8765/ws
 }
 ```
 
-`seq` 只在当前 conversation 内递增；`session.reset` 后重新开始。客户端应按 `seq` 应用事件，不能根据本地到达时间重排服务端记录。
+`seq`（事件序号）只在当前 conversation（会话）内递增；`session.reset`（重置会话）后重新开始。`timestamp`（事件时间）、`conversation_id`（会话编号）、`turn_id`（轮次编号）和 `payload.type`（事件类型）描述事件归属。客户端应按事件序号应用事件，不能根据本地到达时间重排服务端记录。
 
 ## 客户端命令
 
-| 命令 | payload | 作用 |
+| 命令 | payload（参数对象） | 作用 |
 | --- | --- | --- |
 | `subscribe` | 对象，可为空 | 获取 runtime、conversation、Shadow 和指标快照，并开始接收事件。 |
 | `session.start` | 对象，可为空 | 用户手动开始会话后直接连接 ASR（自动语音识别）；静默最终检查完成后仍按现有流程交回 KWS（关键词唤醒）待机。 |
