@@ -4,8 +4,8 @@
 
 | 范围（代码或资源类别） | 仓库位置（主要文件） | 适用许可证（条款来源） |
 | --- | --- | --- |
-| 本项目原创源码、桌面宿主、界面、独立适配器、构建与补丁编排逻辑 | `voice_terminal/`、`apps/`、`scripts/` 及本项目文档；个别目录/文件另有声明时以其声明为准 | Apache-2.0；根目录 `LICENSE`（许可证文本）是这些原创内容的许可依据。当前是否随正式程序包交付见文末说明。 |
-| 上游源码片段及按补丁生成的修改文件 | 见下方 AnifLive-TTS（本地语音引擎）补丁目标表 | 依源文件来源分别适用 PolyForm Noncommercial 1.0.0（非商业用途许可证）、MIT（宽松式许可证）或 Apache-2.0；本项目的根许可证不替换上游许可。 |
+| 本项目原创源码、桌面宿主、界面、独立适配器、构建与补丁编排逻辑 | `voice_terminal/`、`apps/`、`integrations/`、`scripts/` 及本项目文档；个别目录/文件另有声明时以其声明为准 | Apache-2.0；根目录 `LICENSE`（许可证文本）是这些原创内容的许可依据。当前是否随正式程序包交付见文末说明。 |
+| 上游源码片段及派生、补丁修改文件 | 见下方 dsh-windows-remote-ssh（社区远程桌面插件）来源说明与 AnifLive-TTS（本地语音引擎）补丁目标表 | 依源文件来源分别适用 PolyForm Noncommercial 1.0.0（非商业用途许可证）、MIT（宽松式许可证）或 Apache-2.0；本项目的根许可证不替换上游许可。 |
 | Vendored source（复制进仓库的第三方源码）及独立依赖 | `voice_terminal/vendor/asr_hotword/`、`config/dsh/`、`package-lock.json`、`apps/desktop/Cargo.lock` 及其他组件清单 | 保留各自许可证、版权与 NOTICE（第三方声明）；清单见本文件下方“第三方组件许可清单”。 |
 | Model weights（模型权重）、reference audio（参考录音）、生成的推理引擎和其他模型资产 | `config/resources/catalog.json`、`config/aniflive-presets.json` 及本机组件目录 | 不由源码许可证决定；逐项确认模型卡、来源许可、声音权利及分发条件。现有参考录音的分发授权尚未确认，见 [AnifLive 资源说明](config/resources/assets/aniflive/README.md)。 |
 
@@ -13,7 +13,7 @@
 
 | Component（组件） | Use（用途） | License and retained notice（适用许可及保留声明） |
 | --- | --- | --- |
-| [dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)（远端桌面控制插件） | 设备控制观察缓存的选择性派生源码；项目设备控制子入口现已集成观察、动作、终端、文件及原任务查询，具体边界见[统一插件说明](integrations/dsh/voice-terminal/README.md)。 | MIT（宽松开源许可证）；保留 [上游许可证](licenses/dsh-windows-remote-ssh-MIT.txt)，固定提交、原件摘要及修改记录见 [上游锁](config/dsh/remote-ssh-upstream.lock.json)。构建 DSH（代理执行宿主）功能包时复制该许可证。 |
+| [dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)（社区远程桌面插件） | 设备控制中观察缓存、动作复核、脱敏、文件类型判断及 Windows（操作系统）辅助进程的选择性派生源码；具体接入边界见[统一插件说明](integrations/dsh/voice-terminal/README.md)。 | 上游为 MIT（宽松开源许可证），版权归 dsh-windows-remote-ssh contributors（上游贡献者）；保留 [原始许可证与版权声明](licenses/dsh-windows-remote-ssh-MIT.txt)，固定来源与本项目二次开发版权边界见下节。构建 DSH（代理执行宿主）功能包时复制该许可证。 |
 | tiktoken（分词器）词表 | 固定摘要的 o200k_base（分词词表）随程序交付，避免首次运行下载。 | MIT；保留 [词表许可证](config/resources/assets/tokenizers/LICENSE) 和原始文件；来源及摘要见 `config/download-sources.json`（下载来源配置）。 |
 | [DesktopUpdateKit](https://github.com/wet86y/DesktopUpdateKit) | 固定版本的 Windows 本机 WinHTTP（Windows 网络通信接口）传输层，用于资源下载、取消、续传和摘要校验。应用更新仍由 Voice Terminal（语音终端）的工作区安装事务处理。 | MIT；见 [许可证文本](licenses/DesktopUpdateKit-MIT.txt)。上游修订记录见 [config/update-kit.lock.json](config/update-kit.lock.json)（更新组件锁）。 |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp/tree/v0.9.1)（退役的原生语音组件） | 旧兼容源码补丁保留在 `config/resources/patches/audiocpp-quality.patch`（源码补丁文件）；当前桌面程序不再使用 audio.cpp（旧语音框架）作为运行后端，`config/resources/assets/audiocpp/`（旧组件资源目录）不进入正式程序包。 | Apache-2.0；见 [许可证文本](licenses/audio.cpp-Apache-2.0.txt)。固定来源及修订见 `config/resources/catalog.json`（资源目录）和 `scripts/prepare-audiocpp-patch.py`（补丁准备脚本）；补丁生成的上游文件仍保留其来源许可。 |
@@ -25,6 +25,23 @@
 | Cargo（Rust 包管理器）和 npm（JavaScript 包管理器）依赖 | 桌面宿主、安装器和前端构建。 | 固定版本记录于 [apps/desktop/Cargo.lock](apps/desktop/Cargo.lock)（Rust 依赖锁）和 [package-lock.json](package-lock.json)（npm 依赖锁）；每项依赖继续适用其上游许可证。 |
 
 上表列明主要源码组件和分发依赖；各依赖的完整版本仍以相应锁文件和组件清单为准。第三方组件目录内的原始许可证、版权和 NOTICE（第三方声明）优先于本表概括。
+
+## dsh-windows-remote-ssh（社区远程桌面插件）
+
+本项目的 DSH（代理执行宿主）设备控制功能选择性派生自 [pureexe/dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)，采用上游 0.1.1 版，固定提交为 `b640f268c1e1ee1134e6fa5b51f15736b2bab26b`。已核对该提交的 [LICENSE（许可证原文）](https://github.com/pureexe/dsh-windows-remote-ssh/blob/b640f268c1e1ee1134e6fa5b51f15736b2bab26b/LICENSE) 与 [package.json（包声明）](https://github.com/pureexe/dsh-windows-remote-ssh/blob/b640f268c1e1ee1134e6fa5b51f15736b2bab26b/package.json)，两者均声明 MIT（宽松开源许可证）。
+
+上游原始版权声明为 `Copyright (c) 2026 dsh-windows-remote-ssh contributors`（2026 年，版权归该上游项目贡献者所有），原文保留在 [上游许可证副本](licenses/dsh-windows-remote-ssh-MIT.txt)。仓库维护者 pureexe（上游作者账号）与许可证中的版权方表述分别保留，不将原始版权方改写为本项目。
+
+| 代码范围 | 版权归属 | 适用许可 |
+| --- | --- | --- |
+| 上游原有源码，以及派生文件中保留、改编的上游代码部分 | dsh-windows-remote-ssh contributors（上游项目贡献者） | MIT（宽松开源许可证）；本项目的根许可证不替换这部分许可及版权声明。 |
+| 本项目二次开发中自行创作且享有著作权的新增代码和独创性修改 | Voice Terminal（语音终端）项目相应贡献者 | Apache-2.0（Apache 2.0 开源许可证）；仅适用于本项目享有著作权的部分。 |
+
+派生范围包括 `integrations/dsh/voice-terminal/src/device-control/`（设备控制源码目录）中的 `observe.ts`（观察缓存）、`executor.ts`（动作执行与复核）、`sanitize.ts`（脱敏）、`filesystem.ts`（文件类型判断）、`types.ts`（观察相关类型），以及 `integrations/dsh/voice-terminal/native/win32/device-helper.ps1`（桌面辅助进程）和相关迁移测试。逐文件上游路径、原件 SHA-256（内容摘要）、本项目目标路径与修改说明见 [上游锁定清单](config/dsh/remote-ssh-upstream.lock.json)。
+
+本项目的二次开发包括设备及连接、执行器代次隔离、审批后身份复核、受限常驻管道和设备工具集成；设备发现、配对、身份认证、SSH（安全外壳协议）传输及媒体通道由本项目既有设备框架实现。上述归属仅覆盖本项目自行创作的部分，修改上游文件不转移上游代码的版权。同一文件同时包含双方代码时，使用与再分发须分别遵守对应许可条件。
+
+MIT（宽松开源许可证）允许使用、复制、修改、分发及商业使用，但要求在软件副本或实质部分中保留上游版权和许可声明。本项目保留完整许可及免责原文，插件构建时将其复制为功能包内的 `dsh-windows-remote-ssh-MIT.txt`（上游许可证文件）；主页致谢和本节说明不能代替该原文。本项目新增代码和独创性修改的许可另见根目录 [LICENSE（Apache 2.0 许可证）](LICENSE)。
 
 ## AnifLive-TTS（本地语音引擎）
 

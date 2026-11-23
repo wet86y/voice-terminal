@@ -40,6 +40,8 @@
 
 设备控制选择性派生自 `pureexe/dsh-windows-remote-ssh`（社区 Windows 远程桌面插件）0.1.1，固定提交 `b640f268c1e1ee1134e6fa5b51f15736b2bab26b`。来源、原件摘要和修改范围见[上游锁定清单](../../../config/dsh/remote-ssh-upstream.lock.json)，原始 MIT（宽松开源许可证）版权与许可随包保留。
 
+上游源码及派生文件中保留、改编的上游代码部分，版权仍归 dsh-windows-remote-ssh contributors（上游项目贡献者），原始声明为 `Copyright (c) 2026 dsh-windows-remote-ssh contributors`。本项目二次开发中自行创作且享有著作权的新增代码和独创性修改，版权归 Voice Terminal（语音终端）项目相应贡献者，采用 Apache-2.0（Apache 2.0 开源许可证）；该许可不替换上游部分的 MIT 许可。同一文件包含双方代码时，须分别遵守对应许可，完整边界见[许可证范围与第三方声明](../../../LICENSING.md#dsh-windows-remote-ssh社区远程桌面插件)。功能包保留完整 `dsh-windows-remote-ssh-MIT.txt`（上游版权、许可及免责原文）。
+
 派生代码复用了观察缓存、动作复核、脱敏、文件类型判断及 Windows 常驻辅助进程。设备发现、配对、身份认证、SSH（安全外壳协议）传输和媒体通道由项目自己的局域网框架维护，工具参数不携带 SSH 密码或私钥。
 
 底层仍保留应用枚举、独立文本及表格读取、剪贴板、进程管理、显示器与光标信息、系统通知等操作，但当前七项设备工具没有对应模型入口。应用启动受原生白名单禁止；任意 PowerShell（脚本运行环境）执行未开放；上游的等待界面条件和工具延迟加载入口也未作为当前设备工具接入。

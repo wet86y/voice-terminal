@@ -262,6 +262,7 @@ MINIMAX_API_KEY=
 
 - **[AnifLive-TTS](https://github.com/Hiruynk/AnifLive-TTS)** —— 再次感谢由 [Hiruynk](https://github.com/Hiruynk) 开发的推理框架，本项目的本地语音合成能力建立在其上，使用边界见 [许可证范围说明](LICENSING.md#aniflive-tts本地语音引擎)。
 - **[DeepSeek Harness](https://github.com/deepseek-ai/dsh)** —— 后台执行宿主与插件体系。
+- **[dsh-windows-remote-ssh](https://github.com/pureexe/dsh-windows-remote-ssh)** —— 感谢 [pureexe](https://github.com/pureexe) 及上游贡献者提供的远程桌面插件，本项目设备控制功能复用了其部分实现，版权与二次开发范围见 [许可证范围说明](LICENSING.md#dsh-windows-remote-ssh社区远程桌面插件)。
 - **[FunASR](https://github.com/modelscope/FunASR)** —— 语音识别框架。
 - **[MiniMax](https://www.minimaxi.com/)** —— 在线低延迟 TTS 服务。
 - **[Tauri](https://tauri.app)** —— 桌面窗口、托盘、单实例与服务管理宿主。
