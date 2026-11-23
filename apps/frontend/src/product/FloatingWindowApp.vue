@@ -1,15 +1,28 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { desktopPort } from './desktop-port'
-import FloatingWindowShell from './FloatingWindowShell.vue'
+import FloatingWindowShell from '../interface/floating/FloatingWindowShell.vue'
+import { FLOATING_LAYOUT_EVENT } from '../interface/floating/floating-display'
 import VoiceOrb from '../interface/VoiceOrb.vue'
-import { EMPTY_FLOATING_WINDOW_MODEL, FLOATING_WINDOW_MODEL_EVENT, readFloatingCaption, type FloatingWindowModel } from './floating-window'
+import { EMPTY_FLOATING_WINDOW_MODEL, FLOATING_WINDOW_MODEL_EVENT, readFloatingCaption, type FloatingOrbFrame, type FloatingWindowModel } from '../interface/floating/floating-window'
 import '../interface/design.css'
-import './floating-window.css'
+import '../interface/floating/floating-window.css'
 
 const model = ref<FloatingWindowModel>({ ...EMPTY_FLOATING_WINDOW_MODEL })
 const port = desktopPort()
-let unlisten: (() => void) | undefined
+const frame = ref<FloatingOrbFrame | null>(null)
+let layoutRevision = 0
+const unlisteners: Array<() => void> = []
+interface OrbLayout {
+  revision: number // revision（布局版本）。
+  orb_frame: FloatingOrbFrame | null // orb_frame（菱形与识别框布局）。
+}
+function acceptLayout(value: OrbLayout) {
+  if (!disposed && value.revision >= layoutRevision) {
+    layoutRevision = value.revision
+    frame.value = value.orb_frame
+  }
+}
 let disposed = false
 
 function acceptModel(value: FloatingWindowModel) {
@@ -29,11 +42,18 @@ function acceptModel(value: FloatingWindowModel) {
 }
 
 async function initialize() {
-  if (!port.available || !port.getFloatingModel || !port.listen) return
+  if (!port.available || !port.getFloatingModel || !port.floatingWindow || !port.listen) return
   try {
-    unlisten = await port.listen<FloatingWindowModel>(FLOATING_WINDOW_MODEL_EVENT, event => acceptModel(event.payload))
-    if (disposed) { unlisten(); return }
+    for (const subscribe of [
+      () => port.listen!<FloatingWindowModel>(FLOATING_WINDOW_MODEL_EVENT, event => acceptModel(event.payload)),
+      () => port.listen!<OrbLayout>(FLOATING_LAYOUT_EVENT, event => acceptLayout(event.payload)),
+    ]) {
+      const unlisten = await subscribe()
+      if (disposed) { unlisten(); return }
+      unlisteners.push(unlisten)
+    }
     acceptModel(await port.getFloatingModel())
+    if (!disposed) acceptLayout(await port.floatingWindow<OrbLayout>({ kind: 'ready' }))
   } catch {
     if (model.value.revision === 0) model.value = { ...EMPTY_FLOATING_WINDOW_MODEL, state: 'offline' }
   }
@@ -43,8 +63,8 @@ function returnToWorkbench() {
   void port.returnToWorkbench?.().catch(() => undefined)
 }
 
-function drag() {
-  void port.startFloatingDrag?.().catch(() => undefined)
+function drag(origin: { x: number; y: number }) {
+  void port.floatingWindow?.({ kind: 'drag', ...origin }).catch(() => undefined)
 }
 
 function toggleSilence() {
@@ -53,11 +73,11 @@ function toggleSilence() {
 }
 
 onMounted(() => { void initialize() })
-onBeforeUnmount(() => { disposed = true; unlisten?.() })
+onBeforeUnmount(() => { disposed = true; unlisteners.forEach(unlisten => unlisten()) })
 </script>
 
 <template>
-  <FloatingWindowShell :model="model" @return-to-workbench="returnToWorkbench" @drag="drag" @toggle-silence="toggleSilence">
+  <FloatingWindowShell :model="model" :frame="frame" @return-to-workbench="returnToWorkbench" @drag="drag" @toggle-silence="toggleSilence">
     <template #content="{ model: orbModel }">
       <VoiceOrb :model="orbModel" />
     </template>

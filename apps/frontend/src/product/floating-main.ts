@@ -1,4 +1,7 @@
 import { createApp } from 'vue'
-import FloatingWindowApp from './FloatingWindowApp.vue'
 
-createApp(FloatingWindowApp).mount('#app')
+const page = location.search === '?view=display'
+  ? import('./FloatingDisplayApp.vue')
+  : import('./FloatingWindowApp.vue')
+
+void page.then(({ default: component }) => createApp(component).mount('#app'))

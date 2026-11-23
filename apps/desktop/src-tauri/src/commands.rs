@@ -55,6 +55,8 @@ macro_rules! desktop_command_registry {
             return_to_workbench,
             start_floating_drag,
             control_floating_session,
+            floating_windows::floating_preview_command,
+            floating_windows::floating_window_command,
             skip_startup,
             export_logs,
             open_console,

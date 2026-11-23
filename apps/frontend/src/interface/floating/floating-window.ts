@@ -1,4 +1,17 @@
-import type { VoiceOrbModel } from '../interface/voice-orb'
+import type { VoiceOrbModel } from '../voice-orb'
+
+/** FloatingDock（球体吸附边）：自由、左、右、上或下。 */
+export type FloatingDock = 'free' | 'left' | 'right' | 'top' | 'bottom'
+
+/** FloatingOrbFrame（贴边窗内布局）：由桌面工作区定位产生，单位为逻辑像素。 */
+export interface FloatingOrbFrame {
+  orb_x: number // orb_x（菱形中心横坐标）。
+  orb_y: number // orb_y（菱形中心纵坐标）。
+  caption_x: number // caption_x（字幕朝菱形一侧的横坐标）。
+  caption_y: number // caption_y（字幕顶部坐标）。
+  caption_align: number // caption_align（字幕按近边对齐的百分比）。
+  caption_width: number // caption_width（字幕宽度上限）。
+}
 
 /** FloatingCaption（单行语音字幕）：只允许识别和实际播报文本，不接受聊天附件或工具消息。 */
 export interface FloatingCaption {

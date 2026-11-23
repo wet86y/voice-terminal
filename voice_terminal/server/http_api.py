@@ -794,6 +794,8 @@ class VoiceSocketCommand(StrEnum):
     SESSION_RESET = "session.reset"
     SESSION_CLEAR = "session.clear"
     SESSION_REASONING_MODE = "session.reasoning_mode"
+    DISPLAY_MODE = "display.mode"
+    DISPLAY_RECEIPT = "display.receipt"
     SHADOW_DEBUG_WAKE = "shadow.debug.wake"
 
 
@@ -4813,7 +4815,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "device.intent", request_id=request_id, result=result, detail=detail,
             )))
 
-        event_task = asyncio.create_task(_forward_events(writer, subscription, sequencer), name="websocket-events")
+        event_task = asyncio.create_task(_forward_events(writer, subscription, sequencer, connection_id), name="websocket-events")
         debug_task = asyncio.create_task(_forward_debug_events(writer, debug_events, sequencer), name="websocket-shadow-debug")
         device_task = asyncio.create_task(follow_devices(), name="websocket-device-state")
         start_task = None
@@ -4843,6 +4845,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if command == VoiceSocketCommand.SUBSCRIBE:
                     await writer.send_json(sequencer.envelope(runtime.snapshot()))
                     changed.set()
+                elif command in {VoiceSocketCommand.DISPLAY_MODE, VoiceSocketCommand.DISPLAY_RECEIPT}:
+                    display = getattr(runtime, "floating_display", None)
+                    if device is not None or display is None:
+                        await _send_error(writer, sequencer, "DISPLAY_UNAVAILABLE", "当前连接没有本机图文展示权限。", None, True,
+                                          request_id=message["request_id"])
+                    elif command == VoiceSocketCommand.DISPLAY_MODE and not display.set_mode(connection_id, _payload):
+                        await _send_error(writer, sequencer, "DISPLAY_MODE_INVALID", "图文展示模式参数无效。", None, True,
+                                          request_id=message["request_id"])
+                    elif command == VoiceSocketCommand.DISPLAY_RECEIPT:
+                        display.receive(connection_id, _payload)
                 elif command == VoiceSocketCommand.CONVERSATION_IMAGE_READ:
                     cid = _payload.get("conversation_id")
                     aid = _payload.get("attachment_id")
@@ -4932,6 +4944,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         finally:
             logger.info("websocket.disconnected peer=%s", websocket.client)
             runtime.device_state_waiters.discard(changed)
+            if display := getattr(runtime, "floating_display", None):
+                display.disconnect(connection_id)
             tasks = [event_task, debug_task, device_task]
             for task in tasks:
                 task.cancel()
@@ -4963,10 +4977,14 @@ class _VoiceSocketWriter:
             pass
 
 
-async def _forward_events(websocket: Any, subscription: Any, sequencer: ProtocolSequencer) -> None:
+async def _forward_events(websocket: Any, subscription: Any, sequencer: ProtocolSequencer, connection_id: str | None = None) -> None:
     try:
         async for value in subscription:
-            if not sequencer.public(value):
+            if value.type == "display.command":
+                if not connection_id or value.payload.get("_display_connection") != connection_id:
+                    continue
+                value = replace(value, payload={key: val for key, val in value.payload.items() if key != "_display_connection"})
+            elif not sequencer.public(value):
                 continue
             if value.type == "speech.completed":
                 payload = value.payload if isinstance(value.payload, dict) else {}

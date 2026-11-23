@@ -7,6 +7,9 @@ macro_rules! desktop_handler {
 
 mod app_icon;
 mod agent_debug;
+mod floating_geometry;
+mod floating_motion;
+mod floating_windows;
 mod integrity_commands;
 mod lan_update;
 use lan_update::{device_version_check, device_version_sync};
@@ -537,12 +540,20 @@ fn frontend_capability(
 /// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗展示、输入启停及窗口交互。
 fn floating_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
     let embedded = normalized_origin == REMOTE_STATIC_PRODUCT_ORIGIN;
-    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":embedded,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
+    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":embedded,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","allow-floating-window-command","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
+}
+
+fn floating_display_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
+    let embedded = normalized_origin == REMOTE_STATIC_PRODUCT_ORIGIN;
+    serde_json::json!({"identifier":format!("owned-floating-display-{epoch}"),
+        "description":"当前实例图文窗口的布局订阅与显示回执权限","local":embedded,
+        "windows":[floating_windows::PRODUCT_DISPLAY],"remote":{"urls":[format!("{normalized_origin}/*")]},
+        "permissions":["allow-floating-window-command","allow-agent-debug-trace-native","core:event:allow-listen","core:event:allow-unlisten"]})
 }
 
 /// floating_publisher_capability（悬浮窗状态发布权限）：主窗口只能更新浮窗展示快照。
 fn floating_publisher_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
-    serde_json::json!({"identifier":format!("owned-floating-publisher-{epoch}"), "description":"当前实例主工作台的悬浮窗动效发布权限", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-publish-floating-model"]})
+    serde_json::json!({"identifier":format!("owned-floating-publisher-{epoch}"), "description":"当前实例主工作台的悬浮窗动效发布权限", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-publish-floating-model","allow-floating-window-command"]})
 }
 
 struct Desktop {
@@ -553,6 +564,7 @@ struct Desktop {
     data: PathBuf,                         // data（当前模式隔离的 WebView2 缓存目录）。
     webview2: Option<PathBuf>,             // webview2（可选的固定网页运行时）。
     mode: FrontendMode,                    // mode（前端模式：产品或桌面样例）。
+    floating_preview: bool,               // floating_preview（独立悬浮窗测试台）。
     development: bool,                     // development（是否显式源码调试）。
     instance_identifier: String, // instance_identifier（工作区单实例标识；演示单独隔离）。
     service: Mutex<Option<Service>>,
@@ -648,8 +660,6 @@ struct Desktop {
     stopped: AtomicBool,
     tray: AtomicBool,
     floating_mode: AtomicBool,  // floating_mode（是否正在以悬浮窗呈现）。
-    floating_ready: AtomicBool, // floating_ready（悬浮窗页面是否已加载）。
-    floating_transition: Mutex<()>, // floating_transition（模式切换互斥锁）。
     floating_revision: AtomicU64, // floating_revision（快照递增版本）。
     floating_model: Mutex<serde_json::Value>, // floating_model（最近一次语音动效快照）。
     floating_menu: Mutex<Option<CheckMenuItem<tauri::Wry>>>, // floating_menu（托盘悬浮窗勾选项）。
@@ -744,21 +754,27 @@ impl Desktop {
                 product_entry_url_allowed(url, token.as_deref()) || product_page_url_allowed(url)
             }
             FrontendMode::UiPreview => {
-                preview_entry_url_allowed(url, token.as_deref()) || preview_page_url_allowed(url)
+                preview_entry_url_allowed(url, token.as_deref()) || self.is_settled_frontend_url(url)
             }
         }
     }
 
-    fn allows_floating_url(&self, url: &tauri::Url) -> bool {
+    fn allows_floating_url(&self, url: &tauri::Url, label: &str) -> bool {
         self.mode == FrontendMode::Product
             && self.origin.lock().unwrap().as_deref()
                 == Some(url.origin().ascii_serialization().as_str())
-            && floating_page_url_allowed(url)
+            && match label {
+                floating_windows::PRODUCT_ORB => floating_page_url_allowed(url),
+                floating_windows::PRODUCT_DISPLAY => url.query() == Some("view=display")
+                    && page_url_allowed(url, "/floating.html", &["view"]),
+                _ => false,
+            }
     }
 
     fn is_settled_frontend_url(&self, url: &tauri::Url) -> bool {
         match self.mode {
             FrontendMode::Product => product_page_url_allowed(url),
+            FrontendMode::UiPreview if self.floating_preview => floating_windows::page_allowed(url, "main"),
             FrontendMode::UiPreview => preview_page_url_allowed(url),
         }
     }
@@ -794,6 +810,9 @@ impl Desktop {
             }
         }
         self.floating_mode.store(false, Ordering::Release);
+        if let Some(preview) = app.try_state::<Arc<floating_windows::FloatingWindows>>() {
+            preview.conceal(app);
+        }
         if let Some(floating) = app.get_webview_window("floating") {
             let _ = floating.hide();
         }
@@ -898,7 +917,7 @@ fn trusted_floating(window: &WebviewWindow, state: &Desktop) -> Result<(), Strin
         return Err("此窗口没有悬浮窗权限。".into());
     }
     let url = window.url().map_err(|error| error.to_string())?;
-    if !state.stopping.load(Ordering::Acquire) && state.allows_floating_url(&url) {
+    if !state.stopping.load(Ordering::Acquire) && state.allows_floating_url(&url, window.label()) {
         Ok(())
     } else {
         Err("悬浮窗页面不属于当前应用实例。".into())
@@ -911,146 +930,22 @@ fn set_floating_menu_checked(state: &Desktop, checked: bool) {
     }
 }
 
-fn emit_floating_model(app: &tauri::AppHandle, state: &Desktop) {
-    if app.get_webview_window("floating").is_none() {
-        return;
-    }
-    let model = state.floating_model.lock().unwrap().clone();
-    let _ = app.emit_to("floating", "voice-terminal:floating-model", model);
-}
-
-fn set_floating_mode(app: &tauri::AppHandle, state: &Desktop, enabled: bool) -> Result<(), String> {
-    let _transition = state
-        .floating_transition
-        .lock()
-        .map_err(|error| error.to_string())?;
+fn set_floating_mode(app: &tauri::AppHandle, state: &Arc<Desktop>, enabled: bool) -> Result<(), String> {
     if state.stopping.load(Ordering::Acquire) {
         return Err("应用正在退出。".into());
     }
-    if !enabled {
-        state.floating_mode.store(false, Ordering::Release);
-        set_floating_menu_checked(state, false);
-        if let Some(floating) = app.get_webview_window("floating") {
-            let _ = floating.hide();
-        }
-        if let Some(main) = app
-            .get_webview_window("main")
-            .or_else(|| app.get_webview_window("startup"))
-        {
-            let _ = main.show();
-            let _ = main.unminimize();
-            let _ = main.set_focus();
-        }
-        return Ok(());
-    }
-
-    if state.mode != FrontendMode::Product || state.origin.lock().unwrap().is_none() {
-        return Err("工作台尚未就绪，暂时无法打开悬浮窗。".into());
-    }
-    let main = app
-        .get_webview_window("main")
-        .ok_or("主工作台窗口尚未建立。")?;
-    let floating = match app.get_webview_window("floating") {
-        Some(window) => window,
-        None => create_floating_window(app, state)?,
+    let Some(windows) = app.try_state::<Arc<floating_windows::FloatingWindows>>() else {
+        return if enabled { Err("悬浮窗尚未就绪。".into()) } else { Ok(()) };
     };
-    state.floating_mode.store(true, Ordering::Release);
-    set_floating_menu_checked(state, true);
-    if state.floating_ready.load(Ordering::Acquire) {
-        if let Err(error) = floating.show() {
-            state.floating_mode.store(false, Ordering::Release);
-            set_floating_menu_checked(state, false);
-            return Err(error.to_string());
+    if enabled {
+        if state.mode != FrontendMode::Product || state.origin.lock().unwrap().is_none()
+            || app.get_webview_window("main").is_none() {
+            return Err("工作台尚未就绪，暂时无法打开悬浮窗。".into());
         }
-        if let Err(error) = main.hide() {
-            let _ = floating.hide();
-            state.floating_mode.store(false, Ordering::Release);
-            set_floating_menu_checked(state, false);
-            return Err(error.to_string());
-        }
-        emit_floating_model(app, state);
+        windows.inner().prepare_product(app, state)
+    } else {
+        windows.mode(app, state, false, false)
     }
-    Ok(())
-}
-
-fn create_floating_window(
-    app: &tauri::AppHandle,
-    state: &Desktop,
-) -> Result<WebviewWindow, String> {
-    let origin = state
-        .origin
-        .lock()
-        .map_err(|error| error.to_string())?
-        .clone()
-        .ok_or("工作台尚未建立受控界面来源。")?;
-    let url = format!("{origin}/floating.html")
-        .parse::<tauri::Url>()
-        .map_err(|error| error.to_string())?;
-    let navigation_state = app.state::<Arc<Desktop>>().inner().clone();
-    let page_state = navigation_state.clone();
-    let window = WebviewWindowBuilder::new(app, "floating", WebviewUrl::External(url))
-        .title("Voice Terminal · 悬浮窗")
-        // 主体占位由 300×282 缩为 150×141，底部另留 39 像素单行字幕空间。
-        .inner_size(150., 180.)
-        .resizable(false)
-        .decorations(false)
-        .transparent(true)
-        .background_color(tauri::window::Color(0, 0, 0, 0))
-        .shadow(false)
-        .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
-    .initialization_script(agent_debug::AgentDebug::window_script(app))
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .visible(false)
-        .data_directory(
-            state
-                .context()
-                .map(|context| context.install.join("cache/webview2"))
-                .unwrap_or_else(|| state.data.clone()),
-        )
-        .on_navigation(move |url| {
-            let available = navigation_state
-                .recovery
-                .lock()
-                .unwrap()
-                .allows_navigation();
-            available && navigation_state.allows_floating_url(url)
-        })
-        .on_page_load(move |window, payload| {
-            if payload.event() == PageLoadEvent::Started {
-                page_state.floating_ready.store(false, Ordering::Release);
-                let _ = window.hide();
-                if page_state.floating_mode.load(Ordering::Acquire)
-                    && !page_state.stopping.load(Ordering::Acquire)
-                {
-                    if let Some(main) = window.app_handle().get_webview_window("main") {
-                        let _ = main.show();
-                    }
-                }
-            }
-            if payload.event() != PageLoadEvent::Finished
-                || payload.url().path() != "/floating.html"
-                || !page_state.allows_floating_url(payload.url())
-            {
-                return;
-            }
-            if page_state.floating_ready.load(Ordering::Acquire)
-                && page_state.floating_mode.load(Ordering::Acquire)
-                && !page_state.stopping.load(Ordering::Acquire)
-            {
-                if window.show().is_ok() {
-                    if let Some(main) = window.app_handle().get_webview_window("main") {
-                        let _ = main.hide();
-                    }
-                    emit_floating_model(window.app_handle(), &page_state);
-                } else {
-                    let _ = set_floating_mode(window.app_handle(), &page_state, false);
-                }
-            }
-        })
-        .build()
-        .map_err(|error| error.to_string())?;
-    Ok(window)
 }
 
 /// floating_caption_projection（纯语音字幕边界）：未知消息或截图附件不进入悬浮窗。
@@ -1155,17 +1050,7 @@ fn get_floating_model(
     state: tauri::State<Arc<Desktop>>,
 ) -> Result<serde_json::Value, String> {
     trusted_floating(&window, &state)?;
-    // 此请求由悬浮界面挂载后发出；单纯网页加载完成不足以隐藏主工作台。
-    if !state.floating_ready.swap(true, Ordering::AcqRel)
-        && state.floating_mode.load(Ordering::Acquire)
-    {
-        set_floating_mode(window.app_handle(), &state, true)?;
-    }
-    Ok(state
-        .floating_model
-        .lock()
-        .map_err(|error| error.to_string())?
-        .clone())
+    state.floating_model.lock().map(|model| model.clone()).map_err(|error| error.to_string())
 }
 
 fn floating_double_click_ms() -> u32 {
@@ -1191,7 +1076,7 @@ fn return_to_workbench(
         .app_handle()
         .emit_to("main", "voice-terminal:floating-workbench", ())
         .map_err(|error| error.to_string())?;
-    set_floating_mode(&window.app_handle(), &state, false)
+    set_floating_mode(window.app_handle(), state.inner(), false)
 }
 
 #[tauri::command]
@@ -1219,7 +1104,14 @@ fn start_floating_drag(
     state: tauri::State<Arc<Desktop>>,
 ) -> Result<(), String> {
     trusted_floating(&window, &state)?;
-    window.start_dragging().map_err(|error| error.to_string())
+    let bounds = floating_motion::window_bounds(&window)?;
+    let cursor = window.cursor_position().map_err(|error| error.to_string())?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let windows = window.state::<Arc<floating_windows::FloatingWindows>>();
+    windows.inner().begin_drag(&window, floating_geometry::Point {
+        x: (cursor.x - bounds.origin.x) / scale,
+        y: (cursor.y - bounds.origin.y) / scale,
+    })
 }
 
 fn device_runtime_status(state: &Desktop, data_root: &Path) -> serde_json::Value {
@@ -9514,6 +9406,12 @@ fn handoff_local_update(
 
 fn show(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<Arc<Desktop>>() {
+        if state.floating_preview {
+            if let Some(preview) = app.try_state::<Arc<floating_windows::FloatingWindows>>() {
+                let _ = preview.mode(app, &state, false, false);
+                return;
+            }
+        }
         let _ = set_floating_mode(app, state.inner(), false);
     }
     if let Some(window) = app
@@ -9657,14 +9555,18 @@ fn arg_value<'a>(args: &'a [String], key: &str) -> Result<Option<&'a str>, Strin
 }
 
 fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
+    let floating = args.iter().any(|arg| arg == "--floating-preview");
     for arg in args {
-        if arg.starts_with("--") && !["--ui-preview", "--root", "--exit"].contains(&arg.as_str()) {
+        if arg.starts_with("--")
+            && !["--ui-preview", "--root", "--exit"].contains(&arg.as_str())
+            && !(floating && cfg!(debug_assertions) && ["--floating-preview", "--agent-stdio"].contains(&arg.as_str()))
+        {
             return Err(format!("桌面样例不接受产品启动参数：{arg}"));
         }
     }
     let root = arg_value(args, "--root")?.ok_or("桌面样例必须指定 --root（项目根目录）。")?;
     let program = voice_desktop_common::canonical_path(Path::new(root))?;
-    let data = program.join(".local/cache/ui-demo");
+    let data = program.join(if floating { ".local/cache/floating-preview" } else { ".local/cache/ui-demo" });
     fs::create_dir_all(&data).map_err(|e| format!("桌面样例缓存目录不可用：{e}"))?;
     let data = voice_desktop_common::canonical_path(&data)?;
     if !data.starts_with(&program) {
@@ -9881,6 +9783,9 @@ fn start_service_for(
             .arg(&state.program)
             .args(["--mode", "ui-preview"])
             .current_dir(&state.program);
+        if state.floating_preview {
+            command.arg("--floating-preview");
+        }
         if let Some(engine) = &state.webview2 {
             command.env("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", engine);
         }
@@ -10063,12 +9968,26 @@ fn start_service_for(
                             Some(format!("页面权限配置失败：{error}"));
                         break;
                     }
+                    if read_state.floating_preview {
+                        if let Err(error) = read_app.add_capability(
+                            floating_windows::capability(&normalized_origin).to_string(),
+                        ) {
+                            *read_state.error.lock().unwrap() = Some(format!("悬浮窗测试权限配置失败：{error}"));
+                            break;
+                        }
+                    }
                     if read_state.mode == FrontendMode::Product {
                         if let Err(error) = read_app.add_capability(
                             floating_capability(&normalized_origin, epoch).to_string(),
                         ) {
                             *read_state.error.lock().unwrap() =
                                 Some(format!("悬浮窗权限配置失败：{error}"));
+                            break;
+                        }
+                        if let Err(error) = read_app.add_capability(
+                            floating_display_capability(&normalized_origin, epoch).to_string(),
+                        ) {
+                            *read_state.error.lock().unwrap() = Some(format!("图文窗口权限配置失败：{error}"));
                             break;
                         }
                         if let Err(error) = read_app.add_capability(
@@ -10376,13 +10295,15 @@ fn create_window(
     .visible(false)
     .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
     .initialization_script(agent_debug::AgentDebug::window_script(app))
-    .title(if build_state.mode == FrontendMode::UiPreview {
+    .title(if build_state.floating_preview {
+        "语音终端 · 悬浮窗测试台"
+    } else if build_state.mode == FrontendMode::UiPreview {
         "Voice Terminal · 前端演示（无业务后端）"
     } else {
         "Voice Terminal · 语音终端"
     })
     // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
-    .inner_size(1000., 640.)
+    .inner_size(if build_state.floating_preview { 640. } else { 1000. }, 640.)
     .min_inner_size(400., 480.)
     .data_directory(
         build_state
@@ -10390,7 +10311,7 @@ fn create_window(
             .map(|context| context.install.join("cache/webview2"))
             .unwrap_or_else(|| build_state.data.clone()),
     )
-    .incognito(build_state.context().is_none())
+    .incognito(build_state.context().is_none() && !build_state.floating_preview)
     .on_navigation(move |url| {
         let available = navigation_state
             .recovery
@@ -10594,6 +10515,12 @@ fn handle_tray_item(app: &tauri::AppHandle, state: &Arc<Desktop>, id: &str) {
     match id {
         "show" => show(app),
         "floating" => {
+            if state.floating_preview {
+                if let Some(preview) = app.try_state::<Arc<floating_windows::FloatingWindows>>() {
+                    let _ = preview.toggle_mode(app, state);
+                    return;
+                }
+            }
             let enabled = !state.floating_mode.load(Ordering::Acquire);
             if let Err(error) = set_floating_mode(app, state, enabled) {
                 set_floating_menu_checked(state, false);
@@ -10617,10 +10544,17 @@ fn run() -> Result<(), String> {
         return Err("--ui-preview 不能重复。".into());
     }
     let preview = preview_count == 1;
+    let floating_preview = args.iter().any(|arg| arg == "--floating-preview");
+    if floating_preview && (!preview || !cfg!(debug_assertions)) {
+        return Err("悬浮窗测试仅支持调试版桌面样例入口。".into());
+    }
     let exit_requested = args.iter().any(|arg| arg == "--exit");
     let agent_mode = args.iter().any(|arg| arg == "--agent-debug");
     let (context, mode, program, data, webview2) = if preview {
         let (program, _, data) = ui_preview_context(&args)?;
+        if floating_preview && args.iter().any(|arg| arg == "--agent-stdio") {
+            return voice_desktop_common::agent_debug::relay_current_executable(&data);
+        }
         voice_desktop_common::prepare_webview_access_paths(&data, None)?;
         (None, FrontendMode::UiPreview, program, data, None)
     } else {
@@ -10647,7 +10581,7 @@ fn run() -> Result<(), String> {
     }
     // 管理页无需脚本引擎就绪；运行环境沿用分发器检测，管理页不重复弹安装引导。
     let locator = context.as_ref().map(|value| Locator::local(&value.install));
-    let instance_identifier = instance_identifier(
+    let mut instance_identifier = instance_identifier(
         mode,
         if preview {
             Some(program.as_path())
@@ -10655,6 +10589,9 @@ fn run() -> Result<(), String> {
             context.as_ref().map(|value| value.install.as_path())
         },
     );
+    if floating_preview {
+        instance_identifier.push_str(".floating");
+    }
     let development = preview || context.as_ref().is_some_and(|value| value.dev);
     let state = Arc::new(Desktop {
         context: Mutex::new(context),
@@ -10666,6 +10603,7 @@ fn run() -> Result<(), String> {
         data,
         webview2,
         mode,
+        floating_preview,
         development,
         instance_identifier,
         service: Mutex::new(None),
@@ -10758,8 +10696,6 @@ fn run() -> Result<(), String> {
         stopped: AtomicBool::new(false),
         tray: AtomicBool::new(false),
         floating_mode: AtomicBool::new(false),
-        floating_ready: AtomicBool::new(false),
-        floating_transition: Mutex::new(()),
         floating_revision: AtomicU64::new(0),
         floating_model: Mutex::new(
             serde_json::json!({"revision":0,"doubleClickMs":floating_double_click_ms(),"state":"standby","sessionActive":false,"audioLevels":[0,0,0,0,0],"silenced":true,"canControl":false,"caption":null}),
@@ -10821,10 +10757,19 @@ fn run() -> Result<(), String> {
                 initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
                 agent_debug::AgentDebug::install(app.handle(), build_state.clone(), agent_mode).map_err(std::io::Error::other)?;
             }
+            if build_state.floating_preview {
+                app.manage(Arc::new(floating_windows::FloatingWindows::default()));
+                agent_debug::AgentDebug::install_preview(app.handle(), build_state.clone()).map_err(std::io::Error::other)?;
+            } else if build_state.mode == FrontendMode::Product {
+                app.manage(Arc::new(floating_windows::FloatingWindows::product()));
+            }
             let maintenance=build_state.context().map(|context|voice_desktop_common::component_maintenance::pending_repairs(&context).map(|pending|pending||context.install.join("tmp/native-install.json").exists())).transpose().map_err(std::io::Error::other)?.unwrap_or(false);
             create_window(app.handle(),build_state.clone(),maintenance).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
                 app.add_capability(floating_capability(REMOTE_STATIC_PRODUCT_ORIGIN, 0).to_string())?;
+                app.add_capability(floating_display_capability(REMOTE_STATIC_PRODUCT_ORIGIN, 0).to_string())?;
+            }
+            if build_state.mode == FrontendMode::Product || build_state.floating_preview {
                 let [(show_id, show_label), (float_id, float_label), (exit_id, exit_label)] = AGENT_TRAY_ITEMS;
                 let show_item = MenuItem::with_id(app, show_id, show_label, true, None::<&str>)?;
                 let floating_item = CheckMenuItem::with_id(app, float_id, float_label, true, false, None::<&str>)?;
@@ -10835,7 +10780,7 @@ fn run() -> Result<(), String> {
                 let tray_state = build_state.clone();
                 let tray = TrayIconBuilder::with_id("voice-terminal")
                     .icon(icon)
-                    .tooltip("Voice Terminal · 语音终端")
+                    .tooltip(if build_state.floating_preview { "语音终端 · 悬浮窗测试" } else { "Voice Terminal · 语音终端" })
                     .menu(&menu)
                     .on_menu_event(move |app, event| handle_tray_item(app, &tray_state, event.id.as_ref()))
                     .on_tray_icon_event(|tray, event| {
@@ -10856,6 +10801,11 @@ fn run() -> Result<(), String> {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::ScaleFactorChanged { .. }) {
+                if let Some(preview) = window.try_state::<Arc<floating_windows::FloatingWindows>>() {
+                    preview.refresh_monitor(window.app_handle(), window.label());
+                }
+            }
             if matches!(event, tauri::WindowEvent::ScaleFactorChanged { .. }) {
                 if let Ok(handle) = window.hwnd() {
                     // 跨屏幕改变显示缩放时，重新选择标题栏与任务栏的原生图标尺寸。
@@ -10866,21 +10816,38 @@ fn run() -> Result<(), String> {
                 }
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<Arc<Desktop>>();
+                if state.floating_preview {
+                    if let Some(preview) = window.try_state::<Arc<floating_windows::FloatingWindows>>() {
+                        if !state.stopping.load(Ordering::Acquire) {
+                            api.prevent_close();
+                            preview.close_window(window.app_handle(), &state, window.label());
+                        }
+                    }
+                    return;
+                }
                 if window.label() == "main" {
                     let state = window.state::<Arc<Desktop>>();
                     if !state.stopped.load(Ordering::SeqCst) {
                         api.prevent_close();
-                        if state.tray.load(Ordering::SeqCst) {
-                            let _ = window.hide();
-                        } else {
+                        if state.mode == FrontendMode::Product
+                            && !state.stopping.load(Ordering::Acquire) {
+                            if let Err(error) = set_floating_mode(window.app_handle(), state.inner(), true) {
+                                if state.tray.load(Ordering::SeqCst) {
+                                    let _ = window.app_handle().emit_to("main", "voice-terminal:floating-error", error);
+                                } else {
+                                    state.inner().shutdown(window.app_handle());
+                                }
+                            }
+                        } else if !state.tray.load(Ordering::SeqCst) {
                             state.inner().shutdown(window.app_handle());
                         }
                     }
-                } else if window.label() == "floating" {
-                    let state = window.state::<Arc<Desktop>>();
-                    if !state.stopped.load(Ordering::SeqCst) && !state.stopping.load(Ordering::SeqCst) {
-                        api.prevent_close();
-                        let _ = set_floating_mode(window.app_handle(), state.inner(), false);
+                } else if matches!(window.label(), floating_windows::PRODUCT_ORB | floating_windows::PRODUCT_DISPLAY)
+                    && !state.stopped.load(Ordering::SeqCst) && !state.stopping.load(Ordering::Acquire) {
+                    api.prevent_close();
+                    if let Some(windows) = window.try_state::<Arc<floating_windows::FloatingWindows>>() {
+                        windows.close_window(window.app_handle(), &state, window.label());
                     }
                 }
             }
@@ -11653,6 +11620,7 @@ mod tests {
             data: std::path::PathBuf::new(),
             webview2: None,
             mode: FrontendMode::Product,
+            floating_preview: false,
             development: false,
             instance_identifier: "replacement-test".into(),
             service: std::sync::Mutex::new(None),
@@ -11725,8 +11693,6 @@ mod tests {
             stopped: AtomicBool::new(false),
             tray: AtomicBool::new(false),
             floating_mode: AtomicBool::new(false),
-            floating_ready: AtomicBool::new(false),
-            floating_transition: std::sync::Mutex::new(()),
             floating_revision: std::sync::atomic::AtomicU64::new(0),
             floating_model: std::sync::Mutex::new(serde_json::json!({})),
             floating_menu: std::sync::Mutex::new(None),
@@ -12839,6 +12805,17 @@ mod tests {
         authority
             .add_capability(floating_capability(super::REMOTE_STATIC_PRODUCT_ORIGIN, 0).to_string())
             .unwrap();
+
+        authority
+            .add_capability(super::floating_display_capability(origin_text, 9).to_string())
+            .unwrap();
+        let display_origin = tauri::ipc::Origin::Remote {
+            url: tauri::Url::parse("http://127.0.0.1:45001/floating.html?view=display").unwrap(),
+        };
+        assert!(authority.resolve_access("floating_window_command", "floating-display", "floating-display", &display_origin).is_some());
+        assert!(authority.resolve_access("control_floating_session", "floating-display", "floating-display", &display_origin).is_none());
+        assert!(authority.resolve_access("floating_preview_command", "floating-display", "floating-display", &display_origin).is_none());
+        assert!(authority.resolve_access("floating_window_command", "main", "main", &origin).is_some());
 
         for command in [
             "get_floating_model",

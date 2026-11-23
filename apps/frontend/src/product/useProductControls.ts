@@ -17,7 +17,7 @@ import { userMessageKey } from "./conversation-identity";
 import { productApi } from './api';
 import { useHotwordSettings } from './useHotwordSettings';
 import { useFloatingWindowProjection } from './useFloatingWindowProjection';
-import type { FloatingSessionAction } from './floating-window';
+import type { FloatingSessionAction } from '../interface/floating/floating-window';
 
 /** useProductControls（页面控件组合逻辑）：复用业务适配器并集中保留表单和录音生命周期。 */
 export function useProductControls() {

@@ -685,6 +685,70 @@ describe('正式界面的真实控件交互', () => {
     expect(value.wakeForm.keywords).toEqual(['保留的业务设置草稿'])
   })
 
+  it('正式主窗口按悬浮模式代次转交当前图文和回执', async () => {
+    const sent = vi.fn()
+    let socket!: { onopen: () => void; onmessage: (value: { data: string }) => void }
+    vi.stubGlobal('WebSocket', class {
+      readyState = 1
+      send = sent
+      close() {}
+      constructor() { socket = this as unknown as typeof socket }
+    })
+    try {
+      const callbacks = new Map<string, (event: { payload: unknown }) => void>()
+      const floatingWindow = vi.fn(async ({ kind }: { kind: string }) =>
+        kind === 'mode_status' ? { enabled: false, generation: 0 } : null)
+      vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+        available: true, floatingWindow,
+        listen: vi.fn(async (name: string, callback: (event: { payload: unknown }) => void) => {
+          callbacks.set(name, callback)
+          return () => callbacks.delete(name)
+        }),
+      } as never)
+      vi.spyOn(productApi, 'snapshot').mockResolvedValue({
+        settings: structuredClone(DEFAULT_SETTINGS), models: structuredClone(DEFAULT_REGISTRY),
+      } as never)
+      vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({})
+      vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({})
+      vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
+      vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [] } as never)
+      application.businessReady.value = true
+      render(ProductApp)
+      await flushPromises()
+      socket.onopen()
+
+      function mode(enabled: boolean, generation: number) {
+        callbacks.get('voice-terminal:floating-mode')!({ payload: { enabled, generation } })
+      }
+      let sequence = 0
+      const command = { generation: 1, delivery: 1, content: '# 当前结果', duration_seconds: 12 }
+      function show(payload: typeof command) {
+        socket.onmessage({ data: JSON.stringify({
+          type: 'display.command', seq: ++sequence, timestamp: '2026-11-23',
+          conversation_id: 'voice-test', payload,
+        }) })
+      }
+      function submitted() {
+        return floatingWindow.mock.calls.filter(([action]) => action.kind === 'submit')
+      }
+      show(command)
+      expect(submitted()).toHaveLength(0)
+      mode(true, 1)
+      expect(JSON.parse(sent.mock.lastCall![0])).toMatchObject({
+        command: 'display.mode', payload: { enabled: true, generation: 1 },
+      })
+      show(command)
+      expect(submitted()).toEqual([[{ kind: 'submit', ...command }]])
+      const receipt = { generation: 1, delivery: 1, status: 'visible', reason: null }
+      callbacks.get('voice-terminal:floating-display-result')!({ payload: receipt })
+      expect(JSON.parse(sent.mock.lastCall![0])).toMatchObject({ command: 'display.receipt', payload: receipt })
+      mode(false, 2)
+      mode(true, 3)
+      show({ ...command, delivery: 2 })
+      expect(submitted()).toHaveLength(1)
+    } finally { vi.unstubAllGlobals() }
+  })
+
   it('远程录制按钮在后台产品与组件状态刷新期间仍能启停', async () => {
     application.snapshot.value = { remote_mode: true, host_id: 'server-a', management_connected: true,
       remote_business_ready: true, voice_ws_url: window.__VOICE_APPLICATION__?.voice_ws_url, core_phase: 'ready',

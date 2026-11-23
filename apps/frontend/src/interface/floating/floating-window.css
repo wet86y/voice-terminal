@@ -1,0 +1,109 @@
+:root,
+html,
+body,
+#app {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+.floating-window-shell {
+  --orb-x: 50%; /* orb-x（菱形中心横坐标）。 */
+  --orb-y: 62px; /* orb-y（菱形中心纵坐标）。 */
+  --caption-distance: 40px; /* caption-distance（菱形中心到字幕近边）：为波动外圈留少量空间。 */
+  --caption-x: var(--orb-x);
+  --caption-y: calc(var(--orb-y) + var(--caption-distance));
+  --caption-align-x: -50%;
+  --caption-max-width: 126px;
+  --floating-ease: cubic-bezier(.3333, 1, .6667, 1);
+  --orb-resize-duration: var(--duration); /* orb-resize-duration（菱形和外圈的状态尺寸过渡）。 */
+  --orb-resize-ease: var(--floating-ease); /* orb-resize-ease（菱形与字幕同步的过渡曲线）。 */
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  user-select: none;
+}
+.floating-window-shell[data-session-active="true"] { --caption-distance: 58px; }
+
+.floating-orb-control {
+  /* 透明窗口以可见球体反馈操作，屏幕边界裁切贴边部分。 */
+  --button-hover-wash: transparent;
+  --button-press-wash: transparent;
+  position: absolute;
+  left: var(--orb-x);
+  top: var(--orb-y);
+  transform: translate(-50%, -50%);
+  width: 150px;
+  height: 141px;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  touch-action: none;
+  cursor: pointer;
+  transition: left var(--duration) var(--floating-ease), top var(--duration) var(--floating-ease),
+    filter var(--button-feedback-duration), translate var(--button-feedback-duration);
+}
+.floating-orb-control.dragging { cursor: grabbing; }
+.floating-orb-control:focus-visible { outline-offset: -5px; border-radius: 14px; }
+.floating-orb-control > .orb-stage {
+  /* scale（整体缩放）：复用主页语音状态、动效和尺寸。 */
+  width: 200%;
+  height: 200%;
+  transform: scale(0.5);
+  transform-origin: top left;
+}
+
+.floating-caption {
+  --caption-fill: var(--panel-soft);
+  --caption-line: var(--line);
+  display: flex;
+  width: fit-content;
+  max-width: var(--caption-max-width, 126px);
+  min-width: 0;
+  position: absolute;
+  left: var(--caption-x);
+  top: var(--caption-y);
+  translate: var(--caption-align-x) 0;
+  pointer-events: none;
+  transition: left var(--duration) var(--floating-ease), top var(--duration) var(--floating-ease),
+    translate var(--duration) var(--floating-ease), max-width var(--duration) var(--floating-ease),
+    opacity 140ms, transform 140ms;
+}
+.floating-caption-user {
+  --caption-fill: #2c334c;
+  --caption-line: #b2baff30;
+}
+.floating-caption-bubble {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 32px;
+  padding: 6px 9px;
+  border: 1px solid var(--caption-line);
+  border-radius: 9px;
+  background: var(--caption-fill);
+  box-shadow: 0 3px 10px #00000024;
+}
+.floating-caption-viewport {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: pre;
+  font-size: var(--font-body);
+  line-height: 18px;
+  scrollbar-width: none;
+}
+.floating-caption-viewport::-webkit-scrollbar { display: none; }
+.floating-caption-track { display: inline-block; position: relative; white-space: pre; }
+.floating-caption-focus { display: inline-block; color: var(--text); }
+.floating-caption-enter-from,
+.floating-caption-leave-to { opacity: 0; transform: translateY(4px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .floating-window-shell { --orb-resize-duration: 0ms; }
+  .floating-orb-control, .floating-caption { transition: none; }
+}

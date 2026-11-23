@@ -212,7 +212,7 @@ class AgentContextMixin:
 
     def messages(self, kinds, recovery_signal=None, *, prompt_kind="normal", force_context=None,
                  current_turn_id=None, shadow_information=None, secondary_context=None,
-                 reasoning_effort=None, listening_context=None, instruction_candidates=""):
+                 reasoning_effort=None, listening_context=None, instruction_candidates="", floating_display_prompt=None):
         model_turn_id = current_turn_id or self.last_turn_id or ""
         current = self.inputs.get(model_turn_id, {})
         primary = str(current.get("text") or "")
@@ -425,6 +425,10 @@ class AgentContextMixin:
         if error:
             messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "system", error, context_kind="system_context"))
             self._screen_error = ""
+        if floating_display_prompt:
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system", floating_display_prompt, context_kind="floating_display",
+            ))
         messages = consolidate_request_tail(messages)
         self._guard_context_contract(messages)
         self._update_context_metrics(messages)
@@ -456,7 +460,7 @@ class AgentContextMixin:
 
     def _decision_schema(self) -> dict:
         definitions = self._session_action_definitions()
-        return decision_schema(definitions)
+        return decision_schema(definitions, include_display=getattr(self, "floating_display", None) is not None)
 
     def _normalize_schema_envelope(self, envelope: DecisionEnvelope) -> DecisionEnvelope:
         """Remove strict-schema filler fields without weakening local validation."""
@@ -482,4 +486,4 @@ class AgentContextMixin:
                 key: value for key, value in action.arguments.items()
                 if key in keys or key not in merged_keys  # 只删除已知合并填充；未知参数留给本地严格校验。
             }))
-        return DecisionEnvelope(envelope.speak, tuple(normalized))
+        return DecisionEnvelope(envelope.speak, tuple(normalized), envelope.display)

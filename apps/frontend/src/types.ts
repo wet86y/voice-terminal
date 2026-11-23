@@ -408,13 +408,14 @@ export type ServerMessageType =
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'conversation.append' | 'conversation.snapshot'
+  | 'display.command' // display.command（投递到本机悬浮窗的展示操作）。
   | 'shadow.product' | 'shadow.activity' | 'error'
 
 /** ReasoningMode（运行模式）：快速不思考，深度直接使用低强度思考。 */
 export type ReasoningMode = 'fast' | 'deep'
 /** SessionOperation（会话操作）：重置整理上下文，清除归档并开启全新会话。 */
 export type SessionOperation = 'reset' | 'clear'
-export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.clear' | 'session.reasoning_mode' | 'conversation.image.read'
+export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.clear' | 'session.reasoning_mode' | 'conversation.image.read' | 'display.mode' | 'display.receipt'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {
   type: TType

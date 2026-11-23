@@ -195,8 +195,14 @@ impl State {
 }
 
 fn owned(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
+    if state.floating_preview {
+        return crate::floating_windows::trusted(window, state);
+    }
     if state.mode != FrontendMode::Product {
         return Err("当前窗口不是正式产品窗口。".into());
+    }
+    if window.label() == crate::floating_windows::PRODUCT_DISPLAY {
+        return crate::floating_windows::product_trusted(window, state);
     }
     if window.label() == "floating" {
         crate::trusted_floating(window, state)
@@ -439,7 +445,11 @@ async fn evaluate(window: &WebviewWindow, expression: String) -> Result<Value, S
 
 fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'static str>, String> {
     let url = window.url().map_err(|error| error.to_string())?;
-    let mut capability = if window.label() == "floating" {
+    let mut capability = if state.floating_preview {
+        crate::floating_windows::capability(&url.origin().ascii_serialization())
+    } else if window.label() == crate::floating_windows::PRODUCT_DISPLAY {
+        crate::floating_display_capability(&url.origin().ascii_serialization(), 0)
+    } else if window.label() == "floating" {
         crate::floating_capability(&url.origin().ascii_serialization(), 0)
     } else if crate::boot_page_url(&url) {
         serde_json::from_str(include_str!("../../capabilities/boot.json"))
@@ -464,6 +474,9 @@ fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'sta
             commands.extend(imports.iter().cloned());
         }
     }
+    let publisher = (window.label() == "main" && state.mode == crate::FrontendMode::Product
+        && !crate::boot_page_url(&url))
+        .then(|| crate::floating_publisher_capability(&url.origin().ascii_serialization(), 0));
     Ok(COMMANDS
         .lines()
         .filter(|command| {
@@ -471,9 +484,10 @@ fn desktop_commands(window: &WebviewWindow, state: &Desktop) -> Result<Vec<&'sta
                 return false;
             }
             let permission = format!("allow-{}", command.replace('_', "-"));
-            capability["permissions"]
-                .as_array()
-                .is_some_and(|entries| entries.iter().any(|entry| entry == &permission))
+            [Some(&capability), publisher.as_ref()].into_iter().flatten().any(|capability| {
+                capability["permissions"].as_array()
+                    .is_some_and(|entries| entries.iter().any(|entry| entry == &permission))
+            })
         })
         .collect())
 }
@@ -489,7 +503,7 @@ pub fn check_command(window: &WebviewWindow, state: &Desktop, point: &str) -> Re
 pub async fn modules(app: &AppHandle, state: &Desktop, params: &Value) -> Result<Value, String> {
     let window = target(app, state, params["window"].as_str())?;
     let desktop = desktop_commands(&window, state)?;
-    let service = evaluate(&window, format!("({SERVICE})(null)")).await?;
+    let service = if state.floating_preview { json!([]) } else { evaluate(&window, format!("({SERVICE})(null)")).await? };
     let remote: &[&str] = &[];
     #[cfg(feature = "ssh-device")]
     let remote = if desktop.contains(&"device_ssh_management_request")
@@ -515,6 +529,9 @@ pub async fn call(
     let window = target(app, state, params["window"].as_str())?;
     let mut operation = field(params, "operation")?;
     let mut arguments = arguments;
+    if state.floating_preview && matches!(params["surface"].as_str(), Some("service" | "remote")) {
+        return Err("悬浮窗测试仅提供本机桌面调用。".into());
+    }
     if params["surface"] == "service" {
         let value = evaluate(
             &window,

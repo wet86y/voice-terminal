@@ -20,6 +20,7 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "minor_protocol_feedback",
     "immediate_recovery",
     "deferred_recovery",
+    "floating_display",  # 本次请求的正式悬浮展示能力和简短回执。
     "reasoning_mode",  # reasoning_mode（本次推理模式提示）：与冻结的接口推理强度一致。
     "pending_tools",
     "final_silence",
@@ -44,7 +45,7 @@ SPEECH_QUEUE_TASK = (
     "保留旧尾巴所有仍有效的要点，不重新回答或重述锁定部分。"
     "重点核对整轮末尾的修正与最终要求；锁定内容或回答前提与最新明确意图实质冲突时优先 cancel（取消并替换），不要求确认已听到严重错误。替换文本仅含必要更正及回答，不重复已传达的有效信息。\n"
     "用户主动追问且没有仍有效的暂缓或静默要求时依据已知事实回答，没有确认更新就如实说明。actions（后台动作列表）按路由独立判断。"
-    "最终只输出 voice_decision_v06（语音决策结构）要求的 speak（语音决策）与 actions（动作列表）JSON（结构化输出）。"
+    "最终只输出 voice_decision_v06（语音决策结构）要求的 JSON（结构化输出），包含 speak（语音决策）、actions（动作列表）和本次协议声明的其他字段。"
 )
 FINAL_OUTPUT_CONSTRAINT = (
     "输出约束：最终 output_text 必须且只能是一个符合 voice_decision_v06 的完整 JSON 对象。"

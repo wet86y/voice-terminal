@@ -28,7 +28,7 @@ class EpisodeController(RealtimeController):
     def __init__(self, *, agent_options, persona_config=None,
                  custom_instructions_provider=None, instruction_matcher=None,
                  continuity_document_provider=None, on_user_activity=None,
-                 on_silence_anchor=None, **kwargs):
+                 on_silence_anchor=None, floating_display=None, **kwargs):
         self.quiet_policy = kwargs.pop("quiet_policy", None)
         self.deferred_capture = kwargs.pop("deferred_capture", None)
         self.deferred_append = kwargs.pop("deferred_append", None)
@@ -40,6 +40,7 @@ class EpisodeController(RealtimeController):
         self.continuity_document_provider = continuity_document_provider
         self.on_user_activity = on_user_activity
         self.on_silence_anchor = on_silence_anchor
+        self.floating_display = floating_display
         self.output = EpisodeSpeechOutput(self)
         self.episode = self._make_episode()
         self._endpoint_context = None
@@ -152,6 +153,7 @@ class EpisodeController(RealtimeController):
                                         on_speaker_heartbeat=self._speaker_heartbeat_pulse,
                                         admit_user_turn=self._speaker_admit_turn,
                                         defer_user_turn=self._speaker_defer_turn)
+        runtime.floating_display = self.floating_display
         runtime.quiet_policy = self.quiet_policy
         runtime.perception = self.perception
         runtime.deferred_capture = self.deferred_capture

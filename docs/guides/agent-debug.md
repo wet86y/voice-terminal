@@ -34,7 +34,7 @@ if ($start.ExitCode) { throw '调试窗口未就绪。' }
 npm run agent:call -- --method instance.status
 ```
 
-`--exit`（正常退出）等待宿主退出及工作区释放；`--agent-debug`（代理调试启动）等待窗口启动交接，组件就绪需另查应用状态。关闭主窗口通常只隐藏到托盘。结束调试时用同一退出命令，再以不带参数的正式入口启动普通模式：
+`--exit`（正常退出）等待宿主退出及工作区释放；`--agent-debug`（代理调试启动）等待窗口启动交接，组件就绪需另查应用状态。关闭主窗口会进入悬浮模式。结束调试时用同一退出命令，再以不带参数的正式入口启动普通模式：
 
 ```powershell
 $stop = Start-Process -FilePath $entry -ArgumentList '--exit' -WindowStyle Hidden -PassThru

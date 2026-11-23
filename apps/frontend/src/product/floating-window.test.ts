@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { h, nextTick } from 'vue'
 import { mount } from '@vue/test-utils'
 import VoiceOrb from '../interface/VoiceOrb.vue'
-import FloatingWindowShell from './FloatingWindowShell.vue'
-import FloatingCaption from './FloatingCaption.vue'
-import { EMPTY_FLOATING_WINDOW_MODEL, readFloatingCaption, type FloatingWindowModel } from './floating-window'
+import FloatingWindowShell from '../interface/floating/FloatingWindowShell.vue'
+import FloatingCaption from '../interface/floating/FloatingCaption.vue'
+import { EMPTY_FLOATING_WINDOW_MODEL, readFloatingCaption, type FloatingWindowModel } from '../interface/floating/floating-window'
 
 const mounted: ReturnType<typeof mount>[] = []
 beforeEach(() => vi.useFakeTimers())
@@ -81,7 +81,7 @@ describe('悬浮窗动效扩展接口', () => {
     await fire(wrapper.get('.voice-orb').element, 'pointermove', { pointerId: 1, clientX: 26, clientY: 20 })
     expect(wrapper.emitted('drag')).toBeUndefined()
     await fire(wrapper.get('.voice-orb').element, 'pointermove', { pointerId: 1, clientX: 27, clientY: 20 })
-    expect(wrapper.emitted('drag')).toHaveLength(1)
+    expect(wrapper.emitted('drag')).toEqual([[{ x: 20, y: 20 }]])
     await fire(wrapper.get('button').element, 'pointerup', { button: 0, pointerId: 1 })
     await fire(wrapper.get('button').element, 'click', { button: 0, detail: 1 })
     await vi.advanceTimersByTimeAsync(600)

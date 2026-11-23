@@ -1,15 +1,29 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { FloatingCaption as Caption, FloatingWindowModel } from './floating-window'
+import type { FloatingCaption as Caption, FloatingOrbFrame, FloatingWindowModel } from './floating-window'
 import FloatingCaption from './FloatingCaption.vue'
 
 const props = defineProps<{
   model: FloatingWindowModel // model（悬浮窗扩展数据模型）。
+  frame?: FloatingOrbFrame | null // frame（贴边窗内布局）：空值使用自由摆放布局。
 }>()
+
+const frameStyle = computed(() => {
+  const frame = props.frame
+  if (!frame) return
+  return {
+    '--orb-x': frame.orb_x + 'px',
+    '--orb-y': frame.orb_y + 'px',
+    '--caption-x': frame.caption_x + 'px',
+    '--caption-y': frame.caption_y + 'px',
+    '--caption-align-x': frame.caption_align + '%',
+    '--caption-max-width': frame.caption_width + 'px',
+  }
+})
 
 const emit = defineEmits<{
   returnToWorkbench: [] // returnToWorkbench（切回主工作台）。
-  drag: [] // drag（拖动悬浮窗）。
+  drag: [origin: { x: number; y: number }] // drag（拖动悬浮窗）：附窗口内的按下位置。
   toggleSilence: [] // toggleSilence（切换静默与语音识别）。
 }>()
 
@@ -49,7 +63,7 @@ function movePress(event: PointerEvent) {
   clearClick()
   // 越过系统拖动阈值后立即释放网页捕获，让原生窗口接管仍按住的鼠标。
   if (control.value?.hasPointerCapture?.(press.id)) control.value.releasePointerCapture(press.id)
-  emit('drag')
+  emit('drag', { x: press.x, y: press.y })
 }
 function finishPress() {
   suppressClick ||= Boolean(press?.moved || dragging.value)
@@ -105,6 +119,8 @@ defineSlots<{
 <template>
   <main
     class="floating-window-shell"
+    :style="frameStyle"
+    :data-session-active="model.sessionActive"
     aria-label="语音悬浮窗"
     @contextmenu.prevent
   >

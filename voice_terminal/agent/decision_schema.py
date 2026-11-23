@@ -1,16 +1,18 @@
 """V0.6（第六版）决策结构：从真实动作合同生成供应方分支，本地验证仍为执行依据。"""
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Iterable
 
+from .display_decision import DISPLAY_SCHEMA
 
-def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, Any]:
+
+def decision_schema(action_definitions: Iterable[dict[str, Any]], *, include_display: bool = False) -> dict[str, Any]:
     """Build a stable, provider-compatible schema from the local action catalog.
 
     每个动作项分别匹配其真实参数；供应方结构与本地合同共用动作定义。
     """
 
-    from copy import deepcopy
     definitions = [d for d in action_definitions if isinstance(d, dict) and d.get("name")]
     if any(d["name"] == "request_thinking" for d in definitions):
         raise ValueError("request_thinking（追加思考动作）已归档。")
@@ -22,7 +24,7 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, A
     actions = {"type": "array", "maxItems": 8 if branches else 0,
                "items": {"anyOf": branches} if branches else {"type": "string"}}
 
-    return {
+    schema = {
         "type": "object",
         "additionalProperties": False,
         "required": ["speak", "actions"],
@@ -52,3 +54,7 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, A
             "actions": actions,
         },
     }
+    if include_display:
+        schema["required"].append("display")
+        schema["properties"]["display"] = deepcopy(DISPLAY_SCHEMA)
+    return schema

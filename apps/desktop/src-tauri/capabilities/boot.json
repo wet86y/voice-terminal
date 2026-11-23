@@ -51,6 +51,7 @@
     "allow-open-console",
     "allow-open-minimax-voice-library",
     "allow-publish-floating-model",
+    "allow-floating-window-command",
     "allow-desktop-initialize",
     "allow-desktop-manage",
     "allow-desktop-start-service",

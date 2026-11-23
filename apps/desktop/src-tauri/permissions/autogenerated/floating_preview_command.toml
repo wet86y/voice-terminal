@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-floating-preview-command"
+description = "Enables the floating_preview_command command without any pre-configured scope."
+commands.allow = ["floating_preview_command"]
+
+[[permission]]
+identifier = "deny-floating-preview-command"
+description = "Denies the floating_preview_command command without any pre-configured scope."
+commands.deny = ["floating_preview_command"]

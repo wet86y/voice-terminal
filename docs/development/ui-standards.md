@@ -19,7 +19,8 @@
 | [design.css（共享设计系统）](../../apps/frontend/src/interface/design.css) | 配色、字号、尺寸、表单、设置布局、弹窗与响应式规则的权威入口；正式页、管理页、悬浮窗与样例均加载。 |
 | [startup.css（最小共享界面层）](../../apps/desktop/boot/startup.css) | 独立启动、维护、故障页的样式，以及全程序的公共按钮反馈。完整界面由共享设计系统导入；独立入口可直接加载或内嵌，无需先加载界面框架。 |
 | [application.css（产品运行状态布局）](../../apps/frontend/src/product/application.css) | 组件运行、降级提示等专用内容；新增普通设置页不以此建立第二套配色。 |
-| [floating-window.css（悬浮窗布局）](../../apps/frontend/src/product/floating-window.css) | 透明窗口与字幕布局，复用主界面的球体、颜色和反馈。 |
+| [floating-window.css（悬浮窗布局）](../../apps/frontend/src/interface/floating/floating-window.css) | 透明窗口与字幕布局，复用主界面的球体、颜色和反馈。 |
+| [FloatingDisplayWindow.vue（悬浮图文展示）](../../apps/frontend/src/interface/floating/FloatingDisplayWindow.vue) | 紧凑排版校验、关注放大和计时颜色。正式窗口与测试台复用，正式图文依据语音核心投递。 |
 | [AppFrame.vue（应用框架）](../../apps/frontend/src/interface/AppFrame.vue)、[Workbench.vue（工作台）](../../apps/frontend/src/interface/Workbench.vue) | 应用外壳、三栏工作台与会话操作。已有区域通过模型和事件扩展。 |
 | [SettingsFrame.vue（设置框架）](../../apps/frontend/src/interface/SettingsFrame.vue)、[SettingsPageHeader.vue（设置页标题）](../../apps/frontend/src/interface/SettingsPageHeader.vue)、[settings.ts（设置分区定义）](../../apps/frontend/src/interface/settings.ts) | 导航、页面标题、说明及标题右侧操作。页面名称和分区归属沿用同一份定义。 |
 | [UiButton.vue（通用按钮）](../../apps/frontend/src/interface/UiButton.vue) | 普通操作的首选，提供主要、次要、危险及忙碌状态。选择器、图标操作、媒体控制等有专用语义的原生按钮同样继承公共反馈。 |

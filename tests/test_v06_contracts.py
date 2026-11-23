@@ -1245,14 +1245,35 @@ def test_tts_session_started_before_first_pcm_waits_for_user_release():
     asyncio.run(scenario())
 
 
-def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
+@pytest.mark.parametrize("display_state", ["untouched", "show", "invalid", "inactive", "stale"])
+def test_runtime_uses_json_mode_and_promotes_only_valid_envelope(display_state):
     async def scenario():
+        from voice_terminal.core.event_bus import EventBus
+        from voice_terminal.server.floating_display import FloatingDisplaySession
+
         seen = {}
+        delivered = []
+        conversation = ConversationRuntime()
+        target_runtime = SimpleNamespace(
+            conversation=conversation, bus=EventBus(delivered.append),
+            device_registry=SimpleNamespace(active=None),
+        )
+        display = FloatingDisplaySession(target_runtime)
+        if display_state != "inactive":
+            assert display.set_mode("desktop", {"enabled": True, "generation": 2})
+        decision = {"speak": {"state": "speak", "controls": [], "text": "好的"}, "actions": []}
+        if display_state != "untouched":
+            decision["display"] = [{"content": "# 展示\n语音旁白", "duration_seconds": 3 if display_state == "invalid" else 12}]
         class Provider:
             def stream_events(self, _messages, *, json_mode=False):
                 seen["json_mode"] = json_mode
                 async def stream():
-                    yield {"type": "content", "text": '{"speak":{"state":"speak","controls":[],"text":"好的"},"actions":[]}' }
+                    if display_state != "untouched":
+                        serialized = json.dumps(_messages, ensure_ascii=False)
+                        assert ("本次 display（悬浮图文）不可用" if display_state == "inactive" else "当前支持 display（悬浮图文）") in serialized
+                    if display_state == "stale":
+                        assert display.set_mode("desktop", {"enabled": True, "generation": 3})
+                    yield {"type": "content", "text": json.dumps(decision, ensure_ascii=False)}
                     yield {"type": "finish", "reason": "stop"}
                 return stream()
         class Registry:
@@ -1269,12 +1290,24 @@ def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
             async def begin(self, *_args, **_kwargs): return Handle()
         events = []
         async def emit(kind, payload): events.append((kind, payload))
-        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        conversation.begin_turn("turn")
         runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit, conversation=conversation, ledger=SessionLedger())
+        if display_state != "untouched":
+            runtime.floating_display = display
+            assert "display" in runtime._decision_schema()["required"]
         runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"; runtime.inputs = {"turn": {"text": "你好", "final": True}}
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"; runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_FINALIZED"})
         assert seen == {"json_mode": True, "text": "好的", "finished": True}
+        if display_state == "show":
+            assert len(delivered) == 1
+            assert delivered[0].type == "display.command"
+            assert delivered[0].turn_id == "turn"
+            assert delivered[0].payload["content"] == "# 展示\n语音旁白"
+        else:
+            assert not delivered
+        if display_state == "invalid":
+            assert "5–60 秒" in display.feedback
         assert any(kind == "speak.preview" and payload.get("text") == "好的" and payload.get("committed") is False
                    for kind, payload in events)
         assert any(kind == "speak.preview" and payload.get("status") == "committed"

@@ -51,6 +51,26 @@ impl AgentDebug {
     pub fn install(app: &AppHandle, state: Arc<Desktop>, mode: bool) -> Result<(), String> {
         let context = state.context().ok_or("代理调试缺少正式工作区。")?;
         let endpoint = wire::Endpoint::new(&context.install)?;
+        let allowed = wire::allowed(&context.data).unwrap_or(false);
+        Self::install_at(app, state, context.data, endpoint, mode, allowed)
+    }
+
+    pub fn install_preview(app: &AppHandle, state: Arc<Desktop>) -> Result<(), String> {
+        if !state.floating_preview || wire::session_id()? == 0 {
+            return Err("悬浮窗测试调试需要本机交互桌面。".into());
+        }
+        let endpoint = wire::Endpoint::current_executable(&state.data)?;
+        Self::install_at(app, state.clone(), state.data.clone(), endpoint, true, true)
+    }
+
+    fn install_at(
+        app: &AppHandle,
+        state: Arc<Desktop>,
+        data: std::path::PathBuf,
+        endpoint: wire::Endpoint,
+        mode: bool,
+        allowed: bool,
+    ) -> Result<(), String> {
         let session = wire::session_id()?;
         let capability = if mode {
             let mut bytes = [0u8; 32];
@@ -62,9 +82,8 @@ impl AgentDebug {
         } else {
             String::new()
         };
-        let allowed = wire::allowed(&context.data).unwrap_or(false);
         let debug = Arc::new(Self {
-            data: context.data,
+            data,
             mode,
             allowed: AtomicBool::new(allowed),
             setting_write: Mutex::new(()),
@@ -230,6 +249,9 @@ impl AgentDebug {
             |request, subscription| {
                 let method = request["method"].as_str().unwrap_or_default();
                 let params = &request["params"];
+                if state.floating_preview && !same_session {
+                    return Dispatch::Reply(Err("测试调试连接必须来自同一 Windows（操作系统）会话。".into()));
+                }
                 let enabled = self.allowed();
                 let result = match method {
                     "instance.status" if enabled => Ok(json!({

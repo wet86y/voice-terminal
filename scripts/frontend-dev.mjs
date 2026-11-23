@@ -45,9 +45,11 @@ function trustedHost(value) {
  * instanceId（所属实例编号）；hostOrigin（产品宿主地址）；port（监听请求端口，默认由系统分配）；
  * strictPort（连续窗口恢复时必须保留原端口）。
  */
-export async function createDesktopServer({ root, mode, cookieName, session, instanceId, hostOrigin, port, strictPort = false }) {
+export async function createDesktopServer({ root, mode, cookieName, session, instanceId, hostOrigin, port, strictPort = false, floatingPreview = false }) {
   if (!['product', 'ui-preview'].includes(mode)) throw new Error('桌面开发模式无效。')
   const preview = mode === 'ui-preview'
+  if (floatingPreview && !preview) throw new Error('悬浮窗测试要求独立界面样例模式。')
+  const previewPage = floatingPreview ? '/floating-preview.html' : '/ui-demo.html'
   if (preview) {
     instanceId = randomUUID().replaceAll('-', '')
     cookieName = `voice_preview_${instanceId}`
@@ -97,7 +99,7 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
       const tokens = address.searchParams.getAll('token')
       if ([...address.searchParams].length !== 1 || tokens.length !== 1 || !launchToken || Date.now() - issuedAt >= 60000 || !equal(tokens[0], launchToken)) return reject(response)
       launchToken = undefined // 原子消费：事件循环内不跨异步边界。
-      return send(response, bootstrap('/ui-demo.html'), 200, { 'Set-Cookie': `${cookieName}=${session}; Path=/; HttpOnly; SameSite=Strict` })
+      return send(response, bootstrap(previewPage), 200, { 'Set-Cookie': `${cookieName}=${session}; Path=/; HttpOnly; SameSite=Strict` })
     }
     if (!validSession(request)) {
       if (request.method === 'GET' && ['/', '/index.html', '/ui-demo.html'].includes(pathname)) return send(response, ENTRY_HINT)
@@ -113,7 +115,8 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     if (!preview && (pathname === '/application-config.js' || pathname.startsWith('/api/v1/application/'))) return proxy(request, response)
     if (preview && (pathname === '/index.html' || pathname === '/application-config.js' || pathname.startsWith('/api/') || pathname.startsWith('/src/product/') || pathname.startsWith('/src/composables/'))) return reject(response)
     if (!preview && (pathname === '/ui-demo.html' || pathname.startsWith('/src/ui-demo/'))) return reject(response)
-    if (preview && pathname === '/') return send(response, bootstrap('/ui-demo.html'))
+    if (!floatingPreview && pathname === '/floating-preview.html') return reject(response)
+    if (preview && pathname === '/') return send(response, bootstrap(previewPage))
     if (!vite) return send(response, '桌面界面正在准备。', 503)
     response.setHeader('Cache-Control', 'no-store')
     vite.middlewares(request, response, () => send(response, '界面资源不存在。', 404))
@@ -203,7 +206,7 @@ async function main() {
       if (frame.kind === 'start' && !started) {
         started = true
         try {
-          running = await createDesktopServer({ root, mode })
+          running = await createDesktopServer({ root, mode, floatingPreview: args.includes('--floating-preview') })
           if (stopped) { await running.close(); return }
           sendControl('ready', { origin: running.origin, launch_token: running.launchToken, instance_id: running.instanceId, pid: process.pid })
         } catch (error) { process.stderr.write(`${error.message}\n`); await stop(); process.exit(1) }

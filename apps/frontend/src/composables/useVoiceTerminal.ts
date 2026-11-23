@@ -1,3 +1,4 @@
+import type { FloatingDisplayDelivery, FloatingDisplayMode, FloatingDisplayReceipt } from '../interface/floating/floating-display'
 import { configureImageChannel, clearImageChannel, acceptImageChunk, suspendImageChannel, resumeImageChannel } from '../interface/image-channel'
 import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import type {
@@ -1009,6 +1010,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     llmContextTurnId.value = turnId
   }
 
+  const floatingDisplayDelivery = shallowRef<FloatingDisplayDelivery | null>(null)
+  function setFloatingDisplayMode(mode: FloatingDisplayMode) {
+    return sendCommand('display.mode', { ...mode })
+  }
+  function reportFloatingDisplay(result: FloatingDisplayReceipt) {
+    return sendCommand('display.receipt', { ...result })
+  }
+
   function handleMessage(raw: unknown) {
     const message = parseServerMessage(raw)
     if (!message) {
@@ -1019,6 +1028,16 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (lastSequence.value !== null && message.seq <= lastSequence.value) return
     lastSequence.value = message.seq
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'display.command') {
+      if (!isNonNegativeInteger(payload.generation) || !isNonNegativeInteger(payload.delivery)) return
+      const { generation, delivery, content, duration_seconds } = payload
+      if (content === null && duration_seconds === null) {
+        floatingDisplayDelivery.value = { generation, delivery, content, duration_seconds }
+      } else if (typeof content === 'string' && typeof duration_seconds === 'number' && Number.isInteger(duration_seconds)) {
+        floatingDisplayDelivery.value = { generation, delivery, content, duration_seconds }
+      }
+      return
+    }
     if (message.type === 'devices.snapshot') {
       if (typeof payload.core_session_id === 'string' && typeof payload.self_device_id === 'string'
           && isNonNegativeInteger(payload.revision) && Array.isArray(payload.devices)) {
@@ -1481,6 +1500,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   return {
     connection,
+    floatingDisplayDelivery,
+    setFloatingDisplayMode,
+    reportFloatingDisplay,
     audioLevels,
     connectionError,
     connectionLabel,

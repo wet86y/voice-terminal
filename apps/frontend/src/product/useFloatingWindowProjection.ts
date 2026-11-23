@@ -2,7 +2,7 @@ import { computed, ref, watch, type Ref } from 'vue'
 import type { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import type { WorkbenchModel } from '../interface/workbench'
 import { isRecord } from '../record'
-import type { FloatingCaption, FloatingWindowProjection } from './floating-window'
+import type { FloatingCaption, FloatingWindowProjection } from '../interface/floating/floating-window'
 
 /** FloatingWorkbench（动效来源）：仅开放主页面动效与控件状态，不开放聊天列表。 */
 type FloatingWorkbench = Pick<WorkbenchModel, 'state' | 'sessionActive' | 'audioLevels' | 'disabled' | 'controlReady'>

@@ -1073,7 +1073,7 @@ time {
   border: 1px solid color-mix(in srgb, var(--orb-color) 26%, transparent);
   position: absolute;
   pointer-events: none;
-  transition: border-color 320ms, transform 80ms linear;
+  transition: border-color 320ms, transform 80ms linear, width var(--orb-resize-duration, 0ms) var(--orb-resize-ease, ease);
 }
 .orb-ring.second {
   --outline-ratio: 1.26;
@@ -1093,7 +1093,8 @@ time {
     0 0 0 5px color-mix(in srgb, var(--orb-color) 8%, transparent),
     0 0 36px var(--orb-glow),
     inset 2px 2px #ffffff5c;
-  transition: background-color 320ms, border-color 320ms, box-shadow 320ms, transform 80ms linear;
+  transition: background-color 320ms, border-color 320ms, box-shadow 320ms, transform 80ms linear,
+    width var(--orb-resize-duration, 0ms) var(--orb-resize-ease, ease);
 }
 .voice-waveform {
   display: flex;

@@ -15,8 +15,8 @@ export class AgentError extends Error {
 }
 
 export class AgentClient extends EventEmitter {
-  /** entry（正式入口路径）、timeoutMs（调用超时毫秒数）；不自动启停正式宿主。 */
-  constructor({ entry = defaultEntry, timeoutMs = 30000 } = {}, startProcess = spawn) {
+  /** entry（入口路径）、timeoutMs（调用超时毫秒数）、floatingPreview（连接独立悬浮窗测试台）。 */
+  constructor({ entry, timeoutMs = 30000, floatingPreview = false } = {}, startProcess = spawn) {
     super()
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new AgentError('调用超时必须为正整数毫秒。')
     this.timeoutMs = timeoutMs
@@ -26,7 +26,9 @@ export class AgentClient extends EventEmitter {
     this.failure = null
     this.closed = false
     this.stderr = ''
-    this.child = startProcess(entry, ['--agent-stdio'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    const executable = entry ?? (floatingPreview ? resolve(root, '.local/build/desktop/product/debug/VoiceTerminalDesktop.exe') : defaultEntry)
+    const parameters = floatingPreview ? ['--agent-stdio', '--ui-preview', '--floating-preview', '--root', root] : ['--agent-stdio']
+    this.child = startProcess(executable, parameters, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     this.completion = new Promise((resolveDone, rejectDone) => {
       this.child.once('error', error => this.fail(new AgentError(`无法启动正式调试入口：${error.message}。请检查 --entry（入口路径）。`)))
       this.child.once('close', code => {
@@ -113,12 +115,13 @@ export async function runCli(args = process.argv.slice(2)) {
   const { values } = parseArgs({ args, options: {
     method: { type: 'string' }, params: { type: 'string' }, 'params-file': { type: 'string' },
     'timeout-ms': { type: 'string' }, output: { type: 'string' }, screenshot: { type: 'string' },
-    entry: { type: 'string' }, help: { type: 'boolean' },
+    entry: { type: 'string' }, 'floating-preview': { type: 'boolean' }, help: { type: 'boolean' },
   } })
   if (values.help) {
     console.log(`正式代理调试调用：npm run agent:call -- --method ui.snapshot --params '{"window":"main"}'
 --method 方法名；--params 参数对象；--params-file 从 UTF-8（统一字符编码）文件读取参数（两者互斥）
 --timeout-ms 超时毫秒数（默认 30000）；--entry 正式入口路径（默认当前工作区）
+--floating-preview 连接当前工作区单独运行的悬浮窗测试台
 --output 原始完整回执文件；--screenshot 截图保存路径（仅界面快照，保存 JPEG 图片）
 退出码：0 成功，2 参数/连接/文件错误，3 正式接口错误回执，4 等待超时。
 本工具复用 --agent-stdio（标准流连接），请先通过正式入口进入代理调试模式。`)
@@ -134,7 +137,7 @@ export async function runCli(args = process.argv.slice(2)) {
     if (values.method !== 'ui.snapshot') throw new AgentError('--screenshot（截图路径）仅适用于 ui.snapshot（界面快照）。')
     params = { window: 'main', ...params, screenshot: true }
   }
-  const client = new AgentClient({ entry: values.entry, timeoutMs: values['timeout-ms'] === undefined ? 30000 : Number(values['timeout-ms']) })
+  const client = new AgentClient({ entry: values.entry, floatingPreview: values['floating-preview'], timeoutMs: values['timeout-ms'] === undefined ? 30000 : Number(values['timeout-ms']) })
   const response = client.request(values.method, params)
   // 单次工具立即结束输入，依靠服务端结束语义等待完整回执，不插入客户端延时。
   const completion = client.close()

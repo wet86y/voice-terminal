@@ -64,12 +64,23 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn new(root: &Path) -> Result<Self, String> {
         let root = crate::canonical_path(root)?;
+        let desktop = workspace::safe_path(&root, "app/VoiceTerminalDesktop.exe")?;
+        Self::with_desktop(&root, desktop)
+    }
+
+    /// current_executable（测试宿主端点）：验证同一个调试构建的实际进程路径。
+    pub fn current_executable(root: &Path) -> Result<Self, String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        Self::with_desktop(root, crate::canonical_path(&executable)?)
+    }
+
+    fn with_desktop(root: &Path, desktop: PathBuf) -> Result<Self, String> {
+        let root = crate::canonical_path(root)?;
         let sid = system_feature::current_user_sid()?;
         let name = format!(
             r"\\.\pipe\VoiceTerminal-Agent-{:x}",
             Sha256::digest(format!("{sid}\n{}", root.to_string_lossy().to_lowercase()))
         );
-        let desktop = workspace::safe_path(&root, "app/VoiceTerminalDesktop.exe")?;
         Ok(Self { name, sid, desktop })
     }
 
@@ -351,12 +362,20 @@ where
 }
 
 pub fn relay(root: &Path) -> Result<(), String> {
+    relay_endpoint(Endpoint::new(root)?)
+}
+
+pub fn relay_current_executable(root: &Path) -> Result<(), String> {
+    relay_endpoint(Endpoint::current_executable(root)?)
+}
+
+fn relay_endpoint(endpoint: Endpoint) -> Result<(), String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?
         .block_on(async {
-            let (pipe, _) = Endpoint::new(root)?.connect().await?;
+            let (pipe, _) = endpoint.connect().await?;
             let (forward, input) = tokio::sync::mpsc::channel(16);
             // 控制端撤销会话时，退出不等待另一个进程关闭它的标准输入。
             std::thread::spawn(move || {

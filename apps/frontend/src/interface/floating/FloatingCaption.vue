@@ -35,13 +35,10 @@ onBeforeUnmount(() => observer?.disconnect())
 </script>
 
 <template>
-  <!-- floating-caption（悬浮字幕气泡）：沿用界面配色，独立绘制向上斜指主体的尾巴。 -->
+  <!-- floating-caption（悬浮字幕）：同一文本区域用于识别和播报。 -->
   <article class="floating-caption" :class="`floating-caption-${caption.role}`"
     :aria-label="caption.role === 'user' ? '你的语音字幕' : '助手的语音字幕'" role="status">
     <div class="floating-caption-bubble">
-      <svg class="floating-caption-tail" viewBox="0 0 24 16" aria-hidden="true">
-        <path d="M2 16C6 14 9 9 11 6C12.5 3.8 14.5 3.2 16 4.4C17.5 5.6 16.5 7.2 16.5 8.5C16.5 11.6 18.7 14.1 22 16" />
-      </svg>
       <div ref="viewport" class="floating-caption-viewport">
         <span class="floating-caption-track"><span>{{ parts.before }}</span><span ref="focus" class="floating-caption-focus">{{ parts.current }}</span><span>{{ parts.after }}</span></span>
       </div>

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 
+from .floating_display import FloatingDisplaySession
 from ..application.managed import report as application_report
 from .application_runtime import ApplicationRuntimeMixin
 from ..devices.contracts import CapturePort, PlaybackPort, ProcessingPort
@@ -353,6 +354,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
         self._speaker_enrollment: dict[str, dict[str, Any]] = {}
         self._speaker_test_result: dict[str, Any] | None = None
         self.conversation = ConversationRuntime()
+        self.floating_display = FloatingDisplaySession(self)
         self._voice_identity_path = (
             self.paths.history / "active-voice-session.json"
             if self.paths.separated or runtime_data_dir is not None or not config.dsh.enabled
@@ -1976,6 +1978,7 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             custom_instructions_provider=lambda: self._instruction_snapshot,
             instruction_matcher=self.instruction_matcher,
             continuity_document_provider=lambda: self.continuity.document,
+            floating_display=self.floating_display,
             on_user_activity=self._on_voice_activity,
             on_silence_anchor=self._on_voice_silence_anchor,
             quiet_policy=self.quiet_policy,
@@ -3046,6 +3049,8 @@ class SessionRuntime(InferenceRuntimeMixin, ProductSettingsRuntimeMixin, Handoff
             if projection is not None:
                 projection.reset(available=shadow_session is not None and shadow_session.available)
             self.conversation.reset()
+            if display := getattr(self, "floating_display", None):
+                await display.clear()
             if target_voice_session_id:
                 self.conversation.conversation_id = target_voice_session_id
             self._persist_voice_identity()

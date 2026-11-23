@@ -81,6 +81,7 @@ test('浏览器无会话只见说明，桌面凭据单次消费，热更新连�
     const Cookie = entry.headers.get('set-cookie').split(';')[0]
     assert.equal((await request(server.origin, `/desktop-entry?token=${server.launchToken}`)).status, 403)
     assert.equal((await request(server.origin, '/ui-demo.html', { Cookie })).status, 200)
+    assert.equal((await request(server.origin, '/floating-preview.html', { Cookie })).status, 403)
     assert.equal((await request(server.origin, '/ui-demo.html', { Cookie })).status, 200) // 刷新沿用本次会话。
     assert.equal((await request(server.origin, '/src/ui-demo/main.ts', { Cookie })).status, 200)
     assert.equal((await request(server.origin, '/src/product/main.ts', { Cookie })).status, 403)
@@ -106,6 +107,24 @@ test('浏览器无会话只见说明，桌面凭据单次消费，热更新连�
   } finally {
     try { await fallbackServer?.close() }
     finally { await server.close() }
+  }
+})
+
+test('悬浮窗测试页与子窗口共用独立会话，拒绝产品源码和业务接口', async () => {
+  const server = await createDesktopServer({ root, mode: 'ui-preview', floatingPreview: true })
+  try {
+    assert.equal((await request(server.origin, '/floating-preview.html')).status, 403)
+    const entry = await request(server.origin, `/desktop-entry?token=${server.launchToken}`)
+    assert.match(entry.body, /\/floating-preview\.html/)
+    const Cookie = entry.headers.get('set-cookie').split(';')[0]
+    for (const path of ['/floating-preview.html', '/floating-preview.html?view=orb', '/floating-preview.html?view=display']) {
+      assert.equal((await request(server.origin, path, { Cookie })).status, 200)
+    }
+    for (const path of ['/src/product/main.ts', '/application-config.js', '/api/v1/application/status']) {
+      assert.equal((await request(server.origin, path, { Cookie })).status, 403)
+    }
+  } finally {
+    await server.close()
   }
 })
 

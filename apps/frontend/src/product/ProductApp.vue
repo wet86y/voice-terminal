@@ -26,8 +26,11 @@ import LanVersionDialog from '../interface/LanVersionDialog.vue'
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
 import { startRemoteClientRuntimeSupervisor } from './remote-client-runtime'
+import {
+  FLOATING_MODE_EVENT, FLOATING_RESULT_EVENT, type FloatingDisplayMode, type FloatingDisplayReceipt,
+} from '../interface/floating/floating-display'
 import { FLOATING_WINDOW_CONTROL_EVENT, FLOATING_WINDOW_ERROR_EVENT, FLOATING_WINDOW_WORKBENCH_EVENT,
-  type FloatingSessionAction, type FloatingWindowProjection } from './floating-window'
+  type FloatingSessionAction, type FloatingWindowProjection } from '../interface/floating/floating-window'
 
 const controls = useProductControls();
 const application = useApplicationHost();
@@ -77,6 +80,55 @@ if (desktop.available && desktop.listen) {
   });
   subscribeFloating(FLOATING_WINDOW_WORKBENCH_EVENT, () => { activePage.value = 'home'; });
 }
+// 主工作台持有唯一语音实时连接，子窗口只接收原生宿主的展示请求。
+const displayMode = ref<FloatingDisplayMode | null>(null)
+if (desktop.available && desktop.floatingWindow && desktop.listen) {
+  const invokeWindow = desktop.floatingWindow
+  const voice = controls.voice
+  let invalidating: Promise<FloatingDisplayMode> | undefined
+  function acceptDisplayMode(value: FloatingDisplayMode) {
+    if (!disposed && value.generation >= (displayMode.value?.generation ?? 0)
+      && (value.generation !== displayMode.value?.generation || value.enabled !== displayMode.value?.enabled)) {
+      displayMode.value = value
+    }
+  }
+  void desktop.listen<FloatingDisplayMode>(FLOATING_MODE_EVENT, event => acceptDisplayMode(event.payload))
+    .then(async unlisten => {
+      if (disposed) { unlisten(); return }
+      floatingUnlisteners.push(unlisten)
+      acceptDisplayMode(await invokeWindow<FloatingDisplayMode>({ kind: 'mode_status' }))
+    }).catch(() => undefined)
+  subscribeFloating<FloatingDisplayReceipt>(FLOATING_RESULT_EVENT, receipt => {
+    if (displayMode.value?.generation === receipt.generation) voice.reportFloatingDisplay(receipt)
+  })
+  watch([displayMode, voice.connection, () => applicationSnapshot.value?.remote_mode], async ([, connection, remote], previous) => {
+    const lostConnection = previous?.[1] === 'connected' && connection !== 'connected'
+    const switchedToRemote = remote === true && previous?.[2] !== true
+    if ((lostConnection || switchedToRemote) && displayMode.value?.enabled && !invalidating) {
+      const pending = invokeWindow<FloatingDisplayMode>({ kind: 'invalidate_display' })
+      invalidating = pending
+      try { acceptDisplayMode(await pending) } catch { /* 宿主正在退出。 */ }
+      finally { if (invalidating === pending) invalidating = undefined }
+    }
+    if (remote || connection !== 'connected') return
+    if (invalidating) {
+      try { await invalidating } catch { return }
+    }
+    if (!disposed && voice.connection.value === 'connected' && displayMode.value && !applicationSnapshot.value?.remote_mode) {
+      voice.setFloatingDisplayMode(displayMode.value)
+    }
+  }, { immediate: true, flush: 'sync' })
+  watch(voice.floatingDisplayDelivery, delivery => {
+    if (!delivery || !displayMode.value?.enabled || displayMode.value.generation !== delivery.generation
+      || applicationSnapshot.value?.remote_mode) return
+    void invokeWindow({ kind: 'submit', ...delivery }).catch(() => {
+      if (displayMode.value?.generation === delivery.generation) {
+        voice.reportFloatingDisplay({ generation: delivery.generation, delivery: delivery.delivery,
+          status: 'rejected', reason: '展示窗口暂未受理本次投递。' })
+      }
+    })
+  }, { flush: 'sync' })
+}
 onBeforeUnmount(() => { disposed = true; floatingUnlisteners.forEach(unlisten => unlisten()); });
 let stopRemoteClientRuntime: (() => void) | null = null
 watch(() => applicationSnapshot.value?.remote_mode === true, remote => {
@@ -91,8 +143,10 @@ onBeforeUnmount(() => { stopRemoteClientRuntime?.(); stopRemoteClientRuntime = n
 // floatingModel（悬浮窗投影）：语音快照包含字幕，仍由主页面独占真实会话。
 let floatingLatestModel: FloatingWindowProjection | null = null;
 let floatingPublishTimer: ReturnType<typeof setTimeout> | undefined;
+let floatingPublishing = false;
+let floatingPublishAt = 0;
 let floatingPublishFailed = false;
-let firstFloatingModel = true;
+let lastPublishedFloatingModel: FloatingWindowProjection | null = null;
 const floatingWatchSources = [
   () => floatingModel.value.state, () => floatingModel.value.sessionActive,
   () => floatingModel.value.silenced, () => floatingModel.value.canControl,
@@ -100,25 +154,42 @@ const floatingWatchSources = [
   ...Array.from({ length: 5 }, (_, index) => () => floatingModel.value.audioLevels[index] ?? 0),
 ];
 function publishFloatingModel() {
-  if (!floatingLatestModel || !desktop.publishFloatingModel || floatingPublishFailed) return;
-  void desktop.publishFloatingModel(floatingLatestModel).catch((error: unknown) => {
+  const latest = floatingLatestModel;
+  if (disposed || !latest || latest === lastPublishedFloatingModel || !desktop.publishFloatingModel || floatingPublishing) return;
+  const now = performance.now();
+  if (now < floatingPublishAt) {
+    scheduleFloatingPublish(floatingPublishAt - now);
+    return;
+  }
+  if (floatingPublishTimer !== undefined) {
+    clearTimeout(floatingPublishTimer);
+    floatingPublishTimer = undefined;
+  }
+  floatingPublishAt = now + 34; // 音量由实时事件主动更新，静止时用计时器补送最后一帧。
+  floatingPublishing = true;
+  void desktop.publishFloatingModel(latest).then(() => {
+    lastPublishedFloatingModel = latest;
+    floatingPublishFailed = false;
+  }, (error: unknown) => {
+    if (!floatingPublishFailed) lastError.value = error instanceof Error ? error.message : '悬浮窗状态同步失败。';
     floatingPublishFailed = true;
-    lastError.value = error instanceof Error ? error.message : '悬浮窗状态同步失败。';
+    floatingPublishAt = performance.now() + 1000;
+  }).finally(() => {
+    floatingPublishing = false;
+    publishFloatingModel();
   });
+}
+function scheduleFloatingPublish(delay: number) {
+  if (floatingPublishTimer !== undefined) return;
+  floatingPublishTimer = setTimeout(() => {
+    floatingPublishTimer = undefined;
+    publishFloatingModel();
+  }, delay);
 }
 if (desktop.available && desktop.publishFloatingModel) {
   watch(floatingWatchSources, () => {
     floatingLatestModel = { ...floatingModel.value, audioLevels: [...floatingModel.value.audioLevels] };
-    if (firstFloatingModel) {
-      firstFloatingModel = false;
-      publishFloatingModel();
-      return;
-    }
-    if (floatingPublishTimer !== undefined) return;
-    floatingPublishTimer = setTimeout(() => {
-      floatingPublishTimer = undefined;
-      publishFloatingModel();
-    }, 34); // 34 毫秒（约 29.4 次/秒），确保不超过每秒 30 次。
+    publishFloatingModel();
   }, { immediate: true, flush: 'post' });
   onBeforeUnmount(() => {
     if (floatingPublishTimer !== undefined) clearTimeout(floatingPublishTimer);

@@ -1,9 +1,11 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import { listenDesktopEvent, type DesktopEvent } from '../runtime/desktop-events'
 import type { AppUpdateStatus } from '../interface/app-update'
 import type { ComponentRecovery } from '../interface/component-recovery'
 export type { AppUpdateStatus } from '../interface/app-update'
 import type { FixedModelCredentialUpdate, FixedModelCredentials } from './types'
-import type { FloatingSessionAction, FloatingWindowModel, FloatingWindowProjection } from './floating-window'
+import type { DisplayEvent, FloatingDisplayDelivery } from '../interface/floating/floating-display'
+import type { FloatingSessionAction, FloatingWindowModel, FloatingWindowProjection } from '../interface/floating/floating-window'
 
 /** WorkspaceInfo（工作区信息）：由原生启动器返回的当前数据归属。 */
 export interface WorkspaceInfo {
@@ -120,13 +122,6 @@ export interface WorkspaceJob {
   can_cancel?: boolean
 }
 
-/** DesktopEvent（桌面事件封装）：遵循 Tauri event（桌面事件）回调格式。 */
-export interface DesktopEvent<T> {
-  event: string
-  id: number
-  payload: T
-}
-
 export const RESOURCE_PROGRESS_EVENT = 'desktop://resource-progress'
 export const WORKSPACE_PROGRESS_EVENT = 'desktop://workspace-progress'
 export const APP_UPDATE_EVENT = 'desktop://app-update-progress'
@@ -151,8 +146,10 @@ export interface DesktopPort {
   getFloatingModel?(): Promise<FloatingWindowModel>
   /** returnToWorkbench（切回工作台）：仅悬浮窗可调用。 */
   returnToWorkbench?(): Promise<void>
-  /** startFloatingDrag（拖动悬浮窗）：仅悬浮窗可调用。 */
-  startFloatingDrag?(): Promise<void>
+  /** floatingWindow（悬浮窗操作）：各正式窗口只能访问自身的布局、控制和回执。 */
+  floatingWindow?<T>(action: DisplayEvent | ({ kind: 'submit' } & FloatingDisplayDelivery)
+    | { kind: 'mode_status' | 'invalidate_display' | 'snapshot' | 'ready' }
+    | { kind: 'drag'; x: number; y: number }): Promise<T>
   /** controlFloatingSession（控制语音输入）：只允许静默或复用现有开始录制流程。 */
   controlFloatingSession?(action: FloatingSessionAction): Promise<void>
   /** listen（订阅桌面事件）：仅接收当前原生窗口获准的事件。 */
@@ -305,7 +302,7 @@ export function desktopPort(): DesktopPort {
     publishFloatingModel: model => call('publish_floating_model', { model }),
     getFloatingModel: () => call<FloatingWindowModel>('get_floating_model'),
     returnToWorkbench: () => call('return_to_workbench'),
-    startFloatingDrag: () => call('start_floating_drag'),
+    floatingWindow: action => call('floating_window_command', { action }),
     controlFloatingSession: action => call('control_floating_session', { action }),
     workspaceInfo: () => call<WorkspaceInfo>('workspace_info'),
     setAgentDebugAllowed: allowed => call('agent_debug_set_allowed', { allowed }),
@@ -355,35 +352,7 @@ export function desktopPort(): DesktopPort {
     openProjectRepository: () => call('project_open_repository'),
     downloadAppUpdate: () => call<AppUpdateStatus>('app_update_download'),
     cancelAppUpdate: () => call('app_update_cancel'),
-    listen: async <T>(eventName: string, handler: (event: DesktopEvent<T>) => void) => {
-      const eventWindow = typeof window === 'undefined' ? undefined : window as NativeEventWindow
-      const eventRuntime = eventWindow?.__TAURI_INTERNALS__
-      const eventPlugin = eventWindow?.__TAURI_EVENT_PLUGIN_INTERNALS__
-      if (!eventRuntime?.transformCallback || !eventPlugin) {
-        throw new Error('桌面事件接口不可用。')
-      }
-      const callbackId = eventRuntime.transformCallback((event: DesktopEvent<T>) => handler(event))
-      const eventId = await eventRuntime.invoke<number>('plugin:event|listen', {
-        event: eventName,
-        target: { kind: 'Any' },
-        handler: callbackId,
-      })
-      let active = true
-      return () => {
-        if (!active) return
-        active = false
-        eventPlugin.unregisterListener(eventName, eventId)
-        void eventRuntime.invoke<void>('plugin:event|unlisten', { event: eventName, eventId })
-          .catch(() => eventRuntime.unregisterCallback?.(callbackId))
-      }
-    },
+    listen: listenDesktopEvent,
   }
   return port
-}
-
-type NativeEventWindow = Window & {
-  __TAURI_INTERNALS__?: ReturnType<typeof locateNativeInvoker>
-  __TAURI_EVENT_PLUGIN_INTERNALS__?: {
-    unregisterListener(event: string, eventId: number): void
-  }
 }

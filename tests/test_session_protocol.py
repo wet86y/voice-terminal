@@ -89,3 +89,66 @@ def test_manual_session_commands_return_correlated_completion_or_failure(tmp_pat
                 assert response["payload"]["operation"] == operation
                 assert response["payload"]["status"] == "completed"
     action.assert_awaited_once()
+
+def test_floating_display_delivery_and_receipts_are_connection_scoped(tmp_path):
+    from fastapi.testclient import TestClient
+    from voice_terminal.agent.display_decision import DisplayDecision
+    from voice_terminal.server.http_api import create_app
+
+    runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "runtime")
+    display = runtime.floating_display
+
+    def command(connection, name, payload):
+        connection.send_json({"type": "command", "request_id": name, "command": name, "payload": payload})
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws") as observer, client.websocket_connect("/ws") as desktop:
+            command(observer, "subscribe", {})
+            assert observer.receive_json()["type"] == "runtime.snapshot"
+            command(desktop, "display.mode", {"enabled": True, "generation": 4})
+            command(desktop, "subscribe", {})
+            assert desktop.receive_json()["type"] == "runtime.snapshot"
+            owner = display.target()
+            assert owner is not None and owner.generation == 4
+            assert client.portal is not None
+            conversation_id = runtime.conversation.conversation_id
+
+            client.portal.call(display.submit, owner, conversation_id, "input_a", DisplayDecision("# 正文", 5))
+            def read(connection, kind):
+                for _ in range(8):
+                    message = connection.receive_json()
+                    if message["type"] == kind:
+                        return message
+                raise AssertionError(f"未收到 {kind}（预期语音事件）")
+
+            packet = read(desktop, "display.command")
+            assert packet["payload"] == {"generation": 4, "delivery": 1, "content": "# 正文",
+                                         "duration_seconds": 5, "turn_id": "input_a"}
+            client.portal.call(runtime.bus.publish, event("input.started", "input_b"))
+            for _ in range(8):
+                observer_packet = observer.receive_json()
+                assert observer_packet["type"] != "display.command"
+                if observer_packet["type"] == "input.started":
+                    break
+            else:
+                raise AssertionError("观察连接未收到公共语音事件")
+
+            receipt = {"generation": 4, "delivery": 1, "status": "visible", "reason": None}
+            command(observer, "display.receipt", receipt)
+            command(observer, "subscribe", {})
+            read(observer, "runtime.snapshot")
+            assert display.feedback == ""
+            command(desktop, "display.receipt", receipt)
+            command(desktop, "subscribe", {})
+            read(desktop, "runtime.snapshot")
+            assert display.feedback == "图文已经显示。"
+
+            client.portal.call(display.submit, owner, conversation_id, "input_a", DisplayDecision())
+            packet = read(desktop, "display.command")
+            assert packet["payload"]["delivery"] == 2 and packet["payload"]["content"] is None
+            command(desktop, "display.mode", {"enabled": False, "generation": 5})
+            command(desktop, "subscribe", {})
+            read(desktop, "runtime.snapshot")
+            assert display.target() is None
+            client.portal.call(display.submit, owner, conversation_id, "input_a", DisplayDecision("过期内容", 5))
+            assert display.feedback == ""

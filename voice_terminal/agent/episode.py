@@ -26,6 +26,7 @@ from .prompts import (
 from .options import AgentOptions
 from .listening import ListeningRequests
 from .context_audit import capture_context_snapshot, capture_request_outcome
+from .display_decision import DISPLAY_INACTIVE, DISPLAY_RULES
 from .decision_envelope import (
     Action, ActionContractError, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream,
     envelope_error_diagnostics, json_structure_fingerprint,
@@ -1300,12 +1301,12 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             prefix = "失败输出未写入会话历史。这是原系统检查唯一一次即时自动纠正。"
         templates = {
             "LLM_EMPTY_OUTPUT": (
-                "上一次输出为空白。只输出一个完整 JSON 对象，顶层只能有 speak 和 actions；"
+                "上一次输出为空白。只输出一个完整 JSON 对象，顶层使用本次协议声明的字段；"
                 "首个非空白字符必须是 {，末个必须是 }。需要等待也必须输出完整的 "
                 "speak.state=wait，不能用空白代替。"
             ),
             "SPEAK_ENVELOPE_INVALID": (
-                "上一次输出未通过语音信封校验。只输出完整 JSON，顶层只能有 speak 和 actions。"
+                "上一次输出未通过语音信封校验。只输出完整 JSON，顶层使用本次协议声明的字段。"
                 "state=speak（新播报）或 revision（尾巴修订）时 text（文本）必须非空；"
                 "state=wait（等待）时文本必须为空；state=cancel（取消）的空文本只停止，"
                 "非空文本停止并替换，允许条件仍须遵守本次请求的语音队列决策规则。"
@@ -1318,7 +1319,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             ),
             "RESPONSES_INCOMPLETE": (
                 "上一次输出因长度上限未完成，截断内容未提交。请缩短内容并输出一个完整 JSON 对象；"
-                "顶层只能有 speak 和 actions，不要输出 JSON 外文本。"
+                "顶层使用本次协议声明的字段，不要输出 JSON 外文本。"
             ),
         }
         instruction = templates.get(code, templates["SPEAK_ENVELOPE_INVALID"])
@@ -3482,6 +3483,17 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         prepare_voice = getattr(self.output, 'prepare_speech_capabilities', None)
         if callable(prepare_voice):
             await prepare_voice()
+        display = getattr(self, "floating_display", None)
+        display_target = None
+        display_context = {}
+        if display is not None:
+            if prompt_kind not in {"kws_wake", "final_silence"}:
+                display_target = display.target()
+            feedback = display.feedback if display_target is not None else ""
+            display_prompt = DISPLAY_RULES if display_target is not None else DISPLAY_INACTIVE
+            if feedback:
+                display_prompt += " 上一条展示状态：" + feedback
+            display_context["floating_display_prompt"] = display_prompt
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,
@@ -3493,6 +3505,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             listening_context=listening_context["state"],
             reasoning_effort=reasoning_effort,
             instruction_candidates=instruction_candidates,
+            **display_context,
         )
         request_speak_snapshot = dict(self._last_model_speak_snapshot)
         request_speak_context = dict(self._last_model_speak_state)
@@ -3878,6 +3891,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                 )
             else:
                 await self._dispatch_actions_v06(identity, source_turn_id, envelope)
+            if display_target is not None and envelope.display is not None and not self.closed:
+                await display.submit(display_target, identity[0], source_turn_id, envelope.display)
             await self._normalize_deferred_outputs()
             record_audit_outcome(
                 validation,

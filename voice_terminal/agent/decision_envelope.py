@@ -7,6 +7,8 @@ semantic validation authoritative.
 """
 from __future__ import annotations
 
+from .display_decision import DisplayDecision, parse_display
+
 from dataclasses import dataclass
 import json
 from typing import Any
@@ -56,6 +58,7 @@ class Action:
 class DecisionEnvelope:
     speak: SpeechDecision
     actions: tuple[Action, ...]
+    display: DisplayDecision | None = None  # display（独立图文决策），兼容没有该字段的旧响应。
 
 
 @dataclass(frozen=True)
@@ -302,7 +305,7 @@ def _default_empty_emotion(raw: str) -> str | None:
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict) or set(value) != {"speak", "actions"}:
+    if not isinstance(value, dict) or not {"speak", "actions"} <= set(value) <= {"speak", "actions", "display"}:
         return None
     speak = value.get("speak")
     if not isinstance(speak, dict) or set(speak) != {"state", "emotion", "text"} or speak.get("emotion") != "":
@@ -677,8 +680,8 @@ class SpeechDecisionEnvelopeStream:
             value = json.loads(self.raw)
         except (TypeError, json.JSONDecodeError) as exc:
             raise EnvelopeError("incomplete or invalid decision JSON") from exc
-        if not isinstance(value, dict) or set(value) != {"speak", "actions"}:
-            raise EnvelopeError("decision envelope must contain exactly speak and actions")
+        if not isinstance(value, dict) or not {"speak", "actions"} <= set(value) <= {"speak", "actions", "display"}:
+            raise EnvelopeError("decision envelope requires speak and actions, with optional display")
         speak = value.get("speak")
         if not isinstance(speak, dict) or set(speak) - {"state", "emotion", "controls", "text"}:
             raise EnvelopeError("invalid speak object")
@@ -709,4 +712,7 @@ class SpeechDecisionEnvelopeStream:
         if not isinstance(actions, list) or len(actions) > 8:
             raise EnvelopeError("actions must be an array with at most eight entries")
         controls = self._control_tuple(speak["controls"]) if "controls" in speak else None
-        return DecisionEnvelope(SpeechDecision(state, emotion, text, controls), tuple(self._action(item) for item in actions))
+        return DecisionEnvelope(
+            SpeechDecision(state, emotion, text, controls), tuple(self._action(item) for item in actions),
+            parse_display(value["display"]) if "display" in value else None,
+        )
