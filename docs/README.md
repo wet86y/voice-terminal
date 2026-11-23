@@ -98,6 +98,7 @@
 
 ### 专项验收与历史记录
 
+- [悬浮窗主语音与后台链路实机测试及修复（2026-11-23）](testing/floating-main-chain-20261123.md)
 - [设备连接名称同步修复与验证（2026-11-22）](testing/device-name-sync-20261122.md)
 - [本机空间管理、正常卸载与依赖分层验收（2026-11-22）](testing/workspace-storage-20261122.md)
 - [系统脚本执行与编码边界修复（2026-11-22）](testing/system-shell-hardening-20261122.md)

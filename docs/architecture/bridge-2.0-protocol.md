@@ -17,6 +17,16 @@ Bridge（桥接层）控制工具只允许当前 Voice Session（语音会话）
 `context_revision`（上下文修订号）和 `activation_id`（激活标识）必须同时匹配。子代理、普通 DSH 会话、
 过期激活与旧修订全部拒绝。
 
+## 后台悬浮图文
+
+`show_floating_display`（展示悬浮图文）和 `clear_floating_display`（清除悬浮图文）由当前绑定的根代理调用，经 `POST /api/internal/dsh-bridge/display.publish`（后台图文回调）进入正式本机悬浮窗。工具可在后台任务和语音暂停期间使用。展示和取消均继续当前激活，最终结果仍按任务原有规则结算。
+
+回调携带标准桥接身份、`context_revision`（上下文修订号）、`activation_id`（激活标识）和 `display`（图文操作）。展示正文为 `[{"content":"简短正文","duration_seconds":12}]`（正文与初始秒数），取消为 `[{"cancel":true}]`（清除当前卡片）。后台工具本身分别使用两个展示参数和空的取消参数，由插件生成该回调。正文复用固定轻量排版、单张加密地址图片、500 个正文与图注字符及实际行数限制，时间为 5～60 秒。
+
+后台和语音模型共用本机实时连接、展示槽、`generation`（悬浮模式代次）及单调递增的 `delivery`（投递编号）。后台回调冻结到达时的模式，等待期间窗口退出、重新进入或连接变化时拒绝旧请求。后台无须先启动语音识别。普通工作台模式返回 `unavailable`（当前不可用）。
+
+成功回执含 `result`（受理结果）、`status: submitted`（已投递）、模式代次和投递编号；实际可见、排版拒绝及到期由[悬浮窗回执](websocket-protocol.md#本机悬浮图文)确认。相同 `request_id`（请求编号）和完整内容的重复调用返回 `duplicate`（原请求已受理）及原投递编号。同编号异内容返回 `conflict`（内容冲突），过期绑定或激活返回 `stale`（请求已失效）。暂时不可用的请求可在模式就绪后重试。
+
 ## `shadow.event`（影子事件端点）
 
 信封只允许以下字段：

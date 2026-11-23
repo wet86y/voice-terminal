@@ -17,6 +17,7 @@ function callbackError(response: Response, value: unknown): Error {
   const details = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : undefined
   const message = typeof details?.detail === 'string' ? details.detail
+    : typeof details?.reason === 'string' ? details.reason
     : typeof details?.status === 'string' ? details.status : ''
   const suffix = message ? `: ${message.slice(0, 320)}` : ''
   return new Error(`callback rejected (${response.status})${suffix}`)

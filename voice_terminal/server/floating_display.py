@@ -47,28 +47,30 @@ class FloatingDisplaySession:
             self.feedback = self._status = ""
 
     async def submit(self, target: DisplayTarget, conversation_id: str, turn_id: str | None,
-                     decision: DisplayDecision) -> None:
+                     decision: DisplayDecision) -> int | None:
         # 校验派发时冻结的连接、模式和会话，避免晚到的模型响应污染新窗口。
         if target != self.target() or conversation_id != self.runtime.conversation.conversation_id:
             return
         if decision.error:
             self.feedback = decision.error
             return
-        await self._publish(target, turn_id, decision)
+        return await self._publish(target, turn_id, decision)
 
     async def clear(self) -> None:
         if self._target is not None:
             await self._publish(self._target, None, DisplayDecision())
 
-    async def _publish(self, target: DisplayTarget, turn_id: str | None, decision: DisplayDecision) -> None:
+    async def _publish(self, target: DisplayTarget, turn_id: str | None, decision: DisplayDecision) -> int:
         self._delivery += 1
+        delivery = self._delivery  # delivery（本次投递编号）：等待期间其他来源可以提交后续内容。
         self._status = "pending"
         self.feedback = ""
         await self.runtime.bus.publish(event(
             "display.command", turn_id, _display_connection=target.connection_id,
-            generation=target.generation, delivery=self._delivery,
+            generation=target.generation, delivery=delivery,
             content=decision.content, duration_seconds=decision.duration_seconds,
         ))
+        return delivery
 
     def receive(self, connection_id: str, payload: dict) -> bool:
         if (self._target is None or self._target.connection_id != connection_id

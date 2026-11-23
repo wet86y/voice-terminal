@@ -115,6 +115,24 @@ def _strict_text(value: Any, *, field: str, maximum: int) -> str:
     return text
 
 
+def _strict_control_request(payload: dict[str, Any], extra_fields: set[str]) -> str:
+    """校验控制回调的身份字段，返回 request_id（幂等请求编号）。"""
+    expected = {
+        "protocol_version", "request_id", "voice_session_id", "dsh_session_id",
+        "epoch", "context_revision", "activation_id",
+    } | extra_fields
+    if set(payload) != expected or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
+        raise DshBridgeError("控制回调字段或协议版本无效。")
+    for field in ("request_id", "voice_session_id", "dsh_session_id", "activation_id"):
+        if not isinstance(payload[field], str):
+            raise DshBridgeError("控制回调身份字段无效。")
+        _safe_identifier(payload[field], field=field)
+    for field, minimum in (("epoch", 1), ("context_revision", 0)):
+        if type(payload[field]) is not int or payload[field] < minimum:
+            raise DshBridgeError("控制回调的会话代次或上下文修订号无效。")
+    return payload["request_id"]
+
+
 def _strict_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize one Bridge 2.0 discriminated event without compatibility aliases."""
 
@@ -479,6 +497,7 @@ class DshShadowAgentSession:
         self._accepted_events: dict[str, str] = {}
         self._accepted_requests: dict[str, str] = {}
         self._accepted_early_silence: dict[str, tuple[str, str]] = {}  # 提前静默受理记录：请求标识对应激活身份与受理状态。
+        self._accepted_display: dict[str, tuple[str, dict[str, Any]]] = {}  # _accepted_display（图文受理记录）：绑定请求摘要与原始投递回执。
         self._last_terminal_activation_id: str | None = None
         self._last_terminal_dsh_session_id: str | None = None
         self._last_terminal_event_id: str | None = None
@@ -1123,6 +1142,7 @@ class DshShadowAgentSession:
             self._waiting_user = False
             self._accepted_events.clear()
             self._accepted_requests.clear()
+            self._accepted_display.clear()
             self._last_terminal_activation_id = None
             self._last_terminal_dsh_session_id = None
             self._last_terminal_event_id = None
@@ -1276,22 +1296,8 @@ class DshShadowAgentSession:
         self, payload: dict[str, Any], request: Callable[[], Awaitable[str]],
     ) -> tuple[BridgeResult, str]:
         """Authorize one root activation's single-purpose silence request."""
-        expected = {
-            "protocol_version", "request_id", "voice_session_id", "dsh_session_id",
-            "epoch", "context_revision", "activation_id",
-        }
-        if set(payload) != expected or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
-            return "conflict", "invalid_request"
         try:
-            for field in ("request_id", "voice_session_id", "dsh_session_id", "activation_id"):
-                if not isinstance(payload[field], str):
-                    return "conflict", "invalid_request"
-                _safe_identifier(payload[field], field=field)
-            for field, minimum in (("epoch", 1), ("context_revision", 0)):
-                value = payload[field]
-                if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-                    return "conflict", "invalid_request"
-            request_id = payload["request_id"]
+            request_id = _strict_control_request(payload, set())
         except (KeyError, DshBridgeError):
             return "conflict", "invalid_request"
         async with self._event_lock:
@@ -1308,6 +1314,32 @@ class DshShadowAgentSession:
                     self._accepted_early_silence.pop(next(iter(self._accepted_early_silence)))
                 return "accepted", status
             return "conflict", status
+
+    async def accept_display(
+        self, payload: dict[str, Any], publish: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """受理当前后台根代理的图文操作，重复请求返回原投递编号。"""
+        try:
+            request_id = _strict_control_request(payload, {"display"})
+            digest = hashlib.sha256(json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+        except (KeyError, DshBridgeError, UnicodeEncodeError):
+            return {"result": "conflict", "reason": "图文回调参数无效。"}
+        async with self._event_lock:
+            if self.activation_id is None or not await self._callback_matches_or_reconcile(payload):
+                return {"result": "stale", "reason": "后台图文请求所属激活已失效。"}
+            previous = self._accepted_display.get(request_id)
+            if previous is not None:
+                if previous[0] != digest:
+                    return {"result": "conflict", "reason": "同一图文请求编号已绑定其他内容。"}
+                return {**previous[1], "result": "duplicate"}
+            receipt = await publish()
+            if receipt.get("result") == "accepted":
+                self._accepted_display[request_id] = (digest, dict(receipt))
+                if len(self._accepted_display) > EVENT_IDEMPOTENCY_WINDOW:
+                    self._accepted_display.pop(next(iter(self._accepted_display)))
+            return receipt
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
         async with self._event_lock:

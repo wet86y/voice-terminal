@@ -79,6 +79,18 @@ export function installRootTools(agentCtx: Context, binding: Binding): void {
     }
     return response
   }
+  const postDisplay = async (exec: ToolRunContext, display: Json[]): Promise<Record<string, Json>> => {
+    const activationId = ensure(exec)
+    await binding.activationReady
+    if (ensure(exec) !== activationId) throw new Error('图文请求所属后台激活已更换。')
+    const receipt = await bindingCallback(binding, '/api/internal/dsh-bridge/display.publish', {
+      request_id: stableBridgeToolId('display', binding.dshSessionId, exec.callId),
+      voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
+      epoch: binding.epoch, context_revision: binding.revision, activation_id: activationId, display,
+    }, exec.signal)
+    if (ensure(exec) !== activationId) throw new Error('图文投递返回时所属后台激活已结束。')
+    return receipt
+  }
   agentCtx.tools.register(defineTool({
     name: 'get_latest_context', description: '同步缺失时读取 Voice Terminal 最新权威上下文；正常入口由插件强制注入。',
     parameters: { since_revision: { type: 'integer', description: '已读取的 Voice 上下文修订号；读取其后的增量。', required: true } },
@@ -115,6 +127,33 @@ export function installRootTools(agentCtx: Context, binding: Binding): void {
     name: 'publish_voice_information', description: '向 Voice 主模型发布可替换信息；触发可合并的一次推理，不结束回合。',
     parameters: { text: { type: 'string', description: '供 Voice 主模型本次推理判断是否表达的信息；去除首尾空白后为 1～2000 字符。', required: true } }, output: toolOutput(),
     async execute(args, exec: ToolRunContext) { assertArgs(args, ['text']); return post(exec, { type: 'information', text: cleanText(args.text, 'text', 2000)! }) },
+  }))
+  agentCtx.tools.register(defineTool({
+    name: 'show_floating_display',
+    description: '向当前本机悬浮窗投递一屏图文，语音暂停时也可使用。新内容通过排版校验后替换现有卡片，回合继续执行。正文支持开头一个 # 标题、段落、- 短列表、**强调**，最多一张独占一行的 ![图注](HTTPS 图片直链)。正文和图注最多 500 字符，无图最多六个排版行，有图最多三个文字排版行，折行也计入。submitted（已投递）回执表示请求已进入展示链路，实际显示由窗口回执确认。',
+    parameters: {
+      content: { type: 'string', description: '图文正文，需在固定紧凑卡片内完整摆放。图片地址计入传输额度，整体最多 4096 个 UTF-16（统一字符编码）单元，正文和图注共用 500 字符额度。', required: true },
+      duration_seconds: { type: 'integer', description: '初始展示时间，5～60 秒；鼠标关注和移开续时由展示窗口处理。', required: true },
+    },
+    output: toolOutput(),
+    async execute(args, exec: ToolRunContext) {
+      assertArgs(args, ['content', 'duration_seconds'])
+      const content = cleanText(args.content, 'content（图文正文）', 4096)!
+      const seconds = args.duration_seconds
+      if (typeof seconds !== 'number' || !Number.isSafeInteger(seconds) || seconds < 5 || seconds > 60) {
+        throw new Error('duration_seconds（展示秒数）须为 5～60 的整数。')
+      }
+      return postDisplay(exec, [{ content, duration_seconds: seconds }])
+    },
+  }))
+  agentCtx.tools.register(defineTool({
+    name: 'clear_floating_display',
+    description: '请求清除当前本机悬浮窗的图文卡片，回合继续执行。共享展示槽中的当前卡片将收起。',
+    parameters: {}, output: toolOutput(),
+    async execute(args, exec: ToolRunContext) {
+      assertArgs(args, [])
+      return postDisplay(exec, [{ cancel: true }])
+    },
   }))
   agentCtx.tools.register(defineTool({
     name: 'request_early_silence',

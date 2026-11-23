@@ -10,7 +10,7 @@
 
 | 组件 | 源码入口，相对于插件目录 | 负责内容 | 生命周期所有者 |
 | --- | --- | --- | --- |
-| `bridge`（桥接） | `src/bridge/plugin.ts` | 会话绑定、上下文合并与门禁、8 个根代理工具（含按需截屏）、回执、观察、工作区及模型设置 | 桥接插件上下文及绑定的根代理 |
+| `bridge`（桥接） | `src/bridge/plugin.ts` | 会话绑定、上下文合并与门禁、10 个根代理工具（含按需截屏与悬浮图文）、回执、观察、工作区及模型设置 | 桥接插件上下文及绑定的根代理 |
 | `device-control`（设备控制） | `src/device-control/plugin.ts` | 向当前绑定根代理登记七项工具，支持本机及已配对设备的桌面观察、动作、受限终端、文件与回执查询 | 设备控制加载器与当前桥接绑定 |
 | `wake-tasks`（项目唤醒任务） | `src/wake-tasks/plugin.ts` | 8 个任务及语音事件工具、任务接口、持久化、旧项目任务迁移、定时投递 | 任务插件上下文及任务服务 |
 | `client`（浏览器界面） | `src/client/index.ts` | 设置页、消息渲染、语言资源和界面插槽 | 浏览器插件上下文及服务期间注册 |
@@ -47,7 +47,7 @@ graph LR
 | 激活与上下文 | `activation_id`（激活标识）、`context_revision`（上下文版本）；过期调用必须保持拒绝，不能用新激活替代旧请求水位 |
 | 实时运行轨迹 | `shadow.activity`（内部活动回调）的 `action_seq`（动作序号）在激活内递增，思考、工具和运行状态串行发送；`activity`（实时活动正文）只使用绑定根代理的公开实时流及工具事件，字段与拒收规则见 [桥接活动协议](../architecture/bridge-2.0-protocol.md) |
 
-桥接组件保留 8 个根代理工具：`capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）、`finish_shadow_no_action`（终态无需动作）。设备控制组件提供 `device_list`（设备列表）、`device_windows`（窗口清单）、`device_observe`（界面观察）、`device_control`（窗口动作）、`device_task_query`（原任务查询）、`device_terminal`（受限终端）和 `device_file`（设备文件）。这些工具只允许当前绑定的根代理调用。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。
+桥接组件提供 10 个根代理工具，包括 `capture_screen`（捕获前台屏幕双图）、`get_latest_context`（读取权威上下文）、`publish_progress`（发布进度）、`publish_voice_information`（发布可替换信息）、`show_floating_display`（展示悬浮图文）、`clear_floating_display`（清除悬浮图文）、`request_early_silence`（请求提前静默）、`request_user_input`（请求用户澄清）、`return_shadow_result`（提交终态结果）和 `finish_shadow_no_action`（终态无需动作）。设备控制组件提供 `device_list`（设备列表）、`device_windows`（窗口清单）、`device_observe`（界面观察）、`device_control`（窗口动作）、`device_task_query`（原任务查询）、`device_terminal`（受限终端）和 `device_file`（设备文件）。这些工具只允许当前绑定的根代理调用。`capture_screen`（按需截屏工具）使用当前绑定的 `voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代）和 `activation_id`（激活标识），由服务端校验激活并复用屏幕捕获服务；插件校验图片长度、媒体类型和 `sha256`（内容摘要）后写入 DSH 附件库。截图只进入当前 DSH 工具结果，受“屏幕图像”设置控制，不新增 Voice 用户发言。捕获事实字段的中文说明见[屏幕双图输入](screen-input.md)。悬浮图文共用正式展示槽与时长、排版规则，回调身份、幂等结果和模式边界见[后台悬浮图文协议](../architecture/bridge-2.0-protocol.md#后台悬浮图文)。
 
 窗口动作审批通过后只做一次实况复核，服务端在派发时固定原连接和执行器代次。元素动作由辅助进程重新定位指定元素，纯窗口动作核对窗口身份，坐标及按键动作继续比较同一观察范围内的窗口内容。执行结果以原任务回执为准，结果未知时返回原任务编号。只读查询校验当前激活及原任务设备归属，设备离线或未登记桌面能力时仍可读取台账。
 

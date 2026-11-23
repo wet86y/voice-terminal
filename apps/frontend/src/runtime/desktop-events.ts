@@ -19,12 +19,13 @@ export async function listenDesktopEvent<T>(eventName: string, handler: (event: 
   const runtime = locateNativeInvoker(eventWindow)
   const plugin = eventWindow?.__TAURI_EVENT_PLUGIN_INTERNALS__
   if (!runtime?.transformCallback || !plugin) throw new Error('桌面事件接口不可用。')
+  const label = runtime.metadata?.currentWebview?.label
   const callbackId = runtime.transformCallback(handler)
   let eventId: number
   try {
     eventId = await runtime.invoke<number>('plugin:event|listen', {
       event: eventName,
-      target: { kind: 'Any' },
+      target: label ? { kind: 'Webview', label } : { kind: 'Any' },
       handler: callbackId,
     })
   } catch (error) {

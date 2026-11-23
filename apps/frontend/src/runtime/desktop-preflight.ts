@@ -22,6 +22,8 @@ export interface DesktopStatus {
 
 /** NativeCommandInvoker（原生命令调用器）：受控调用 Tauri（桌面运行时）命令。 */
 export interface NativeCommandInvoker {
+  /** metadata（原生身份）：包含当前网页窗口的标签。 */
+  metadata?: { currentWebview?: { label?: string } }
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
   /** transformCallback（转换回调）：Tauri event（桌面事件）订阅的官方 IPC 回调注册入口。 */
   transformCallback?<T>(callback?: (response: T) => void, once?: boolean): number
@@ -45,6 +47,7 @@ export function locateNativeInvoker(target: Window | undefined = typeof window =
   const native = desktop?.__TAURI_INTERNALS__
   if (!native || !desktop?.__VOICE_AGENT_DEBUG__) return native ?? null
   return {
+    metadata: native.metadata,
     transformCallback: native.transformCallback?.bind(native),
     unregisterCallback: native.unregisterCallback?.bind(native),
     async invoke<T>(command: string, args?: Record<string, unknown>) {

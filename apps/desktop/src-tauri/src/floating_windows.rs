@@ -1112,6 +1112,7 @@ fn apply_action(
                         .chars()
                         .take(160)
                         .collect();
+                    drop(session);
                 }
                 DisplayStatus::Cleared => return Err("清除展示由宿主处理。".into()),
                 DisplayStatus::Expired => {

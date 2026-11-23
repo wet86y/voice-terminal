@@ -3188,6 +3188,40 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.post("/api/internal/dsh-bridge/display.publish")
+    async def dsh_publish_display(request: Request) -> JSONResponse:
+        """display.publish（后台图文投递）：共用本机悬浮窗展示槽，独立于语音监听。"""
+        from ..agent.display_decision import parse_display
+
+        payload, session = await dsh_callback_body(request)
+        decision = parse_display(payload.get("display"))
+        if decision is None or decision.error:
+            raise HTTPException(status_code=422, detail=(
+                decision.error if decision is not None else "请提交一个展示或取消操作。"))
+        display = runtime.floating_display
+        target = display.target()
+        conversation_id = runtime.conversation.conversation_id
+        async with runtime._session_lock:
+            async def publish() -> dict[str, Any]:
+                if runtime.shadow_session is not session or session.voice_session_id != runtime.conversation.conversation_id:
+                    return {"result": "stale", "reason": "图文请求所属语音会话已变化。"}
+                if target is None:
+                    return {"result": "unavailable", "reason": "请先进入本机悬浮窗模式。"}
+                delivery = await display.submit(target, conversation_id, None, decision)
+                if delivery is None:
+                    return {"result": "unavailable", "reason": "本机悬浮窗连接或模式已变化。"}
+                return {"result": "accepted", "status": "submitted",
+                        "generation": target.generation, "delivery": delivery}
+
+            receipt = await session.accept_display(payload, publish)
+        return JSONResponse(
+            {"protocol_version": BRIDGE_PROTOCOL_VERSION, **receipt,
+             "fields": {"result": "请求受理结果", "status": "submitted 表示已投递，实际显示由窗口回执确认",
+                        "generation": "悬浮模式代次", "delivery": "图文投递编号", "reason": "不可用或拒绝原因"}},
+            status_code=200 if receipt.get("result") in {"accepted", "duplicate"} else 409,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.post("/api/internal/dsh-bridge/shadow.activity")
     @app.post("/api/internal/dsh-bridge/shadow.lifecycle")
     async def dsh_shadow_activity(request: Request) -> JSONResponse:

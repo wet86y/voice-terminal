@@ -22,7 +22,7 @@ export function createBridgeUserMessage(content: UserMessage['content'], id?: st
 }
 
 /** Stable idempotency identity（稳定幂等标识） for one DSH tool side effect. */
-export function stableBridgeToolId(scope: 'request' | 'event' | 'early-silence', dshSessionId: string, callId: unknown): string {
+export function stableBridgeToolId(scope: 'request' | 'event' | 'early-silence' | 'display', dshSessionId: string, callId: unknown): string {
   return digest({ scope: `shadow-tool-${scope}`, dsh_session_id: dshSessionId, call_id: String(callId) })
 }
 
